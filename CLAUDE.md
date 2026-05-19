@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Sister project
 
-**gonogo** is the consumer of this mod: a TypeScript SPA that displays kerbcam camera feeds in a mission-control dashboard. It lives in a sibling repo on the author's machine. When in doubt about shared conventions — commits, semver, performance-budget patterns, the Steam-Deck-to-MacBook topology, who the user is — read gonogo's `CLAUDE.md` first. It is the canonical record of how this user works.
+**[gonogo](https://github.com/jonpepler/gonogo)** is the consumer of this mod: a TypeScript SPA that displays kerbcam camera feeds in a mission-control dashboard. The two projects share conventions — commits, semver, performance-budget patterns, the Steam-Deck-to-MacBook topology — and gonogo's `CLAUDE.md` is the canonical record of those.
 
 The full design rationale for kerbcam lives in **gonogo's `local_docs/ocisly_state_and_rebuild.md`** — read it before any non-trivial architectural decision. This CLAUDE.md is an index pointing at it, not a replacement.
 
