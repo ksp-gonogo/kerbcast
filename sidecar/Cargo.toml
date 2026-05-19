@@ -38,10 +38,20 @@ openh264 = { version = "0.9", default-features = false, features = ["source"] }
 # /dev/shm/, so we have to meet it where it lives.
 memmap2 = "0.9"
 
+# Browser-facing transport. Pure-Rust libwebrtc-equivalent: handles ICE,
+# DTLS, SRTP, RTP packetisation, and the SDP offer/answer dance. Heavy dep
+# tree (~200 transitive crates) but it's the load-bearing piece for the
+# rebuild's "stream to a <video srcObject>" UX. Without this we're back to
+# OCISLY's JPEG-over-gRPC architecture which is what we're trying to escape.
+webrtc = "0.13"
+
 # Transport deps still deferred:
-#   webrtc-rs              — peer connection, media tracks, data channels
 #   ffmpeg-next            — for the tier-1 libva hardware encode backend on
 #                            Steam Deck (currently a stub)
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# Used by examples/webrtc_peer.rs for the manual stdin/stdout SDP exchange —
+# pasting raw multi-line SDP through a terminal is fragile, base64 is one
+# line and round-trips cleanly through whatever clipboard.
+base64 = "0.22"

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>kerbcam webrtc_peer dev test</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 6rem; font-family: ui-monospace, monospace; font-size: 12px; }
+  button { padding: 0.5rem 1rem; margin: 0.25rem 0; }
+  video { width: 100%; max-width: 640px; background: #111; }
+  pre { background: #f4f4f4; padding: 0.5rem; overflow-x: auto; font-size: 12px; }
+  .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<h1>kerbcam webrtc_peer dev test</h1>
+<p>Companion to <code>cargo run --example webrtc_peer --release</code>.
+   Paste the offer the sidecar prints, click <strong>Generate answer</strong>,
+   paste the resulting answer back into the sidecar's stdin.</p>
+
+<h3>1. Paste the offer (base64) from the sidecar</h3>
+<textarea id="offer" placeholder="paste offer here"></textarea>
+<div class="row">
+  <button id="goButton">Generate answer</button>
+  <span id="status" style="color:#666">idle</span>
+</div>
+
+<h3>2. Copy this answer (base64) back into the sidecar</h3>
+<textarea id="answer" readonly></textarea>
+
+<h3>3. Video should appear here once connected</h3>
+<video id="video" autoplay playsinline controls></video>
+
+<h3>Stats</h3>
+<pre id="stats">no stats yet</pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const status = (text, color="#666") => { $("status").textContent = text; $("status").style.color = color; };
+
+let pc = null;
+let statsTimer = null;
+
+$("goButton").addEventListener("click", async () => {
+  const offerB64 = $("offer").value.trim();
+  if (!offerB64) { status("paste offer first", "red"); return; }
+
+  // Decode base64 -> SDP string
+  const offerSdp = atob(offerB64);
+
+  pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+
+  pc.ontrack = (ev) => {
+    status("track received, attaching to <video>");
+    if (ev.streams && ev.streams[0]) {
+      $("video").srcObject = ev.streams[0];
+    } else {
+      // Single-track fallback
+      const ms = new MediaStream();
+      ms.addTrack(ev.track);
+      $("video").srcObject = ms;
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => status(`ICE: ${pc.iceConnectionState}`);
+  pc.onconnectionstatechange = () => status(`PC: ${pc.connectionState}`,
+    pc.connectionState === "connected" ? "green" :
+    pc.connectionState === "failed" ? "red" : "#666");
+
+  // Set the remote offer (the SDP needs to claim it'll receive video)
+  // — we add a recvonly transceiver to make sure m= line is there.
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+
+  // Wait for ICE gathering complete so the answer carries candidates
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    const check = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", check); resolve(); } };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+
+  const localAnswer = pc.localDescription.sdp;
+  $("answer").value = btoa(localAnswer);
+  status("answer ready, paste into sidecar", "green");
+
+  // Stats polling
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    const stats = await pc.getStats(null);
+    const lines = [];
+    stats.forEach((report) => {
+      if (report.type === "inbound-rtp" && report.kind === "video") {
+        lines.push(`inbound-rtp video: packets=${report.packetsReceived} bytes=${report.bytesReceived} framesReceived=${report.framesReceived ?? "?"} framesDecoded=${report.framesDecoded ?? "?"} jitter=${report.jitter?.toFixed(4) ?? "?"}`);
+      }
+    });
+    $("stats").textContent = lines.length ? lines.join("\n") : "waiting for inbound video stats";
+  }, 1000);
+});
+</script>
+</body>
+</html>
