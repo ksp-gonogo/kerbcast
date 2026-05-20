@@ -59,3 +59,18 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets
+
+      # Dev artefact only — not a release. Drops the linux-x64 binary so
+      # contributors on non-Linux dev machines (e.g. Apple Silicon, where
+      # QEMU's x86_64 emulation segfaults modern rustc binaries) can
+      # download a working sidecar instead of cross-compiling locally.
+      # The release pipeline is its own workflow once we cut tags.
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Upload dev sidecar binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kerbcam-sidecar-linux-x64-dev
+          path: sidecar/target/release/kerbcam-sidecar
+          if-no-files-found: error

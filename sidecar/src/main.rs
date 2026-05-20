@@ -42,13 +42,17 @@ struct Cli {
     encoder: EncoderChoice,
 
     /// Path to the shared-memory ring file the KSP plugin writes to.
-    #[arg(long, default_value = "/tmp/kerbcam-frames")]
+    /// Matches the plugin's `KerbcamCore.ResolveRingPath` default —
+    /// `$XDG_RUNTIME_DIR/kerbcam.ring` if that dir exists, else
+    /// `/tmp/kerbcam.ring`. Override with `--shm-path` when running
+    /// against a relocated install or a recorded fixture.
+    #[arg(long, default_value_os_t = default_shm_path())]
     shm_path: PathBuf,
 
-    #[arg(long, default_value_t = 1280)]
+    #[arg(long, default_value_t = 768)]
     max_width: u32,
 
-    #[arg(long, default_value_t = 720)]
+    #[arg(long, default_value_t = 768)]
     max_height: u32,
 
     #[arg(long, default_value_t = 4)]
@@ -76,6 +80,18 @@ struct Cli {
     /// test page is served at `GET /`; POST `/offer` accepts SDP.
     #[arg(long, default_value = "127.0.0.1:8088")]
     http_bind: SocketAddr,
+}
+
+fn default_shm_path() -> PathBuf {
+    // Mirror the C# plugin's path-picking so a vanilla `cargo run` lines
+    // up with a vanilla KSP launch on the same machine.
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let p = PathBuf::from(xdg);
+        if p.is_dir() {
+            return p.join("kerbcam.ring");
+        }
+    }
+    PathBuf::from("/tmp/kerbcam.ring")
 }
 
 #[tokio::main(flavor = "multi_thread")]

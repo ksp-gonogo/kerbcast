@@ -14,6 +14,11 @@ obj/
 # Build output
 /dist/
 /build/
+# QEMU emulation coredumps from failed cross-builds
+**/qemu_*_*.core
+# Side-by-side Linux cross-build target dir (used when CARGO_TARGET_DIR
+# points at a separate tree to avoid arch-mixing with native target/)
+sidecar/target-linux/
 
 # IDE
 .idea/
