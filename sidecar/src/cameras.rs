@@ -24,7 +24,26 @@ use tracing::{info, warn};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::encoder::EncoderBackend;
+use crate::protocol::Layer;
 use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+/// In-memory mirror of the plugin's `<flight_id>.control.json` file.
+/// The data-channel message handlers mutate this struct and the
+/// registry's `write_control` flushes the full state to disk, so two
+/// independent setters compose cleanly.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlState {
+    /// Operator-requested layer mask. Empty = "fall back to settings.cfg
+    /// initial mask on the plugin side"; populated = explicit override.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<Layer>,
+    /// Operator-requested render size. None = "use settings.cfg initial".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
 
 /// Public shape returned by `GET /cameras` — what a browser sees before
 /// it picks a subscription set. Operator-readable fields (`part_title`,
@@ -68,6 +87,12 @@ pub struct CameraState {
     pub part_title: String,
     pub camera_name: String,
     pub vessel_name: String,
+    /// Sidecar-side mirror of the plugin's control file. Mutated by
+    /// data-channel messages (SetLayers / SetRenderSize); the registry's
+    /// `write_control` flushes the full struct to disk on each change so
+    /// fields stay in sync — setting layers doesn't clobber an
+    /// already-set render size.
+    pub control: Mutex<ControlState>,
     /// Lazy: created on first encoded frame so the encoder sees the
     /// actual frame dimensions, not the ring's max. Closed + reinit if
     /// the frame dimensions change (the plugin's adaptive downscale
@@ -192,6 +217,7 @@ impl CameraRegistry {
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
                             tracks: RwLock::new(Vec::new()),
+                            control: Mutex::new(ControlState::default()),
                         }),
                     );
                 }
@@ -238,16 +264,15 @@ impl CameraRegistry {
         self.cameras.read().await.get(&flight_id).cloned()
     }
 
-    /// Write a control file the plugin polls each LateUpdate. Currently
-    /// carries the requested layer mask; future iterations can grow this
-    /// (per-camera resolution, zoom, pan/tilt). Atomic rename so the
-    /// plugin never sees a half-written file.
-    pub async fn write_control(&self, flight_id: u32, layers: &[String]) -> std::io::Result<()> {
+    /// Flush a camera's in-memory `ControlState` to its
+    /// `<flight_id>.control.json` file. Atomic rename so the plugin
+    /// never observes a half-written file. Carries every field that's
+    /// currently set; the plugin parses lazily, so adding new fields
+    /// here doesn't break older plugin versions.
+    pub async fn flush_control(&self, flight_id: u32, state: &ControlState) -> std::io::Result<()> {
         let dest = self.shm_dir.join(format!("{flight_id}.control.json"));
         let tmp = self.shm_dir.join(format!("{flight_id}.control.json.tmp"));
-        let body = serde_json::to_string_pretty(&serde_json::json!({
-            "layers": layers,
-        }))?;
+        let body = serde_json::to_string_pretty(state)?;
         tokio::fs::write(&tmp, body).await?;
         tokio::fs::rename(&tmp, &dest).await?;
         Ok(())

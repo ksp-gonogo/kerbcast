@@ -54,6 +54,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 base64 = "0.22"
 
+# Type-export attribute. The `typeshare-cli` tool reads `#[typeshare]`-
+# annotated structs/enums and emits TypeScript / Kotlin / Swift / Scala
+# bindings — single source of truth for the protocol package. The CLI
+# isn't a runtime dep; only the marker attribute crate is.
+typeshare = "1"
+
 # Transport deps still deferred:
 #   ffmpeg-next            — for the tier-1 libva hardware encode backend on
 #                            Steam Deck (currently a stub)

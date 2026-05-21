@@ -1,23 +1,33 @@
 //! WebRTC peer for the kerbcam sidecar. One `KerbcamPeer` per browser
 //! connection; each carries one H.264 video track per camera the browser
-//! subscribed to. webrtc-rs handles ICE/DTLS/SRTP/RTP packetisation
-//! internally.
+//! subscribed to AND a "kerbcam-control" data channel for bidirectional
+//! protocol messages (see `crate::protocol`). webrtc-rs handles
+//! ICE/DTLS/SRTP/RTP packetisation internally.
 //!
 //! Track lifecycle: the peer owns Arcs to its tracks for the duration of
 //! its RTCPeerConnection. Each camera's registry entry holds a Weak ref
 //! to the same track + a subscriber count. When the peer is dropped,
 //! the Arcs go with it; the camera-side consume loop notices the dead
 //! Weaks on its next tick and decrements its subscriber count.
+//!
+//! Data channel: created by the browser side (the offer SDP includes a
+//! datachannel m-section). When it opens, the handler dispatches
+//! incoming `ClientMessage` JSON; the server replies / pushes
+//! `ServerMessage` JSON back. The plugin reads the mutated control
+//! state via its periodic `*.control.json` poll, so layer/render-size
+//! changes propagate within ~1s of the data-channel write.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -28,6 +38,12 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 
 use crate::cameras::CameraRegistry;
+use crate::protocol::{
+    CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage, ErrorPayload,
+    FlightIdPayload, HelloPayload, Layer, ServerMessage, SetLayersPayload, SetRenderSizePayload,
+};
+
+const CONTROL_CHANNEL_LABEL: &str = "kerbcam-control";
 
 pub struct KerbcamPeer {
     pc: Arc<RTCPeerConnection>,
@@ -37,6 +53,12 @@ pub struct KerbcamPeer {
     _tracks: Vec<Arc<TrackLocalStaticSample>>,
     /// flight_ids the peer subscribed to — surfaced for logging.
     pub subscribed: Vec<u32>,
+    /// Set once the browser opens the control channel. Held for the
+    /// peer's lifetime so server-initiated pushes (AdaptiveShed, vessel
+    /// changes once a plugin status file lands) can address this peer
+    /// directly without re-discovering the channel each time.
+    #[allow(dead_code)]
+    control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     connected: Arc<Notify>,
     /// Flipped to `false` when the underlying RTCPeerConnection reaches a
     /// terminal state. The daemon polls `is_alive()` each consume tick.
@@ -47,8 +69,10 @@ impl KerbcamPeer {
     /// Build a peer with one H.264 track per requested camera that exists
     /// in the registry. Unknown camera IDs are dropped with a warning —
     /// the caller can still return a useful answer to the browser with
-    /// the surviving tracks.
-    pub async fn new(registry: &CameraRegistry, requested: &[u32]) -> Result<Self> {
+    /// the surviving tracks. Also registers an `on_data_channel` handler
+    /// that wires up the "kerbcam-control" protocol channel when the
+    /// browser opens one.
+    pub async fn new(registry: Arc<CameraRegistry>, requested: &[u32]) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let api = APIBuilder::new().with_media_engine(media_engine).build();
@@ -102,6 +126,32 @@ impl KerbcamPeer {
             subscribed.push(flight_id);
         }
 
+        let control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
+
+        let registry_for_dc = registry.clone();
+        let control_channel_for_handler = control_channel.clone();
+        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let registry = registry_for_dc.clone();
+            let control_channel = control_channel_for_handler.clone();
+            Box::pin(async move {
+                if dc.label() != CONTROL_CHANNEL_LABEL {
+                    info!(label = %dc.label(), "ignoring unexpected data channel");
+                    return;
+                }
+                info!(label = %dc.label(), "control channel opened");
+                *control_channel.lock().await = Some(dc.clone());
+
+                let dc_for_msg = dc.clone();
+                dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    let registry = registry.clone();
+                    let dc = dc_for_msg.clone();
+                    Box::pin(async move {
+                        handle_client_message(registry, dc, msg).await;
+                    })
+                }));
+            })
+        }));
+
         let connected = Arc::new(Notify::new());
         let alive = Arc::new(AtomicBool::new(true));
         let connected_for_handler = connected.clone();
@@ -126,6 +176,7 @@ impl KerbcamPeer {
             pc,
             _tracks: owned_tracks,
             subscribed,
+            control_channel,
             connected,
             alive,
         })
@@ -167,5 +218,259 @@ impl KerbcamPeer {
     pub async fn close(&self) -> Result<()> {
         self.pc.close().await?;
         Ok(())
+    }
+}
+
+/// Single-message dispatch. Pulled out of the closure so the error
+/// paths and per-variant logic don't drown the construction code.
+async fn handle_client_message(
+    registry: Arc<CameraRegistry>,
+    dc: Arc<RTCDataChannel>,
+    msg: DataChannelMessage,
+) {
+    if msg.is_string {
+        // expected branch
+    }
+    let text = match std::str::from_utf8(&msg.data) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "control channel: non-utf8 payload, dropping");
+            return;
+        }
+    };
+    let parsed: ClientMessage = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, payload = %text, "control channel: parse failed");
+            send_server_message(
+                &dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: format!("parse failed: {e}"),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match parsed {
+        ClientMessage::Hello => {
+            info!("control channel: hello received");
+            send_server_message(
+                &dc,
+                &ServerMessage::Hello(HelloPayload {
+                    sidecar_version: crate::VERSION.to_owned(),
+                    encoder_backend: "openh264".to_owned(),
+                }),
+            )
+            .await;
+            send_camera_snapshot(&registry, &dc).await;
+        }
+        ClientMessage::SetLayers(SetLayersPayload { flight_id, layers }) => {
+            apply_layer_change(&registry, &dc, flight_id, layers).await;
+        }
+        ClientMessage::SetRenderSize(SetRenderSizePayload {
+            flight_id,
+            width,
+            height,
+        }) => {
+            apply_render_size_change(&registry, &dc, flight_id, width, height).await;
+        }
+        ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {
+            // The encoder backends expose `request_keyframe()`; we call
+            // it through the per-camera encoder lock if it's currently
+            // initialised. If not, the next encode produces an IDR
+            // anyway (cold start), so the no-op is the right thing.
+            if let Some(cam) = registry.get(flight_id).await {
+                let mut guard = cam.encoder.lock().await;
+                if let Some(backend) = guard.as_mut() {
+                    backend.request_keyframe();
+                    info!(flight_id, "keyframe requested");
+                }
+            }
+        }
+    }
+}
+
+async fn apply_layer_change(
+    registry: &Arc<CameraRegistry>,
+    dc: &Arc<RTCDataChannel>,
+    flight_id: u32,
+    layers: Vec<Layer>,
+) {
+    let cam = match registry.get(flight_id).await {
+        Some(c) => c,
+        None => {
+            send_server_message(
+                dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: format!("no camera with flight_id={flight_id}"),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let snapshot = {
+        let mut ctrl = cam.control.lock().await;
+        ctrl.layers = layers.clone();
+        ctrl.clone()
+    };
+
+    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+        warn!(flight_id, error = %e, "control file flush failed");
+        send_server_message(
+            dc,
+            &ServerMessage::Error(ErrorPayload {
+                message: format!("control file flush failed: {e}"),
+            }),
+        )
+        .await;
+        return;
+    }
+
+    info!(flight_id, layers = ?layers, "data-channel set-layers applied");
+    push_camera_state(registry, dc, flight_id).await;
+}
+
+async fn apply_render_size_change(
+    registry: &Arc<CameraRegistry>,
+    dc: &Arc<RTCDataChannel>,
+    flight_id: u32,
+    width: u32,
+    height: u32,
+) {
+    let cam = match registry.get(flight_id).await {
+        Some(c) => c,
+        None => {
+            send_server_message(
+                dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: format!("no camera with flight_id={flight_id}"),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Cap at the ring's allocated max — anything bigger would be
+    // rejected by the plugin's MmapFrameRing.Produce on the next emit.
+    let w = make_even(width.min(cam.max_width));
+    let h = make_even(height.min(cam.max_height));
+
+    let snapshot = {
+        let mut ctrl = cam.control.lock().await;
+        ctrl.width = Some(w);
+        ctrl.height = Some(h);
+        ctrl.clone()
+    };
+
+    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+        warn!(flight_id, error = %e, "control file flush failed");
+        send_server_message(
+            dc,
+            &ServerMessage::Error(ErrorPayload {
+                message: format!("control file flush failed: {e}"),
+            }),
+        )
+        .await;
+        return;
+    }
+
+    info!(
+        flight_id,
+        width = w,
+        height = h,
+        "data-channel set-render-size applied"
+    );
+    push_camera_state(registry, dc, flight_id).await;
+}
+
+async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataChannel>) {
+    let cams = registry.list().await;
+    let cameras: Vec<CameraState> = cams
+        .into_iter()
+        .map(|c| CameraState {
+            flight_id: c.flight_id,
+            part_name: c.part_name,
+            part_title: c.part_title,
+            camera_name: c.camera_name,
+            vessel_name: c.vessel_name,
+            // We don't yet have plugin-side status reporting, so the
+            // sidecar mirrors operator state for both effective and
+            // operator views. Once the plugin writes back a status file,
+            // these split.
+            layers: vec![Layer::Near, Layer::Scaled, Layer::Galaxy],
+            operator_layers: vec![Layer::Near, Layer::Scaled, Layer::Galaxy],
+            render_width: c.max_width,
+            render_height: c.max_height,
+            operator_width: c.max_width,
+            operator_height: c.max_height,
+        })
+        .collect();
+    send_server_message(
+        dc,
+        &ServerMessage::CameraSnapshot(CameraSnapshotPayload { cameras }),
+    )
+    .await;
+}
+
+async fn push_camera_state(
+    registry: &Arc<CameraRegistry>,
+    dc: &Arc<RTCDataChannel>,
+    flight_id: u32,
+) {
+    let cam = match registry.get(flight_id).await {
+        Some(c) => c,
+        None => return,
+    };
+    let ctrl = cam.control.lock().await.clone();
+    let layers = if ctrl.layers.is_empty() {
+        vec![Layer::Near, Layer::Scaled, Layer::Galaxy]
+    } else {
+        ctrl.layers.clone()
+    };
+    let w = ctrl.width.unwrap_or(cam.max_width);
+    let h = ctrl.height.unwrap_or(cam.max_height);
+    let state = CameraState {
+        flight_id,
+        part_name: cam.part_name.clone(),
+        part_title: cam.part_title.clone(),
+        camera_name: cam.camera_name.clone(),
+        vessel_name: cam.vessel_name.clone(),
+        layers: layers.clone(),
+        operator_layers: layers,
+        render_width: w,
+        render_height: h,
+        operator_width: w,
+        operator_height: h,
+    };
+    send_server_message(
+        dc,
+        &ServerMessage::CameraStateChanged(CameraStateChangedPayload { state }),
+    )
+    .await;
+}
+
+async fn send_server_message(dc: &Arc<RTCDataChannel>, msg: &ServerMessage) {
+    let body = match serde_json::to_string(msg) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "control channel: serialise failed");
+            return;
+        }
+    };
+    if let Err(e) = dc.send_text(body).await {
+        warn!(error = %e, "control channel: send failed");
+    }
+}
+
+fn make_even(v: u32) -> u32 {
+    if v.is_multiple_of(2) {
+        v
+    } else {
+        v.saturating_sub(1)
     }
 }

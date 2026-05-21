@@ -10,6 +10,8 @@
   button { padding: 0.5rem 1rem; }
   .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
   .status { color: #666; }
+  .control-channel { color: #888; font-family: ui-monospace, monospace; font-size: 12px; }
+  .control-channel.open { color: green; }
   table.cameras { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 0.5rem; }
   table.cameras th, table.cameras td { padding: 6px 8px; border-bottom: 1px solid #e5e5e5; text-align: left; vertical-align: middle; }
   table.cameras th { background: #fafafa; font-weight: 600; }
@@ -28,13 +30,14 @@
 </head>
 <body>
 <h1>kerbcam</h1>
-<p>Lists cameras the sidecar has discovered. Tick which ones to stream, then Connect. Per-camera layer checkboxes toggle the near / scaled / galaxy render layers live (no reconnect needed).</p>
+<p>Layer toggles travel via the bidirectional <code>kerbcam-control</code> data channel (see <code>@kerbcam/protocol</code>); the sidecar pushes <code>camera-state-changed</code> back so every connected client sees the same state.</p>
 
 <div class="row">
   <button id="refreshBtn">Refresh cameras</button>
   <button id="connectBtn" disabled>Connect</button>
   <button id="disconnectBtn" disabled>Disconnect</button>
   <span id="status" class="status">idle</span>
+  <span id="channelStatus" class="control-channel">control channel: idle</span>
 </div>
 
 <h3>Detected cameras</h3>
@@ -59,36 +62,52 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const setStatus = (text, color = "#666") => { $("status").textContent = text; $("status").style.color = color; };
+const setChannelStatus = (text, open = false) => {
+  $("channelStatus").textContent = `control channel: ${text}`;
+  $("channelStatus").classList.toggle("open", open);
+};
 
-const layerKinds = ["NEAR", "SCALED", "GALAXY"];
+const LAYER_KINDS = ["NEAR", "SCALED", "GALAXY"];
 
 let pc = null;
+let dc = null;
 let statsTimer = null;
-let discovered = []; // [{flight_id, part_title, vessel_name, max_width, max_height}]
-let included = new Set(); // flight_ids the operator wants to subscribe to
+let discovered = []; // CameraState[] from /cameras (HTTP, pre-offer)
+let included = new Set(); // flight_ids selected for streaming
 let layerState = new Map(); // flight_id -> Set<layer>
-let trackByFlightId = new Map(); // flight_id -> MediaStreamTrack
+let trackByFlightId = new Map();
 
-function setLayerLocal(flightId, layer, on) {
-  const set = layerState.get(flightId) ?? new Set(layerKinds);
-  if (on) set.add(layer); else set.delete(layer);
-  layerState.set(flightId, set);
+function sendControl(message) {
+  if (!dc || dc.readyState !== "open") {
+    setChannelStatus("not open, dropping message", false);
+    return;
+  }
+  dc.send(JSON.stringify(message));
 }
 
-async function pushLayers(flightId) {
-  const set = layerState.get(flightId) ?? new Set(layerKinds);
-  const layers = layerKinds.filter((l) => set.has(l));
-  try {
-    const res = await fetch(`/cameras/${flightId}/layers`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ layers }),
-    });
-    if (!res.ok) {
-      setStatus(`layer update failed for ${flightId}: ${res.status}`, "red");
+function handleServerMessage(msg) {
+  switch (msg.type) {
+    case "hello":
+      setChannelStatus(`open (sidecar ${msg.content.sidecarVersion}, ${msg.content.encoderBackend})`, true);
+      break;
+    case "camera-snapshot":
+    case "camera-state-changed": {
+      const cams = msg.type === "camera-snapshot" ? msg.content.cameras : [msg.content.state];
+      for (const cs of cams) {
+        layerState.set(cs.flightId, new Set(cs.operatorLayers));
+      }
+      renderTable();
+      break;
     }
-  } catch (e) {
-    setStatus(`layer update error: ${e.message}`, "red");
+    case "adaptive-shed":
+      setStatus(`adaptive shed level=${msg.content.level} (KSP ${msg.content.kspFps.toFixed(1)} fps): ${msg.content.reason}`,
+        msg.content.level > 0 ? "#b80" : "green");
+      break;
+    case "error":
+      setChannelStatus(`error: ${msg.content.message}`, false);
+      break;
+    default:
+      console.warn("unknown server message", msg);
   }
 }
 
@@ -107,6 +126,7 @@ function renderTable() {
     const incCb = document.createElement("input");
     incCb.type = "checkbox";
     incCb.checked = included.has(cam.flight_id);
+    incCb.disabled = pc !== null;
     incCb.addEventListener("change", () => {
       if (incCb.checked) included.add(cam.flight_id); else included.delete(cam.flight_id);
       tr.classList.toggle("subscribed", incCb.checked);
@@ -122,16 +142,22 @@ function renderTable() {
       <div class="id">flight_id ${cam.flight_id}</div>`;
     tr.appendChild(nameTd);
 
-    const currentLayers = layerState.get(cam.flight_id) ?? new Set(layerKinds);
-    for (const layer of layerKinds) {
+    const currentLayers = layerState.get(cam.flight_id) ?? new Set(LAYER_KINDS);
+    for (const layer of LAYER_KINDS) {
       const td = document.createElement("td");
       td.className = "layer";
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.checked = currentLayers.has(layer);
+      cb.disabled = !dc || dc.readyState !== "open";
       cb.addEventListener("change", () => {
-        setLayerLocal(cam.flight_id, layer, cb.checked);
-        pushLayers(cam.flight_id);
+        const next = new Set(currentLayers);
+        if (cb.checked) next.add(layer); else next.delete(layer);
+        layerState.set(cam.flight_id, next);
+        sendControl({
+          type: "set-layers",
+          content: { flightId: cam.flight_id, layers: [...next] },
+        });
       });
       td.appendChild(cb);
       tr.appendChild(td);
@@ -151,28 +177,22 @@ async function refreshCameras() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { cameras } = await res.json();
     discovered = cameras || [];
-
-    // Initialise included + layerState for new cameras.
     for (const cam of discovered) {
-      if (!layerState.has(cam.flight_id)) {
-        layerState.set(cam.flight_id, new Set(layerKinds));
-      }
-      // Default: stream all newly-detected cameras
-      if (included.size === 0 || pc === null) included.add(cam.flight_id);
+      if (!layerState.has(cam.flight_id)) layerState.set(cam.flight_id, new Set(LAYER_KINDS));
+      if (pc === null) included.add(cam.flight_id);
     }
-    // Drop included entries for cameras that vanished.
     for (const id of [...included]) {
       if (!discovered.find((c) => c.flight_id === id)) included.delete(id);
     }
     renderTable();
     $("connectBtn").disabled = pc !== null || included.size === 0;
   } catch (e) {
-    const tbody = $("cameraTable");
-    tbody.innerHTML = `<tr><td colspan="5" class="empty">error fetching /cameras: ${escapeHtml(e.message)}</td></tr>`;
+    $("cameraTable").innerHTML = `<tr><td colspan="5" class="empty">error fetching /cameras: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 
 function disconnect() {
+  if (dc) { try { dc.close(); } catch {} dc = null; }
   if (pc) { pc.close(); pc = null; }
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   trackByFlightId.clear();
@@ -180,6 +200,8 @@ function disconnect() {
   $("connectBtn").disabled = included.size === 0;
   $("disconnectBtn").disabled = true;
   setStatus("disconnected");
+  setChannelStatus("closed");
+  renderTable();
 }
 
 $("refreshBtn").addEventListener("click", refreshCameras);
@@ -193,25 +215,39 @@ $("connectBtn").addEventListener("click", async () => {
 
   pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 
-  // Add one recvonly transceiver per camera we want to receive. The order
-  // here matches the order we send in the offer body, which the sidecar
-  // uses to assign tracks → m-sections.
   for (const _ of selected) pc.addTransceiver("video", { direction: "recvonly" });
+
+  // Create the control data channel BEFORE setLocalDescription so the
+  // offer SDP includes its m-section. webrtc-rs creates the server-side
+  // half via on_data_channel.
+  dc = pc.createDataChannel("kerbcam-control");
+  setChannelStatus("opening");
+  dc.onopen = () => {
+    setChannelStatus("opened, sending hello");
+    sendControl({ type: "hello" });
+    renderTable();
+  };
+  dc.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      handleServerMessage(msg);
+    } catch (e) {
+      setChannelStatus(`parse failed: ${e.message}`);
+    }
+  };
+  dc.onclose = () => { setChannelStatus("closed"); renderTable(); };
+  dc.onerror = (ev) => setChannelStatus(`error: ${ev?.error?.message ?? "unknown"}`);
 
   let trackIdx = 0;
   pc.ontrack = (ev) => {
-    // Tracks arrive in the order we requested. Map by index → flight_id.
     const flightId = selected[trackIdx++];
     const cam = discovered.find((c) => c.flight_id === flightId);
 
     const fig = document.createElement("figure");
     const cap = document.createElement("figcaption");
-    cap.innerHTML = `<span>${escapeHtml(cam?.camera_name || cam?.part_title || cam?.part_name || "?" )}</span><span>flight ${flightId}</span>`;
+    cap.innerHTML = `<span>${escapeHtml(cam?.camera_name || cam?.part_title || cam?.part_name || "?")}</span><span>flight ${flightId}</span>`;
     const v = document.createElement("video");
-    v.autoplay = true;
-    v.playsInline = true;
-    v.controls = true;
-    v.muted = true;
+    v.autoplay = true; v.playsInline = true; v.controls = true; v.muted = true;
     const ms = new MediaStream();
     ms.addTrack(ev.track);
     v.srcObject = ms;
@@ -232,14 +268,11 @@ $("connectBtn").addEventListener("click", async () => {
     setStatus(`PC: ${pc.connectionState}`,
       pc.connectionState === "connected" ? "green" :
       pc.connectionState === "failed" ? "red" : "#666");
-    if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
-      disconnect();
-    }
+    if (["failed", "closed", "disconnected"].includes(pc.connectionState)) disconnect();
   };
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
   await new Promise((resolve) => {
     if (pc.iceGatheringState === "complete") return resolve();
     const check = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", check); resolve(); } };
@@ -252,11 +285,7 @@ $("connectBtn").addEventListener("click", async () => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sdp: pc.localDescription.sdp, cameras: selected }),
   });
-  if (!res.ok) {
-    setStatus(`offer failed: ${res.status}`, "red");
-    disconnect();
-    return;
-  }
+  if (!res.ok) { setStatus(`offer failed: ${res.status}`, "red"); disconnect(); return; }
   const { sdp: answerSdp, cameras: subscribed } = await res.json();
   await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
   setStatus(`subscribed to ${subscribed.length}: ${subscribed.join(", ")}`, "green");
@@ -270,8 +299,6 @@ $("connectBtn").addEventListener("click", async () => {
     const byTrackId = new Map();
     allStats.forEach((report) => {
       if (report.type === "inbound-rtp" && report.kind === "video") {
-        const trackInfo = allStats.get(report.trackId);
-        const ssrcInfo = trackInfo ?? report;
         byTrackId.set(report.trackIdentifier ?? report.ssrc, report);
       }
     });

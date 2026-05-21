@@ -1,0 +1,26 @@
+{
+  "name": "@kerbcam/protocol",
+  "version": "0.1.0",
+  "description": "TypeScript bindings for the kerbcam sidecar's WebRTC data-channel protocol. Generated from Rust types via typeshare — do not edit src/index.ts by hand.",
+  "license": "CC-BY-NC-SA-4.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jonpepler/kerbcam.git",
+    "directory": "client-sdk/typescript"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "src/index.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "regen": "typeshare ../../sidecar/src --lang=typescript --output-file=src/index.ts",
+    "prepublishOnly": "pnpm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

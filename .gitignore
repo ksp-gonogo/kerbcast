@@ -14,6 +14,11 @@ obj/
 # Build output
 /dist/
 /build/
+# TypeScript package — generated source IS committed (so consumers
+# pulling from a tag don't need typeshare installed), but compiled
+# output and pulled deps aren't.
+client-sdk/typescript/dist/
+client-sdk/typescript/node_modules/
 # QEMU emulation coredumps from failed cross-builds
 **/qemu_*_*.core
 # Side-by-side Linux cross-build target dir (used when CARGO_TARGET_DIR
