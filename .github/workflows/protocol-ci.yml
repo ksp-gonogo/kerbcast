@@ -19,11 +19,13 @@ on:
     branches: [main]
     paths:
       - 'sidecar/src/protocol/**'
+      - 'sidecar/Cargo.toml'
       - 'client-sdk/typescript/**'
       - '.github/workflows/protocol-ci.yml'
   pull_request:
     paths:
       - 'sidecar/src/protocol/**'
+      - 'sidecar/Cargo.toml'
       - 'client-sdk/typescript/**'
       - '.github/workflows/protocol-ci.yml'
   workflow_dispatch: {}
@@ -68,6 +70,16 @@ jobs:
           if ! diff -u client-sdk/typescript/src/index.ts /tmp/regenerated.ts; then
             echo "::error::client-sdk/typescript/src/index.ts is out of sync with the Rust protocol types."
             echo "::error::Run \`typeshare ./sidecar/src --lang=typescript --output-file=client-sdk/typescript/src/index.ts\` and commit the result."
+            exit 1
+          fi
+
+      - name: Verify version sync (Cargo.toml == package.json)
+        run: |
+          PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
+          CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "cargo=$CARGO_VER package=$PKG_VER"
+          if [ "$CARGO_VER" != "$PKG_VER" ]; then
+            echo "::error::version mismatch — Cargo.toml ($CARGO_VER) vs package.json ($PKG_VER). Run ./scripts/bump-version.sh."
             exit 1
           fi
 

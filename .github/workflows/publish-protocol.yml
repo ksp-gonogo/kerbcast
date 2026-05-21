@@ -1,0 +1,119 @@
+name: publish-protocol
+
+# Tag-triggered publish to GitHub Packages for @jonpepler/kerbcam.
+#
+# GitHub Packages requires the npm scope to match the repo's owner;
+# we use `@jonpepler` because that's where the repo lives today. If
+# the project later moves to an umbrella org, the scope changes to
+# that org's name in a single search-replace.
+#
+# Trigger: annotated tag matching `v*` (e.g. `v0.1.0`, `v1.2.3`).
+# The version is treated as a single source of truth across both
+# halves of the wire contract:
+#
+#   - sidecar/Cargo.toml's `version = ...` (Rust)
+#   - client-sdk/typescript/package.json's `version` (TypeScript)
+#
+# All three (tag, Cargo.toml, package.json) must agree or the
+# workflow fails before publishing. `./scripts/bump-version.sh
+# X.Y.Z` bumps all of them atomically.
+#
+# Before publish:
+#   * typeshare drift check (same as protocol-ci) — stale generated
+#     TS can't escape under a release tag
+#   * Version sync check (tag == Cargo.toml == package.json)
+#   * tsc build
+#   * `npm publish` to GitHub Packages, using the workflow's
+#     built-in GITHUB_TOKEN (no manual secret needed)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  # Required to publish to the repo's GitHub Packages registry.
+  packages: write
+  # Required by `npm publish --provenance` so GitHub can attest the
+  # package was built in this workflow run from this commit.
+  id-token: write
+
+jobs:
+  publish:
+    name: drift + version sync + tsc + GitHub Packages publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + typeshare binary
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/typeshare
+          key: ${{ runner.os }}-typeshare-cli-1.13.4
+
+      - name: Install typeshare-cli
+        run: |
+          if ! command -v typeshare >/dev/null 2>&1; then
+            cargo install typeshare-cli --version 1.13.4 --locked
+          fi
+          typeshare --version
+
+      - name: Regenerate TS bindings
+        run: |
+          typeshare ./sidecar/src \
+            --lang=typescript \
+            --output-file=/tmp/regenerated.ts
+
+      - name: Diff against committed bindings
+        run: |
+          if ! diff -u client-sdk/typescript/src/index.ts /tmp/regenerated.ts; then
+            echo "::error::client-sdk/typescript/src/index.ts is out of sync with the Rust protocol types — cannot publish."
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node + GitHub Packages registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client-sdk/typescript/pnpm-lock.yaml
+          registry-url: https://npm.pkg.github.com
+          scope: '@jonpepler'
+
+      - name: Verify version sync (tag == Cargo.toml == package.json)
+        working-directory: ${{ github.workspace }}
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
+          CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag=$TAG_VER cargo=$CARGO_VER package=$PKG_VER"
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ]; then
+            echo "::error::version mismatch — run ./scripts/bump-version.sh $TAG_VER and re-tag"
+            exit 1
+          fi
+
+      - name: Install + build
+        working-directory: client-sdk/typescript
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm run build
+
+      - name: Publish to GitHub Packages
+        working-directory: client-sdk/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm publish --provenance
