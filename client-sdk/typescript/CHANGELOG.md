@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — 2026-05-21
+
+Export `KerbcamTransport`, `KerbcamPeer`, `KerbcamDataChannel` from
+the package root. 0.3.0 introduced these as a public extension
+point for tests and non-browser consumers but didn't re-export
+them, so the only way to reference the types was a deep import
+into `dist/client.d.ts`. Strictly additive — no behaviour change.
+
+
 ## 0.3.0 — 2026-05-21
 
 High-level `KerbcamClient` class wraps the WebRTC peer, the

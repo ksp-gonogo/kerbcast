@@ -11,5 +11,8 @@ export {
   type KerbcamConnectionState,
   type KerbcamClientEvents,
   type KerbcamCameraEvents,
+  type KerbcamTransport,
+  type KerbcamPeer,
+  type KerbcamDataChannel,
   type DiscoveredCamera,
 } from "./client";
