@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.0 — 2026-05-21
+
+High-level `KerbcamClient` class wraps the WebRTC peer, the
+`kerbcam-control` data channel, per-camera state cache, and
+per-track `MediaStream`s. Consumers no longer hand-roll
+`RTCPeerConnection`, build JSON wire messages, or thread SDP offers
+through `fetch`.
+
+```ts
+import { KerbcamClient, Layer } from "@jonpepler/kerbcam";
+
+const client = new KerbcamClient({ host: "192.168.1.74", port: 8088 });
+await client.connect();
+
+const cam = client.camera(2592004302);
+await cam.setLayers([Layer.Near, Layer.Scaled]);
+await cam.setFov(35);
+await cam.setDegrade(0.5);
+
+document.querySelector("video")!.srcObject = cam.mediaStream;
+
+cam.on("change", (state) => { /* per-camera state delta */ });
+client.on("adaptive-shed", (e) => { /* shed level + reason */ });
+```
+
+### Added
+
+- `KerbcamClient` owns the peer, control channel, and registry of
+  cameras. `connect(flightIds?)`, `disconnect()`, `camera(flightId)`,
+  `discover()`.
+- `KerbcamCameraHandle` exposes `setLayers`, `setRenderSize`,
+  `setFov`, `setPan`, `setDegrade`, `requestKeyframe`, plus a
+  `mediaStream` getter that yields the per-camera `MediaStream`
+  once the track arrives.
+- Typed event API on both `KerbcamClient`
+  (`state-change` / `cameras-change` / `adaptive-shed` / `error`)
+  and `KerbcamCameraHandle` (`change` / `stream`). Subscribing
+  returns an unsubscribe function.
+- `KerbcamTransport` interface — swappable transport for tests and
+  non-browser consumers. Default `BrowserKerbcamTransport` uses
+  `RTCPeerConnection`.
+- `client.discover()` fetches the sidecar's `/cameras` listing
+  without opening a peer connection, for picking a subset to
+  `connect()` with.
+
+### Restructured
+
+- Generated wire-format types moved from `src/index.ts` to
+  `src/__generated__/types.ts`. `src/index.ts` is now hand-written
+  and re-exports both the generated types and the new client.
+- Consumers that imported types from the package root keep working
+  (`import { ClientMessage } from "@jonpepler/kerbcam"` still
+  resolves to the same wire-format types).
+
 Version line is shared with the Rust sidecar (`sidecar/Cargo.toml`).
 CI verifies the two agree before any publish.
 

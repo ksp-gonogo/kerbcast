@@ -74,8 +74,8 @@ jobs:
 
       - name: Diff against committed bindings
         run: |
-          if ! diff -u client-sdk/typescript/src/index.ts /tmp/regenerated.ts; then
-            echo "::error::client-sdk/typescript/src/index.ts is out of sync with the Rust protocol types — cannot publish."
+          if ! diff -u client-sdk/typescript/src/__generated__/types.ts /tmp/regenerated.ts; then
+            echo "::error::client-sdk/typescript/src/__generated__/types.ts is out of sync with the Rust protocol types — cannot publish."
             exit 1
           fi
 

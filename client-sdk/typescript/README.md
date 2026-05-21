@@ -1,13 +1,18 @@
 # @jonpepler/kerbcam
 
-TypeScript bindings for the kerbcam sidecar's WebRTC control
-protocol. Used by browsers and other clients that consume the
-sidecar's H.264 streams.
+TypeScript client for the kerbcam sidecar. Used by browsers and other
+clients that consume the sidecar's H.264 streams.
+
+`KerbcamClient` owns the WebRTC peer, the `kerbcam-control` data
+channel, and the per-camera state cache and `MediaStream`s.
+Consumers get a high-level RPC surface plus typed event
+subscriptions. The wire-format types are still exported for anyone
+rolling their own transport.
 
 The Rust types in [`sidecar/src/protocol/`](https://github.com/jonpepler/kerbcam/tree/main/sidecar/src/protocol)
 are the source of truth. [typeshare](https://github.com/1Password/typeshare)
-generates `src/index.ts` from them, and CI fails publishes if the
-generated file is out of sync. Don't hand-edit it.
+generates `src/__generated__/types.ts` from them, and CI fails
+publishes if the generated file is out of sync.
 
 The Rust crate and this package ship the same SemVer version,
 bumped together by `./scripts/bump-version.sh`.
@@ -30,48 +35,62 @@ pnpm add @jonpepler/kerbcam
 
 ## Use
 
-The protocol is JSON-per-message over an `RTCDataChannel` named
-`kerbcam-control`. The browser opens the channel after the SDP
-exchange, then exchanges tagged-union messages with the sidecar.
+```ts
+import { KerbcamClient, Layer } from "@jonpepler/kerbcam";
+
+const client = new KerbcamClient({ host: "192.168.1.74", port: 8088 });
+await client.connect();
+
+const cam = client.camera(2592004302);
+await cam.setLayers([Layer.Near, Layer.Scaled]);
+await cam.setFov(35);
+await cam.setRenderSize(384, 384);
+await cam.setDegrade(0.5);
+
+const videoEl = document.querySelector("video")!;
+videoEl.srcObject = cam.mediaStream;
+
+cam.on("change", (state) => {
+  console.log("camera state", state);
+});
+client.on("adaptive-shed", (event) => {
+  console.log("shed level", event.level, "ksp fps", event.kspFps);
+});
+
+// Tear down when done.
+client.disconnect();
+```
+
+### Pre-handshake discovery
 
 ```ts
-import type { ClientMessage, ServerMessage, CameraState } from "@jonpepler/kerbcam";
-import { Layer } from "@jonpepler/kerbcam";
+const cameras = await client.discover();
+// Pick the cameras you want, then connect with that subset.
+await client.connect(cameras.slice(0, 2).map((c) => c.flightId));
+```
 
-// `controlChannel` is the RTCDataChannel returned by
-// RTCPeerConnection.createDataChannel("kerbcam-control") on the
-// client side, opened after the SDP offer/answer exchange.
+### Lower-level access
+
+The wire-format types are also exported for consumers that want to
+roll their own transport (a Node.js consumer outside a browser, a
+test harness, an alternative-language gateway, etc).
+
+```ts
+import type { ClientMessage } from "@jonpepler/kerbcam";
+
 declare const controlChannel: RTCDataChannel;
 
-// Client to server
 const setLayers: ClientMessage = {
   type: "set-layers",
-  content: { flightId: 2592004302, layers: [Layer.Near, Layer.Scaled] },
+  content: { flightId: 2592004302, layers: ["NEAR", "SCALED"] },
 };
 controlChannel.send(JSON.stringify(setLayers));
-
-// Unit variants carry no `content`
-controlChannel.send(JSON.stringify({ type: "hello" } satisfies ClientMessage));
-
-// Server to client
-controlChannel.onmessage = (ev) => {
-  const msg: ServerMessage = JSON.parse(ev.data);
-  switch (msg.type) {
-    case "camera-snapshot":
-      msg.content.cameras.forEach((c: CameraState) => renderCamera(c));
-      break;
-    case "adaptive-shed":
-      console.log(`shed level=${msg.content.level} (KSP ${msg.content.kspFps} fps)`);
-      break;
-    // ...
-  }
-};
 ```
 
 ## Per-camera capabilities
 
-`CameraState` includes capability flags so consumers render only
-the controls each part actually supports.
+`CameraState` includes capability flags so consumers render only the
+controls each part actually supports.
 
 - `supportsZoom`, `fov`, `fovMin`, `fovMax`. 19 of 21 stock Hullcam
   VDS parts support runtime FoV via `MuMechModuleHullCameraZoom`.
@@ -81,6 +100,11 @@ the controls each part actually supports.
 - `encoderBitrateBps`, `targetBitrateBps`. Current encoder bitrate
   and the REMB-driven target. They diverge briefly when receivers'
   bandwidth estimates move.
+- `degradeLevel`. Effective signal-degradation level (max across
+  subscribers). Sidecar applies it via bitrate squeeze plus frame
+  skip, producing the macroblocking and stuttering aesthetic of
+  in-game CommNet signal loss. Also a real CPU optimisation when
+  every consumer wants degraded video.
 
 ## Multi-language
 
@@ -95,7 +119,7 @@ hand-written shim.
 
 ## Versioning
 
-[SemVer](https://semver.org/) against the wire format. See
-[CHANGELOG.md](https://github.com/jonpepler/kerbcam/blob/main/client-sdk/typescript/CHANGELOG.md).
+[SemVer](https://semver.org/) against the wire format and client
+API. See [CHANGELOG.md](https://github.com/jonpepler/kerbcam/blob/main/client-sdk/typescript/CHANGELOG.md).
 While the protocol is at `0.x`, any minor bump may require consumer
 updates. Strict SemVer applies at `1.0.0`.

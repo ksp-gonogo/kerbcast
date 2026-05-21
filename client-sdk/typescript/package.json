@@ -1,7 +1,7 @@
 {
   "name": "@jonpepler/kerbcam",
-  "version": "0.2.0",
-  "description": "TypeScript bindings for the kerbcam KSP camera-streaming sidecar's WebRTC data-channel protocol. Generated from Rust types via typeshare — do not edit src/index.ts by hand.",
+  "version": "0.3.0",
+  "description": "TypeScript client for the kerbcam KSP camera-streaming sidecar. KerbcamClient wraps the WebRTC peer + control channel; wire-format types are typeshare-generated from the sidecar's Rust protocol module.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "Jon Pepler",
   "homepage": "https://github.com/jonpepler/kerbcam#readme",
@@ -32,13 +32,14 @@
   },
   "files": [
     "dist/",
-    "src/index.ts",
+    "src/",
     "README.md",
     "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",
-    "regen": "typeshare ../../sidecar/src --lang=typescript --output-file=src/index.ts",
+    "test": "vitest run",
+    "regen": "typeshare ../../sidecar/src --lang=typescript --output-file=src/__generated__/types.ts",
     "prepublishOnly": "pnpm run build"
   },
   "publishConfig": {
@@ -46,6 +47,8 @@
     "registry": "https://npm.pkg.github.com"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "jsdom": "^29.0.2",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.4"
   }
 }
