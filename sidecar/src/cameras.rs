@@ -125,6 +125,7 @@ pub struct CameraInfo {
     pub pan_pitch_max: f32,
     pub encoder_bitrate_bps: u32,
     pub target_bitrate_bps: u32,
+    pub degrade_level: f32,
 }
 
 /// Manifest the plugin writes alongside the ring file. Static for the
@@ -214,6 +215,17 @@ pub struct CameraState {
     /// the peer's RTCP drain loop; consume loop reads + takes the min
     /// to produce `target_bitrate_bps`.
     pub bandwidth_estimates: Mutex<std::collections::HashMap<u32, u32>>,
+    /// Per-SSRC SetDegrade requests from active subscribers
+    /// (0.0..=1.0). Like bandwidth_estimates but max-across-
+    /// subscribers — the noisiest consumer's request wins, mirroring
+    /// the slowest-consumer-wins logic for bandwidth.
+    pub degrade_levels: Mutex<std::collections::HashMap<u32, f32>>,
+    /// Cached max-across-subscribers degrade level. Recomputed when
+    /// any peer's SetDegrade lands; encode loop reads atomically.
+    /// Stored as bits-of-f32 in an AtomicU32 to keep the hot path
+    /// lock-free (encode_and_fan_out runs per-frame, the f32 is
+    /// already bit-pattern-stable for our levels).
+    pub effective_degrade: AtomicU32,
     /// Last wall-clock instant we *encoded* (and emitted NALs to) a frame.
     /// The consume loop uses this to pace encodes against the configured
     /// `fps`, instead of running once per ring write at LateUpdate's
@@ -266,6 +278,36 @@ impl CameraState {
         estimates.remove(&ssrc);
         let min = estimates.values().copied().min().unwrap_or(0);
         self.target_bitrate_bps.store(min, Ordering::Release);
+    }
+
+    /// Record a SetDegrade request from a subscriber. Recomputes
+    /// `effective_degrade` as the max across all known requests so
+    /// the noisiest consumer wins (mirrors how `target_bitrate_bps`
+    /// picks the *slowest* receiver — both are "worst case from any
+    /// subscriber" reductions).
+    pub async fn record_degrade(&self, ssrc: u32, level: f32) {
+        let mut levels = self.degrade_levels.lock().await;
+        let clamped = level.clamp(0.0, 1.0);
+        levels.insert(ssrc, clamped);
+        let max = levels.values().copied().fold(0.0f32, |acc, v| acc.max(v));
+        self.effective_degrade
+            .store(max.to_bits(), Ordering::Release);
+    }
+
+    /// Forget a subscriber's degrade request. Recomputes the max so
+    /// the level relaxes once the noisiest consumer drops.
+    pub async fn forget_degrade(&self, ssrc: u32) {
+        let mut levels = self.degrade_levels.lock().await;
+        levels.remove(&ssrc);
+        let max = levels.values().copied().fold(0.0f32, |acc, v| acc.max(v));
+        self.effective_degrade
+            .store(max.to_bits(), Ordering::Release);
+    }
+
+    /// Snapshot of the current effective degrade level. Lock-free
+    /// read for the per-frame encode path.
+    pub fn current_degrade(&self) -> f32 {
+        f32::from_bits(self.effective_degrade.load(Ordering::Acquire))
     }
 }
 
@@ -360,6 +402,8 @@ impl CameraRegistry {
                             encoder_bitrate: AtomicU32::new(0),
                             target_bitrate_bps: AtomicU32::new(0),
                             bandwidth_estimates: Mutex::new(std::collections::HashMap::new()),
+                            degrade_levels: Mutex::new(std::collections::HashMap::new()),
+                            effective_degrade: AtomicU32::new(0),
                             last_encoded_at: Mutex::new(None),
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
@@ -411,6 +455,7 @@ impl CameraRegistry {
                 pan_pitch_max: s.pan_pitch_max,
                 encoder_bitrate_bps: s.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: s.target_bitrate_bps.load(Ordering::Acquire),
+                degrade_level: s.current_degrade(),
             })
             .collect();
         // Stable ordering for tests + UX (a refresh shouldn't shuffle).
@@ -512,6 +557,7 @@ impl CameraRegistry {
                 pan_pitch_max: cam.pan_pitch_max,
                 encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
+                degrade_level: cam.current_degrade(),
             });
         }
 

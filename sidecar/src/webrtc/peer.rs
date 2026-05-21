@@ -17,8 +17,14 @@
 //! state via its periodic `*.control.json` poll, so layer/render-size
 //! changes propagate within ~1s of the data-channel write.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+
+/// Monotonic counter for per-peer identifiers. Used as the key on
+/// each camera's `degrade_levels` map (SetDegrade arrives via the
+/// data channel rather than RTCP, so we don't have an SSRC to lean
+/// on — peer_id fills the same slot).
+static NEXT_PEER_ID: AtomicU32 = AtomicU32::new(1);
 
 use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, Notify};
@@ -43,14 +49,18 @@ use crate::cameras::CameraState as InternalCameraState;
 use crate::cameras::CameraRegistry;
 use crate::protocol::{
     CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage, ErrorPayload,
-    FlightIdPayload, HelloPayload, Layer, ServerMessage, SetFovPayload, SetLayersPayload,
-    SetPanPayload, SetRenderSizePayload,
+    FlightIdPayload, HelloPayload, Layer, ServerMessage, SetDegradePayload, SetFovPayload,
+    SetLayersPayload, SetPanPayload, SetRenderSizePayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcam-control";
 
 pub struct KerbcamPeer {
     pc: Arc<RTCPeerConnection>,
+    /// Stable identifier for this peer for the lifetime of the
+    /// connection. Used as the per-camera degrade map key (see
+    /// `CameraState.degrade_levels`).
+    pub peer_id: u32,
     /// Arcs held for the lifetime of the peer connection. Dropping the
     /// peer drops these Arcs; the matching Weak refs in each camera's
     /// `tracks` list become stale and are pruned on the next encode tick.
@@ -76,6 +86,7 @@ impl KerbcamPeer {
     /// that wires up the "kerbcam-control" protocol channel when the
     /// browser opens one.
     pub async fn new(registry: Arc<CameraRegistry>, requested: &[u32]) -> Result<Self> {
+        let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let api = APIBuilder::new().with_media_engine(media_engine).build();
@@ -164,7 +175,7 @@ impl KerbcamPeer {
                     let registry = registry.clone();
                     let dc = dc_for_msg.clone();
                     Box::pin(async move {
-                        handle_client_message(registry, dc, msg).await;
+                        handle_client_message(registry, peer_id, dc, msg).await;
                     })
                 }));
             })
@@ -192,6 +203,7 @@ impl KerbcamPeer {
 
         Ok(Self {
             pc,
+            peer_id,
             _tracks: owned_tracks,
             subscribed,
             control_channel,
@@ -255,6 +267,7 @@ impl KerbcamPeer {
 /// paths and per-variant logic don't drown the construction code.
 async fn handle_client_message(
     registry: Arc<CameraRegistry>,
+    peer_id: u32,
     dc: Arc<RTCDataChannel>,
     msg: DataChannelMessage,
 ) {
@@ -315,6 +328,9 @@ async fn handle_client_message(
             pitch,
         }) => {
             apply_pan_change(&registry, &dc, flight_id, yaw, pitch).await;
+        }
+        ClientMessage::SetDegrade(SetDegradePayload { flight_id, level }) => {
+            apply_degrade_change(&registry, &dc, peer_id, flight_id, level).await;
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {
             // The encoder backends expose `request_keyframe()`; we call
@@ -547,6 +563,37 @@ async fn apply_pan_change(
     push_camera_state(registry, dc, flight_id).await;
 }
 
+async fn apply_degrade_change(
+    registry: &Arc<CameraRegistry>,
+    dc: &Arc<RTCDataChannel>,
+    peer_id: u32,
+    flight_id: u32,
+    level: f32,
+) {
+    let cam = match registry.get(flight_id).await {
+        Some(c) => c,
+        None => {
+            send_server_message(
+                dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: format!("no camera with flight_id={flight_id}"),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+    cam.record_degrade(peer_id, level).await;
+    info!(
+        flight_id,
+        peer_id,
+        level = level.clamp(0.0, 1.0),
+        effective = cam.current_degrade(),
+        "set-degrade applied",
+    );
+    push_camera_state(registry, dc, flight_id).await;
+}
+
 async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataChannel>) {
     let cams = registry.list().await;
     // Initial snapshot: optimistic defaults until the plugin's status
@@ -581,6 +628,7 @@ async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataCh
             pan_pitch_max: c.pan_pitch_max,
             encoder_bitrate_bps: c.encoder_bitrate_bps,
             target_bitrate_bps: c.target_bitrate_bps,
+            degrade_level: c.degrade_level,
         })
         .collect();
     send_server_message(
@@ -635,6 +683,7 @@ async fn push_camera_state(
         pan_pitch_max: cam.pan_pitch_max,
         encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
         target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
+        degrade_level: cam.current_degrade(),
     };
     send_server_message(
         dc,

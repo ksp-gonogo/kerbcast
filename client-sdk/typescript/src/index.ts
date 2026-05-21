@@ -99,6 +99,14 @@ export interface CameraState {
 	 * arrives — encoder falls back to the sidecar's CLI default.
 	 */
 	targetBitrateBps: number;
+	/**
+	 * Effective degrade level (max across subscribers' SetDegrade
+	 * requests). 0.0 = perfect, 1.0 = max degradation. Applied
+	 * alongside operator render-size + adaptive shed; the encoder
+	 * multiplies its effective bitrate by `(1 - 0.7 * level)` and
+	 * skips fan-out for a fraction of frames at high levels.
+	 */
+	degradeLevel: number;
 }
 
 export interface CameraSnapshotPayload {
@@ -120,6 +128,17 @@ export interface FlightIdPayload {
 export interface HelloPayload {
 	sidecarVersion: string;
 	encoderBackend: string;
+}
+
+export interface SetDegradePayload {
+	flightId: number;
+	/**
+	 * 0.0 = perfect quality, 1.0 = maximum degradation. Caps and
+	 * is per-subscriber: the sidecar applies max across active
+	 * subscribers so the noisiest consumer's request wins (same
+	 * pattern as REMB picking the min bandwidth).
+	 */
+	level: number;
 }
 
 export interface SetFovPayload {
@@ -177,6 +196,17 @@ export type ClientMessage =
 	 * pan controls until `supportsPan == true` for the camera.
 	 */
 	| { type: "set-pan", content: SetPanPayload }
+	/**
+	 * Request artificial signal degradation. 0.0 = perfect quality,
+	 * 1.0 = maximum degradation. Per-subscriber: the sidecar
+	 * applies max across active subscribers (slowest consumer
+	 * wins, same pattern as REMB bandwidth). Lets consumers signal
+	 * to the sidecar "I want to look like the in-game CommNet
+	 * antenna is struggling"; sidecar takes the opportunity to
+	 * reduce bitrate + skip frames, which both creates the
+	 * signal-loss aesthetic AND saves encoder CPU.
+	 */
+	| { type: "set-degrade", content: SetDegradePayload }
 	/**
 	 * Request an IDR (keyframe) on the next encode tick. Browsers send
 	 * this when they've dropped enough frames to be unable to decode

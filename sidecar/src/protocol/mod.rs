@@ -104,6 +104,12 @@ pub struct CameraState {
     /// significantly diverged. Zero until the first REMB packet
     /// arrives — encoder falls back to the sidecar's CLI default.
     pub target_bitrate_bps: u32,
+    /// Effective degrade level (max across subscribers' SetDegrade
+    /// requests). 0.0 = perfect, 1.0 = max degradation. Applied
+    /// alongside operator render-size + adaptive shed; the encoder
+    /// multiplies its effective bitrate by `(1 - 0.7 * level)` and
+    /// skips fan-out for a fraction of frames at high levels.
+    pub degrade_level: f32,
 }
 
 // Wrapper structs for the algebraic-enum content payloads. typeshare's
@@ -143,6 +149,18 @@ pub struct SetPanPayload {
     pub flight_id: u32,
     pub yaw: f32,
     pub pitch: f32,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDegradePayload {
+    pub flight_id: u32,
+    /// 0.0 = perfect quality, 1.0 = maximum degradation. Caps and
+    /// is per-subscriber: the sidecar applies max across active
+    /// subscribers so the noisiest consumer's request wins (same
+    /// pattern as REMB picking the min bandwidth).
+    pub level: f32,
 }
 
 #[typeshare]
@@ -216,6 +234,15 @@ pub enum ClientMessage {
     /// adds steerable mounts to specific parts. Clients should hide
     /// pan controls until `supportsPan == true` for the camera.
     SetPan(SetPanPayload),
+    /// Request artificial signal degradation. 0.0 = perfect quality,
+    /// 1.0 = maximum degradation. Per-subscriber: the sidecar
+    /// applies max across active subscribers (slowest consumer
+    /// wins, same pattern as REMB bandwidth). Lets consumers signal
+    /// to the sidecar "I want to look like the in-game CommNet
+    /// antenna is struggling"; sidecar takes the opportunity to
+    /// reduce bitrate + skip frames, which both creates the
+    /// signal-loss aesthetic AND saves encoder CPU.
+    SetDegrade(SetDegradePayload),
     /// Request an IDR (keyframe) on the next encode tick. Browsers send
     /// this when they've dropped enough frames to be unable to decode
     /// the current P-frame chain. Sidecar forwards to the camera's
@@ -302,6 +329,7 @@ mod tests {
                 pan_pitch_max: 0.0,
                 encoder_bitrate_bps: 1_500_000,
                 target_bitrate_bps: 1_200_000,
+                degrade_level: 0.0,
             }],
         });
         let s = serde_json::to_string(&snap).unwrap();
@@ -314,6 +342,26 @@ mod tests {
         assert!(s.contains("\"supportsPan\":false"));
         assert!(s.contains("\"fovMin\":30"));
         assert!(s.contains("\"fovMax\":100"));
+    }
+
+    #[test]
+    fn set_degrade_roundtrips() {
+        let msg = ClientMessage::SetDegrade(SetDegradePayload {
+            flight_id: 7,
+            level: 0.65,
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"type\":\"set-degrade\""));
+        assert!(s.contains("\"flightId\":7"));
+        assert!(s.contains("\"level\":0.65"));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::SetDegrade(p) => {
+                assert_eq!(p.flight_id, 7);
+                assert!((p.level - 0.65).abs() < f32::EPSILON);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

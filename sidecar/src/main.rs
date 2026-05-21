@@ -195,11 +195,30 @@ async fn consume_loop(
             last_rescan = Instant::now();
         }
 
-        // Prune dead peers — dropped Arcs propagate to the Weak refs in
-        // each CameraState.tracks list, which we GC inline below.
-        {
+        // Prune dead peers — dropped Arcs propagate to the Weak refs
+        // in each CameraState.tracks list, which we GC inline below.
+        // Before forgetting the peer, wipe its SetDegrade entries from
+        // every camera it was subscribed to so the noisiest-consumer
+        // max relaxes when a degrade-requesting peer leaves.
+        let dropped_peers: Vec<(u32, Vec<u32>)> = {
             let mut guard = peers.write().await;
-            guard.retain(|p| p.is_alive());
+            let mut dropped = Vec::new();
+            guard.retain(|p| {
+                if p.is_alive() {
+                    true
+                } else {
+                    dropped.push((p.peer_id, p.subscribed.clone()));
+                    false
+                }
+            });
+            dropped
+        };
+        for (peer_id, subscribed) in dropped_peers {
+            for flight_id in subscribed {
+                if let Some(cam) = registry.get(flight_id).await {
+                    cam.forget_degrade(peer_id).await;
+                }
+            }
         }
 
         let cameras = registry.snapshot().await;
@@ -307,6 +326,26 @@ async fn encode_and_fan_out(
     }
     cam.last_sequence.store(frame.sequence, Ordering::Release);
 
+    // Apply SetDegrade. Two cheap levers:
+    //
+    //   * Frame skipping — at level>0 we deterministically drop a
+    //     fraction of frames. Receiver sees timestamp gaps → P-frame
+    //     recovery → stuttering. Saves encoder CPU on every skipped
+    //     frame (the whole encode/packetise path is bypassed).
+    //
+    //   * Bitrate floor — feeds into the encoder reinit threshold
+    //     below. The encoder runs at `(1 - 0.7*level) * effective`
+    //     so level=1.0 lands ≈ 30% of the operator target. Heavy
+    //     bitrate squeeze creates the blocky/macro look real
+    //     signal loss has.
+    let degrade = cam.current_degrade();
+    if degrade > 0.001 {
+        let skip_every = 1u64 + (degrade * 3.0).round() as u64; // 1..=4
+        if !frame.sequence.is_multiple_of(skip_every) {
+            return;
+        }
+    }
+
     // Lazy encoder init — first encoded frame per camera. Done under
     // the camera's encoder lock so concurrent ticks can't double-init.
     //
@@ -323,10 +362,20 @@ async fn encode_and_fan_out(
     let cur_bps = cam.encoder_bitrate.load(Ordering::Acquire);
     let target_bps_raw = cam.target_bitrate_bps.load(Ordering::Acquire);
     // Fall back to the CLI default until the first REMB packet arrives.
-    let effective_bps = if target_bps_raw == 0 {
+    let effective_bps_pre_degrade = if target_bps_raw == 0 {
         bitrate_bps
     } else {
         target_bps_raw
+    };
+    // Apply degrade as a multiplicative bitrate squeeze. degrade=1.0
+    // lands the encoder around 30% of the otherwise-target — enough
+    // to produce visible macroblocking. Floor at 64kbps so we never
+    // try to init the encoder at an absurdly low rate.
+    let effective_bps = if degrade > 0.001 {
+        let factor = 1.0 - 0.7 * degrade.clamp(0.0, 1.0);
+        ((effective_bps_pre_degrade as f32) * factor).max(64_000.0) as u32
+    } else {
+        effective_bps_pre_degrade
     };
     let dims_changed = encoder_guard.is_some() && (cur_w != frame.width || cur_h != frame.height);
     let bitrate_changed =
