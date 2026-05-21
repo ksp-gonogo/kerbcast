@@ -37,6 +37,14 @@ namespace Kerbcam
         private readonly List<KerbcamCamera> _cameras = new List<KerbcamCamera>();
         private Process _sidecar;
 
+        // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
+        // changed — KSP fps, shed level, per-camera effective layers / dims.
+        // Sidecar reads, diffs, and pushes camera-state-changed +
+        // adaptive-shed messages to all peers' control channels.
+        private string _statusPath;
+        private float _statusCooldown;
+        private const float StatusWriteIntervalSeconds = 1.0f;
+
         // Rolling 60-sample FPS window for adaptive layer shedding.
         // ~1s at 60fps, ~2s at 30fps — long enough to ignore single-frame
         // hitches, short enough to react to sustained slow-downs.
@@ -101,6 +109,7 @@ namespace Kerbcam
             try
             {
                 Directory.CreateDirectory(RingDir);
+                _statusPath = Path.Combine(RingDir, "global.status.json");
                 Debug.Log($"[Kerbcam] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
             }
             catch (Exception ex)
@@ -275,6 +284,64 @@ namespace Kerbcam
             {
                 _cameras[i].Refresh();
             }
+
+            MaybeWriteStatusFile();
+        }
+
+        // ~1 Hz status write. Each write carries the full per-camera
+        // snapshot + global KSP fps + shed level. The sidecar reads,
+        // diffs against a cached copy, and pushes camera-state-changed
+        // and adaptive-shed messages over each peer's data channel.
+        private void MaybeWriteStatusFile()
+        {
+            if (_statusPath == null) return;
+            _statusCooldown -= Time.unscaledDeltaTime;
+            if (_statusCooldown > 0f) return;
+            _statusCooldown = StatusWriteIntervalSeconds;
+
+            try
+            {
+                var sb = new System.Text.StringBuilder(256 + _cameras.Count * 256);
+                sb.Append("{\n");
+                sb.Append($"  \"kspFps\": {_fpsAvg:F2},\n");
+                sb.Append($"  \"shedLevel\": {_shedLevel},\n");
+                sb.Append("  \"cameras\": [\n");
+                for (int i = 0; i < _cameras.Count; i++)
+                {
+                    var cam = _cameras[i];
+                    sb.Append("    {\n");
+                    sb.Append($"      \"flightId\": {cam.FlightId},\n");
+                    sb.Append($"      \"renderWidth\": {cam.RenderWidth},\n");
+                    sb.Append($"      \"renderHeight\": {cam.RenderHeight},\n");
+                    sb.Append($"      \"operatorWidth\": {cam.OperatorWidth},\n");
+                    sb.Append($"      \"operatorHeight\": {cam.OperatorHeight},\n");
+                    sb.Append($"      \"layers\": {LayersToJson(cam.Layers)},\n");
+                    sb.Append($"      \"operatorLayers\": {LayersToJson(cam.OperatorLayers)}\n");
+                    sb.Append(i == _cameras.Count - 1 ? "    }\n" : "    },\n");
+                }
+                sb.Append("  ]\n");
+                sb.Append("}\n");
+
+                // Atomic write: drop into .tmp + rename so the sidecar
+                // never reads a half-written file.
+                var tmp = _statusPath + ".tmp";
+                File.WriteAllText(tmp, sb.ToString());
+                if (File.Exists(_statusPath)) File.Delete(_statusPath);
+                File.Move(tmp, _statusPath);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcam] status file write failed: {ex.Message}");
+            }
+        }
+
+        private static string LayersToJson(CameraLayers layers)
+        {
+            var parts = new List<string>(3);
+            if ((layers & CameraLayers.Near) != 0) parts.Add("\"NEAR\"");
+            if ((layers & CameraLayers.Scaled) != 0) parts.Add("\"SCALED\"");
+            if ((layers & CameraLayers.Galaxy) != 0) parts.Add("\"GALAXY\"");
+            return "[" + string.Join(", ", parts.ToArray()) + "]";
         }
 
         private void UpdateFpsAverage()
@@ -328,6 +395,18 @@ namespace Kerbcam
             foreach (var cam in _cameras) cam.Dispose();
             _cameras.Clear();
             StopSidecar();
+
+            // Clean up status file so a stale snapshot doesn't survive
+            // into the next launch.
+            try
+            {
+                if (_statusPath != null && File.Exists(_statusPath))
+                    File.Delete(_statusPath);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcam] status file delete failed: {ex.Message}");
+            }
         }
     }
 }

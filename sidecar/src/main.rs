@@ -24,6 +24,9 @@ use webrtc::media::Sample;
 
 use kerbcam_sidecar::cameras::{CameraRegistry, CameraState};
 use kerbcam_sidecar::encoder::{select_backend, EncodeConfig, EncoderChoice, RawFrame};
+use kerbcam_sidecar::protocol::{
+    AdaptiveShedPayload, CameraStateChangedPayload, ServerMessage,
+};
 use kerbcam_sidecar::shared_mem::MmapRingConfig;
 use kerbcam_sidecar::signalling::{router, AppState};
 use kerbcam_sidecar::webrtc::KerbcamPeer;
@@ -185,6 +188,12 @@ async fn consume_loop(
     loop {
         if last_rescan.elapsed() >= rescan_interval {
             registry.rescan().await;
+            // Status poll piggybacks on the rescan cadence — both are
+            // ~1Hz and the plugin's status writer matches that rate.
+            let delta = registry.poll_status().await;
+            if delta.adaptive_shed.is_some() || !delta.changed_cameras.is_empty() {
+                broadcast_status_delta(&peers, delta).await;
+            }
             last_rescan = Instant::now();
         }
 
@@ -210,6 +219,43 @@ async fn consume_loop(
             sleep(poll_interval).await;
         } else {
             sleep(idle_interval).await;
+        }
+    }
+}
+
+/// Push a status delta (adaptive-shed level changes + per-camera state
+/// changes) to every connected peer's data channel. Best-effort: peers
+/// whose data channels haven't opened yet (or have closed) silently
+/// drop the message — there's always another snapshot a tick later.
+async fn broadcast_status_delta(
+    peers: &Arc<RwLock<Vec<Arc<KerbcamPeer>>>>,
+    delta: kerbcam_sidecar::cameras::StatusDelta,
+) {
+    let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+    if snapshot.is_empty() {
+        return;
+    }
+
+    if let Some((level, ksp_fps)) = delta.adaptive_shed {
+        let reason = if level == 0 {
+            "ksp-fps-recovered".to_string()
+        } else {
+            "ksp-fps-low".to_string()
+        };
+        let msg = ServerMessage::AdaptiveShed(AdaptiveShedPayload {
+            level,
+            ksp_fps,
+            reason,
+        });
+        for peer in &snapshot {
+            peer.push_message(&msg).await;
+        }
+    }
+
+    for state in delta.changed_cameras {
+        let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
+        for peer in &snapshot {
+            peer.push_message(&msg).await;
         }
     }
 }

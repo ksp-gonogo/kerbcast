@@ -54,10 +54,9 @@ pub struct KerbcamPeer {
     /// flight_ids the peer subscribed to — surfaced for logging.
     pub subscribed: Vec<u32>,
     /// Set once the browser opens the control channel. Held for the
-    /// peer's lifetime so server-initiated pushes (AdaptiveShed, vessel
-    /// changes once a plugin status file lands) can address this peer
-    /// directly without re-discovering the channel each time.
-    #[allow(dead_code)]
+    /// peer's lifetime so server-initiated pushes (AdaptiveShed,
+    /// vessel-change-driven camera-state-changed) can address this
+    /// peer directly without re-discovering the channel each time.
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     connected: Arc<Notify>,
     /// Flipped to `false` when the underlying RTCPeerConnection reaches a
@@ -205,6 +204,18 @@ impl KerbcamPeer {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Server-initiated push to the browser. No-op if the control
+    /// channel hasn't been opened yet (we drop the message rather than
+    /// queue — pushes from the consume loop are state snapshots, so a
+    /// later snapshot supersedes a dropped one).
+    pub async fn push_message(&self, msg: &ServerMessage) {
+        let dc = match self.control_channel.lock().await.as_ref() {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        send_server_message(&dc, msg).await;
     }
 
     /// Block until the peer reaches the Connected state. Used by tests.

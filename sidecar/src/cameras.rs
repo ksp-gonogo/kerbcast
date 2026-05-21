@@ -24,8 +24,43 @@ use tracing::{info, warn};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::encoder::EncoderBackend;
-use crate::protocol::Layer;
+use crate::protocol::{CameraState as ProtocolCameraState, Layer};
 use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+/// On-disk shape of `global.status.json` — the plugin → sidecar push
+/// half of the IPC. The plugin rewrites this file at ~1Hz with the
+/// current effective state for every tracked camera plus the global
+/// KSP framerate and adaptive shed level.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GlobalStatusFile {
+    ksp_fps: f32,
+    shed_level: u32,
+    #[serde(default)]
+    cameras: Vec<PerCameraStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PerCameraStatus {
+    flight_id: u32,
+    render_width: u32,
+    render_height: u32,
+    operator_width: u32,
+    operator_height: u32,
+    #[serde(default)]
+    layers: Vec<Layer>,
+    #[serde(default)]
+    operator_layers: Vec<Layer>,
+}
+
+/// Diff result from a status poll. Empty vec / None when nothing
+/// changed so the consume loop can skip broadcasting.
+#[derive(Debug, Default)]
+pub struct StatusDelta {
+    pub adaptive_shed: Option<(u32, f32)>, // (level, ksp_fps)
+    pub changed_cameras: Vec<ProtocolCameraState>,
+}
 
 /// In-memory mirror of the plugin's `<flight_id>.control.json` file.
 /// The data-channel message handlers mutate this struct and the
@@ -138,11 +173,13 @@ impl CameraState {
 }
 
 /// Registry of cameras. Owns the rescan logic that discovers new rings
-/// and forgets dead ones.
+/// and forgets dead ones. Also caches the last-seen global status snapshot
+/// from the plugin so the consume loop can diff against it.
 pub struct CameraRegistry {
     shm_dir: PathBuf,
     ring_cfg: MmapRingConfig,
     pub cameras: RwLock<HashMap<u32, Arc<CameraState>>>,
+    last_status: Mutex<Option<GlobalStatusFile>>,
 }
 
 impl CameraRegistry {
@@ -151,6 +188,7 @@ impl CameraRegistry {
             shm_dir,
             ring_cfg,
             cameras: RwLock::new(HashMap::new()),
+            last_status: Mutex::new(None),
         }
     }
 
@@ -262,6 +300,87 @@ impl CameraRegistry {
 
     pub async fn get(&self, flight_id: u32) -> Option<Arc<CameraState>> {
         self.cameras.read().await.get(&flight_id).cloned()
+    }
+
+    /// Read `global.status.json` and diff against the cached snapshot.
+    /// Returns the set of changes that need broadcasting over the data
+    /// channel — per-camera state deltas + adaptive-shed level changes.
+    /// Tolerant of the file being absent (plugin hasn't written yet) or
+    /// malformed (partial write — atomic rename normally prevents this,
+    /// but better to skip a tick than crash).
+    pub async fn poll_status(&self) -> StatusDelta {
+        let path = self.shm_dir.join("global.status.json");
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StatusDelta::default(),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "status read failed");
+                return StatusDelta::default();
+            }
+        };
+        let parsed: GlobalStatusFile = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "status parse failed");
+                return StatusDelta::default();
+            }
+        };
+
+        let mut delta = StatusDelta::default();
+        let cameras = self.cameras.read().await;
+        let mut last = self.last_status.lock().await;
+
+        // Shed-level changes are global — emit one adaptive-shed
+        // message whenever the level moves.
+        if last
+            .as_ref()
+            .map(|s| s.shed_level != parsed.shed_level)
+            .unwrap_or(true)
+        {
+            delta.adaptive_shed = Some((parsed.shed_level, parsed.ksp_fps));
+        }
+
+        // Per-camera diffs. Only flag cameras whose effective state moved.
+        for cam_status in &parsed.cameras {
+            let prev = last.as_ref().and_then(|s| {
+                s.cameras
+                    .iter()
+                    .find(|c| c.flight_id == cam_status.flight_id)
+            });
+            let changed = match prev {
+                None => true,
+                Some(p) => {
+                    p.render_width != cam_status.render_width
+                        || p.render_height != cam_status.render_height
+                        || p.operator_width != cam_status.operator_width
+                        || p.operator_height != cam_status.operator_height
+                        || p.layers != cam_status.layers
+                        || p.operator_layers != cam_status.operator_layers
+                }
+            };
+            if !changed {
+                continue;
+            }
+            let Some(cam) = cameras.get(&cam_status.flight_id) else {
+                continue;
+            };
+            delta.changed_cameras.push(ProtocolCameraState {
+                flight_id: cam_status.flight_id,
+                part_name: cam.part_name.clone(),
+                part_title: cam.part_title.clone(),
+                camera_name: cam.camera_name.clone(),
+                vessel_name: cam.vessel_name.clone(),
+                layers: cam_status.layers.clone(),
+                operator_layers: cam_status.operator_layers.clone(),
+                render_width: cam_status.render_width,
+                render_height: cam_status.render_height,
+                operator_width: cam_status.operator_width,
+                operator_height: cam_status.operator_height,
+            });
+        }
+
+        *last = Some(parsed);
+        delta
     }
 
     /// Flush a camera's in-memory `ControlState` to its
