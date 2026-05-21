@@ -297,14 +297,30 @@ async fn encode_and_fan_out(
     // until enough wall time has elapsed since the last one keeps the
     // encoder running at its configured rate and the receiver's playback
     // clock honest.
+    // Wall-clock interval since the previous encode for this camera.
+    // Drives both (a) the throttle (skip if it's too soon) and (b) the
+    // sample duration we tag on the wire. The browser playback clock
+    // advances by `sample.duration` per frame; if we always tag the
+    // configured 1/fps but real encodes arrive every ~140ms (CPU-bound
+    // openh264 across 6 cams), playback time falls behind arrival
+    // monotonically — jitterBufferDelay grows from 0 to hundreds of
+    // ms over a session, which presents visually as "framerate slowly
+    // drops as time goes by". Tagging with the actual interval keeps
+    // playback honest.
+    let actual_duration: Duration;
     {
         let mut last_at = cam.last_encoded_at.lock().await;
         let now = Instant::now();
-        if let Some(prev) = *last_at {
-            if now.duration_since(prev) < frame_duration {
-                return;
+        actual_duration = match *last_at {
+            Some(prev) => {
+                let elapsed = now.duration_since(prev);
+                if elapsed < frame_duration {
+                    return;
+                }
+                elapsed
             }
-        }
+            None => frame_duration, // first encode — no prior reference
+        };
         *last_at = Some(now);
     }
 
@@ -369,13 +385,14 @@ async fn encode_and_fan_out(
     let mut encoder_guard = cam.encoder.lock().await;
     let cur_w = cam.encoder_width.load(Ordering::Acquire);
     let cur_h = cam.encoder_height.load(Ordering::Acquire);
-    let target_bps_raw = cam.target_bitrate_bps.load(Ordering::Acquire);
-    // Fall back to the CLI default until the first REMB packet arrives.
-    let effective_bps_pre_degrade = if target_bps_raw == 0 {
-        bitrate_bps
-    } else {
-        target_bps_raw
-    };
+    // Always init at the CLI bitrate default — DO NOT consult REMB's
+    // target_bitrate_bps here. REMB starts with a very low probe
+    // estimate (often <100kbps) and ramps up, so consulting it at
+    // cold start means the encoder boots at probe-speed and stays
+    // there forever (we don't re-init on bitrate change any more).
+    // REMB feedback is still recorded for diagnostics but ignored
+    // by the encode path until a real live-update lands.
+    let effective_bps_pre_degrade = bitrate_bps;
     // Apply degrade as a multiplicative bitrate squeeze. degrade=1.0
     // lands the encoder around 30% of the otherwise-target — enough
     // to produce visible macroblocking. Floor at 64kbps so we never
@@ -450,7 +467,7 @@ async fn encode_and_fan_out(
     }
     let sample = Sample {
         data: combined.into(),
-        duration: frame_duration,
+        duration: actual_duration,
         ..Default::default()
     };
 
