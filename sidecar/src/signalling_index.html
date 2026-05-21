@@ -55,11 +55,12 @@
       <th class="layer">Galaxy</th>
       <th class="zoom">FoV</th>
       <th class="zoom">Render size</th>
+      <th class="zoom">Degrade</th>
       <th class="zoom">Bitrate</th>
     </tr>
   </thead>
   <tbody id="cameraTable">
-    <tr><td colspan="8" class="empty">none yet — click Refresh</td></tr>
+    <tr><td colspan="9" class="empty">none yet — click Refresh</td></tr>
   </tbody>
 </table>
 
@@ -86,6 +87,8 @@ let effectiveLayers = new Map(); // flight_id -> Set<layer> (actually rendered)
 let fovState = new Map(); // flight_id -> current fov
 let renderSizeState = new Map(); // flight_id -> { width, height }
 let bitrateState = new Map(); // flight_id -> { encoderBitrateBps, targetBitrateBps }
+let degradeState = new Map(); // flight_id -> 0..1 (this client's last requested level)
+let effectiveDegradeState = new Map(); // flight_id -> 0..1 (max across all subscribers, from server)
 let trackByFlightId = new Map();
 
 function sendControl(message) {
@@ -113,6 +116,7 @@ function handleServerMessage(msg) {
           encoderBitrateBps: cs.encoderBitrateBps,
           targetBitrateBps: cs.targetBitrateBps,
         });
+        effectiveDegradeState.set(cs.flightId, cs.degradeLevel ?? 0);
       }
       renderTable();
       break;
@@ -132,7 +136,7 @@ function handleServerMessage(msg) {
 function renderTable() {
   const tbody = $("cameraTable");
   if (discovered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty">none yet — is KSP running with Hullcam parts?</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">none yet — is KSP running with Hullcam parts?</td></tr>`;
     return;
   }
   tbody.innerHTML = "";
@@ -264,6 +268,47 @@ function renderTable() {
     rsTd.appendChild(rsValue);
     tr.appendChild(rsTd);
 
+    // Degrade slider — operator-requested 0..100%. Sends set-degrade
+    // via the data channel. The sidecar applies max across all
+    // subscribers, so a peer that doesn't request degrade still gets
+    // a degraded feed if another peer raised the level. The "effective"
+    // suffix shows server-side max when it differs from local request.
+    const dgTd = document.createElement("td");
+    dgTd.className = "zoom";
+    const dgLocal = degradeState.get(cam.flightId) ?? 0;
+    const dgEffective = effectiveDegradeState.get(cam.flightId) ?? 0;
+    const dgSlider = document.createElement("input");
+    dgSlider.type = "range";
+    dgSlider.min = 0;
+    dgSlider.max = 100;
+    dgSlider.step = 5;
+    dgSlider.value = Math.round(dgLocal * 100);
+    dgSlider.disabled = !dc || dc.readyState !== "open";
+    const dgValue = document.createElement("span");
+    dgValue.className = "value";
+    const renderDgLabel = () => {
+      const localPct = Math.round(parseInt(dgSlider.value, 10));
+      const effectivePct = Math.round(dgEffective * 100);
+      if (Math.abs(localPct - effectivePct) > 1) {
+        dgValue.innerHTML = `${localPct}% <span style="color:#b80">→ ${effectivePct}%</span>`;
+      } else {
+        dgValue.textContent = `${localPct}%`;
+      }
+    };
+    renderDgLabel();
+    dgSlider.addEventListener("input", renderDgLabel);
+    dgSlider.addEventListener("change", () => {
+      const level = parseInt(dgSlider.value, 10) / 100;
+      degradeState.set(cam.flightId, level);
+      sendControl({
+        type: "set-degrade",
+        content: { flightId: cam.flightId, level },
+      });
+    });
+    dgTd.appendChild(dgSlider);
+    dgTd.appendChild(dgValue);
+    tr.appendChild(dgTd);
+
     // Bitrate readout — encoder current vs target. Diverges briefly
     // between a REMB packet arriving and the consume loop's next
     // reinit threshold check. Both zero before the first encoded
@@ -306,7 +351,7 @@ async function refreshCameras() {
     renderTable();
     $("connectBtn").disabled = pc !== null || included.size === 0;
   } catch (e) {
-    $("cameraTable").innerHTML = `<tr><td colspan="8" class="empty">error fetching /cameras: ${escapeHtml(e.message)}</td></tr>`;
+    $("cameraTable").innerHTML = `<tr><td colspan="9" class="empty">error fetching /cameras: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 

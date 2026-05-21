@@ -3,6 +3,35 @@
 Version line is shared with the Rust sidecar (`sidecar/Cargo.toml`).
 CI verifies the two agree before any publish.
 
+## 0.2.0 — 2026-05-21
+
+New `set-degrade` client message and matching `degradeLevel` field
+on `CameraState`. Lets consumers request artificial signal
+degradation per camera (e.g. when in-game CommNet signal weakens);
+sidecar applies `max` across active subscribers and squeezes the
+encoder bitrate + skips a fraction of frames to produce the
+macroblocking + stuttering aesthetic of real signal loss. Also a
+real CPU optimisation: if every consumer wants degraded video, the
+encoder runs lighter.
+
+```ts
+const msg: ClientMessage = {
+  type: "set-degrade",
+  content: { flightId: 2592004302, level: 0.7 },
+};
+dc.send(JSON.stringify(msg));
+```
+
+### Wire-format additions
+
+- `ClientMessage::SetDegrade { flightId, level }` — level clamps to
+  `[0.0, 1.0]`; out-of-range values are clamped by the sidecar.
+- `CameraState.degradeLevel` — sidecar-pushed effective degrade
+  (max across subscribers).
+
+Additive: existing 0.1.0 consumers keep working — they just don't
+see the new field unless they read it.
+
 ## 0.1.0 — 2026-05-21
 
 Initial release as `@jonpepler/kerbcam` on GitHub Packages.
