@@ -35,6 +35,7 @@ mod imp {
     use ffmpeg_next::util::frame::video::Video as VideoFrame;
     use std::path::Path;
     use std::ptr;
+    use std::sync::OnceLock;
     use tracing::{debug, warn};
 
     use super::super::{EncodeConfig, EncodeError, EncoderBackend, Nal, RawFrame};
@@ -77,19 +78,31 @@ mod imp {
             }
         }
 
-        /// Probe whether VAAPI H.264 encoding is plausibly available on this
-        /// host. Three gates: (1) a render node exists under `/dev/dri/`,
-        /// (2) `av_hwdevice_ctx_create(VAAPI)` succeeds (i.e. libva can
-        /// open the driver), (3) `avcodec_find_encoder_by_name("h264_vaapi")`
-        /// returns non-null. Any failure → false, and `auto_select` walks
-        /// past us to the next backend.
+        /// Probe whether VAAPI H.264 encoding is actually usable on this host.
+        /// Result is cached in a `OnceLock` — probing is expensive (opens the
+        /// VAAPI device) and `auto_select` calls `is_available()` every frame
+        /// on the first camera until an encoder succeeds.
+        ///
+        /// Gates: (1) a render node exists, (2) `av_hwdevice_ctx_create(VAAPI)`
+        /// succeeds, (3) `avcodec_get_hw_config` confirms h264_vaapi has an
+        /// HW_FRAMES_CTX config, (4) `av_hwframe_ctx_init` with that pixel
+        /// format succeeds. Gate 4 is critical: on some setups (e.g. Ubuntu
+        /// 22.04's ffmpeg 4.4 where `FF_API_VAAPI` flips the value of
+        /// `AV_PIX_FMT_VAAPI` between the build-time Rust enum and the runtime
+        /// libavcodec.so) the device opens fine but hwframe init fails with
+        /// `vaapi_moco not supported`. Catching it here lets `auto_select` fall
+        /// through to the software backend instead of retrying every frame.
         fn probe() -> bool {
+            static CACHE: OnceLock<bool> = OnceLock::new();
+            *CACHE.get_or_init(|| Self::probe_once())
+        }
+
+        fn probe_once() -> bool {
             if !render_node_exists() {
                 return false;
             }
-            // av_hwdevice_ctx_create with device=NULL lets libva pick the
-            // first usable render node automatically.
             unsafe {
+                // ---- 1. Open VAAPI device ----
                 let mut device_ref: *mut ffmpeg::ffi::AVBufferRef = ptr::null_mut();
                 let rc = ffmpeg::ffi::av_hwdevice_ctx_create(
                     &mut device_ref,
@@ -101,17 +114,81 @@ mod imp {
                 if rc < 0 || device_ref.is_null() {
                     return false;
                 }
+
+                // ---- 2. Find h264_vaapi codec + get its runtime hw pixel format ----
+                let name = std::ffi::CString::new("h264_vaapi").unwrap();
+                let codec = ffmpeg::ffi::avcodec_find_encoder_by_name(name.as_ptr());
+                if codec.is_null() {
+                    ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+                    return false;
+                }
+                let hw_pix_fmt = hw_frames_pix_fmt_for_codec(codec);
+                if hw_pix_fmt == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                    ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+                    return false;
+                }
+
+                // ---- 3. Test hwframe init with the runtime pixel format ----
+                // This catches pixel-format enum mismatches between the Rust
+                // bindings and the installed libavcodec that only show up at
+                // av_hwframe_ctx_init time (not at device open time).
+                let frames_ref = ffmpeg::ffi::av_hwframe_ctx_alloc(device_ref);
+                if frames_ref.is_null() {
+                    ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+                    return false;
+                }
+                let fctx = (*frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
+                (*fctx).format = hw_pix_fmt;
+                (*fctx).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+                (*fctx).width = 64;
+                (*fctx).height = 64;
+                (*fctx).initial_pool_size = 1;
+                let hw_ok = ffmpeg::ffi::av_hwframe_ctx_init(frames_ref) >= 0;
+                // av_buffer_unref handles the frames_ref; device_ref is kept
+                // alive by the frames context until we unref both.
+                let mut frames_mut = frames_ref;
+                ffmpeg::ffi::av_buffer_unref(&mut frames_mut);
                 ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+                hw_ok
             }
-            let name = std::ffi::CString::new("h264_vaapi").unwrap();
-            let codec = unsafe { ffmpeg::ffi::avcodec_find_encoder_by_name(name.as_ptr()) };
-            !codec.is_null()
         }
     }
 
     impl Default for Libva {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    /// Walk the codec's hw configs and return the pixel format for the first
+    /// entry that supports HW_FRAMES_CTX on VAAPI. Returns AV_PIX_FMT_NONE if
+    /// no such config exists.
+    ///
+    /// Using avcodec_get_hw_config avoids hardcoding `AV_PIX_FMT_VAAPI` —
+    /// that constant's numeric value varies depending on whether FF_API_VAAPI
+    /// was defined at the time the Rust bindings were generated, causing a
+    /// mismatch with the runtime libavcodec.
+    ///
+    /// # Safety
+    /// `codec` must be a valid non-null `*const AVCodec`.
+    unsafe fn hw_frames_pix_fmt_for_codec(
+        codec: *const ffmpeg::ffi::AVCodec,
+    ) -> ffmpeg::ffi::AVPixelFormat {
+        // AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX = 0x02 (stable since ffmpeg 4.0)
+        const HW_FRAMES_CTX: i32 = 0x02;
+        let mut i = 0;
+        loop {
+            let cfg = ffmpeg::ffi::avcodec_get_hw_config(codec, i);
+            if cfg.is_null() {
+                return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+            }
+            if (*cfg).methods & HW_FRAMES_CTX != 0
+                && (*cfg).device_type
+                    == ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+            {
+                return (*cfg).pix_fmt;
+            }
+            i += 1;
         }
     }
 
@@ -178,7 +255,35 @@ mod imp {
                     )));
                 }
 
-                // ---- 2. Allocate + init hwframe pool (NV12-backed VAAPI surfaces) ----
+                // ---- 2. Find codec early so we can query the runtime hw pixel format ----
+                // We look this up before allocating the hwframe pool because
+                // the pool's `format` field must be the *runtime* value of the
+                // VAAPI pixel format enum — not the compile-time Rust constant.
+                // On Ubuntu 22.04 (ffmpeg 4.4 + FF_API_VAAPI=1) the runtime
+                // value is 124 (AV_PIX_FMT_VAAPI_VLD), but ffmpeg-sys-next 8.x
+                // generates bindings without FF_API_VAAPI, assigning
+                // AV_PIX_FMT_VAAPI = 122 (vaapi_moco). Using the constant
+                // directly writes the wrong value → av_hwframe_ctx_init fails.
+                // avcodec_get_hw_config returns the value from the installed
+                // libavcodec, which is always correct.
+                let codec_name = std::ffi::CString::new("h264_vaapi").unwrap();
+                let codec_ptr =
+                    ffmpeg::ffi::avcodec_find_encoder_by_name(codec_name.as_ptr());
+                if codec_ptr.is_null() {
+                    self.close();
+                    return Err(EncodeError::Runtime(
+                        "h264_vaapi encoder not registered in this libavcodec build".into(),
+                    ));
+                }
+                let hw_pix_fmt = hw_frames_pix_fmt_for_codec(codec_ptr);
+                if hw_pix_fmt == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                    self.close();
+                    return Err(EncodeError::Runtime(
+                        "h264_vaapi: no HW_FRAMES_CTX config found for VAAPI".into(),
+                    ));
+                }
+
+                // ---- 3. Allocate + init hwframe pool (NV12-backed VAAPI surfaces) ----
                 self.hw_frames_ref = ffmpeg::ffi::av_hwframe_ctx_alloc(self.hw_device_ref);
                 if self.hw_frames_ref.is_null() {
                     self.close();
@@ -188,7 +293,7 @@ mod imp {
                 }
                 let frames_ctx_data =
                     (*self.hw_frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
-                (*frames_ctx_data).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                (*frames_ctx_data).format = hw_pix_fmt;
                 (*frames_ctx_data).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
                 (*frames_ctx_data).width = cfg.width as i32;
                 (*frames_ctx_data).height = cfg.height as i32;
@@ -205,20 +310,17 @@ mod imp {
                     )));
                 }
 
-                // ---- 3. Find h264_vaapi encoder + build a Video encoder ctx ----
-                let codec = ffmpeg::codec::encoder::find_by_name("h264_vaapi").ok_or_else(|| {
-                    // Restore close() here without consuming `self.close()`
-                    // inside ok_or_else (borrow conflict); do the cleanup
-                    // outside via a sentinel after the assignment.
-                    EncodeError::Runtime(
-                        "h264_vaapi encoder not registered in this libavcodec build".into(),
-                    )
-                });
-                let codec = match codec {
-                    Ok(c) => c,
-                    Err(e) => {
+                // ---- 4. Build the encoder context from the codec we already found ----
+                // `codec_ptr` is a raw *const AVCodec; wrap it in the safe
+                // ffmpeg-next type via find_by_name (cheap — just a registry
+                // lookup, same codec object).
+                let codec = match ffmpeg::codec::encoder::find_by_name("h264_vaapi") {
+                    Some(c) => c,
+                    None => {
                         self.close();
-                        return Err(e);
+                        return Err(EncodeError::Runtime(
+                            "h264_vaapi encoder not registered in this libavcodec build".into(),
+                        ));
                     }
                 };
 
@@ -239,7 +341,10 @@ mod imp {
 
                 encoder.set_width(cfg.width);
                 encoder.set_height(cfg.height);
-                encoder.set_format(Pixel::VAAPI);
+                // Set pix_fmt directly on the raw AVCodecContext using the same
+                // runtime value we used for the hwframe pool — avoids the same
+                // enum-alias mismatch that broke av_hwframe_ctx_init.
+                // encoder.set_format(Pixel::VAAPI) would write the wrong value.
                 encoder.set_bit_rate(cfg.bitrate_bps as usize);
                 encoder.set_max_bit_rate(cfg.bitrate_bps as usize);
                 encoder.set_time_base((1, cfg.fps as i32));
@@ -249,12 +354,13 @@ mod imp {
                 // an explicit keyframe via request_keyframe().
                 encoder.set_gop(cfg.fps.saturating_mul(2).max(1));
 
-                // Inject the hwframe context on the raw AVCodecContext.
+                // Inject hw_frames_ctx + pix_fmt on the raw AVCodecContext.
                 // av_buffer_ref bumps refcount; the encoder owns the new
                 // reference, we keep our own hw_frames_ref live for the
                 // session in case we need to allocate fresh upload frames
                 // later (we do — every encode call).
                 let ctx_mut = encoder.as_mut_ptr();
+                (*ctx_mut).pix_fmt = hw_pix_fmt;
                 (*ctx_mut).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(self.hw_frames_ref);
                 if (*ctx_mut).hw_frames_ctx.is_null() {
                     self.close();
