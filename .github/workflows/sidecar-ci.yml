@@ -165,6 +165,21 @@ jobs:
           echo "Bundled size:"
           du -sh staging/lib/
 
+          # Record what we built against so the artifact is self-describing.
+          # steam_runtime_target = minimum Steam Runtime version this artifact
+          # is compatible with (RT3 / sniper = Debian Bookworm = glibc 2.36).
+          # glibc_build_host = the glibc version on the CI runner; bundled libs
+          # require at most this version (ubuntu-22.04 → 2.35 ≤ RT3's 2.36).
+          # Update steam_runtime_target if we intentionally drop RT3 support.
+          cat > staging/build-info.txt <<EOF
+          steam_runtime_target=3 (sniper / Debian Bookworm / glibc 2.36)
+          glibc_build_host=$(ldd --version | head -1 | grep -oP '\d+\.\d+$')
+          runner=${{ runner.os }} ${{ runner.arch }} (${{ runner.name }})
+          ci_run=${{ github.run_id }}
+          git_sha=${{ github.sha }}
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
       - name: Upload dev sidecar bundle
         uses: actions/upload-artifact@v7
         with:
