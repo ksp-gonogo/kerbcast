@@ -98,20 +98,27 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
-      # Bundle the ffmpeg shared libraries the sidecar links against so the
-      # deployed artefact is self-contained on any Linux. SteamOS doesn't
-      # ship libavutil.so.58 / libavcodec.so.60 / etc., and the binary
-      # resolves every ffmpeg symbol at exec time — without bundling, the
+      # Bundle the non-system shared libraries the sidecar links against so
+      # the deployed artefact is self-contained on any Linux. SteamOS doesn't
+      # ship libavutil.so.58 / libavcodec.so.60 / libvpl.so.2 / etc., and
+      # the binary resolves every symbol at exec time — without bundling, the
       # dynamic linker fails before is_available()'s software-fallback path
       # can run, and the sidecar dies with exit 127.
       #
-      # We bundle libav* / libsw* / libpostproc* (the ffmpeg-next link set)
-      # but DELIBERATELY do NOT bundle libva itself. libva is a thin shim
-      # that dlopen()s GPU-driver .so's (iHD_drv_video, i965_drv_video,
-      # radeonsi_drv_video) matched to the host's kernel+Mesa stack;
-      # bundling Ubuntu's libva on the Deck risks ABI mismatch with the
-      # Deck's drivers. The Deck has its own libva already (Mesa needs it),
-      # so we let LD_LIBRARY_PATH fall through to the system copy for it.
+      # We use a denylist rather than a whitelist: bundle everything ldd
+      # resolves except known-stable system libs (glibc, libstdc++, libgcc_s,
+      # ld-linux, linux-vdso) and libva.
+      #
+      # libva is the one deliberate exclusion: it is a thin shim that
+      # dlopen()s GPU-driver .so's (iHD_drv_video, radeonsi_drv_video, …)
+      # matched to the host's kernel+Mesa stack; bundling Ubuntu's libva on
+      # the Deck risks ABI mismatch with the Deck's Mesa drivers. The Deck
+      # already has its own libva (Mesa needs it), so we let LD_LIBRARY_PATH
+      # fall through to the system copy for it.
+      #
+      # The denylist approach future-proofs against codec backends that Ubuntu
+      # ffmpeg dlopen()s at link time (libvpl for Intel VPL, x264, vpx, …) —
+      # a whitelist would require a manual update every time a new dep appears.
       - name: Stage sidecar + bundled shared libs
         working-directory: ${{ github.workspace }}
         run: |
@@ -119,16 +126,18 @@ jobs:
           mkdir -p staging/lib
           cp sidecar/target/release/kerbcam-sidecar staging/
 
-          # Resolve every libav* / libsw* / libpostproc* the binary links
-          # against. ldd's second column is the resolved system path; copy
-          # the file (not the symlink) so the artefact is portable, then
-          # lay it down under the SONAME basename the binary asks for.
+          # Collect all resolved dep paths, then strip:
+          #   - stable glibc / C++ runtime (stable ABI across all Linux)
+          #   - the dynamic loader and the vDSO (not real files)
+          #   - libva (driver shim, must match host Mesa — see comment above)
           deps="$(ldd staging/kerbcam-sidecar \
-            | awk '/=>/ {print $3}' \
-            | grep -E '/(libav|libsw|libpostproc)' \
+            | awk '/=>/ && $3 ~ /^\// {print $3}' \
+            | grep -Ev '/(libc|libm|libpthread|libdl|librt|libstdc\+\+|libgcc_s)[.\-]' \
+            | grep -Ev '/(ld-linux|linux-vdso)' \
+            | grep -v libva \
             || true)"
           if [ -z "$deps" ]; then
-            echo "::error::ldd found no libav*/libsw*/libpostproc* deps — refusing to upload a non-self-contained artefact"
+            echo "::error::ldd found no bundleable non-system deps — refusing to upload a non-self-contained artefact"
             ldd staging/kerbcam-sidecar
             exit 1
           fi
