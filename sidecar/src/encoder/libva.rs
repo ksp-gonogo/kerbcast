@@ -94,7 +94,7 @@ mod imp {
         /// through to the software backend instead of retrying every frame.
         fn probe() -> bool {
             static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| Self::probe_once())
+            *CACHE.get_or_init(Self::probe_once)
         }
 
         fn probe_once() -> bool {

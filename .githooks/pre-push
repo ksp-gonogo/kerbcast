@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Pre-push hook: runs cargo fmt + clippy before every push.
+#
+# Install: git config core.hooksPath .githooks
+#
+# macOS note: #[cfg(target_os = "linux")] blocks are NOT compiled here.
+# Before pushing changes to sidecar/src/encoder/libva.rs or any other
+# Linux-specific file, run the full Linux CI check first:
+#   ./scripts/ci-check.sh
+set -euo pipefail
+
+SIDECAR="$(git rev-parse --show-toplevel)/sidecar"
+
+echo "--- pre-push: cargo fmt --check ---"
+(cd "$SIDECAR" && cargo fmt --check)
+
+echo "--- pre-push: cargo clippy ---"
+(cd "$SIDECAR" && cargo clippy --all-targets -- -D warnings)
+
+echo "--- pre-push: ok ---"
