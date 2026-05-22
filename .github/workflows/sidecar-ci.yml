@@ -34,7 +34,13 @@ permissions:
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    # ubuntu-22.04 ships glibc 2.35. KSP runs inside Steam's pressure-vessel
+    # container whose glibc is < 2.38 (Steam Runtime 3 / sniper is Debian
+    # Bookworm = glibc 2.36). Libs built on ubuntu-latest (24.04, glibc 2.39)
+    # require GLIBC_2.38 and crash at exec time on the Deck. Building here
+    # keeps every bundled .so's glibc requirement at ≤ 2.35, safely below the
+    # pressure-vessel floor.
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: sidecar
