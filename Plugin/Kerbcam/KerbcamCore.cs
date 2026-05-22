@@ -483,9 +483,21 @@ namespace Kerbcam
                 if (scaled != null) scaled.enabled = false;
                 var galaxy = FindKspCameraByName("GalaxyCamera");
                 if (galaxy != null) galaxy.enabled = false;
+                // FXCamera is a separate singleton MonoBehaviour with its
+                // own Camera component (NOT in FlightCamera.cameras array)
+                // that renders aero/re-entry FX via a velocity-based
+                // shader. Without disabling it the operator sees "wind
+                // effects + ship silhouette" while throttled — the wind
+                // renders, the ship doesn't (because Camera 00 is off).
+                if (FXCamera.Instance != null)
+                {
+                    var fxCam = FXCamera.Instance.GetComponent<Camera>();
+                    if (fxCam != null) fxCam.enabled = false;
+                }
                 _mainCamerasDisabled = true;
                 _throttleEffective = true;
                 Debug.Log("[Kerbcam] main flight render disabled (ThrottleMainScreen=true)");
+                LogAllCameras("throttle-applied");
             }
             catch (Exception ex)
             {
@@ -506,6 +518,11 @@ namespace Kerbcam
                 if (scaled != null) scaled.enabled = true;
                 var galaxy = FindKspCameraByName("GalaxyCamera");
                 if (galaxy != null) galaxy.enabled = true;
+                if (FXCamera.Instance != null)
+                {
+                    var fxCam = FXCamera.Instance.GetComponent<Camera>();
+                    if (fxCam != null) fxCam.enabled = true;
+                }
                 _mainCamerasDisabled = false;
                 _throttleEffective = false;
                 Debug.Log("[Kerbcam] main flight render restored (ThrottleMainScreen=false)");
@@ -513,6 +530,30 @@ namespace Kerbcam
             catch (Exception ex)
             {
                 Debug.LogError($"[Kerbcam] RestoreMainScreen failed: {ex}");
+            }
+        }
+
+        // Diagnostic: log every active Camera in the scene with its
+        // current enabled state. Lets us spot additional render
+        // surfaces we should consider disabling on throttle — KSP +
+        // mods can add cameras we don't know about ahead of time
+        // (Scatterer, EVE, TUFX, FX setups, etc).
+        private static void LogAllCameras(string tag)
+        {
+            try
+            {
+                var names = new System.Text.StringBuilder();
+                foreach (var c in Camera.allCameras)
+                {
+                    names.Append(c.enabled ? "+" : "-");
+                    names.Append(c.name);
+                    names.Append(' ');
+                }
+                Debug.Log($"[Kerbcam] cameras-snapshot ({tag}): {names}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcam] LogAllCameras failed: {ex.Message}");
             }
         }
 
