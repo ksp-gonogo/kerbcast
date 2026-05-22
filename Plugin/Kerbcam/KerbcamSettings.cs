@@ -51,6 +51,20 @@ namespace Kerbcam
         public bool AutoSpawnSidecar { get; private set; } = true;
         public bool EnableAdaptiveShed { get; private set; } = true;
 
+        // Default for the per-save ThrottleMainScreen Difficulty Setting
+        // when a save is loaded for the first time. After that the
+        // value stored in the save file wins; settings.cfg changes
+        // don't retroactively override existing saves. Read by
+        // KerbcamGameParameters's constructor.
+        public static bool SeedThrottleMainScreen { get; private set; } = false;
+
+        // KeyCode the operator can press at runtime to toggle the
+        // throttle live without opening the Difficulty Settings menu.
+        // Unbound (KeyCode.None) by default; set via settings.cfg
+        // ThrottleMainScreenKey. Examples: F11, M (collision with
+        // map view! avoid), Numlock, ScrollLock, Quote.
+        public static KeyCode ThrottleMainScreenKey { get; private set; } = KeyCode.None;
+
         public string HttpBind => $"{BindAddress}:{Port}";
 
         // Per-PartName initial layer mask (e.g. "navCam1" → NEAR only).
@@ -115,6 +129,22 @@ namespace Kerbcam
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyBool(node, "EnableAdaptiveShed", v => settings.EnableAdaptiveShed = v);
+            // Static slots so KerbcamGameParameters (constructed by
+            // KSP before our plugin instance loads) can pick up the
+            // seed values. Settings.cfg is the source of truth for
+            // first-time-on-this-save defaults.
+            ApplyBool(node, "ThrottleMainScreen", v => SeedThrottleMainScreen = v);
+            ApplyString(node, "ThrottleMainScreenKey", v =>
+            {
+                if (System.Enum.TryParse<KeyCode>(v.Trim(), ignoreCase: true, out var k))
+                {
+                    ThrottleMainScreenKey = k;
+                }
+                else
+                {
+                    Debug.LogWarning($"[Kerbcam] settings.cfg: ThrottleMainScreenKey='{v}' is not a Unity KeyCode; ignoring");
+                }
+            });
 
             foreach (var camNode in node.GetNodes("Camera"))
             {

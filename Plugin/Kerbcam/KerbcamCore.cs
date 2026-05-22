@@ -123,6 +123,15 @@ namespace Kerbcam
             GameEvents.onVesselChange.Add(OnVesselChange);
             RebuildCameraList(FlightGlobals.ActiveVessel);
 
+            // Throttle state seeded from the per-save Difficulty Setting
+            // (which itself seeds from settings.cfg on a fresh save). We
+            // poll it every LateUpdate rather than wire to a settings-
+            // changed GameEvent because KSP doesn't ship one for
+            // CustomParameterNode value changes.
+            _throttleDesired = ReadThrottleDesired();
+            _throttleEffective = _throttleDesired;
+            if (_throttleEffective) ApplyMainScreenThrottle();
+
             TryStartSidecar();
         }
 
@@ -315,6 +324,18 @@ namespace Kerbcam
             Debug.Log($"[Kerbcam] tracking {_cameras.Count} Hullcam VDS camera(s)");
         }
 
+        // Hotkey poll. Update runs once per frame; cheap to scan a key
+        // here, and Input.GetKeyDown only fires the tick a key first
+        // goes down so there's no autorepeat risk.
+        private void Update()
+        {
+            if (KerbcamSettings.ThrottleMainScreenKey != KeyCode.None &&
+                Input.GetKeyDown(KerbcamSettings.ThrottleMainScreenKey))
+            {
+                ToggleThrottleViaHotkey();
+            }
+        }
+
         // LateUpdate so the Unity render cameras have finished compositing
         // the scene into our RenderTextures before we kick the readback.
         private void LateUpdate()
@@ -325,12 +346,185 @@ namespace Kerbcam
             // without the cascade kicking in.
             if (_settings.EnableAdaptiveShed) ApplyAdaptiveShedding();
 
+            // Reconcile the per-save Difficulty Setting against our
+            // effective state. KSP has no settings-changed event for
+            // CustomParameterNode, so we poll. The read is cheap (one
+            // dictionary lookup) and only does work when the value
+            // actually moved.
+            bool desired = ReadThrottleDesired();
+            if (desired != _throttleEffective)
+            {
+                _throttleDesired = desired;
+                if (desired) ApplyMainScreenThrottle();
+                else RestoreMainScreen();
+            }
+
             for (int i = 0; i < _cameras.Count; i++)
             {
                 _cameras[i].Refresh();
             }
 
             MaybeWriteStatusFile();
+        }
+
+        // Warning overlay shown to the operator while the main flight
+        // render is disabled. Top-centred so it doesn't compete with
+        // the navball / staging / right-click panels. Tells them where
+        // to look to undo, including the active hotkey if one is bound.
+        private void OnGUI()
+        {
+            if (!_throttleEffective) return;
+
+            // Lazy style so we pay the GUIStyle alloc once, not per
+            // OnGUI frame.
+            if (_throttleWarnStyle == null)
+            {
+                _throttleWarnStyle = new GUIStyle(GUI.skin.box)
+                {
+                    fontSize = 14,
+                    alignment = TextAnchor.MiddleCenter,
+                    wordWrap = true,
+                    normal = { textColor = new Color(1f, 0.85f, 0.3f) },
+                };
+            }
+
+            string keyHint = KerbcamSettings.ThrottleMainScreenKey != KeyCode.None
+                ? $" or press [{KerbcamSettings.ThrottleMainScreenKey}]"
+                : " (no hotkey bound; set ThrottleMainScreenKey in settings.cfg)";
+            string msg =
+                "Main flight camera disabled by kerbcam to free GPU for camera streams. " +
+                $"Go to Pause → Difficulty Settings → Kerbcam{keyHint} to restore.";
+
+            const float w = 560f;
+            const float h = 60f;
+            float x = (Screen.width - w) * 0.5f;
+            float y = 8f;
+            GUI.Box(new Rect(x, y, w, h), msg, _throttleWarnStyle);
+        }
+
+        // -- throttle plumbing --
+
+        private bool _throttleDesired;
+        private bool _throttleEffective;
+        private bool _mainCamerasDisabled;
+        private GUIStyle _throttleWarnStyle;
+
+        // Read the operator-set Difficulty value, with a fallback to
+        // the settings.cfg seed when no save is active (shouldn't
+        // happen in flight scene but defensive — Awake order is
+        // sometimes weird across mod combinations).
+        private bool ReadThrottleDesired()
+        {
+            try
+            {
+                var game = HighLogic.CurrentGame;
+                if (game?.Parameters != null)
+                {
+                    var node = game.Parameters.CustomParams<KerbcamGameParameters>();
+                    if (node != null) return node.ThrottleMainScreen;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcam] CustomParams read failed: {ex.Message}");
+            }
+            return KerbcamSettings.SeedThrottleMainScreen;
+        }
+
+        // Hotkey toggles BOTH the live state AND the per-save value
+        // (so the change persists if the operator saves now). Lets the
+        // hotkey behave intuitively — "press it, it stays toggled
+        // until I press it again or change the Difficulty Setting".
+        private void ToggleThrottleViaHotkey()
+        {
+            bool next = !_throttleEffective;
+            try
+            {
+                var game = HighLogic.CurrentGame;
+                if (game?.Parameters != null)
+                {
+                    var node = game.Parameters.CustomParams<KerbcamGameParameters>();
+                    if (node != null) node.ThrottleMainScreen = next;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcam] hotkey CustomParams write failed: {ex.Message}");
+            }
+            _throttleDesired = next;
+            if (next) ApplyMainScreenThrottle();
+            else RestoreMainScreen();
+            Debug.Log($"[Kerbcam] ThrottleMainScreen toggled via hotkey → {next}");
+        }
+
+        // KSP ships FlightCamera.EnableCamera() / DisableCamera() as
+        // its first-class on/off for the layered main view; calling
+        // DisableCamera here is the same code path KSP itself uses on
+        // scene transitions, so we're not fighting the engine. We
+        // additionally disable Camera ScaledSpace + GalaxyCamera so
+        // no layer of the main composite renders. The ScaledCamera
+        // and GalaxyCamera MonoBehaviours keep running their
+        // transform-tracking LateUpdate logic independently of the
+        // Camera component's enabled flag, so our per-Hullcam cameras
+        // (which are parented to those transforms) still get correct
+        // positions every frame.
+        private void ApplyMainScreenThrottle()
+        {
+            if (_mainCamerasDisabled) { _throttleEffective = true; return; }
+            try
+            {
+                if (FlightCamera.fetch != null)
+                {
+                    FlightCamera.fetch.DisableCamera(disableAudioListener: false);
+                }
+                var scaled = FindKspCameraByName("Camera ScaledSpace");
+                if (scaled != null) scaled.enabled = false;
+                var galaxy = FindKspCameraByName("GalaxyCamera");
+                if (galaxy != null) galaxy.enabled = false;
+                _mainCamerasDisabled = true;
+                _throttleEffective = true;
+                Debug.Log("[Kerbcam] main flight render disabled (ThrottleMainScreen=true)");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Kerbcam] ApplyMainScreenThrottle failed: {ex}");
+            }
+        }
+
+        private void RestoreMainScreen()
+        {
+            if (!_mainCamerasDisabled) { _throttleEffective = false; return; }
+            try
+            {
+                if (FlightCamera.fetch != null)
+                {
+                    FlightCamera.fetch.EnableCamera();
+                }
+                var scaled = FindKspCameraByName("Camera ScaledSpace");
+                if (scaled != null) scaled.enabled = true;
+                var galaxy = FindKspCameraByName("GalaxyCamera");
+                if (galaxy != null) galaxy.enabled = true;
+                _mainCamerasDisabled = false;
+                _throttleEffective = false;
+                Debug.Log("[Kerbcam] main flight render restored (ThrottleMainScreen=false)");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Kerbcam] RestoreMainScreen failed: {ex}");
+            }
+        }
+
+        // Camera.allCameras snapshots every active Camera, so this is
+        // cheap. KerbcamCamera.SetCameras() uses the same pattern via
+        // FindKspCamera; duplicated here because we run earlier than
+        // the per-camera setup and don't want the cross-class call.
+        private static Camera FindKspCameraByName(string name)
+        {
+            foreach (var c in Camera.allCameras)
+            {
+                if (c.name == name) return c;
+            }
+            return null;
         }
 
         // ~1 Hz status write. Each write carries the full per-camera
@@ -439,6 +633,13 @@ namespace Kerbcam
 
         private void OnDestroy()
         {
+            // ALWAYS restore the main flight cameras on scene exit so a
+            // revert / quit-to-KSC / quit-to-main-menu doesn't leave KSP
+            // with a dead viewport. This is unconditional even if the
+            // operator never enabled throttle this session — a no-op in
+            // that case.
+            RestoreMainScreen();
+
             GameEvents.onVesselChange.Remove(OnVesselChange);
             foreach (var cam in _cameras) cam.Dispose();
             _cameras.Clear();

@@ -63,6 +63,19 @@
       <HintPath>$(KspManaged)/UnityEngine.UIModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <!-- IMGUI for the throttle-warning overlay (OnGUI + GUIStyle). -->
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(KspManaged)/UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(KspManaged)/UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(KspManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="Assembly-CSharp">
       <HintPath>$(KspManaged)/Assembly-CSharp.dll</HintPath>
       <Private>False</Private>
