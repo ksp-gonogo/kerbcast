@@ -368,9 +368,10 @@ namespace Kerbcam
         }
 
         // Warning overlay shown to the operator while the main flight
-        // render is disabled. Top-centred so it doesn't compete with
-        // the navball / staging / right-click panels. Tells them where
-        // to look to undo, including the active hotkey if one is bound.
+        // render is disabled. Centred on the (blanked) viewport so it
+        // doesn't compete with the altimeter / navball / staging /
+        // right-click panels at the top + sides. Tells them where to
+        // look to undo, including the active hotkey if one is bound.
         private void OnGUI()
         {
             if (!_throttleEffective) return;
@@ -384,6 +385,7 @@ namespace Kerbcam
                     fontSize = 14,
                     alignment = TextAnchor.MiddleCenter,
                     wordWrap = true,
+                    padding = new RectOffset(12, 12, 10, 10),
                     normal = { textColor = new Color(1f, 0.85f, 0.3f) },
                 };
             }
@@ -396,9 +398,9 @@ namespace Kerbcam
                 $"Go to Pause → Difficulty Settings → Kerbcam{keyHint} to restore.";
 
             const float w = 560f;
-            const float h = 60f;
+            const float h = 80f;
             float x = (Screen.width - w) * 0.5f;
-            float y = 8f;
+            float y = (Screen.height - h) * 0.5f;
             GUI.Box(new Rect(x, y, w, h), msg, _throttleWarnStyle);
         }
 
