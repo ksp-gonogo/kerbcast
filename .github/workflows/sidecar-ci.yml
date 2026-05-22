@@ -100,9 +100,63 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
-      - name: Upload dev sidecar binary
+      # Bundle the ffmpeg shared libraries the sidecar links against so the
+      # deployed artefact is self-contained on any Linux. SteamOS doesn't
+      # ship libavutil.so.58 / libavcodec.so.60 / etc., and the binary
+      # resolves every ffmpeg symbol at exec time — without bundling, the
+      # dynamic linker fails before is_available()'s software-fallback path
+      # can run, and the sidecar dies with exit 127.
+      #
+      # We bundle libav* / libsw* / libpostproc* (the ffmpeg-next link set)
+      # but DELIBERATELY do NOT bundle libva itself. libva is a thin shim
+      # that dlopen()s GPU-driver .so's (iHD_drv_video, i965_drv_video,
+      # radeonsi_drv_video) matched to the host's kernel+Mesa stack;
+      # bundling Ubuntu's libva on the Deck risks ABI mismatch with the
+      # Deck's drivers. The Deck has its own libva already (Mesa needs it),
+      # so we let LD_LIBRARY_PATH fall through to the system copy for it.
+      - name: Stage sidecar + bundled shared libs
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging/lib
+          cp sidecar/target/release/kerbcam-sidecar staging/
+
+          # Resolve every libav* / libsw* / libpostproc* the binary links
+          # against. ldd's second column is the resolved system path; copy
+          # the file (not the symlink) so the artefact is portable, then
+          # lay it down under the SONAME basename the binary asks for.
+          deps="$(ldd staging/kerbcam-sidecar \
+            | awk '/=>/ {print $3}' \
+            | grep -E '/(libav|libsw|libpostproc)' \
+            || true)"
+          if [ -z "$deps" ]; then
+            echo "::error::ldd found no libav*/libsw*/libpostproc* deps — refusing to upload a non-self-contained artefact"
+            ldd staging/kerbcam-sidecar
+            exit 1
+          fi
+          echo "Bundling:"
+          echo "$deps"
+          while IFS= read -r src; do
+            [ -z "$src" ] && continue
+            # Resolve to the real file (libavutil.so.58 -> libavutil.so.58.x.y)
+            # but place it under the SONAME basename the binary asks for.
+            # Keeps the lib/ dir flat and symlink-free so `gh run download`
+            # round-trips cleanly (artifact zip doesn't preserve symlinks).
+            real="$(readlink -f "$src")"
+            soname="$(basename "$src")"
+            cp "$real" "staging/lib/$soname"
+          done <<< "$deps"
+
+          echo "Bundled lib/ contents:"
+          ls -la staging/lib/
+          echo "Bundled size:"
+          du -sh staging/lib/
+
+      - name: Upload dev sidecar bundle
         uses: actions/upload-artifact@v7
         with:
           name: kerbcam-sidecar-linux-x64-dev
-          path: sidecar/target/release/kerbcam-sidecar
+          # Uploading the staging directory preserves the layout
+          # (kerbcam-sidecar + lib/) when consumers `gh run download -n`.
+          path: staging
           if-no-files-found: error
