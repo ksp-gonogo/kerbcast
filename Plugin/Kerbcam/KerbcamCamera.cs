@@ -322,6 +322,44 @@ namespace Kerbcam
             galaxyRot.NearCamera = _nearCam;
             galaxyRot.UseScaledSpace = false;
             galaxyGo.AddComponent<CanvasHack>();
+
+            // Debug log of per-camera cullingMask + source-camera
+            // cullingMask. Gated on settings.cfg DebugCameraLogging
+            // (default off). Hook for the cam-stream-FX investigation
+            // — we suspect KSP dynamically modifies Camera 00's mask
+            // after our one-shot CopyFrom and that's why atmospheric
+            // effects are missing from streams. Logging both sides
+            // lets the operator catch the divergence in KSP.log.
+            if (KerbcamSettings.DebugCameraLogging)
+            {
+                long srcNearMask = sourceNear != null ? sourceNear.cullingMask : 0;
+                long srcScaledMask = sourceScaled != null ? sourceScaled.cullingMask : 0;
+                long srcGalaxyMask = sourceGalaxy != null ? sourceGalaxy.cullingMask : 0;
+                Debug.Log(
+                    $"[Kerbcam-debug] cam={FlightId} cullingMasks " +
+                    $"near=src:0x{srcNearMask:X8}/ours:0x{_nearCam.cullingMask:X8} " +
+                    $"scaled=src:0x{srcScaledMask:X8}/ours:0x{_scaledCam.cullingMask:X8} " +
+                    $"galaxy=src:0x{srcGalaxyMask:X8}/ours:0x{_galaxyCam.cullingMask:X8}");
+            }
+        }
+
+        // Periodic cullingMask diff between our cams and their KSP
+        // source cameras. Catches the case where KSP mutates the
+        // source cam's mask after we CopyFrom'd — our cams would
+        // miss whatever the new layer is. Gated, called once per
+        // minute by KerbcamCore so the log stays readable.
+        public void LogCullingMaskIfDiverged()
+        {
+            if (!KerbcamSettings.DebugCameraLogging) return;
+            var srcNear = FindKspCamera("Camera 00");
+            if (srcNear == null || _nearCam == null) return;
+            if (srcNear.cullingMask != _nearCam.cullingMask)
+            {
+                Debug.Log(
+                    $"[Kerbcam-debug] cam={FlightId} near cullingMask DIVERGED — " +
+                    $"src:0x{srcNear.cullingMask:X8} ours:0x{_nearCam.cullingMask:X8} " +
+                    $"missing-from-ours:0x{srcNear.cullingMask & ~_nearCam.cullingMask:X8}");
+            }
         }
 
         private static Camera FindKspCamera(string name)

@@ -359,6 +359,17 @@ namespace Kerbcam
                 else RestoreMainScreen();
             }
 
+            // Debug: periodic cullingMask divergence check. ~once per
+            // minute (3600 LateUpdates at 60fps; degrades gracefully
+            // at lower fps). Gated inside the cam itself so this is a
+            // single nullary call per tick when off.
+            if (--_debugMaskCheckCountdown <= 0)
+            {
+                _debugMaskCheckCountdown = 3600;
+                for (int i = 0; i < _cameras.Count; i++)
+                    _cameras[i].LogCullingMaskIfDiverged();
+            }
+
             for (int i = 0; i < _cameras.Count; i++)
             {
                 _cameras[i].Refresh();
@@ -410,6 +421,7 @@ namespace Kerbcam
         private bool _throttleEffective;
         private bool _mainCamerasDisabled;
         private GUIStyle _throttleWarnStyle;
+        private int _debugMaskCheckCountdown = 60;
 
         // Read the operator-set Difficulty value, with a fallback to
         // the settings.cfg seed when no save is active (shouldn't

@@ -51,6 +51,14 @@ namespace Kerbcam
         public bool AutoSpawnSidecar { get; private set; } = true;
         public bool EnableAdaptiveShed { get; private set; } = true;
 
+        // Debug: when true, log additional per-camera diagnostics
+        // useful for investigating render-mask / cullingMask issues
+        // (atmospheric FX missing from streams, layer mismatches
+        // after vessel changes, etc). Off by default — log spam in
+        // KSP.log otherwise. Static so KerbcamCamera can read it
+        // without needing a back-ref to the settings instance.
+        public static bool DebugCameraLogging { get; private set; } = false;
+
         // Default for the per-save ThrottleMainScreen Difficulty Setting
         // when a save is loaded for the first time. After that the
         // value stored in the save file wins; settings.cfg changes
@@ -129,6 +137,7 @@ namespace Kerbcam
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyBool(node, "EnableAdaptiveShed", v => settings.EnableAdaptiveShed = v);
+            ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             // Static slots so KerbcamGameParameters (constructed by
             // KSP before our plugin instance loads) can pick up the
             // seed values. Settings.cfg is the source of truth for
