@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use webrtc::media::Sample;
 
 use kerbcam_sidecar::cameras::{CameraRegistry, CameraState};
-use kerbcam_sidecar::encoder::{select_backend, EncodeConfig, EncoderChoice, RawFrame};
+use kerbcam_sidecar::encoder::{select_backend, EncodeConfig, EncoderChoice, RawFrame, Software};
 use kerbcam_sidecar::protocol::{AdaptiveShedPayload, CameraStateChangedPayload, ServerMessage};
 use kerbcam_sidecar::shared_mem::MmapRingConfig;
 use kerbcam_sidecar::signalling::{router, AppState};
@@ -417,21 +417,31 @@ async fn encode_and_fan_out(
         );
     }
     if encoder_guard.is_none() {
-        let mut backend = select_backend(encoder_choice);
-        if let Err(e) = backend.init(EncodeConfig {
+        let cfg = EncodeConfig {
             width: frame.width,
             height: frame.height,
             fps,
             bitrate_bps: effective_bps,
-        }) {
-            warn!(flight_id = cam.flight_id, error = %e, "encoder init failed");
-            return;
+        };
+        let mut backend = select_backend(encoder_choice);
+        if let Err(e) = backend.init(cfg.clone()) {
+            // Hardware backend failed (e.g. VAAPI probe passed but
+            // avcodec_open2 rejected the resolution or profile). Fall back
+            // to software immediately rather than retrying the same failing
+            // backend every frame.
+            warn!(flight_id = cam.flight_id, error = %e, "encoder init failed; falling back to software");
+            backend = Box::new(Software::new());
+            if let Err(e2) = backend.init(cfg) {
+                warn!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
+                return;
+            }
         }
         info!(
             flight_id = cam.flight_id,
             width = frame.width,
             height = frame.height,
             bitrate_bps = effective_bps,
+            backend = backend.name(),
             "per-camera encoder initialised",
         );
         cam.encoder_width.store(frame.width, Ordering::Release);
