@@ -263,6 +263,11 @@ namespace Kerbcam
             // TrackingCamera enables these explicitly for the same reason.
             _nearCam.allowHDR = true;
             _nearCam.allowMSAA = true;
+            // Offscreen RT cameras shouldn't run Unity's occlusion logic —
+            // it's computed against the main viewport's frustum and either
+            // wastes cycles or incorrectly culls objects in our cameras'
+            // frusta. JustReadTheInstructions does this on every layer.
+            _nearCam.useOcclusionCulling = false;
             nearGo.AddComponent<CanvasHack>();
 
             // Scaled layer — planet terrain + atmosphere at scaled-space scale.
@@ -282,6 +287,7 @@ namespace Kerbcam
             _scaledCam.targetTexture = _captureRt;
             _scaledCam.allowHDR = true;
             _scaledCam.allowMSAA = true;
+            _scaledCam.useOcclusionCulling = false;
             var scaledRot = scaledGo.AddComponent<LayerCamRotator>();
             scaledRot.NearCamera = _nearCam;
             scaledRot.UseScaledSpace = true;
@@ -290,6 +296,13 @@ namespace Kerbcam
             // Galaxy layer — skybox + distant celestials.
             var galaxyGo = new GameObject($"Kerbcam_{FlightId}_Galaxy");
             _galaxyCam = galaxyGo.AddComponent<Camera>();
+            // Pre-CopyFrom fallback: if the source GalaxyCamera lookup
+            // fails (vessel-load race, scene weirdness), at least we
+            // render a predictable solid-black backdrop instead of
+            // whatever Unity defaults Camera to. CopyFrom overwrites
+            // these when it succeeds. JTI does the same.
+            _galaxyCam.clearFlags = CameraClearFlags.SolidColor;
+            _galaxyCam.backgroundColor = Color.black;
             var sourceGalaxy = FindKspCamera("GalaxyCamera");
             if (sourceGalaxy != null)
             {
@@ -304,6 +317,7 @@ namespace Kerbcam
             _galaxyCam.targetTexture = _captureRt;
             _galaxyCam.allowHDR = true;
             _galaxyCam.allowMSAA = true;
+            _galaxyCam.useOcclusionCulling = false;
             var galaxyRot = galaxyGo.AddComponent<LayerCamRotator>();
             galaxyRot.NearCamera = _nearCam;
             galaxyRot.UseScaledSpace = false;
