@@ -10,7 +10,15 @@ name: sidecar-ci
 
 on:
   push:
-    branches: [main]
+    # wip/** covers active long-running branches (libva, throttle,
+    # future hardware-encoder + render experiments) so each push
+    # builds a sidecar artifact we can pull via gonogo_claude_tools.sh
+    # without needing to dispatch manually. Path filter still gates
+    # so plugin-only commits don't burn CI minutes; consumers of a
+    # plugin-only branch should download main's artifact instead.
+    branches:
+      - main
+      - 'wip/**'
     paths:
       - 'sidecar/**'
       - '.github/workflows/sidecar-ci.yml'
