@@ -154,13 +154,23 @@ mod imp {
             ffmpeg::ffi::av_buffer_unref(&mut device_ref);
             return false;
         }
+        // Use 256×256 for probe dimensions. AMD VCN H.264 encoding has a
+        // minimum dimension constraint (≥128px) that causes avcodec_open2 to
+        // fail at 64×64 even though 768×768 real encodes work fine. 256×256
+        // is conservatively above the hardware minimum, well below the real
+        // encode size, and fast to allocate.
+        const PROBE_W: i32 = 256;
+        const PROBE_H: i32 = 256;
+
         let fctx = (*frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
         (*fctx).format = hw_pix_fmt;
         (*fctx).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-        (*fctx).width = 64;
-        (*fctx).height = 64;
+        (*fctx).width = PROBE_W;
+        (*fctx).height = PROBE_H;
         (*fctx).initial_pool_size = 1;
-        if ffmpeg::ffi::av_hwframe_ctx_init(frames_ref) < 0 {
+        let hwframe_rc = ffmpeg::ffi::av_hwframe_ctx_init(frames_ref);
+        if hwframe_rc < 0 {
+            warn!(rc = hwframe_rc, "VAAPI probe: av_hwframe_ctx_init failed");
             let mut f = frames_ref;
             ffmpeg::ffi::av_buffer_unref(&mut f);
             ffmpeg::ffi::av_buffer_unref(&mut device_ref);
@@ -176,15 +186,19 @@ mod imp {
             ffmpeg::ffi::av_buffer_unref(&mut device_ref);
             return false;
         }
-        (*ctx).width = 64;
-        (*ctx).height = 64;
+        (*ctx).width = PROBE_W;
+        (*ctx).height = PROBE_H;
         (*ctx).pix_fmt = hw_pix_fmt;
         (*ctx).time_base = ffmpeg::ffi::AVRational { num: 1, den: 30 };
         // Give the codec context its own ref to the frames pool.
         // avcodec_free_context will release it.
         (*ctx).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ref);
 
-        let open_ok = ffmpeg::ffi::avcodec_open2(ctx, codec, ptr::null_mut()) >= 0;
+        let open_rc = ffmpeg::ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+        if open_rc < 0 {
+            warn!(rc = open_rc, "VAAPI probe: avcodec_open2 failed");
+        }
+        let open_ok = open_rc >= 0;
 
         // avcodec_free_context unrefs hw_frames_ctx for us.
         ffmpeg::ffi::avcodec_free_context(&mut (ctx as *mut _));
