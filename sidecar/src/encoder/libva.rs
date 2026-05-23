@@ -85,13 +85,12 @@ mod imp {
         ///
         /// Gates: (1) a render node exists, (2) `av_hwdevice_ctx_create(VAAPI)`
         /// succeeds, (3) `avcodec_get_hw_config` confirms h264_vaapi has an
-        /// HW_FRAMES_CTX config, (4) `av_hwframe_ctx_init` with that pixel
-        /// format succeeds. Gate 4 is critical: on some setups (e.g. Ubuntu
-        /// 22.04's ffmpeg 4.4 where `FF_API_VAAPI` flips the value of
-        /// `AV_PIX_FMT_VAAPI` between the build-time Rust enum and the runtime
-        /// libavcodec.so) the device opens fine but hwframe init fails with
-        /// `vaapi_moco not supported`. Catching it here lets `auto_select` fall
-        /// through to the software backend instead of retrying every frame.
+        /// HW_FRAMES_CTX config for VAAPI, (4) `av_hwframe_ctx_init` succeeds
+        /// with the runtime pixel format, (5) `avcodec_open2` succeeds. Gate 5
+        /// is critical: drivers that accept surface allocation but reject H.264
+        /// encoding (missing VCN entrypoint, wrong profile, pixel-format enum
+        /// mismatch between build-time bindings and runtime libavcodec) all
+        /// fail here rather than at the first real init() call.
         fn probe() -> bool {
             static CACHE: OnceLock<bool> = OnceLock::new();
             *CACHE.get_or_init(Self::probe_once)
@@ -101,56 +100,7 @@ mod imp {
             if !render_node_exists() {
                 return false;
             }
-            unsafe {
-                // ---- 1. Open VAAPI device ----
-                let mut device_ref: *mut ffmpeg::ffi::AVBufferRef = ptr::null_mut();
-                let rc = ffmpeg::ffi::av_hwdevice_ctx_create(
-                    &mut device_ref,
-                    ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    0,
-                );
-                if rc < 0 || device_ref.is_null() {
-                    return false;
-                }
-
-                // ---- 2. Find h264_vaapi codec + get its runtime hw pixel format ----
-                let name = std::ffi::CString::new("h264_vaapi").unwrap();
-                let codec = ffmpeg::ffi::avcodec_find_encoder_by_name(name.as_ptr());
-                if codec.is_null() {
-                    ffmpeg::ffi::av_buffer_unref(&mut device_ref);
-                    return false;
-                }
-                let hw_pix_fmt = hw_frames_pix_fmt_for_codec(codec);
-                if hw_pix_fmt == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-                    ffmpeg::ffi::av_buffer_unref(&mut device_ref);
-                    return false;
-                }
-
-                // ---- 3. Test hwframe init with the runtime pixel format ----
-                // This catches pixel-format enum mismatches between the Rust
-                // bindings and the installed libavcodec that only show up at
-                // av_hwframe_ctx_init time (not at device open time).
-                let frames_ref = ffmpeg::ffi::av_hwframe_ctx_alloc(device_ref);
-                if frames_ref.is_null() {
-                    ffmpeg::ffi::av_buffer_unref(&mut device_ref);
-                    return false;
-                }
-                let fctx = (*frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
-                (*fctx).format = hw_pix_fmt;
-                (*fctx).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-                (*fctx).width = 64;
-                (*fctx).height = 64;
-                (*fctx).initial_pool_size = 1;
-                let hw_ok = ffmpeg::ffi::av_hwframe_ctx_init(frames_ref) >= 0;
-                // av_buffer_unref handles the frames_ref; device_ref is kept
-                // alive by the frames context until we unref both.
-                let mut frames_mut = frames_ref;
-                ffmpeg::ffi::av_buffer_unref(&mut frames_mut);
-                ffmpeg::ffi::av_buffer_unref(&mut device_ref);
-                hw_ok
-            }
+            unsafe { probe_vaapi_encode() }
         }
     }
 
@@ -158,6 +108,90 @@ mod imp {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    /// Full end-to-end VAAPI H.264 encoding probe. Returns true only if every
+    /// step of the real `init()` path — device open, hwframes init, AND
+    /// avcodec_open2 — succeeds on this host. Uses minimal 64×64 dimensions.
+    ///
+    /// Splitting the codec open into probe rather than only testing hwframes
+    /// init catches drivers that accept surface allocation but reject the H.264
+    /// encoding entrypoint (e.g. AMD Mesa on hardware without VCN H.264 encode
+    /// support, or when the encode profile/level is unavailable).
+    ///
+    /// # Safety
+    /// Must only be called from `probe_once` (single-writer OnceLock path).
+    unsafe fn probe_vaapi_encode() -> bool {
+        // ---- 1. Open VAAPI device ----
+        let mut device_ref: *mut ffmpeg::ffi::AVBufferRef = ptr::null_mut();
+        let rc = ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut device_ref,
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            ptr::null(),
+            ptr::null_mut(),
+            0,
+        );
+        if rc < 0 || device_ref.is_null() {
+            return false;
+        }
+
+        // ---- 2. Find codec + runtime hw pixel format ----
+        let name = std::ffi::CString::new("h264_vaapi").unwrap();
+        let codec = ffmpeg::ffi::avcodec_find_encoder_by_name(name.as_ptr());
+        if codec.is_null() {
+            ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+            return false;
+        }
+        let hw_pix_fmt = hw_frames_pix_fmt_for_codec(codec);
+        if hw_pix_fmt == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+            return false;
+        }
+
+        // ---- 3. Alloc + init hwframes (64×64 test surface) ----
+        let frames_ref = ffmpeg::ffi::av_hwframe_ctx_alloc(device_ref);
+        if frames_ref.is_null() {
+            ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+            return false;
+        }
+        let fctx = (*frames_ref).data as *mut ffmpeg::ffi::AVHWFramesContext;
+        (*fctx).format = hw_pix_fmt;
+        (*fctx).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*fctx).width = 64;
+        (*fctx).height = 64;
+        (*fctx).initial_pool_size = 1;
+        if ffmpeg::ffi::av_hwframe_ctx_init(frames_ref) < 0 {
+            let mut f = frames_ref;
+            ffmpeg::ffi::av_buffer_unref(&mut f);
+            ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+            return false;
+        }
+
+        // ---- 4. Try avcodec_open2 — the gate most drivers fail if they
+        //        don't support H.264 encoding on this hardware. ----
+        let ctx = ffmpeg::ffi::avcodec_alloc_context3(codec);
+        if ctx.is_null() {
+            let mut f = frames_ref;
+            ffmpeg::ffi::av_buffer_unref(&mut f);
+            ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+            return false;
+        }
+        (*ctx).width = 64;
+        (*ctx).height = 64;
+        (*ctx).pix_fmt = hw_pix_fmt;
+        (*ctx).time_base = ffmpeg::ffi::AVRational { num: 1, den: 30 };
+        // Give the codec context its own ref to the frames pool.
+        // avcodec_free_context will release it.
+        (*ctx).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(frames_ref);
+
+        let open_ok = ffmpeg::ffi::avcodec_open2(ctx, codec, ptr::null_mut()) >= 0;
+
+        // avcodec_free_context unrefs hw_frames_ctx for us.
+        ffmpeg::ffi::avcodec_free_context(&mut (ctx as *mut _));
+        let mut f = frames_ref;
+        ffmpeg::ffi::av_buffer_unref(&mut f);
+        ffmpeg::ffi::av_buffer_unref(&mut device_ref);
+        open_ok
     }
 
     /// Walk the codec's hw configs and return the pixel format for the first
