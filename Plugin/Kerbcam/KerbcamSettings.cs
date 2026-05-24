@@ -51,16 +51,6 @@ namespace Kerbcam
         public bool AutoSpawnSidecar { get; private set; } = true;
         public bool EnableAdaptiveShed { get; private set; } = true;
 
-        // Apply Hullcam VDS's per-part shader filters (NightVision green
-        // grain, MovieTime film effect, CRT/TV scanlines, etc — 9 modes
-        // total). Each cam reads its hullcam.cameraMode field at attach
-        // and instantiates the matching HullcamVDS.CameraFilter; the
-        // existing capture-RT → readback-RT blit becomes a
-        // RenderImageWithFilter call. Default true so kerbcam streams
-        // show the same visual effects as Hullcam's own in-game UI.
-        // Set false to skip the filter pass (pure unfiltered composite).
-        public static bool EnableHullcamEffects { get; private set; } = true;
-
         // Apply TUFX (TexturesUnlimitedFX) post-processing — tonemap,
         // bloom, colour grading — to each layered kerbcam camera when
         // TUFX is installed. Without it, atmospheric scattering on
@@ -158,7 +148,6 @@ namespace Kerbcam
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyBool(node, "EnableAdaptiveShed", v => settings.EnableAdaptiveShed = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
-            ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             // Static slots so KerbcamGameParameters (constructed by
             // KSP before our plugin instance loads) can pick up the
