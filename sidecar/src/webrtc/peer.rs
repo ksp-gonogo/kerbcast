@@ -94,8 +94,7 @@ impl KerbcamPeer {
         // generates .local hostnames that desktop Chrome resolves but Android
         // Chrome cannot, preventing streams from loading on mobile.
         let mut setting_engine = SettingEngine::default();
-        setting_engine
-            .set_ice_multicast_dns_mode(ice::mdns::MulticastDnsMode::Disabled);
+        setting_engine.set_ice_multicast_dns_mode(ice::mdns::MulticastDnsMode::Disabled);
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_setting_engine(setting_engine)
