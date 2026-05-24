@@ -104,6 +104,17 @@ namespace Kerbcam
         private double _pendingCaptureTsMs;
         private int _consecutiveErrors;
 
+        // HullcamVDS per-part shader filter (NightVision, MovieTime,
+        // CRT scanlines etc — 9 modes total enumerated by
+        // HullcamVDS.CameraFilter.eCameraMode). Created from
+        // hullcam.cameraMode at attach; null if the mode is Normal
+        // (no filter), if creation failed, or if EnableHullcamEffects
+        // is false in settings.cfg. When non-null, replaces the
+        // capture-RT → readback-RT blit in Refresh() with a filter
+        // pass that lands the post-processed pixels into _readbackRt
+        // for the existing AsyncGPUReadback path to read.
+        private CameraFilter _cameraFilter;
+
         public KerbcamCamera(
             MuMechModuleHullCamera hullcam,
             uint flightId,
@@ -158,6 +169,41 @@ namespace Kerbcam
             BuildRenderTargets(renderWidth, renderHeight);
             SetCameras();
             ApplyLayers();
+            BuildHullcamFilter();
+        }
+
+        // Instantiate the HullcamVDS shader filter that matches this
+        // part's configured cameraMode. Read once at attach; mode
+        // changes from the operator's right-click Hullcam UI mid-flight
+        // are NOT picked up — a vessel reload (or kerbcam re-attach)
+        // would. Acceptable for v1; can add a periodic mode-poll later.
+        //
+        // cameraMode is a float in the Hullcam ConfigNode (0-8, mapped
+        // to eCameraMode by value) — converted to enum by direct cast.
+        // Mode 0 (Normal) returns a no-op filter; we leave _cameraFilter
+        // null in that case so Refresh's blit takes the fast path.
+        private void BuildHullcamFilter()
+        {
+            if (!KerbcamSettings.EnableHullcamEffects) return;
+            try
+            {
+                int modeInt = (int)Hullcam.cameraMode;
+                var mode = (CameraFilter.eCameraMode)modeInt;
+                if (mode == CameraFilter.eCameraMode.Normal) return;
+                var filter = CameraFilter.CreateFilter(mode);
+                if (filter == null) return;
+                if (!filter.Activate())
+                {
+                    UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} CameraFilter.Activate failed for mode={mode}");
+                    return;
+                }
+                _cameraFilter = filter;
+                UnityEngine.Debug.Log($"[Kerbcam] cam={FlightId} HullcamVDS filter active: mode={mode}");
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} BuildHullcamFilter failed: {ex.Message}");
+            }
         }
 
         private void BuildRenderTargets(int width, int height)
@@ -685,7 +731,19 @@ namespace Kerbcam
             try
             {
                 // Blit the depth-bundled capture RT into the clean readback RT.
-                Graphics.Blit(_captureRt, _readbackRt);
+                // When a HullcamVDS filter is active (NightVision etc), it
+                // replaces the plain Blit with its own shader pass that
+                // post-processes _captureRt → _readbackRt in one step. The
+                // existing AsyncGPUReadback path then reads the
+                // already-filtered pixels — no extra round-trip needed.
+                if (_cameraFilter != null)
+                {
+                    _cameraFilter.RenderImageWithFilter(_captureRt, _readbackRt);
+                }
+                else
+                {
+                    Graphics.Blit(_captureRt, _readbackRt);
+                }
 
                 _readbackInFlight = true;
                 _pendingCaptureTsMs = Time.unscaledTime * 1000.0;
@@ -734,6 +792,12 @@ namespace Kerbcam
 
         public void Dispose()
         {
+            if (_cameraFilter != null)
+            {
+                try { _cameraFilter.Deactivate(); }
+                catch (Exception ex) { UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} CameraFilter.Deactivate failed: {ex.Message}"); }
+                _cameraFilter = null;
+            }
             if (_nearCam != null) UnityEngine.Object.Destroy(_nearCam.gameObject);
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);
