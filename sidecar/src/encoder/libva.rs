@@ -47,13 +47,6 @@ mod imp {
             ctx: *mut ffmpeg::ffi::AVCodecContext,
             r: *mut ffmpeg::ffi::AVBufferRef,
         );
-        fn kerbcam_avcodec_get_hw_frames_ctx(
-            ctx: *const ffmpeg::ffi::AVCodecContext,
-        ) -> *mut ffmpeg::ffi::AVBufferRef;
-        fn kerbcam_avcodec_set_hw_device_ctx(
-            ctx: *mut ffmpeg::ffi::AVCodecContext,
-            r: *mut ffmpeg::ffi::AVBufferRef,
-        );
     }
 
     use super::super::{EncodeConfig, EncodeError, EncoderBackend, Nal, RawFrame};
