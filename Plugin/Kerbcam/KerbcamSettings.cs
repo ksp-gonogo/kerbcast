@@ -51,6 +51,16 @@ namespace Kerbcam
         public bool AutoSpawnSidecar { get; private set; } = true;
         public bool EnableAdaptiveShed { get; private set; } = true;
 
+        // Apply TUFX (TexturesUnlimitedFX) post-processing — tonemap,
+        // bloom, colour grading — to each layered kerbcam camera when
+        // TUFX is installed. Without it, atmospheric scattering on
+        // Kerbin's horizon has too wide a dynamic range to display
+        // correctly even with allowHDR=true: the bright sky clips and
+        // the rest crushes dark ("dark Kerbin / black hole horizon").
+        // Default true; integration silently no-ops when TUFX is not
+        // installed. Static so KerbcamCamera can read it directly.
+        public static bool EnableTUFX { get; private set; } = true;
+
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
         // (atmospheric FX missing from streams, layer mismatches
@@ -137,6 +147,7 @@ namespace Kerbcam
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyBool(node, "EnableAdaptiveShed", v => settings.EnableAdaptiveShed = v);
+            ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             // Static slots so KerbcamGameParameters (constructed by
             // KSP before our plugin instance loads) can pick up the

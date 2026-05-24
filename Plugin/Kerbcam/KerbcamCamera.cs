@@ -323,6 +323,23 @@ namespace Kerbcam
             galaxyRot.UseScaledSpace = false;
             galaxyGo.AddComponent<CanvasHack>();
 
+            // TUFX (TexturesUnlimitedFX) post-processing. Reflection-only
+            // — silently no-ops when TUFX isn't installed. Applied to ALL
+            // THREE layers (not just near, per JustReadTheInstructions'
+            // pattern, the more recent reference implementation). The
+            // near cam carries the heaviest tonemap+bloom load since it
+            // sees the highest-luminance content (engines, near-vessel
+            // atmosphere); the scaled cam handles the wide-DR atmospheric
+            // gradient that was the original "dark Kerbin / black hole
+            // horizon" complaint that triggered this work; the galaxy cam
+            // applies it to the skybox composite for consistency.
+            if (KerbcamSettings.EnableTUFX)
+            {
+                TUFXIntegration.ApplyToCamera(_nearCam);
+                TUFXIntegration.ApplyToCamera(_scaledCam);
+                TUFXIntegration.ApplyToCamera(_galaxyCam);
+            }
+
             // Debug log of per-camera cullingMask + source-camera
             // cullingMask. Gated on settings.cfg DebugCameraLogging
             // (default off). Hook for the cam-stream-FX investigation
