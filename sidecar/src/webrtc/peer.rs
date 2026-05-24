@@ -35,7 +35,6 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
-use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -48,6 +47,7 @@ use webrtc::track::track_local::TrackLocal;
 use crate::cameras::CameraState as InternalCameraState;
 
 use crate::cameras::CameraRegistry;
+use crate::encoder::selected_backend_name;
 use crate::protocol::{
     CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage, ErrorPayload,
     FlightIdPayload, HelloPayload, Layer, ServerMessage, SetDegradePayload, SetFovPayload,
@@ -100,13 +100,11 @@ impl KerbcamPeer {
             .with_setting_engine(setting_engine)
             .build();
 
-        let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        // No external STUN server: this is a LAN-only tool and host candidates
+        // are sufficient. The Google STUN URL was unreachable over IPv6 from
+        // the Deck (Network is unreachable) and its timeout caused 1-2 minute
+        // delays before mobile ICE proceeded with what it had.
+        let config = RTCConfiguration::default();
 
         let pc = Arc::new(api.new_peer_connection(config).await?);
 
@@ -317,7 +315,7 @@ async fn handle_client_message(
                 &dc,
                 &ServerMessage::Hello(HelloPayload {
                     sidecar_version: crate::VERSION.to_owned(),
-                    encoder_backend: "openh264".to_owned(),
+                    encoder_backend: selected_backend_name().to_owned(),
                 }),
             )
             .await;

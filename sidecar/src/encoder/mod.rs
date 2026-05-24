@@ -126,3 +126,21 @@ pub fn auto_select() -> Box<dyn EncoderBackend> {
     // practice, but the type checker doesn't know that.
     Box::new(Software::new())
 }
+
+/// Return the name of the backend that `auto_select` would choose, without
+/// allocating a full encoder. Probe results are cached via OnceLock so this
+/// is cheap after the first call.
+pub fn selected_backend_name() -> &'static str {
+    let candidates: [Box<dyn EncoderBackend>; 4] = [
+        Box::new(Libva::new()),
+        Box::new(VideoToolbox::new()),
+        Box::new(Nvenc::new()),
+        Box::new(Software::new()),
+    ];
+    for b in candidates {
+        if b.is_available() {
+            return b.name();
+        }
+    }
+    Software::new().name()
+}
