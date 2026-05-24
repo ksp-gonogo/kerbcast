@@ -44,6 +44,7 @@ memmap2 = "0.9"
 # rebuild's "stream to a <video srcObject>" UX. Without this we're back to
 # OCISLY's JPEG-over-gRPC architecture which is what we're trying to escape.
 webrtc = "0.13"
+ice = { package = "webrtc-ice", version = "0.13" }
 
 # HTTP signalling endpoint — POST /offer accepts the browser's SDP, returns
 # the sidecar's answer. axum is the lightest tokio-native option that

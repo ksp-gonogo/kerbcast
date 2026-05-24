@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -89,7 +90,16 @@ impl KerbcamPeer {
         let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
-        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        // Disable mDNS candidate obfuscation: the default QueryAndGather mode
+        // generates .local hostnames that desktop Chrome resolves but Android
+        // Chrome cannot, preventing streams from loading on mobile.
+        let mut setting_engine = SettingEngine::default();
+        setting_engine
+            .set_ice_multicast_dns_mode(ice::mdns::MulticastDnsMode::Disabled);
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_setting_engine(setting_engine)
+            .build();
 
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
