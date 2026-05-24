@@ -71,15 +71,6 @@ namespace Kerbcam
         // installed. Static so KerbcamCamera can read it directly.
         public static bool EnableTUFX { get; private set; } = true;
 
-        // Name of the TUFX profile to attach to kerbcam's per-camera
-        // volumes. Default "kerbcam" → uses the curated profile
-        // bundled at GameData/Kerbcam/TUFXProfiles/kerbcam.cfg (ACES
-        // tonemap, SMAA, modest bloom). Set to any other TUFX
-        // profile name to use that instead; set empty to skip the
-        // attach (volumes inherit TUFX's global scene selection,
-        // pre-bundling behaviour). No effect without TUFX installed.
-        public static string TUFXProfile { get; private set; } = "kerbcam";
-
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
         // (atmospheric FX missing from streams, layer mismatches
@@ -167,7 +158,6 @@ namespace Kerbcam
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyBool(node, "EnableAdaptiveShed", v => settings.EnableAdaptiveShed = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
-            ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             // Static slots so KerbcamGameParameters (constructed by
