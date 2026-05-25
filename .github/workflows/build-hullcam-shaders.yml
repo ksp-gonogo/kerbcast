@@ -36,7 +36,13 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      UNITY_VERSION: 2019.4.41f1
+      # Unity 2019.4 LTS, latest available patch. Personal license
+      # activation requires >= 2019.4.41f2 (Unity's modern Named User
+      # Licensing floor); the .x wildcard picks the latest stable in
+      # the line so we always satisfy that. AssetBundles built on any
+      # 2019.4.x patch are cross-compatible with KSP 1.12.5 which runs
+      # 2019.4.18f1 at runtime.
+      UNITY_VERSION: 2019.4.x
       # Pin HullcamVDSContinued to the current HEAD commit on master.
       # Bump as needed when upstream updates shader source. Keeping it
       # pinned (vs. tracking master) avoids surprise CI changes when
