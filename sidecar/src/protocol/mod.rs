@@ -39,6 +39,25 @@ pub enum Layer {
     Galaxy,
 }
 
+/// Lifecycle state of a camera. Transmitted in `CameraState` so clients
+/// can react to part destruction without a new message type.
+///
+/// Destroyed is a terminal state — the sidecar never transitions a camera
+/// back to Active after writing the tombstone.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CameraLifecycle {
+    Active,
+    Destroyed,
+}
+
+impl Default for CameraLifecycle {
+    fn default() -> Self {
+        CameraLifecycle::Active
+    }
+}
+
 /// Per-camera snapshot pushed by the sidecar on every state change
 /// (operator API call, adaptive shed, vessel change). Same shape served
 /// by `GET /cameras` so client UIs can treat the two interchangeably.
@@ -52,6 +71,13 @@ pub enum Layer {
 #[serde(rename_all = "camelCase")]
 pub struct CameraState {
     pub flight_id: u32,
+    /// Part-destruction lifecycle. `Active` for live cameras. `Destroyed`
+    /// when the plugin reports the Hullcam part was destroyed in-flight
+    /// (collision, overheating, decoupling beyond physics range). Once
+    /// destroyed the sidecar stops forwarding frames; the client should
+    /// surface a "SIGNAL LOST" overlay and keep the last frame visible.
+    #[serde(default)]
+    pub lifecycle: CameraLifecycle,
     pub part_name: String,
     pub part_title: String,
     pub camera_name: String,
@@ -306,6 +332,7 @@ mod tests {
         let snap = ServerMessage::CameraSnapshot(CameraSnapshotPayload {
             cameras: vec![CameraState {
                 flight_id: 99,
+                lifecycle: CameraLifecycle::Active,
                 part_name: "navCam1".into(),
                 part_title: "NavCam".into(),
                 camera_name: "NavCam".into(),

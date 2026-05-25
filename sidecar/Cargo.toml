@@ -86,3 +86,4 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"

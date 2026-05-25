@@ -9,6 +9,18 @@ export interface AdaptiveShedPayload {
 }
 
 /**
+ * Lifecycle state of a camera. Transmitted in `CameraState` so clients
+ * can react to part destruction without a new message type.
+ *
+ * Destroyed is a terminal state — the sidecar never transitions a camera
+ * back to Active after writing the tombstone.
+ */
+export enum CameraLifecycle {
+	Active = "active",
+	Destroyed = "destroyed",
+}
+
+/**
  * Layer mask. Mirrors `Kerbcam.CameraLayers` on the plugin side.
  * Receiving clients use this for both the rendered-layer status reports
  * and per-camera layer requests.
@@ -23,7 +35,7 @@ export enum Layer {
  * Per-camera snapshot pushed by the sidecar on every state change
  * (operator API call, adaptive shed, vessel change). Same shape served
  * by `GET /cameras` so client UIs can treat the two interchangeably.
- * 
+ *
  * Capability fields (`supports_zoom`, `supports_pan`) let clients
  * render controls only for features each part actually offers — a
  * fixed-FoV camera shouldn't get a zoom slider, a non-steerable one
@@ -31,6 +43,8 @@ export enum Layer {
  */
 export interface CameraState {
 	flightId: number;
+	/** Part-destruction lifecycle. `active` for live cameras. `destroyed` when the plugin reports the Hullcam part was destroyed in-flight. */
+	lifecycle: CameraLifecycle;
 	partName: string;
 	partTitle: string;
 	cameraName: string;

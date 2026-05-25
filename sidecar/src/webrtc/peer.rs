@@ -49,9 +49,9 @@ use crate::cameras::CameraState as InternalCameraState;
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
-    CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage, ErrorPayload,
-    FlightIdPayload, HelloPayload, Layer, ServerMessage, SetDegradePayload, SetFovPayload,
-    SetLayersPayload, SetPanPayload, SetRenderSizePayload,
+    CameraLifecycle, CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage,
+    ErrorPayload, FlightIdPayload, HelloPayload, Layer, ServerMessage, SetDegradePayload,
+    SetFovPayload, SetLayersPayload, SetPanPayload, SetRenderSizePayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcam-control";
@@ -119,6 +119,13 @@ impl KerbcamPeer {
                     continue;
                 }
             };
+            if cam.destroyed.load(Ordering::Acquire) {
+                // Part was destroyed before this peer connected — don't create
+                // a track for it. The browser will receive a camera-state-changed
+                // with lifecycle=destroyed in the Hello exchange snapshot.
+                warn!(flight_id, "skipping track for destroyed camera");
+                continue;
+            }
 
             let track = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability {
@@ -617,6 +624,7 @@ async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataCh
         .into_iter()
         .map(|c| CameraState {
             flight_id: c.flight_id,
+            lifecycle: c.lifecycle,
             part_name: c.part_name,
             part_title: c.part_title,
             camera_name: c.camera_name,
@@ -672,6 +680,11 @@ async fn push_camera_state(
     let pan_pitch = ctrl.pan_pitch.unwrap_or(0.0);
     let state = CameraState {
         flight_id,
+        lifecycle: if cam.destroyed.load(Ordering::Acquire) {
+            CameraLifecycle::Destroyed
+        } else {
+            CameraLifecycle::Active
+        },
         part_name: cam.part_name.clone(),
         part_title: cam.part_title.clone(),
         camera_name: cam.camera_name.clone(),

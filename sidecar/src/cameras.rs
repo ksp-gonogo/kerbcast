@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::encoder::EncoderBackend;
-use crate::protocol::{CameraState as ProtocolCameraState, Layer};
+use crate::protocol::{CameraLifecycle, CameraState as ProtocolCameraState, Layer};
 use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
 
 /// On-disk shape of `global.status.json` — the plugin → sidecar push
@@ -121,6 +121,11 @@ pub struct ControlState {
 #[serde(rename_all = "camelCase")]
 pub struct CameraInfo {
     pub flight_id: u32,
+    /// Part-destruction lifecycle. Reflects the camera's last-known
+    /// state from `info.json`. Destroyed cameras remain in the list so
+    /// the UI can show a "SIGNAL LOST" badge until the next vessel change
+    /// clears the registry. `"active"` for live cameras.
+    pub lifecycle: CameraLifecycle,
     pub max_width: u32,
     pub max_height: u32,
     pub part_name: String,
@@ -147,10 +152,17 @@ pub struct CameraInfo {
 /// Hullcam module on the plugin side: `supportsZoom = true` iff the
 /// part is `MuMechModuleHullCameraZoom`; `supportsPan = true` only once
 /// the planned mod extension adds steerable mounts.
+///
+/// When the plugin destroys a Hullcam part it rewrites this file with
+/// `lifecycle: "destroyed"` and removes the `.ring` file. The sidecar
+/// must detect the transition and clean up.
 #[derive(Debug, Clone, Deserialize)]
 struct InfoManifest {
     #[allow(dead_code)] // echo-only — we already know the flight_id from the filename
     flight_id: u32,
+    /// Absent / unknown values treated as `Active` per the protocol spec.
+    #[serde(default)]
+    lifecycle: CameraLifecycle,
     #[serde(default)]
     part_name: String,
     #[serde(default)]
@@ -197,6 +209,15 @@ pub struct CameraState {
     pub pan_yaw_max: f32,
     pub pan_pitch_min: f32,
     pub pan_pitch_max: f32,
+    /// Current lifecycle state. Set once to `Destroyed` on first detection
+    /// of `lifecycle: "destroyed"` in info.json; never flips back to `Active`.
+    /// Stored as an `AtomicBool` (true = destroyed) for lock-free reads in
+    /// the encode path.
+    pub destroyed: AtomicBool,
+    /// Tracks whether we've already sent the destruction notification to
+    /// peers. Prevents duplicate broadcasts when the consume loop re-reads
+    /// the tombstone on a subsequent tick before info.json is deleted.
+    pub destruction_broadcast_sent: AtomicBool,
     /// Sidecar-side mirror of the plugin's control file. Mutated by
     /// data-channel messages (SetLayers / SetRenderSize); the registry's
     /// `write_control` flushes the full struct to disk on each change so
@@ -446,17 +467,25 @@ impl CameraRegistry {
         self.status_log.lock().await.clone()
     }
 
-    /// Walk `shm_dir`, attach any new `<flight_id>.ring` files, drop any
-    /// that have disappeared from disk. Tolerant of the directory not yet
-    /// existing — the plugin may not have created it.
-    pub async fn rescan(&self) {
+    /// Walk `shm_dir`, attach any new `<flight_id>.ring` files, poll
+    /// info.json for existing cameras (to catch `lifecycle: "destroyed"`
+    /// tombstones written by the plugin), and drop rings that have
+    /// disappeared under normal teardown. Tolerant of the directory not
+    /// yet existing — the plugin may not have created it.
+    ///
+    /// Returns the set of flight IDs that transitioned to `Destroyed`
+    /// this tick and have not yet had their broadcast sent. Callers
+    /// (the consume loop) use this to fan `camera-state-changed` out to
+    /// all peers, then call `acknowledge_destruction` to delete the
+    /// tombstone and mark the broadcast as sent.
+    pub async fn rescan(&self) -> Vec<u32> {
         let mut found: HashMap<u32, PathBuf> = HashMap::new();
         let mut entries = match tokio::fs::read_dir(&self.shm_dir).await {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
             Err(e) => {
                 warn!(dir = %self.shm_dir.display(), error = %e, "rescan read_dir failed");
-                return;
+                return Vec::new();
             }
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -475,7 +504,39 @@ impl CameraRegistry {
 
         let mut cameras = self.cameras.write().await;
 
-        // Attach new rings.
+        // --- Step 1: poll info.json for EXISTING cameras to catch destroyed
+        // tombstones BEFORE the ring-disappearance retain runs.
+        //
+        // Ordering from the protocol doc:
+        //   plugin writes `lifecycle: "destroyed"` → closes ring → deletes ring file
+        //
+        // The ring file is gone by the time we see it. If we checked ring
+        // existence first, we'd drop the camera silently without ever reading
+        // the tombstone. Re-reading info.json for every known camera at ~1Hz
+        // is cheap (6 files, ~200 bytes each).
+        let mut newly_destroyed: Vec<u32> = Vec::new();
+        for (id, cam) in cameras.iter() {
+            if cam.destroyed.load(Ordering::Acquire) {
+                // Already flagged — check if broadcast is still pending.
+                if !cam.destruction_broadcast_sent.load(Ordering::Acquire) {
+                    newly_destroyed.push(*id);
+                }
+                continue;
+            }
+            let manifest = read_manifest(&self.shm_dir, *id).await;
+            if manifest.lifecycle == CameraLifecycle::Destroyed {
+                cam.destroyed.store(true, Ordering::Release);
+                warn!(
+                    flight_id = id,
+                    part_title = %cam.part_title,
+                    "camera part destroyed — stopping encode, notifying peers",
+                );
+                newly_destroyed.push(*id);
+            }
+        }
+
+        // --- Step 2: attach new rings (skips destroyed cameras; they have
+        // no ring file, so they won't appear in `found`).
         for (id, path) in &found {
             if cameras.contains_key(id) {
                 continue;
@@ -511,6 +572,8 @@ impl CameraRegistry {
                             pan_yaw_max: manifest.pan_yaw_max,
                             pan_pitch_min: manifest.pan_pitch_min,
                             pan_pitch_max: manifest.pan_pitch_max,
+                            destroyed: AtomicBool::new(false),
+                            destruction_broadcast_sent: AtomicBool::new(false),
                             encoder: Mutex::new(None),
                             encoder_width: AtomicU32::new(0),
                             encoder_height: AtomicU32::new(0),
@@ -533,9 +596,15 @@ impl CameraRegistry {
             }
         }
 
-        // Drop rings that have disappeared.
+        // --- Step 3: drop cameras that have disappeared under normal
+        // teardown (ring file gone AND not a pending destroyed camera).
+        // Destroyed cameras are retained so the UI can display SIGNAL LOST.
         let mut removed = Vec::new();
-        cameras.retain(|id, _| {
+        cameras.retain(|id, cam| {
+            if cam.destroyed.load(Ordering::Acquire) {
+                // Destroyed — keep in registry (visible in /cameras as destroyed).
+                return true;
+            }
             let still = found.contains_key(id);
             if !still {
                 removed.push(*id);
@@ -543,7 +612,33 @@ impl CameraRegistry {
             still
         });
         for id in removed {
-            info!(flight_id = id, "camera ring removed");
+            info!(flight_id = id, "camera ring removed (normal teardown)");
+        }
+
+        newly_destroyed
+    }
+
+    /// Mark the destruction broadcast as sent and delete the info.json
+    /// tombstone. Called by the consume loop after broadcasting
+    /// `camera-state-changed` for a destroyed camera.
+    ///
+    /// Deleting the file is our acknowledgment to the plugin that we've
+    /// seen the tombstone; the protocol requires this because the plugin
+    /// may exit immediately after writing it.
+    pub async fn acknowledge_destruction(&self, flight_id: u32) {
+        if let Some(cam) = self.cameras.read().await.get(&flight_id) {
+            cam.destruction_broadcast_sent
+                .store(true, Ordering::Release);
+        }
+        let path = self.shm_dir.join(format!("{flight_id}.info.json"));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => info!(flight_id, "info.json tombstone deleted"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already deleted (e.g. by a previous sidecar instance).
+            }
+            Err(e) => {
+                warn!(flight_id, error = %e, "failed to delete info.json tombstone");
+            }
         }
     }
 
@@ -553,6 +648,11 @@ impl CameraRegistry {
             .values()
             .map(|s| CameraInfo {
                 flight_id: s.flight_id,
+                lifecycle: if s.destroyed.load(Ordering::Acquire) {
+                    CameraLifecycle::Destroyed
+                } else {
+                    CameraLifecycle::Active
+                },
                 max_width: s.max_width,
                 max_height: s.max_height,
                 part_name: s.part_name.clone(),
@@ -649,6 +749,11 @@ impl CameraRegistry {
             };
             delta.changed_cameras.push(ProtocolCameraState {
                 flight_id: cam_status.flight_id,
+                lifecycle: if cam.destroyed.load(Ordering::Acquire) {
+                    CameraLifecycle::Destroyed
+                } else {
+                    CameraLifecycle::Active
+                },
                 part_name: cam.part_name.clone(),
                 part_title: cam.part_title.clone(),
                 camera_name: cam.camera_name.clone(),
@@ -747,6 +852,7 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
     let path = shm_dir.join(format!("{flight_id}.info.json"));
     let empty = InfoManifest {
         flight_id,
+        lifecycle: CameraLifecycle::Active,
         part_name: String::new(),
         part_title: String::new(),
         camera_name: String::new(),
@@ -775,5 +881,75 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
             warn!(flight_id, path = %path.display(), error = %e, "info manifest parse failed");
             empty
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `read_manifest` returns `Destroyed` when info.json has
+    /// `lifecycle: "destroyed"` — the tombstone the plugin writes on part
+    /// destruction. This is the primitive the rescan detection loop calls
+    /// on every existing camera at ~1Hz.
+    #[tokio::test]
+    async fn read_manifest_detects_destroyed_lifecycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 9_001;
+
+        let content = format!(
+            r#"{{"lifecycle":"destroyed","flight_id":{flight_id},"part_name":"testPart","part_title":"Test Camera","camera_name":"Cam 1","vessel_name":"Kerbal X","supports_zoom":false,"fov":60.0,"fov_min":10.0,"fov_max":90.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+        );
+        tokio::fs::write(shm.join(format!("{flight_id}.info.json")), content)
+            .await
+            .unwrap();
+
+        let manifest = read_manifest(shm, flight_id).await;
+        assert_eq!(
+            manifest.lifecycle,
+            CameraLifecycle::Destroyed,
+            "read_manifest should return Destroyed when info.json has lifecycle=destroyed"
+        );
+    }
+
+    /// Missing info.json (normal teardown — plugin deletes it entirely)
+    /// defaults to `Active`. The sidecar then drops the camera silently
+    /// via the ring-disappearance retain path; no broadcast needed.
+    #[tokio::test]
+    async fn read_manifest_missing_defaults_to_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        // No file written.
+        let manifest = read_manifest(shm, 9_002).await;
+        assert_eq!(
+            manifest.lifecycle,
+            CameraLifecycle::Active,
+            "missing info.json should default to Active (normal teardown path)"
+        );
+    }
+
+    /// Unknown / future lifecycle values that serde can't map to a known
+    /// variant cause a parse error. The error path returns the `empty`
+    /// manifest (lifecycle = Active) for forward compatibility.
+    #[tokio::test]
+    async fn unknown_lifecycle_defaults_to_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 9_003;
+
+        let content = format!(
+            r#"{{"lifecycle":"future-unknown-value","flight_id":{flight_id},"part_name":"","part_title":"","camera_name":"","vessel_name":"","supports_zoom":false,"fov":0.0,"fov_min":0.0,"fov_max":0.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+        );
+        tokio::fs::write(shm.join(format!("{flight_id}.info.json")), content)
+            .await
+            .unwrap();
+
+        let manifest = read_manifest(shm, flight_id).await;
+        assert_eq!(
+            manifest.lifecycle,
+            CameraLifecycle::Active,
+            "unknown lifecycle in info.json should be treated as Active"
+        );
     }
 }

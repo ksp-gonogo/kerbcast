@@ -24,7 +24,10 @@ use webrtc::media::Sample;
 
 use kerbcam_sidecar::cameras::{CameraRegistry, CameraState};
 use kerbcam_sidecar::encoder::{select_backend, EncodeConfig, EncoderChoice, RawFrame, Software};
-use kerbcam_sidecar::protocol::{AdaptiveShedPayload, CameraStateChangedPayload, ServerMessage};
+use kerbcam_sidecar::protocol::{
+    AdaptiveShedPayload, CameraLifecycle, CameraState as ProtocolCameraState,
+    CameraStateChangedPayload, ServerMessage,
+};
 use kerbcam_sidecar::shared_mem::MmapRingConfig;
 use kerbcam_sidecar::signalling::{router, AppState};
 use kerbcam_sidecar::webrtc::KerbcamPeer;
@@ -185,12 +188,24 @@ async fn consume_loop(
 
     loop {
         if last_rescan.elapsed() >= rescan_interval {
-            registry.rescan().await;
+            let newly_destroyed = registry.rescan().await;
             // Status poll piggybacks on the rescan cadence — both are
             // ~1Hz and the plugin's status writer matches that rate.
             let delta = registry.poll_status().await;
             if delta.adaptive_shed.is_some() || !delta.changed_cameras.is_empty() {
                 broadcast_status_delta(&peers, delta).await;
+            }
+            // Broadcast camera-state-changed for newly-destroyed cameras and
+            // acknowledge (delete tombstone). "Clean close" is via the
+            // data-channel notification rather than RTCP/track removal because
+            // KerbcamPeer doesn't store per-camera RTCRtpSender refs; the
+            // published client renders SIGNAL LOST on receipt and keeps the
+            // last decoded frame visible through the HTML video element.
+            if !newly_destroyed.is_empty() {
+                broadcast_destroyed_cameras(&registry, &peers, &newly_destroyed).await;
+                for flight_id in newly_destroyed {
+                    registry.acknowledge_destruction(flight_id).await;
+                }
             }
             last_rescan = Instant::now();
         }
@@ -225,6 +240,10 @@ async fn consume_loop(
         let mut any_active = false;
 
         for cam in &cameras {
+            // Destroyed cameras never encode — the part is gone.
+            if cam.destroyed.load(Ordering::Acquire) {
+                continue;
+            }
             if cam.subscribers.load(Ordering::Acquire) == 0 {
                 continue;
             }
@@ -275,6 +294,57 @@ async fn broadcast_status_delta(
     }
 
     for state in delta.changed_cameras {
+        let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
+        for peer in &snapshot {
+            peer.push_message(&msg).await;
+        }
+    }
+}
+
+/// Broadcast `camera-state-changed` with `lifecycle: "destroyed"` for
+/// each camera whose part was destroyed this tick. Sends to every
+/// connected peer so their UI can render a "SIGNAL LOST" overlay.
+async fn broadcast_destroyed_cameras(
+    registry: &Arc<CameraRegistry>,
+    peers: &Arc<RwLock<Vec<Arc<KerbcamPeer>>>>,
+    flight_ids: &[u32],
+) {
+    let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+    if snapshot.is_empty() {
+        return;
+    }
+    for &flight_id in flight_ids {
+        let Some(cam) = registry.get(flight_id).await else {
+            continue;
+        };
+        let state = ProtocolCameraState {
+            flight_id,
+            lifecycle: CameraLifecycle::Destroyed,
+            part_name: cam.part_name.clone(),
+            part_title: cam.part_title.clone(),
+            camera_name: cam.camera_name.clone(),
+            vessel_name: cam.vessel_name.clone(),
+            layers: Vec::new(),
+            operator_layers: Vec::new(),
+            render_width: 0,
+            render_height: 0,
+            operator_width: 0,
+            operator_height: 0,
+            supports_zoom: cam.supports_zoom,
+            fov: 0.0,
+            fov_min: cam.fov_min,
+            fov_max: cam.fov_max,
+            supports_pan: cam.supports_pan,
+            pan_yaw: 0.0,
+            pan_pitch: 0.0,
+            pan_yaw_min: cam.pan_yaw_min,
+            pan_yaw_max: cam.pan_yaw_max,
+            pan_pitch_min: cam.pan_pitch_min,
+            pan_pitch_max: cam.pan_pitch_max,
+            encoder_bitrate_bps: 0,
+            target_bitrate_bps: 0,
+            degrade_level: 0.0,
+        };
         let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
         for peer in &snapshot {
             peer.push_message(&msg).await;
