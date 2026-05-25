@@ -1,0 +1,112 @@
+name: Build HullcamVDS shader bundle (Linux)
+
+# Rebuilds HullcamVDSContinued's shader AssetBundle for Linux using a
+# modern Unity 2019.4 LTS, working around the upstream bundle's broken
+# state on Mesa OpenGL (GitHub issue
+# linuxgurugamer/HullcamVDSContinued#27, open since 2021). The upstream
+# CreateAssetBundles.cs targets the deprecated StandaloneLinuxUniversal
+# enum which was removed in Unity 2019.2; our override at
+# ci/hullcam-shaders/BuildShaderBundle.cs targets StandaloneLinux64.
+#
+# Output: a `shaders.linux` AssetBundle uploaded as a workflow artifact.
+# Kerbcam picks it up at runtime via the Harmony patch in the plugin
+# (see HullcamFilterIntegration.cs).
+#
+# Auth: uses buildalon/activate-unity-license@v2 with UNITY_USERNAME +
+# UNITY_PASSWORD repo secrets. No 2FA assumed. If the Unity account
+# later gets 2FA enabled, add UNITY_TOTP_KEY and pass via the action's
+# `totp` input.
+#
+# Trigger: manual via workflow_dispatch (and on push to this workflow
+# file or to ci/hullcam-shaders/) — keeps activation rate down on
+# Unity's licensing servers while we iterate.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-hullcam-shaders.yml'
+      - 'ci/hullcam-shaders/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      UNITY_VERSION: 2019.4.41f1
+      # Pin HullcamVDSContinued to the current HEAD commit on master.
+      # Bump as needed when upstream updates shader source. Keeping it
+      # pinned (vs. tracking master) avoids surprise CI changes when
+      # upstream commits land mid-iteration.
+      HULLCAM_REPO: linuxgurugamer/HullcamVDSContinued
+      HULLCAM_REF: master
+
+    steps:
+      - name: Checkout kerbcam (for our build override)
+        uses: actions/checkout@v4
+        with:
+          path: kerbcam
+
+      - name: Checkout HullcamVDSContinued (shader source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HULLCAM_REPO }}
+          ref: ${{ env.HULLCAM_REF }}
+          path: hullcam
+
+      - name: Drop our build script into the Unity asset project
+        run: |
+          # Override upstream's deprecated-target script with ours that
+          # targets StandaloneLinux64. Their original is left in place
+          # too; we override by adding a new file beside it. Unity's
+          # batch invocation specifies our method explicitly via
+          # -executeMethod, so the upstream script's MenuItem entry
+          # never fires.
+          mkdir -p hullcam/HullCameraAssets/Assets/Editor
+          cp kerbcam/ci/hullcam-shaders/BuildShaderBundle.cs \
+             hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
+          ls -la hullcam/HullCameraAssets/Assets/Editor/
+
+      - name: Activate Unity Personal license
+        uses: buildalon/activate-unity-license@v2
+        with:
+          license: 'Personal'
+          username: ${{ secrets.UNITY_USERNAME }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Set up Unity Editor
+        uses: buildalon/unity-setup@v1
+        with:
+          version: ${{ env.UNITY_VERSION }}
+          modules: 'linux-il2cpp'
+
+      - name: Build shaders.linux AssetBundle
+        working-directory: hullcam/HullCameraAssets
+        run: |
+          "$UNITY_EDITOR_PATH" \
+            -batchmode -nographics -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcamCI.BuildShaderBundle.BuildLinux \
+            -buildTarget Linux64 \
+            -logFile -
+          echo "--- output bundle ---"
+          ls -la Bundles-linux/
+
+      - name: Rename + upload bundle artifact
+        working-directory: hullcam/HullCameraAssets
+        run: |
+          # Unity names the output after the AssetBundle name set in
+          # the project. The bundle of interest is `shaders`; copy +
+          # rename to shaders.linux so kerbcam can ship it under
+          # HullcamVDS' canonical filename if we want to.
+          cp Bundles-linux/shaders shaders.linux
+
+      - name: Upload shaders.linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaders.linux
+          path: hullcam/HullCameraAssets/shaders.linux
+          retention-days: 30
