@@ -36,13 +36,13 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      # Unity 2019.4 LTS, latest available patch. Personal license
-      # activation requires >= 2019.4.41f2 (Unity's modern Named User
-      # Licensing floor); the .x wildcard picks the latest stable in
-      # the line so we always satisfy that. AssetBundles built on any
-      # 2019.4.x patch are cross-compatible with KSP 1.12.5 which runs
-      # 2019.4.18f1 at runtime.
-      UNITY_VERSION: 2019.4.x
+      # Unity 2019.4 LTS final release. AssetBundles built here are
+      # cross-compatible with KSP 1.12.5 (runs 2019.4.18f1) across the
+      # 2019.4.x patch range. If Unity Personal activation rejects this
+      # patch (modern Named User Licensing has a floor circa .41), bump
+      # to a known-higher patch. Bracketed hash is what Unity Hub uses
+      # to disambiguate installs.
+      UNITY_VERSION: 2019.4.40f1 (ffc62b691db5)
       # Pin HullcamVDSContinued to the current HEAD commit on master.
       # Bump as needed when upstream updates shader source. Keeping it
       # pinned (vs. tracking master) avoids surprise CI changes when
@@ -83,6 +83,11 @@ jobs:
         uses: buildalon/unity-setup@v2
         with:
           unity-version: ${{ env.UNITY_VERSION }}
+          # Skip auto-detection of ProjectVersion.txt in the cloned
+          # HullCameraAssets/ — that file pins an ancient Unity version
+          # which the action's resolver chokes on. We control the
+          # version explicitly via unity-version above.
+          version-file: 'None'
           build-targets: StandaloneLinux64
           cache-installation: true
 
