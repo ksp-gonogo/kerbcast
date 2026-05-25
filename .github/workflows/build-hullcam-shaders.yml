@@ -65,13 +65,14 @@ jobs:
 
       - name: Drop our build script into the Unity asset project
         run: |
-          # Override upstream's deprecated-target script with ours that
-          # targets StandaloneLinux64. Their original is left in place
-          # too; we override by adding a new file beside it. Unity's
-          # batch invocation specifies our method explicitly via
-          # -executeMethod, so the upstream script's MenuItem entry
-          # never fires.
+          # Replace upstream's CreateAssetBundles.cs with ours.
+          # Upstream's script references BuildTarget.StandaloneOSXUniversal
+          # and BuildTarget.StandaloneLinuxUniversal, both removed in
+          # Unity 2019.2 — Unity will fail to compile the project even
+          # if we never invoke their method. Our script targets only
+          # StandaloneLinux64 with the modern enum.
           mkdir -p hullcam/HullCameraAssets/Assets/Editor
+          rm -f hullcam/HullCameraAssets/Assets/Editor/CreateAssetBundles.cs
           cp kerbcam/ci/hullcam-shaders/BuildShaderBundle.cs \
              hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
           ls -la hullcam/HullCameraAssets/Assets/Editor/
