@@ -110,6 +110,7 @@ namespace Kerbcam
 
         private UniversalAsyncGPUReadbackRequest _pendingRequest;
         private bool _readbackInFlight;
+        private bool _fxShaderApplied;
         private double _pendingCaptureTsMs;
         private int _consecutiveErrors;
 
@@ -422,6 +423,42 @@ namespace Kerbcam
                     $"scaled=src:0x{srcScaledMask:X8}/ours:0x{_scaledCam.cullingMask:X8} " +
                     $"galaxy=src:0x{srcGalaxyMask:X8}/ours:0x{_galaxyCam.cullingMask:X8}");
             }
+
+            ApplyAtmosphericFx();
+        }
+
+        // Apply the same replacement shader FXCamera uses on Camera 00 to
+        // our near cam so atmospheric effects (wind streaks, re-entry plasma,
+        // anything else in FXCamera.ReplacementShaders) appear in the stream.
+        // CopyFrom does not copy replacement-shader bindings, so this must be
+        // called explicitly. Safe to call every frame — no-ops once applied.
+        // Retries silently until FXCamera.Instance is available (it initialises
+        // after our constructor during flight-scene setup).
+        // Near-only: scaled and galaxy cameras are at a scale where atmospheric
+        // FX renderers are not present in the scene.
+        private void ApplyAtmosphericFx()
+        {
+            if (_fxShaderApplied || _nearCam == null) return;
+            if (FXCamera.Instance == null) return;
+            var shaders = FXCamera.Instance.ReplacementShaders;
+            if (shaders == null || shaders.Length == 0) return;
+
+            // shaderLOD drives which entry in ReplacementShaders[] FXCamera
+            // itself uses. Read via reflection so we don't break if the field
+            // is private in a given KSP version; fall back to index 0.
+            int lod = 0;
+            var lodField = typeof(FXCamera).GetField("shaderLOD",
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+            if (lodField != null)
+                lod = Mathf.Clamp((int)lodField.GetValue(FXCamera.Instance), 0, shaders.Length - 1);
+
+            var shader = shaders[lod];
+            if (shader == null) return;
+            _nearCam.SetReplacementShader(shader, "RenderType");
+            _fxShaderApplied = true;
+            Debug.Log($"[Kerbcam] cam={FlightId} atmospheric FX shader applied (lod={lod} shader={shader.name})");
         }
 
         // Periodic cullingMask diff between our cams and their KSP
@@ -720,6 +757,11 @@ namespace Kerbcam
                 PollControlFile();
             }
 
+            // Retry atmospheric FX shader application every tick until it
+            // succeeds. FXCamera.Instance is null during the first few frames
+            // of flight-scene init; once it arrives this becomes a no-op.
+            ApplyAtmosphericFx();
+
             // Subscriber-aware skip: when no peer is subscribed, skip all
             // rendering work — no camera.Render() calls, no readback, no
             // ring writes, no encoder work downstream. Pending in-flight
@@ -849,6 +891,7 @@ namespace Kerbcam
                 catch (Exception ex) { UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} CameraFilter.Deactivate failed: {ex.Message}"); }
                 _cameraFilter = null;
             }
+            if (_nearCam != null) _nearCam.ResetReplacementShader();
             if (_nearCam != null) UnityEngine.Object.Destroy(_nearCam.gameObject);
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);

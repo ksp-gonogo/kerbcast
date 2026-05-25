@@ -386,6 +386,13 @@ namespace Kerbcam
                 else RestoreMainScreen();
             }
 
+            // If the main screen is throttled but FXCamera arrived after we
+            // applied the throttle (its singleton initialises during flight-scene
+            // setup, so the first ApplyMainScreenThrottle call may have seen a
+            // null Instance), suppress it now.
+            if (_throttleEffective && !_fxCamSuppressed)
+                TrySuppressFxCamera();
+
             // Debug: periodic cullingMask divergence check. ~once per
             // minute (3600 LateUpdates at 60fps; degrades gracefully
             // at lower fps). Gated inside the cam itself so this is a
@@ -447,6 +454,12 @@ namespace Kerbcam
         private bool _throttleDesired;
         private bool _throttleEffective;
         private bool _mainCamerasDisabled;
+        // Tracks whether we have successfully disabled FXCamera's camera
+        // component as part of a throttle. ApplyMainScreenThrottle sets this
+        // only when FXCamera.Instance is available at call time; LateUpdate
+        // retries every frame until it succeeds, so a late-initialising
+        // FXCamera doesn't escape suppression.
+        private bool _fxCamSuppressed;
         private GUIStyle _throttleWarnStyle;
         private int _debugMaskCheckCountdown = 60;
 
@@ -509,6 +522,16 @@ namespace Kerbcam
         // Camera component's enabled flag, so our per-Hullcam cameras
         // (which are parented to those transforms) still get correct
         // positions every frame.
+        private void TrySuppressFxCamera()
+        {
+            if (FXCamera.Instance == null) return;
+            var fxCam = FXCamera.Instance.GetComponent<Camera>();
+            if (fxCam == null) return;
+            fxCam.enabled = false;
+            _fxCamSuppressed = true;
+            Debug.Log("[Kerbcam] FXCamera suppressed (late-init, throttle already active)");
+        }
+
         private void ApplyMainScreenThrottle()
         {
             if (_mainCamerasDisabled) { _throttleEffective = true; return; }
@@ -531,8 +554,15 @@ namespace Kerbcam
                 if (FXCamera.Instance != null)
                 {
                     var fxCam = FXCamera.Instance.GetComponent<Camera>();
-                    if (fxCam != null) fxCam.enabled = false;
+                    if (fxCam != null)
+                    {
+                        fxCam.enabled = false;
+                        _fxCamSuppressed = true;
+                    }
                 }
+                // If FXCamera.Instance was null here, _fxCamSuppressed stays
+                // false. LateUpdate will retry every frame via
+                // TrySuppressFxCamera() until it succeeds.
                 _mainCamerasDisabled = true;
                 _throttleEffective = true;
                 Debug.Log("[Kerbcam] main flight render disabled (ThrottleMainScreen=true)");
@@ -564,6 +594,7 @@ namespace Kerbcam
                 }
                 _mainCamerasDisabled = false;
                 _throttleEffective = false;
+                _fxCamSuppressed = false;
                 Debug.Log("[Kerbcam] main flight render restored (ThrottleMainScreen=false)");
             }
             catch (Exception ex)
