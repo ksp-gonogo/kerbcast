@@ -35,6 +35,14 @@
 // Per-camera Width / Height overrides aren't supported yet — the
 // sidecar still opens all rings at the global max dims. Plumbing
 // variable dims through MmapRingConfig is a follow-up.
+//
+//   EnableHullcamLinuxShaderSwap — (Linux only, default true) when true,
+//                       kerbcam Harmony-patches CameraFilter.LoadBundle to
+//                       load our rebuilt shaders.linux bundle from
+//                       GameData/Kerbcam/HullcamShaders/ instead of
+//                       HullcamVDS's broken upstream bundle. Set to false
+//                       to disable the swap and test against upstream's
+//                       bundle directly.
 
 using System.Collections.Generic;
 using System.IO;
@@ -81,6 +89,13 @@ namespace Kerbcam
         // flight — opt-in until we know it's actually better.
         // No effect without TUFX installed.
         public static string TUFXProfile { get; private set; } = "";
+
+        // When true (default), kerbcam Harmony-patches HullcamVDS's
+        // CameraFilter.LoadBundle to substitute our rebuilt shaders.linux.
+        // Linux-only; set false to test against upstream's broken bundle.
+        // Static so HullcamShaderBundleSwap (Instantly-scoped, no settings
+        // instance) can read it without a back-ref.
+        public static bool EnableHullcamLinuxShaderSwap { get; private set; } = true;
 
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
@@ -171,6 +186,7 @@ namespace Kerbcam
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
             ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
+            ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             // Static slots so KerbcamGameParameters (constructed by
             // KSP before our plugin instance loads) can pick up the

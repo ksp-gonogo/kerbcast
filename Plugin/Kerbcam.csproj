@@ -76,6 +76,10 @@
       <HintPath>$(KspManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.AssetBundleModule">
+      <HintPath>$(KspManaged)/UnityEngine.AssetBundleModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="Assembly-CSharp">
       <HintPath>$(KspManaged)/Assembly-CSharp.dll</HintPath>
       <Private>False</Private>
@@ -84,6 +88,13 @@
          every kerbcam-tracked camera part has attached. -->
     <Reference Include="HullcamVDSContinued">
       <HintPath>$(KspGameData)/HullCameraVDS/Plugins/HullcamVDSContinued.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- Harmony (HarmonyX) — bundled by KSP 1.12 at
+         GameData/000_Harmony/0Harmony.dll. Used by HullcamShaderBundleSwap
+         to patch CameraFilter.LoadBundle on Linux. -->
+    <Reference Include="0Harmony">
+      <HintPath>$(KspGameData)/000_Harmony/0Harmony.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
