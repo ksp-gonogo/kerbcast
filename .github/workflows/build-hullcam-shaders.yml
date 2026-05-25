@@ -70,18 +70,22 @@ jobs:
              hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
           ls -la hullcam/HullCameraAssets/Assets/Editor/
 
+      # Order matters: unity-setup installs Unity Hub + Editor first;
+      # activate-unity-license then uses Hub's Licensing Client to
+      # auth. Reversed order errors with "Unity Hub is not installed".
+      - name: Set up Unity Hub + Editor
+        uses: buildalon/unity-setup@v2
+        with:
+          unity-version: ${{ env.UNITY_VERSION }}
+          build-targets: StandaloneLinux64
+          cache-installation: true
+
       - name: Activate Unity Personal license
         uses: buildalon/activate-unity-license@v2
         with:
           license: 'Personal'
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-
-      - name: Set up Unity Editor
-        uses: buildalon/unity-setup@v1
-        with:
-          version: ${{ env.UNITY_VERSION }}
-          modules: 'linux-il2cpp'
 
       - name: Build shaders.linux AssetBundle
         working-directory: hullcam/HullCameraAssets
