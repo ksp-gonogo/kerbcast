@@ -152,9 +152,16 @@ namespace Kerbcam
         private bool _disposed;
         private bool _firstRender = true;
         private bool _firstPixelCheck = true;
+        private struct FaderState
+        {
+            public Renderer Renderer;
+            public bool WasEnabled;
+            public float OriginalFade;
+        }
         // Pre-allocated; cleared and repopulated each scaled render to avoid
         // per-frame GC pressure.
-        private readonly List<Renderer> _faderDisabled = new List<Renderer>();
+        private readonly List<FaderState> _faderOverrides = new List<FaderState>();
+        private static readonly int _fadeAltitudeId = Shader.PropertyToID("_FadeAltitude");
 
         private UniversalAsyncGPUReadbackRequest _pendingRequest;
         private bool _readbackInFlight;
@@ -171,6 +178,9 @@ namespace Kerbcam
         // pass that lands the post-processed pixels into _readbackRt
         // for the existing AsyncGPUReadback path to read.
         private CameraFilter _cameraFilter;
+        // kerbcam's own NightVision material, used instead of HullcamVDS's
+        // additive-shift filter when the shader bundle is available.
+        private Material _nvMaterial;
 
         public KerbcamCamera(
             MuMechModuleHullCamera hullcam,
@@ -256,6 +266,20 @@ namespace Kerbcam
                 int modeInt = (int)Hullcam.cameraMode;
                 var mode = (CameraFilter.eCameraMode)modeInt;
                 if (mode == CameraFilter.eCameraMode.Normal) return;
+
+                // Night vision: use kerbcam's multiplicative-gain shader
+                // instead of HullcamVDS's additive-shift filter. Falls back
+                // to the HullcamVDS path below if the bundle is missing.
+                if (mode == CameraFilter.eCameraMode.NightVision)
+                {
+                    _nvMaterial = KerbcamNightVisionFilter.GetMaterial();
+                    if (_nvMaterial != null)
+                    {
+                        UnityEngine.Debug.Log($"[Kerbcam] cam={FlightId} kerbcam NightVision shader active");
+                        return;
+                    }
+                }
+
                 var filter = CameraFilter.CreateFilter(mode);
                 if (filter == null) return;
                 if (!filter.Activate())
@@ -957,14 +981,30 @@ namespace Kerbcam
                     // force-enable any renderer that ScaledSpaceFader switched off,
                     // render, then restore. The finally block guarantees restore even
                     // if Render() throws.
-                    _faderDisabled.Clear();
+                    // ScaledSpaceFader controls scaled-body visibility in two ways:
+                    // (1) r.enabled=false when below fadeStart — renderer entirely off.
+                    // (2) r.material._FadeAltitude ramping 0→1 in the transition zone
+                    //     while r.enabled=true — planet fades in gradually.
+                    // Our camera renders from a different position so we bypass both:
+                    // force-enable and override _FadeAltitude=1 for any renderer that
+                    // ScaledSpaceFader has suppressed. Original state is saved and
+                    // restored in the finally block so the main camera's view is
+                    // unaffected.
+                    _faderOverrides.Clear();
                     foreach (var body in FlightGlobals.Bodies)
                     {
                         var r = body.scaledBody?.GetComponent<Renderer>();
-                        if (r != null && !r.enabled)
+                        if (r == null) continue;
+                        bool wasEnabled = r.enabled;
+                        float fade = r.material.GetFloat(_fadeAltitudeId);
+                        if (!wasEnabled || fade < 1f)
                         {
-                            _faderDisabled.Add(r);
-                            r.enabled = true;
+                            _faderOverrides.Add(new FaderState { Renderer = r, WasEnabled = wasEnabled, OriginalFade = fade });
+                            if (!wasEnabled) r.enabled = true;
+                            var mpb = new MaterialPropertyBlock();
+                            r.GetPropertyBlock(mpb);
+                            mpb.SetFloat(_fadeAltitudeId, 1f);
+                            r.SetPropertyBlock(mpb);
                         }
                     }
                     try
@@ -998,8 +1038,18 @@ namespace Kerbcam
                     }
                     finally
                     {
-                        foreach (var r in _faderDisabled)
-                            r.enabled = false;
+                        foreach (var state in _faderOverrides)
+                        {
+                            // Restore _FadeAltitude to ScaledSpaceFader's value in the
+                            // MPB so the main camera sees the correct fade. Get the
+                            // current MPB (which may carry _sunLightDirection etc) and
+                            // only replace the one property we overrode.
+                            var mpb = new MaterialPropertyBlock();
+                            state.Renderer.GetPropertyBlock(mpb);
+                            mpb.SetFloat(_fadeAltitudeId, state.OriginalFade);
+                            state.Renderer.SetPropertyBlock(mpb);
+                            state.Renderer.enabled = state.WasEnabled;
+                        }
                         ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
                     }
                 }
@@ -1020,7 +1070,11 @@ namespace Kerbcam
                 // post-processes _captureRt → _readbackRt in one step. The
                 // existing AsyncGPUReadback path then reads the
                 // already-filtered pixels — no extra round-trip needed.
-                if (_cameraFilter != null)
+                if (_nvMaterial != null)
+                {
+                    Graphics.Blit(_captureRt, _readbackRt, _nvMaterial);
+                }
+                else if (_cameraFilter != null)
                 {
                     _cameraFilter.RenderImageWithFilter(_captureRt, _readbackRt);
                 }
@@ -1102,6 +1156,10 @@ namespace Kerbcam
             // is also a caller). Second call is a no-op.
             if (_disposed) return;
             _disposed = true;
+
+            // The Material is owned by the static KerbcamNightVisionFilter cache;
+            // only null the ref, not Destroy it.
+            _nvMaterial = null;
 
             if (partDestroyed)
             {

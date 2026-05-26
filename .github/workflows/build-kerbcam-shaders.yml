@@ -1,0 +1,68 @@
+name: build-kerbcam-shaders
+
+# Builds the kerbcam-shaders AssetBundle (KerbcamNightVision shader) for
+# Linux using Unity 2019.4 LTS, matching KSP 1.12.5's engine version.
+# Output is shipped as GameData/Kerbcam/kerbcam-shaders alongside the plugin.
+#
+# Auth: uses buildalon/activate-unity-license@v2 with UNITY_USERNAME +
+# UNITY_PASSWORD repo secrets. Same pattern as build-hullcam-shaders.yml.
+#
+# Trigger: manual via workflow_dispatch, and on push to the shader sources
+# or this workflow file.
+
+on:
+  push:
+    paths:
+      - 'ci/kerbcam-shaders/**'
+      - '.github/workflows/build-kerbcam-shaders.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build kerbcam shader bundle (Linux)
+    runs-on: ubuntu-22.04
+
+    env:
+      UNITY_VERSION: 2019.4.40f1 (ffc62b691db5)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Unity Hub + Editor
+        uses: buildalon/unity-setup@v2
+        with:
+          unity-version: ${{ env.UNITY_VERSION }}
+          version-file: 'None'
+          build-targets: StandaloneLinux64
+          cache-installation: true
+
+      - name: Activate Unity Personal license
+        uses: buildalon/activate-unity-license@v2
+        with:
+          license: 'Personal'
+          username: ${{ secrets.UNITY_USERNAME }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Build kerbcam-shaders AssetBundle
+        working-directory: ci/kerbcam-shaders
+        run: |
+          "$UNITY_EDITOR_PATH" \
+            -batchmode -nographics -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildLinux \
+            -buildTarget Linux64 \
+            -logFile -
+          echo "--- output bundle ---"
+          ls -la Bundles-linux/
+
+      - name: Copy bundle into GameData
+        run: cp ci/kerbcam-shaders/Bundles-linux/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kerbcam-shaders
+          path: GameData/Kerbcam/kerbcam-shaders
+          retention-days: 30
