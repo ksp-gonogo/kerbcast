@@ -9,11 +9,6 @@ Consumers get a high-level RPC surface plus typed event
 subscriptions. The wire-format types are still exported for anyone
 rolling their own transport.
 
-The Rust types in [`sidecar/src/protocol/`](https://github.com/jonpepler/kerbcam/tree/main/sidecar/src/protocol)
-are the source of truth. [typeshare](https://github.com/1Password/typeshare)
-generates `src/__generated__/types.ts` from them, and CI fails
-publishes if the generated file is out of sync.
-
 The Rust crate and this package ship the same SemVer version,
 bumped together by `./scripts/bump-version.sh`.
 
@@ -30,7 +25,7 @@ Hosted on GitHub Packages. In `.npmrc`:
 `secrets.GITHUB_TOKEN` already has it.
 
 ```sh
-pnpm add @jonpepler/kerbcam
+npm add @jonpepler/kerbcam
 ```
 
 ## Use
@@ -96,7 +91,7 @@ controls each part actually supports.
   VDS parts support runtime FoV via `MuMechModuleHullCameraZoom`.
 - `supportsPan`, `panYawMin/Max`, `panPitchMin/Max`. Reserved for the
   planned mod extension that adds steerable mounts. Always `false`
-  on shipping parts. Hide pan UI until it flips.
+  right now.
 - `encoderBitrateBps`, `targetBitrateBps`. Current encoder bitrate
   and the REMB-driven target. They diverge briefly when receivers'
   bandwidth estimates move.

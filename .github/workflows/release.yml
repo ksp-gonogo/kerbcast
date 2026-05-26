@@ -254,7 +254,7 @@ jobs:
           3. Start KSP — kerbcam auto-launches the sidecar on scene load.
 
           ## Assets
-          - \`$(basename ${{ env.RELEASE_ZIP }})\` — complete install tree (plugin + sidecar + shader bundles + settings)
-          - \`Kerbcam.dll\` — plugin DLL only (for manual installs)
+          - \`$(basename ${{ env.RELEASE_ZIP }})\` - complete install tree (plugin + sidecar + shader bundles + settings)
+          - \`Kerbcam.dll\` - plugin DLL only (for manual installs)
 
           > TypeScript SDK \`@jonpepler/kerbcam@${TAG#v}\` published to GitHub Packages."
