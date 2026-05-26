@@ -150,6 +150,7 @@ namespace Kerbcam
         /// </summary>
         private bool _subscribed;
         private bool _disposed;
+        private bool _firstRender = true;
 
         private UniversalAsyncGPUReadbackRequest _pendingRequest;
         private bool _readbackInFlight;
@@ -946,6 +947,11 @@ namespace Kerbcam
                     try
                     {
                         _scaledCam.Render();
+                        if (_firstRender)
+                        {
+                            _firstRender = false;
+                            Debug.Log($"[Kerbcam] cam={FlightId} scaled actualRenderingPath={_scaledCam.actualRenderingPath} (set={_scaledCam.renderingPath})");
+                        }
                     }
                     finally
                     {
