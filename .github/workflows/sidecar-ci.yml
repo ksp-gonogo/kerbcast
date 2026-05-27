@@ -56,8 +56,12 @@ jobs:
       # into the sidecar artifact so deployment doesn't depend on the
       # target host having ffmpeg installed.
       - name: Install ffmpeg + VA-API system libs
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::http::Timeout=60 update && break
+            [ "$attempt" -lt 3 ] && echo "apt-get update failed (attempt $attempt/3), retrying in 15s..." && sleep 15 || exit 1
+          done
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             clang \
