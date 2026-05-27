@@ -13,7 +13,7 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch: {}
 
 permissions:
@@ -30,6 +30,8 @@ jobs:
       HULLCAM_REF: master
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install ffmpeg + VA-API system libs
         run: |
@@ -86,7 +88,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '8.x'
+          dotnet-version: "8.x"
 
       - name: Checkout KSP assemblies
         uses: actions/checkout@v6
@@ -119,14 +121,14 @@ jobs:
         uses: buildalon/unity-setup@v2
         with:
           unity-version: ${{ env.UNITY_VERSION }}
-          version-file: 'None'
+          version-file: "None"
           build-targets: StandaloneLinux64
           cache-installation: true
 
       - name: Activate Unity Personal license
         uses: buildalon/activate-unity-license@v2
         with:
-          license: 'Personal'
+          license: "Personal"
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
@@ -179,7 +181,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: client-sdk/typescript/pnpm-lock.yaml
           registry-url: https://npm.pkg.github.com
-          scope: '@jonpepler'
+          scope: "@jonpepler"
 
       - name: Verify version sync (tag == Cargo.toml == package.json)
         working-directory: ${{ github.workspace }}
@@ -238,23 +240,44 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish --provenance
 
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLIFF_CHANGELOG: ${{ steps.git-cliff.outputs.changelog }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+          {
+            echo "## Installation"
+            echo ""
+            echo "1. Extract \`kerbcam-${TAG}.zip\` into your KSP \`GameData/\` directory."
+            echo "2. Install Hullcam VDS Continued (required)."
+            echo "3. Start KSP and launch a flight with onboard camera parts."
+            echo "4. Go to <ksp-ip>:<port> (configured in settings.cfg) to connect to streams."
+            echo ""
+            echo "## Assets"
+            echo "- \`kerbcam-${TAG}.zip\` — complete install tree (plugin + sidecar + shader bundles + settings)"
+            echo "- \`Kerbcam.dll\` — plugin DLL only (for manual installs)"
+            echo ""
+            echo "> TypeScript SDK \`@jonpepler/kerbcam@${TAG#v}\` published to GitHub Packages."
+            echo ""
+            echo "<details>"
+            echo "<summary>Changelog</summary>"
+            echo ""
+            echo "${CLIFF_CHANGELOG}"
+            echo ""
+            echo "</details>"
+          } > release-notes.md
           gh release create "${TAG}" \
             "${{ env.RELEASE_ZIP }}" \
             Plugin/obj/Release/Kerbcam.dll \
             --title "kerbcam ${TAG}" \
-            --notes "## Installation
-
-          1. Extract \`$(basename ${{ env.RELEASE_ZIP }})\` into your KSP \`GameData/\` directory.
-          2. Install Hullcam VDS Continued (required).
-          3. Start KSP — kerbcam auto-launches the sidecar on scene load.
-
-          ## Assets
-          - \`$(basename ${{ env.RELEASE_ZIP }})\` - complete install tree (plugin + sidecar + shader bundles + settings)
-          - \`Kerbcam.dll\` - plugin DLL only (for manual installs)
-
-          > TypeScript SDK \`@jonpepler/kerbcam@${TAG#v}\` published to GitHub Packages."
+            --notes-file release-notes.md
