@@ -404,7 +404,7 @@ async fn apply_layer_change(
             dc,
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
-                    source: ErrorSource::Sidecar,
+                source: ErrorSource::Sidecar,
             }),
         )
         .await;
@@ -455,7 +455,7 @@ async fn apply_render_size_change(
             dc,
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
-                    source: ErrorSource::Sidecar,
+                source: ErrorSource::Sidecar,
             }),
         )
         .await;
@@ -496,7 +496,7 @@ async fn apply_fov_change(
             dc,
             &ServerMessage::Error(ErrorPayload {
                 message: format!("camera {flight_id} does not support zoom"),
-                    source: ErrorSource::Sidecar,
+                source: ErrorSource::Sidecar,
             }),
         )
         .await;
@@ -518,7 +518,7 @@ async fn apply_fov_change(
             dc,
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
-                    source: ErrorSource::Sidecar,
+                source: ErrorSource::Sidecar,
             }),
         )
         .await;
@@ -580,7 +580,7 @@ async fn apply_pan_change(
             dc,
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
-                    source: ErrorSource::Sidecar,
+                source: ErrorSource::Sidecar,
             }),
         )
         .await;
