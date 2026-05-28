@@ -842,8 +842,8 @@ namespace Kerbcam
                 }
                 if (SupportsPan)
                 {
-                    var panYaw = ParseFloatField(raw, "pan_yaw");
-                    var panPitch = ParseFloatField(raw, "pan_pitch");
+                    var panYaw = ParseFloatField(raw, "panYaw");
+                    var panPitch = ParseFloatField(raw, "panPitch");
                     if (panYaw.HasValue)
                         _panYawTarget = Mathf.Clamp(panYaw.Value, _panCap.YawMin, _panCap.YawMax);
                     if (panPitch.HasValue)
