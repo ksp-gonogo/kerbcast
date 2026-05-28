@@ -304,7 +304,11 @@ function renderTable() {
     // the sidecar's validation bounds.
     const rsTd = document.createElement("td");
     rsTd.className = "zoom";
-    const rs = renderSizeState.get(cam.flightId) ?? { width: cam.maxWidth, height: cam.maxHeight };
+    const rs = renderSizeState.get(cam.flightId) ?? (() => {
+      const w = Math.min(cam.maxWidth, 1024);
+      const h = Math.round(w * cam.maxHeight / cam.maxWidth);
+      return { width: w, height: h - (h & 1) };
+    })();
     const rsSlider = document.createElement("input");
     rsSlider.type = "range";
     rsSlider.min = 128;
@@ -475,7 +479,12 @@ async function refreshCameras() {
       if (!operatorLayers.has(cam.flightId)) operatorLayers.set(cam.flightId, new Set(LAYER_KINDS));
       if (!effectiveLayers.has(cam.flightId)) effectiveLayers.set(cam.flightId, new Set(LAYER_KINDS));
       if (!fovState.has(cam.flightId)) fovState.set(cam.flightId, cam.fov);
-      if (!renderSizeState.has(cam.flightId)) renderSizeState.set(cam.flightId, { width: cam.maxWidth, height: cam.maxHeight });
+      if (!renderSizeState.has(cam.flightId)) {
+        const defaultW = Math.min(cam.maxWidth, 1024);
+        const defaultH = Math.min(cam.maxHeight, Math.round(defaultW * cam.maxHeight / cam.maxWidth));
+        const defaultHEven = defaultH - (defaultH & 1);
+        renderSizeState.set(cam.flightId, { width: defaultW, height: defaultHEven });
+      }
       if (!bitrateState.has(cam.flightId)) bitrateState.set(cam.flightId, { encoderBitrateBps: cam.encoderBitrateBps, targetBitrateBps: cam.targetBitrateBps });
       if (!panYawState.has(cam.flightId)) panYawState.set(cam.flightId, 0);
       if (!panPitchState.has(cam.flightId)) panPitchState.set(cam.flightId, 0);
@@ -542,6 +551,18 @@ async function connect() {
   dc.onopen = () => {
     setChannelStatus("opened, sending hello");
     sendControl({ type: "hello" });
+    // Apply default render sizes so the plugin matches whatever the
+    // UI shows (e.g. after adaptive shedding changed the plugin-side
+    // resolution while disconnected).
+    for (const cam of discovered) {
+      const rs = renderSizeState.get(cam.flightId);
+      if (rs) {
+        sendControl({
+          type: "set-render-size",
+          content: { flightId: cam.flightId, width: rs.width, height: rs.height },
+        });
+      }
+    }
     resetPingTimer();
     renderTable();
   };
