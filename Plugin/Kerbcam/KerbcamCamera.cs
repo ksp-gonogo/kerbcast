@@ -382,6 +382,22 @@ namespace Kerbcam
             SetRenderSize(width, height);
         }
 
+        private static void DumpModelTransforms(Part part)
+        {
+            var sb = new System.Text.StringBuilder();
+            var root = part.FindModelTransform("model");
+            if (root == null) root = part.transform;
+            WalkTransforms(root, 0, sb);
+            Debug.Log($"[Kerbcam] model transforms for {part.name}:\n{sb}");
+        }
+
+        private static void WalkTransforms(Transform t, int depth, System.Text.StringBuilder sb)
+        {
+            sb.Append(' ', depth * 2).Append(t.name).Append('\n');
+            for (int i = 0; i < t.childCount; i++)
+                WalkTransforms(t.GetChild(i), depth + 1, sb);
+        }
+
         // Layered camera triple. Each layer copies the corresponding KSP
         // main flight camera so depth-ordering, clearFlags, cullingMask,
         // and per-layer rendering tricks all inherit correctly. All three
@@ -402,11 +418,15 @@ namespace Kerbcam
             // Resolve the yaw mesh transform before camera setup so we can
             // parent the near camera to it. Must happen here, at rest pose,
             // so InverseTransformPoint reads the unrotated frame correctly.
+            DumpModelTransforms(Hullcam.part);
             if (!string.IsNullOrEmpty(_panCap.YawTransformName))
             {
                 _yawTransform = Hullcam.part.FindModelTransform(_panCap.YawTransformName);
                 if (_yawTransform != null)
+                {
                     _yawRestRot = _yawTransform.localRotation;
+                    Debug.Log($"[Kerbcam] cam={FlightId} yaw transform '{_panCap.YawTransformName}' found, restRot={_yawRestRot}");
+                }
                 else
                     Debug.LogWarning($"[Kerbcam] cam={FlightId} yaw transform '{_panCap.YawTransformName}' not found on {Hullcam.part.name}");
             }
@@ -1023,25 +1043,44 @@ namespace Kerbcam
                 _panYawCurrent = Mathf.MoveTowards(_panYawCurrent, _panYawTarget, maxDelta);
                 _panPitchCurrent = Mathf.MoveTowards(_panPitchCurrent, _panPitchTarget, maxDelta);
 
+                // When yaw and pitch share a single joint (e.g. launchcam's
+                // hc_launchcam), applying them separately would fight — the
+                // second assignment overwrites the first. Apply a single compound
+                // Euler so both axes land in one rotation.
+                bool compoundJoint = _yawTransform != null && _pitchTransform != null
+                    && ReferenceEquals(_yawTransform, _pitchTransform);
+
                 if (_nearCam != null)
                 {
-                    // Positive pan_yaw = camera turns right; positive pan_pitch = up.
-                    // Negate pitch because Unity's X-rotation is positive-down.
-                    // When parented to the yaw joint, the joint's own rotation
-                    // carries the yaw — applying it here too would double it.
-                    float camYaw = _yawTransform != null ? 0f : _panYawCurrent;
-                    _nearCam.transform.localRotation = _baseRotation
-                        * Quaternion.Euler(-_panPitchCurrent, camYaw, 0f);
+                    if (compoundJoint)
+                    {
+                        // Joint carries both axes; near cam stays at rest relative to joint.
+                        _nearCam.transform.localRotation = _baseRotation;
+                    }
+                    else
+                    {
+                        // Positive pan_yaw = camera turns right; positive pan_pitch = up.
+                        // Negate pitch because Unity's X-rotation is positive-down.
+                        // When parented to the yaw joint, the joint's own rotation
+                        // carries the yaw — applying it here too would double it.
+                        float camYaw = _yawTransform != null ? 0f : _panYawCurrent;
+                        _nearCam.transform.localRotation = _baseRotation
+                            * Quaternion.Euler(-_panPitchCurrent, camYaw, 0f);
+                    }
                 }
-                if (_yawTransform != null)
+                if (compoundJoint)
                 {
                     _yawTransform.localRotation = _yawRestRot
-                        * Quaternion.Euler(0f, _panYawCurrent, 0f);
+                        * Quaternion.Euler(-_panPitchCurrent, _panYawCurrent, 0f);
                 }
-                if (_pitchTransform != null)
+                else
                 {
-                    _pitchTransform.localRotation = _pitchRestRot
-                        * Quaternion.Euler(-_panPitchCurrent, 0f, 0f);
+                    if (_yawTransform != null)
+                        _yawTransform.localRotation = _yawRestRot
+                            * Quaternion.Euler(0f, _panYawCurrent, 0f);
+                    if (_pitchTransform != null)
+                        _pitchTransform.localRotation = _pitchRestRot
+                            * Quaternion.Euler(-_panPitchCurrent, 0f, 0f);
                 }
             }
 
