@@ -285,43 +285,16 @@ namespace Kerbcam
             RebuildCameraList(v);
         }
 
-        // Decoupling, docking, fairing jettison and similar structural events
-        // change part counts without firing onPartDestroyed. Dirty the FX
-        // renderer cache on all cameras tracking this vessel so the next
-        // Refresh rebuilds it against the updated part list.
-        private void OnVesselWasModified(Vessel v)
-        {
-            if (v == null) return;
-            foreach (var cam in _cameras)
-            {
-                if (cam.Hullcam != null && cam.Hullcam.vessel == v)
-                    cam.MarkFxRenderersDirty();
-            }
-        }
-
         // GameEvents.onPartDestroyed fires when a Part's GameObject is
         // destroyed (vessel crash, decoupling + physics-range expire, etc).
         // Walk _cameras and dispose any whose Hullcam belongs to this part.
         // DisposeDestroyed writes lifecycle="destroyed" to the info.json
         // tombstone before closing the ring so the sidecar observes the
         // transition, and leaves the info.json on disk for the sidecar.
-        // Also dirty FX renderer caches on remaining cams — the destroyed
-        // part's renderers must be purged from their CB lists.
         private void OnPartDestroyed(Part part)
         {
             if (part == null) return;
-            // Capture the vessel reference before any Dispose calls, since
-            // Hullcam.vessel may become null during destruction.
-            Vessel affectedVessel = null;
-            foreach (var cam in _cameras)
-            {
-                if (cam.Hullcam != null && cam.Hullcam.part == part)
-                {
-                    affectedVessel = cam.Hullcam.vessel;
-                    break;
-                }
-            }
-
+            Vessel affected = null;
             // Iterate backwards so we can remove by index without
             // skipping entries.
             for (int i = _cameras.Count - 1; i >= 0; i--)
@@ -329,22 +302,29 @@ namespace Kerbcam
                 var cam = _cameras[i];
                 if (cam.Hullcam != null && cam.Hullcam.part == part)
                 {
+                    if (affected == null) affected = cam.Hullcam.vessel;
                     Debug.Log($"[Kerbcam] part destroyed — disposing cam={cam.FlightId} ({part.name})");
                     _cameras.RemoveAt(i);
                     cam.DisposeDestroyed();
                 }
             }
+            // Rebuild FX draw lists on the surviving cams of the same vessel so
+            // the destroyed part's renderers don't linger in their CommandBuffers.
+            if (affected != null) MarkFxDirtyForVessel(affected);
+        }
 
-            // Dirty remaining cameras on the same vessel so destroyed part's
-            // renderers are flushed from FX CB lists on next Refresh.
-            if (affectedVessel != null)
-            {
-                foreach (var cam in _cameras)
-                {
-                    if (cam.Hullcam != null && cam.Hullcam.vessel == affectedVessel)
-                        cam.MarkFxRenderersDirty();
-                }
-            }
+        // Decoupling, staging, fairing jettison etc. change a vessel's part set
+        // without firing onPartDestroyed for our tracked part. Rebuild the FX
+        // draw lists so they match the current parts.
+        private void OnVesselWasModified(Vessel v)
+        {
+            if (v != null) MarkFxDirtyForVessel(v);
+        }
+
+        private void MarkFxDirtyForVessel(Vessel v)
+        {
+            foreach (var cam in _cameras)
+                if (cam.Hullcam != null && cam.Hullcam.vessel == v) cam.MarkFxDirty();
         }
 
         // Derive a unique FlightId per Hullcam module on a part. Module 0
@@ -391,6 +371,8 @@ namespace Kerbcam
                     {
                         var partName = part.partInfo?.name ?? string.Empty;
                         var initialLayers = _settings.GetInitialLayers(partName);
+                        var enableFx = _settings.GetEnableAtmosphericFx(partName);
+                        var fxLayers = _settings.GetAtmosphericFxLayers(partName);
                         var (renderW, renderH) = _settings.GetRenderSize(partName);
                         // Camera identity is per-module, not per-part — but
                         // the ring + info + control file names are keyed on
@@ -412,6 +394,8 @@ namespace Kerbcam
                             renderW,
                             renderH,
                             initialLayers,
+                            enableFx,
+                            fxLayers,
                             panCap));
                     }
                     catch (Exception ex)
@@ -761,6 +745,7 @@ namespace Kerbcam
                     sb.Append($"      \"operatorHeight\": {cam.OperatorHeight},\n");
                     sb.Append($"      \"layers\": {LayersToJson(cam.Layers)},\n");
                     sb.Append($"      \"operatorLayers\": {LayersToJson(cam.OperatorLayers)},\n");
+                    sb.Append($"      \"enableAtmosphericFx\": {(cam.EnableFx ? "true" : "false")},\n");
                     sb.Append($"      \"fov\": {cam.Fov.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     sb.Append($"      \"panYaw\": {cam.PanYaw.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     sb.Append($"      \"panPitch\": {cam.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n");
