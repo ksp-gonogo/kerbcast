@@ -26,6 +26,11 @@ namespace Kerbcam
 
         private static readonly int _IntensityId = Shader.PropertyToID("_Intensity");
         private static readonly int _WindDirId = Shader.PropertyToID("_WindDirWorld");
+        private static readonly int _PuffId = Shader.PropertyToID("_PuffDistance");
+
+        // Max outward inflation (metres) at full intensity — tuned C#-side so
+        // the puff amount can be adjusted without a CI shader rebuild.
+        private const float _puffMeters = 0.35f;
 
         // Diagnostics (gated on DebugCameraLogging): how many DrawRenderer calls
         // the CB holds + a throttle so the per-frame state log doesn't spam.
@@ -90,6 +95,7 @@ namespace Kerbcam
             if (_cbDirty) RebuildCommandBuffer(state.Vessel);
 
             _material.SetFloat(_IntensityId, intensity);
+            _material.SetFloat(_PuffId, _puffMeters * intensity); // puffs out as it heats
             _material.SetVector(_WindDirId, state.VelocityWorld.sqrMagnitude > 1e-4f
                 ? state.VelocityWorld.normalized
                 : Vector3.up);

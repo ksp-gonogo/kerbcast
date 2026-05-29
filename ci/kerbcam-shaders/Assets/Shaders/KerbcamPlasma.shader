@@ -16,6 +16,10 @@ Shader "Kerbcam/Plasma"
         _RimPower    ("Rim Power", Range(0.5,8)) = 3
         _StreakScale ("Streak Scale", Float) = 6
         _StreakSpeed ("Streak Speed", Float) = 4
+        // Outward inflation (metres) along vertex normals — makes the sheath
+        // "puff" off the skin so it reads as flowing over the hull. Driven from
+        // C# (scaled by intensity); free perf-wise (a per-vertex offset).
+        _PuffDistance("Puff Distance (m)", Range(0,1)) = 0.2
     }
     SubShader
     {
@@ -38,6 +42,7 @@ Shader "Kerbcam/Plasma"
             float  _RimPower;
             float  _StreakScale;
             float  _StreakSpeed;
+            float  _PuffDistance;
 
             struct v2f
             {
@@ -49,9 +54,14 @@ Shader "Kerbcam/Plasma"
             v2f vert(appdata_base v)
             {
                 v2f o;
-                o.pos = UnityObjectToClipPos(v.vertex);
-                o.worldNormal = UnityObjectToWorldNormal(v.normal);
-                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
+                float3 worldNormal = UnityObjectToWorldNormal(v.normal);
+                float3 worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
+                // Inflate outward along the normal so the sheath sits off the
+                // skin (a halo/flow rather than a decal). Free: no new geometry.
+                worldPos += worldNormal * _PuffDistance;
+                o.pos = mul(UNITY_MATRIX_VP, float4(worldPos, 1.0));
+                o.worldNormal = worldNormal;
+                o.worldPos = worldPos;
                 return o;
             }
 
