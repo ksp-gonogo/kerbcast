@@ -1,24 +1,22 @@
 // kerbcam atmospheric-FX core sheath shader. Drawn additively over the vessel's
-// part renderers (via a CommandBuffer at AfterForwardAlpha), so it composites
-// against the near render's depth — ZTest LEqual gives correct occlusion.
+// part renderers (CommandBuffer at AfterForwardAlpha) so it composites against
+// the near render's depth — correct occlusion, no second camera.
 //
-// P1 placeholder: the *shape* of the final shader (additive, depth-tested,
-// windward + rim + scrolling streaks, intensity-driven) without the visual
-// richness. Tunables are material properties so they can be driven from C#
-// (fast loop) rather than baked (which would need a CI rebuild per tweak).
+// Look: a windward + rim glow, broken up by animated procedural turbulence so it
+// flows/shakes rather than sitting as a smooth shell, inflated off the hull by
+// _PuffDistance, and colour-ramped from pale wind (low intensity) to orange
+// plasma (high). Tunables are material properties driven from C# (fast loop).
 Shader "Kerbcam/Plasma"
 {
     Properties
     {
-        _Color       ("Plasma Color", Color) = (1.0, 0.45, 0.15, 1)
+        _WindColor   ("Wind Colour (low intensity)", Color) = (0.70, 0.85, 1.0, 1)
+        _PlasmaColor ("Plasma Colour (high intensity)", Color) = (1.0, 0.45, 0.15, 1)
         _Intensity   ("Intensity", Range(0,4)) = 0
         _WindDirWorld("Wind Dir (world)", Vector) = (0,1,0,0)
         _RimPower    ("Rim Power", Range(0.5,8)) = 3
-        _StreakScale ("Streak Scale", Float) = 6
-        _StreakSpeed ("Streak Speed", Float) = 4
-        // Outward inflation (metres) along vertex normals — makes the sheath
-        // "puff" off the skin so it reads as flowing over the hull. Driven from
-        // C# (scaled by intensity); free perf-wise (a per-vertex offset).
+        _NoiseScale  ("Turbulence Scale", Float) = 0.15
+        _NoiseSpeed  ("Turbulence Speed", Float) = 3
         _PuffDistance("Puff Distance (m)", Range(0,1)) = 0.2
     }
     SubShader
@@ -36,12 +34,13 @@ Shader "Kerbcam/Plasma"
             #pragma fragment frag
             #include "UnityCG.cginc"
 
-            float4 _Color;
+            float4 _WindColor;
+            float4 _PlasmaColor;
             float  _Intensity;
             float4 _WindDirWorld;
             float  _RimPower;
-            float  _StreakScale;
-            float  _StreakSpeed;
+            float  _NoiseScale;
+            float  _NoiseSpeed;
             float  _PuffDistance;
 
             struct v2f
@@ -57,12 +56,25 @@ Shader "Kerbcam/Plasma"
                 float3 worldNormal = UnityObjectToWorldNormal(v.normal);
                 float3 worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
                 // Inflate outward along the normal so the sheath sits off the
-                // skin (a halo/flow rather than a decal). Free: no new geometry.
+                // skin (a flow/halo, not a decal). Free: no new geometry.
                 worldPos += worldNormal * _PuffDistance;
                 o.pos = mul(UNITY_MATRIX_VP, float4(worldPos, 1.0));
                 o.worldNormal = worldNormal;
                 o.worldPos = worldPos;
                 return o;
+            }
+
+            // Cheap flowing turbulence — layered sines along the wind axis +
+            // lateral, animated. Returns 0..1, contrast-biased into wisps.
+            float turbulence(float3 p, float3 wind, float t)
+            {
+                float along = dot(p, wind) * _NoiseScale;
+                float lat = (p.x + p.z) * _NoiseScale;
+                float n = sin(along * 1.0 + t)
+                        + sin(along * 2.3 - t * 1.7 + lat * 1.5) * 0.6
+                        + sin(lat * 3.1 + t * 2.3) * 0.4;
+                n = n * 0.5 + 0.5;             // ~0..1
+                return saturate(n * 1.5 - 0.25); // sharpen into wisps
             }
 
             fixed4 frag(v2f i) : SV_Target
@@ -73,20 +85,18 @@ Shader "Kerbcam/Plasma"
                 float3 wind = normalize(_WindDirWorld.xyz);
                 float3 viewDir = normalize(_WorldSpaceCameraPos - i.worldPos);
 
-                // Windward surfaces (facing into the airflow) glow most.
                 float windward = saturate(dot(n, wind));
                 windward *= windward;
-
-                // Rim / fresnel edge glow.
                 float rim = pow(1.0 - saturate(dot(n, viewDir)), _RimPower);
 
-                // Streaks: a stripe scrolling along the wind axis.
-                float along = dot(i.worldPos, wind);
-                float streak = 0.5 + 0.5 * sin(along * _StreakScale - _Time.y * _StreakSpeed);
-                streak = lerp(0.6, 1.0, streak);
+                float turb = turbulence(i.worldPos, wind, _Time.y * _NoiseSpeed);
 
-                float glow = (windward * 0.8 + rim * 0.5) * streak * _Intensity;
-                return fixed4(_Color.rgb * glow, 1.0);
+                float base = windward * 0.8 + rim * 0.5;
+                float glow = base * lerp(0.35, 1.2, turb) * _Intensity;
+
+                // Pale wind → orange plasma as intensity (heating) rises.
+                float3 col = lerp(_WindColor.rgb, _PlasmaColor.rgb, saturate(_Intensity));
+                return fixed4(col * glow, 1.0);
             }
             ENDCG
         }

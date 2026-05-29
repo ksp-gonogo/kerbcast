@@ -30,7 +30,10 @@ namespace Kerbcam
 
         // Max outward inflation (metres) at full intensity — tuned C#-side so
         // the puff amount can be adjusted without a CI shader rebuild.
-        private const float _puffMeters = 0.35f;
+        private const float _puffMeters = 0.18f;
+        // Intensity used by ForceAtmosphericFx — a moderate, flight-like value
+        // (not max) so the forced pad preview reads like real supersonic flight.
+        private const float _forcedIntensity = 0.6f;
 
         // Diagnostics (gated on DebugCameraLogging): how many DrawRenderer calls
         // the CB holds + a throttle so the per-frame state log doesn't spam.
@@ -66,7 +69,7 @@ namespace Kerbcam
             if (_material == null || _cam == null) return;
 
             float intensity = KerbcamSettings.ForceAtmosphericFx
-                ? 1f
+                ? _forcedIntensity
                 : ComputeIntensity(state.Mach, state.DynamicPressure);
 
             // Throttled state readout — logged even when intensity is 0, so a
@@ -119,11 +122,19 @@ namespace Kerbcam
             foreach (var part in vessel.parts)
             {
                 if (part == null) continue;
+                // Skip deployable appendages (solar panels, antennas, radiators):
+                // their thin/flat geometry inflates into spikes and shouldn't
+                // carry a sheath.
+                if (part.FindModuleImplementing<ModuleDeployablePart>() != null) continue;
+
                 var renderers = part.GetComponentsInChildren<Renderer>(includeInactive: false);
                 for (int r = 0; r < renderers.Length; r++)
                 {
                     var rend = renderers[r];
                     if (rend == null || !rend.enabled || !rend.gameObject.activeInHierarchy) continue;
+                    // Mesh surfaces only — line/particle/trail/billboard renderers
+                    // produce the stray-spike artifacts when re-drawn inflated.
+                    if (!(rend is MeshRenderer || rend is SkinnedMeshRenderer)) continue;
                     // Re-draw every submesh of the part with our plasma material,
                     // additively over the part's normal render.
                     int subMeshes = rend.sharedMaterials.Length;
