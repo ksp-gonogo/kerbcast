@@ -365,6 +365,24 @@ async fn handle_client_message(
                 }
             }
         }
+        ClientMessage::Subscribe(FlightIdPayload { flight_id })
+        | ClientMessage::Unsubscribe(FlightIdPayload { flight_id }) => {
+            // Stage B (dynamic slot pool) implements the real binding. Until
+            // then, reject clearly so a client probing the dynamic path gets a
+            // signal rather than silence. No shipping client sends these yet.
+            warn!(
+                flight_id,
+                "dynamic subscribe/unsubscribe not yet implemented"
+            );
+            send_server_message(
+                &dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: "dynamic subscribe/unsubscribe not yet implemented".into(),
+                    source: ErrorSource::Sidecar,
+                }),
+            )
+            .await;
+        }
         ClientMessage::Pong => {
             // No-op — the peer is alive by virtue of having sent this.
         }
