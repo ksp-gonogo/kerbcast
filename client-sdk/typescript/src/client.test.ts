@@ -7,6 +7,7 @@ import {
   type KerbcamTransport,
   KerbcamClient,
 } from "./client";
+import { MockSidecar } from "./testing";
 
 interface FakeChannel extends KerbcamDataChannel {
   sent: string[];
@@ -598,5 +599,84 @@ describe("KerbcamClient", () => {
         rafSpy.mockRestore();
       }
     });
+  });
+});
+
+describe("KerbcamClient — dynamic slot subscription", () => {
+  it("subscribe binds a slot and routes its track; unsubscribe clears it", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+
+    await client.subscribe(42);
+    expect(sidecar.lastCommand("subscribe")?.content.flightId).toBe(42);
+    const mid = sidecar.slotMidFor(42);
+    expect(mid).toBeDefined();
+
+    // Mapping known but media not arrived yet → still null.
+    expect(client.camera(42).mediaStream).toBeNull();
+
+    sidecar.deliverTrack(mid as string, {} as MediaStreamTrack);
+    expect(client.camera(42).mediaStream).not.toBeNull();
+
+    await client.unsubscribe(42);
+    expect(client.camera(42).mediaStream).toBeNull();
+  });
+
+  it("reuses a freed slot for a different camera (the switch path)", async () => {
+    const sidecar = new MockSidecar().withSlots(["a"]); // single slot
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    await client.subscribe(1);
+    const mid = sidecar.slotMidFor(1) as string;
+    sidecar.deliverTrack(mid, {} as MediaStreamTrack);
+    expect(client.camera(1).mediaStream).not.toBeNull();
+
+    await client.unsubscribe(1);
+    expect(client.camera(1).mediaStream).toBeNull();
+
+    // The one slot is free again → camera 2 reuses it and inherits its track.
+    await client.subscribe(2);
+    expect(sidecar.slotMidFor(2)).toBe(mid);
+    expect(client.camera(2).mediaStream).not.toBeNull();
+    expect(client.camera(1).mediaStream).toBeNull();
+  });
+
+  it("surfaces a sidecar error when no slot is free", async () => {
+    const sidecar = new MockSidecar().withSlots(["only"]);
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    const errors: { message: string }[] = [];
+    client.on("error", (e) => errors.push(e));
+
+    await client.subscribe(1); // takes the only slot
+    await client.subscribe(2); // no free slot → sidecar error
+    expect(errors.some((e) => /no free slot/.test(e.message))).toBe(true);
   });
 });

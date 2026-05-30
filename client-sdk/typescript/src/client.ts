@@ -122,7 +122,9 @@ export interface KerbcamTransport {
 export interface KerbcamPeer {
   addRecvOnlyTransceiver(): void;
   createDataChannel(label: string): KerbcamDataChannel;
-  onTrack(handler: (track: MediaStreamTrack, idx: number) => void): void;
+  onTrack(
+    handler: (track: MediaStreamTrack, idx: number, mid: string) => void,
+  ): void;
   onStateChange(handler: (state: KerbcamConnectionState) => void): void;
   createOffer(): Promise<string>;
   setLocalDescription(sdp: string): Promise<void>;
@@ -147,11 +149,15 @@ export class BrowserKerbcamTransport implements KerbcamTransport {
   createPeer(iceServers: RTCIceServer[]): KerbcamPeer {
     const pc = new RTCPeerConnection({ iceServers });
     let trackIdx = 0;
-    let onTrack: ((t: MediaStreamTrack, idx: number) => void) | null = null;
+    let onTrack:
+      | ((t: MediaStreamTrack, idx: number, mid: string) => void)
+      | null = null;
     let onStateChange: ((s: KerbcamConnectionState) => void) | null = null;
 
     pc.ontrack = (ev) => {
-      onTrack?.(ev.track, trackIdx++);
+      // ev.transceiver.mid is the stable m-line id the sidecar keys its
+      // SlotMap on; it's set by the time ontrack fires (post-answer).
+      onTrack?.(ev.track, trackIdx++, ev.transceiver.mid ?? "");
     };
     pc.onconnectionstatechange = () => {
       onStateChange?.(mapPeerState(pc.connectionState));
@@ -427,6 +433,14 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
   private _cameras: CameraState[] = [];
   private readonly handles = new Map<number, CameraHandle>();
   private requestedOrder: number[] = [];
+  /** Set when `connect` is given an explicit slot pool. Switches track
+   *  routing from legacy index order to mid-keyed dynamic slots. */
+  private dynamicMode = false;
+  /** Dynamic mode: transceiver mid -> the live track on that slot. */
+  private readonly trackByMid = new Map<string, MediaStreamTrack>();
+  /** Dynamic mode: transceiver mid -> the camera bound to that slot
+   *  (populated by SlotMap — initial bindings announced on Hello). */
+  private readonly flightByMid = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
   private _encoderBackend: string | null = null;
@@ -466,35 +480,47 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
   }
 
   /**
-   * Open the WebRTC peer and subscribe to the given cameras. An
-   * empty array subscribes to every currently-known camera. Idempotent:
-   * calling `connect` while already connected disconnects first.
+   * Open the WebRTC peer and subscribe to cameras. Idempotent: calling
+   * `connect` while already connected disconnects first.
+   *
+   * Two modes:
+   * - **Legacy** (no `opts.slots`): one transceiver per requested camera;
+   *   an empty array subscribes to every currently-known camera. Tracks
+   *   route by m-line index. Unchanged behaviour.
+   * - **Dynamic** (`opts.slots` set): negotiates a pool of `opts.slots`
+   *   recv-only video slots. `requestedCameras` are the *initial*
+   *   subscription bound to the first slots; spare slots are filled at
+   *   runtime via {@link subscribe}. Tracks route by transceiver mid
+   *   (the sidecar announces bindings via SlotMap), so switching a slot's
+   *   camera needs no renegotiation.
    */
-  async connect(requestedCameras: number[] = []): Promise<void> {
+  async connect(
+    requestedCameras: number[] = [],
+    opts: { slots?: number } = {},
+  ): Promise<void> {
     this.disconnect();
     this.setState("connecting");
     this.requestedOrder = [...requestedCameras];
+    this.dynamicMode = opts.slots !== undefined;
+    this.trackByMid.clear();
+    this.flightByMid.clear();
 
     const peer = this.transport.createPeer(
       this.cfg.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
     );
     this.peer = peer;
 
-    // One recv-only transceiver per requested camera so SDP carries
-    // the right number of m-sections. The sidecar accepts an empty
-    // request and infers the full set; in that case we add a single
-    // transceiver and the sidecar's answer will negotiate the rest.
-    const transceiverCount = Math.max(this.requestedOrder.length, 1);
-    for (let i = 0; i < transceiverCount; i++) {
+    // Slot-pool size = the recv-only transceivers we offer. Dynamic mode
+    // uses the explicit pool size (spares subscribable at runtime); legacy
+    // uses one per requested camera (>=1).
+    const slotCount = this.dynamicMode
+      ? Math.max(opts.slots ?? 0, 1)
+      : Math.max(this.requestedOrder.length, 1);
+    for (let i = 0; i < slotCount; i++) {
       peer.addRecvOnlyTransceiver();
     }
 
-    peer.onTrack((track, idx) => {
-      const flightId = this.requestedOrder[idx];
-      if (flightId === undefined) return;
-      const stream = new MediaStream([track]);
-      this.getOrCreateHandle(flightId)._setMediaStream(stream);
-    });
+    peer.onTrack((track, idx, mid) => this.handleTrack(track, idx, mid));
 
     peer.onStateChange((s) => {
       this.setState(s);
@@ -518,13 +544,16 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
     await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
     await peer.waitForIceComplete();
 
+    const body: { sdp: string; cameras: number[]; slots?: number } = {
+      sdp: peer.localSdp(),
+      cameras: this.requestedOrder,
+    };
+    if (this.dynamicMode) body.slots = slotCount;
+
     const res = await fetch(`http://${this.cfg.host}:${this.cfg.port}/offer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sdp: peer.localSdp(),
-        cameras: this.requestedOrder,
-      }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       this.setState("failed");
@@ -532,10 +561,12 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
     }
     const answer = (await res.json()) as { sdp: string; cameras: number[] };
     await peer.setRemoteAnswer(answer.sdp);
-    // If the sidecar dropped any unknown flight_ids, replace our
-    // requested order with what's actually wired so track-index
-    // mapping stays aligned.
-    this.requestedOrder = answer.cameras;
+    // Legacy mode routes by index → requestedOrder, so realign to what the
+    // sidecar actually wired. Dynamic mode routes by mid via SlotMap (initial
+    // bindings arrive on Hello), so the answer's camera list isn't used.
+    if (!this.dynamicMode) {
+      this.requestedOrder = answer.cameras;
+    }
   }
 
   disconnect(): void {
@@ -552,6 +583,24 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
    */
   camera(flightId: number): KerbcamCameraHandle {
     return this.getOrCreateHandle(flightId);
+  }
+
+  /**
+   * Dynamic mode only: bind a camera to a free slot on the already-connected
+   * peer. The camera's stream appears on its handle once the sidecar answers
+   * with a SlotMap; the sidecar emits an `error` event if no slot is free. No
+   * renegotiation.
+   */
+  async subscribe(flightId: number): Promise<void> {
+    await this._send({ type: "subscribe", content: { flightId } });
+  }
+
+  /**
+   * Dynamic mode only: release a camera's slot. Its handle's `mediaStream`
+   * goes null once the sidecar confirms with a SlotMap.
+   */
+  async unsubscribe(flightId: number): Promise<void> {
+    await this._send({ type: "unsubscribe", content: { flightId } });
   }
 
   /**
@@ -585,6 +634,30 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
       this.handles.set(flightId, handle);
     }
     return handle;
+  }
+
+  private handleTrack(
+    track: MediaStreamTrack,
+    idx: number,
+    mid: string,
+  ): void {
+    if (this.dynamicMode) {
+      // Store the slot's track keyed by mid; bind it to a camera if (or once)
+      // a SlotMap names this mid. Track and SlotMap can arrive in either
+      // order — whichever lands second triggers the binding.
+      this.trackByMid.set(mid, track);
+      const flightId = this.flightByMid.get(mid);
+      if (flightId !== undefined) {
+        this.getOrCreateHandle(flightId)._setMediaStream(
+          new MediaStream([track]),
+        );
+      }
+      return;
+    }
+    // Legacy: m-line index maps to the requested camera list.
+    const flightId = this.requestedOrder[idx];
+    if (flightId === undefined) return;
+    this.getOrCreateHandle(flightId)._setMediaStream(new MediaStream([track]));
   }
 
   private handleServerMessage(raw: string): void {
@@ -621,6 +694,30 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
           msg.content.state,
         );
         this.emit("cameras-change", this._cameras);
+        break;
+      }
+      case "slot-map": {
+        const { mid, flightId } = msg.content;
+        const prev = this.flightByMid.get(mid);
+        if (flightId == null) {
+          // Slot freed — the camera that held it loses its stream.
+          if (prev !== undefined) {
+            this.getOrCreateHandle(prev)._setMediaStream(null);
+          }
+          this.flightByMid.delete(mid);
+        } else {
+          // A switch (a different camera held this slot) clears the old one.
+          if (prev !== undefined && prev !== flightId) {
+            this.getOrCreateHandle(prev)._setMediaStream(null);
+          }
+          this.flightByMid.set(mid, flightId);
+          const track = this.trackByMid.get(mid);
+          if (track) {
+            this.getOrCreateHandle(flightId)._setMediaStream(
+              new MediaStream([track]),
+            );
+          }
+        }
         break;
       }
       case "adaptive-shed":
