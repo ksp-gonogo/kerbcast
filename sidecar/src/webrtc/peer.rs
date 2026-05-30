@@ -357,6 +357,10 @@ async fn handle_client_message(
             )
             .await;
             send_camera_snapshot(&registry, &dc).await;
+            // Announce the initial slot bindings so the client maps its
+            // initial cameras to slots by mid — uniform with dynamic
+            // Subscribe, no reliance on the answer's camera order.
+            send_initial_slot_maps(&slots, &dc).await;
         }
         ClientMessage::SetLayers(SetLayersPayload { flight_id, layers }) => {
             apply_layer_change(&registry, &dc, flight_id, layers).await;
@@ -528,6 +532,33 @@ async fn handle_unsubscribe(
             &ServerMessage::SlotMap(SlotMapPayload {
                 mid,
                 flight_id: None,
+            }),
+        )
+        .await;
+    }
+}
+
+/// Announce the currently-bound slots to a freshly-opened control channel so
+/// the client maps its initial cameras to slots by mid (the same mechanism
+/// dynamic Subscribe uses). Idle slots and slots without a negotiated mid are
+/// skipped.
+async fn send_initial_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Arc<RTCDataChannel>) {
+    let bindings: Vec<(String, u32)> = {
+        let guard = slots.lock().await;
+        guard
+            .iter()
+            .filter_map(|s| match (&s.mid, s.bound) {
+                (Some(mid), Some(flight_id)) => Some((mid.clone(), flight_id)),
+                _ => None,
+            })
+            .collect()
+    };
+    for (mid, flight_id) in bindings {
+        send_server_message(
+            dc,
+            &ServerMessage::SlotMap(SlotMapPayload {
+                mid,
+                flight_id: Some(flight_id),
             }),
         )
         .await;
