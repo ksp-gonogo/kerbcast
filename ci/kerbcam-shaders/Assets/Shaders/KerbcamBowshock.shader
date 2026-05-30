@@ -45,6 +45,13 @@ Shader "Kerbcam/Bowshock"
             float  _ScrollSpeed;
             float  _PlasmaOnset;
 
+            // KSP FXCamera globals — published process-wide by the stock
+            // aero-FX system. Provide the same tuned plasma noise texture
+            // and real-heating colour stock plasma uses, so the bowshock
+            // visually agrees with KSP's own FX in colour and animation.
+            sampler2D _FXMainTex;
+            float4    _FXColor;     // .rgb stock heating colour, .a heating hint
+
             struct appdata
             {
                 float4 vertex : POSITION;
@@ -83,20 +90,26 @@ Shader "Kerbcam/Bowshock"
                 float ndv = abs(dot(n, viewDir));
                 float rim = pow(1.0 - saturate(ndv), _RimPower);
 
-                // Slow rearward scroll along the cone axis. Local +Z is the
-                // apex direction (apex points along velocity); subtracting
-                // _Time.y * speed moves the wave toward -Z, i.e. toward the
-                // vessel — air rushing through the shock front.
-                float scroll = sin(i.localPos.z * 1.5 - _Time.y * _ScrollSpeed);
-                float shimmer = 0.85 + 0.15 * scroll;
+                // Sample KSP's tuned plasma noise texture, scrolled along the
+                // cone axis toward -Z (toward the vessel — air rushing through
+                // the shock front). Visual continuity with stock plasma.
+                float2 fxUv = float2(i.localPos.x * 0.3 + i.localPos.y * 0.2,
+                                     i.localPos.z * 0.4 - _Time.y * _ScrollSpeed * 0.15);
+                float fxNoise = tex2D(_FXMainTex, fxUv).r;
+                float shimmer = 0.7 + 0.6 * fxNoise;
 
                 // Soft interior glow so the cone isn't pure silhouette; the
                 // rim still dominates by a wide margin.
                 float baseGlow = 0.18;
                 float glow = (baseGlow + rim) * shimmer * _Intensity;
 
+                // Wind→plasma colour ramp, then tinted toward KSP's stock
+                // heating colour (_FXColor) at high real heating. Stays
+                // wind-white when stock heating is cold.
                 float plasmaShift = smoothstep(_PlasmaOnset, 1.0, _Intensity);
-                float3 col = lerp(_WindColor.rgb, _PlasmaColor.rgb, plasmaShift);
+                float3 baseCol = lerp(_WindColor.rgb, _PlasmaColor.rgb, plasmaShift);
+                float fxHeat = saturate(_FXColor.a);
+                float3 col = lerp(baseCol, baseCol * (0.4 + _FXColor.rgb * 1.6), fxHeat * plasmaShift);
                 return fixed4(col * glow, 1.0);
             }
             ENDCG

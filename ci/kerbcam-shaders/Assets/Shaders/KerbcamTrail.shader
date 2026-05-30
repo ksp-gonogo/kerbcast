@@ -53,6 +53,13 @@ Shader "Kerbcam/Trail"
             float  _FadePower;
             float  _PlasmaOnset;
 
+            // KSP FXCamera globals — published process-wide by the stock
+            // aero-FX system. Provide the same tuned plasma noise texture
+            // and real-heating colour stock plasma uses, so the trail
+            // visually agrees with KSP's own FX in colour and animation.
+            sampler2D _FXMainTex;
+            float4    _FXColor;
+
             struct v2f
             {
                 float4 pos : SV_POSITION;
@@ -76,20 +83,15 @@ Shader "Kerbcam/Trail"
                 float lenFade = pow(saturate(1.0 - i.uv.y), _FadePower);
 
                 // Scroll speed scales with intensity — faster wake at higher
-                // mach, per spec. Streaks move toward uv.y=1 (the tail) as
-                // time advances: sample uv.y - t.
+                // mach. Sample KSP's tuned plasma noise scrolled along the
+                // tube length (uv.y - t) so streaks visibly pull toward the
+                // tail. _CrossFreq tiles the texture around the tube.
                 float scrollT = _Time.y * _ScrollSpeed * (0.5 + _Intensity);
-                float along = i.uv.y * _StreakFreq - scrollT;
-
-                // Layered sines across uv.x so the streaks break up around
-                // the tube rather than read as concentric bands.
-                float across = sin(i.uv.x * _CrossFreq * 6.28318)
-                             + sin(i.uv.x * _CrossFreq * 9.7 + 1.3) * 0.6;
-                float streakRaw = sin(along) * 0.6
-                                + sin(along * 2.1 + across * 0.8) * 0.4;
-                // Map to [0,1], pinch into wisps.
-                float streaks = saturate(0.5 + 0.55 * streakRaw);
-                streaks = pow(streaks, 1.6);
+                float2 fxUv = float2(i.uv.x * _CrossFreq,
+                                     i.uv.y * _StreakFreq * 0.05 - scrollT * 0.12);
+                float fxNoise = tex2D(_FXMainTex, fxUv).r;
+                float streaks = saturate(fxNoise);
+                streaks = pow(streaks, 1.4); // sharpen into wisps
 
                 // Soft radial pulse toward the front so the head reads as a
                 // hot core, not a uniform tube.
@@ -97,9 +99,13 @@ Shader "Kerbcam/Trail"
 
                 float glow = (streaks * 0.85 + head * 0.4) * lenFade * _Intensity;
 
-                // Same wind-white → plasma-orange convention as KerbcamPlasma.
+                // Wind→plasma colour ramp, then tinted toward KSP's stock
+                // heating colour at high real heating. Stays wind-white when
+                // FXColor.a is low (no real heating yet).
                 float plasmaShift = smoothstep(_PlasmaOnset, 1.0, _Intensity);
-                float3 col = lerp(_WindColor.rgb, _PlasmaColor.rgb, plasmaShift);
+                float3 baseCol = lerp(_WindColor.rgb, _PlasmaColor.rgb, plasmaShift);
+                float fxHeat = saturate(_FXColor.a);
+                float3 col = lerp(baseCol, baseCol * (0.4 + _FXColor.rgb * 1.6), fxHeat * plasmaShift);
 
                 return fixed4(col * glow, 1.0);
             }

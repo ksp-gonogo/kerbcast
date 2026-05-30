@@ -36,6 +36,11 @@ Shader "Kerbcam/Ember"
             float  _Intensity;
             float  _SoftEdge;
 
+            // KSP FXCamera global — RGB is the stock heating colour, alpha
+            // hints at real heating intensity. Lightly tints the per-particle
+            // colour so embers warm visibly with stock heating.
+            float4 _FXColor;
+
             // Particle-system shaders need the per-particle COLOR semantic
             // (appdata_base does NOT include it). We declare appdata_t
             // explicitly with the standard particle vertex layout and pass
@@ -73,11 +78,15 @@ Shader "Kerbcam/Ember"
                 float a = saturate(1.0 - smoothstep(_SoftEdge, 0.5, r));
 
                 // Per-particle colour (from ColorOverLifetime) tinted by the
-                // material's _Color, brightened by _Intensity. Additive blend
-                // means the final RGB is the emitted brightness; we encode
-                // the alpha-shaped falloff into RGB rather than relying on
-                // the alpha channel (Blend One One ignores src alpha).
-                fixed3 rgb = i.color.rgb * _Color.rgb * (a * i.color.a * _Intensity);
+                // material's _Color and lightly warmed by KSP's stock heating
+                // colour (_FXColor) so sparks read hotter as real heating
+                // climbs. Additive blend means the final RGB is the emitted
+                // brightness; we encode the alpha-shaped falloff into RGB
+                // rather than relying on the alpha channel (Blend One One
+                // ignores src alpha).
+                float fxHeat = saturate(_FXColor.a);
+                fixed3 tint = lerp(fixed3(1, 1, 1), _FXColor.rgb * 1.4, fxHeat * 0.6);
+                fixed3 rgb = i.color.rgb * _Color.rgb * tint * (a * i.color.a * _Intensity);
                 return fixed4(rgb, a);
             }
             ENDCG

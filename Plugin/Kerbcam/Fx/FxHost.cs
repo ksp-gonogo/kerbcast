@@ -71,7 +71,9 @@ namespace Kerbcam
             switch (layer)
             {
                 case AtmoFxLayers.Core: return new CoreSheathEffect();
-                // Bowshock / Trail / Embers: TODO (tasks #10-#12)
+                case AtmoFxLayers.Bowshock: return new BowshockEffect();
+                case AtmoFxLayers.Trail: return new TrailEffect();
+                case AtmoFxLayers.Embers: return new EmbersEffect();
                 default: return null;
             }
         }
