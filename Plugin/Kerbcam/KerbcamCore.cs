@@ -601,6 +601,12 @@ namespace Kerbcam
         private void TrySuppressFxCamera()
         {
             if (FXCamera.Instance == null) return;
+            // Keep FXCamera alive when atmospheric FX is on — our plasma shader
+            // samples its globals (_FXDepthMap, _LightDirection0, _FXColor) and
+            // they only refresh while FXCamera renders. The "wind without ship"
+            // artifact in the main view is moot during throttle because the
+            // operator is watching kerbcam streams, not the main view.
+            if (_settings.EnableAtmosphericFx) return;
             var fxCam = FXCamera.Instance.GetComponent<Camera>();
             if (fxCam == null) return;
             fxCam.enabled = false;
@@ -623,11 +629,16 @@ namespace Kerbcam
                 if (galaxy != null) galaxy.enabled = false;
                 // FXCamera is a separate singleton MonoBehaviour with its
                 // own Camera component (NOT in FlightCamera.cameras array)
-                // that renders aero/re-entry FX via a velocity-based
-                // shader. Without disabling it the operator sees "wind
-                // effects + ship silhouette" while throttled — the wind
-                // renders, the ship doesn't (because Camera 00 is off).
-                if (FXCamera.Instance != null)
+                // that renders aero/re-entry FX via a velocity-based shader.
+                // Without disabling it the operator sees "wind effects + ship
+                // silhouette" in the *main view* while throttled — but when
+                // EnableAtmosphericFx is on, kerbcam's plasma shader samples
+                // FXCamera's globals (_FXDepthMap, _LightDirection0, _FXColor)
+                // and needs them refreshed, so we deliberately leave FXCamera
+                // alive in that case. The main-view artifact doesn't matter
+                // because the operator is watching kerbcam streams, not the
+                // main view, while throttled.
+                if (FXCamera.Instance != null && !_settings.EnableAtmosphericFx)
                 {
                     var fxCam = FXCamera.Instance.GetComponent<Camera>();
                     if (fxCam != null)
