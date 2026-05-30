@@ -111,9 +111,11 @@ namespace Kerbcam
                 : state.Vessel.transform.up;
             // Offset the shell forward (along wind) so its bulk sits in front
             // of the vessel — visibly telegraphs the direction of motion.
-            Vector3 com = state.Vessel.CoM + windDir * _vesselExtent * 0.2f;
-            float rLateral = _vesselExtent * 1.3f;
-            float rAxial = _vesselExtent * 1.8f;
+            // Loose extents so the shell stands clearly off the hull rather
+            // than hugging it.
+            Vector3 com = state.Vessel.CoM + windDir * _vesselExtent * 0.25f;
+            float rLateral = _vesselExtent * 1.7f;
+            float rAxial = _vesselExtent * 2.4f;
             Vector3 scale = new Vector3(rLateral, rLateral, rAxial);
             Quaternion rot = Quaternion.LookRotation(windDir);
             Matrix4x4 m = Matrix4x4.TRS(com, rot, scale);

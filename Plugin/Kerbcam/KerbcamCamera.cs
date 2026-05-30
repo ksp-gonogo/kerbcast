@@ -487,6 +487,10 @@ namespace Kerbcam
             // wastes cycles or incorrectly culls objects in our cameras'
             // frusta. JustReadTheInstructions does this on every layer.
             _nearCam.useOcclusionCulling = false;
+            // Add kerbcam's FX-only layer so ember ParticleSystems (and any
+            // future GameObject-based effects on AtmoFxConstants.Layer) render
+            // on kerbcam streams without leaking into the main flight view.
+            _nearCam.cullingMask |= AtmoFxConstants.LayerMask;
             nearGo.AddComponent<CanvasHack>();
 
             // Scaled layer — planet terrain + atmosphere at scaled-space scale.

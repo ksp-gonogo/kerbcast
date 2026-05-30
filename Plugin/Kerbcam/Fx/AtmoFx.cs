@@ -10,6 +10,17 @@ using UnityEngine;
 
 namespace Kerbcam
 {
+    // Shared layer index for kerbcam-FX GameObjects (e.g. the ember
+    // ParticleSystem). KSP's main flight cameras don't cull this layer by
+    // default, so anything on it renders ONLY on kerbcam's near-cams (which
+    // explicitly OR the layer into their cullingMask in SetCameras).
+    // Pick a high index that KSP itself doesn't use.
+    internal static class AtmoFxConstants
+    {
+        public const int Layer = 22;
+        public const int LayerMask = 1 << 22;
+    }
+
     // Individually-toggleable FX layers. Bits map 1:1 to settings.cfg tokens
     // (CORE, BOWSHOCK, TRAIL, EMBERS) and to each effect's IAtmoFxEffect.Layer.
     [System.Flags]

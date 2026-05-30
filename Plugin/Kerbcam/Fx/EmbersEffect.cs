@@ -70,6 +70,10 @@ namespace Kerbcam
                 : nearCam.transform;
 
             _root = new GameObject("Kerbcam FX Embers");
+            // KSP's main flight cameras don't cull AtmoFxConstants.Layer, so
+            // pinning the particles to it confines them to kerbcam streams
+            // (the near cam's mask is OR'd with this layer in SetCameras).
+            _root.layer = AtmoFxConstants.Layer;
             _root.transform.SetParent(parent, worldPositionStays: false);
             _root.transform.localPosition = Vector3.zero;
             _root.transform.localRotation = Quaternion.identity;

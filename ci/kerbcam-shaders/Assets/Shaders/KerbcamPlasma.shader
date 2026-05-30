@@ -186,17 +186,29 @@ Shader "Kerbcam/Plasma"
                 // Silhouette rim accent.
                 float rim = pow(1.0 - saturate(dot(n, viewDir)), _RimPower);
 
-                // Streaks: lateral high-frequency pattern scrolling along the
-                // wind axis so they read as pulling rearward off the front.
+                // Streaks: ridges that run PARALLEL to the wind axis (along
+                // the direction of motion), as actual airflow does. For
+                // ridges to run along wind on a surface that goes AROUND the
+                // wind axis, the pattern must vary AZIMUTHALLY around that
+                // axis — at any constant azimuth angle, the surface
+                // coordinate runs parallel to wind. So we project the world
+                // normal into the plane perpendicular to wind and read its
+                // angle in that plane, then sin(angle * N) gives N ridges
+                // spaced evenly around the axis.
                 float3 helper = abs(wind.y) < 0.99 ? float3(0,1,0) : float3(1,0,0);
-                float3 latAxis = normalize(cross(wind, helper));
+                float3 e1 = normalize(cross(wind, helper));
+                float3 e2 = cross(wind, e1);
+                float3 nPerp = n - dot(n, wind) * wind;
+                float angle = atan2(dot(nPerp, e2), dot(nPerp, e1));
+
+                // Scroll envelope along the wind axis so streaks visibly flow
+                // toward -wind (rearward, relative to motion) as t advances.
                 float along = dot(i.worldPos, wind);
-                float lat = dot(i.worldPos, latAxis);
                 float t = _Time.y * _StreakSpeed;
-                float streaks = sin(lat * 5.0) + sin(lat * 9.3 + 1.1) * 0.6;
+                float streaks = sin(angle * 8.0) + sin(angle * 13.0 + 1.1) * 0.5;
                 streaks = saturate(streaks * 0.5 + 0.5);
-                streaks *= sin(along * 0.5 + t) * 0.5 + 0.5;
-                streaks = pow(streaks, 1.3);
+                streaks *= sin(along * 0.6 + t) * 0.5 + 0.5;
+                streaks = pow(streaks, 1.2);
 
                 // Wrap heat from KSP's depth map — per-fragment "how far
                 // downstream of the vessel's windward surface am I?" — gives
@@ -207,12 +219,13 @@ Shader "Kerbcam/Plasma"
                 // Combined glow. Wrap term is the dominant contribution when
                 // FXCamera is publishing useful data; otherwise the shader
                 // falls back to the windFront+rim+streak look for pad iteration.
-                float base = windFront * 0.5 + rim * 0.25;
-                float surface = base + streaks * 0.4 * windFront;
+                float base = windFront * 0.55 + rim * 0.3;
+                float surface = base + streaks * 0.8 * windFront;
                 float fxHeating = saturate(_FXColor.a); // soft hint
-                float wrapContribution = wrap * (0.6 + 0.4 * fxHeating);
+                float wrapContribution = wrap * (0.7 + 0.5 * fxHeating);
 
-                float glow = (surface + wrapContribution) * _Intensity * 0.5;
+                // Brighter overall — prior 0.5 multiplier washed too much.
+                float glow = (surface + wrapContribution) * _Intensity * 0.85;
 
                 // Stay wind-white through moderate intensities; plasma-orange
                 // only blends in above _PlasmaOnset (reserved for hard reentry).

@@ -52,6 +52,13 @@ namespace Kerbcam
         // Throttled state log gate so the per-frame diagnostic doesn't spam.
         private float _lastLogTime;
 
+        // Cached half-extent of the vessel from CoM — refreshed on vessel
+        // change. Used to scale + position the cone so it sits just past the
+        // vessel's leading edge rather than at a fixed CoM offset (which
+        // placed it inside nose-mounted cameras on small vessels and far
+        // ahead on large stacks).
+        private float _vesselExtent = 5f;
+
         public bool TryInitialize(Camera nearCam)
         {
             _cam = nearCam;
@@ -68,6 +75,19 @@ namespace Kerbcam
             // Bowshock placement reads state.Vessel each Render, and the mesh
             // is vessel-independent — no per-vessel rebuild needed.
             _vessel = vessel;
+            // Cache the vessel's furthest-part distance from CoM so we can
+            // place the cone just past the leading edge and scale it to suit.
+            _vesselExtent = 5f;
+            if (vessel != null && vessel.parts != null)
+            {
+                Vector3 com = vessel.CoM;
+                foreach (var part in vessel.parts)
+                {
+                    if (part == null) continue;
+                    float d = Vector3.Distance(part.transform.position, com);
+                    if (d > _vesselExtent) _vesselExtent = d;
+                }
+            }
         }
 
         public void Render(in FxFrameState state)
@@ -116,13 +136,19 @@ namespace Kerbcam
             }
 
             Vector3 windDir = vel.normalized;
-            // Crude size proxy: more parts → larger vessel → place the cone
-            // farther ahead so it doesn't visually intersect the hull. Capped
-            // at 30 parts so the shock doesn't wander to infinity for big stacks.
-            float offset = 8f + Mathf.Min(state.Vessel.parts.Count, 30) * 0.5f;
+            // Place the cone JUST past the vessel's leading edge along wind and
+            // scale it relative to vessel extent — so a small probe gets a
+            // small cone and a big stack gets a proportionally large one,
+            // without ever sitting inside a nose-mounted camera. The cone mesh
+            // is built at 6 m × 3 m (length × base radius); scale shrinks/grows
+            // it. Apex (+Z) points along velocity.
+            float coneScale = Mathf.Clamp(_vesselExtent * 0.35f / 3f, 0.25f, 1.5f);
+            // Offset by vessel extent + half the (now-scaled) cone length so the
+            // base ring sits just past the windward extreme of the vessel.
+            float offset = _vesselExtent + 3f * coneScale; // 3f ≈ scaled half-length
             Vector3 worldPos = state.Vessel.CoM + windDir * offset;
-            Quaternion rot = Quaternion.LookRotation(windDir); // apex (+Z) points along velocity
-            Matrix4x4 m = Matrix4x4.TRS(worldPos, rot, Vector3.one);
+            Quaternion rot = Quaternion.LookRotation(windDir);
+            Matrix4x4 m = Matrix4x4.TRS(worldPos, rot, Vector3.one * coneScale);
 
             _material.SetFloat(_IntensityId, intensity);
 
