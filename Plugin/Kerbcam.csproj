@@ -72,6 +72,12 @@
       <HintPath>$(KspManaged)/UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <!-- ParticleSystem types — used by Fx/EmbersEffect.cs for the ember
+         particle system attached to the near camera. -->
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>$(KspManaged)/UnityEngine.ParticleSystemModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="UnityEngine.TextRenderingModule">
       <HintPath>$(KspManaged)/UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>False</Private>

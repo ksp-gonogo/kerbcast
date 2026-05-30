@@ -20,14 +20,13 @@
 // Scaled layer's Render() call. Per-layer shedding is now expressed as
 // "skip camera.Render() this tick" rather than toggling enabled.
 //
-// Atmospheric FX (wind streaks, re-entry plasma): replicated by setting
-// the same replacement shader on _nearCam that KSP's FXCamera sets on the
-// live near view. The effect is drawn during _nearCam's own scene render
-// (RenderType-matched shader replacement, not a separate pass), so it
-// composites against Near's own depth and point of view — no second camera,
-// no frustum to diverge, no occlusion mismatch. The vessel-relative depth
-// feed (_FXDepthMap et al.) is published process-wide by FXCamera's
-// OnPreRender, so our cam samples it for free. See ApplyAtmosphericFx.
+// Atmospheric FX: kerbcam's own pluggable plasma overlay (the stock FXCamera
+// effect couldn't be faithfully reproduced offscreen — see
+// atmospheric_fx_parked.md). A per-camera FxHost owns a set of IAtmoFxEffect
+// layers (core sheath, bowshock, trail, embers). The core effect attaches a
+// CommandBuffer to _nearCam at AfterForwardAlpha that re-draws the vessel's
+// part renderers with our additive plasma material — inside the near render, so
+// it composites against the near depth (correct occlusion). See Fx/.
 
 using System;
 using System.Collections.Generic;
@@ -100,15 +99,12 @@ namespace Kerbcam
         // Whether this camera should replicate KSP's atmospheric FX. Set from
         // settings.cfg at construction; flipped at runtime by the control file.
         private bool _enableFx;
-        // Whether the FX replacement shader is currently bound to _nearCam.
-        // Tracked so ApplyAtmosphericFx is idempotent and only resets when the
-        // operator turns FX off (a missing FXCamera.Instance is a retry, not
-        // a reset).
-        private bool _fxShaderApplied;
-        // One-shot guard so a never-ready FXCamera.Instance is logged once
-        // (not every tick) — makes a silent "FX on but nothing happens"
-        // failure visible in KSP.log.
-        private bool _fxWaitLogged;
+        // Pluggable atmospheric-FX host for this camera. Owns the enabled FX
+        // effects (core sheath, bowshock, …); each effect renders into the near
+        // pass. Null until SetCameras builds it.
+        private FxHost _fxHost;
+        // Which FX layers this camera runs (subject to the _enableFx master).
+        private AtmoFxLayers _fxLayers;
         private RenderTexture _captureRt;
         private RenderTexture _readbackRt; // depth=0, GL_TEXTURE_2D-clean
         private Texture2D _scratchTex;
@@ -206,6 +202,7 @@ namespace Kerbcam
             int renderHeight,
             CameraLayers initialLayers,
             bool enableAtmosphericFx,
+            AtmoFxLayers fxLayers,
             PanCapability panCap = default)
         {
             Hullcam = hullcam;
@@ -220,6 +217,7 @@ namespace Kerbcam
             _operatorLayers = initialLayers;
             _layers = initialLayers;
             _enableFx = enableAtmosphericFx;
+            _fxLayers = fxLayers;
 
             // Zoom capability: the zoom subclass `MuMechModuleHullCameraZoom`
             // carries cameraFoVMin / cameraFoVMax fields the base module
@@ -489,6 +487,10 @@ namespace Kerbcam
             // wastes cycles or incorrectly culls objects in our cameras'
             // frusta. JustReadTheInstructions does this on every layer.
             _nearCam.useOcclusionCulling = false;
+            // Add kerbcam's FX-only layer so ember ParticleSystems (and any
+            // future GameObject-based effects on AtmoFxConstants.Layer) render
+            // on kerbcam streams without leaking into the main flight view.
+            _nearCam.cullingMask |= AtmoFxConstants.LayerMask;
             nearGo.AddComponent<CanvasHack>();
 
             // Scaled layer — planet terrain + atmosphere at scaled-space scale.
@@ -622,62 +624,73 @@ namespace Kerbcam
                     $"galaxy=src:0x{srcGalaxyMask:X8}/ours:0x{_galaxyCam.cullingMask:X8}");
             }
 
-            // Bind the atmospheric-FX replacement shader if enabled (no-op /
-            // retry-next-tick when FXCamera.Instance isn't up yet).
-            ApplyAtmosphericFx();
+            // Build the pluggable atmospheric-FX host for the near camera. The
+            // effective layer set folds the master toggle in (off → no effects,
+            // a genuine no-op). Each effect owns its own rendering surface.
+            _fxHost = new FxHost(_nearCam);
+            _fxHost.SetEnabledLayers(EffectiveFxLayers());
+            _fxHost.OnVesselChanged(Hullcam?.vessel);
         }
 
-        // Bind or release the atmospheric-FX replacement shader on _nearCam to
-        // match _enableFx. Called from SetCameras and every Refresh tick (cheap
-        // — idempotent via _fxShaderApplied). Uses the same shader FXCamera
-        // sets on the live near view: shader replacement draws the wind effect
-        // during _nearCam's own render, sampling the process-wide _FXDepthMap
-        // globals FXCamera publishes. A null FXCamera.Instance is a retry (it
-        // loads alongside the flight scene), not a reset.
-        private void ApplyAtmosphericFx()
-        {
-            if (_nearCam == null) return;
+        // Master gate folded into the layer set: FX off ⇒ no layers ⇒ no effects.
+        private AtmoFxLayers EffectiveFxLayers() => _enableFx ? _fxLayers : AtmoFxLayers.None;
 
-            if (_enableFx)
-            {
-                if (_fxShaderApplied) return;
-                var fx = FXCamera.Instance;
-                var shaders = fx != null ? fx.ReplacementShaders : null;
-                if (shaders == null || shaders.Length == 0)
-                {
-                    if (!_fxWaitLogged)
-                    {
-                        Debug.Log($"[Kerbcam] cam={FlightId} atmospheric FX enabled but FXCamera.Instance/ReplacementShaders not ready — retrying each tick");
-                        _fxWaitLogged = true;
-                    }
-                    return;
-                }
-                // LOD 0. FXCamera's own shaderLOD tracks AERO_FX_QUALITY; if the
-                // operator runs a higher quality the streams may differ slightly
-                // from the main view. Revisit after the Deck probe (Risk #2/LOD).
-                _nearCam.SetReplacementShader(shaders[0], "RenderType");
-                _fxShaderApplied = true;
-                // Log the whole array once (not gated — fires once per cam, no
-                // spam). The names + count settle the design doc's Risk #2 —
-                // what RenderTypes the replacement covers — in a single Deck run.
-                var names = string.Join(", ", shaders.Select(s => s != null ? s.name : "<null>").ToArray());
-                Debug.Log($"[Kerbcam] cam={FlightId} atmospheric FX shader applied (LOD0='{shaders[0]?.name}'); ReplacementShaders[{shaders.Length}] = {names}");
-            }
-            else if (_fxShaderApplied)
-            {
-                _nearCam.ResetReplacementShader();
-                _fxShaderApplied = false;
-                _fxWaitLogged = false;
-                Debug.Log($"[Kerbcam] cam={FlightId} atmospheric FX shader reset (disabled)");
-            }
+        // Build this frame's FX inputs from the vessel's flight state. Effects
+        // derive their own intensities from these.
+        private FxFrameState BuildFxFrameState()
+        {
+            var v = Hullcam != null ? Hullcam.vessel : null;
+            Vector3 vel = v != null ? (Vector3)v.srf_velocity : Vector3.zero;
+            float mach = v != null ? (float)v.mach : 0f;
+            float q = v != null ? (float)v.dynamicPressurekPa : 0f;
+
+            // Prefer KSP's published aero direction (_LightDirection0) when
+            // meaningful — it's the same vector FXCamera uses internally and
+            // is physics-driven from the actual flight state. Falling through
+            // to the vessel's srf_velocity if FXCamera isn't publishing
+            // anything yet (early in flight init, or in vacuum). This makes
+            // every effect (core, bowshock, trail, embers) wind-driven by the
+            // game's own aero solver without each shader having to sample
+            // globals independently.
+            //
+            // IMPORTANT SIGN: AerodynamicsFX.cs (line 411 of the decompile)
+            // sets `fxCamera.effectDirection = -velocity`, so _LightDirection0
+            // is the AIRFLOW direction (the direction the air is blowing,
+            // i.e. opposite of the vessel's motion). Our state.VelocityWorld
+            // convention is the vessel's velocity direction, so negate.
+            Vector3 fxDir = Shader.GetGlobalVector(_LightDirection0Id);
+            if (fxDir.sqrMagnitude > 0.01f)
+                vel = -fxDir;
+
+            // Debug override beats both: pretend the vessel is moving in this
+            // world-space direction so motion-dependent shader paths can be
+            // exercised on the pad. Pair with ForceAtmosphericFx.
+            if (KerbcamSettings.DebugWindDirection.sqrMagnitude > 0.0001f)
+                vel = KerbcamSettings.DebugWindDirection;
+
+            return new FxFrameState(v, _nearCam, vel, mach, q, Time.deltaTime, Time.time);
+        }
+
+        // Cached shader ID for FXCamera's published wind direction global.
+        private static readonly int _LightDirection0Id = Shader.PropertyToID("_LightDirection0");
+
+        /// <summary>
+        /// Turn atmospheric-FX replication on or off at runtime. Re-syncs the
+        /// host's effective layer set; takes effect next frame. Called by
+        /// PollControlFile on operator flips.
+        /// </summary>
+        public void SetEnableAtmosphericFx(bool enabled)
+        {
+            _enableFx = enabled;
+            _fxHost?.SetEnabledLayers(EffectiveFxLayers());
         }
 
         /// <summary>
-        /// Turn atmospheric-FX replication on or off at runtime. Idempotent;
-        /// the actual shader bind/release happens on the next Refresh tick via
-        /// ApplyAtmosphericFx. Called by PollControlFile on operator flips.
+        /// Rebuild FX per-vessel state (the effects' draw lists) — called by
+        /// KerbcamCore on part destruction / vessel modification so stale part
+        /// renderers don't linger in an effect's CommandBuffer.
         /// </summary>
-        public void SetEnableAtmosphericFx(bool enabled) => _enableFx = enabled;
+        public void MarkFxDirty() => _fxHost?.OnVesselChanged(Hullcam != null ? Hullcam.vessel : null);
 
         // Periodic cullingMask diff between our cams and their KSP
         // source cameras. Catches the case where KSP mutates the
@@ -1158,7 +1171,13 @@ namespace Kerbcam
                         var r = body.scaledBody?.GetComponent<Renderer>();
                         if (r == null) continue;
                         bool wasEnabled = r.enabled;
-                        float fade = r.material.GetFloat(_fadeAltitudeId);
+                        // Guard the read: some scaled-body materials (e.g. the
+                        // sun, mod-added bodies) lack _FadeAltitude. GetFloat on
+                        // a missing property logs an error every body, every cam,
+                        // every frame — thousands/sec. Default to 1 (no fade).
+                        float fade = r.material.HasProperty(_fadeAltitudeId)
+                            ? r.material.GetFloat(_fadeAltitudeId)
+                            : 1f;
                         if (!wasEnabled || fade < 1f)
                         {
                             _faderOverrides.Add(new FaderState { Renderer = r, WasEnabled = wasEnabled, OriginalFade = fade });
@@ -1216,13 +1235,12 @@ namespace Kerbcam
                     }
                 }
 
-                // Bind/release the FX replacement shader to match _enableFx
-                // before _nearCam.Render(). Idempotent and cheap; also retries
-                // the bind if FXCamera.Instance wasn't ready at construction.
-                ApplyAtmosphericFx();
-
                 if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
                 {
+                    // FX effects update materials and (re)attach their command
+                    // buffers before the render; the near render then executes
+                    // those CBs (e.g. the core sheath at AfterForwardAlpha).
+                    _fxHost?.Render(BuildFxFrameState());
                     _nearCam.Render();
                 }
 
@@ -1337,8 +1355,10 @@ namespace Kerbcam
                 catch (Exception ex) { UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} CameraFilter.Deactivate failed: {ex.Message}"); }
                 _cameraFilter = null;
             }
-            // Destroying the near-cam GameObject reclaims its replacement-shader
-            // binding — no explicit ResetReplacementShader needed.
+            // Tear down FX effects (detach their CBs, release materials) before
+            // destroying the camera they're attached to.
+            _fxHost?.Dispose();
+            _fxHost = null;
             if (_nearCam != null) UnityEngine.Object.Destroy(_nearCam.gameObject);
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);

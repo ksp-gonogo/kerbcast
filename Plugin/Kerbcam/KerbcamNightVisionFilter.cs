@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using UnityEngine;
 
 namespace Kerbcam
@@ -21,30 +20,19 @@ namespace Kerbcam
             _attempted = true;
             try
             {
-                var bundlePath = Path.Combine(
-                    KSPUtil.ApplicationRootPath,
-                    "GameData", "Kerbcam", "kerbcam-shaders");
-                if (!File.Exists(bundlePath))
+                // Shares the one kerbcam-shaders bundle via KerbcamFxAssets — a
+                // second independent AssetBundle.LoadFromFile on the same file
+                // returns null ("already loaded"), so all callers route here.
+                _material = KerbcamFxAssets.LoadMaterial("KerbcamNightVision");
+                if (_material != null)
                 {
-                    Debug.LogWarning("[Kerbcam] kerbcam-shaders bundle not found at " + bundlePath +
-                        "; falling back to HullcamVDS NightVision filter");
-                    return null;
+                    _material.SetFloat("_Gain", 4.0f);
+                    Debug.Log("[Kerbcam] KerbcamNightVision shader loaded from bundle");
                 }
-                var bundle = AssetBundle.LoadFromFile(bundlePath);
-                if (bundle == null)
+                else
                 {
-                    Debug.LogWarning("[Kerbcam] AssetBundle.LoadFromFile returned null for kerbcam-shaders");
-                    return null;
+                    Debug.LogWarning("[Kerbcam] KerbcamNightVision unavailable; falling back to HullcamVDS filter");
                 }
-                var shader = bundle.LoadAsset<Shader>("KerbcamNightVision");
-                if (shader == null)
-                {
-                    Debug.LogWarning("[Kerbcam] KerbcamNightVision shader not found in bundle");
-                    return null;
-                }
-                _material = new Material(shader) { name = "KerbcamNightVision" };
-                _material.SetFloat("_Gain", 4.0f);
-                Debug.Log("[Kerbcam] KerbcamNightVision shader loaded from bundle");
             }
             catch (Exception ex)
             {

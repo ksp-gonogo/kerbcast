@@ -31,6 +31,10 @@
 //                       Sets the initial layer mask for the camera on
 //                       attach; operator can still override at runtime
 //                       via POST /cameras/{id}/layers.
+//   EnableAtmosphericFx — per-camera override (true/false) for atmospheric
+//                       FX replication. Overrides the top-level default
+//                       either direction; operator can flip at runtime
+//                       via the control file's enableAtmosphericFx.
 //
 // Per-camera Width / Height overrides aren't supported yet — the
 // sidecar still opens all rings at the global max dims. Plumbing
@@ -58,6 +62,16 @@ namespace Kerbcam
         public int Height { get; private set; } = 576;
         public bool AutoSpawnSidecar { get; private set; } = true;
         public bool EnableAdaptiveShed { get; private set; } = true;
+
+        // Master toggle for kerbcam's own atmospheric FX (a pluggable overlay
+        // — see atmospheric_fx_parked.md for why the stock-FX replication was
+        // abandoned). Default OFF; set true (or per-camera) to opt in.
+        public bool EnableAtmosphericFx { get; private set; } = false;
+
+        // Which FX layers are active when the master is on — individually
+        // toggleable. settings.cfg token list: CORE, BOWSHOCK, TRAIL, EMBERS
+        // (or ALL). Defaults to ALL. Per-camera override via the Camera node.
+        public AtmoFxLayers AtmosphericFxLayers { get; private set; } = AtmoFxLayers.All;
 
         // Apply Hullcam VDS's per-part shader filters (NightVision green
         // grain, MovieTime film effect, CRT/TV scanlines, etc — 9 modes
@@ -105,6 +119,20 @@ namespace Kerbcam
         // without needing a back-ref to the settings instance.
         public static bool DebugCameraLogging { get; private set; } = false;
 
+        // Debug: force atmospheric-FX intensity to full regardless of mach /
+        // dynamic pressure, so the effect renders even on the pad. Used to
+        // verify the FX *renders* independent of the flight-state gating. Off
+        // by default — leave off for normal play.
+        public static bool ForceAtmosphericFx { get; private set; } = false;
+
+        // Debug: override the vessel's surface velocity (world space) used to
+        // drive FX direction — wind-aligned streaks, bowshock placement, trail
+        // orientation, ember drift. Zero (default) → real srf_velocity. Pair
+        // with ForceAtmosphericFx to test motion-dependent shader behaviour on
+        // the pad without flying. Magnitude should be > 1 so velocity-gates in
+        // effects don't trip. settings.cfg syntax: `DebugWindDirection = 100, 0, 0`.
+        public static Vector3 DebugWindDirection { get; private set; } = Vector3.zero;
+
         // Default for the per-save ThrottleMainScreen Difficulty Setting
         // when a save is loaded for the first time. After that the
         // value stored in the save file wins; settings.cfg changes
@@ -129,6 +157,14 @@ namespace Kerbcam
         // cameras without an override use the global Width × Height.
         private readonly Dictionary<string, (int, int)> _renderSize =
             new Dictionary<string, (int, int)>();
+        // Per-PartName atmospheric-FX override. Present only when a Camera
+        // node sets EnableAtmosphericFx; absent cameras use the global default.
+        private readonly Dictionary<string, bool> _atmosphericFx =
+            new Dictionary<string, bool>();
+        // Per-PartName FX-layer override. Present only when a Camera node sets
+        // AtmosphericFxLayers; absent cameras use the global default.
+        private readonly Dictionary<string, AtmoFxLayers> _atmosphericFxLayers =
+            new Dictionary<string, AtmoFxLayers>();
 
         /// <summary>
         /// Initial layer mask for a part. Falls back to All if no override
@@ -157,6 +193,34 @@ namespace Kerbcam
             return (Width, Height);
         }
 
+        /// <summary>
+        /// Whether a part's near camera should replicate atmospheric FX.
+        /// A per-PartName override (either direction) wins over the global
+        /// EnableAtmosphericFx default. Operator can still flip it at runtime
+        /// via the control file's enableAtmosphericFx field.
+        /// </summary>
+        public bool GetEnableAtmosphericFx(string partName)
+        {
+            if (!string.IsNullOrEmpty(partName) && _atmosphericFx.TryGetValue(partName, out var v))
+            {
+                return v;
+            }
+            return EnableAtmosphericFx;
+        }
+
+        /// <summary>
+        /// Which FX layers a part's camera should run. Per-PartName override
+        /// wins over the global AtmosphericFxLayers default.
+        /// </summary>
+        public AtmoFxLayers GetAtmosphericFxLayers(string partName)
+        {
+            if (!string.IsNullOrEmpty(partName) && _atmosphericFxLayers.TryGetValue(partName, out var v))
+            {
+                return v;
+            }
+            return AtmosphericFxLayers;
+        }
+
         public static KerbcamSettings Load()
         {
             var settings = new KerbcamSettings();
@@ -183,11 +247,15 @@ namespace Kerbcam
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyBool(node, "EnableAdaptiveShed", v => settings.EnableAdaptiveShed = v);
+            ApplyBool(node, "EnableAtmosphericFx", v => settings.EnableAtmosphericFx = v);
+            ApplyString(node, "AtmosphericFxLayers", v => settings.AtmosphericFxLayers = ParseAtmoFxLayers(v));
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
             ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
+            ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
+            ApplyVector3(node, "DebugWindDirection", v => DebugWindDirection = v);
             // Static slots so KerbcamGameParameters (constructed by
             // KSP before our plugin instance loads) can pick up the
             // seed values. Settings.cfg is the source of truth for
@@ -218,6 +286,19 @@ namespace Kerbcam
                 {
                     settings._initialLayers[partName] = ParseLayers(layersRaw);
                 }
+                var fxRaw = camNode.GetValue("EnableAtmosphericFx");
+                if (!string.IsNullOrEmpty(fxRaw))
+                {
+                    if (bool.TryParse(fxRaw.Trim(), out bool fxVal))
+                        settings._atmosphericFx[partName] = fxVal;
+                    else
+                        Debug.LogWarning($"[Kerbcam] settings.cfg: Camera '{partName}' EnableAtmosphericFx='{fxRaw}' is not a bool; ignoring");
+                }
+                var fxLayersRaw = camNode.GetValue("AtmosphericFxLayers");
+                if (!string.IsNullOrEmpty(fxLayersRaw))
+                {
+                    settings._atmosphericFxLayers[partName] = ParseAtmoFxLayers(fxLayersRaw);
+                }
                 // Per-camera Width/Height overrides must be even (H.264
                 // chroma sampling) and <= the global Width/Height (the
                 // ring's allocated capacity). Either field defaults to the
@@ -243,6 +324,27 @@ namespace Kerbcam
             var camCount = settings._initialLayers.Count;
             Debug.Log($"[Kerbcam] settings loaded: bind={settings.HttpBind} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
             return settings;
+        }
+
+        // Parse the AtmosphericFxLayers token list (CORE, BOWSHOCK, TRAIL,
+        // EMBERS, ALL). An empty/all-invalid list means "no FX layers" — which
+        // is a legitimate operator choice (master on but every layer off), so
+        // unlike ParseLayers we return None rather than falling back to All.
+        private static AtmoFxLayers ParseAtmoFxLayers(string raw)
+        {
+            var mask = AtmoFxLayers.None;
+            foreach (var tok in raw.Split(','))
+            {
+                var t = tok.Trim();
+                if (t.Equals("CORE", System.StringComparison.OrdinalIgnoreCase)) mask |= AtmoFxLayers.Core;
+                else if (t.Equals("BOWSHOCK", System.StringComparison.OrdinalIgnoreCase)) mask |= AtmoFxLayers.Bowshock;
+                else if (t.Equals("TRAIL", System.StringComparison.OrdinalIgnoreCase)) mask |= AtmoFxLayers.Trail;
+                else if (t.Equals("EMBERS", System.StringComparison.OrdinalIgnoreCase)) mask |= AtmoFxLayers.Embers;
+                else if (t.Equals("ALL", System.StringComparison.OrdinalIgnoreCase)) mask |= AtmoFxLayers.All;
+                else if (!string.IsNullOrEmpty(t))
+                    Debug.LogWarning($"[Kerbcam] settings.cfg: unknown FX layer '{t}', skipping");
+            }
+            return mask;
         }
 
         private static CameraLayers ParseLayers(string raw)
@@ -295,6 +397,25 @@ namespace Kerbcam
             if (string.IsNullOrEmpty(raw)) return;
             if (bool.TryParse(raw.Trim(), out bool v)) set(v);
             else Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' is not a bool; using default");
+        }
+
+        // Parses three comma-separated floats: `x, y, z`.
+        private static void ApplyVector3(ConfigNode node, string key, System.Action<Vector3> set)
+        {
+            var raw = node.GetValue(key);
+            if (string.IsNullOrEmpty(raw)) return;
+            var parts = raw.Split(',');
+            if (parts.Length != 3)
+            {
+                Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' must be three comma-separated floats; using default");
+                return;
+            }
+            if (float.TryParse(parts[0].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float x) &&
+                float.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float y) &&
+                float.TryParse(parts[2].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float z))
+                set(new Vector3(x, y, z));
+            else
+                Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' contains a non-float component; using default");
         }
     }
 }
