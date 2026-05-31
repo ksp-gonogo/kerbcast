@@ -23,7 +23,14 @@ Shader "Kerbcam/Trail"
         _ScrollSpeed ("Scroll Speed", Float) = 3.0
         _StreakFreq  ("Streak Frequency (along)", Float) = 18.0
         _CrossFreq   ("Streak Frequency (around)", Float) = 6.0
-        _FadePower   ("Tail Fade Power", Range(0.5,8)) = 2.2
+        _FadePower   ("Tail Fade Power", Range(0.5,8)) = 3.2
+        // Brightness ceiling — caps the trail's peak output so a maxed-out
+        // intensity doesn't paint a solid wall in front of the camera. The
+        // wake should read as a moving texture, not a filled colour.
+        _Brightness  ("Brightness Ceiling", Range(0.1, 1.5)) = 0.55
+        // Streak contrast: higher = more wisp-like, more dark gaps between
+        // streaks; lower = more uniform glow.
+        _StreakContrast ("Streak Contrast", Range(1.0, 4.0)) = 2.4
         // Plasma colour only blends in above this intensity (reserved for
         // heavy reentry); below it stays wind-white.
         _PlasmaOnset ("Plasma Onset", Range(0,1)) = 0.85
@@ -51,6 +58,8 @@ Shader "Kerbcam/Trail"
             float  _StreakFreq;
             float  _CrossFreq;
             float  _FadePower;
+            float  _Brightness;
+            float  _StreakContrast;
             float  _PlasmaOnset;
 
             // KSP FXCamera globals — published process-wide by the stock
@@ -90,14 +99,22 @@ Shader "Kerbcam/Trail"
                 float2 fxUv = float2(i.uv.x * _CrossFreq,
                                      i.uv.y * _StreakFreq * 0.05 - scrollT * 0.12);
                 float fxNoise = tex2D(_FXMainTex, fxUv).r;
-                float streaks = saturate(fxNoise);
-                streaks = pow(streaks, 1.4); // sharpen into wisps
+                // Sharpen into wispy streaks — _StreakContrast controls how
+                // hard the dark/bright gap is. Combined with a second
+                // octave scrolled at half speed for some sub-streak detail.
+                float streaks = pow(saturate(fxNoise), _StreakContrast);
+                float fxNoise2 = tex2D(_FXMainTex, float2(i.uv.x * _CrossFreq * 0.5,
+                                                          i.uv.y * _StreakFreq * 0.07 - scrollT * 0.06)).r;
+                streaks = max(streaks, pow(saturate(fxNoise2), _StreakContrast) * 0.6);
 
                 // Soft radial pulse toward the front so the head reads as a
                 // hot core, not a uniform tube.
                 float head = pow(saturate(1.0 - i.uv.y * 1.4), 2.0);
 
-                float glow = (streaks * 0.85 + head * 0.4) * lenFade * _Intensity;
+                // Brightness held in by _Brightness so even at _Intensity=1
+                // the trail's peak fragment doesn't paint a wall.
+                float glow = (streaks * 0.85 + head * 0.4) * lenFade
+                             * saturate(_Intensity) * _Brightness;
 
                 // Wind→plasma colour ramp, then tinted toward KSP's stock
                 // heating colour at high real heating. Stays wind-white when
