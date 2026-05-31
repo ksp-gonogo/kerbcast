@@ -57,6 +57,11 @@ Shader "Kerbcam/Plasma"
         _Intensity         ("Intensity",        Range(0, 4))   = 0
         _FxState           ("FxState (cond->reentry)", Range(0, 1)) = 0
         _WindDirWorld      ("Wind Dir Fallback (world; vessel velocity dir)", Vector) = (0, 0, 1, 0)
+        // Multiplier on the strip-side spread (sideMid / sideTip in emitStrip).
+        // 1.0 = original tight ribbons; >1 puffs the trail out laterally so it
+        // reads more as a sheath than a line. Default 1.6 gives a clearly
+        // visible "wind around the vessel" without losing trail definition.
+        _FxRadiusMul       ("FX Radius Multiplier (lateral spread)", Range(0.5, 4.0)) = 1.6
         // NOTE: _FxLength / _FXWobble / _FXFalloff are KSP-published globals.
         // Deliberately NOT in Properties — putting a uniform in Properties
         // gives it per-material storage that overrides Shader.SetGlobal* on
@@ -92,6 +97,7 @@ Shader "Kerbcam/Plasma"
             float  _FxLength;
             float  _FXWobble;
             float  _FXFalloff;
+            float  _FxRadiusMul;
 
             // KSP FXCamera globals (published process-wide by the stock aero-FX
             // system every frame FXCamera renders). All come "free".
@@ -216,11 +222,20 @@ Shader "Kerbcam/Plasma"
 
                 // Side spread: widen toward the tip. Cross product between
                 // the airflow and the edge gives a sideways normal in the
-                // plane perpendicular to airflow.
+                // plane perpendicular to airflow. When the edge is nearly
+                // parallel to airflow (long thin parts: engine bells, ladders,
+                // antenna booms) the cross product is degenerate — that
+                // produced the off-to-the-side "stray flare" artifact on
+                // high-mach reentry. Detect and skip.
                 float3 edge = wpB - wpA;
-                float3 side = cross(windDir, normalize(edge + 1e-4));
-                float sideMid = 0.15 * baseLen;
-                float sideTip = 0.45 * baseLen;
+                float3 edgeN = normalize(edge + 1e-4);
+                float3 side = cross(windDir, edgeN);
+                float sideLen2 = dot(side, side);
+                if (sideLen2 < 0.04) return;   // edge < ~12° off airflow — skip
+                side *= rsqrt(sideLen2);       // normalise so widths are absolute, not angle-dependent
+                float radiusMul = max(_FxRadiusMul, 0.5);
+                float sideMid = 0.15 * baseLen * radiusMul;
+                float sideTip = 0.45 * baseLen * radiusMul;
 
                 // Per-vertex perpendicular wobble — driven off _FXWobble so the
                 // tuning lives in the stock published value when present.
