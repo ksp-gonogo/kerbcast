@@ -27,7 +27,7 @@ Shader "Kerbcam/Bowshock"
         _WindColor   ("Wind Colour (low intensity)", Color) = (0.85, 0.92, 1.0, 1)
         _PlasmaColor ("Plasma Colour (high intensity)", Color) = (1.0, 0.45, 0.15, 1)
         _Intensity   ("Intensity", Range(0,4)) = 0
-        _RimPower    ("Rim Power", Range(0.5,12)) = 4.0
+        _RimPower    ("Rim Power", Range(0.5,12)) = 3.0
         _ScrollSpeed ("Scroll Speed", Float) = 1.5
         // Plasma colour only blends in above this intensity (reserved for
         // heavy reentry); below it stays wind-white. Matches KerbcamPlasma.
@@ -117,10 +117,14 @@ Shader "Kerbcam/Bowshock"
 
                 // Fresnel-style silhouette glow. abs(dot()) keeps the rim
                 // correct on the backside since Cull Off draws both faces.
+                // _RimPower 3 widens the rim band so off-axis (external)
+                // views can read a coherent silhouette curve, not just a
+                // hair-thin grazing edge. Face dampener lighter so the
+                // interior surface stays visible.
                 float ndv = abs(dot(n, viewDir));
                 float rim = pow(1.0 - saturate(ndv), _RimPower);
                 float face = pow(saturate(ndv), 2.0);
-                float faceFade = 1.0 - face * 0.75;
+                float faceFade = 1.0 - face * 0.45;
 
                 // Near-camera distance fade — when a fragment is closer than
                 // _NearFadeDist the contribution drops to 0 by the time it
@@ -140,9 +144,9 @@ Shader "Kerbcam/Bowshock"
                 // rim still dominates by a wide margin. Total brightness is
                 // capped so even at peak fresnel * peak intensity the cone
                 // can't paint the frame as a wash.
-                float baseGlow = 0.08;
+                float baseGlow = 0.15;
                 float raw = (baseGlow + rim * apexFade) * shimmer * faceFade * nearFade;
-                float glow = saturate(raw * 0.7) * _Intensity;
+                float glow = saturate(raw * 0.6) * _Intensity;
 
                 // Wind→plasma colour ramp, then tinted toward KSP's stock
                 // heating colour (_FXColor) at high real heating. Stays
