@@ -108,28 +108,26 @@ Shader "Kerbcam/Ember"
             // Emit one camera-aligned billboard quad at world position centre
             // with the given half-size in world units. life01 is passed
             // through to the fragment for the lifecycle colour blend.
+            //
+            // Billboard math via view-space offsets: transform centre to
+            // view space, then add the half-size in the view-X / view-Y
+            // axes (which are screen X / Y by construction). Avoids the
+            // matrix-layout ambiguity of picking world camera basis vectors
+            // out of UNITY_MATRIX_V directly.
             void emitQuad(float3 centre, float halfSize, float life01,
                           inout TriangleStream<g2f> stream)
             {
-                // Screen-aligned billboarding: derive camera right/up in
-                // world space from UNITY_MATRIX_V. Row 0 is +X (right),
-                // row 1 is +Y (up). Negate row 2 (=forward in view) if
-                // you need forward, not needed here.
-                float3 camRight = float3(UNITY_MATRIX_V[0].x, UNITY_MATRIX_V[1].x, UNITY_MATRIX_V[2].x);
-                float3 camUp    = float3(UNITY_MATRIX_V[0].y, UNITY_MATRIX_V[1].y, UNITY_MATRIX_V[2].y);
-                float3 r = camRight * halfSize;
-                float3 u = camUp * halfSize;
-
+                float4 viewCenter = mul(UNITY_MATRIX_V, float4(centre, 1.0));
                 g2f o;
                 o.life01 = life01;
 
-                o.pos = mul(UNITY_MATRIX_VP, float4(centre - r - u, 1.0));
+                o.pos = mul(UNITY_MATRIX_P, viewCenter + float4(-halfSize, -halfSize, 0, 0));
                 o.quadUV = float2(0, 0); stream.Append(o);
-                o.pos = mul(UNITY_MATRIX_VP, float4(centre + r - u, 1.0));
+                o.pos = mul(UNITY_MATRIX_P, viewCenter + float4( halfSize, -halfSize, 0, 0));
                 o.quadUV = float2(1, 0); stream.Append(o);
-                o.pos = mul(UNITY_MATRIX_VP, float4(centre - r + u, 1.0));
+                o.pos = mul(UNITY_MATRIX_P, viewCenter + float4(-halfSize,  halfSize, 0, 0));
                 o.quadUV = float2(0, 1); stream.Append(o);
-                o.pos = mul(UNITY_MATRIX_VP, float4(centre + r + u, 1.0));
+                o.pos = mul(UNITY_MATRIX_P, viewCenter + float4( halfSize,  halfSize, 0, 0));
                 o.quadUV = float2(1, 1); stream.Append(o);
                 stream.RestartStrip();
             }
@@ -152,13 +150,13 @@ Shader "Kerbcam/Ember"
                 float triWind = max(wf0, max(wf1, wf2));
                 if (triWind < 0.05) return;
 
-                // Triangle centroid in world space — the spark's emission
+                // Triangle triCentroid in world space — the spark's emission
                 // anchor (ablation point on the heated surface).
-                float3 centroid = (input[0].worldPos + input[1].worldPos + input[2].worldPos) / 3.0;
+                float3 triCentroid = (input[0].worldPos + input[1].worldPos + input[2].worldPos) / 3.0;
 
                 // Per-triangle pseudo-random seeds for variation.
-                float seedA = hash13(centroid * 7.3);
-                float seedB = hash13(centroid * 4.1 + 11.7);
+                float seedA = hash13(triCentroid * 7.3);
+                float seedB = hash13(triCentroid * 4.1 + 11.7);
 
                 // Maximum extrusion distance along airflow — scales with the
                 // KSP-published _FxLength and our _Intensity. Embers can be
@@ -176,11 +174,11 @@ Shader "Kerbcam/Ember"
                 // Random lateral jitter so sparks don't all sit dead-centre.
                 float3 jitterAxis = normalize(input[1].worldPos - input[0].worldPos + float3(1e-4, 0, 0));
                 float3 jitterAxis2 = cross(jitterAxis, windDir);
-                float jitterA = (hash13(centroid * 3.7) - 0.5) * 0.08 * fxLen;
-                float jitterB = (hash13(centroid * 5.9) - 0.5) * 0.08 * fxLen;
+                float jitterA = (hash13(triCentroid * 3.7) - 0.5) * 0.08 * fxLen;
+                float jitterB = (hash13(triCentroid * 5.9) - 0.5) * 0.08 * fxLen;
 
-                float3 posA = centroid + windDir * distA + jitterAxis * jitterA;
-                float3 posB = centroid + windDir * distB + jitterAxis2 * jitterB;
+                float3 posA = triCentroid + windDir * distA + jitterAxis * jitterA;
+                float3 posB = triCentroid + windDir * distB + jitterAxis2 * jitterB;
 
                 // Size shrinks with lifecycle (hot sparks bigger, cool dimmer).
                 float sizeA = _SparkSize * lerp(1.0, 0.4, life01_a);
