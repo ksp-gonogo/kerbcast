@@ -358,6 +358,33 @@ namespace Kerbcam
 
             if (vessel == null) return;
 
+            // If main-screen throttling is currently active, the KSP source
+            // cameras (Camera 00, Camera ScaledSpace, GalaxyCamera) are
+            // disabled. KerbcamCamera.SetCameras() locates them via
+            // Camera.allCameras which only enumerates ENABLED cameras —
+            // so SetCameras() would skip CopyFrom and our per-camera
+            // Unity Camera components would inherit Unity's defaults
+            // (cullingMask = ~0, no source-transform parenting). That
+            // produces the "command pod interior + black sky" symptom
+            // operators have seen on flight-scene reload / quickload,
+            // when onVesselChange fires AFTER Awake's initial
+            // ApplyMainScreenThrottle and re-runs SetCameras against the
+            // now-disabled sources.
+            //
+            // Temporarily restore the source cameras so SetCameras sees
+            // a fully-initialised render stack, then re-apply the
+            // throttle once the rebuild is complete. The restore/apply
+            // pair captures whatever state KSP currently considers
+            // canonical (e.g. cullingMask updates from other mods,
+            // post-IVA-exit state), not whatever stale snapshot we last
+            // disabled from.
+            bool wasThrottled = _mainCamerasDisabled;
+            if (wasThrottled)
+            {
+                Debug.Log("[Kerbcam] rebuild: temporarily restoring main screen so SetCameras sees enabled source cameras");
+                RestoreMainScreen();
+            }
+
             foreach (var part in vessel.parts)
             {
                 // A part can carry multiple Hullcam modules — the booster
@@ -406,6 +433,15 @@ namespace Kerbcam
                 }
             }
             Debug.Log($"[Kerbcam] tracking {_cameras.Count} Hullcam VDS camera(s)");
+
+            // Re-apply the throttle we restored above. ReadThrottleDesired
+            // is the source of truth — honour the operator's current
+            // setting in case they toggled it during the rebuild window.
+            if (wasThrottled && ReadThrottleDesired())
+            {
+                Debug.Log("[Kerbcam] rebuild: re-applying main screen throttle");
+                ApplyMainScreenThrottle();
+            }
         }
 
         // Hotkey poll. Update runs once per frame; cheap to scan a key
