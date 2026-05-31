@@ -109,9 +109,21 @@ Shader "Kerbcam/Bowshock"
                 // — at the literal tip there is no well-defined radial
                 // direction. apexFade smoothly suppresses rim contribution
                 // in that region so the cone tip doesn't blow out.
+                // Smoothed normal in local space. The shader supports two
+                // mesh shapes:
+                //   dome — unit oblate hemisphere, z in [0, 1], normal at
+                //     each fragment is the position vector itself (sphere).
+                //   cone — legacy 6 m tall cone, z in [-3, +3], normal at
+                //     each fragment is the radial direction from the
+                //     cone axis (cylindrical).
+                // Heuristic: total |localPos| ≤ 1.3 → dome, otherwise cone.
                 float2 lpXY = i.localPos.xy;
                 float lpLen = length(lpXY);
-                float3 nLocal = float3(lpXY / max(lpLen, 1e-3), 0.0);
+                float lenLocal = length(i.localPos);
+                float3 nLocalCyl = float3(lpXY / max(lpLen, 1e-3), 0.0);
+                float3 nLocalSph = i.localPos / max(lenLocal, 1e-3);
+                float isDome = step(lenLocal, 1.3);
+                float3 nLocal = lerp(nLocalCyl, nLocalSph, isDome);
                 float3 n = normalize(mul((float3x3)unity_ObjectToWorld, nLocal));
                 // apexFade: fades the rim near the cone tip (lpXY ~ 0)
                 // where the smoothed radial normal is degenerate.
@@ -123,12 +135,15 @@ Shader "Kerbcam/Bowshock"
                 // the alpha drop-off"). Half-length of cone is 3 in mesh
                 // local; fading begins at the outer ~17 % of the cone.
                 float apexFade = saturate(lpLen / 0.4);
-                // Widened base fade — fades over ~1.5 units of local Z
-                // instead of 0.5. The much softer transition makes the
-                // outer half of the cone progressively dimmer, which
-                // matches "more diffuse" — the shock smears out into
-                // empty space rather than terminating at a defined edge.
-                float baseFade = smoothstep(-3.0, -1.5, i.localPos.z);
+                // Base fade — fragments near the open base of the mesh
+                // dissolve into transparency. For the dome mesh, base is
+                // at local z=0 (fades over 0..0.3). For the legacy cone
+                // mesh, base is at local z=-3 (handled by the negative
+                // branch below). The smoothstep edges are chosen so the
+                // mesh's outer-most ring fades smoothly to nothing.
+                float baseFade = i.localPos.z >= 0.0
+                    ? smoothstep(0.0, 0.3, i.localPos.z)        // dome: fade near z=0
+                    : smoothstep(-3.0, -1.5, i.localPos.z);     // cone: fade near z=-3
                 float endsFade = apexFade * baseFade;
 
                 float3 toCam = _WorldSpaceCameraPos - i.worldPos;

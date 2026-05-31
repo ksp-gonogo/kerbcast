@@ -123,9 +123,9 @@ namespace KerbcamCI
                 switch (shaderId)
                 {
                     case "plasma": SetupPlasma(sceneRoot.transform, cam, mat); break;
-                    case "bowshock": SetupBowshock(sceneRoot.transform, mat); break;
+                    case "bowshock": SetupBowshock(sceneRoot.transform, mat, fx.inputs); break;
                     case "trail": SetupTrail(sceneRoot.transform, mat, fx.inputs); break;
-                    case "ember": SetupEmber(sceneRoot.transform, cam, mat); break;
+                    case "ember": SetupEmber(sceneRoot.transform, cam, mat, fx.inputs); break;
                 }
 
                 // Render to RT
@@ -179,49 +179,71 @@ namespace KerbcamCI
             cam.AddCommandBuffer(CameraEvent.AfterForwardAlpha, cb);
         }
 
-        // Bowshock: place a procedural hollow cone above the vessel (apex
-        // points +Y = along velocity). Scaled to 0.6× — twice as big as
-        // the previous 0.3× iteration, matching what real bowshocks look
-        // like (wide, diffuse). The wide base ring sinks slightly into the
-        // vessel nose so the cone wraps the windward end rather than
-        // floating ahead of it.
-        private static void SetupBowshock(Transform root, Material mat)
+        // Bowshock: a procedural oblate dome (flattened hemisphere) ahead
+        // of the vessel along the wind axis. The DOME mesh better matches
+        // real bowshock physics (blunt-body detached shock = flat dome)
+        // than the previous cone shape. Size and position are computed
+        // from the proxy vessel's windward profile so the shock adapts to
+        // vessel orientation: when wind blows broadside, the dome becomes
+        // wider and closer to the vessel; when wind is end-on, the dome
+        // is narrower and further forward. Same logic mirrored on the
+        // runtime in BowshockEffect.
+        private static void SetupBowshock(Transform root, Material mat, FxFixture.Inputs inputs)
         {
-            var go = new GameObject("bowshock_cone");
+            Vector3 windDir = WindDirFromInputs(inputs);
+            var profile = ComputeWindwardProfile(root, windDir);
+
+            // Dome width = 1.5× vessel windward radius (shock is wider than
+            // body); depth = 0.55× width (flat oblate).
+            float domeRadius = Mathf.Max(profile.WindwardRadius * 1.5f, 0.5f);
+            float domeDepth = domeRadius * 0.55f;
+
+            // Dome base sits right at the vessel's windward extreme; the
+            // dome's curved surface bulges forward into the airflow.
+            Vector3 basePos = root.position + windDir * profile.ForwardStandoff;
+
+            var go = new GameObject("bowshock_dome");
             go.transform.SetParent(root, false);
-            go.transform.localPosition = new Vector3(0f, 3.2f, 0f);
-            go.transform.localRotation = Quaternion.LookRotation(Vector3.up, Vector3.forward);
-            go.transform.localScale = new Vector3(0.6f, 0.6f, 0.6f);
+            go.transform.position = basePos;
+            // Local +Z = wind direction (curved surface facing into wind).
+            // helperUp avoids degenerate LookRotation when wind ≈ ±Y.
+            Vector3 helperUp = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.right;
+            go.transform.rotation = Quaternion.LookRotation(windDir, helperUp);
+            go.transform.localScale = new Vector3(domeRadius, domeRadius, domeDepth);
             var mf = go.AddComponent<MeshFilter>();
             var mr = go.AddComponent<MeshRenderer>();
-            mf.sharedMesh = BuildConeMesh();
+            mf.sharedMesh = BuildDomeMesh();
             mr.sharedMaterial = mat;
             mr.shadowCastingMode = ShadowCastingMode.Off;
             mr.receiveShadows = false;
         }
 
         // Trail: procedural tapered tube behind the vessel along airflow.
-        // axis +Z = downstream. The preview mesh is sized to start AT the
-        // vessel's local radius (0.6 m) and extend 40 m downstream so the
-        // wake reads as continuous with the vessel rather than a detached
-        // shape; no extra scale applied. Position is exactly at the cylinder
-        // base so the head of the tube touches the vessel.
+        // axis +Z = downstream. The mesh's natural size is 0.6 m × 40 m;
+        // we apply a NON-UNIFORM scale: the tube's start radius is scaled
+        // to match the vessel's windward radius (so the wake's head
+        // matches the vessel's profile), then a small overlap pulls the
+        // head INSIDE the vessel so the cylinder occludes the top edge.
+        // Mirrored on runtime in TrailEffect.
         private static void SetupTrail(Transform root, Material mat, FxFixture.Inputs inputs)
         {
+            Vector3 windDir = WindDirFromInputs(inputs);
+            var profile = ComputeWindwardProfile(root, windDir);
+
             var go = new GameObject("trail_tube");
             go.transform.SetParent(root, false);
-            // Head of tube sits INSIDE the cylinder (cylinder extends to
-            // y = -1.2, we start at y = -0.7) so the cylinder occludes the
-            // top fragments of the tube. Combined with the shader's
-            // headFade, the wake emerges seamlessly from the vessel body
-            // rather than starting at a hard ring.
-            go.transform.localPosition = new Vector3(0f, -0.7f, 0f);
-            Vector3 windDir = inputs != null && inputs.windDirWorld != null && inputs.windDirWorld.Length >= 3
-                ? new Vector3(inputs.windDirWorld[0], inputs.windDirWorld[1], inputs.windDirWorld[2]).normalized
-                : Vector3.up;
-            if (windDir.sqrMagnitude < 1e-3f) windDir = Vector3.up;
+            // Position: at the vessel's aft windward edge, pulled IN by
+            // 0.5 m so the head buries inside the vessel and the cylinder
+            // occludes the ring of vertices at the tube's start.
+            Vector3 trailHeadPos = root.position - windDir * (profile.AftStandoff - 0.5f);
+            go.transform.position = trailHeadPos;
             Vector3 helperUp = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.right;
-            go.transform.localRotation = Quaternion.LookRotation(-windDir, helperUp);
+            go.transform.rotation = Quaternion.LookRotation(-windDir, helperUp);
+            // Scale the tube's start radius to vessel windward radius so the
+            // wake is wide enough to match the vessel's profile. Length stays
+            // at the mesh's natural 40 m (already long enough to fade).
+            float radiusScale = Mathf.Max(profile.WindwardRadius / 0.6f, 0.5f);
+            go.transform.localScale = new Vector3(radiusScale, radiusScale, 1f);
             var mf = go.AddComponent<MeshFilter>();
             var mr = go.AddComponent<MeshRenderer>();
             mf.sharedMesh = BuildTaperedTubeMesh();
@@ -238,32 +260,47 @@ namespace KerbcamCI
         // the camera at mesh-build time (the ember shader vert stage does
         // a vanilla ObjectToClipPos and doesn't billboard internally), so
         // we rebuild per render to track the active camera.
-        private static void SetupEmber(Transform root, Camera cam, Material mat)
+        //
+        // Spawn area + drift direction are derived from the windward
+        // profile so the embers shed off the vessel's actual windward
+        // edge and trail along the airflow regardless of orientation.
+        private static void SetupEmber(Transform root, Camera cam, Material mat, FxFixture.Inputs inputs)
         {
+            Vector3 windDir = WindDirFromInputs(inputs);
+            var profile = ComputeWindwardProfile(root, windDir);
             var go = new GameObject("ember_quads");
             go.transform.SetParent(root, false);
             go.transform.localPosition = Vector3.zero;
             var mf = go.AddComponent<MeshFilter>();
             var mr = go.AddComponent<MeshRenderer>();
-            mf.sharedMesh = BuildEmberQuadMesh(cam);
+            mf.sharedMesh = BuildEmberQuadMesh(cam, windDir, profile);
             mr.sharedMaterial = mat;
             mr.shadowCastingMode = ShadowCastingMode.Off;
             mr.receiveShadows = false;
         }
 
-        // Build N camera-facing quads spread along the wake (-Y from vessel
-        // base), with per-vertex colour sampled from the ember gradient so
-        // the spatial distribution reads hot→cool from front to tail.
-        private static Mesh BuildEmberQuadMesh(Camera cam)
+        // Build N camera-facing quads spread along the wake. The emitter
+        // region spans the vessel's windward edge (perpendicular to wind)
+        // and the wake extends along -windDir for ~6m. Each particle's
+        // colour is sampled from the ember gradient based on its
+        // along-wake position so the spatial distribution reads
+        // hot→cool from front to tail.
+        private static Mesh BuildEmberQuadMesh(Camera cam, Vector3 windDir, WindwardProfile profile)
         {
             const int count = 80;
             const float wakeLen = 4.5f;
             var gradient = MakeEmberGradient();
-            // Camera-aligned right/up so each quad is screen-facing for the
-            // current view. Computed once in world space then converted to
-            // mesh-local (mesh sits at root origin so they're equivalent).
             Vector3 camRight = cam.transform.right;
             Vector3 camUp = cam.transform.up;
+
+            // Build an orthonormal basis perpendicular to windDir so we
+            // can scatter the emit origins across the windward face.
+            Vector3 perpUp = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.right;
+            Vector3 perpA = Vector3.Cross(windDir, perpUp).normalized;
+            Vector3 perpB = Vector3.Cross(windDir, perpA).normalized;
+            float emitRadius = Mathf.Max(profile.WindwardRadius * 0.7f, 0.2f);
+            // Origin of the wake: at the vessel's aft windward edge.
+            Vector3 wakeOrigin = -windDir * (profile.AftStandoff - 0.2f);
 
             var verts = new Vector3[count * 4];
             var uvs = new Vector2[count * 4];
@@ -272,13 +309,13 @@ namespace KerbcamCI
             for (int i = 0; i < count; i++)
             {
                 float along01 = i / (float)(count - 1);
-                float along = -0.5f - along01 * wakeLen + Random.Range(-0.2f, 0.2f);
-                float spread = Mathf.Lerp(0.05f, 0.7f, along01) * Random.Range(0.2f, 1.4f);
+                float along = -along01 * wakeLen + Random.Range(-0.2f, 0.2f);
+                float spread = Mathf.Lerp(emitRadius * 0.2f, emitRadius * 1.4f, along01)
+                               * Random.Range(0.2f, 1.4f);
                 float theta = Random.Range(0f, Mathf.PI * 2f);
-                Vector3 centre = new Vector3(
-                    Mathf.Cos(theta) * spread,
-                    along,
-                    Mathf.Sin(theta) * spread);
+                Vector3 centre = wakeOrigin
+                    + windDir * along
+                    + (perpA * Mathf.Cos(theta) + perpB * Mathf.Sin(theta)) * spread;
                 float size = Mathf.Lerp(0.10f, 0.04f, along01);
                 Color col = gradient.Evaluate(along01);
                 int v = i * 4;
@@ -583,6 +620,107 @@ namespace KerbcamCI
             mesh.RecalculateBounds();
             mf.sharedMesh = mesh;
             return go;
+        }
+
+        // Windward profile of the proxy vessel relative to the wind axis.
+        // WindwardRadius is the max perpendicular-to-wind distance from
+        // the root origin to any renderer's AABB corner — sizes the
+        // bowshock dome and trail tube. ForwardStandoff is the max along
+        // +windDir (vessel-to-shock standoff). AftStandoff is the max
+        // along -windDir (where the trail/embers attach).
+        private struct WindwardProfile
+        {
+            public float WindwardRadius;
+            public float ForwardStandoff;
+            public float AftStandoff;
+        }
+
+        private static WindwardProfile ComputeWindwardProfile(Transform root, Vector3 windDir)
+        {
+            float fwd = 0f, aft = 0f, perpMax = 0f;
+            Vector3 origin = root.position;
+            foreach (var rend in root.GetComponentsInChildren<Renderer>())
+            {
+                if (rend == null || rend is ParticleSystemRenderer) continue;
+                var b = rend.bounds;
+                Vector3 c = b.center, e = b.extents;
+                for (int i = 0; i < 8; i++)
+                {
+                    Vector3 corner = c + new Vector3(
+                        (i & 1) == 0 ? -e.x : e.x,
+                        (i & 2) == 0 ? -e.y : e.y,
+                        (i & 4) == 0 ? -e.z : e.z);
+                    Vector3 rel = corner - origin;
+                    float along = Vector3.Dot(rel, windDir);
+                    if (along > fwd) fwd = along;
+                    if (-along > aft) aft = -along;
+                    Vector3 perp = rel - along * windDir;
+                    float perpDist = perp.magnitude;
+                    if (perpDist > perpMax) perpMax = perpDist;
+                }
+            }
+            return new WindwardProfile { WindwardRadius = perpMax, ForwardStandoff = fwd, AftStandoff = aft };
+        }
+
+        private static Vector3 WindDirFromInputs(FxFixture.Inputs inputs)
+        {
+            Vector3 windDir = inputs != null && inputs.windDirWorld != null && inputs.windDirWorld.Length >= 3
+                ? new Vector3(inputs.windDirWorld[0], inputs.windDirWorld[1], inputs.windDirWorld[2])
+                : Vector3.up;
+            if (windDir.sqrMagnitude < 1e-3f) windDir = Vector3.up;
+            return windDir.normalized;
+        }
+
+        // Oblate dome (flattened hemisphere) for the bowshock. Local frame:
+        // open base at z=0 (faces the vessel), curved surface extends to
+        // z=+1 (faces the airflow). xy in [-1, +1] at the base. The
+        // GameObject's localScale stretches this unit dome to (radius,
+        // radius, depth) for the actual flat shape.
+        private static Mesh BuildDomeMesh()
+        {
+            const int latSeg = 10;
+            const int lonSeg = 32;
+            int ringVerts = lonSeg + 1;
+            int totalVerts = latSeg * ringVerts + 1;
+            var verts = new Vector3[totalVerts];
+            var uvs = new Vector2[totalVerts];
+            verts[0] = new Vector3(0f, 0f, 1f);
+            uvs[0] = new Vector2(0.5f, 1f);
+            for (int lat = 1; lat <= latSeg; lat++)
+            {
+                float phi = (lat / (float)latSeg) * Mathf.PI * 0.5f;
+                float sp = Mathf.Sin(phi);
+                float cp = Mathf.Cos(phi);
+                for (int lon = 0; lon < ringVerts; lon++)
+                {
+                    float th = (lon / (float)lonSeg) * Mathf.PI * 2f;
+                    int idx = 1 + (lat - 1) * ringVerts + lon;
+                    verts[idx] = new Vector3(sp * Mathf.Cos(th), sp * Mathf.Sin(th), cp);
+                    uvs[idx] = new Vector2(lon / (float)lonSeg, 1f - lat / (float)latSeg);
+                }
+            }
+            var tris = new List<int>();
+            for (int lon = 0; lon < lonSeg; lon++)
+            {
+                tris.Add(0); tris.Add(1 + lon); tris.Add(1 + lon + 1);
+            }
+            for (int lat = 1; lat < latSeg; lat++)
+            {
+                int rowA = 1 + (lat - 1) * ringVerts;
+                int rowB = 1 + lat * ringVerts;
+                for (int lon = 0; lon < lonSeg; lon++)
+                {
+                    tris.Add(rowA + lon);     tris.Add(rowB + lon);     tris.Add(rowA + lon + 1);
+                    tris.Add(rowA + lon + 1); tris.Add(rowB + lon);     tris.Add(rowB + lon + 1);
+                }
+            }
+            var mesh = new Mesh { name = "Kerbcam Bowshock Dome" };
+            mesh.vertices = verts;
+            mesh.uv = uvs;
+            mesh.triangles = tris.ToArray();
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+            return mesh;
         }
 
         // Higher-segment cone (32 radial faces) for the preview so the

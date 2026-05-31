@@ -1,0 +1,40 @@
+{
+  "name": "07_hypersonic_wind_diagonal",
+  "note": "Same flight regime as fixture 03 but wind is DIAGONAL (45° between +Y and +X). Tests adaptive sizing/positioning when vessel attitude isn't axis-aligned with velocity.",
+  "scalars": {
+    "mach": 5.0,
+    "dynamicPressureKPa": 2.0,
+    "atmDensity": 0.13,
+    "altitude": 18000.0,
+    "srfSpeed": 1450.0,
+    "srfVelocity": [1025.4, 1025.4, 0.0]
+  },
+  "globals": {
+    "lightDirection0": [-0.7071, -0.7071, 0.0, 0.0],
+    "fxColor": [1.0, 0.55, 0.25, 0.85],
+    "fxLength": 1.4,
+    "fxWobble": 0.95,
+    "fxFalloff": 0.9,
+    "fxDepthCamMatrix": [1,0,0,0, 0,0,-1,0, 0,1,0,0, 0,0,0,1],
+    "fxDepthProjMatrix": [1.2,0,0,0, 0,1.2,0,0, 0,0,-1.001,-1, 0,0,-0.5,0],
+    "fxProjectionNear": 0.5,
+    "fxProjectionFar": 80.0
+  },
+  "inputs": {
+    "intensity": 0.93,
+    "fxState": 0.65,
+    "fxRadiusMul": 1.6,
+    "windDirWorld": [0.7071, 0.7071, 0.0, 0.0]
+  },
+  "camera": {
+    "fov": 60.0,
+    "near": 0.3,
+    "far": 200.0,
+    "position": [3.5, 0.0, 0.0],
+    "rotation": [0.0, -0.7071068, 0.0, 0.7071068]
+  },
+  "textures": {
+    "fxMainTex": "",
+    "fxDepthMap": ""
+  }
+}

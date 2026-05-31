@@ -1,0 +1,40 @@
+{
+  "name": "06_full_plasma_wind_sideways",
+  "note": "Same flight regime as fixture 04 (full reentry plasma) but vessel is moving SIDEWAYS — wind blowing along +X (broadside). FX should adapt: bowshock wider+closer, trail wide+short, embers shed from long edge.",
+  "scalars": {
+    "mach": 7.0,
+    "dynamicPressureKPa": 0.5,
+    "atmDensity": 0.025,
+    "altitude": 28000.0,
+    "srfSpeed": 2050.0,
+    "srfVelocity": [2050.0, 0.0, 0.0]
+  },
+  "globals": {
+    "lightDirection0": [-1.0, 0.0, 0.0, 0.0],
+    "fxColor": [1.0, 0.42, 0.12, 1.0],
+    "fxLength": 1.8,
+    "fxWobble": 1.3,
+    "fxFalloff": 0.7,
+    "fxDepthCamMatrix": [1,0,0,0, 0,0,-1,0, 0,1,0,0, 0,0,0,1],
+    "fxDepthProjMatrix": [1.2,0,0,0, 0,1.2,0,0, 0,0,-1.001,-1, 0,0,-0.5,0],
+    "fxProjectionNear": 0.5,
+    "fxProjectionFar": 80.0
+  },
+  "inputs": {
+    "intensity": 1.0,
+    "fxState": 1.0,
+    "fxRadiusMul": 1.6,
+    "windDirWorld": [1.0, 0.0, 0.0, 0.0]
+  },
+  "camera": {
+    "fov": 60.0,
+    "near": 0.3,
+    "far": 200.0,
+    "position": [3.5, 0.0, 0.0],
+    "rotation": [0.0, -0.7071068, 0.0, 0.7071068]
+  },
+  "textures": {
+    "fxMainTex": "",
+    "fxDepthMap": ""
+  }
+}
