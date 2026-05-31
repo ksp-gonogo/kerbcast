@@ -1,5 +1,5 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ServerMessage } from "../__generated__/types";
-import { CameraLifecycle, Layer } from "../__generated__/types";
+import { CameraLifecycle, ErrorSource, Layer } from "../__generated__/types";
 import type {
   KerbcamConnectionState,
   KerbcamDataChannel,
@@ -96,6 +96,15 @@ export class MockSidecar {
   private _openHandler: (() => void) | undefined;
   private _clientMsgHandler: ((raw: string) => void) | undefined;
   private _stateHandler: ((s: KerbcamConnectionState) => void) | undefined;
+  private _onTrackHandler:
+    | ((track: MediaStreamTrack, idx: number, mid: string) => void)
+    | undefined;
+  private _trackIdx = 0;
+  /** Slot mids available for the dynamic-subscription model. Override with
+   *  {@link withSlots} before connecting if a test needs a specific pool. */
+  private _slotMids: string[] = ["0", "1", "2", "3"];
+  /** mid -> camera currently bound to that slot. */
+  private readonly _slotBindings = new Map<string, number>();
 
   /** Register a camera that will appear in the `camera-snapshot` sent on `open()`. */
   addCamera(init: MockCameraInit): void {
@@ -127,7 +136,9 @@ export class MockSidecar {
         return {
           addRecvOnlyTransceiver() {},
           createDataChannel: () => channel,
-          onTrack() {},
+          onTrack(h) {
+            self._onTrackHandler = h;
+          },
           onStateChange(h) {
             self._stateHandler = h;
           },
@@ -183,6 +194,23 @@ export class MockSidecar {
     this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
   }
 
+  /**
+   * Replace the entire camera registry and push a fresh `camera-snapshot` to
+   * the client. Models a vessel change / scene switch where the set of
+   * available cameras changes (cameras appear or disappear) — distinct from
+   * {@link destroyCamera}, which keeps the camera present but `Destroyed`.
+   */
+  setCameras(inits: MockCameraInit[]): void {
+    this._cameras.clear();
+    for (const init of inits) {
+      this._cameras.set(init.flightId, buildCamera(init));
+    }
+    this._sendToClient({
+      type: "camera-snapshot",
+      content: { cameras: Array.from(this._cameras.values()) },
+    });
+  }
+
   /** Send a `ping` from the sidecar; the client should respond with `pong`. */
   firePing(): void {
     this._sendToClient({ type: "ping" });
@@ -191,6 +219,30 @@ export class MockSidecar {
   /** Push an `adaptive-shed` event to the client. */
   fireAdaptiveShed(payload: AdaptiveShedPayload): void {
     this._sendToClient({ type: "adaptive-shed", content: payload });
+  }
+
+  /** Configure the slot-pool mids before connecting (dynamic mode). */
+  withSlots(mids: string[]): this {
+    this._slotMids = [...mids];
+    return this;
+  }
+
+  /**
+   * Deliver a track onto a slot (by mid), simulating the slot's media
+   * arriving over WebRTC. The client routes it to whichever camera is bound
+   * to that mid. (jsdom can't make real tracks; pass a stub in unit tests or
+   * a `canvas.captureStream()` track in a real-browser harness.)
+   */
+  deliverTrack(mid: string, track: MediaStreamTrack): void {
+    this._onTrackHandler?.(track, this._trackIdx++, mid);
+  }
+
+  /** The slot mid currently carrying `flightId`, or undefined. */
+  slotMidFor(flightId: number): string | undefined {
+    for (const [mid, fid] of this._slotBindings) {
+      if (fid === flightId) return mid;
+    }
+    return undefined;
   }
 
   /** Every `ClientMessage` received from the client, in order. */
@@ -235,6 +287,19 @@ export class MockSidecar {
       JSON.stringify({ sdp: "v=0\r\n", cameras }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
+  }
+
+  /**
+   * Signaling-seam analogue of {@link makeOfferResponse}: resolve an offer's
+   * answer without HTTP. Pass as the client's `negotiate` config to exercise
+   * the brokered-signaling path a station uses.
+   */
+  negotiate(offer: {
+    sdp: string;
+    cameras: number[];
+    slots?: number;
+  }): Promise<{ sdp: string; cameras: number[] }> {
+    return Promise.resolve({ sdp: "v=0\r\n", cameras: offer.cameras });
   }
 
   private _sendToClient(msg: ServerMessage): void {
@@ -287,6 +352,41 @@ export class MockSidecar {
         const cam = this._cameras.get(msg.content.flightId);
         if (cam) {
           this._cameras.set(msg.content.flightId, { ...cam, degradeLevel: msg.content.level });
+        }
+        break;
+      }
+      case "subscribe": {
+        const flightId = msg.content.flightId;
+        const freeMid = this._slotMids.find((m) => !this._slotBindings.has(m));
+        if (freeMid === undefined) {
+          this._sendToClient({
+            type: "error",
+            content: { message: "no free slot", source: ErrorSource.Sidecar },
+          });
+        } else {
+          this._slotBindings.set(freeMid, flightId);
+          this._sendToClient({
+            type: "slot-map",
+            content: { mid: freeMid, flightId },
+          });
+        }
+        break;
+      }
+      case "unsubscribe": {
+        const flightId = msg.content.flightId;
+        let bound: string | undefined;
+        for (const [mid, fid] of this._slotBindings) {
+          if (fid === flightId) {
+            bound = mid;
+            break;
+          }
+        }
+        if (bound !== undefined) {
+          this._slotBindings.delete(bound);
+          this._sendToClient({
+            type: "slot-map",
+            content: { mid: bound, flightId: undefined },
+          });
         }
         break;
       }

@@ -47,10 +47,18 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct OfferRequest {
     pub sdp: String,
-    /// flight IDs the browser wants tracks for. Empty = subscribe to
-    /// every currently-known camera (useful for the dev test page).
+    /// flight IDs the browser wants tracks for. With no `slots` field, empty
+    /// = subscribe to every currently-known camera (the dev test page). With
+    /// `slots` set (the dynamic model) these are the *initial* subscription
+    /// bound to the first slots; empty then means "no initial subscription".
     #[serde(default)]
     pub cameras: Vec<u32>,
+    /// Slot-pool size = the number of recv-only video transceivers in the
+    /// offer. Absent (older clients) → one slot per initial camera, i.e. the
+    /// old one-track-per-camera behaviour. When set, spare slots beyond the
+    /// initial subscription stay idle until a runtime `Subscribe`.
+    #[serde(default)]
+    pub slots: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,7 +150,10 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
     // subscribe to all of them. Useful for the v0.2 test page which
     // populates the picker from /cameras but lets the user click
     // "connect to all" without an explicit selection.
-    let requested: Vec<u32> = if req.cameras.is_empty() {
+    // Legacy/test-page path: no explicit pool size AND no cameras = subscribe
+    // to all. With an explicit `slots` (the dynamic model), an empty `cameras`
+    // means "no initial subscription".
+    let requested: Vec<u32> = if req.slots.is_none() && req.cameras.is_empty() {
         state
             .registry
             .list()
@@ -154,7 +165,11 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
         req.cameras
     };
 
-    let peer = Arc::new(KerbcamPeer::new(state.registry.clone(), &requested).await?);
+    // Pool size = the offer's recv-only video transceiver count. Absent
+    // (older clients) → one slot per initial camera (the old behaviour).
+    let slot_count = req.slots.map(|s| s as usize).unwrap_or(requested.len());
+
+    let peer = Arc::new(KerbcamPeer::new(state.registry.clone(), &requested, slot_count).await?);
     let answer_sdp = peer.answer_to_offer(req.sdp).await?;
     let subscribed = peer.subscribed.clone();
 

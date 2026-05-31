@@ -189,6 +189,27 @@ export interface SetRenderSizePayload {
 	height: number;
 }
 
+/**
+ * Slot↔camera assignment for the dynamic-subscription model. The sidecar
+ * negotiates a pool of recv-only video transceivers up front; `Subscribe`
+ * binds a camera to a free one and the sidecar announces the binding here.
+ */
+export interface SlotMapPayload {
+	/**
+	 * Transceiver `mid` carrying this slot's track. Stable for the
+	 * connection's life, so the client keys off it rather than the
+	 * fragile `onTrack` arrival order — match against
+	 * `RTCTrackEvent.transceiver.mid`.
+	 */
+	mid: string;
+	/**
+	 * Camera now carried by the slot, or `None` when the slot was freed
+	 * by `Unsubscribe`. Serialised as `null` (not omitted) so "freed" is
+	 * unambiguous on the wire.
+	 */
+	flightId?: number;
+}
+
 /** Messages sent FROM the client TO the sidecar. */
 export type ClientMessage = 
 	/**
@@ -240,6 +261,21 @@ export type ClientMessage =
 	 * encoder.
 	 */
 	| { type: "request-keyframe", content: FlightIdPayload }
+	/**
+	 * Dynamically subscribe to a camera on an already-connected peer. The
+	 * sidecar binds it to a free pre-negotiated slot (one of the recv-only
+	 * video transceivers from the offer), starts encoding it, forces a
+	 * keyframe, and replies with `SlotMap` naming the transceiver `mid` now
+	 * carrying it — no renegotiation. Replies with `Error` if no slot is
+	 * free (the client should have negotiated enough transceivers up front).
+	 */
+	| { type: "subscribe", content: FlightIdPayload }
+	/**
+	 * Release a camera's slot. The sidecar stops feeding that slot (the
+	 * camera sleeps if it has no other subscribers) and replies with
+	 * `SlotMap { flightId: null }` for the freed transceiver `mid`.
+	 */
+	| { type: "unsubscribe", content: FlightIdPayload }
 	/** Response to `Ping`. Browser sends this immediately on receiving each Ping. */
 	| { type: "pong", content?: undefined };
 
@@ -262,6 +298,14 @@ export type ServerMessage =
 	 * without re-fetching the whole snapshot.
 	 */
 	| { type: "camera-state-changed", content: CameraStateChangedPayload }
+	/**
+	 * Slot↔camera assignment for the dynamic-subscription model. Sent in
+	 * reply to `Subscribe`/`Unsubscribe`: `flightId` is the camera now
+	 * carried by transceiver `mid`, or `null` when the slot was freed. The
+	 * client maps `mid` to the track it received via `onTrack` and routes
+	 * that track to (or away from) the camera's stream — no renegotiation.
+	 */
+	| { type: "slot-map", content: SlotMapPayload }
 	/**
 	 * Adaptive shedding level changed. Reason is human-readable
 	 * ("ksp-fps-low", "ksp-fps-recovered") so client UIs can show

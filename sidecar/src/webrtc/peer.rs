@@ -28,7 +28,7 @@ static NEXT_PEER_ID: AtomicU32 = AtomicU32::new(1);
 
 use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
 use webrtc::api::setting_engine::SettingEngine;
@@ -39,7 +39,6 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
@@ -52,9 +51,20 @@ use crate::protocol::{
     CameraLifecycle, CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage,
     ErrorPayload, ErrorSource, FlightIdPayload, HelloPayload, Layer, ServerMessage,
     SetDegradePayload, SetFovPayload, SetLayersPayload, SetPanPayload, SetRenderSizePayload,
+    SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcam-control";
+
+/// One pre-negotiated video slot. The track stays on the peer connection
+/// for the connection's lifetime; `bound` records which camera currently
+/// feeds it (`None` = idle/silent) and `mid` is the transceiver mid the
+/// browser keys its `SlotMap` routing on (filled once the answer is set).
+struct Slot {
+    track: Arc<TrackLocalStaticSample>,
+    mid: Option<String>,
+    bound: Option<u32>,
+}
 
 pub struct KerbcamPeer {
     pc: Arc<RTCPeerConnection>,
@@ -62,11 +72,13 @@ pub struct KerbcamPeer {
     /// connection. Used as the per-camera degrade map key (see
     /// `CameraState.degrade_levels`).
     pub peer_id: u32,
-    /// Arcs held for the lifetime of the peer connection. Dropping the
-    /// peer drops these Arcs; the matching Weak refs in each camera's
-    /// `tracks` list become stale and are pruned on the next encode tick.
-    _tracks: Vec<Arc<TrackLocalStaticSample>>,
-    /// flight_ids the peer subscribed to — surfaced for logging.
+    /// The pre-negotiated slot pool. `Subscribe` binds a camera to a free
+    /// slot; `Unsubscribe` frees one — no renegotiation. Dropping the peer
+    /// drops the slot-track Arcs; the matching Weak refs in each camera's
+    /// `tracks` list go stale and are pruned on the next encode tick.
+    slots: Arc<Mutex<Vec<Slot>>>,
+    /// flight_ids bound at connect time — echoed (in slot order) in the
+    /// `/offer` answer so the browser maps its initial cameras to slots.
     pub subscribed: Vec<u32>,
     /// Set once the browser opens the control channel. Held for the
     /// peer's lifetime so server-initiated pushes (AdaptiveShed,
@@ -80,13 +92,17 @@ pub struct KerbcamPeer {
 }
 
 impl KerbcamPeer {
-    /// Build a peer with one H.264 track per requested camera that exists
-    /// in the registry. Unknown camera IDs are dropped with a warning —
-    /// the caller can still return a useful answer to the browser with
-    /// the surviving tracks. Also registers an `on_data_channel` handler
-    /// that wires up the "kerbcam-control" protocol channel when the
-    /// browser opens one.
-    pub async fn new(registry: Arc<CameraRegistry>, requested: &[u32]) -> Result<Self> {
+    /// Build a peer with a pool of `slot_count` pre-negotiated H.264 video
+    /// slots + a "kerbcam-control" data channel. The cameras in `initial`
+    /// are bound to the first slots immediately (skipping unknown/destroyed
+    /// ones); the rest stay idle until the browser `Subscribe`s a camera
+    /// into them. `slot_count` must equal the number of recv-only video
+    /// transceivers in the browser's offer or SDP negotiation won't match.
+    pub async fn new(
+        registry: Arc<CameraRegistry>,
+        initial: &[u32],
+        slot_count: usize,
+    ) -> Result<Self> {
         let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
@@ -108,79 +124,71 @@ impl KerbcamPeer {
 
         let pc = Arc::new(api.new_peer_connection(config).await?);
 
-        let mut owned_tracks = Vec::with_capacity(requested.len());
-        let mut subscribed = Vec::with_capacity(requested.len());
-
-        for &flight_id in requested {
-            let cam = match registry.get(flight_id).await {
-                Some(c) => c,
-                None => {
-                    warn!(flight_id, "requested camera not found, skipping track");
-                    continue;
-                }
-            };
-            if cam.destroyed.load(Ordering::Acquire) {
-                // Part was destroyed before this peer connected — don't create
-                // a track for it. The browser will receive a camera-state-changed
-                // with lifecycle=destroyed in the Hello exchange snapshot.
-                warn!(flight_id, "skipping track for destroyed camera");
-                continue;
-            }
-
+        // Build the slot pool: one send-track per slot, added to the PC so
+        // the answer carries `slot_count` video m-lines matching the offer's
+        // recv-only transceivers. Each sender's RTCP must be drained or
+        // webrtc-rs's NACK/PLI pipelines stall (see `drain_rtcp_sink`).
+        let mut slots: Vec<Slot> = Vec::with_capacity(slot_count);
+        for i in 0..slot_count {
             let track = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     ..Default::default()
                 },
-                format!("video-{flight_id}"),
-                format!("kerbcam-{flight_id}"),
+                format!("video-slot{i}"),
+                format!("kerbcam-slot{i}"),
             ));
-
             let rtp_sender = pc
                 .add_track(track.clone() as Arc<dyn TrackLocal + Send + Sync>)
                 .await?;
-
-            // RTCP feedback stream from the receiver. webrtc-rs requires
-            // us to drain it (NACK / PLI break silently otherwise) — we
-            // additionally parse REMB packets to drive per-camera bitrate
-            // adaptation. The browser sends REMB ~1Hz with its current
-            // bandwidth estimate; the consume loop uses the min across
-            // active subscribers to retarget the encoder.
-            //
-            // SSRC discovery: the sender's get_parameters() returns the
-            // encoding's SSRC, which the REMB packet's `ssrcs` field
-            // matches. We capture it once on attach and use it to wipe
-            // our estimate from the camera's map when the loop exits
-            // (peer dropped or sender closed).
-            let cam_for_drain = cam.clone();
-            let track_ssrc = rtp_sender
-                .get_parameters()
-                .await
-                .encodings
-                .first()
-                .map(|e| e.ssrc)
-                .unwrap_or(0);
             tokio::spawn(async move {
-                drain_rtcp(rtp_sender, cam_for_drain, track_ssrc).await;
+                drain_rtcp_sink(rtp_sender).await;
             });
+            slots.push(Slot {
+                track,
+                mid: None,
+                bound: None,
+            });
+        }
 
-            cam.add_track(track.clone()).await;
-            // Plugin's subscriber-aware capture skip uses the
-            // ControlState's `subscribed` flag — flip it true now so
-            // the plugin wakes the camera on its next 1Hz control
-            // poll. (No-op if already true from a prior peer.)
+        // Bind the initial subscription onto the first free slots. Camera ->
+        // slot binding is just `cam.add_track`; the consume loop then feeds
+        // the slot from that camera's encoder. set_subscribed(true) wakes the
+        // plugin's per-camera render on its next ~1Hz control poll.
+        let mut subscribed = Vec::new();
+        for &flight_id in initial {
+            let cam = match registry.get(flight_id).await {
+                Some(c) => c,
+                None => {
+                    warn!(flight_id, "initial camera not found, skipping");
+                    continue;
+                }
+            };
+            if cam.destroyed.load(Ordering::Acquire) {
+                warn!(flight_id, "skipping destroyed initial camera");
+                continue;
+            }
+            let Some(slot) = slots.iter_mut().find(|s| s.bound.is_none()) else {
+                warn!(flight_id, "no free slot for initial subscription");
+                break;
+            };
+            cam.add_track(slot.track.clone()).await;
             registry.set_subscribed(flight_id, true).await;
-            owned_tracks.push(track);
+            slot.bound = Some(flight_id);
             subscribed.push(flight_id);
         }
+
+        let slots = Arc::new(Mutex::new(slots));
 
         let control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
 
         let registry_for_dc = registry.clone();
         let control_channel_for_handler = control_channel.clone();
+        let slots_for_handler = slots.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let registry = registry_for_dc.clone();
             let control_channel = control_channel_for_handler.clone();
+            let slots = slots_for_handler.clone();
             Box::pin(async move {
                 if dc.label() != CONTROL_CHANNEL_LABEL {
                     info!(label = %dc.label(), "ignoring unexpected data channel");
@@ -192,9 +200,10 @@ impl KerbcamPeer {
                 let dc_for_msg = dc.clone();
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let registry = registry.clone();
+                    let slots = slots.clone();
                     let dc = dc_for_msg.clone();
                     Box::pin(async move {
-                        handle_client_message(registry, peer_id, dc, msg).await;
+                        handle_client_message(registry, peer_id, slots, dc, msg).await;
                     })
                 }));
             })
@@ -223,7 +232,7 @@ impl KerbcamPeer {
         Ok(Self {
             pc,
             peer_id,
-            _tracks: owned_tracks,
+            slots,
             subscribed,
             control_channel,
             connected,
@@ -243,6 +252,25 @@ impl KerbcamPeer {
 
         let mut gather_complete = self.pc.gathering_complete_promise().await;
         let _ = gather_complete.recv().await;
+
+        // Record each slot's negotiated transceiver mid so SlotMap addresses
+        // slots by the same stable mid the browser sees. Slot-tracks were
+        // add_track'd in order, so get_transceivers() is index-aligned with
+        // the pool (Unified Plan preserves m-line order).
+        let transceivers = self.pc.get_transceivers().await;
+        {
+            let mut slots = self.slots.lock().await;
+            if slots.len() != transceivers.len() {
+                warn!(
+                    slots = slots.len(),
+                    transceivers = transceivers.len(),
+                    "slot/transceiver count mismatch — slot mids may misalign",
+                );
+            }
+            for (slot, tr) in slots.iter_mut().zip(transceivers.iter()) {
+                slot.mid = tr.mid().map(|m| m.to_string());
+            }
+        }
 
         let local = self
             .pc
@@ -287,6 +315,7 @@ impl KerbcamPeer {
 async fn handle_client_message(
     registry: Arc<CameraRegistry>,
     peer_id: u32,
+    slots: Arc<Mutex<Vec<Slot>>>,
     dc: Arc<RTCDataChannel>,
     msg: DataChannelMessage,
 ) {
@@ -328,6 +357,10 @@ async fn handle_client_message(
             )
             .await;
             send_camera_snapshot(&registry, &dc).await;
+            // Announce the initial slot bindings so the client maps its
+            // initial cameras to slots by mid — uniform with dynamic
+            // Subscribe, no reliance on the answer's camera order.
+            send_initial_slot_maps(&slots, &dc).await;
         }
         ClientMessage::SetLayers(SetLayersPayload { flight_id, layers }) => {
             apply_layer_change(&registry, &dc, flight_id, layers).await;
@@ -365,9 +398,170 @@ async fn handle_client_message(
                 }
             }
         }
+        ClientMessage::Subscribe(FlightIdPayload { flight_id }) => {
+            handle_subscribe(&registry, &slots, &dc, flight_id).await;
+        }
+        ClientMessage::Unsubscribe(FlightIdPayload { flight_id }) => {
+            handle_unsubscribe(&registry, &slots, &dc, flight_id).await;
+        }
         ClientMessage::Pong => {
             // No-op — the peer is alive by virtue of having sent this.
         }
+    }
+}
+
+/// Force the camera's encoder to emit an IDR on its next encode. No-op when no
+/// encoder exists yet (a cold start already produces an IDR). Shared by the
+/// explicit keyframe request and the slot-subscribe path.
+async fn request_keyframe_for(cam: &Arc<InternalCameraState>) {
+    let mut guard = cam.encoder.lock().await;
+    if let Some(backend) = guard.as_mut() {
+        backend.request_keyframe();
+    }
+}
+
+/// Bind a camera to a free slot (or re-announce if already bound). On a fresh
+/// bind the camera's subscriber count goes 0 -> 1, waking the plugin render;
+/// the consume loop then feeds the slot's track from the camera's encoder.
+async fn handle_subscribe(
+    registry: &Arc<CameraRegistry>,
+    slots: &Arc<Mutex<Vec<Slot>>>,
+    dc: &Arc<RTCDataChannel>,
+    flight_id: u32,
+) {
+    let cam = match registry.get(flight_id).await {
+        Some(c) if !c.destroyed.load(Ordering::Acquire) => c,
+        _ => {
+            send_server_message(
+                dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: format!("no live camera with flight_id={flight_id}"),
+                    source: ErrorSource::Sidecar,
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Choose a slot under the lock, then release it before the awaiting camera
+    // ops. `fresh` distinguishes a new bind (add_track once) from a re-subscribe
+    // of an already-bound camera (re-announce only — never double add_track).
+    let (track, mid, fresh) = {
+        let mut guard = slots.lock().await;
+        if let Some(slot) = guard.iter().find(|s| s.bound == Some(flight_id)) {
+            (slot.track.clone(), slot.mid.clone(), false)
+        } else if let Some(slot) = guard.iter_mut().find(|s| s.bound.is_none()) {
+            slot.bound = Some(flight_id);
+            (slot.track.clone(), slot.mid.clone(), true)
+        } else {
+            drop(guard);
+            send_server_message(
+                dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message: "no free slot — negotiate more video transceivers".into(),
+                    source: ErrorSource::Sidecar,
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if fresh {
+        // Keyframe BEFORE add_track so the next encode emits an IDR (with
+        // SPS/PPS) to every track of this camera, including the freshly-added
+        // slot — otherwise the slot's first frame is a mid-GOP P-frame that
+        // decodes as garbage until the next periodic IDR.
+        request_keyframe_for(&cam).await;
+        cam.add_track(track).await;
+        registry.set_subscribed(flight_id, true).await;
+        info!(flight_id, "subscribed camera to slot");
+    }
+
+    match mid {
+        Some(mid) => {
+            send_server_message(
+                dc,
+                &ServerMessage::SlotMap(SlotMapPayload {
+                    mid,
+                    flight_id: Some(flight_id),
+                }),
+            )
+            .await;
+        }
+        None => warn!(
+            flight_id,
+            "slot has no negotiated mid yet — SlotMap skipped"
+        ),
+    }
+}
+
+/// Release a camera's slot. The slot-track stays alive (reused for a later
+/// subscribe); the camera sleeps once its last viewer leaves.
+async fn handle_unsubscribe(
+    registry: &Arc<CameraRegistry>,
+    slots: &Arc<Mutex<Vec<Slot>>>,
+    dc: &Arc<RTCDataChannel>,
+    flight_id: u32,
+) {
+    let (track, mid) = {
+        let mut guard = slots.lock().await;
+        match guard.iter_mut().find(|s| s.bound == Some(flight_id)) {
+            Some(slot) => {
+                slot.bound = None;
+                (slot.track.clone(), slot.mid.clone())
+            }
+            None => return, // not bound to any slot — nothing to do
+        }
+    };
+
+    if let Some(cam) = registry.get(flight_id).await {
+        let remaining = cam.remove_track(&track).await;
+        if remaining == 0 {
+            // Last viewer — sleep the camera promptly (the consume loop's
+            // maybe_sleep_idle_cameras would also catch this next tick).
+            registry.set_subscribed(flight_id, false).await;
+        }
+        info!(flight_id, remaining, "unsubscribed camera from slot");
+    }
+
+    if let Some(mid) = mid {
+        send_server_message(
+            dc,
+            &ServerMessage::SlotMap(SlotMapPayload {
+                mid,
+                flight_id: None,
+            }),
+        )
+        .await;
+    }
+}
+
+/// Announce the currently-bound slots to a freshly-opened control channel so
+/// the client maps its initial cameras to slots by mid (the same mechanism
+/// dynamic Subscribe uses). Idle slots and slots without a negotiated mid are
+/// skipped.
+async fn send_initial_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Arc<RTCDataChannel>) {
+    let bindings: Vec<(String, u32)> = {
+        let guard = slots.lock().await;
+        guard
+            .iter()
+            .filter_map(|s| match (&s.mid, s.bound) {
+                (Some(mid), Some(flight_id)) => Some((mid.clone(), flight_id)),
+                _ => None,
+            })
+            .collect()
+    };
+    for (mid, flight_id) in bindings {
+        send_server_message(
+            dc,
+            &ServerMessage::SlotMap(SlotMapPayload {
+                mid,
+                flight_id: Some(flight_id),
+            }),
+        )
+        .await;
     }
 }
 
@@ -753,53 +947,19 @@ fn make_even(v: u32) -> u32 {
     }
 }
 
-/// Per-track RTCP drain. Mostly serves to keep webrtc-rs's internal
-/// pipelines flowing (NACK / PLI break silently if we don't drain) —
-/// but also parses REMB packets and pushes the receiver's bandwidth
-/// estimate into the camera's per-SSRC estimate map. The consume loop
-/// reads the camera's `target_bitrate_bps` (min across active
-/// subscribers) and retargets the encoder when it diverges
-/// significantly from the encoder's current bitrate.
+/// Per-slot RTCP drain. webrtc-rs's NACK/PLI pipelines stall silently if a
+/// sender's RTCP isn't read, so every slot-track's sender must be drained for
+/// the connection's lifetime regardless of which camera (if any) currently
+/// feeds the slot. Exits when the sender closes (peer torn down).
 ///
-/// Loop exits on read error (sender closed → peer connection torn
-/// down) at which point we wipe our estimate from the camera's map so
-/// stale numbers don't pin the encoder at an obsolete target.
-async fn drain_rtcp(
-    sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
-    cam: Arc<InternalCameraState>,
-    track_ssrc: u32,
-) {
-    use std::any::Any;
-    loop {
-        match sender.read_rtcp().await {
-            Ok((packets, _attrs)) => {
-                for packet in packets {
-                    let any: &dyn Any = packet.as_any();
-                    if let Some(remb) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
-                        // REMB carries a max-bitrate estimate the
-                        // receiver thinks the path can sustain. We log
-                        // at debug — info would flood at the ~1Hz REMB
-                        // cadence × N peers.
-                        let bps = remb.bitrate as u32;
-                        debug!(
-                            flight_id = cam.flight_id,
-                            ssrc = track_ssrc,
-                            bps,
-                            "REMB received",
-                        );
-                        cam.record_bandwidth_estimate(track_ssrc, bps).await;
-                    }
-                }
-            }
-            Err(_) => {
-                debug!(
-                    flight_id = cam.flight_id,
-                    ssrc = track_ssrc,
-                    "RTCP drain loop exited"
-                );
-                cam.forget_estimate(track_ssrc).await;
-                break;
-            }
-        }
+/// REMB is deliberately NOT consumed here. In the slot model a slot's camera
+/// changes on Subscribe/Unsubscribe, so a REMB keyed by the slot's (stable)
+/// SSRC can't be pinned to one camera. That's acceptable *only* because
+/// REMB-driven bitrate is currently disabled (it caused a reinit death spiral
+/// — see `main.rs`). The frame-skip congestion follow-up must re-introduce
+/// per-slot bandwidth attribution before it can act on REMB again.
+async fn drain_rtcp_sink(sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>) {
+    while sender.read_rtcp().await.is_ok() {
+        // Packets (including REMB) intentionally discarded — see fn doc.
     }
 }

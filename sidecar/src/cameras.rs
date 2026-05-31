@@ -292,6 +292,27 @@ impl CameraState {
         self.subscribers.fetch_sub(n, Ordering::AcqRel);
     }
 
+    /// Remove a *specific, still-alive* track — the explicit `Unsubscribe`
+    /// path of the dynamic slot model. Unlike the consume loop's pruner
+    /// (which collects Weaks that have gone dead because a peer dropped),
+    /// here the track Arc is still owned by the peer as a reusable slot, so
+    /// it won't appear dead; we match it by pointer, drop its Weak, and
+    /// decrement the subscriber count ourselves. The fan-out pruner therefore
+    /// never double-counts it (it's already out of the list). Returns the
+    /// subscriber count after the decrement; removing a track this camera
+    /// isn't feeding is a no-op.
+    pub async fn remove_track(&self, track: &Arc<TrackLocalStaticSample>) -> usize {
+        let mut tracks = self.tracks.write().await;
+        let before = tracks.len();
+        tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
+        let removed = before - tracks.len();
+        drop(tracks);
+        if removed > 0 {
+            self.subscribers.fetch_sub(removed, Ordering::AcqRel);
+        }
+        self.subscribers.load(Ordering::Acquire)
+    }
+
     /// Record a REMB bandwidth estimate from a subscriber. Identified
     /// by the receiving track's SSRC so per-peer estimates stay
     /// distinct. Recomputes `target_bitrate_bps` as the min across all
@@ -950,6 +971,55 @@ mod tests {
             manifest.lifecycle,
             CameraLifecycle::Active,
             "unknown lifecycle in info.json should be treated as Active"
+        );
+    }
+
+    /// `add_track` / `remove_track` drive the subscriber count that gates
+    /// encoding — the efficiency premise of the dynamic slot model. The
+    /// transitions the slot pool relies on: subscribe -> 1, a second slot on
+    /// the same camera -> 2, unsubscribe one -> 1, last viewer -> 0; and
+    /// removing a track the camera isn't feeding is a no-op.
+    #[tokio::test]
+    async fn subscriber_count_transitions() {
+        use webrtc::api::media_engine::MIME_TYPE_H264;
+        use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        registry.rescan().await;
+        let cam = registry.get(1).await.expect("camera attached from ring");
+
+        let mk = || {
+            Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_H264.to_owned(),
+                    ..Default::default()
+                },
+                "video".to_owned(),
+                "stream".to_owned(),
+            ))
+        };
+        let a = mk();
+        let b = mk();
+
+        assert_eq!(cam.add_track(a.clone()).await, 1, "first subscribe");
+        assert_eq!(
+            cam.add_track(b.clone()).await,
+            2,
+            "second slot, same camera"
+        );
+        assert_eq!(cam.remove_track(&a).await, 1, "unsubscribe one slot");
+        assert_eq!(cam.remove_track(&b).await, 0, "last viewer leaves");
+        assert_eq!(
+            cam.remove_track(&a).await,
+            0,
+            "removing an unbound track is a no-op"
         );
     }
 }

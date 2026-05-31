@@ -191,6 +191,24 @@ pub struct FlightIdPayload {
     pub flight_id: u32,
 }
 
+/// Slot↔camera assignment for the dynamic-subscription model. The sidecar
+/// negotiates a pool of recv-only video transceivers up front; `Subscribe`
+/// binds a camera to a free one and the sidecar announces the binding here.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotMapPayload {
+    /// Transceiver `mid` carrying this slot's track. Stable for the
+    /// connection's life, so the client keys off it rather than the
+    /// fragile `onTrack` arrival order — match against
+    /// `RTCTrackEvent.transceiver.mid`.
+    pub mid: String,
+    /// Camera now carried by the slot, or `None` when the slot was freed
+    /// by `Unsubscribe`. Serialised as `null` (not omitted) so "freed" is
+    /// unambiguous on the wire.
+    pub flight_id: Option<u32>,
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,6 +298,17 @@ pub enum ClientMessage {
     /// the current P-frame chain. Sidecar forwards to the camera's
     /// encoder.
     RequestKeyframe(FlightIdPayload),
+    /// Dynamically subscribe to a camera on an already-connected peer. The
+    /// sidecar binds it to a free pre-negotiated slot (one of the recv-only
+    /// video transceivers from the offer), starts encoding it, forces a
+    /// keyframe, and replies with `SlotMap` naming the transceiver `mid` now
+    /// carrying it — no renegotiation. Replies with `Error` if no slot is
+    /// free (the client should have negotiated enough transceivers up front).
+    Subscribe(FlightIdPayload),
+    /// Release a camera's slot. The sidecar stops feeding that slot (the
+    /// camera sleeps if it has no other subscribers) and replies with
+    /// `SlotMap { flightId: null }` for the freed transceiver `mid`.
+    Unsubscribe(FlightIdPayload),
     /// Response to `Ping`. Browser sends this immediately on receiving each Ping.
     Pong,
 }
@@ -300,6 +329,12 @@ pub enum ServerMessage {
     /// or adaptive shedding kicks in. Lets clients update their UI
     /// without re-fetching the whole snapshot.
     CameraStateChanged(CameraStateChangedPayload),
+    /// Slot↔camera assignment for the dynamic-subscription model. Sent in
+    /// reply to `Subscribe`/`Unsubscribe`: `flightId` is the camera now
+    /// carried by transceiver `mid`, or `null` when the slot was freed. The
+    /// client maps `mid` to the track it received via `onTrack` and routes
+    /// that track to (or away from) the camera's stream — no renegotiation.
+    SlotMap(SlotMapPayload),
     /// Adaptive shedding level changed. Reason is human-readable
     /// ("ksp-fps-low", "ksp-fps-recovered") so client UIs can show
     /// *why* quality changed rather than just *that* it did.
@@ -459,5 +494,57 @@ mod tests {
         let s = serde_json::to_string(&msg).unwrap();
         assert!(s.contains("\"type\":\"adaptive-shed\""));
         assert!(s.contains("\"kspFps\":16.5"));
+    }
+
+    #[test]
+    fn subscribe_roundtrips() {
+        let msg = ClientMessage::Subscribe(FlightIdPayload { flight_id: 7 });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"type\":\"subscribe\""));
+        assert!(s.contains("\"flightId\":7"));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(&s).unwrap(),
+            ClientMessage::Subscribe(FlightIdPayload { flight_id: 7 })
+        ));
+    }
+
+    #[test]
+    fn unsubscribe_roundtrips() {
+        let msg = ClientMessage::Unsubscribe(FlightIdPayload { flight_id: 7 });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"type\":\"unsubscribe\""));
+        assert!(s.contains("\"flightId\":7"));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(&s).unwrap(),
+            ClientMessage::Unsubscribe(FlightIdPayload { flight_id: 7 })
+        ));
+    }
+
+    #[test]
+    fn slot_map_assigned_and_freed_roundtrip() {
+        let assigned = ServerMessage::SlotMap(SlotMapPayload {
+            mid: "1".into(),
+            flight_id: Some(42),
+        });
+        let s = serde_json::to_string(&assigned).unwrap();
+        assert!(s.contains("\"type\":\"slot-map\""));
+        assert!(s.contains("\"mid\":\"1\""));
+        assert!(s.contains("\"flightId\":42"));
+
+        // Freed: flightId serialises as null (not omitted) so the client
+        // distinguishes "slot freed" from a malformed message.
+        let freed = ServerMessage::SlotMap(SlotMapPayload {
+            mid: "1".into(),
+            flight_id: None,
+        });
+        let s = serde_json::to_string(&freed).unwrap();
+        assert!(s.contains("\"flightId\":null"));
+        match serde_json::from_str::<ServerMessage>(&s).unwrap() {
+            ServerMessage::SlotMap(p) => {
+                assert_eq!(p.mid, "1");
+                assert_eq!(p.flight_id, None);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
