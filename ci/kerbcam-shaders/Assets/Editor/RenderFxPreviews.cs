@@ -31,7 +31,12 @@ namespace KerbcamCI
         private const string _outputDir = "Previews";
 
         private static readonly string[] _shaderIds = { "plasma", "bowshock", "trail", "ember" };
-        private static readonly string[] _viewIds = { "external", "nose_up", "body_out" };
+        // Three viewpoints chosen to actually frame the FX they're meant to
+        // showcase:
+        //   side_profile     — pulled back, full vessel + wake + bowshock in frame
+        //   aft_hullcam      — body-mounted, looking back/down — sees trail + embers
+        //   forward_hullcam  — body-mounted, looking forward/up — sees bowshock
+        private static readonly string[] _viewIds = { "side_profile", "aft_hullcam", "forward_hullcam" };
 
         public static void RenderAll()
         {
@@ -194,23 +199,22 @@ namespace KerbcamCI
         }
 
         // Trail: procedural tapered tube behind the vessel along airflow.
-        // axis +Z = downstream (Quaternion.LookRotation(-windDir) below points
-        // the tube's +Z along -wind = the wake direction). Scaled down to
-        // vessel-relative size — the 20 m × 4 m runtime mesh would dominate
-        // the preview frame, so apply a 0.25× scale so it reads as a wake
-        // not a wall.
+        // axis +Z = downstream. The preview mesh is sized to start AT the
+        // vessel's local radius (0.6 m) and extend 40 m downstream so the
+        // wake reads as continuous with the vessel rather than a detached
+        // shape; no extra scale applied. Position is exactly at the cylinder
+        // base so the head of the tube touches the vessel.
         private static void SetupTrail(Transform root, Material mat, FxFixture.Inputs inputs)
         {
             var go = new GameObject("trail_tube");
             go.transform.SetParent(root, false);
-            go.transform.localPosition = new Vector3(0f, -1.3f, 0f); // just below cylinder base
+            go.transform.localPosition = new Vector3(0f, -1.2f, 0f); // exactly at cylinder base
             Vector3 windDir = inputs != null && inputs.windDirWorld != null && inputs.windDirWorld.Length >= 3
                 ? new Vector3(inputs.windDirWorld[0], inputs.windDirWorld[1], inputs.windDirWorld[2]).normalized
                 : Vector3.up;
             if (windDir.sqrMagnitude < 1e-3f) windDir = Vector3.up;
             Vector3 helperUp = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.right;
             go.transform.localRotation = Quaternion.LookRotation(-windDir, helperUp);
-            go.transform.localScale = new Vector3(0.25f, 0.25f, 0.25f);
             var mf = go.AddComponent<MeshFilter>();
             var mr = go.AddComponent<MeshRenderer>();
             mf.sharedMesh = BuildTaperedTubeMesh();
@@ -402,35 +406,41 @@ namespace KerbcamCI
             light.color = new Color(1f, 0.96f, 0.9f, 1f);
         }
 
-        // Three camera presets. external = current default (outside, looking
-        // at vessel). nose_up = camera at base looking up the long axis past
-        // the cone — bowshock-view, where the disc artifact was worst.
-        // body_out = camera mounted on the cylinder body looking outward
-        // perpendicular to the vessel axis — Hullcam-style internal view.
+        // Camera presets that actually frame the FX in question — replaces
+        // the first iteration's `external/nose_up/body_out` set which left
+        // most FX outside the visible frustum.
+        //
+        //   side_profile:    pulled-back side view at (9, 1, 0) looking at
+        //                    (0, -3, 0). Frames the whole vessel + trail
+        //                    region + bowshock cone in one shot.
+        //   aft_hullcam:     body-mounted (0.85, -0.5, 0) angled aft-down
+        //                    so the trail tube and embers fill the frame —
+        //                    the kerbcam-on-booster looking back use case.
+        //   forward_hullcam: body-mounted (0.85, 0.8, 0) angled forward
+        //                    past the nose so the bowshock + nose tip are
+        //                    in frame — the kerbcam-on-body looking up.
         private static void ApplyCameraPose(Transform t, FxFixture.CameraPose pose, string viewId)
         {
             switch (viewId)
             {
-                case "nose_up":
-                    // Mounted on the body side, near the top, looking up
-                    // along +Y toward the cone tip. Critically the camera
-                    // sits WINDWARD of the airflow extrusion (which goes
-                    // downward from windward surfaces) so plasma strips
-                    // don't pass through the near-clipping plane and trip
-                    // LLVMpipe's near-fullscreen-triangle deadlock.
-                    t.localPosition = new Vector3(0.85f, 1.0f, 0f);
+                case "side_profile":
+                    t.localPosition = new Vector3(9f, 1f, 0f);
                     t.localRotation = Quaternion.LookRotation(
-                        new Vector3(-0.85f, 1.5f, 0f).normalized, Vector3.forward);
+                        (new Vector3(0f, -3f, 0f) - t.localPosition).normalized, Vector3.up);
                     return;
-                case "body_out":
-                    // Same body-side mount but looking radially outward.
-                    // Airflow extrusion is along the body axis (Y), so a
-                    // camera looking along X never has extrusion crossing
-                    // its near plane.
-                    t.localPosition = new Vector3(0.85f, 0.3f, 0f);
-                    t.localRotation = Quaternion.LookRotation(Vector3.right, Vector3.up);
+                case "aft_hullcam":
+                    t.localPosition = new Vector3(0.85f, -0.5f, 0.3f);
+                    // LookRotation up CANNOT be world-up here because the
+                    // direction is mostly along -Y (degenerate). Use +Z as
+                    // the helper up so the image "up" is the vessel's +Z.
+                    t.localRotation = Quaternion.LookRotation(
+                        new Vector3(-0.5f, -1.6f, 0f).normalized, Vector3.forward);
                     return;
-                case "external":
+                case "forward_hullcam":
+                    t.localPosition = new Vector3(0.85f, 0.8f, 0.3f);
+                    t.localRotation = Quaternion.LookRotation(
+                        new Vector3(-0.5f, 1.6f, 0f).normalized, Vector3.forward);
+                    return;
                 default:
                     if (pose == null) { t.localPosition = new Vector3(3.5f, 0f, 0f); t.LookAt(Vector3.zero, Vector3.up); return; }
                     t.localPosition = ToVec3(pose.position, new Vector3(3.5f, 0f, 0f));
@@ -608,15 +618,17 @@ namespace KerbcamCI
             return mesh;
         }
 
-        // Higher-segment tapered tube (24 radial × 32 length) for the
-        // preview so radial silhouette and length banding aren't visible.
-        // Runtime TrailEffect uses 12 × 24 — same generator, more faces.
+        // Preview trail tube: narrower at the vessel end (0.6 m) and much
+        // longer (40 m) than the runtime fixed 4 m × 20 m mesh, so it can
+        // visually emerge FROM the vessel rather than hanging off-axis
+        // below it. 24 radial × 32 length so the silhouette isn't
+        // visibly polygonal.
         private static Mesh BuildTaperedTubeMesh()
         {
             const int lengthSeg = 32;
             const int radialSeg = 24;
-            const float startR = 4f;
-            const float length = 20f;
+            const float startR = 0.6f;
+            const float length = 40f;
             int ringVerts = radialSeg + 1;
             int totalVerts = (lengthSeg + 1) * ringVerts;
             var verts = new Vector3[totalVerts];

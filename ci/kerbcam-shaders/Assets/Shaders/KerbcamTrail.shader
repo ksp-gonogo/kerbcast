@@ -73,6 +73,8 @@ Shader "Kerbcam/Trail"
             {
                 float4 pos : SV_POSITION;
                 float2 uv  : TEXCOORD0;
+                float3 worldNormal : TEXCOORD1;
+                float3 worldPos : TEXCOORD2;
             };
 
             v2f vert(appdata_base v)
@@ -80,6 +82,8 @@ Shader "Kerbcam/Trail"
                 v2f o;
                 o.pos = UnityObjectToClipPos(v.vertex);
                 o.uv  = v.texcoord.xy;
+                o.worldNormal = UnityObjectToWorldNormal(v.normal);
+                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
                 return o;
             }
 
@@ -111,9 +115,22 @@ Shader "Kerbcam/Trail"
                 // hot core, not a uniform tube.
                 float head = pow(saturate(1.0 - i.uv.y * 1.4), 2.0);
 
+                // Face-weighted volume term: bright in the centre of the
+                // visible tube cross-section (camera looking through the
+                // hot core, where the surface normal is parallel to the
+                // view), fades to zero at the silhouette edges (where the
+                // normal is perpendicular to the view). Cull Off means
+                // both near and far surfaces contribute additively — they
+                // stack in the centre and fall off together at the rim,
+                // giving a flame-like glow with no hard mesh outline.
+                float3 nrm = normalize(i.worldNormal);
+                float3 vDir = normalize(_WorldSpaceCameraPos - i.worldPos);
+                float faceAbs = abs(dot(nrm, vDir));
+                float volume = pow(faceAbs, 1.5);
+
                 // Brightness held in by _Brightness so even at _Intensity=1
                 // the trail's peak fragment doesn't paint a wall.
-                float glow = (streaks * 0.85 + head * 0.4) * lenFade
+                float glow = (streaks * 0.85 + head * 0.4) * lenFade * volume
                              * saturate(_Intensity) * _Brightness;
 
                 // Wind→plasma colour ramp, then tinted toward KSP's stock

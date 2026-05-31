@@ -24,13 +24,17 @@ Shader "Kerbcam/Bowshock"
 {
     Properties
     {
-        _WindColor   ("Wind Colour (low intensity)", Color) = (0.85, 0.92, 1.0, 1)
-        _PlasmaColor ("Plasma Colour (high intensity)", Color) = (1.0, 0.45, 0.15, 1)
+        // Wind colour shifted toward blue-violet — the leading edge of a
+        // hypersonic shock front in ionised air glows ultraviolet/blue at
+        // the highest temperatures. Stays subtle visually because the
+        // bowshock output is dominated by rim glow only.
+        _WindColor   ("Wind Colour (low intensity)", Color) = (0.55, 0.65, 1.0, 1)
+        _PlasmaColor ("Plasma Colour (high intensity)", Color) = (1.0, 0.40, 0.20, 1)
         _Intensity   ("Intensity", Range(0,4)) = 0
-        _RimPower    ("Rim Power", Range(0.5,12)) = 3.0
+        _RimPower    ("Rim Power", Range(0.5,12)) = 2.5
         _ScrollSpeed ("Scroll Speed", Float) = 1.5
         // Plasma colour only blends in above this intensity (reserved for
-        // heavy reentry); below it stays wind-white. Matches KerbcamPlasma.
+        // heavy reentry); below it stays wind-blue. Matches KerbcamPlasma.
         _PlasmaOnset ("Plasma Onset", Range(0,1)) = 0.85
         // Near-camera distance over which the cone fades to zero. Stops the
         // cone from being a wall when the camera is inside or very close.
@@ -115,16 +119,15 @@ Shader "Kerbcam/Bowshock"
                 float distToCam = length(toCam);
                 float3 viewDir = toCam / max(distToCam, 1e-3);
 
-                // Fresnel-style silhouette glow. abs(dot()) keeps the rim
-                // correct on the backside since Cull Off draws both faces.
-                // _RimPower 3 widens the rim band so off-axis (external)
-                // views can read a coherent silhouette curve, not just a
-                // hair-thin grazing edge. Face dampener lighter so the
-                // interior surface stays visible.
+                // Bowshock output is essentially RIM ONLY — we read the
+                // shock as a thin curved arc at the silhouette of the cone,
+                // not as a filled surface. Interior contribution is reduced
+                // to a very faint hint (baseGlow * 0.03). This matches the
+                // real-world reference: actual bowshocks are mostly
+                // invisible volumes with only the highest-energy leading
+                // edge faintly glowing.
                 float ndv = abs(dot(n, viewDir));
                 float rim = pow(1.0 - saturate(ndv), _RimPower);
-                float face = pow(saturate(ndv), 2.0);
-                float faceFade = 1.0 - face * 0.45;
 
                 // Near-camera distance fade — when a fragment is closer than
                 // _NearFadeDist the contribution drops to 0 by the time it
@@ -140,13 +143,13 @@ Shader "Kerbcam/Bowshock"
                 float fxNoise = tex2D(_FXMainTex, fxUv).r;
                 float shimmer = 0.7 + 0.6 * fxNoise;
 
-                // Soft interior glow so the cone isn't pure silhouette; the
-                // rim still dominates by a wide margin. Total brightness is
-                // capped so even at peak fresnel * peak intensity the cone
-                // can't paint the frame as a wash.
-                float baseGlow = 0.15;
-                float raw = (baseGlow + rim * apexFade) * shimmer * faceFade * nearFade;
-                float glow = saturate(raw * 0.6) * _Intensity;
+                // Rim-dominant glow with a sharp brightness cap. baseGlow is
+                // tiny on purpose — the interior should NOT be visible as a
+                // surface. apexFade kills the rim contribution right at the
+                // cone tip where the smoothed normal is degenerate.
+                float baseGlow = 0.03;
+                float raw = (baseGlow + rim * apexFade * 1.2) * shimmer * nearFade;
+                float glow = saturate(raw * 0.55) * _Intensity;
 
                 // Wind→plasma colour ramp, then tinted toward KSP's stock
                 // heating colour (_FXColor) at high real heating. Stays
