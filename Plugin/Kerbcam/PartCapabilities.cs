@@ -37,6 +37,16 @@ namespace Kerbcam
         /// rotation around the view axis. Use 180 to correct an upside-down
         /// feed when cameraForward points opposite to the default camera Z.</summary>
         public float CameraRollDeg;
+        /// <summary>When true, the sign of the yaw angle applied to the mesh
+        /// joint transform is negated. Set this for cameras whose
+        /// <c>cameraForward</c> points in the −Z direction in the joint's local
+        /// frame (i.e. <c>cameraForward.z &lt; 0</c>). Without the negation,
+        /// rotating the joint by +Y (counterclockwise from above) sweeps a
+        /// backward-facing camera to the left — opposite of what the operator
+        /// expects for +panYaw. Cameras with <c>cameraForward.z &gt; 0</c>
+        /// face the joint's +Z and sweep right under +Y rotation, which is
+        /// already correct, so they leave this false.</summary>
+        public bool YawMeshInvert;
 
         public bool SupportsPan => YawMin != YawMax || PitchMin != PitchMax;
     }
@@ -92,6 +102,16 @@ namespace Kerbcam
             // TopJoint so stream and mesh move together. Limits from the
             // commented-out servo block: hardMinMaxLimits = -177, 177 — trimmed
             // to ±135 to leave a dead zone around the mount's cable entry.
+            //
+            // YawMeshInvert = true: TurretCam's cameraForward = (0,0,-1), meaning
+            // the lens faces the −Z direction in TopJoint's local frame. Unity's
+            // Euler(0,+Y,0) rotates the joint CCW when viewed from above, which
+            // sweeps −Z toward −X — turning the camera LEFT when the operator
+            // commands +panYaw (pan right). Negating the joint angle corrects this
+            // so the on-screen view and the mesh both sweep right on +panYaw.
+            // The near camera's own localRotation is not touched (it is parented to
+            // the joint and carries _baseRotation only when a yaw joint is present),
+            // so only the joint-drive line in Refresh() is affected.
             ["DC.TurretCam"] = new PanCapability
             {
                 YawMin = -135f, YawMax = 135f,
@@ -100,6 +120,7 @@ namespace Kerbcam
                 PanRateDegPerSec = 25f,
                 YawTransformName = "TopJoint",
                 PitchTransformName = "",
+                YawMeshInvert = true,
             },
 
             // LaunchCam: single joint (hc_launchcam) that carries both yaw and
@@ -107,9 +128,11 @@ namespace Kerbcam
             // names point to the same node; Refresh() detects this and applies
             // a compound Euler(-pitch, yaw, 0) in one assignment so they don't
             // fight. Near cam is parented to the joint and uses _baseRotation
-            // only (joint carries all rotation). Yaw sign may need verification
-            // in-game — cameraForward = 0,0,+1 is opposite TurretCam's 0,0,-1
-            // so positive yaw may appear to go left; flip YawMin/YawMax if so.
+            // only (joint carries all rotation).
+            // Yaw direction: cameraForward = 0,0,+1 means the lens faces +Z in
+            // the joint's local frame. Unity Euler(0,+Y,0) rotates CCW from
+            // above, sweeping +Z toward +X — turning the camera RIGHT for
+            // +panYaw. Confirmed correct in live KSP; no YawMeshInvert needed.
             ["hc.launchcam"] = new PanCapability
             {
                 YawMin = -180f, YawMax = 180f,
