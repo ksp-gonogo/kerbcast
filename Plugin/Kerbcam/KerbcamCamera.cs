@@ -1109,13 +1109,18 @@ namespace Kerbcam
 
         public void Refresh()
         {
-            // Control-file poll ~20Hz (countdown=3 at 60fps). Fast enough
-            // for interactive pan; File.GetLastWriteTime is a stat() so the
-            // cost is negligible even at 20Hz. The old 1Hz cadence (60) was
-            // fine for layer/fov changes but too sluggish for pan input.
+            // Control-file poll every frame (~60Hz at 60fps). The only cost is
+            // one File.GetLastWriteTimeUtc stat() per frame — a single syscall
+            // (<1µs on Linux ext4/tmpfs); the file is only re-read when mtime
+            // changes. At the previous 20Hz cadence (countdown=3), a released
+            // pan-rate command could go unacknowledged for up to 50ms, causing
+            // ~1.25° overshoot at full deflection (25°/s × 0.05s). At 60Hz the
+            // worst-case command pickup latency drops to ~16ms and overshoot to
+            // ~0.42°, making stop-accuracy and start-responsiveness noticeably
+            // better with zero meaningful runtime cost.
             if (--_controlCheckCountdown <= 0)
             {
-                _controlCheckCountdown = 3;
+                _controlCheckCountdown = 1;
                 PollControlFile();
             }
 
@@ -1195,8 +1200,17 @@ namespace Kerbcam
                 else
                 {
                     if (_yawTransform != null)
+                    {
+                        // YawMeshInvert: cameras with cameraForward.z < 0 face
+                        // −Z in the joint's local frame. Unity Euler(0,+Y,0)
+                        // rotates CCW from above, sweeping −Z toward −X (camera
+                        // turns left for +panYaw). Negate the joint angle so the
+                        // mesh and the rendered view both pan in the expected
+                        // direction (+panYaw → right).
+                        float meshYaw = _panCap.YawMeshInvert ? -_panYawCurrent : _panYawCurrent;
                         _yawTransform.localRotation = _yawRestRot
-                            * Quaternion.Euler(0f, _panYawCurrent, 0f);
+                            * Quaternion.Euler(0f, meshYaw, 0f);
+                    }
                     if (_pitchTransform != null)
                         _pitchTransform.localRotation = _pitchRestRot
                             * Quaternion.Euler(-_panPitchCurrent, 0f, 0f);
