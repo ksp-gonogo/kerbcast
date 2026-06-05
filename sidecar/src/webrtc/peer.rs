@@ -316,8 +316,12 @@ impl KerbcamPeer {
         self.connected.notified().await;
     }
 
-    /// Tear down the peer cleanly. Idempotent.
-    #[allow(dead_code)]
+    /// Tear down the peer cleanly. Idempotent. Releases the RTCRtpSenders'
+    /// strong refs to the slot tracks (see `close_releases_track_arc`), so each
+    /// camera's Weak goes dead and the consume loop prunes it — dropping the
+    /// subscriber count to zero and flushing `set_subscribed(false)`. Must be
+    /// called when reaping a dropped peer, or cameras keep rendering for a
+    /// viewer that's already gone.
     pub async fn close(&self) -> Result<()> {
         self.pc.close().await?;
         Ok(())
@@ -1127,5 +1131,77 @@ fn make_even(v: u32) -> u32 {
 async fn drain_rtcp_sink(sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>) {
     while sender.read_rtcp().await.is_ok() {
         // Packets (including REMB) intentionally discarded — see fn doc.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+    use std::time::Duration;
+
+    // Build a minimal RTCPeerConnection the same way KerbcamPeer::new does, so
+    // the sender/track lifecycle matches production.
+    async fn build_pc() -> Arc<RTCPeerConnection> {
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("register default codecs");
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("create peer connection"),
+        )
+    }
+
+    // F4 premise (deterministic, no real connection needed): `pc.close()` must
+    // release the RTCRtpSender's strong ref to the track, so the camera's Weak
+    // goes dead and the consume loop prunes it — dropping the subscriber count
+    // to zero, which flushes `set_subscribed(false)` and lets the plugin stop
+    // rendering. WITHOUT close() the sender holds the track Arc for the life of
+    // the (already-dropped) peer, so the Weak never dies: that is the leak that
+    // left cameras rendering after a clean disconnect (the reaper dropped the
+    // Arc<KerbcamPeer> but never called close()).
+    #[tokio::test]
+    async fn close_releases_track_arc() {
+        let pc = build_pc().await;
+        let track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            "stream".to_owned(),
+        ));
+        pc.add_track(track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("add_track");
+
+        let weak: Weak<TrackLocalStaticSample> = Arc::downgrade(&track);
+        drop(track); // release our ref; the sender inside pc still holds one
+
+        assert!(
+            weak.upgrade().is_some(),
+            "while the peer is open the sender keeps the track alive — this is \
+             exactly the leak when close() is never called on disconnect"
+        );
+
+        pc.close().await.expect("close");
+
+        // close() winds sender tasks down asynchronously; poll briefly.
+        let mut freed = false;
+        for _ in 0..40 {
+            if weak.upgrade().is_none() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "pc.close() must release the sender's track Arc within ~2s — \
+             this is the mechanism F4 relies on to free camera subscriptions"
+        );
     }
 }

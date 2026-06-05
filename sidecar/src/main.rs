@@ -243,6 +243,16 @@ async fn consume_loop(
             dropped
         };
         for peer in dropped_peers {
+            // Close the RTCPeerConnection so its senders release the slot
+            // tracks. Dropping the Arc<KerbcamPeer> alone is NOT enough —
+            // webrtc-rs keeps the sender tasks (and their track Arcs) alive
+            // until close(), so without this the camera's Weak refs never die,
+            // the subscriber count stays > 0, and the plugin keeps rendering
+            // for a viewer that has already disconnected. (See
+            // peer::tests::close_releases_track_arc.)
+            if let Err(e) = peer.close().await {
+                warn!(peer_id = peer.peer_id, error = %e, "peer close on reap failed");
+            }
             for flight_id in &peer.subscribed {
                 if let Some(cam) = registry.get(*flight_id).await {
                     cam.forget_degrade(peer.peer_id).await;
