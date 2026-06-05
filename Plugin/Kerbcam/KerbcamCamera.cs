@@ -105,9 +105,34 @@ namespace Kerbcam
         private FxHost _fxHost;
         // Which FX layers this camera runs (subject to the _enableFx master).
         private AtmoFxLayers _fxLayers;
+        // The *current* render-target triple (also held in _rtPool). Refresh()
+        // renders + blits + issues new readbacks against these.
         private RenderTexture _captureRt;
         private RenderTexture _readbackRt; // depth=0, GL_TEXTURE_2D-clean
         private Texture2D _scratchTex;
+        // RenderTexture pool keyed by render size (RenderSizeKey.Pack). Adaptive
+        // shedding switches between pooled sets instead of destroying and
+        // reallocating: destroying a RenderTexture while an AsyncGPUReadback is
+        // still in flight against it orphans the native readback task (the
+        // bundled OpenGL plugin exposes no cancel/free API), and that orphan is
+        // then walked every frame by the DontDestroyOnLoad updater for the rest
+        // of the process. Pooling never destroys mid-flight (so nothing is
+        // orphaned) and removes the per-change realloc hitch. The shed cascade
+        // yields ≤6 distinct sizes, so the pool stays small and bounded.
+        private struct RenderTargetSet
+        {
+            public RenderTexture Capture;
+            public RenderTexture Readback;
+            public Texture2D Scratch;
+        }
+        private readonly Dictionary<long, RenderTargetSet> _rtPool =
+            new Dictionary<long, RenderTargetSet>();
+        // The in-flight readback is described independently of the *current*
+        // target so a resolution change mid-readback still drains the pending
+        // frame at its original dimensions before switching. The decoupling
+        // logic is unit-tested in ReadbackTargetTracker.Tests.
+        private readonly ReadbackTargetTracker<Texture2D> _targets =
+            new ReadbackTargetTracker<Texture2D>();
         private readonly MmapFrameRing _ring;
         private readonly string _ringPath;
         private readonly string _infoPath;
@@ -353,25 +378,38 @@ namespace Kerbcam
             }
         }
 
+        // Select (or lazily create) the pooled render-target set for this size
+        // and make it current. Never destroys — see the _rtPool field comment.
         private void BuildRenderTargets(int width, int height)
         {
-            _captureRt = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
+            long key = RenderSizeKey.Pack(width, height);
+            if (!_rtPool.TryGetValue(key, out var set))
             {
-                antiAliasing = 1,
-            };
-            _captureRt.Create();
+                var capture = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
+                {
+                    antiAliasing = 1,
+                };
+                capture.Create();
 
-            // depth=0 so GetNativeTexturePtr returns a vanilla GL_TEXTURE_2D
-            // handle on Mesa OpenGL. With depth=24 (the capture RT) the
-            // yangrc plugin's glGetTexLevelParameteriv reads back zero
-            // dimensions and silently does nothing.
-            _readbackRt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
-            _readbackRt.Create();
+                // depth=0 so GetNativeTexturePtr returns a vanilla GL_TEXTURE_2D
+                // handle on Mesa OpenGL. With depth=24 (the capture RT) the
+                // yangrc plugin's glGetTexLevelParameteriv reads back zero
+                // dimensions and silently does nothing.
+                var readback = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
+                readback.Create();
 
-            // RGBA32 (not ARGB32). DX11/Mesa async readback only supports a
-            // narrow set of GraphicsFormats as readback destinations; RGBA32
-            // (R8G8B8A8_UNorm) is in the list, ARGB32 (B8G8R8A8_SRGB) isn't.
-            _scratchTex = new Texture2D(width, height, TextureFormat.RGBA32, mipChain: false);
+                // RGBA32 (not ARGB32). DX11/Mesa async readback only supports a
+                // narrow set of GraphicsFormats as readback destinations; RGBA32
+                // (R8G8B8A8_UNorm) is in the list, ARGB32 (B8G8R8A8_SRGB) isn't.
+                var scratch = new Texture2D(width, height, TextureFormat.RGBA32, mipChain: false);
+
+                set = new RenderTargetSet { Capture = capture, Readback = readback, Scratch = scratch };
+                _rtPool[key] = set;
+            }
+            _captureRt = set.Capture;
+            _readbackRt = set.Readback;
+            _scratchTex = set.Scratch;
+            _targets.SetCurrent(width, height, _scratchTex);
         }
 
         /// <summary>
@@ -387,13 +425,10 @@ namespace Kerbcam
             if (width > MaxWidth || height > MaxHeight) return;
             if (width == RenderWidth && height == RenderHeight) return;
 
-            // Drop any in-flight readback before destroying its source RT.
-            _readbackInFlight = false;
-
-            if (_captureRt != null) { _captureRt.Release(); UnityEngine.Object.Destroy(_captureRt); }
-            if (_readbackRt != null) { _readbackRt.Release(); UnityEngine.Object.Destroy(_readbackRt); }
-            if (_scratchTex != null) UnityEngine.Object.Destroy(_scratchTex);
-
+            // Switch to the pooled set for the new size. The old set stays in
+            // the pool (never destroyed), so a readback still in flight against
+            // it drains safely at its captured dimensions (_pendingW/_pendingH/
+            // _pendingScratch) — nothing is orphaned, and there's no realloc.
             BuildRenderTargets(width, height);
             RenderWidth = width;
             RenderHeight = height;
@@ -1070,7 +1105,7 @@ namespace Kerbcam
             return sb.ToString();
         }
 
-        public void Refresh()
+        public void Refresh(bool mayIssueReadback)
         {
             // Control-file poll every frame (~60Hz at 60fps). PollControlFile
             // reads the (tiny, tmpfs-backed) file and compares its contents, so
@@ -1233,6 +1268,13 @@ namespace Kerbcam
                 _readbackInFlight = false;
             }
 
+            // Capture staggering: KerbcamCore grants only a round-robin subset of
+            // cameras a new capture each frame, so they don't all render + read
+            // back on the same frame (bounding simultaneous in-flight readbacks).
+            // The control poll, pan slew and readback drain above still run every
+            // frame; only the render + readback issue below is paced.
+            if (!mayIssueReadback) return;
+
             try
             {
                 // Manual render sequence: galaxy → scaled → near.
@@ -1381,7 +1423,19 @@ namespace Kerbcam
                 Graphics.Blit(flipTmp, _readbackRt);
                 RenderTexture.ReleaseTemporary(flipTmp);
 
+                // INVARIANT: at most one readback is in flight per camera. The
+                // drain guards above (both the !_subscribed branch and the main
+                // path) early-return until _pendingRequest.done and clear the
+                // flag before we reach here, so this Request only runs when none
+                // is pending. The pending-dims snapshot below relies on this —
+                // if a second request were ever issued before the first drained,
+                // _pendingScratch/_pendingW/_pendingH would be clobbered and
+                // ProcessReadback would corrupt the in-flight frame.
                 _readbackInFlight = true;
+                // Snapshot the target this readback belongs to, so a resolution
+                // change before it completes doesn't make ProcessReadback use
+                // the new (mismatched) dimensions / scratch texture.
+                _targets.CapturePending();
                 _pendingCaptureTsMs = Time.unscaledTime * 1000.0;
                 _pendingRequest = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
             }
@@ -1403,11 +1457,14 @@ namespace Kerbcam
                 }
 
                 var data = request.GetData<byte>();
-                _scratchTex.LoadRawTextureData(data);
-                _scratchTex.Apply();
-                var rgba = _scratchTex.GetRawTextureData();
+                // Use the snapshot taken when this readback was issued — the
+                // current render size may have changed since (pooled switch).
+                var scratch = _targets.PendingScratch;
+                scratch.LoadRawTextureData(data);
+                scratch.Apply();
+                var rgba = scratch.GetRawTextureData();
 
-                _ring.Produce(RenderWidth, RenderHeight, _pendingCaptureTsMs, rgba, 0, rgba.Length);
+                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, rgba, 0, rgba.Length);
                 _consecutiveErrors = 0;
             }
             catch (Exception ex)
@@ -1480,9 +1537,17 @@ namespace Kerbcam
             if (_nearCam != null) UnityEngine.Object.Destroy(_nearCam.gameObject);
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);
-            if (_captureRt != null) _captureRt.Release();
-            if (_readbackRt != null) _readbackRt.Release();
-            UnityEngine.Object.Destroy(_scratchTex);
+            // Destroy every pooled render-target set (the current _captureRt /
+            // _readbackRt / _scratchTex are members of one of these, so this
+            // covers them). Safe here because the camera is being torn down —
+            // no further readbacks will be issued.
+            foreach (var set in _rtPool.Values)
+            {
+                if (set.Capture != null) { set.Capture.Release(); UnityEngine.Object.Destroy(set.Capture); }
+                if (set.Readback != null) { set.Readback.Release(); UnityEngine.Object.Destroy(set.Readback); }
+                if (set.Scratch != null) UnityEngine.Object.Destroy(set.Scratch);
+            }
+            _rtPool.Clear();
 
             _ring?.Dispose();
             _controlBlock?.Dispose();

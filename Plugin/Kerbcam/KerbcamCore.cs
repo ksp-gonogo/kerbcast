@@ -63,17 +63,27 @@ namespace Kerbcam
         private int _fpsIdx;
         private int _fpsCount; // up to FpsSamples; growing-average until full
         private float _fpsAvg;
-        private int _shedLevel;
-        // Shed level transitions. Each pair = (escalate-below, restore-above)
-        // for the transition from level N to level N+1. Hysteresis (~5 fps)
-        // prevents flapping. See KerbcamCamera.ShedTable for what each level
-        // actually applies — scaled is in level 5 so the trigger is severe.
-        //
-        // Levels:  0 → 1 → 2 → 3 → 4 → 5
-        //
-        // Transition: 0→1     1→2     2→3     3→4     4→5
-        private static readonly float[] ShedBelow    = { 25f, 18f, 12f,  7f, 3f };
-        private static readonly float[] RestoreAbove = { 30f, 23f, 17f, 12f, 7f };
+        // Adaptive-shed decision state machine. The fps thresholds + hysteresis
+        // and the anti-flap dwell/back-off all live in ShedController (which is
+        // Unity-free and unit-tested). Each LateUpdate we hand it the rolling
+        // fps average + the unscaled clock and apply the level it returns.
+        // Initialised with defaults; Awake rebuilds it from settings.cfg once
+        // they're loaded (the field initialiser keeps it non-null meanwhile).
+        private ShedController _shedController =
+            new ShedController(KerbcamCamera.MaxShedLevel);
+
+        // The DontDestroyOnLoad GameObject hosting AsyncReadbackUpdater, whose
+        // Update() pumps the OpenGL readback plugin (a per-frame render-thread
+        // GL.IssuePluginEvent) every frame. Tracked so OnDestroy can tear it
+        // down on flight exit — otherwise it keeps pumping in every later scene
+        // (space centre, main menu) for the rest of the process, stalling the
+        // render thread on any leftover readback tasks until KSP is restarted.
+        private GameObject _readbackUpdaterGo;
+
+        // Round-robins which cameras capture each frame (see ReadbackScheduler),
+        // so they don't all issue a GPU render + readback on the same frame.
+        private readonly ReadbackScheduler _readbackScheduler = new ReadbackScheduler();
+        private bool[] _capturePermit = new bool[0];
 
         private static string ResolveRingDir()
         {
@@ -96,6 +106,12 @@ namespace Kerbcam
             Debug.Log("[Kerbcam] KerbcamCore.Awake — initialising");
 
             _settings = KerbcamSettings.Load();
+            _shedController = new ShedController(
+                KerbcamCamera.MaxShedLevel,
+                _settings.ShedDwellSeconds,
+                _settings.ShedRestoreDwellSeconds,
+                _settings.ShedRestoreBackoffFactor,
+                _settings.ShedMaxRestoreDwellSeconds);
 
             try
             {
@@ -106,9 +122,10 @@ namespace Kerbcam
                 // DontDestroyOnLoad GameObject.
                 if (AsyncReadbackUpdater.instance == null)
                 {
-                    var updaterGo = new GameObject("Kerbcam_AsyncReadbackUpdater");
-                    UnityEngine.Object.DontDestroyOnLoad(updaterGo);
-                    updaterGo.AddComponent<AsyncReadbackUpdater>();
+                    _readbackUpdaterGo = new GameObject("Kerbcam_AsyncReadbackUpdater");
+                    UnityEngine.Object.DontDestroyOnLoad(_readbackUpdaterGo);
+                    _readbackUpdaterGo.AddComponent<AsyncReadbackUpdater>();
+                    Debug.Log("[Kerbcam] spawned AsyncReadbackUpdater (readback pump)");
                 }
             }
             catch (Exception ex)
@@ -535,9 +552,17 @@ namespace Kerbcam
                 }
             }
 
-            for (int i = 0; i < _cameras.Count; i++)
+            // Stagger captures round-robin so the cameras don't all render +
+            // read back on the same frame. Budget = how many may capture this
+            // frame to sustain CaptureFps at the current game fps (_fpsAvg);
+            // below CaptureFps it grants all of them.
+            int camCount = _cameras.Count;
+            if (_capturePermit.Length < camCount) _capturePermit = new bool[camCount];
+            int budget = ReadbackScheduler.Budget(camCount, _settings.CaptureFps, _fpsAvg);
+            _readbackScheduler.NextTick(camCount, budget, _capturePermit);
+            for (int i = 0; i < camCount; i++)
             {
-                _cameras[i].Refresh();
+                _cameras[i].Refresh(_capturePermit[i]);
             }
 
             MaybeWriteStatusFile();
@@ -838,7 +863,7 @@ namespace Kerbcam
                 var sb = new System.Text.StringBuilder(256 + _cameras.Count * 256);
                 sb.Append("{\n");
                 sb.Append($"  \"kspFps\": {_fpsAvg:F2},\n");
-                sb.Append($"  \"shedLevel\": {_shedLevel},\n");
+                sb.Append($"  \"shedLevel\": {_shedController.Level},\n");
                 sb.Append("  \"cameras\": [\n");
                 for (int i = 0; i < _cameras.Count; i++)
                 {
@@ -904,27 +929,14 @@ namespace Kerbcam
         {
             if (_fpsCount < FpsSamples) return;
 
-            int desired = _shedLevel;
-            int maxLevel = KerbcamCamera.MaxShedLevel;
-            // Escalate one level if we're below this transition's shed
-            // threshold; de-escalate one level if we're above the
-            // previous transition's restore threshold. One step per tick
-            // so the system doesn't lurch through multiple resolution
-            // changes in a single LateUpdate.
-            if (_shedLevel < maxLevel && _fpsAvg < ShedBelow[_shedLevel])
-            {
-                desired = _shedLevel + 1;
-            }
-            else if (_shedLevel > 0 && _fpsAvg > RestoreAbove[_shedLevel - 1])
-            {
-                desired = _shedLevel - 1;
-            }
+            int before = _shedController.Level;
+            // Unscaled time so dwell/back-off track wall-clock seconds, not
+            // in-game time (timewarp must not race the shed loop).
+            int level = _shedController.Evaluate(_fpsAvg, Time.unscaledTime);
+            if (level == before) return;
 
-            if (desired == _shedLevel) return;
-
-            _shedLevel = desired;
-            Debug.Log($"[Kerbcam] adaptive shed level={_shedLevel} (avg fps={_fpsAvg:F1})");
-            foreach (var cam in _cameras) cam.ApplyAutoShed(_shedLevel);
+            Debug.Log($"[Kerbcam] adaptive shed level={level} (avg fps={_fpsAvg:F1})");
+            foreach (var cam in _cameras) cam.ApplyAutoShed(level);
         }
 
         private void OnDestroy()
@@ -942,6 +954,20 @@ namespace Kerbcam
             foreach (var cam in _cameras) cam.Dispose();
             _cameras.Clear();
             StopSidecar();
+
+            // Tear down the readback pump now that the cameras (and their
+            // readback requests) are gone. Leaving it alive would keep firing a
+            // per-frame render-thread plugin event in every later scene — the
+            // root of the "spikes persist on the main menu / only a KSP restart
+            // recovers" symptom. Destroying the GameObject also clears
+            // AsyncReadbackUpdater.instance via Unity's destroyed-object null
+            // semantics, so the next Flight scene re-spawns a fresh one.
+            if (_readbackUpdaterGo != null)
+            {
+                UnityEngine.Object.Destroy(_readbackUpdaterGo);
+                _readbackUpdaterGo = null;
+                Debug.Log("[Kerbcam] tore down AsyncReadbackUpdater (readback pump) on scene exit");
+            }
 
             // Clean up status file so a stale snapshot doesn't survive
             // into the next launch.

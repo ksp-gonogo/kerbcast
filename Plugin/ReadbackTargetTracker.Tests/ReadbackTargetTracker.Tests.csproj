@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone unit test for ReadbackTargetTracker.cs — the Unity-free
+    current-vs-pending decoupling that keeps a resolution change from corrupting
+    an in-flight readback. Uses int ids in place of Texture2D. Run: `dotnet run`.
+    Mirrors the ControlBlock.Tests / ShedController.Tests pattern.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../Kerbcam/ReadbackTargetTracker.cs" />
+  </ItemGroup>
+
+</Project>
