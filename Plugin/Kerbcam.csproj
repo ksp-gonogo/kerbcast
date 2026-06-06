@@ -117,6 +117,7 @@
     <Compile Remove="ReadbackTargetTracker.Tests/**/*.cs" />
     <Compile Remove="ReadbackScheduler.Tests/**/*.cs" />
     <Compile Remove="MmapFrameRing.Tests/**/*.cs" />
+    <Compile Remove="PhaseTimings.Tests/**/*.cs" />
   </ItemGroup>
 
 </Project>

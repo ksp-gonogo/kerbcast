@@ -251,6 +251,28 @@ namespace Kerbcam
         private double _pendingCaptureTsMs;
         private int _consecutiveErrors;
 
+        // Per-phase render-timing accumulator (last / EMA / rolling-max per
+        // phase). Populated only when KerbcamSettings.EnableTelemetry is true;
+        // the status writer reads it and aggregates across cameras. Always
+        // allocated (cheap, one small object per camera) but never written to
+        // when telemetry is off, so the OFF path stays allocation-free.
+        private readonly PhaseTimings _phaseTimings = new PhaseTimings();
+        /// <summary>Per-phase render timings for this camera. Read by the 1Hz
+        /// status writer; only meaningful when telemetry is enabled.</summary>
+        public PhaseTimings PhaseTimings => _phaseTimings;
+        // Cached for this Refresh tick (read once at the top). When false, every
+        // timing bracket is skipped so the OFF path makes zero GetTimestamp
+        // calls. When true, drain (ProcessReadback) timing accumulates here so
+        // it can be combined with the Request-issue timing into one Readback
+        // sample at the end of the tick.
+        private bool _telemetry;
+        private double _readbackDrainMs;
+        // Milliseconds per Stopwatch tick — computed once. Stopwatch.GetTimestamp
+        // returns raw ticks (no allocation, no shared mutable Stopwatch state);
+        // multiply the tick delta by this to get milliseconds.
+        private static readonly double _msPerTick =
+            1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
         // HullcamVDS per-part shader filter (NightVision, MovieTime,
         // CRT scanlines etc — 9 modes total enumerated by
         // HullcamVDS.CameraFilter.eCameraMode). Created from
@@ -1128,6 +1150,13 @@ namespace Kerbcam
 
         public void Refresh(bool mayIssueReadback)
         {
+            // Read the telemetry gate once per tick so the OFF path makes zero
+            // GetTimestamp calls (zero-cost when disabled). Reset the per-tick
+            // drain accumulator; ProcessReadback adds to it when it drains a
+            // completed readback this frame.
+            _telemetry = KerbcamSettings.EnableTelemetry;
+            _readbackDrainMs = 0.0;
+
             // Control-file poll every frame (~60Hz at 60fps). PollControlFile
             // reads the (tiny, tmpfs-backed) file and compares its contents, so
             // the cost is one small read + a string compare per frame — the work
@@ -1296,6 +1325,12 @@ namespace Kerbcam
             // frame; only the render + readback issue below is paced.
             if (!mayIssueReadback) return;
 
+            // Zero this frame's per-phase Last values before recording, so a
+            // phase shed this tick reads 0 rather than its last-rendered figure
+            // (otherwise the across-camera Last sum overstates cost under
+            // adaptive layer shedding). EMA / rolling-max are preserved.
+            if (_telemetry) _phaseTimings.BeginFrame();
+
             try
             {
                 // Manual render sequence: galaxy → scaled → near.
@@ -1313,9 +1348,17 @@ namespace Kerbcam
                 // try/finally ensures restore even if Render() throws.
                 if (_galaxyCam != null && (_layers & CameraLayers.Galaxy) != 0)
                 {
+                    long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     _galaxyCam.Render();
+                    if (_telemetry)
+                        _phaseTimings.Record(RenderPhase.Galaxy,
+                            (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
                 }
 
+                // Scaled layer: bracket the whole block (fader override
+                // bookkeeping + Render + restore) so the recorded cost matches
+                // the main-thread work this layer actually adds per tick.
+                long scaledStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 if (_scaledCam != null && (_layers & CameraLayers.Scaled) != 0)
                 {
                     ScaledSunLightHelper.StripCompositeShadowsBuffer();
@@ -1404,14 +1447,23 @@ namespace Kerbcam
                         ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
                     }
                 }
+                if (_telemetry && _scaledCam != null && (_layers & CameraLayers.Scaled) != 0)
+                    _phaseTimings.Record(RenderPhase.Scaled,
+                        (System.Diagnostics.Stopwatch.GetTimestamp() - scaledStart) * _msPerTick);
 
                 if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
                 {
                     // FX effects update materials and (re)attach their command
                     // buffers before the render; the near render then executes
                     // those CBs (e.g. the core sheath at AfterForwardAlpha).
+                    // Time the FX build + render + near render together (the
+                    // task's "near Render() (+ FX)" phase).
+                    long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     _fxHost?.Render(BuildFxFrameState());
                     _nearCam.Render();
+                    if (_telemetry)
+                        _phaseTimings.Record(RenderPhase.Near,
+                            (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
                 }
 
                 // Blit the depth-bundled capture RT into the clean readback RT.
@@ -1420,6 +1472,10 @@ namespace Kerbcam
                 // post-processes _captureRt → _readbackRt in one step. The
                 // existing AsyncGPUReadback path then reads the
                 // already-filtered pixels — no extra round-trip needed.
+                // Blit phase: the filter/nv/plain capture→readback blit AND the
+                // horizontal-flip correction below — all the main-thread Blit
+                // dispatch this tick.
+                long blitStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 if (_nvMaterial != null)
                 {
                     Graphics.Blit(_captureRt, _readbackRt, _nvMaterial);
@@ -1444,6 +1500,9 @@ namespace Kerbcam
                 Graphics.Blit(_readbackRt, flipTmp, new Vector2(-1f, 1f), new Vector2(1f, 0f));
                 Graphics.Blit(flipTmp, _readbackRt);
                 RenderTexture.ReleaseTemporary(flipTmp);
+                if (_telemetry)
+                    _phaseTimings.Record(RenderPhase.Blit,
+                        (System.Diagnostics.Stopwatch.GetTimestamp() - blitStart) * _msPerTick);
 
                 // INVARIANT: at most one readback is in flight per camera. The
                 // drain guards above (both the !_subscribed branch and the main
@@ -1459,7 +1518,21 @@ namespace Kerbcam
                 // the new (mismatched) dimensions / scratch texture.
                 _targets.CapturePending();
                 _pendingCaptureTsMs = Time.unscaledTime * 1000.0;
+                long reqStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 _pendingRequest = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
+                if (_telemetry)
+                {
+                    // Readback phase = this tick's drain of the PREVIOUS frame's
+                    // capture (the ring memcpy in ProcessReadback, accumulated
+                    // into _readbackDrainMs at the top of Refresh) + the cheap
+                    // Request() issue here. Recording them combined keeps the
+                    // single "readback" column meaningful even though the work
+                    // straddles two frames — both halves are main-thread time
+                    // spent on this tick.
+                    double issueMs = (System.Diagnostics.Stopwatch.GetTimestamp() - reqStart) * _msPerTick;
+                    _phaseTimings.Record(RenderPhase.Readback, _readbackDrainMs + issueMs);
+                    _phaseTimings.FrameComplete();
+                }
             }
             catch (Exception ex)
             {
@@ -1470,6 +1543,13 @@ namespace Kerbcam
 
         private unsafe void ProcessReadback(UniversalAsyncGPUReadbackRequest request)
         {
+            // Time the drain (the full-frame ring memcpy in Produce, the main-
+            // thread cost commit 458016a was about) and accumulate into the
+            // per-tick drain total. Called from both the !_subscribed branch and
+            // the main drain path — accumulating covers both. The Readback-phase
+            // sample is recorded once at the Request site, combining this with
+            // the issue cost.
+            long drainStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {
                 if (request.hasError)
@@ -1494,6 +1574,12 @@ namespace Kerbcam
             catch (Exception ex)
             {
                 LogRateLimited($"readback callback threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                if (_telemetry)
+                    _readbackDrainMs +=
+                        (System.Diagnostics.Stopwatch.GetTimestamp() - drainStart) * _msPerTick;
             }
         }
 

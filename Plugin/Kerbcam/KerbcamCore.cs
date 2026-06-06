@@ -85,6 +85,13 @@ namespace Kerbcam
         private readonly ReadbackScheduler _readbackScheduler = new ReadbackScheduler();
         private bool[] _capturePermit = new bool[0];
 
+        // Telemetry (Recommendation 1): GC collection-count tracker. Sampled
+        // once per LateUpdate when KerbcamSettings.EnableTelemetry is true,
+        // surfaced into the status JSON's "telemetry" section and reset each
+        // write. Lets us see, with no profiler, whether the ~100ms frametime
+        // spikes coincide with a Mono GC. Struct field — no allocation.
+        private GcTracker _gcTracker;
+
         private static string ResolveRingDir()
         {
             // XDG_RUNTIME_DIR is the right home on Steam Deck / Linux —
@@ -499,6 +506,18 @@ namespace Kerbcam
         private void LateUpdate()
         {
             UpdateFpsAverage();
+
+            // Telemetry: sample the GC collection counters once per frame and
+            // fold this frame's wall-clock duration into the interval stats, so
+            // a frametime spike that coincides with a gen-0/1/2 collection is
+            // recorded as GC-caused. CollectionCount is a cheap field read; gated
+            // so it's a single bool check when telemetry is off.
+            if (KerbcamSettings.EnableTelemetry)
+            {
+                _gcTracker.Sample(
+                    GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2),
+                    Time.unscaledDeltaTime);
+            }
             // Update the degrade level every frame (drives capture staggering
             // below). Quality shedding (resolution/FX cascade) is opt-in via
             // settings.cfg's EnableAdaptiveShed; the temporal degrade (fewer
@@ -884,8 +903,29 @@ namespace Kerbcam
                     sb.Append($"      \"panPitch\": {cam.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n");
                     sb.Append(i == _cameras.Count - 1 ? "    }\n" : "    },\n");
                 }
-                sb.Append("  ]\n");
-                sb.Append("}\n");
+                sb.Append("  ]");
+
+                // Telemetry section (Recommendation 1). Per-phase render cost
+                // (summed across cameras = total main-thread cost per tick; max
+                // across cameras' rolling-max = the spike peak), the GC interval
+                // deltas + spike correlation, degrade level, and camera count.
+                // Only emitted when EnableTelemetry; the array above closes with
+                // no trailing comma, so we add one only when extending the object.
+                if (KerbcamSettings.EnableTelemetry)
+                {
+                    AppendTelemetry(sb);
+                }
+                sb.Append("\n}\n");
+
+                if (KerbcamSettings.EnableTelemetry)
+                {
+                    // Roll the interval stats over now that they've been written:
+                    // clear the GC interval accumulators and each camera's
+                    // rolling-max, so the next write reflects the next ~1s window.
+                    _gcTracker.ResetInterval();
+                    for (int i = 0; i < _cameras.Count; i++)
+                        _cameras[i].PhaseTimings.ResetMax();
+                }
 
                 // Atomic write: drop into .tmp + rename so the sidecar
                 // never reads a half-written file.
@@ -898,6 +938,70 @@ namespace Kerbcam
             {
                 Debug.LogWarning($"[Kerbcam] status file write failed: {ex.Message}");
             }
+        }
+
+        // Builds the "telemetry" object appended to the status JSON when
+        // EnableTelemetry is set. Phase costs are aggregated across cameras:
+        // `ms` is the SUM of each camera's last per-phase value (the total
+        // main-thread cost of that phase this tick across all cameras — the
+        // galaxy:scaled:near ratio that answers "which layer dominates"), and
+        // `maxMs` is the MAX of each camera's rolling-max for the interval (the
+        // worst single-camera spike, reset each write). GC + degrade + camera
+        // count are global. Allocation here is fine — 1Hz, on the blessed status
+        // write path. Caller has just closed the cameras array; we open with a
+        // comma so the telemetry object extends the same JSON object.
+        private void AppendTelemetry(System.Text.StringBuilder sb)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            sb.Append(",\n  \"telemetry\": {\n");
+            sb.Append($"    \"cameraCount\": {_cameras.Count},\n");
+            sb.Append($"    \"shedLevel\": {_shedController.Level},\n");
+
+            sb.Append("    \"phasesMs\": {\n");
+            AppendPhase(sb, "galaxy", RenderPhase.Galaxy, ci, first: true);
+            AppendPhase(sb, "scaled", RenderPhase.Scaled, ci, first: false);
+            AppendPhase(sb, "near", RenderPhase.Near, ci, first: false);
+            AppendPhase(sb, "blit", RenderPhase.Blit, ci, first: false);
+            AppendPhase(sb, "readback", RenderPhase.Readback, ci, first: false);
+            sb.Append("\n    },\n");
+
+            sb.Append("    \"gc\": {\n");
+            sb.Append($"      \"gen0\": {_gcTracker.IntervalGen0},\n");
+            sb.Append($"      \"gen1\": {_gcTracker.IntervalGen1},\n");
+            sb.Append($"      \"gen2\": {_gcTracker.IntervalGen2},\n");
+            sb.Append($"      \"worstFrameMs\": {_gcTracker.WorstFrameMs.ToString("F2", ci)},\n");
+            sb.Append($"      \"worstGcFrameMs\": {_gcTracker.WorstGcFrameMs.ToString("F2", ci)},\n");
+            sb.Append($"      \"worstFrameWasGc\": {(_gcTracker.WorstFrameWasGc ? "true" : "false")},\n");
+            // Best-effort Mono heap gauge — may read 0 in a non-development
+            // player. Informational only; lead with the collection counts above,
+            // which are reliable.
+            sb.Append($"      \"monoHeapBytes\": {UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong()}\n");
+            sb.Append("    }\n");
+
+            sb.Append("  }");
+        }
+
+        // One phase row: { "ms": <sum-of-last>, "emaMs": <sum-of-ema>, "maxMs":
+        // <max-of-rolling-max> }, all aggregated across cameras. `ms` is the
+        // latest tick's total main-thread cost, `emaMs` the smoothed central
+        // tendency, `maxMs` the interval's worst single-camera spike. `first`
+        // controls the leading comma so the JSON object stays well-formed.
+        private void AppendPhase(System.Text.StringBuilder sb, string name,
+            RenderPhase phase, System.Globalization.CultureInfo ci, bool first)
+        {
+            double sumLast = 0.0;
+            double sumEma = 0.0;
+            double maxMax = 0.0;
+            for (int i = 0; i < _cameras.Count; i++)
+            {
+                var pt = _cameras[i].PhaseTimings;
+                sumLast += pt.Last(phase);
+                sumEma += pt.Ema(phase);
+                double m = pt.Max(phase);
+                if (m > maxMax) maxMax = m;
+            }
+            if (!first) sb.Append(",\n");
+            sb.Append($"      \"{name}\": {{ \"ms\": {sumLast.ToString("F3", ci)}, \"emaMs\": {sumEma.ToString("F3", ci)}, \"maxMs\": {maxMax.ToString("F3", ci)} }}");
         }
 
         private static string LayersToJson(CameraLayers layers)

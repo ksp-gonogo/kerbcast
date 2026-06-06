@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone unit test for PhaseTimings.cs — the Unity-free perf-telemetry
+    accumulators (per-phase rolling stats + GC-delta / spike-correlation
+    tracker). Compiles ONLY that file (no KSP/Unity assemblies needed) and
+    asserts the EMA / rolling-max / GC-delta logic. Run: `dotnet run`.
+    Mirrors the ShedController.Tests pattern.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Disabled to mirror the net48 plugin's context so this harness compiles
+         PhaseTimings.cs exactly as the plugin does. -->
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compile the unit under test directly — no project reference to the KSP
+         plugin (which can't build off-Linux / needs Unity refs). -->
+    <Compile Include="../Kerbcam/PhaseTimings.cs" />
+  </ItemGroup>
+
+</Project>

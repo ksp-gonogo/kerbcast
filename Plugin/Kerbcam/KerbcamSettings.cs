@@ -153,6 +153,20 @@ namespace Kerbcam
         // without needing a back-ref to the settings instance.
         public static bool DebugCameraLogging { get; private set; } = false;
 
+        // Low-overhead in-plugin performance telemetry (Recommendation 1 from
+        // the profiling study). When true, KerbcamCamera.Refresh times each
+        // render phase (galaxy / scaled / near / blit / readback) with
+        // Stopwatch.GetTimestamp (allocation-free) and KerbcamCore samples the
+        // GC collection counters every frame; both are surfaced into a
+        // "telemetry" section of global.status.json each ~1Hz write. Lets us
+        // measure on the Deck — with no profiler attach — whether the residual
+        // ~100ms frametime spikes are Mono GC (a deltaTime spike that coincides
+        // with a gen-0/1/2 collection is the proof) and read the per-layer
+        // render-cost ratio. Default false so the feature is genuinely zero-cost
+        // when off (Refresh reads the flag once and skips every GetTimestamp
+        // call). Static so KerbcamCamera reads it without a settings back-ref.
+        public static bool EnableTelemetry { get; private set; } = false;
+
         // Debug: force atmospheric-FX intensity to full regardless of mach /
         // dynamic pressure, so the effect renders even on the pad. Used to
         // verify the FX *renders* independent of the flight-state gating. Off
@@ -293,6 +307,7 @@ namespace Kerbcam
             ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
+            ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
             ApplyVector3(node, "DebugWindDirection", v => DebugWindDirection = v);
             // Static slots so KerbcamGameParameters (constructed by
