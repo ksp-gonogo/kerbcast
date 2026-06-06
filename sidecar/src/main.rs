@@ -283,10 +283,11 @@ async fn consume_loop(
             encode_and_fan_out(cam, encoder_choice, fps, bitrate_bps, frame_duration).await;
         }
 
-        // After encode + GC of dead weak refs, any cam that just lost
-        // its last subscriber needs `subscribed=false` flushed so the
-        // plugin can put it to sleep on the next 1Hz control poll.
-        maybe_sleep_idle_cameras(&registry, &cameras).await;
+        // After encode + GC of dead weak refs, any cam that just lost its
+        // last subscriber needs `subscribed=false` flushed so the plugin sleeps
+        // it — unless the force-render profiling override is on, in which case
+        // every live camera is kept subscribed so it renders without a peer.
+        registry.refresh_idle_subscriptions(&cameras).await;
 
         if any_active {
             sleep(poll_interval).await;
@@ -604,18 +605,5 @@ async fn encode_and_fan_out(
     drop(tracks);
     if pruned > 0 {
         cam.release(pruned);
-    }
-}
-
-/// After pruning dead tracks, push a sleep signal to the plugin via
-/// the camera's control.json if subscriber count has hit zero. The
-/// plugin's PollControlFile pass sees the flag flip and disables the
-/// per-camera Unity Camera components + skips Refresh() — taking the
-/// idle camera's per-frame cost down to nothing.
-async fn maybe_sleep_idle_cameras(registry: &Arc<CameraRegistry>, cameras: &[Arc<CameraState>]) {
-    for cam in cameras {
-        if cam.subscribers.load(Ordering::Acquire) == 0 {
-            registry.set_subscribed(cam.flight_id, false).await;
-        }
     }
 }

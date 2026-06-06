@@ -425,6 +425,14 @@ pub struct CameraRegistry {
     /// construction so timestamps are relative to sidecar startup —
     /// not wall-clock, immune to NTP slews mid-run.
     epoch: Instant,
+    /// Profiling override: when true, every live camera is kept
+    /// `subscribed` (so the plugin renders + reports telemetry) even with
+    /// no peer attached. Lets `POST /profile/render` exercise the real
+    /// per-camera render/readback cost from any scene without a streaming
+    /// client. Render-only by design — no peer means no tracks, so the
+    /// consume loop never encodes; we measure the plugin's KSP-frametime
+    /// cost cleanly, not the sidecar encode path.
+    force_render: AtomicBool,
 }
 
 const STATUS_LOG_CAP: usize = 12_288;
@@ -506,6 +514,43 @@ impl CameraRegistry {
             last_status: Mutex::new(None),
             status_log: Mutex::new(Vec::new()),
             epoch: Instant::now(),
+            force_render: AtomicBool::new(false),
+        }
+    }
+
+    /// The shm directory the plugin writes rings + `global.status.json` into.
+    /// Used by `GET /profile` to serve the latest telemetry snapshot.
+    pub fn shm_dir(&self) -> &std::path::Path {
+        self.shm_dir.as_path()
+    }
+
+    /// Profiling override (see the field). `POST /profile/render` toggles it.
+    pub fn set_force_render(&self, on: bool) {
+        self.force_render.store(on, Ordering::Release);
+    }
+
+    pub fn force_render(&self) -> bool {
+        self.force_render.load(Ordering::Acquire)
+    }
+
+    /// Per-tick subscription bookkeeping. Normally: a camera that has lost its
+    /// last peer-track is flushed `subscribed=false` so the plugin sleeps it.
+    /// Under the force-render profiling override, every live camera is instead
+    /// kept `subscribed=true` so it renders without a peer. `set_subscribed` is
+    /// idempotent (no flush without a transition), so calling this each consume
+    /// tick is cheap. Replaces the old free-standing `maybe_sleep_idle_cameras`
+    /// so the force-render branch is unit-testable.
+    pub async fn refresh_idle_subscriptions(&self, cameras: &[Arc<CameraState>]) {
+        let force = self.force_render();
+        for cam in cameras {
+            if cam.destroyed.load(Ordering::Acquire) {
+                continue;
+            }
+            if force {
+                self.set_subscribed(cam.flight_id, true).await;
+            } else if cam.subscribers.load(Ordering::Acquire) == 0 {
+                self.set_subscribed(cam.flight_id, false).await;
+            }
         }
     }
 
@@ -1093,6 +1138,48 @@ mod tests {
             cam.remove_track(&a).await,
             0,
             "removing an unbound track is a no-op"
+        );
+    }
+
+    // The force-render profiling override keeps a peerless camera subscribed
+    // (so the plugin renders + reports telemetry), and clearing it releases the
+    // camera again — the cleanup path POST /profile/render?on=false relies on.
+    #[tokio::test]
+    async fn force_render_overrides_idle_subscription() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        registry.rescan().await;
+        let cam = registry.get(1).await.expect("camera attached from ring");
+        let cams = vec![cam.clone()];
+
+        // Default: no force, no peer-tracks → camera stays unsubscribed.
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(
+            !cam.control.lock().await.subscribed,
+            "idle camera is not subscribed by default"
+        );
+
+        // Force-render on → subscribed even with zero subscribers (renders for
+        // profiling, no peer needed).
+        registry.set_force_render(true);
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(
+            cam.control.lock().await.subscribed,
+            "force_render keeps the camera subscribed without a peer"
+        );
+
+        // Force-render off → cleanup releases the camera again.
+        registry.set_force_render(false);
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(
+            !cam.control.lock().await.subscribed,
+            "clearing force_render releases the camera (cleanup path)"
         );
     }
 

@@ -88,6 +88,8 @@ pub fn router(state: AppState) -> Router {
         .route("/offer", post(offer))
         .route("/dumpLogs", get(dump_logs))
         .route("/dumpLogs/reset", post(reset_logs))
+        .route("/profile", get(profile))
+        .route("/profile/render", post(profile_render))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -112,6 +114,53 @@ async fn serve_index() -> impl IntoResponse {
 async fn cameras(State(state): State<AppState>) -> impl IntoResponse {
     let list = state.registry.list().await;
     (StatusCode::OK, Json(CamerasResponse { cameras: list })).into_response()
+}
+
+/// Serves the plugin's latest `global.status.json` (the per-phase render/
+/// readback timings + GC counters written when `EnableTelemetry` is on).
+/// The sidecar runs on the same machine as KSP, so this is the egress for
+/// reading that Deck-local tmpfs file remotely — hit it per scene to build a
+/// profile. Returns 404 with a hint when the file isn't there yet (telemetry
+/// off, or no camera has rendered).
+async fn profile(State(state): State<AppState>) -> impl IntoResponse {
+    let path = state.registry.shm_dir().join("global.status.json");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no telemetry at {}: {e} \
+                 (is EnableTelemetry=true and a camera rendering? try POST /profile/render?on=true)",
+                path.display()
+            ),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenderParams {
+    /// true → keep every live camera subscribed so it renders without a peer
+    /// (profiling); false → release the override, back to normal.
+    pub on: bool,
+}
+
+/// Profiling override: force the plugin to render every camera (full per-frame
+/// cost) without a streaming client, so per-scene perf can be measured from
+/// anywhere. Render-only — no peer means no encode, so this isolates the
+/// plugin's KSP-frametime cost. `POST /profile/render?on=true` to engage,
+/// `?on=false` to release.
+async fn profile_render(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<RenderParams>,
+) -> impl IntoResponse {
+    state.registry.set_force_render(params.on);
+    (StatusCode::OK, format!("force_render = {}\n", params.on)).into_response()
 }
 
 /// Returns every `global.status.json` snapshot the sidecar has seen
