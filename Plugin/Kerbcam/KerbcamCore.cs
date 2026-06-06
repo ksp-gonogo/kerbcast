@@ -499,10 +499,11 @@ namespace Kerbcam
         private void LateUpdate()
         {
             UpdateFpsAverage();
-            // Shedding can be disabled via settings.cfg's EnableAdaptiveShed
-            // for perf-comparison runs where we want raw per-camera cost
-            // without the cascade kicking in.
-            if (_settings.EnableAdaptiveShed) ApplyAdaptiveShedding();
+            // Update the degrade level every frame (drives capture staggering
+            // below). Quality shedding (resolution/FX cascade) is opt-in via
+            // settings.cfg's EnableAdaptiveShed; the temporal degrade (fewer
+            // cameras captured per frame) is always on.
+            UpdateDegradeLevel();
 
             // Reconcile the per-save Difficulty Setting against our
             // effective state. KSP has no settings-changed event for
@@ -558,7 +559,8 @@ namespace Kerbcam
             // below CaptureFps it grants all of them.
             int camCount = _cameras.Count;
             if (_capturePermit.Length < camCount) _capturePermit = new bool[camCount];
-            int budget = ReadbackScheduler.Budget(camCount, _settings.CaptureFps, _fpsAvg);
+            int budget = ReadbackScheduler.EffectiveBudget(
+                camCount, _settings.CaptureFps, _fpsAvg, _shedController.Level);
             _readbackScheduler.NextTick(camCount, budget, _capturePermit);
             for (int i = 0; i < camCount; i++)
             {
@@ -920,23 +922,27 @@ namespace Kerbcam
             _fpsAvg = sum / _fpsCount;
         }
 
-        // Per-tick: decide whether to escalate / de-escalate the shed
-        // level given the rolling fps average. Hysteresis between shed
-        // and restore thresholds prevents flapping. Skips entirely until
-        // the window has filled — early frames after a scene load are
-        // noisy and would trigger spurious sheds.
-        private void ApplyAdaptiveShedding()
+        // Per-tick: escalate / de-escalate the degrade level from the rolling
+        // fps average (dwell + back-off in ShedController prevent flapping).
+        // The level always drives capture staggering (the temporal degrade in
+        // LateUpdate's Refresh loop). The resolution/FX *quality* cascade is
+        // applied only when EnableAdaptiveShed is opted in. Skips until the fps
+        // window has filled — early post-load frames are noisy.
+        private void UpdateDegradeLevel()
         {
             if (_fpsCount < FpsSamples) return;
 
             int before = _shedController.Level;
             // Unscaled time so dwell/back-off track wall-clock seconds, not
-            // in-game time (timewarp must not race the shed loop).
+            // in-game time (timewarp must not race the loop).
             int level = _shedController.Evaluate(_fpsAvg, Time.unscaledTime);
             if (level == before) return;
 
-            Debug.Log($"[Kerbcam] adaptive shed level={level} (avg fps={_fpsAvg:F1})");
-            foreach (var cam in _cameras) cam.ApplyAutoShed(level);
+            Debug.Log($"[Kerbcam] degrade level={level} (avg fps={_fpsAvg:F1}, quality-shed={_settings.EnableAdaptiveShed})");
+            if (_settings.EnableAdaptiveShed)
+            {
+                foreach (var cam in _cameras) cam.ApplyAutoShed(level);
+            }
         }
 
         private void OnDestroy()

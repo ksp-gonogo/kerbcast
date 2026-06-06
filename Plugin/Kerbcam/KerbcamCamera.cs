@@ -33,6 +33,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using HullcamVDS;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 using Yangrc.OpenGLAsyncReadback;
 
@@ -105,11 +106,10 @@ namespace Kerbcam
         private FxHost _fxHost;
         // Which FX layers this camera runs (subject to the _enableFx master).
         private AtmoFxLayers _fxLayers;
-        // The *current* render-target triple (also held in _rtPool). Refresh()
+        // The *current* render-target pair (also held in _rtPool). Refresh()
         // renders + blits + issues new readbacks against these.
         private RenderTexture _captureRt;
         private RenderTexture _readbackRt; // depth=0, GL_TEXTURE_2D-clean
-        private Texture2D _scratchTex;
         // RenderTexture pool keyed by render size (RenderSizeKey.Pack). Adaptive
         // shedding switches between pooled sets instead of destroying and
         // reallocating: destroying a RenderTexture while an AsyncGPUReadback is
@@ -123,7 +123,6 @@ namespace Kerbcam
         {
             public RenderTexture Capture;
             public RenderTexture Readback;
-            public Texture2D Scratch;
         }
         private readonly Dictionary<long, RenderTargetSet> _rtPool =
             new Dictionary<long, RenderTargetSet>();
@@ -131,8 +130,7 @@ namespace Kerbcam
         // target so a resolution change mid-readback still drains the pending
         // frame at its original dimensions before switching. The decoupling
         // logic is unit-tested in ReadbackTargetTracker.Tests.
-        private readonly ReadbackTargetTracker<Texture2D> _targets =
-            new ReadbackTargetTracker<Texture2D>();
+        private readonly ReadbackTargetTracker _targets = new ReadbackTargetTracker();
         private readonly MmapFrameRing _ring;
         private readonly string _ringPath;
         private readonly string _infoPath;
@@ -232,8 +230,20 @@ namespace Kerbcam
             public float OriginalFade;
         }
         // Pre-allocated; cleared and repopulated each scaled render to avoid
-        // per-frame GC pressure.
+        // per-frame GC pressure. FaderState is a struct, so the list stores them
+        // inline (no per-entry GC).
         private readonly List<FaderState> _faderOverrides = new List<FaderState>();
+        // Reused across bodies and frames. Previously the fader loop did
+        // `new MaterialPropertyBlock()` twice per overridden body, per camera,
+        // per frame — a steady stream of Mono garbage (stop-the-world GC ⇒
+        // frametime spikes). GetPropertyBlock overwrites it each call, so a
+        // single shared scratch instance is correct.
+        private readonly MaterialPropertyBlock _faderMpb = new MaterialPropertyBlock();
+        // Scaled-body renderers, cached on first use. Celestial bodies don't
+        // change during a flight and the camera is recreated on vessel change,
+        // so this avoids a GetComponent<Renderer> over every body on every
+        // scaled render. Entries can still go null defensively (handled below).
+        private List<Renderer> _scaledBodyRenderers;
         private static readonly int _fadeAltitudeId = Shader.PropertyToID("_FadeAltitude");
 
         private UniversalAsyncGPUReadbackRequest _pendingRequest;
@@ -398,18 +408,12 @@ namespace Kerbcam
                 var readback = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
                 readback.Create();
 
-                // RGBA32 (not ARGB32). DX11/Mesa async readback only supports a
-                // narrow set of GraphicsFormats as readback destinations; RGBA32
-                // (R8G8B8A8_UNorm) is in the list, ARGB32 (B8G8R8A8_SRGB) isn't.
-                var scratch = new Texture2D(width, height, TextureFormat.RGBA32, mipChain: false);
-
-                set = new RenderTargetSet { Capture = capture, Readback = readback, Scratch = scratch };
+                set = new RenderTargetSet { Capture = capture, Readback = readback };
                 _rtPool[key] = set;
             }
             _captureRt = set.Capture;
             _readbackRt = set.Readback;
-            _scratchTex = set.Scratch;
-            _targets.SetCurrent(width, height, _scratchTex);
+            _targets.SetCurrent(width, height);
         }
 
         /// <summary>
@@ -903,6 +907,23 @@ namespace Kerbcam
 
         private static int MakeEven(int v) => v - (v & 1);
 
+        // Cached list of scaled-body renderers (one per celestial body that has
+        // one). Built once on first scaled render; bodies are fixed for the
+        // flight and the camera is recreated on vessel change, so we never
+        // refresh it. Replaces a per-frame, per-camera GetComponent sweep over
+        // FlightGlobals.Bodies.
+        private List<Renderer> ScaledBodyRenderers()
+        {
+            if (_scaledBodyRenderers != null) return _scaledBodyRenderers;
+            _scaledBodyRenderers = new List<Renderer>();
+            foreach (var body in FlightGlobals.Bodies)
+            {
+                var r = body.scaledBody?.GetComponent<Renderer>();
+                if (r != null) _scaledBodyRenderers.Add(r);
+            }
+            return _scaledBodyRenderers;
+        }
+
         private void ApplyLayers()
         {
             // Cameras are permanently disabled (enabled=false) — Unity's
@@ -1314,10 +1335,11 @@ namespace Kerbcam
                     // restored in the finally block so the main camera's view is
                     // unaffected.
                     _faderOverrides.Clear();
-                    foreach (var body in FlightGlobals.Bodies)
+                    var bodyRenderers = ScaledBodyRenderers();
+                    for (int bi = 0; bi < bodyRenderers.Count; bi++)
                     {
-                        var r = body.scaledBody?.GetComponent<Renderer>();
-                        if (r == null) continue;
+                        var r = bodyRenderers[bi];
+                        if (r == null) continue; // body renderer torn down since cache
                         bool wasEnabled = r.enabled;
                         // Guard the read: some scaled-body materials (e.g. the
                         // sun, mod-added bodies) lack _FadeAltitude. GetFloat on
@@ -1330,10 +1352,9 @@ namespace Kerbcam
                         {
                             _faderOverrides.Add(new FaderState { Renderer = r, WasEnabled = wasEnabled, OriginalFade = fade });
                             if (!wasEnabled) r.enabled = true;
-                            var mpb = new MaterialPropertyBlock();
-                            r.GetPropertyBlock(mpb);
-                            mpb.SetFloat(_fadeAltitudeId, 1f);
-                            r.SetPropertyBlock(mpb);
+                            r.GetPropertyBlock(_faderMpb);
+                            _faderMpb.SetFloat(_fadeAltitudeId, 1f);
+                            r.SetPropertyBlock(_faderMpb);
                         }
                     }
                     try
@@ -1372,11 +1393,12 @@ namespace Kerbcam
                             // Restore _FadeAltitude to ScaledSpaceFader's value in the
                             // MPB so the main camera sees the correct fade. Get the
                             // current MPB (which may carry _sunLightDirection etc) and
-                            // only replace the one property we overrode.
-                            var mpb = new MaterialPropertyBlock();
-                            state.Renderer.GetPropertyBlock(mpb);
-                            mpb.SetFloat(_fadeAltitudeId, state.OriginalFade);
-                            state.Renderer.SetPropertyBlock(mpb);
+                            // only replace the one property we overrode. Reuses the
+                            // shared scratch block — no per-frame allocation.
+                            if (state.Renderer == null) continue;
+                            state.Renderer.GetPropertyBlock(_faderMpb);
+                            _faderMpb.SetFloat(_fadeAltitudeId, state.OriginalFade);
+                            state.Renderer.SetPropertyBlock(_faderMpb);
                             state.Renderer.enabled = state.WasEnabled;
                         }
                         ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
@@ -1446,7 +1468,7 @@ namespace Kerbcam
             }
         }
 
-        private void ProcessReadback(UniversalAsyncGPUReadbackRequest request)
+        private unsafe void ProcessReadback(UniversalAsyncGPUReadbackRequest request)
         {
             try
             {
@@ -1457,14 +1479,16 @@ namespace Kerbcam
                 }
 
                 var data = request.GetData<byte>();
-                // Use the snapshot taken when this readback was issued — the
-                // current render size may have changed since (pooled switch).
-                var scratch = _targets.PendingScratch;
-                scratch.LoadRawTextureData(data);
-                scratch.Apply();
-                var rgba = scratch.GetRawTextureData();
-
-                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, rgba, 0, rgba.Length);
+                // Write the readback bytes straight into the ring — no
+                // intermediate Texture2D, no pointless GPU Apply(). The readback
+                // target is RGBA32, so `data` is already the exact pixel layout
+                // the ring expects; this is byte-identical to the old
+                // LoadRawTextureData→GetRawTextureData path (proven in
+                // MmapFrameRing.Tests). Dimensions come from the snapshot taken
+                // when the readback was issued, since the current render size may
+                // have changed in the meantime (pooled-set switch).
+                byte* src = (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
+                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, src, data.Length);
                 _consecutiveErrors = 0;
             }
             catch (Exception ex)
@@ -1538,14 +1562,13 @@ namespace Kerbcam
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);
             // Destroy every pooled render-target set (the current _captureRt /
-            // _readbackRt / _scratchTex are members of one of these, so this
-            // covers them). Safe here because the camera is being torn down —
-            // no further readbacks will be issued.
+            // _readbackRt are members of one of these, so this covers them).
+            // Safe here because the camera is being torn down — no further
+            // readbacks will be issued.
             foreach (var set in _rtPool.Values)
             {
                 if (set.Capture != null) { set.Capture.Release(); UnityEngine.Object.Destroy(set.Capture); }
                 if (set.Readback != null) { set.Readback.Release(); UnityEngine.Object.Destroy(set.Readback); }
-                if (set.Scratch != null) UnityEngine.Object.Destroy(set.Scratch);
             }
             _rtPool.Clear();
 

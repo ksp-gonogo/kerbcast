@@ -67,5 +67,32 @@ Check(ReadbackScheduler.Budget(8, 0, 60) == 8, "captureFps 0 (pacing off) -> all
     Check(permit[0] && permit[1] && permit[2], "budget >= count grants all");
 }
 
+// --- Degrade budget: scales cuts up as the level rises, floored at 1. ---
+Check(ReadbackScheduler.DegradeBudget(8, 0) == 8, "level 0 -> no temporal cut (all 8)");
+Check(ReadbackScheduler.DegradeBudget(8, 1) < 8, "level 1 -> some cameras cut");
+{
+    int prev = 9;
+    bool monotonic = true;
+    for (int lvl = 0; lvl <= 5; lvl++)
+    {
+        int b = ReadbackScheduler.DegradeBudget(8, lvl);
+        if (b > prev) monotonic = false;
+        if (b < 1) monotonic = false;
+        prev = b;
+    }
+    Check(monotonic, "degrade budget is monotonically non-increasing and never < 1 across levels");
+}
+Check(ReadbackScheduler.DegradeBudget(8, 99) >= 1, "level clamps past the cascade end (floored at 1)");
+
+// --- EffectiveBudget = min(rate-cap, degrade). ---
+// Healthy game above stream fps: rate-cap dominates, degrade (level 0) is full.
+Check(ReadbackScheduler.EffectiveBudget(8, 20, 60, 0) == ReadbackScheduler.Budget(8, 20, 60),
+    "healthy + level 0 -> just the rate-cap");
+// Overloaded (game below stream fps so rate-cap = all) but degraded: the level cut wins.
+Check(ReadbackScheduler.EffectiveBudget(8, 20, 12, 3) == ReadbackScheduler.DegradeBudget(8, 3),
+    "overloaded + level 3 -> degrade budget dominates (temporal cut engages)");
+Check(ReadbackScheduler.EffectiveBudget(8, 20, 12, 3) < 8,
+    "overloaded + level 3 actually cuts below all-8");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");
 return failures == 0 ? 0 : 1;

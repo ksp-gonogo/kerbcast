@@ -36,6 +36,44 @@ namespace Kerbcam
             return b;
         }
 
+        // Fraction of cameras allowed to capture per frame at each degrade
+        // level. Level 0 = no cut; higher levels (driven by ShedController as
+        // fps drops below the shed thresholds) progressively *temporally*
+        // degrade — fewer cameras captured per frame, so each updates less often
+        // but at full quality. This is the default adaptive response now that
+        // quality shedding is opt-in. Index clamps to the last entry.
+        private static readonly double[] DegradeFraction =
+            { 1.0, 0.66, 0.5, 0.33, 0.25, 0.12 };
+
+        /// <summary>
+        /// Capture budget from the degrade level alone: as fps falls and the
+        /// level rises, fewer cameras capture per frame. Floored at 1 so feeds
+        /// never freeze entirely.
+        /// </summary>
+        public static int DegradeBudget(int count, int level)
+        {
+            if (count <= 0) return 0;
+            if (level < 0) level = 0;
+            if (level >= DegradeFraction.Length) level = DegradeFraction.Length - 1;
+            int b = (int)Math.Ceiling(count * DegradeFraction[level]);
+            if (b < 1) b = 1;
+            if (b > count) b = count;
+            return b;
+        }
+
+        /// <summary>
+        /// The per-frame capture budget: the tighter of the stream rate-cap
+        /// (don't capture faster than CaptureFps) and the degrade budget (cut
+        /// captures as performance degrades). At level 0 with a healthy game
+        /// this is just the rate-cap; under load the degrade term dominates.
+        /// </summary>
+        public static int EffectiveBudget(int count, double captureFps, double gameFps, int level)
+        {
+            int rate = Budget(count, captureFps, gameFps);
+            int degrade = DegradeBudget(count, level);
+            return rate < degrade ? rate : degrade;
+        }
+
         /// <summary>
         /// Fill <paramref name="permit"/>[0..count) with the contiguous,
         /// round-robin window of <paramref name="budget"/> cameras allowed to

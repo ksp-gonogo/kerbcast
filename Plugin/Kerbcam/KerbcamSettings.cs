@@ -63,7 +63,12 @@ namespace Kerbcam
         public int Width { get; private set; } = 1024;
         public int Height { get; private set; } = 576;
         public bool AutoSpawnSidecar { get; private set; } = true;
-        public bool EnableAdaptiveShed { get; private set; } = true;
+        // Opt-in QUALITY shedding (resolution + FX-layer cascade). Default
+        // false: by default kerbcam degrades *temporally* instead (capture
+        // staggering scales cuts up as fps drops — see ReadbackScheduler), which
+        // keeps full image quality. Set true to also drop resolution/FX layers
+        // under load.
+        public bool EnableAdaptiveShed { get; private set; } = false;
         // Anti-flap tuning for the adaptive-shed loop (see ShedController).
         // ShedDwellSeconds: min seconds between shedding further (fast attack).
         // ShedRestoreDwellSeconds: min seconds before restoring quality (slow

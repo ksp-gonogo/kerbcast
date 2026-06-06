@@ -116,6 +116,7 @@
     <Compile Remove="RenderSizeKey.Tests/**/*.cs" />
     <Compile Remove="ReadbackTargetTracker.Tests/**/*.cs" />
     <Compile Remove="ReadbackScheduler.Tests/**/*.cs" />
+    <Compile Remove="MmapFrameRing.Tests/**/*.cs" />
   </ItemGroup>
 
 </Project>

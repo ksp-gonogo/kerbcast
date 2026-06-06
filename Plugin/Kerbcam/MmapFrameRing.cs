@@ -154,6 +154,34 @@ namespace Kerbcam
         /// </summary>
         public ulong Produce(int width, int height, double captureTsMs, byte[] rgba, int rgbaOffset, int rgbaLength)
         {
+            ValidateFrame(width, height, rgbaLength);
+            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs);
+            _view.WriteArray(slotStart + SlotOffPixels, rgba, rgbaOffset, rgbaLength);
+            PublishSlot(slot, slotStart, newSeq);
+            return (ulong)newSeq;
+        }
+
+        /// <summary>
+        /// Produce a frame straight from an unmanaged pixel buffer (e.g. the
+        /// AsyncGPUReadback NativeArray), copying directly into the mapped slot.
+        /// Lets the capture path skip the intermediate Texture2D round-trip
+        /// (LoadRawTextureData + a pointless GPU Apply() + GetRawTextureData).
+        /// Byte-for-byte identical to the <c>byte[]</c> overload — see
+        /// MmapFrameRing.Tests.
+        /// </summary>
+        public unsafe ulong Produce(int width, int height, double captureTsMs, byte* src, int length)
+        {
+            ValidateFrame(width, height, length);
+            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs);
+            byte* basePtr = null;
+            _view.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+            Buffer.MemoryCopy(src, basePtr + slotStart + SlotOffPixels, length, length);
+            PublishSlot(slot, slotStart, newSeq);
+            return (ulong)newSeq;
+        }
+
+        private void ValidateFrame(int width, int height, int length)
+        {
             if (width <= 0 || height <= 0)
                 throw new ArgumentOutOfRangeException(nameof(width));
             if (width > _maxWidth || height > _maxHeight)
@@ -161,38 +189,36 @@ namespace Kerbcam
                     nameof(width),
                     $"frame {width}x{height} exceeds capacity {_maxWidth}x{_maxHeight}");
             int expected = width * height * 4;
-            if (rgbaLength != expected)
+            if (length != expected)
                 throw new ArgumentException(
-                    $"rgbaLength {rgbaLength} != width*height*4 ({expected})", nameof(rgbaLength));
+                    $"length {length} != width*height*4 ({expected})", nameof(length));
+        }
 
-            // Step 1: bump header.sequence atomically. Interlocked.Increment
-            // on Int64 issues an atomic add + load — same semantics as Rust's
-            // AtomicU64.fetch_add(1, Release) for our cross-process purposes.
+        // Steps 1-2 of the seqlock write plus the slot header. The pixel copy
+        // (step 3) is the caller's job — the only part that differs between the
+        // byte[] and unmanaged-pointer overloads. PublishSlot does steps 4-5.
+        private (int slot, int slotStart, long seq) BeginSlot(int width, int height, double captureTsMs)
+        {
+            // Interlocked.Increment on Int64 is an atomic add + load — same
+            // semantics as Rust's AtomicU64.fetch_add(1, Release) cross-process.
             long newSeq = AtomicIncrementHeaderSequence();
-
-            // Step 2: pick next slot.
             uint currentIdx = (uint)Interlocked.CompareExchange(
                 ref AsRefInt32(HeaderOffWriteIndex), 0, 0);
             uint nextSlot = (currentIdx + 1) % (uint)_slotCount;
-
-            // Step 3: write the slot body (non-atomic; readers gate on the
-            // slot.sequence write below).
             int slotStart = HeaderSize + (int)nextSlot * _slotBytes;
             _view.Write(slotStart + SlotOffWidth, (uint)width);
             _view.Write(slotStart + SlotOffHeight, (uint)height);
             _view.Write(slotStart + SlotOffStride, (uint)(width * 4));
             _view.Write(slotStart + SlotOffCaptureTs, captureTsMs);
-            _view.WriteArray(slotStart + SlotOffPixels, rgba, rgbaOffset, rgbaLength);
+            return ((int)nextSlot, slotStart, newSeq);
+        }
 
-            // Step 4: publish slot.sequence (Release).
-            Interlocked.Exchange(
-                ref AsRefInt64(slotStart + SlotOffSequence), newSeq);
-
-            // Step 5: publish header.write_index (Release).
-            Interlocked.Exchange(
-                ref AsRefInt32(HeaderOffWriteIndex), (int)nextSlot);
-
-            return (ulong)newSeq;
+        private void PublishSlot(int slot, int slotStart, long newSeq)
+        {
+            // Step 4: publish slot.sequence (Release). Step 5: publish
+            // header.write_index (Release). Readers gate on slot.sequence.
+            Interlocked.Exchange(ref AsRefInt64(slotStart + SlotOffSequence), newSeq);
+            Interlocked.Exchange(ref AsRefInt32(HeaderOffWriteIndex), slot);
         }
 
         private long AtomicIncrementHeaderSequence()
