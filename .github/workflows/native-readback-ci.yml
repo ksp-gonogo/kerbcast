@@ -1,0 +1,89 @@
+name: native-readback-ci
+
+# Toolchain SPIKE (2026-06): prove we can build the UnityOpenGLAsyncReadback
+# native plugin (libAsyncGPUReadbackPlugin.so) for the Steam Deck and that the
+# unmodified rebuild works identically to the upstream prebuilt binary. Once
+# proven, the C++ source gets vendored under Plugin/Vendor/ and this workflow
+# switches to building the vendored (patched) copy for readback perf changes
+# #2 (PBO pooling) + #4 (glReadPixels format match).
+#
+# Builds on ubuntu-22.04 ON PURPOSE: glibc 2.35. KSP runs inside Steam's
+# pressure-vessel (sniper / glibc 2.36); a .so built on ubuntu-24.04 (glibc
+# 2.39) needs GLIBC_2.38 and crashes at load on the Deck. Same constraint as
+# sidecar-ci.yml. The glibc-ceiling guard below fails the build if anything
+# pulls the requirement above 2.36.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'spike/**'
+      - 'perf/**'
+      - 'fix/**'
+    paths:
+      - '.github/workflows/native-readback-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build libAsyncGPUReadbackPlugin.so
+    runs-on: ubuntu-22.04
+    env:
+      # Pinned upstream commit (yangrc1234/UnityOpenGLAsyncReadback) so the
+      # spike build is reproducible. Self-contained: bundles GLEW + Unity headers.
+      UPSTREAM_SHA: aff05c2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ make libgl1-mesa-dev libglu1-mesa-dev mesa-common-dev binutils
+
+      - name: Fetch upstream native source (pinned)
+        run: |
+          git clone https://github.com/yangrc1234/UnityOpenGLAsyncReadback.git upstream
+          cd upstream && git checkout "$UPSTREAM_SHA" && git rev-parse HEAD
+
+      - name: Build
+        run: |
+          cd upstream/NativePlugin
+          # Drop -Werror: the upstream tree predates modern gcc's stricter
+          # warnings; a stray -Wall/-Wextra warning must not fail the spike.
+          sed -i 's/ -Werror//g' CMakeLists.txt
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOpenGL_GL_PREFERENCE=LEGACY
+          cmake --build build --config Release -j
+          find build -name '*.so' -print
+
+      - name: glibc ceiling guard (must be <= 2.36)
+        run: |
+          SO=$(find upstream/NativePlugin/build -name 'libAsyncGPUReadbackPlugin.so' | head -1)
+          echo "built: $SO"
+          echo "=== GLIBC version symbols required ==="
+          objdump -T "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tee /tmp/glibc.txt
+          MAX=$(sort -uV /tmp/glibc.txt | tail -1 | sed 's/GLIBC_//')
+          echo "max GLIBC required: $MAX (ceiling 2.36)"
+          # numeric compare 2.x
+          awk -v m="$MAX" 'BEGIN{ split(m,a,"."); if (a[1]>2 || (a[1]==2 && a[2]>36)) { print "FAIL: needs GLIBC_"m" > 2.36"; exit 1 } print "OK" }'
+
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          cp upstream/NativePlugin/build/libAsyncGPUReadbackPlugin.so out/
+          # record provenance alongside the binary
+          echo "upstream_sha=$UPSTREAM_SHA" > out/build-info.txt
+          echo "built_on=ubuntu-22.04 (glibc 2.35)" >> out/build-info.txt
+          ( cd out && sha256sum libAsyncGPUReadbackPlugin.so >> build-info.txt )
+          cat out/build-info.txt
+
+      - name: Upload .so
+        uses: actions/upload-artifact@v7
+        with:
+          name: libAsyncGPUReadbackPlugin-linux-x64
+          path: out/
+          if-no-files-found: error
