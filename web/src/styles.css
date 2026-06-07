@@ -1,0 +1,97 @@
+/* kerbcam design tokens
+ *
+ * Light values are the default. Dark values apply when:
+ *   - html has no data-theme attribute, and prefers-color-scheme is dark
+ *   - html[data-theme="auto"], and prefers-color-scheme is dark
+ *   - html[data-theme="dark"]
+ *
+ * Map the shared CameraFeed accent vars to the kc tokens so overlays
+ * inherit the current theme.
+ */
+
+:root {
+  --kc-bg: #f8f8f8;
+  --kc-surface: #ffffff;
+  --kc-surface-raised: #f0f0f0;
+  --kc-text: #1a1a1a;
+  --kc-text-muted: #666666;
+  --kc-border: #e0e0e0;
+  --kc-accent: #007aff;
+  --kc-accent-wash: rgba(0, 122, 255, 0.12);
+  --kc-warn: #b8840a;
+  --kc-danger: #d0021b;
+  --kc-ok: #2a7a2a;
+
+  /* Forward to shared CameraFeed */
+  --kerbcam-accent: var(--kc-accent);
+  --kerbcam-accent-wash: var(--kc-accent-wash);
+
+  font-family: -apple-system, system-ui, sans-serif;
+  color-scheme: light;
+}
+
+/* Auto dark: no explicit theme set, system is dark */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]),
+  html[data-theme="auto"] {
+    --kc-bg: #0e0e0e;
+    --kc-surface: #1c1c1e;
+    --kc-surface-raised: #2c2c2e;
+    --kc-text: #f0f0f0;
+    --kc-text-muted: #8e8e93;
+    --kc-border: #3a3a3c;
+    --kc-accent: #0a84ff;
+    --kc-accent-wash: rgba(10, 132, 255, 0.15);
+    --kc-warn: #ffd60a;
+    --kc-danger: #ff453a;
+    --kc-ok: #30d158;
+    color-scheme: dark;
+  }
+}
+
+/* Explicit dark */
+html[data-theme="dark"] {
+  --kc-bg: #0e0e0e;
+  --kc-surface: #1c1c1e;
+  --kc-surface-raised: #2c2c2e;
+  --kc-text: #f0f0f0;
+  --kc-text-muted: #8e8e93;
+  --kc-border: #3a3a3c;
+  --kc-accent: #0a84ff;
+  --kc-accent-wash: rgba(10, 132, 255, 0.15);
+  --kc-warn: #ffd60a;
+  --kc-danger: #ff453a;
+  --kc-ok: #30d158;
+  color-scheme: dark;
+}
+
+/* Explicit light */
+html[data-theme="light"] {
+  --kc-bg: #f8f8f8;
+  --kc-surface: #ffffff;
+  --kc-surface-raised: #f0f0f0;
+  --kc-text: #1a1a1a;
+  --kc-text-muted: #666666;
+  --kc-border: #e0e0e0;
+  --kc-accent: #007aff;
+  --kc-accent-wash: rgba(0, 122, 255, 0.12);
+  --kc-warn: #b8840a;
+  --kc-danger: #d0021b;
+  --kc-ok: #2a7a2a;
+  color-scheme: light;
+}
+
+/* Reset */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--kc-bg);
+  color: var(--kc-text);
+}
+
+button {
+  font-family: inherit;
+}
