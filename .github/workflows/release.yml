@@ -231,11 +231,24 @@ jobs:
           zip -r "kerbcam-${TAG}.zip" GameData/
           echo "RELEASE_ZIP=kerbcam-${TAG}.zip" >> $GITHUB_ENV
 
-      - name: Publish TypeScript package
-        working-directory: client-sdk/typescript
+      # publish-protocol.yml also fires on the same tag and usually wins the
+      # race; a duplicate publish 409s and used to abort the release before
+      # the GitHub Release was created (v0.12.0). Skip versions that are
+      # already in the registry so the two workflows can coexist.
+      - name: Publish TypeScript packages (skip versions already published)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm publish --provenance
+        run: |
+          set -euo pipefail
+          for pkg in client-sdk/typescript client-sdk/react; do
+            NAME="$(node -p "require('./$pkg/package.json').name")"
+            VER="$(node -p "require('./$pkg/package.json').version")"
+            if npm view "${NAME}@${VER}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+              echo "${NAME}@${VER} already published, skipping"
+            else
+              (cd "$pkg" && pnpm publish --no-git-checks)
+            fi
+          done
 
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
