@@ -1,4 +1,4 @@
-//! HTTP signalling endpoint. Two endpoints + a test page:
+//! HTTP signalling endpoint. Two endpoints + the bundled web UI:
 //!
 //! - `GET /cameras` returns a JSON list of currently-attached cameras
 //!   (with `part_title`, `vessel_name`, etc); the browser fetches this
@@ -8,7 +8,8 @@
 //!   "kerbcam-control" data channel, answers the SDP, and returns the
 //!   answer. Unknown camera IDs are dropped with a warning rather than
 //!   failing the whole request.
-//! - `GET /` serves the bundled test page.
+//! - `GET /` serves the bundled kerbcam web UI (web/dist/index.html,
+//!   embedded at compile time via include_str!).
 //!
 //! Per-camera operational state (layer mask, render size, future zoom)
 //! is no longer exposed over HTTP — it's owned by the data channel
@@ -107,7 +108,7 @@ async fn serve_index() -> impl IntoResponse {
     (
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
-        include_str!("./signalling_index.html"),
+        include_str!("../../web/dist/index.html"),
     )
 }
 
