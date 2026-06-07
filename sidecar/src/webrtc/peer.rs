@@ -298,6 +298,16 @@ impl KerbcamPeer {
             .collect()
     }
 
+    /// Release every camera this peer's slots are bound to (immediate
+    /// subscriber-count decrement + `set_subscribed(false)` at zero). Called by
+    /// the reaper when the peer is reaped, and shares the exact logic of the
+    /// graceful `Disconnect` message — so a dropped viewer's cameras stop
+    /// rendering on the next reaper tick instead of waiting for the consume
+    /// loop's lazy dead-Weak prune (which a staggered camera can starve).
+    pub async fn release_all(&self, registry: &Arc<CameraRegistry>) {
+        release_all_bound(registry, &self.slots).await;
+    }
+
     /// Server-initiated push to the browser. No-op if the control
     /// channel hasn't been opened yet (we drop the message rather than
     /// queue — pushes from the consume loop are state snapshots, so a
@@ -435,6 +445,17 @@ async fn handle_client_message(
         ClientMessage::Pong => {
             // No-op — the peer is alive by virtue of having sent this.
         }
+        ClientMessage::Disconnect => {
+            // Graceful teardown: release every camera this peer is feeding now,
+            // so they sleep immediately instead of waiting for the ICE drop to
+            // be detected. The client closes its connection after this; the
+            // reaper still handles the close (and any ungraceful exit).
+            info!(
+                peer_id,
+                "client requested graceful disconnect — releasing cameras"
+            );
+            release_all_bound(&registry, &slots).await;
+        }
     }
 }
 
@@ -563,6 +584,37 @@ async fn handle_unsubscribe(
             }),
         )
         .await;
+    }
+}
+
+/// Release EVERY camera this peer's slots are bound to — the shared teardown
+/// used by both the graceful `Disconnect` message and the drop-detection
+/// reaper. Mirrors `handle_unsubscribe`'s release (unbind the slot, drop the
+/// camera's track ref by pointer, flush `set_subscribed(false)` when the last
+/// viewer leaves) but over all slots at once, and without the per-slot SlotMap
+/// reply (on a graceful Disconnect the client is leaving; on a reap the channel
+/// is already gone). Decrements immediately — no dependence on the consume
+/// loop's lazy dead-Weak prune (which a staggered camera's reduced frame
+/// cadence can starve). Idempotent: a second call finds nothing bound.
+async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec<Slot>>>) {
+    let bound: Vec<(u32, Arc<TrackLocalStaticSample>)> = {
+        let mut guard = slots.lock().await;
+        let mut v = Vec::new();
+        for slot in guard.iter_mut() {
+            if let Some(flight_id) = slot.bound.take() {
+                v.push((flight_id, slot.track.clone()));
+            }
+        }
+        v
+    };
+    for (flight_id, track) in bound {
+        if let Some(cam) = registry.get(flight_id).await {
+            let remaining = cam.remove_track(&track).await;
+            if remaining == 0 {
+                registry.set_subscribed(flight_id, false).await;
+            }
+            info!(flight_id, remaining, "released camera on peer teardown");
+        }
     }
 }
 

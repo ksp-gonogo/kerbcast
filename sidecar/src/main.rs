@@ -253,6 +253,14 @@ async fn consume_loop(
             if let Err(e) = peer.close().await {
                 warn!(peer_id = peer.peer_id, error = %e, "peer close on reap failed");
             }
+            // Release this peer's cameras IMMEDIATELY (decrement subscribers +
+            // flush set_subscribed(false) at zero), the same way the graceful
+            // Disconnect message does. Don't wait for the consume loop's lazy
+            // dead-Weak prune — that only runs on a tick where the camera has a
+            // NEW frame to encode, which capture staggering can starve, leaving
+            // a disconnected viewer's cameras rendering indefinitely (fps never
+            // recovers until a KSP restart).
+            peer.release_all(&registry).await;
             for flight_id in &peer.subscribed {
                 if let Some(cam) = registry.get(*flight_id).await {
                     cam.forget_degrade(peer.peer_id).await;

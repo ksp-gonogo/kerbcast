@@ -47,6 +47,7 @@
   <button id="disconnectBtn" disabled>Disconnect</button>
   <span id="status" class="status">idle</span>
   <span id="channelStatus" class="control-channel">control channel: idle</span>
+  <span id="staggerStatus" class="status">stagger: -</span>
 </div>
 
 <h3>Detected cameras</h3>
@@ -532,6 +533,24 @@ $("disconnectBtn").addEventListener("click", () => {
   disconnect();
 });
 refreshCameras();
+
+// Poll the plugin's lossless temporal-degrade telemetry from /profile (the raw
+// global.status.json), independent of any WebRTC connection, so the operator can
+// watch kerbcam hold its frame-time budget: staggerBudget = cameras captured per
+// frame, kerbcamFrameMs = kerbcam's own main-thread cost, plus the game fps.
+async function pollStagger() {
+  try {
+    const r = await fetch("/profile");
+    if (!r.ok) { $("staggerStatus").textContent = "stagger: (telemetry off)"; return; }
+    const s = await r.json();
+    const budget = s.staggerBudget ?? "?";
+    const ms = Number(s.kerbcamFrameMs ?? 0).toFixed(1);
+    const fps = Number(s.kspFps ?? 0).toFixed(0);
+    $("staggerStatus").textContent = `stagger: ${budget} cam/frame · kerbcam ${ms}ms · KSP ${fps}fps`;
+  } catch { $("staggerStatus").textContent = "stagger: -"; }
+}
+pollStagger();
+setInterval(pollStagger, 1000);
 
 async function connect() {
   if (included.size === 0) return;

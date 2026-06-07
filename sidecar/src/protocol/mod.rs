@@ -355,6 +355,12 @@ pub enum ClientMessage {
     Unsubscribe(FlightIdPayload),
     /// Response to `Ping`. Browser sends this immediately on receiving each Ping.
     Pong,
+    /// Graceful teardown. The canonical way for a client to leave: the sidecar
+    /// immediately releases every camera this peer is feeding (so they sleep
+    /// without waiting for ICE to time out), after which the client may close
+    /// the connection. The drop-detection reaper remains the fallback for
+    /// ungraceful exits (crash / tab close / network loss) that can't send this.
+    Disconnect,
 }
 
 /// Messages sent FROM the sidecar TO the client.
@@ -554,6 +560,14 @@ mod tests {
         // Pong should parse back
         let back: ClientMessage = serde_json::from_str(&pong).unwrap();
         assert!(matches!(back, ClientMessage::Pong));
+    }
+
+    #[test]
+    fn disconnect_roundtrip() {
+        let s = serde_json::to_string(&ClientMessage::Disconnect).unwrap();
+        assert_eq!(s, r#"{"type":"disconnect"}"#);
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, ClientMessage::Disconnect));
     }
 
     #[test]
