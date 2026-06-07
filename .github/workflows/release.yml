@@ -171,15 +171,13 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
-        with:
-          version: 9
 
       - name: Setup Node + GitHub Packages registry
         uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: client-sdk/typescript/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
           registry-url: https://npm.pkg.github.com
           scope: "@jonpepler"
 
@@ -191,7 +189,7 @@ jobs:
           CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           echo "tag=$TAG_VER cargo=$CARGO_VER package=$PKG_VER"
           if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ]; then
-            echo "::error::version mismatch — run ./scripts/bump-version.sh $TAG_VER and re-tag"
+            echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
             exit 1
           fi
 
@@ -202,10 +200,9 @@ jobs:
             --output-file=client-sdk/typescript/src/__generated__/types.ts
 
       - name: Build TypeScript package
-        working-directory: client-sdk/typescript
         run: |
           pnpm install --no-frozen-lockfile
-          pnpm run build
+          pnpm -r build
 
       - name: Assemble GameData/KerbCam
         run: |

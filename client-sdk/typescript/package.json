@@ -43,6 +43,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit",
     "regen": "typeshare ../../sidecar/src --lang=typescript --output-file=src/__generated__/types.ts",
     "prepublishOnly": "pnpm run build"
   },
