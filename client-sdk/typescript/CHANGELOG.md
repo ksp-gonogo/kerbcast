@@ -25,6 +25,11 @@
   `encoderBitrateBps`, `targetBitrateBps`, `degradeLevel`. `maxWidth`/`maxHeight`
   were already present. Additive -- existing consumers that destructure only
   the previous fields continue working unchanged.
+- `PanZoomController` headless state machine for pan/zoom camera control.
+  Manages rate deduplication, analog deadzone, optimistic nudge accumulators,
+  FoV slider debounce, and echo-sync idle rules. `KerbcamCameraHandle`
+  satisfies `PanZoomCommandSink` structurally. Exported from the package root
+  along with `PanZoomCommandSink`, `PanZoomBounds`, and `PanZoomControllerOptions`.
 
 ## 0.3.1 — 2026-05-21
 

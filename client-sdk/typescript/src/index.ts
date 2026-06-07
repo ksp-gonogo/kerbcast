@@ -20,3 +20,10 @@ export {
   type DiscoveredCamera,
   type NoiseConfig,
 } from "./client";
+
+export {
+  PanZoomController,
+  type PanZoomCommandSink,
+  type PanZoomBounds,
+  type PanZoomControllerOptions,
+} from "./panZoom";
