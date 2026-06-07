@@ -6,8 +6,13 @@ import type {
   Layer,
   ServerMessage,
 } from "./__generated__/types";
-import { ErrorSource } from "./__generated__/types";
+import { CameraLifecycle, ErrorSource } from "./__generated__/types";
 import { type NoisePipeline, tryCreateNoisePipeline } from "./noise";
+
+/** Intensity the static runs at when a camera has no live source (signal lost). */
+const SOURCELESS_INTENSITY = 1.0;
+/** Floor applied to the degrade-driven intensity of a live feed. */
+const LIVE_INTENSITY_FLOOR = 0.05;
 
 /** Controls the digital-static noise overlay baked into `cam.mediaStream`. */
 export interface NoiseConfig {
@@ -315,6 +320,13 @@ class CameraHandle
   private _rawStream: MediaStream | null = null;
   private _noisePipeline: NoisePipeline | null = null;
   private _noiseOverride: Partial<NoiseConfig> | null = null;
+  /**
+   * True while the handle has no live source but is still showing static
+   * (signal-loss / camera-switch gap). Distinct from a true teardown, where
+   * the pipeline is destroyed and `_mediaStream` goes null. While sourceless,
+   * intensity is pinned at full and degrade updates must not lower it.
+   */
+  private _sourceless = false;
   private readonly client: KerbcamClient;
 
   constructor(flightId: number, client: KerbcamClient) {
@@ -333,51 +345,97 @@ class CameraHandle
 
   configure(options: { noise?: Partial<NoiseConfig> }): void {
     this._noiseOverride = options.noise ?? null;
-    if (this._rawStream) this._rebuildPipeline(this._rawStream);
+    // Re-evaluate with the new noise setting: rebuild from whatever source
+    // state we're currently in (live, sourceless, or torn down).
+    this._applySource(this._rawStream);
   }
 
   /** Internal — called by the client when CameraState pushes arrive. */
   _setState(state: CameraState): void {
+    const prevDestroyed = this._state?.lifecycle === CameraLifecycle.Destroyed;
     this._state = state;
-    this._noisePipeline?.setIntensity(Math.max(0.05, state.degradeLevel));
     this.emit("change", state);
-  }
 
-  /** Internal — called by the client when a track arrives or drops. */
-  _setMediaStream(stream: MediaStream | null): void {
-    this._noisePipeline?.destroy();
-    this._noisePipeline = null;
-    this._rawStream = stream;
-
-    if (!stream) {
-      this._mediaStream = null;
-      this.emit("stream", null);
+    // A destroyed camera stops forwarding frames but its track never ends, so
+    // nothing else drives the handle into the sourceless state — do it here.
+    if (state.lifecycle === CameraLifecycle.Destroyed) {
+      if (!this._sourceless || !prevDestroyed) this._applySource(null);
       return;
     }
 
-    this._rebuildPipeline(stream);
+    // Live feed: degrade drives intensity. Don't touch a sourceless pipeline,
+    // which is pinned at full static.
+    if (!this._sourceless) {
+      this._noisePipeline?.setIntensity(this._liveIntensity());
+    }
   }
 
-  private _rebuildPipeline(raw: MediaStream): void {
-    this._noisePipeline?.destroy();
-    this._noisePipeline = null;
+  /**
+   * Internal — called by the client when a track arrives or drops.
+   * A null stream does NOT tear down: if a pipeline can run, the handle keeps
+   * emitting live full-intensity static (signal-loss / camera-switch gap).
+   * Use {@link _teardown} for genuine teardown (disconnect / peer failure).
+   */
+  _setMediaStream(stream: MediaStream | null): void {
+    this._applySource(stream);
+  }
+
+  /**
+   * Drive the persistent pipeline to a given source (or sourceless static when
+   * `raw` is null). Creates the pipeline lazily on first need and reuses it
+   * thereafter so the output stream stays stable across source swaps.
+   */
+  private _applySource(raw: MediaStream | null): void {
+    this._rawStream = raw;
+    this._sourceless = raw === null;
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
-    const initialIntensity = Math.max(0.05, this._state?.degradeLevel ?? 0);
 
     if (noiseEnabled) {
-      const pipeline = tryCreateNoisePipeline(raw, initialIntensity);
+      // Reuse an existing pipeline; otherwise try to create one.
+      if (!this._noisePipeline) {
+        const initial = raw ? this._liveIntensity() : SOURCELESS_INTENSITY;
+        this._noisePipeline = tryCreateNoisePipeline(raw, initial);
+      } else {
+        this._noisePipeline.setSource(raw);
+      }
+
+      const pipeline = this._noisePipeline;
       if (pipeline) {
-        this._noisePipeline = pipeline;
-        this._mediaStream = pipeline.processedStream;
-        this.emit("stream", pipeline.processedStream);
+        pipeline.setIntensity(raw ? this._liveIntensity() : SOURCELESS_INTENSITY);
+        this._setOutput(pipeline.processedStream);
         return;
       }
+    } else if (this._noisePipeline) {
+      // Noise just got disabled — drop the pipeline and fall through to raw.
+      this._noisePipeline.destroy();
+      this._noisePipeline = null;
     }
 
-    // Noise disabled or captureStream unavailable — expose raw stream directly.
-    this._mediaStream = raw;
-    this.emit("stream", raw);
+    // Noise disabled, or captureStream unavailable (no pipeline creatable):
+    // expose the raw stream directly, or null when there's no source.
+    this._setOutput(raw);
+  }
+
+  private _setOutput(stream: MediaStream | null): void {
+    this._mediaStream = stream;
+    this.emit("stream", stream);
+  }
+
+  private _liveIntensity(): number {
+    return Math.max(LIVE_INTENSITY_FLOOR, this._state?.degradeLevel ?? 0);
+  }
+
+  /**
+   * Internal — genuine teardown (client disconnect / peer failure). Destroys
+   * the persistent pipeline, stops its rAF loop, and nulls the stream.
+   */
+  _teardown(): void {
+    this._noisePipeline?.destroy();
+    this._noisePipeline = null;
+    this._rawStream = null;
+    this._sourceless = false;
+    this._setOutput(null);
   }
 
   async setLayers(layers: Layer[]): Promise<void> {
@@ -771,6 +829,11 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
             this.getOrCreateHandle(flightId)._setMediaStream(
               new MediaStream([track]),
             );
+          } else {
+            // Bound to a slot but the track hasn't arrived yet (the
+            // camera-switch gap). Drive the incoming handle sourceless so it
+            // shows static rather than going blank until the track lands.
+            this.getOrCreateHandle(flightId)._setMediaStream(null);
           }
         }
         break;
@@ -796,7 +859,7 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
 
   private tearDownStreams(): void {
     for (const handle of this.handles.values()) {
-      handle._setMediaStream(null);
+      handle._teardown();
     }
   }
 }
