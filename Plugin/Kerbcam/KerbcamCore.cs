@@ -502,18 +502,6 @@ namespace Kerbcam
             }
         }
 
-        // Hotkey poll. Update runs once per frame; cheap to scan a key
-        // here, and Input.GetKeyDown only fires the tick a key first
-        // goes down so there's no autorepeat risk.
-        private void Update()
-        {
-            if (KerbcamSettings.ThrottleMainScreenKey != KeyCode.None &&
-                Input.GetKeyDown(KerbcamSettings.ThrottleMainScreenKey))
-            {
-                ToggleThrottleViaHotkey();
-            }
-        }
-
         // LateUpdate drives explicit camera.Render() calls via each
         // KerbcamCamera.Refresh(). Our offscreen cameras are permanently
         // disabled (enabled=false) so they never fire during Unity's normal
@@ -671,12 +659,9 @@ namespace Kerbcam
                 };
             }
 
-            string keyHint = KerbcamSettings.ThrottleMainScreenKey != KeyCode.None
-                ? $" or press [{KerbcamSettings.ThrottleMainScreenKey}]"
-                : " (no hotkey bound; set ThrottleMainScreenKey in settings.cfg)";
             string msg =
                 "Main flight camera disabled by kerbcam to free GPU for camera streams. " +
-                $"Go to Pause → Difficulty Settings → Kerbcam{keyHint} to restore.";
+                "Go to Pause > Difficulty Settings > Kerbcam to restore.";
 
             const float w = 560f;
             const float h = 80f;
@@ -725,28 +710,6 @@ namespace Kerbcam
         // (so the change persists if the operator saves now). Lets the
         // hotkey behave intuitively — "press it, it stays toggled
         // until I press it again or change the Difficulty Setting".
-        private void ToggleThrottleViaHotkey()
-        {
-            bool next = !_throttleEffective;
-            try
-            {
-                var game = HighLogic.CurrentGame;
-                if (game?.Parameters != null)
-                {
-                    var node = game.Parameters.CustomParams<KerbcamGameParameters>();
-                    if (node != null) node.ThrottleMainScreen = next;
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Kerbcam] hotkey CustomParams write failed: {ex.Message}");
-            }
-            _throttleDesired = next;
-            if (next) ApplyMainScreenThrottle();
-            else RestoreMainScreen();
-            Debug.Log($"[Kerbcam] ThrottleMainScreen toggled via hotkey → {next}");
-        }
-
         // KSP ships FlightCamera.EnableCamera() / DisableCamera() as
         // its first-class on/off for the layered main view; calling
         // DisableCamera here is the same code path KSP itself uses on
