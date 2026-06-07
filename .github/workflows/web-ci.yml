@@ -1,0 +1,67 @@
+name: web-ci
+
+# Vite build is deterministic with a pinned lockfile (vite-plugin-singlefile
+# produces a stable content-hash across runs when deps don't change). We gate
+# on `git diff --exit-code web/dist/index.html` on both push and PRs rather
+# than using an auto-commit loop (unlike protocol-ci's typeshare regen, which
+# is intentionally authoritative). If the diff check ever flakes, the fix is
+# to re-run `pnpm --filter kerbcam-web build` locally and commit the result;
+# it is NOT acceptable to skip the gate or weaken it to a parse check.
+#
+# Determinism evidence: two sequential local builds with the same node_modules
+# produced byte-identical output (2026-06-07). CI uses --frozen-lockfile to pin
+# the dep tree to the committed pnpm-lock.yaml, which is the primary source of
+# build non-determinism across runs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'client-sdk/**'
+      - '.github/workflows/web-ci.yml'
+  pull_request:
+    paths:
+      - 'web/**'
+      - 'client-sdk/**'
+      - '.github/workflows/web-ci.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: test + typecheck + build + freshness gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test (kerbcam-web)
+        run: pnpm --filter kerbcam-web test
+
+      - name: Typecheck (kerbcam-web)
+        run: pnpm --filter kerbcam-web typecheck
+
+      - name: Build (kerbcam-web)
+        run: pnpm --filter kerbcam-web build
+
+      - name: Freshness gate - web/dist/index.html must be up to date
+        run: |
+          if ! git diff --exit-code web/dist/index.html; then
+            echo "::error::web/dist/index.html is stale. Run \`pnpm --filter kerbcam-web build\` locally and commit the result."
+            exit 1
+          fi
