@@ -26,14 +26,12 @@ which dispatches at runtime to:
 
 ## Native plugin binary
 
-`libAsyncGPUReadbackPlugin.so`. Mono on Linux only finds it from specific paths
-(`KSP_Data/MonoBleedingEdge/x86_64/` or `KSP_Data/Plugins/`); the install copies
-it to those. **No longer the upstream prebuilt binary** — it is now built from
-the vendored C++ source under `NativePlugin/` (kerbcam fork, see below) by
-`.github/workflows/native-readback-ci.yml` on ubuntu-22.04 (glibc 2.35 floor,
-matching the Deck's pressure-vessel; CI guards the requirement at ≤ 2.36).
-Download the `libAsyncGPUReadbackPlugin-linux-x64` artifact and copy it to both
-Mono paths above.
+`libAsyncGPUReadbackPlugin.so` ships in
+`GameData/Kerbcam/Plugins/x86_64/`. Mono on Linux only finds it from
+specific paths (`KSP_Data/MonoBleedingEdge/x86_64/` or `KSP_Data/Plugins/`);
+the install script copies it to the right one. Sourced from the
+upstream's `UnityExampleProject/Assets/OpenglAsyncReadback/Plugins/Linux/`
+folder.
 
 ## Local modifications (kerbcam fork)
 
@@ -56,21 +54,6 @@ upstream)` in-source:
   the pump on the next Flight scene) saw "not null" and never respawned — async
   readbacks then wedged until a full KSP restart.
   Rationale: `local_docs/perf_profiles/session_20260606.md` (pump-respawn bug).
-
-- **`NativePlugin/`** — the full upstream native C++ source (pinned at upstream
-  `aff05c2`), vendored so we can build a modified `.so`. Changes, marked
-  `kerbcam … (not upstream)` in `src/AsyncGPUReadbackPlugin.cpp`:
-  - **#2 FBO+PBO pool** — `FrameTask` reuses a size-keyed framebuffer + pixel
-    buffer across readbacks instead of `glGen*`/`glBufferData`/`glDelete*` every
-    frame. Render-thread-only, no extra locking (StartRequest/Update both run on
-    the render thread under `tasks_mutex`).
-  - **#4 format diagnostic** — logs the driver's `GL_IMPLEMENTATION_COLOR_READ_FORMAT/
-    _TYPE` vs. the format we request, once, to stderr (→ Player.log). Diagnostic
-    only; no format change yet (a BGRA switch would ripple into the sidecar's
-    byte-order contract).
-  - `CMakeLists.txt` — dropped `-Werror`/`/WX` (builds on a newer toolchain than
-    upstream).
-  Rationale: `local_docs/perf_profiles/readback_investigation.md` #2/#4.
 
 Note: the `ClearDeadRefs` dictionary-during-enumeration bug is NOT fixed in
 this source — it's patched at runtime via Harmony in
