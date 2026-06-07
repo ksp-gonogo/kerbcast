@@ -16,7 +16,8 @@
 #           client-sdk/typescript/package.json \
 #           client-sdk/typescript/CHANGELOG.md \
 #           client-sdk/react/package.json \
-#           client-sdk/react/CHANGELOG.md
+#           client-sdk/react/CHANGELOG.md \
+#           web/dist/index.html
 #   git commit -m "release: vX.Y.Z"
 #   git tag -s vX.Y.Z -m "vX.Y.Z"
 #   git push origin main --follow-tags
@@ -82,6 +83,17 @@ if command -v cargo >/dev/null 2>&1; then
   ( cd "$(dirname "$CARGO")" && cargo update -p kerbcam-sidecar --precise "$NEW" >/dev/null 2>&1 || true )
 fi
 
+# Rebuild the embedded web UI so the shipped binary contains the page at the
+# bumped version. Requires pnpm; fails with a clear error if it is absent so a
+# release cannot silently ship a stale page.
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "error: pnpm not found -- install pnpm and re-run so the web build is current" >&2
+  exit 4
+fi
+echo "rebuilding web UI..."
+( cd "$ROOT" && pnpm --filter kerbcam-web build >/dev/null )
+echo "  $ROOT/web/dist/index.html"
+
 # Prepend a placeholder version header to each CHANGELOG. Caller fills body.
 bump_changelog() {
   local changelog="$1"
@@ -112,12 +124,14 @@ echo "  $TS_PKG"
 echo "  $REACT_PKG"
 echo "  $TS_CHANGELOG (placeholder header -- fill the body before committing)"
 echo "  $REACT_CHANGELOG (placeholder header -- fill the body before committing)"
+echo "  $ROOT/web/dist/index.html (rebuilt)"
 echo ""
 echo "next:"
 echo "  vim $TS_CHANGELOG $REACT_CHANGELOG  # describe the changes"
 echo "  git add sidecar/Cargo.toml sidecar/Cargo.lock \\"
 echo "          client-sdk/typescript/package.json client-sdk/typescript/CHANGELOG.md \\"
-echo "          client-sdk/react/package.json client-sdk/react/CHANGELOG.md"
+echo "          client-sdk/react/package.json client-sdk/react/CHANGELOG.md \\"
+echo "          web/dist/index.html"
 echo "  git commit -m \"release: v$NEW\""
 echo "  git tag -s v$NEW -m \"v$NEW\""
 echo "  git push origin main --follow-tags"
