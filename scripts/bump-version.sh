@@ -4,8 +4,8 @@
 # React package.json files are kept in lockstep so consumers and the sidecar
 # binary share one SemVer line.
 #
-# CI's protocol-ci + publish-protocol workflows verify they all match; this
-# script makes the bump a one-line operation so they can't drift.
+# CI's protocol-ci + the release workflow's publish-sdk job verify they all
+# match; this script makes the bump a one-line operation so they can't drift.
 #
 # Usage:
 #   ./scripts/bump-version.sh 0.2.0

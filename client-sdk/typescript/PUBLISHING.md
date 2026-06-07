@@ -26,23 +26,29 @@ vim client-sdk/typescript/CHANGELOG.md
 # 3. Commit + tag.
 git add sidecar/Cargo.toml sidecar/Cargo.lock \
         client-sdk/typescript/package.json \
-        client-sdk/typescript/CHANGELOG.md
+        client-sdk/typescript/CHANGELOG.md \
+        client-sdk/react/package.json \
+        client-sdk/react/CHANGELOG.md \
+        web/dist/index.html
 git commit -m "release: v0.1.1"
 git tag -s v0.1.1 -m "v0.1.1"
 git push origin main --follow-tags
 ```
 
-CI then runs `publish-protocol.yml`:
+CI then runs the `publish-sdk` job in `release.yml`:
 
-1. Drift-checks the typeshare output (stale generated TS can't
-   ship under a release tag).
-2. Verifies the tag, `Cargo.toml`, and `package.json` all carry
-   `0.1.1`.
-3. Builds with `tsc`.
-4. `npm publish --provenance` to `npm.pkg.github.com`.
+1. Regenerates the typeshare bindings from Rust (the published
+   types always come from a fresh regen, never the committed copy).
+2. Verifies the tag, `Cargo.toml`, and both package.json files all
+   carry `0.1.1`.
+3. Builds the workspace with `tsc`.
+4. `pnpm publish` for `@jonpepler/kerbcam`, then
+   `@jonpepler/kerbcam-react`, to `npm.pkg.github.com`.
 
-If any check fails the workflow exits without publishing, so a
-mismatched tag never produces a release.
+If any check fails the job exits without publishing, and the
+GameData bundle job (which `needs` it) never creates a GitHub
+Release, so a mismatched tag never produces a release in either
+form.
 
 ## Installing as a consumer
 

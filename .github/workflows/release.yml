@@ -1,16 +1,28 @@
 name: release
 
-# Triggered on v* tags. Assembles a complete GameData/Kerbcam/ install tree:
-# sidecar binary + bundled libs, plugin DLL, both shader bundles, settings.cfg.
+# Triggered on v* tags. Two linked jobs:
 #
-# npm package publishing is NOT done here: publish-protocol.yml fires on the
-# same tag and owns it. Keeping the two apart means the wire-contract packages
-# ship in under a minute and survive any failure in this much longer, more
-# fragile chain (Unity licensing, third-party shader checkout, ldd bundling),
-# and either workflow can be re-dispatched without re-running the other.
+#   publish-sdk  (~1 min)   regenerates the typeshare bindings from Rust,
+#                           verifies version sync, publishes @jonpepler/kerbcam
+#                           and @jonpepler/kerbcam-react to GitHub Packages.
+#   bundle       (~11 min)  assembles the complete GameData/Kerbcam/ install
+#                           tree (sidecar binary + bundled libs, plugin DLL,
+#                           shader bundles, settings.cfg) and creates the
+#                           GitHub Release. needs publish-sdk, so a Release
+#                           never claims packages that failed to publish, and
+#                           a mis-cut tag fails in about a minute instead of
+#                           after the Unity builds.
 #
-# Runs on ubuntu-22.04 (glibc 2.35) so bundled .so files stay within the
-# Steam Deck's pressure-vessel glibc floor (Steam Runtime 3 = glibc 2.36).
+# "Re-run failed jobs" re-runs whichever half failed without repeating the
+# other.
+#
+# bundle runs on ubuntu-22.04 (glibc 2.35) so bundled .so files stay within
+# the Steam Deck's pressure-vessel glibc floor (Steam Runtime 3 = glibc 2.36).
+#
+# GitHub Packages requires the npm scope to match the repo's owner; we use
+# `@jonpepler` because that's where the repo lives today. pnpm rewrites
+# workspace:^ to real semver ranges in the published tarballs. pnpm 9 does
+# not support --provenance; attestation is deferred until it does.
 #
 # Secrets required:
 #   KSP_MANAGED_TOKEN — fine-grained PAT (Contents: read) for jonpepler/ksp-managed
@@ -22,12 +34,92 @@ on:
       - "v*"
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-
 jobs:
-  release:
+  publish-sdk:
+    name: publish SDK packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + typeshare binary
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/typeshare
+          key: ${{ runner.os }}-typeshare-cli-1.13.4
+
+      - name: Install typeshare-cli
+        run: |
+          if ! command -v typeshare >/dev/null 2>&1; then
+            cargo install typeshare-cli --version 1.13.4 --locked
+          fi
+          typeshare --version
+
+      # The Rust protocol is the source of truth: publish from a fresh regen,
+      # never from the committed copy.
+      - name: Regenerate TS bindings
+        run: |
+          typeshare ./sidecar/src \
+            --lang=typescript \
+            --output-file=client-sdk/typescript/src/__generated__/types.ts
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node + GitHub Packages registry
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          registry-url: https://npm.pkg.github.com
+          scope: "@jonpepler"
+
+      - name: Verify version sync (tag == Cargo.toml == all package.json files)
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
+          REACT_VER="$(node -p "require('./client-sdk/react/package.json').version")"
+          CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER"
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ]; then
+            echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
+            exit 1
+          fi
+
+      - name: Install workspace dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm -r build
+
+      # Core first so the registry has the dependency when react is indexed.
+      - name: Publish @jonpepler/kerbcam to GitHub Packages
+        working-directory: client-sdk/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm publish --no-git-checks
+
+      - name: Publish @jonpepler/kerbcam-react to GitHub Packages
+        working-directory: client-sdk/react
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm publish --no-git-checks
+
+  bundle:
+    name: GameData bundle + GitHub Release
+    needs: publish-sdk
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     env:
       UNITY_VERSION: 2019.4.40f1 (ffc62b691db5)
       HULLCAM_REPO: linuxgurugamer/HullcamVDSContinued
@@ -36,21 +128,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      # Fail fast, before ~10 minutes of Unity setup, if the tag was cut
-      # without running ./scripts/bump-version.sh. node is preinstalled on
-      # the runner; no setup-node needed.
-      - name: Verify version sync (tag == Cargo.toml == package.json files)
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#v}"
-          TS_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
-          REACT_VER="$(node -p "require('./client-sdk/react/package.json').version")"
-          CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$TS_VER react=$REACT_VER"
-          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$TS_VER" ] || [ "$TS_VER" != "$REACT_VER" ]; then
-            echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
-            exit 1
-          fi
 
       - name: Install ffmpeg + VA-API system libs
         run: |
@@ -226,7 +303,7 @@ jobs:
             echo "- \`kerbcam-${TAG}.zip\` — complete install tree (plugin + sidecar + shader bundles + settings)"
             echo "- \`Kerbcam.dll\` — plugin DLL only (for manual installs)"
             echo ""
-            echo "> TypeScript SDK \`@jonpepler/kerbcam@${TAG#v}\` and \`@jonpepler/kerbcam-react@${TAG#v}\` published to GitHub Packages (via publish-protocol)."
+            echo "> TypeScript SDK \`@jonpepler/kerbcam@${TAG#v}\` and \`@jonpepler/kerbcam-react@${TAG#v}\` published to GitHub Packages."
             echo ""
             echo "<details>"
             echo "<summary>Changelog</summary>"
