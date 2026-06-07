@@ -535,37 +535,41 @@ namespace Kerbcam
 
             // Camera parenting strategy:
             //
-            // Compound joint (yaw == pitch transform, e.g. hc.launchcam): parent
-            // the near camera to the joint. The joint carries both pan axes via a
-            // single Euler, and the camera inherits both as world-space rotation.
-            // Re-express cameraPosition/Forward/Up in the joint's local frame so
-            // the lens stays at the correct world position throughout the joint's
-            // travel. Refresh() keeps the camera's localRotation at _baseRotation
+            // Any joint (compound yaw+pitch like hc.launchcam, OR yaw-only like
+            // DC.TurretCam / TopJoint): parent the near camera RIGIDLY to the
+            // joint. The joint carries the pan rotation and the camera inherits
+            // it as world-space rotation, so the lens travels WITH the visible
+            // head — the head therefore stays behind the lens and never enters
+            // frame. Refresh() keeps the camera's localRotation at _baseRotation
             // (no additional camera-level pan) since the joint provides it all.
             //
-            // Yaw-only joint (e.g. DC.TurretCam / TopJoint): do NOT parent the
-            // near camera to the joint. Parenting at a non-zero localPosition
-            // would orbit the camera around the joint's origin as the joint
-            // rotates — the lens would arc through space rather than rotating in
-            // place, producing the "rotates about the wrong point" symptom. Instead,
-            // parent the camera to partTransform and drive its localRotation
-            // directly in Refresh() (the same path as when there is no joint at
-            // all). The mesh joint is animated separately and independently.
+            // The mount position is re-expressed in the joint's local frame so
+            // the lens sits at the correct world position throughout the joint's
+            // travel. For a yaw-only joint whose authored cameraPosition is well
+            // off the yaw axis (TurretCam's is ~0.5 lateral), parenting at that
+            // offset would orbit the lens through a wide arc — the old "rotates
+            // about the wrong point" symptom. CameraMountLocal lets such a part
+            // pin the lens onto the yaw axis (in joint-local coords) so it
+            // rotates in place while still travelling with the head.
             //
             // No joint: parent to partTransform, use cameraPosition/Forward/Up
-            // as-is in part space.
-            bool compoundJointAtConstruct =
-                _yawTransform != null
-                && !string.IsNullOrEmpty(_panCap.PitchTransformName)
-                && _panCap.PitchTransformName == _panCap.YawTransformName;
-
+            // as-is in part space, and Refresh() drives the camera's own
+            // localRotation for pan.
             Transform nearParent;
             Vector3 nearLocalPos;
-            if (compoundJointAtConstruct)
+            if (_yawTransform != null)
             {
-                // Compound: camera follows the joint; re-express in joint frame.
-                Vector3 worldPos = partTransform.TransformPoint(Hullcam.cameraPosition);
-                nearLocalPos = _yawTransform.InverseTransformPoint(worldPos);
+                // Joint present: camera follows the joint; re-express in joint frame.
+                if (_panCap.CameraMountLocal.HasValue)
+                {
+                    // Authored mount is already given in the joint's local frame.
+                    nearLocalPos = _panCap.CameraMountLocal.Value;
+                }
+                else
+                {
+                    Vector3 worldPos = partTransform.TransformPoint(Hullcam.cameraPosition);
+                    nearLocalPos = _yawTransform.InverseTransformPoint(worldPos);
+                }
                 Vector3 worldFwd = partTransform.TransformDirection(Hullcam.cameraForward);
                 Vector3 worldUp  = partTransform.TransformDirection(Hullcam.cameraUp);
                 _baseRotation = Quaternion.LookRotation(
@@ -575,8 +579,7 @@ namespace Kerbcam
             }
             else
             {
-                // Yaw-only joint or no joint: camera stays on partTransform and
-                // rotates in place; joint (if any) drives mesh only.
+                // No joint: camera stays on partTransform and rotates in place.
                 nearLocalPos = Hullcam.cameraPosition;
                 _baseRotation = Quaternion.LookRotation(Hullcam.cameraForward, Hullcam.cameraUp);
                 nearParent = partTransform;
@@ -1205,23 +1208,20 @@ namespace Kerbcam
 
                 if (_nearCam != null)
                 {
-                    if (compoundJoint)
+                    if (_yawTransform != null)
                     {
-                        // Joint carries both axes; near cam stays at rest relative to joint.
+                        // A joint (compound or yaw-only) is present and the near
+                        // camera is parented to it, so the joint's rotation IS the
+                        // camera's pan. The camera stays at rest relative to the
+                        // joint; applying pan here too would double it.
                         _nearCam.transform.localRotation = _baseRotation;
                     }
                     else
                     {
-                        // Positive pan_yaw = camera turns right; positive pan_pitch = up.
-                        // Negate pitch because Unity's X-rotation is positive-down.
-                        // The camera is always parented to partTransform in this
-                        // (non-compound) path, regardless of whether a yaw mesh
-                        // joint exists — so the full pan angle is applied here.
-                        // (Previously this was 0f when a yaw joint was present,
-                        // because the camera was parented to the joint and the joint
-                        // carried the rotation. That parenting caused the camera to
-                        // orbit around the joint's origin rather than rotating in
-                        // place — the "rotates about the wrong point" bug.)
+                        // No joint: the camera is parented to partTransform and
+                        // carries the full pan itself. Positive pan_yaw = camera
+                        // turns right; positive pan_pitch = up. Negate pitch
+                        // because Unity's X-rotation is positive-down.
                         _nearCam.transform.localRotation = _baseRotation
                             * Quaternion.Euler(-_panPitchCurrent, _panYawCurrent, 0f);
                     }
@@ -1252,15 +1252,13 @@ namespace Kerbcam
                 {
                     if (_yawTransform != null)
                     {
-                        // YawMeshInvert: cameras with cameraForward.z < 0 face
-                        // −Z in the joint's local frame. Unity Euler(0,+Y,0)
-                        // rotates CCW from above, sweeping −Z toward −X (camera
-                        // turns left for +panYaw). Negate the joint angle so the
-                        // mesh and the rendered view both pan in the expected
-                        // direction (+panYaw → right).
-                        float meshYaw = _panCap.YawMeshInvert ? -_panYawCurrent : _panYawCurrent;
+                        // The near camera is parented rigidly to this joint, so a
+                        // single +panYaw rotation drives BOTH the visible head and
+                        // the lens in the same direction — no sign disagreement to
+                        // reconcile (the lens stays at _baseRotation relative to
+                        // the joint, set in the _nearCam branch above).
                         _yawTransform.localRotation = _yawRestRot
-                            * Quaternion.Euler(0f, meshYaw, 0f);
+                            * Quaternion.Euler(0f, _panYawCurrent, 0f);
                     }
                     if (_pitchTransform != null)
                         _pitchTransform.localRotation = _pitchRestRot

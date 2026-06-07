@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using UnityEngine;
 
 namespace Kerbcam
 {
@@ -37,16 +38,15 @@ namespace Kerbcam
         /// rotation around the view axis. Use 180 to correct an upside-down
         /// feed when cameraForward points opposite to the default camera Z.</summary>
         public float CameraRollDeg;
-        /// <summary>When true, the sign of the yaw angle applied to the mesh
-        /// joint transform is negated. Set this for cameras whose
-        /// <c>cameraForward</c> points in the −Z direction in the joint's local
-        /// frame (i.e. <c>cameraForward.z &lt; 0</c>). Without the negation,
-        /// rotating the joint by +Y (counterclockwise from above) sweeps a
-        /// backward-facing camera to the left — opposite of what the operator
-        /// expects for +panYaw. Cameras with <c>cameraForward.z &gt; 0</c>
-        /// face the joint's +Z and sweep right under +Y rotation, which is
-        /// already correct, so they leave this false.</summary>
-        public bool YawMeshInvert;
+        /// <summary>Optional override for the near camera's mount position,
+        /// expressed in the YAW JOINT's local frame (not the part frame). Use
+        /// for a yaw-only joint whose authored <c>cameraPosition</c> sits well
+        /// off the yaw axis: parenting the lens rigidly to the joint would then
+        /// orbit it through a wide arc. Placing the mount on (or near) the yaw
+        /// axis via this override keeps the lens on-pivot so it rotates in place
+        /// while still travelling with the head. Null = re-express the part's
+        /// <c>cameraPosition</c> into the joint frame as-is.</summary>
+        public Vector3? CameraMountLocal;
 
         public bool SupportsPan => YawMin != YawMax || PitchMin != PitchMax;
     }
@@ -98,20 +98,28 @@ namespace Kerbcam
             // cameraTransform (the visible rotating head); BottomJoint contains
             // only base/col_base (the fixed mount plate). We rotate TopJoint
             // directly via FindModelTransform + localRotation — same technique as
-            // solar panels and landing gear. The near camera is also parented to
-            // TopJoint so stream and mesh move together. Limits from the
+            // solar panels and landing gear. The near camera is parented RIGIDLY
+            // to TopJoint so the lens travels WITH the head and the head stays
+            // behind the lens through the whole sweep — fixing the "TurretCam
+            // sees its own body mid-sweep, mirrored" symptom. Limits from the
             // commented-out servo block: hardMinMaxLimits = -177, 177 — trimmed
             // to ±135 to leave a dead zone around the mount's cable entry.
             //
-            // YawMeshInvert = true: TurretCam's cameraForward = (0,0,-1), meaning
-            // the lens faces the −Z direction in TopJoint's local frame. Unity's
-            // Euler(0,+Y,0) rotates the joint CCW when viewed from above, which
-            // sweeps −Z toward −X — turning the camera LEFT when the operator
-            // commands +panYaw (pan right). Negating the joint angle corrects this
-            // so the on-screen view and the mesh both sweep right on +panYaw.
-            // The near camera's own localRotation is not touched (it is parented to
-            // the joint and carries _baseRotation only when a yaw joint is present),
-            // so only the joint-drive line in Refresh() is affected.
+            // CameraMountLocal pins the lens to the model's authored optical node
+            // (~0.047, 0.046, -0.200, already in TopJoint's local frame) rather
+            // than the part's authored cameraPosition (~0.5 lateral, well off the
+            // yaw axis). On-axis, the rigidly-parented lens rotates in place
+            // instead of orbiting the joint — so we get the rigid head-mount
+            // without reintroducing the wide-arc "rotates about the wrong point"
+            // behaviour that the earlier in-place fix removed.
+            //
+            // Pan direction needs no special handling: the joint now drives both
+            // the head and the lens with one rotation and the same sign, so
+            // +panYaw sweeps the view in the operator-expected direction with no
+            // sign disagreement to reconcile and no dependence on the readback
+            // flip for pan direction. (The old YawMeshInvert flag — which negated
+            // the joint angle to paper over that disagreement back when the lens
+            // rotated in place on the part root — is therefore gone.)
             ["DC.TurretCam"] = new PanCapability
             {
                 YawMin = -135f, YawMax = 135f,
@@ -120,7 +128,7 @@ namespace Kerbcam
                 PanRateDegPerSec = 25f,
                 YawTransformName = "TopJoint",
                 PitchTransformName = "",
-                YawMeshInvert = true,
+                CameraMountLocal = new Vector3(0.047f, 0.046f, -0.200f),
             },
 
             // LaunchCam: single joint (hc_launchcam) that carries both yaw and
@@ -132,7 +140,7 @@ namespace Kerbcam
             // Yaw direction: cameraForward = 0,0,+1 means the lens faces +Z in
             // the joint's local frame. Unity Euler(0,+Y,0) rotates CCW from
             // above, sweeping +Z toward +X — turning the camera RIGHT for
-            // +panYaw. Confirmed correct in live KSP; no YawMeshInvert needed.
+            // +panYaw. Confirmed correct in live KSP.
             ["hc.launchcam"] = new PanCapability
             {
                 YawMin = -180f, YawMax = 180f,
