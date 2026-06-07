@@ -325,7 +325,15 @@ export type ClientMessage =
 	 */
 	| { type: "unsubscribe", content: FlightIdPayload }
 	/** Response to `Ping`. Browser sends this immediately on receiving each Ping. */
-	| { type: "pong", content?: undefined };
+	| { type: "pong", content?: undefined }
+	/**
+	 * Graceful teardown. The canonical way for a client to leave: the sidecar
+	 * immediately releases every camera this peer is feeding (so they sleep
+	 * without waiting for ICE to time out), after which the client may close
+	 * the connection. The drop-detection reaper remains the fallback for
+	 * ungraceful exits (crash / tab close / network loss) that can't send this.
+	 */
+	| { type: "disconnect", content?: undefined };
 
 /** Messages sent FROM the sidecar TO the client. */
 export type ServerMessage = 
