@@ -3,6 +3,7 @@ import {
   CameraFeed,
   useKerbcamCameras,
 } from "@jonpepler/kerbcam-react";
+import { Plus, X } from "lucide-react";
 import { useMemo } from "react";
 import styled from "styled-components";
 
@@ -45,23 +46,9 @@ export function Tile({
         onClick={onRemove}
         title={`Remove tile ${index + 1}`}
       >
-        <CloseIcon aria-hidden="true" />
+        <X size={11} strokeWidth={1.75} aria-hidden="true" />
       </RemoveButton>
     </TileRoot>
-  );
-}
-
-function CloseIcon() {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 10 10"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <path d="M1 1l8 8M9 1L1 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-    </svg>
   );
 }
 
@@ -79,9 +66,7 @@ export function AddTile({ onClick, isEmpty }: AddTileProps): React.JSX.Element {
       $isEmpty={isEmpty ?? false}
     >
       <AddIcon aria-hidden="true">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M10 4v12M4 10h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-        </svg>
+        <Plus size={20} strokeWidth={1.5} />
       </AddIcon>
       {isEmpty && <AddLabel>Add camera</AddLabel>}
     </AddRoot>

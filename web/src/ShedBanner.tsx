@@ -1,6 +1,7 @@
 import type { AdaptiveShedPayload } from "@jonpepler/kerbcam";
 import type { KerbcamClient } from "@jonpepler/kerbcam";
 import { useEffect, useState } from "react";
+import { X } from "lucide-react";
 import styled from "styled-components";
 
 interface ShedBannerProps {
@@ -36,17 +37,9 @@ export function ShedBanner({ client }: ShedBannerProps): React.JSX.Element | nul
         aria-label="Dismiss quality warning"
         onClick={() => setDismissed(true)}
       >
-        <CloseX aria-hidden="true" />
+        <X size={12} strokeWidth={1.75} aria-hidden="true" />
       </DismissButton>
     </Banner>
-  );
-}
-
-function CloseX() {
-  return (
-    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M1 1l8 8M9 1L1 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-    </svg>
   );
 }
 

@@ -1,4 +1,5 @@
 import type { KerbcamClient } from "@jonpepler/kerbcam";
+import { Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import styled from "styled-components";
 import type { ManagerStatus } from "./connectionManager";
@@ -57,34 +58,10 @@ export function Header({ status, client, onOpenSettings }: HeaderProps): React.J
           aria-label="Settings"
           onClick={onOpenSettings}
         >
-          <GearIcon aria-hidden="true" />
+          <Settings size={16} strokeWidth={1.75} aria-hidden="true" />
         </GearButton>
       </Actions>
     </Root>
-  );
-}
-
-function GearIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 16 16"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <path
-        d="M8 10a2 2 0 100-4 2 2 0 000 4z"
-        fill="currentColor"
-      />
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M6.68 1.28a.75.75 0 01.74-.28l.02.005L8 1.07l.56-.005.02-.005a.75.75 0 01.74.28l.57.83a5.06 5.06 0 011.05.61l.98-.18a.75.75 0 01.74.35l.56.97a.75.75 0 01-.1.87l-.7.69c.03.17.05.35.05.53s-.02.36-.05.53l.7.69a.75.75 0 01.1.87l-.56.97a.75.75 0 01-.74.35l-.98-.18a5.06 5.06 0 01-1.05.61l-.57.83a.75.75 0 01-.74.28L8 10.93l-.56.005-.02.005a.75.75 0 01-.74-.28l-.57-.83a5.06 5.06 0 01-1.05-.61l-.98.18a.75.75 0 01-.74-.35l-.56-.97a.75.75 0 01.1-.87l.7-.69A4.1 4.1 0 012.5 8c0-.18.02-.36.05-.53l-.7-.69a.75.75 0 01-.1-.87l.56-.97a.75.75 0 01.74-.35l.98.18a5.06 5.06 0 011.05-.61l.57-.83zM8 2.57l-.4.58a.75.75 0 01-.5.3 3.56 3.56 0 00-1.35.79.75.75 0 01-.57.18l-.7-.13-.19.33.5.49a.75.75 0 01.2.65A2.6 2.6 0 005.75 8c0 .1 0 .2.02.3a.75.75 0 01-.2.64l-.5.49.19.33.7-.13a.75.75 0 01.57.18c.38.35.83.63 1.35.79a.75.75 0 01.5.3l.39.57h.38l.4-.58a.75.75 0 01.5-.3c.52-.16.97-.44 1.35-.79a.75.75 0 01.57-.18l.7.13.19-.33-.5-.49a.75.75 0 01-.2-.65C10.5 8.2 10.5 8.1 10.5 8c0-.1 0-.2-.02-.3a.75.75 0 01.2-.64l.5-.49-.19-.33-.7.13a.75.75 0 01-.57-.18A3.56 3.56 0 008.9 5.4a.75.75 0 01-.5-.3L8 4.53l-.38-.01z"
-        fill="currentColor"
-        opacity="0.8"
-      />
-    </svg>
   );
 }
 

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { X } from "lucide-react";
 import styled from "styled-components";
 import { applyTheme, saveDebug, saveTheme } from "./settings";
 import type { ThemePreference } from "./settings";
@@ -54,7 +55,7 @@ export function Settings({
       <PanelHeader>
         <PanelTitle>Settings</PanelTitle>
         <CloseIconButton type="button" onClick={onClose} aria-label="Close">
-          <CloseX aria-hidden="true" />
+          <X size={14} strokeWidth={1.75} aria-hidden="true" />
         </CloseIconButton>
       </PanelHeader>
 
@@ -88,14 +89,6 @@ export function Settings({
         </FieldRow>
       </Sections>
     </Panel>
-  );
-}
-
-function CloseX() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-    </svg>
   );
 }
 

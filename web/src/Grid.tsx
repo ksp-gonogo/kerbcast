@@ -1,4 +1,5 @@
 import { useKerbcamCameras } from "@jonpepler/kerbcam-react";
+import { Video } from "lucide-react";
 import styled from "styled-components";
 import { AddTile, Tile } from "./Tile";
 import { addTile, MAX_TILES, removeTile, saveTiles, updateTile } from "./tiles";
@@ -52,11 +53,7 @@ export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.
       {isEmpty && (
         <EmptyHint>
           <EmptyIcon aria-hidden="true">
-            <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <rect x="2" y="7" width="20" height="15" rx="2.5" stroke="currentColor" strokeWidth="1.5" fill="none"/>
-              <polygon points="22,12 30,9 30,23 22,20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/>
-              <circle cx="12" cy="14.5" r="3.5" stroke="currentColor" strokeWidth="1.5" fill="none"/>
-            </svg>
+            <Video size={32} strokeWidth={1.5} />
           </EmptyIcon>
           <EmptyTitle>No cameras active</EmptyTitle>
           <EmptyBody>
