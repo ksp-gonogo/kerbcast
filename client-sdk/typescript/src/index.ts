@@ -7,6 +7,7 @@ export * from "./__generated__/types";
 export {
   KerbcamClient,
   BrowserKerbcamTransport,
+  type BrowserKerbcamTransportOptions,
   type KerbcamCameraHandle,
   type KerbcamClientConfig,
   type KerbcamConnectionState,

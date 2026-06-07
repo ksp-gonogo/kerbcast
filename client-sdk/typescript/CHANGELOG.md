@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `BrowserKerbcamTransport` accepts an options object with `iceGatheringTimeoutMs`
+  (default 2000 ms). `waitForIceComplete` now resolves at the earlier of gathering
+  completing or the timeout, so connect does not stall the full STUN timeout on
+  LAN topologies where the STUN server is unreachable.
+- `KerbcamClientConfig.iceGatheringTimeoutMs` threads the timeout into the default
+  transport when no custom transport is provided.
+- `BrowserKerbcamTransportOptions` exported from the package root.
+
 ## 0.3.1 — 2026-05-21
 
 Export `KerbcamTransport`, `KerbcamPeer`, `KerbcamDataChannel` from

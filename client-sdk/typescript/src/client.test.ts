@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorSource, Layer } from "./__generated__/types";
 import {
+  BrowserKerbcamTransport,
   type KerbcamConnectionState,
   type KerbcamDataChannel,
   type KerbcamPeer,
@@ -1003,5 +1004,129 @@ describe("KerbcamClient — dynamic slot subscription", () => {
     const mid = sidecar.slotMidFor(7) as string;
     sidecar.deliverTrack(mid, {} as MediaStreamTrack);
     expect(client.camera(7).mediaStream).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BrowserKerbcamTransport: ICE gathering timeout
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal RTCPeerConnection stub with controllable iceGatheringState.
+ * Tracks event listeners so tests can fire or skip the gathering event.
+ */
+function makeFakeRTCPeerConnection(
+  initialState: RTCIceGatheringState = "gathering",
+) {
+  const listeners = new Map<string, (() => void)[]>();
+  const pc = {
+    iceGatheringState: initialState as RTCIceGatheringState,
+    localDescription: null as { sdp: string } | null,
+    connectionState: "new" as RTCPeerConnectionState,
+    ontrack: null as ((ev: RTCTrackEvent) => void) | null,
+    onconnectionstatechange: null as (() => void) | null,
+    addTransceiver: () => {},
+    createDataChannel: () => ({
+      onopen: null,
+      onclose: null,
+      onmessage: null,
+      send: () => {},
+    }),
+    createOffer: async () => ({ sdp: "fake-sdp", type: "offer" as RTCSdpType }),
+    setLocalDescription: async () => {
+      pc.localDescription = { sdp: "fake-sdp" };
+    },
+    setRemoteDescription: async () => {},
+    close: () => {},
+    addEventListener(type: string, handler: () => void) {
+      const list = listeners.get(type) ?? [];
+      list.push(handler);
+      listeners.set(type, list);
+    },
+    removeEventListener(type: string, handler: () => void) {
+      const list = listeners.get(type) ?? [];
+      listeners.set(
+        type,
+        list.filter((h) => h !== handler),
+      );
+    },
+    /** Test helper: simulate gathering state change. */
+    fireGatheringComplete() {
+      pc.iceGatheringState = "complete";
+      for (const h of listeners.get("icegatheringstatechange") ?? []) h();
+    },
+    listenerCount(type: string) {
+      return (listeners.get(type) ?? []).length;
+    },
+  };
+  return pc;
+}
+
+describe("BrowserKerbcamTransport: waitForIceComplete", () => {
+  it("resolves immediately when already complete", async () => {
+    const pc = makeFakeRTCPeerConnection("complete");
+    // @ts-expect-error -- stub replaces the real constructor
+    globalThis.RTCPeerConnection = class { constructor() { return pc; } };
+    try {
+      const transport = new BrowserKerbcamTransport({ iceGatheringTimeoutMs: 500 });
+      const peer = transport.createPeer([]);
+      const start = Date.now();
+      await peer.waitForIceComplete();
+      expect(Date.now() - start).toBeLessThan(100);
+    } finally {
+      // @ts-expect-error -- cleanup
+      delete globalThis.RTCPeerConnection;
+    }
+  });
+
+  it("resolves after the timeout when gathering never completes", async () => {
+    vi.useFakeTimers();
+    const pc = makeFakeRTCPeerConnection("gathering");
+    // @ts-expect-error -- stub replaces the real constructor
+    globalThis.RTCPeerConnection = class { constructor() { return pc; } };
+    try {
+      const transport = new BrowserKerbcamTransport({ iceGatheringTimeoutMs: 2000 });
+      const peer = transport.createPeer([]);
+      const done = vi.fn();
+      void peer.waitForIceComplete().then(done);
+
+      expect(done).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(done).toHaveBeenCalledOnce();
+      // Listener must have been cleaned up after the timeout fires.
+      expect(pc.listenerCount("icegatheringstatechange")).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      // @ts-expect-error -- cleanup
+      delete globalThis.RTCPeerConnection;
+    }
+  });
+
+  it("resolves when gathering completes before the timeout and cleans up the timer", async () => {
+    vi.useFakeTimers();
+    const pc = makeFakeRTCPeerConnection("gathering");
+    // @ts-expect-error -- stub replaces the real constructor
+    globalThis.RTCPeerConnection = class { constructor() { return pc; } };
+    try {
+      const transport = new BrowserKerbcamTransport({ iceGatheringTimeoutMs: 2000 });
+      const peer = transport.createPeer([]);
+      const done = vi.fn();
+      void peer.waitForIceComplete().then(done);
+
+      // Gathering completes before the timeout.
+      await vi.advanceTimersByTimeAsync(500);
+      pc.fireGatheringComplete();
+      await Promise.resolve(); // flush microtasks
+      expect(done).toHaveBeenCalledOnce();
+      // No listener remains; timer was cancelled.
+      expect(pc.listenerCount("icegatheringstatechange")).toBe(0);
+      // Advancing past the original timeout must not call done again.
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(done).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+      // @ts-expect-error -- cleanup
+      delete globalThis.RTCPeerConnection;
+    }
   });
 });

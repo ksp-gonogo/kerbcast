@@ -84,15 +84,26 @@ export interface KerbcamClientConfig {
   iceServers?: RTCIceServer[];
   /**
    * Default noise settings for all cameras. Individual cameras can override
-   * this via `cam.configure({ noise: … })`. Noise is enabled by default.
+   * this via `cam.configure({ noise: ... })`. Noise is enabled by default.
    */
   noise?: Partial<NoiseConfig>;
+  /**
+   * ICE gathering timeout in milliseconds. Passed to the default
+   * {@link BrowserKerbcamTransport}; ignored when a custom transport is
+   * provided (the transport owns gathering). Defaults to 2000 ms.
+   *
+   * On LAN topologies where the STUN server is unreachable (e.g. Steam Deck
+   * IPv6 LAN with no internet path), gathering can stall for the full STUN
+   * timeout. Host candidates alone are sufficient for LAN streaming, so this
+   * timeout lets the connect flow proceed once host candidates are gathered.
+   */
+  iceGatheringTimeoutMs?: number;
   /**
    * Override how the SDP offer/answer is exchanged. Defaults to a POST to the
    * sidecar's HTTP `/offer`. A station screen injects a version that relays
    * the offer through the main screen (which can reach the sidecar), so the
    * station needs no direct sidecar address. The media itself still flows
-   * peer↔sidecar (direct or via TURN) — only the handshake is brokered.
+   * peer-to-sidecar (direct or via TURN) -- only the handshake is brokered.
    */
   negotiate?: (offer: {
     sdp: string;
@@ -177,9 +188,29 @@ export interface KerbcamDataChannel {
 // Default transport: browser RTCPeerConnection
 // ---------------------------------------------------------------------------
 
+/** Options for {@link BrowserKerbcamTransport}. */
+export interface BrowserKerbcamTransportOptions {
+  /**
+   * Maximum time (ms) to wait for ICE gathering to complete before proceeding
+   * with whatever candidates have been gathered. Defaults to 2000 ms.
+   *
+   * On LAN paths where the STUN server is unreachable, gathering blocks until
+   * the STUN timeout elapses. Host candidates are all a local LAN stream
+   * needs, so this timeout lets connect proceed without waiting for STUN.
+   */
+  iceGatheringTimeoutMs?: number;
+}
+
 export class BrowserKerbcamTransport implements KerbcamTransport {
+  private readonly opts: Required<BrowserKerbcamTransportOptions>;
+
+  constructor(opts: BrowserKerbcamTransportOptions = {}) {
+    this.opts = { iceGatheringTimeoutMs: opts.iceGatheringTimeoutMs ?? 2000 };
+  }
+
   createPeer(iceServers: RTCIceServer[]): KerbcamPeer {
     const pc = new RTCPeerConnection({ iceServers });
+    const { iceGatheringTimeoutMs } = this.opts;
     let trackIdx = 0;
     let onTrack:
       | ((t: MediaStreamTrack, idx: number, mid: string) => void)
@@ -219,13 +250,29 @@ export class BrowserKerbcamTransport implements KerbcamTransport {
       },
       waitForIceComplete: () =>
         new Promise<void>((resolve) => {
-          if (pc.iceGatheringState === "complete") return resolve();
+          if (pc.iceGatheringState === "complete") {
+            resolve();
+            return;
+          }
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const cleanup = () => {
+            pc.removeEventListener("icegatheringstatechange", check);
+            if (timer !== null) {
+              clearTimeout(timer);
+              timer = null;
+            }
+          };
           const check = () => {
             if (pc.iceGatheringState === "complete") {
-              pc.removeEventListener("icegatheringstatechange", check);
+              cleanup();
               resolve();
             }
           };
+          timer = setTimeout(() => {
+            timer = null;
+            cleanup();
+            resolve();
+          }, iceGatheringTimeoutMs);
           pc.addEventListener("icegatheringstatechange", check);
         }),
       localSdp: () => pc.localDescription?.sdp ?? "",
@@ -547,7 +594,11 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
   constructor(cfg: KerbcamClientConfig, transport?: KerbcamTransport) {
     super();
     this.cfg = cfg;
-    this.transport = transport ?? new BrowserKerbcamTransport();
+    this.transport =
+      transport ??
+      new BrowserKerbcamTransport({
+        iceGatheringTimeoutMs: cfg.iceGatheringTimeoutMs,
+      });
   }
 
   get state(): KerbcamConnectionState {
