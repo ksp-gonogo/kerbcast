@@ -119,6 +119,23 @@ export type KerbcamConnectionState =
   | "connected"
   | "failed";
 
+/**
+ * Inbound RTP video statistics for one camera track, derived from the
+ * WebRTC stats report. Fields are `undefined` when the browser has not yet
+ * emitted that stat (e.g. `framesPerSecond` before the first full second).
+ * `packetsReceived` and `bytesReceived` default to 0 in the same case.
+ *
+ * Retrieve per-camera stats via {@link KerbcamClient.inboundVideoStats}.
+ */
+export interface InboundVideoStats {
+  packetsReceived: number;
+  bytesReceived: number;
+  framesReceived: number | undefined;
+  framesDecoded: number | undefined;
+  jitter: number | undefined;
+  framesPerSecond: number | undefined;
+}
+
 /** Camera summary returned by {@link KerbcamClient.discover}. */
 export interface DiscoveredCamera {
   flightId: number;
@@ -175,6 +192,12 @@ export interface KerbcamPeer {
   waitForIceComplete(): Promise<void>;
   localSdp(): string;
   close(): void;
+  /**
+   * Retrieve the raw WebRTC stats report. Optional so existing third-party
+   * transports and mocks that predate this method keep compiling without
+   * changes. Equivalent to `RTCPeerConnection.getStats(null)`.
+   */
+  getStats?(): Promise<RTCStatsReport>;
 }
 
 export interface KerbcamDataChannel {
@@ -276,6 +299,7 @@ export class BrowserKerbcamTransport implements KerbcamTransport {
           pc.addEventListener("icegatheringstatechange", check);
         }),
       localSdp: () => pc.localDescription?.sdp ?? "",
+      getStats: () => pc.getStats(null),
       close: () => {
         pc.close();
       },
@@ -585,8 +609,15 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
   /** Dynamic mode: transceiver mid -> the live track on that slot. */
   private readonly trackByMid = new Map<string, MediaStreamTrack>();
   /** Dynamic mode: transceiver mid -> the camera bound to that slot
-   *  (populated by SlotMap — initial bindings announced on Hello). */
+   *  (populated by SlotMap -- initial bindings announced on Hello). */
   private readonly flightByMid = new Map<string, number>();
+  /**
+   * Legacy mode: raw incoming track id -> flightId. Populated in handleTrack
+   * so inboundVideoStats() can match inbound-rtp report entries by
+   * trackIdentifier. Cleared on disconnect. Not used in dynamic mode (which
+   * matches by mid instead).
+   */
+  private readonly flightByTrackId = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
   private _encoderBackend: string | null = null;
@@ -654,6 +685,7 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
     this.dynamicMode = opts.slots !== undefined;
     this.trackByMid.clear();
     this.flightByMid.clear();
+    this.flightByTrackId.clear();
 
     const peer = this.transport.createPeer(
       this.cfg.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
@@ -821,6 +853,9 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
     // Legacy: m-line index maps to the requested camera list.
     const flightId = this.requestedOrder[idx];
     if (flightId === undefined) return;
+    // Record the raw track id so inboundVideoStats() can match it against
+    // the report's trackIdentifier field.
+    if (track.id) this.flightByTrackId.set(track.id, flightId);
     this.getOrCreateHandle(flightId)._setMediaStream(new MediaStream([track]));
   }
 
@@ -908,7 +943,67 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
     this.emit("state-change", state);
   }
 
+  /**
+   * Inbound RTP video statistics keyed by flight ID. Returns an empty map
+   * when not connected or when the transport does not implement `getStats`.
+   *
+   * Iterates the stats report and matches `inbound-rtp` + `kind === "video"`
+   * entries to cameras. Legacy mode matches by `trackIdentifier`; dynamic
+   * mode falls back to the `mid` field when `trackIdentifier` is absent
+   * (modern browsers include it; some implementations omit it).
+   */
+  async inboundVideoStats(): Promise<Map<number, InboundVideoStats>> {
+    const result = new Map<number, InboundVideoStats>();
+    if (!this.peer?.getStats) return result;
+
+    let report: RTCStatsReport;
+    try {
+      report = await this.peer.getStats();
+    } catch {
+      return result;
+    }
+
+    report.forEach((raw) => {
+      if (raw.type !== "inbound-rtp" || raw.kind !== "video") return;
+      const entry = raw as {
+        type: string;
+        kind: string;
+        trackIdentifier?: string;
+        mid?: string;
+        packetsReceived?: number;
+        bytesReceived?: number;
+        framesReceived?: number;
+        framesDecoded?: number;
+        jitter?: number;
+        framesPerSecond?: number;
+      };
+
+      // Resolve the flightId: trackIdentifier wins (legacy path populated it),
+      // mid fallback covers dynamic mode and browsers that omit trackIdentifier.
+      let flightId: number | undefined;
+      if (entry.trackIdentifier) {
+        flightId = this.flightByTrackId.get(entry.trackIdentifier);
+      }
+      if (flightId === undefined && entry.mid) {
+        flightId = this.flightByMid.get(entry.mid);
+      }
+      if (flightId === undefined) return;
+
+      result.set(flightId, {
+        packetsReceived: entry.packetsReceived ?? 0,
+        bytesReceived: entry.bytesReceived ?? 0,
+        framesReceived: entry.framesReceived,
+        framesDecoded: entry.framesDecoded,
+        jitter: entry.jitter,
+        framesPerSecond: entry.framesPerSecond,
+      });
+    });
+
+    return result;
+  }
+
   private tearDownStreams(): void {
+    this.flightByTrackId.clear();
     for (const handle of this.handles.values()) {
       handle._teardown();
     }

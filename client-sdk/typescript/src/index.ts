@@ -8,6 +8,7 @@ export {
   KerbcamClient,
   BrowserKerbcamTransport,
   type BrowserKerbcamTransportOptions,
+  type InboundVideoStats,
   type KerbcamCameraHandle,
   type KerbcamClientConfig,
   type KerbcamConnectionState,

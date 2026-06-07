@@ -1130,3 +1130,114 @@ describe("BrowserKerbcamTransport: waitForIceComplete", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// KerbcamClient.inboundVideoStats
+// ---------------------------------------------------------------------------
+
+describe("KerbcamClient.inboundVideoStats", () => {
+  it("returns empty map when disconnected", async () => {
+    const { transport } = makeFakeTransport();
+    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const stats = await client.inboundVideoStats();
+    expect(stats.size).toBe(0);
+  });
+
+  it("returns empty map when the transport has no getStats", async () => {
+    const { transport } = makeFakeTransport();
+    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
+    await client.connect([42]);
+    // makeFakeTransport does not implement getStats, so the peer lacks it.
+    const stats = await client.inboundVideoStats();
+    expect(stats.size).toBe(0);
+  });
+
+  it("returns stats keyed by flightId in legacy mode (trackIdentifier match)", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([42])),
+    );
+
+    await client.connect([42]);
+    sidecar.open();
+    // Deliver a track with a known id so the client records it in flightByTrackId.
+    const fakeTrack = { id: "track-42" } as MediaStreamTrack;
+    sidecar.deliverTrack("0", fakeTrack);
+
+    sidecar.setInboundStats(42, {
+      packetsReceived: 1200,
+      bytesReceived: 500_000,
+      framesDecoded: 360,
+      jitter: 0.002,
+      framesPerSecond: 30,
+    });
+
+    const stats = await client.inboundVideoStats();
+    expect(stats.size).toBe(1);
+    const cam42 = stats.get(42);
+    expect(cam42?.packetsReceived).toBe(1200);
+    expect(cam42?.bytesReceived).toBe(500_000);
+    expect(cam42?.framesDecoded).toBe(360);
+    expect(cam42?.jitter).toBeCloseTo(0.002);
+    expect(cam42?.framesPerSecond).toBe(30);
+  });
+
+  it("returns stats keyed by flightId in dynamic mode (mid match)", async () => {
+    const sidecar = new MockSidecar().withSlots(["a"]);
+    sidecar.addCamera({ flightId: 7 });
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    await client.subscribe(7);
+    // Deliver a track; dynamic mode matches by mid, not trackIdentifier.
+    sidecar.deliverTrack("a", {} as MediaStreamTrack);
+
+    sidecar.setInboundStats(7, {
+      packetsReceived: 800,
+      bytesReceived: 200_000,
+      framesDecoded: 240,
+    });
+
+    const stats = await client.inboundVideoStats();
+    expect(stats.size).toBe(1);
+    const cam7 = stats.get(7);
+    expect(cam7?.packetsReceived).toBe(800);
+    expect(cam7?.framesDecoded).toBe(240);
+    // Fields not set default to 0 or undefined.
+    expect(cam7?.framesPerSecond).toBeUndefined();
+  });
+
+  it("returns empty map after disconnect", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 5 });
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([5])),
+    );
+
+    await client.connect([5]);
+    sidecar.open();
+    sidecar.deliverTrack("0", { id: "track-5" } as MediaStreamTrack);
+    sidecar.setInboundStats(5, { packetsReceived: 100 });
+
+    client.disconnect();
+    const stats = await client.inboundVideoStats();
+    expect(stats.size).toBe(0);
+  });
+});

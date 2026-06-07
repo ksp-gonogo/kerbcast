@@ -11,6 +11,15 @@
 - `KerbcamClientConfig.iceGatheringTimeoutMs` threads the timeout into the default
   transport when no custom transport is provided.
 - `BrowserKerbcamTransportOptions` exported from the package root.
+- `KerbcamPeer.getStats?()` optional method; `BrowserKerbcamTransport` implements
+  it via `RTCPeerConnection.getStats(null)`. Third-party transports and existing
+  mocks keep compiling without changes.
+- `KerbcamClient.inboundVideoStats()` returns a `Map<number, InboundVideoStats>`
+  keyed by flightId. Resolves to an empty map when not connected or when the
+  transport does not implement `getStats`.
+- `InboundVideoStats` type exported from the package root.
+- `MockSidecar.setInboundStats(flightId, partialStats)` configures the stats the
+  fake `getStats()` returns, keyed by track id (legacy mode) or mid (dynamic mode).
 
 ## 0.3.1 — 2026-05-21
 

@@ -1,6 +1,7 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ServerMessage } from "../__generated__/types";
 import { CameraLifecycle, ErrorSource, Layer } from "../__generated__/types";
 import type {
+  InboundVideoStats,
   KerbcamConnectionState,
   KerbcamDataChannel,
   KerbcamPeer,
@@ -105,6 +106,16 @@ export class MockSidecar {
   private _slotMids: string[] = ["0", "1", "2", "3"];
   /** mid -> camera currently bound to that slot. */
   private readonly _slotBindings = new Map<string, number>();
+  /**
+   * Per-flight inbound stats to return from the fake getStats. Set via
+   * {@link setInboundStats}. Keyed by flightId.
+   */
+  private readonly _inboundStats = new Map<number, Partial<InboundVideoStats>>();
+  /**
+   * Tracks delivered by {@link deliverTrack}, keyed by mid/idx string so
+   * getStats can synthesize a trackIdentifier matching what the client saw.
+   */
+  private readonly _deliveredTracks = new Map<string, MediaStreamTrack>();
 
   /** Register a camera that will appear in the `camera-snapshot` sent on `open()`. */
   addCamera(init: MockCameraInit): void {
@@ -148,6 +159,7 @@ export class MockSidecar {
           waitForIceComplete: async () => {},
           localSdp: () => "v=0\r\n",
           close() {},
+          getStats: async () => self._buildStatsReport(),
         };
       },
     };
@@ -232,8 +244,12 @@ export class MockSidecar {
    * arriving over WebRTC. The client routes it to whichever camera is bound
    * to that mid. (jsdom can't make real tracks; pass a stub in unit tests or
    * a `canvas.captureStream()` track in a real-browser harness.)
+   *
+   * The track is remembered so the fake `getStats()` can synthesize a
+   * `trackIdentifier` matching what the client received.
    */
   deliverTrack(mid: string, track: MediaStreamTrack): void {
+    this._deliveredTracks.set(mid, track);
     this._onTrackHandler?.(track, this._trackIdx++, mid);
   }
 
@@ -300,6 +316,82 @@ export class MockSidecar {
     slots?: number;
   }): Promise<{ sdp: string; cameras: number[] }> {
     return Promise.resolve({ sdp: "v=0\r\n", cameras: offer.cameras });
+  }
+
+  /**
+   * Configure the inbound video stats the fake `getStats()` will return for
+   * a given camera. Call before `client.inboundVideoStats()` in tests.
+   *
+   * The mock synthesizes a minimal `RTCStatsReport`-shaped object: one entry
+   * per flight that has stats set, with `type: "inbound-rtp"`, `kind: "video"`,
+   * and either a `trackIdentifier` matching the track delivered for that camera
+   * (legacy path) or a `mid` matching the slot binding (dynamic path), plus
+   * the stat fields from `partialStats`.
+   *
+   * ```ts
+   * sidecar.setInboundStats(42, { packetsReceived: 1000, framesDecoded: 300 });
+   * const stats = await client.inboundVideoStats();
+   * expect(stats.get(42)?.packetsReceived).toBe(1000);
+   * ```
+   */
+  setInboundStats(flightId: number, partialStats: Partial<InboundVideoStats>): void {
+    this._inboundStats.set(flightId, partialStats);
+  }
+
+  /** Build a minimal RTCStatsReport-compatible object for the current state. */
+  private _buildStatsReport(): RTCStatsReport {
+    const entries: [string, RTCStats][] = [];
+
+    for (const [flightId, stats] of this._inboundStats) {
+      const id = `inbound-rtp-${flightId}`;
+
+      // Resolve the identifier: prefer trackIdentifier from the delivered track
+      // (legacy path); fall back to mid from the slot binding (dynamic path).
+      let trackIdentifier: string | undefined;
+      let mid: string | undefined;
+
+      // Check slot bindings (dynamic mode).
+      for (const [slotMid, fid] of this._slotBindings) {
+        if (fid === flightId) {
+          mid = slotMid;
+          const track = this._deliveredTracks.get(slotMid);
+          if (track?.id) trackIdentifier = track.id;
+          break;
+        }
+      }
+
+      // Legacy mode: look for a delivered track whose mid matches the index
+      // position (mids in legacy mode are the slot index strings "0", "1", ...).
+      if (!trackIdentifier && !mid) {
+        for (const [deliveredMid, track] of this._deliveredTracks) {
+          if (track.id) {
+            trackIdentifier = track.id;
+            mid = deliveredMid;
+            break;
+          }
+        }
+      }
+
+      const entry = {
+        id,
+        type: "inbound-rtp" as const,
+        timestamp: Date.now(),
+        kind: "video",
+        trackIdentifier,
+        mid,
+        packetsReceived: stats.packetsReceived ?? 0,
+        bytesReceived: stats.bytesReceived ?? 0,
+        framesReceived: stats.framesReceived,
+        framesDecoded: stats.framesDecoded,
+        jitter: stats.jitter,
+        framesPerSecond: stats.framesPerSecond,
+      };
+      entries.push([id, entry as unknown as RTCStats]);
+    }
+
+    // Build a Map that satisfies the RTCStatsReport interface (iterable + forEach).
+    const map = new Map<string, RTCStats>(entries);
+    return map as unknown as RTCStatsReport;
   }
 
   private _sendToClient(msg: ServerMessage): void {
