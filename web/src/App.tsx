@@ -140,4 +140,6 @@ const MainArea = styled.main`
   flex: 1;
   display: flex;
   flex-direction: column;
+  /* Subtle vignette to ground the tile grid */
+  background: radial-gradient(ellipse at 50% 0%, transparent 60%, rgba(0,0,0,0.06) 100%);
 `;

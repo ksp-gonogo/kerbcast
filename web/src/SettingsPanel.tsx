@@ -51,106 +51,151 @@ export function Settings({
 
   return (
     <Panel ref={panelRef} role="dialog" aria-label="Settings">
-      <PanelTitle>Settings</PanelTitle>
+      <PanelHeader>
+        <PanelTitle>Settings</PanelTitle>
+        <CloseIconButton type="button" onClick={onClose} aria-label="Close settings">
+          <CloseX aria-hidden="true" />
+        </CloseIconButton>
+      </PanelHeader>
 
-      <FieldRow>
-        <label htmlFor="kc-theme-select">Theme</label>
-        <select
-          id="kc-theme-select"
-          value={theme}
-          onChange={(e) => handleTheme(e.target.value as ThemePreference)}
-        >
-          <option value="auto">Auto</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
-      </FieldRow>
+      <Sections>
+        <SectionLabel>Display</SectionLabel>
 
-      <FieldRow>
-        <label htmlFor="kc-debug-toggle">Show debug info</label>
-        <input
-          id="kc-debug-toggle"
-          type="checkbox"
-          checked={debug}
-          onChange={(e) => handleDebug(e.target.checked)}
-        />
-      </FieldRow>
+        <FieldRow>
+          <FieldLabel htmlFor="kc-theme-select">Theme</FieldLabel>
+          <NativeSelect
+            id="kc-theme-select"
+            value={theme}
+            onChange={(e) => handleTheme(e.target.value as ThemePreference)}
+          >
+            <option value="auto">Auto</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </NativeSelect>
+        </FieldRow>
 
-      <CloseButton type="button" onClick={onClose}>
-        Close
-      </CloseButton>
+        <SectionLabel style={{ marginTop: "0.75rem" }}>Developer</SectionLabel>
+
+        <FieldRow>
+          <FieldLabel htmlFor="kc-debug-toggle">Show debug info</FieldLabel>
+          <input
+            id="kc-debug-toggle"
+            type="checkbox"
+            checked={debug}
+            onChange={(e) => handleDebug(e.target.checked)}
+            style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
+          />
+        </FieldRow>
+      </Sections>
     </Panel>
+  );
+}
+
+function CloseX() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+    </svg>
   );
 }
 
 const Panel = styled.div`
   position: absolute;
-  top: 3rem;
+  top: calc(var(--kc-header-h) + 0.5rem);
   right: 1rem;
   z-index: 100;
   background: var(--kc-surface);
   border: 1px solid var(--kc-border);
-  border-radius: 6px;
-  padding: 1rem;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
-  min-width: 220px;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.12);
+  min-width: 240px;
+`;
+
+const PanelHeader = styled.div`
   display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.65rem 0.85rem 0.6rem;
+  border-bottom: 1px solid var(--kc-border);
+  background: var(--kc-surface-raised);
 `;
 
 const PanelTitle = styled.h2`
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 0.75rem;
   font-weight: 600;
-  color: var(--kc-text);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--kc-text-muted);
+`;
+
+const CloseIconButton = styled.button`
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--kc-text-muted);
+  padding: 0.1rem;
+  line-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  transition: color 0.12s ease;
+
+  &:hover {
+    color: var(--kc-text);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--kc-accent);
+    outline-offset: 2px;
+  }
+`;
+
+const Sections = styled.div`
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+`;
+
+const SectionLabel = styled.p`
+  margin: 0 0 0.3rem;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--kc-text-muted);
+  opacity: 0.7;
 `;
 
 const FieldRow = styled.div`
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.75rem;
-  font-size: 0.85rem;
-  color: var(--kc-text);
-
-  select,
-  input[type="checkbox"] {
-    color: var(--kc-text);
-    background: var(--kc-surface-raised);
-    border: 1px solid var(--kc-border);
-    border-radius: 4px;
-    padding: 0.2rem 0.4rem;
-    font-size: 0.85rem;
-    font-family: inherit;
-  }
-
-  input[type="checkbox"] {
-    padding: 0;
-    width: 1rem;
-    height: 1rem;
-    accent-color: var(--kc-accent);
-  }
+  gap: 1rem;
 `;
 
-const CloseButton = styled.button`
-  margin-top: 0.25rem;
-  padding: 0.35rem 0.75rem;
-  background: var(--kc-accent);
-  color: #fff;
-  border: none;
-  border-radius: 4px;
+const FieldLabel = styled.label`
+  font-size: 0.8rem;
+  color: var(--kc-text);
   cursor: pointer;
-  font-size: 0.85rem;
-  font-family: inherit;
-  align-self: flex-end;
+`;
 
-  &:hover {
-    opacity: 0.9;
-  }
+const NativeSelect = styled.select`
+  color: var(--kc-text);
+  background: var(--kc-surface-raised);
+  border: 1px solid var(--kc-border);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  accent-color: var(--kc-accent);
+  cursor: pointer;
 
   &:focus-visible {
     outline: 2px solid var(--kc-accent);
-    outline-offset: 2px;
+    outline-offset: 1px;
   }
 `;

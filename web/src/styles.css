@@ -7,26 +7,39 @@
  *
  * Map the shared CameraFeed accent vars to the kc tokens so overlays
  * inherit the current theme.
+ *
+ * Design: mission-control minimal. Dark-first. Muted warm-near-black ground,
+ * video tiles as the primary element, chrome that recedes. One amber-warm ok
+ * signal, cool blue accent, quiet typography.
  */
 
 :root {
-  --kc-bg: #f8f8f8;
+  /* Light theme */
+  --kc-bg: #f2f1ef;
   --kc-surface: #ffffff;
-  --kc-surface-raised: #f0f0f0;
-  --kc-text: #1a1a1a;
-  --kc-text-muted: #666666;
-  --kc-border: #e0e0e0;
-  --kc-accent: #007aff;
-  --kc-accent-wash: rgba(0, 122, 255, 0.12);
-  --kc-warn: #b8840a;
-  --kc-danger: #d0021b;
-  --kc-ok: #2a7a2a;
+  --kc-surface-raised: #e9e8e5;
+  --kc-text: #1a1918;
+  --kc-text-muted: #6b6965;
+  --kc-border: #d8d6d2;
+  --kc-border-subtle: #eceae7;
+  --kc-accent: #0066e0;
+  --kc-accent-wash: rgba(0, 102, 224, 0.10);
+  --kc-warn: #8a5d00;
+  --kc-warn-bg: rgba(255, 190, 0, 0.12);
+  --kc-danger: #c0001a;
+  --kc-ok: #1a7a3c;
+
+  /* Header sizing */
+  --kc-header-h: 44px;
+
+  /* Tile */
+  --kc-tile-radius: 6px;
 
   /* Forward to shared CameraFeed */
   --kerbcam-accent: var(--kc-accent);
   --kerbcam-accent-wash: var(--kc-accent-wash);
 
-  font-family: -apple-system, system-ui, sans-serif;
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Fira Mono", Menlo, monospace;
   color-scheme: light;
 }
 
@@ -34,50 +47,56 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]),
   html[data-theme="auto"] {
-    --kc-bg: #0e0e0e;
-    --kc-surface: #1c1c1e;
-    --kc-surface-raised: #2c2c2e;
-    --kc-text: #f0f0f0;
-    --kc-text-muted: #8e8e93;
-    --kc-border: #3a3a3c;
-    --kc-accent: #0a84ff;
-    --kc-accent-wash: rgba(10, 132, 255, 0.15);
-    --kc-warn: #ffd60a;
-    --kc-danger: #ff453a;
-    --kc-ok: #30d158;
+    --kc-bg: #111110;
+    --kc-surface: #1c1b19;
+    --kc-surface-raised: #252421;
+    --kc-text: #edecea;
+    --kc-text-muted: #8a887f;
+    --kc-border: #333028;
+    --kc-border-subtle: #252421;
+    --kc-accent: #4d9fff;
+    --kc-accent-wash: rgba(77, 159, 255, 0.13);
+    --kc-warn: #e8ab00;
+    --kc-warn-bg: rgba(232, 171, 0, 0.12);
+    --kc-danger: #ff4535;
+    --kc-ok: #2ec45a;
     color-scheme: dark;
   }
 }
 
 /* Explicit dark */
 html[data-theme="dark"] {
-  --kc-bg: #0e0e0e;
-  --kc-surface: #1c1c1e;
-  --kc-surface-raised: #2c2c2e;
-  --kc-text: #f0f0f0;
-  --kc-text-muted: #8e8e93;
-  --kc-border: #3a3a3c;
-  --kc-accent: #0a84ff;
-  --kc-accent-wash: rgba(10, 132, 255, 0.15);
-  --kc-warn: #ffd60a;
-  --kc-danger: #ff453a;
-  --kc-ok: #30d158;
+  --kc-bg: #111110;
+  --kc-surface: #1c1b19;
+  --kc-surface-raised: #252421;
+  --kc-text: #edecea;
+  --kc-text-muted: #8a887f;
+  --kc-border: #333028;
+  --kc-border-subtle: #252421;
+  --kc-accent: #4d9fff;
+  --kc-accent-wash: rgba(77, 159, 255, 0.13);
+  --kc-warn: #e8ab00;
+  --kc-warn-bg: rgba(232, 171, 0, 0.12);
+  --kc-danger: #ff4535;
+  --kc-ok: #2ec45a;
   color-scheme: dark;
 }
 
 /* Explicit light */
 html[data-theme="light"] {
-  --kc-bg: #f8f8f8;
+  --kc-bg: #f2f1ef;
   --kc-surface: #ffffff;
-  --kc-surface-raised: #f0f0f0;
-  --kc-text: #1a1a1a;
-  --kc-text-muted: #666666;
-  --kc-border: #e0e0e0;
-  --kc-accent: #007aff;
-  --kc-accent-wash: rgba(0, 122, 255, 0.12);
-  --kc-warn: #b8840a;
-  --kc-danger: #d0021b;
-  --kc-ok: #2a7a2a;
+  --kc-surface-raised: #e9e8e5;
+  --kc-text: #1a1918;
+  --kc-text-muted: #6b6965;
+  --kc-border: #d8d6d2;
+  --kc-border-subtle: #eceae7;
+  --kc-accent: #0066e0;
+  --kc-accent-wash: rgba(0, 102, 224, 0.10);
+  --kc-warn: #8a5d00;
+  --kc-warn-bg: rgba(255, 190, 0, 0.12);
+  --kc-danger: #c0001a;
+  --kc-ok: #1a7a3c;
   color-scheme: light;
 }
 
@@ -94,4 +113,12 @@ body {
 
 button {
   font-family: inherit;
+}
+
+/* Reduce motion: disable transitions site-wide */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }
