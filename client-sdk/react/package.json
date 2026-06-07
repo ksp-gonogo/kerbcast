@@ -1,0 +1,67 @@
+{
+  "name": "@jonpepler/kerbcam-react",
+  "version": "0.10.0",
+  "description": "React components and hooks for kerbcam camera feeds.",
+  "license": "CC-BY-NC-SA-4.0",
+  "author": "Jon Pepler",
+  "homepage": "https://github.com/jonpepler/kerbcam#readme",
+  "bugs": {
+    "url": "https://github.com/jonpepler/kerbcam/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jonpepler/kerbcam.git",
+    "directory": "client-sdk/react"
+  },
+  "keywords": [
+    "kerbcam",
+    "ksp",
+    "kerbal-space-program",
+    "webrtc",
+    "react",
+    "camera"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm run build"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://npm.pkg.github.com"
+  },
+  "dependencies": {
+    "@jonpepler/kerbcam": "workspace:^"
+  },
+  "peerDependencies": {
+    "react": "^18 || ^19",
+    "react-dom": "^18 || ^19",
+    "styled-components": "^6"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.0.0",
+    "@types/react": "^18.3.28",
+    "@vitest/coverage-v8": "^4.1.4",
+    "jsdom": "^29.0.2",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "styled-components": "^6.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.4"
+  }
+}
