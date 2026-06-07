@@ -4,16 +4,26 @@ const NOISE_MAX_H = 180;
 export interface NoisePipeline {
   readonly processedStream: MediaStream;
   setIntensity(level: number): void;
+  /**
+   * Swap (or remove) the source video. With a non-null stream the pipeline
+   * composites static over the live frame; with `null` it goes *sourceless*
+   * — `draw()` skips `drawImage` and renders pure static. The output
+   * `processedStream` stays valid across the swap, so consumers never see a
+   * gap.
+   */
+  setSource(stream: MediaStream | null): void;
   destroy(): void;
 }
 
 /**
- * Wraps a raw `MediaStream` in a canvas pipeline that composites
- * digital static over the video. Returns null when `captureStream` is
+ * Wraps a (possibly absent) `MediaStream` in a canvas pipeline that
+ * composites digital static over the video. Pass `null` to run the pipeline
+ * sourceless — it emits pure static until a source is attached via
+ * {@link NoisePipeline.setSource}. Returns null when `captureStream` is
  * unavailable (SSR, test environments without canvas support).
  */
 export function tryCreateNoisePipeline(
-  rawStream: MediaStream,
+  rawStream: MediaStream | null,
   initialIntensity: number,
 ): NoisePipeline | null {
   const canvas = document.createElement("canvas");
@@ -27,7 +37,8 @@ export function tryCreateNoisePipeline(
   if (!noiseCtx || !ctx) return null;
 
   // Size the output canvas to video dimensions once metadata loads.
-  // Until then, use a placeholder so captureStream has something to output.
+  // Until then (and while sourceless), use a placeholder so captureStream
+  // has something to output.
   canvas.width = NOISE_MAX_W;
   canvas.height = NOISE_MAX_H;
   noiseCanvas.width = Math.ceil(NOISE_MAX_W / 2);
@@ -38,7 +49,6 @@ export function tryCreateNoisePipeline(
   let destroyed = false;
 
   const video = document.createElement("video");
-  video.srcObject = rawStream;
   video.muted = true;
   video.playsInline = true;
 
@@ -53,7 +63,25 @@ export function tryCreateNoisePipeline(
     noiseCanvas.height = Math.max(1, Math.round(vh * scale));
   };
   video.addEventListener("loadedmetadata", onMeta);
-  void video.play();
+
+  const setSource = (stream: MediaStream | null) => {
+    if (destroyed) return;
+    if (stream) {
+      video.srcObject = stream;
+      void video.play();
+    } else {
+      // Sourceless: detach the video so draw() composites pure static. Reset
+      // the canvas to the placeholder size so a stale source's dimensions
+      // don't linger.
+      video.pause();
+      video.srcObject = null;
+      canvas.width = NOISE_MAX_W;
+      canvas.height = NOISE_MAX_H;
+      noiseCanvas.width = Math.ceil(NOISE_MAX_W / 2);
+      noiseCanvas.height = Math.ceil(NOISE_MAX_H / 2);
+    }
+  };
+  setSource(rawStream);
 
   const draw = () => {
     if (destroyed) return;
@@ -62,8 +90,16 @@ export function tryCreateNoisePipeline(
     const nw = noiseCanvas.width;
     const nh = noiseCanvas.height;
 
-    if (video.readyState >= 2) {
+    // Only draw the source frame when one is attached and decodable;
+    // otherwise the canvas keeps its prior contents and we composite static
+    // on top — which, sourceless, is the full-static signal-loss look.
+    if (video.srcObject && video.readyState >= 2) {
       ctx.drawImage(video, 0, 0, cw, ch);
+    } else if (!video.srcObject) {
+      // Sourceless: clear to black so static composites over a blank field
+      // rather than the last live frame.
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, cw, ch);
     }
 
     // Build noise at reduced resolution; composited up to full canvas size.
@@ -114,6 +150,7 @@ export function tryCreateNoisePipeline(
     setIntensity(level: number) {
       intensity = level;
     },
+    setSource,
     destroy() {
       destroyed = true;
       if (rafId !== null) cancelAnimationFrame(rafId);

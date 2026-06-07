@@ -8,6 +8,7 @@ import {
   KerbcamClient,
 } from "./client";
 import { MockSidecar } from "./testing";
+import * as noise from "./noise";
 
 interface FakeChannel extends KerbcamDataChannel {
   sent: string[];
@@ -109,6 +110,49 @@ function fakeCameraState(flightId: number, overrides: Record<string, unknown> = 
     targetBitrateBps: 0,
     degradeLevel: 0,
     ...overrides,
+  };
+}
+
+/**
+ * Install a stubbed canvas pipeline so `tryCreateNoisePipeline` succeeds in
+ * jsdom (which has no real `captureStream`). Returns the spies + a `restore`
+ * to call in a `finally`. Each `captureStream()` call yields a fresh
+ * MediaStream identity so a destroy→recreate is observable, while a persistent
+ * pipeline keeps emitting the same one across source swaps.
+ */
+function installNoisePipelineMock() {
+  const captureStream = vi.fn(() => new MediaStream());
+  const fakeCtx = {
+    drawImage: vi.fn(),
+    fillRect: vi.fn(),
+    fillStyle: "",
+    createImageData: vi
+      .fn()
+      .mockReturnValue({ data: new Uint8ClampedArray(4) }),
+    putImageData: vi.fn(),
+  };
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  // @ts-expect-error — jsdom augmentation
+  HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(fakeCtx);
+  // @ts-expect-error — jsdom augmentation
+  HTMLCanvasElement.prototype.captureStream = captureStream;
+  const rafSpy = vi
+    .spyOn(globalThis, "requestAnimationFrame")
+    .mockReturnValue(0);
+  const cancelSpy = vi
+    .spyOn(globalThis, "cancelAnimationFrame")
+    .mockImplementation(() => {});
+  return {
+    captureStream,
+    rafSpy,
+    cancelSpy,
+    restore() {
+      HTMLCanvasElement.prototype.getContext = origGetContext;
+      // @ts-expect-error — cleanup
+      delete HTMLCanvasElement.prototype.captureStream;
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+    },
   };
 }
 
@@ -621,6 +665,236 @@ describe("KerbcamClient", () => {
         // @ts-expect-error — cleanup
         delete HTMLCanvasElement.prototype.captureStream;
         rafSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("sourceless static (signal-loss / switch gap)", () => {
+    it("keeps mediaStream non-null when a destroyed camera's source stops", async () => {
+      const mock = installNoisePipelineMock();
+      try {
+        const sidecar = new MockSidecar();
+        sidecar.addCamera({ flightId: 42 });
+        const client = new KerbcamClient(
+          { host: "h", port: 1 },
+          sidecar.createTransport(),
+        );
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([42])),
+        );
+
+        await client.connect([42]);
+        sidecar.open();
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+
+        const live = client.camera(42).mediaStream;
+        expect(live).not.toBeNull();
+
+        // Destruction sends only camera-state-changed(Destroyed); the track
+        // never ends. The handle must still go to live static, not null.
+        sidecar.destroyCamera(42);
+        expect(client.camera(42).mediaStream).not.toBeNull();
+        // Persistent pipeline → same output stream, never a gap.
+        expect(client.camera(42).mediaStream).toBe(live);
+      } finally {
+        mock.restore();
+      }
+    });
+
+    it("drives static to full intensity on signal loss", async () => {
+      const setIntensity = vi.fn();
+      const setSource = vi.fn();
+      const processedStream = new MediaStream();
+      const createSpy = vi
+        .spyOn(noise, "tryCreateNoisePipeline")
+        .mockReturnValue({
+          processedStream,
+          setIntensity,
+          setSource,
+          destroy: vi.fn(),
+        });
+      try {
+        const sidecar = new MockSidecar();
+        sidecar.addCamera({ flightId: 42, degradeLevel: 0.3 });
+        const client = new KerbcamClient(
+          { host: "h", port: 1 },
+          sidecar.createTransport(),
+        );
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([42])),
+        );
+
+        await client.connect([42]);
+        sidecar.open();
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+
+        // Live feed tracks degrade (0.3), not full.
+        expect(setIntensity).toHaveBeenLastCalledWith(0.3);
+
+        sidecar.destroyCamera(42);
+        // Sourceless → full static, and the source was detached.
+        expect(setSource).toHaveBeenLastCalledWith(null);
+        expect(setIntensity).toHaveBeenLastCalledWith(1.0);
+
+        // A later degrade=0 state update must NOT lower the full static.
+        setIntensity.mockClear();
+        sidecar.updateCamera(42, { degradeLevel: 0 });
+        expect(setIntensity).not.toHaveBeenCalledWith(0.05);
+      } finally {
+        createSpy.mockRestore();
+      }
+    });
+
+    it("restores video when a source returns after loss", async () => {
+      const setSource = vi.fn();
+      const processedStream = new MediaStream();
+      const createSpy = vi
+        .spyOn(noise, "tryCreateNoisePipeline")
+        .mockReturnValue({
+          processedStream,
+          setIntensity: vi.fn(),
+          setSource,
+          destroy: vi.fn(),
+        });
+      try {
+        const sidecar = new MockSidecar().withSlots(["a"]);
+        sidecar.addCamera({ flightId: 1 });
+        const client = new KerbcamClient(
+          { host: "h", port: 1 },
+          sidecar.createTransport(),
+        );
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([])),
+        );
+
+        await client.connect([], { slots: 1 });
+        sidecar.open();
+        await client.subscribe(1);
+        sidecar.deliverTrack("a", {} as MediaStreamTrack);
+
+        // Free the slot → outgoing camera goes sourceless (static).
+        await client.unsubscribe(1);
+        expect(setSource).toHaveBeenLastCalledWith(null);
+        expect(client.camera(1).mediaStream).toBe(processedStream);
+
+        // Resubscribe + new track → source restored on the SAME pipeline.
+        await client.subscribe(1);
+        sidecar.deliverTrack("a", {} as MediaStreamTrack);
+        const last = setSource.mock.calls.at(-1)?.[0];
+        expect(last).not.toBeNull();
+        // Reused the persistent pipeline rather than building a new one.
+        expect(createSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        createSpy.mockRestore();
+      }
+    });
+
+    it("sourceless draw() clears to black and composites static (no drawImage)", () => {
+      const captureStream = vi.fn(() => new MediaStream());
+      const fakeCtx = {
+        drawImage: vi.fn(),
+        fillRect: vi.fn(),
+        fillStyle: "",
+        createImageData: vi
+          .fn()
+          .mockReturnValue({ data: new Uint8ClampedArray(4) }),
+        putImageData: vi.fn(),
+      };
+      const origGetContext = HTMLCanvasElement.prototype.getContext;
+      // @ts-expect-error — jsdom augmentation
+      HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(fakeCtx);
+      // @ts-expect-error — jsdom augmentation
+      HTMLCanvasElement.prototype.captureStream = captureStream;
+      // Run the rAF callback exactly once so draw() executes its sourceless
+      // branch, then stop (return 0, ignore the re-schedule).
+      let ran = false;
+      const rafSpy = vi
+        .spyOn(globalThis, "requestAnimationFrame")
+        .mockImplementation((cb) => {
+          if (!ran) {
+            ran = true;
+            cb(0);
+          }
+          return 0;
+        });
+      try {
+        const pipeline = noise.tryCreateNoisePipeline(null, 1.0);
+        expect(pipeline).not.toBeNull();
+        // No source → never drawImage the (absent) video.
+        expect(fakeCtx.drawImage).toHaveBeenCalledTimes(1); // only the noise canvas
+        // Sourceless branch clears the field to black.
+        expect(fakeCtx.fillRect).toHaveBeenCalledTimes(1);
+        expect(fakeCtx.putImageData).toHaveBeenCalledTimes(1);
+        pipeline?.destroy();
+      } finally {
+        HTMLCanvasElement.prototype.getContext = origGetContext;
+        // @ts-expect-error — cleanup
+        delete HTMLCanvasElement.prototype.captureStream;
+        rafSpy.mockRestore();
+      }
+    });
+
+    it("shows static for a subscribed camera whose track hasn't arrived (switch gap)", async () => {
+      const mock = installNoisePipelineMock();
+      try {
+        const sidecar = new MockSidecar().withSlots(["a"]);
+        sidecar.addCamera({ flightId: 9 });
+        const client = new KerbcamClient(
+          { host: "h", port: 1 },
+          sidecar.createTransport(),
+        );
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([])),
+        );
+
+        await client.connect([], { slots: 1 });
+        sidecar.open();
+
+        // Slot bound (slot-map arrives) but no track yet — the incoming
+        // camera must show live static, not blank.
+        await client.subscribe(9);
+        expect(client.camera(9).mediaStream).not.toBeNull();
+
+        // When the track lands the source is restored on the same pipeline.
+        sidecar.deliverTrack("a", {} as MediaStreamTrack);
+        expect(client.camera(9).mediaStream).not.toBeNull();
+      } finally {
+        mock.restore();
+      }
+    });
+
+    it("teardown (disconnect) destroys the pipeline and nulls the stream", async () => {
+      const destroy = vi.fn();
+      const processedStream = new MediaStream();
+      const createSpy = vi
+        .spyOn(noise, "tryCreateNoisePipeline")
+        .mockReturnValue({
+          processedStream,
+          setIntensity: vi.fn(),
+          setSource: vi.fn(),
+          destroy,
+        });
+      try {
+        const sidecar = new MockSidecar();
+        sidecar.addCamera({ flightId: 42 });
+        const client = new KerbcamClient(
+          { host: "h", port: 1 },
+          sidecar.createTransport(),
+        );
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([42])),
+        );
+
+        await client.connect([42]);
+        sidecar.open();
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+        expect(client.camera(42).mediaStream).toBe(processedStream);
+
+        client.disconnect();
+        expect(destroy).toHaveBeenCalledTimes(1);
+        expect(client.camera(42).mediaStream).toBeNull();
+      } finally {
+        createSpy.mockRestore();
       }
     });
   });
