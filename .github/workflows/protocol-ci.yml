@@ -13,12 +13,18 @@ on:
       - 'sidecar/src/protocol/**'
       - 'sidecar/Cargo.toml'
       - 'client-sdk/typescript/**'
+      - 'client-sdk/react/**'
+      - 'pnpm-workspace.yaml'
+      - 'pnpm-lock.yaml'
       - '.github/workflows/protocol-ci.yml'
   pull_request:
     paths:
       - 'sidecar/src/protocol/**'
       - 'sidecar/Cargo.toml'
       - 'client-sdk/typescript/**'
+      - 'client-sdk/react/**'
+      - 'pnpm-workspace.yaml'
+      - 'pnpm-lock.yaml'
       - '.github/workflows/protocol-ci.yml'
   workflow_dispatch: {}
 
@@ -27,7 +33,7 @@ permissions:
 
 jobs:
   drift-check:
-    name: typeshare regen + tsc build
+    name: typeshare regen + tsc build + tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -66,13 +72,13 @@ jobs:
           git diff --staged --quiet || git commit -m "chore: regenerate typeshare bindings [skip ci]"
           git push
 
-      - name: Verify version sync (Cargo.toml == package.json)
+      - name: Verify version sync (Cargo.toml == typescript package.json)
         run: |
           PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
           CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           echo "cargo=$CARGO_VER package=$PKG_VER"
           if [ "$CARGO_VER" != "$PKG_VER" ]; then
-            echo "::error::version mismatch — Cargo.toml ($CARGO_VER) vs package.json ($PKG_VER). Run ./scripts/bump-version.sh."
+            echo "::error::version mismatch: Cargo.toml ($CARGO_VER) vs package.json ($PKG_VER). Run ./scripts/bump-version.sh."
             exit 1
           fi
 
@@ -86,13 +92,16 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: client-sdk/typescript/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
-      - name: Install + build TypeScript package
-        working-directory: client-sdk/typescript
-        run: |
-          pnpm install --no-frozen-lockfile
-          pnpm run build
+      - name: Install workspace dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm -r build
+
+      - name: Test all packages
+        run: pnpm -r test
 
       - name: Upload built TS dist as dev artefact
         uses: actions/upload-artifact@v7
