@@ -879,10 +879,17 @@ const TopMeta = styled.div`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
-// Panel inline replacement: a flex column with a dark background and a border.
+/*
+ * Outer frame. Fills the host container: the video is absolutely
+ * positioned, so without explicit width/height the Stage collapses
+ * to zero height.
+ */
 const Panel = styled.div`
   display: flex;
   flex-direction: column;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
   background: #111;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 4px;

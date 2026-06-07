@@ -104,8 +104,10 @@ export async function createMockClient(): Promise<KerbcamClient> {
     sidecar.addCamera(cam);
   }
 
-  // Canvas tracks are built once per camera and reused across reconnects;
-  // the canvases keep animating regardless of connection state.
+  /*
+   * Canvas tracks are built once per camera and reused across reconnects;
+   * the canvases keep animating regardless of connection state.
+   */
   const tracks = new Map<number, MediaStreamTrack>();
   const deliverTracks = () => {
     let slotIdx = 0;
@@ -132,8 +134,10 @@ export async function createMockClient(): Promise<KerbcamClient> {
       port: 0,
       negotiate: async (offer) => {
         const answer = await sidecar.negotiate(offer);
-        // Finish the sidecar's half once connect() has applied the answer:
-        // open the control channel, report connected, hand over tracks.
+        /*
+         * Finish the sidecar's half once connect() has applied the answer:
+         * open the control channel, report connected, hand over tracks.
+         */
         setTimeout(() => {
           sidecar.open();
           sidecar.setConnectionState("connected");

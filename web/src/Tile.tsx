@@ -22,9 +22,11 @@ export function Tile({
   onSelectCamera,
   onRemove,
 }: TileProps): React.JSX.Element {
-  // Corner label: the camera's name once one is bound; the tile number is
-  // only a placeholder while nothing is selected. CameraFeed's own title
-  // chrome is hover-revealed, so this is the at-a-glance identifier.
+  /*
+   * Corner label: the camera's name once one is bound, the tile number
+   * until then. The feed's own title chrome is hover-revealed, so this
+   * is the at-a-glance identifier.
+   */
   const cameras = useKerbcamCameras();
   const label = useMemo(() => {
     const cam = cameras.find((c) => c.flightId === flightId);

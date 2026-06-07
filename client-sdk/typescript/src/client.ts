@@ -959,8 +959,10 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
         this.emit("error", msg.content);
         break;
       case "ping":
-        // A ping can race a closing channel (disconnect mid-flight); a
-        // pong that can't be delivered is moot, not an error.
+        /*
+         * A ping can race a closing channel (disconnect mid-flight); a
+         * pong that can't be delivered is moot, not an error.
+         */
         void this._send({ type: "pong" }).catch(() => {});
         this.emit("ping", undefined);
         break;
