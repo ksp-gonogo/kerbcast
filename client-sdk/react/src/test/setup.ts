@@ -1,2 +1,3 @@
-// Test setup for @jonpepler/kerbcam-react.
-// DOM stubs (installDomStubs) are wired here in commit feat(sdk): DOM stubs.
+import { installDomStubs } from "@jonpepler/kerbcam/testing";
+
+installDomStubs();

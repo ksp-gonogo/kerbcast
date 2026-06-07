@@ -495,3 +495,116 @@ export class MockSidecar {
     }
   }
 }
+
+/**
+ * Install jsdom shims needed by kerbcam component tests.
+ *
+ * jsdom omits several browser APIs that the SDK and React components call at
+ * construction or mount time. Stubbing here keeps individual tests clean.
+ * Each shim is idempotent so setup files can call `installDomStubs()`
+ * unconditionally.
+ *
+ * Stubs installed:
+ *   ResizeObserver   - jsdom does not implement it; CameraFeed uses it to
+ *                      drive auto render-size updates.
+ *   captureStream    - jsdom's HTMLCanvasElement lacks captureStream; the
+ *                      noise pipeline calls it to get its output MediaStream.
+ *                      Returns a stub MediaStream so callers receive a valid
+ *                      object rather than throwing.
+ *   MediaStream      - jsdom's MediaStream constructor is incomplete; tests
+ *                      need to construct instances for track delivery and
+ *                      stream assertions.
+ *   play             - jsdom prints "Not implemented" for HTMLMediaElement.play;
+ *                      the noise pipeline awaits it on the internal video element.
+ *   matchMedia       - jsdom does not implement window.matchMedia; theme
+ *                      detection reads prefers-color-scheme through it.
+ */
+export function installDomStubs(): void {
+  // ResizeObserver: jsdom omits entirely; CameraFeed's auto-size hook needs it.
+  if (typeof globalThis.ResizeObserver === "undefined") {
+    globalThis.ResizeObserver = class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+  }
+
+  // captureStream: jsdom's HTMLCanvasElement does not have it; the noise
+  // pipeline's tryCreateNoisePipeline checks for it and returns null when
+  // absent (safe degrade), but component tests that exercise the stream
+  // path directly need a stub that returns a constructible MediaStream.
+  if (
+    typeof HTMLCanvasElement !== "undefined" &&
+    typeof (HTMLCanvasElement.prototype as { captureStream?: unknown }).captureStream !== "function"
+  ) {
+    (HTMLCanvasElement.prototype as { captureStream: (fps?: number) => MediaStream }).captureStream =
+      (_fps?: number): MediaStream => new StubMediaStream() as unknown as MediaStream;
+  }
+
+  // MediaStream: jsdom's implementation is minimal and not always constructible
+  // with tracks. Provide a stub that satisfies the basic interface used by
+  // tests (getTracks, addTrack, id).
+  installStubMediaStream();
+
+  // play: jsdom's HTMLMediaElement.play is not implemented and prints a warning.
+  // The noise pipeline awaits video.play() on its internal video element.
+  if (typeof HTMLMediaElement !== "undefined") {
+    HTMLMediaElement.prototype.play = (): Promise<void> => Promise.resolve();
+  }
+
+  // matchMedia: jsdom does not implement window.matchMedia; theme detection
+  // queries prefers-color-scheme through it. Stub returns a non-matching
+  // MediaQueryList so tests default to the light theme unless overridden.
+  if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
+    window.matchMedia = (query: string): MediaQueryList => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener() {},
+      removeListener() {},
+      addEventListener() {},
+      removeEventListener() {},
+      dispatchEvent: () => false,
+    } as MediaQueryList);
+  }
+}
+
+/** Minimal MediaStream stand-in for jsdom environments. */
+class StubMediaStream {
+  readonly id: string = Math.random().toString(36).slice(2);
+  private readonly _tracks: MediaStreamTrack[] = [];
+
+  getTracks(): MediaStreamTrack[] {
+    return [...this._tracks];
+  }
+  getVideoTracks(): MediaStreamTrack[] {
+    return this._tracks.filter((t) => t.kind === "video");
+  }
+  getAudioTracks(): MediaStreamTrack[] {
+    return this._tracks.filter((t) => t.kind === "audio");
+  }
+  addTrack(track: MediaStreamTrack): void {
+    this._tracks.push(track);
+  }
+  removeTrack(track: MediaStreamTrack): void {
+    const i = this._tracks.indexOf(track);
+    if (i !== -1) this._tracks.splice(i, 1);
+  }
+  clone(): StubMediaStream {
+    return new StubMediaStream();
+  }
+}
+
+function installStubMediaStream(): void {
+  if (typeof globalThis === "undefined") return;
+  // Only replace if the native MediaStream is not constructible (jsdom
+  // registers the class but its constructor requires active getUserMedia
+  // permissions that are never granted in a test environment).
+  try {
+    const ms = new globalThis.MediaStream();
+    if (typeof ms.getTracks === "function") return; // native is adequate
+  } catch {
+    // Fall through to install the stub.
+  }
+  (globalThis as unknown as { MediaStream: unknown }).MediaStream = StubMediaStream;
+}
