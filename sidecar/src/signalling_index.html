@@ -91,6 +91,41 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let userDisconnected = false;
 
+// LAN-first ICE: on the Steam Deck's IPv6 LAN, public STUN (e.g. Google's)
+// is unreachable and stalls ICE for 1–2 min. The Rust answerer uses no STUN
+// (host candidates only), so we mirror that here: start STUN-less with empty
+// iceServers, and only escalate to relay TURN after a genuine connection
+// failure. Sticky for the rest of the session until the user disconnects.
+let turnEscalated = false;
+const ICE_CONFIG_TIMEOUT_MS = 4000;
+
+// Fail-soft fetch of relay TURN creds from the sidecar's /ice-config.
+// Returns the iceServers array on 200, or [] on any failure/timeout/non-200
+// (including 404 — the sidecar may not implement the endpoint yet, in which
+// case host-candidate-only is the correct LAN path). Never throws.
+async function fetchIceServers() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ICE_CONFIG_TIMEOUT_MS);
+  try {
+    const res = await fetch("/ice-config", { signal: controller.signal });
+    if (!res.ok) {
+      console.warn(`kerbcam: /ice-config returned ${res.status} — host candidates only`);
+      return [];
+    }
+    const body = await res.json();
+    if (!Array.isArray(body.iceServers)) {
+      console.warn("kerbcam: /ice-config response missing iceServers — host candidates only");
+      return [];
+    }
+    return body.iceServers;
+  } catch (e) {
+    console.warn(`kerbcam: /ice-config fetch failed — host candidates only (${e?.message ?? e})`);
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function resetPingTimer() {
   if (pingTimer) clearTimeout(pingTimer);
   pingTimer = setTimeout(() => {
@@ -223,7 +258,7 @@ function renderTable() {
       ? ` <span style="color:red;font-size:10px;font-family:ui-monospace,monospace">[SIGNAL LOST]</span>`
       : "";
     nameTd.innerHTML = `
-      <div class="name">${escapeHtml(cam.cameraName || cam.partTitle || cam.partName || "(no label)")}${destroyedBadge}</div>
+      <div class="name">${escapeHtml(cameraLabel(cam))}${destroyedBadge}</div>
       <div class="vessel">${escapeHtml(cam.vesselName || "")} · ${cam.maxWidth}×${cam.maxHeight}</div>
       <div class="id">flight_id ${cam.flightId}</div>`;
     tr.appendChild(nameTd);
@@ -465,6 +500,17 @@ function renderTable() {
   }
 }
 
+// Display label for a camera. Hullcam names every docking-port camera
+// "NavCam" (same as the dedicated NavCam part), so cameraName alone can't
+// tell a docking cam apart. Append the distinct partTitle when it differs
+// (e.g. "NavCam — Clamp-O-Tron Docking Port Jr.") so colliding cameras are
+// recognisable.
+function cameraLabel(cam) {
+  const name = cam?.cameraName || cam?.partTitle || cam?.partName || "(no label)";
+  const title = cam?.partTitle;
+  return title && title !== name ? `${name} — ${title}` : name;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
@@ -528,6 +574,9 @@ $("selectAllCb").addEventListener("change", () => {
 });
 $("disconnectBtn").addEventListener("click", () => {
   userDisconnected = true;
+  // Explicit disconnect resets the escalation ladder: the next manual
+  // connect starts LAN-first (host candidates only) again.
+  turnEscalated = false;
   cancelReconnect();
   disconnect();
 });
@@ -539,7 +588,10 @@ async function connect() {
   const selected = [...included];
   setStatus(`creating peer connection for ${selected.length} camera(s)`);
 
-  pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  // LAN-first: host candidates only by default; fetch relay TURN creds
+  // only after a prior connection failure escalated us (see turnEscalated).
+  const iceServers = turnEscalated ? await fetchIceServers() : [];
+  pc = new RTCPeerConnection({ iceServers });
 
   for (const _ of selected) pc.addTransceiver("video", { direction: "recvonly" });
 
@@ -584,7 +636,7 @@ async function connect() {
 
     const fig = document.createElement("figure");
     const cap = document.createElement("figcaption");
-    cap.innerHTML = `<span>${escapeHtml(cam?.cameraName || cam?.partTitle || cam?.partName || "?")}</span><span>flight ${flightId}</span>`;
+    cap.innerHTML = `<span>${escapeHtml(cameraLabel(cam))}</span><span>flight ${flightId}</span>`;
     const v = document.createElement("video");
     v.autoplay = true; v.playsInline = true; v.controls = true; v.muted = true;
     const ms = new MediaStream();
@@ -610,6 +662,9 @@ async function connect() {
     if (pc.connectionState === "connected") {
       reconnectAttempts = 0;
     } else if (["failed", "closed"].includes(pc.connectionState)) {
+      // Genuine connection failure — escalate so the next backoff attempt
+      // gathers relay TURN candidates instead of host-only.
+      turnEscalated = true;
       disconnect();
       scheduleReconnect();
     }
@@ -629,7 +684,7 @@ async function connect() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sdp: pc.localDescription.sdp, cameras: selected }),
   });
-  if (!res.ok) { setStatus(`offer failed: ${res.status}`, "red"); disconnect(); return; }
+  if (!res.ok) { setStatus(`offer failed: ${res.status}`, "red"); turnEscalated = true; disconnect(); scheduleReconnect(); return; }
   const { sdp: answerSdp, cameras: subscribed } = await res.json();
   await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
   setStatus(`subscribed to ${subscribed.length}: ${subscribed.join(", ")}`, "green");
