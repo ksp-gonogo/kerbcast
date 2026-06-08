@@ -91,15 +91,31 @@ jobs:
           sed -i "0,/^version = \"${CURRENT}\"/{s/version = \"${CURRENT}\"/version = \"${NEW}\"/}" \
             sidecar/Cargo.toml
 
-          node -e "
-            const fs = require('fs');
-            const p = JSON.parse(fs.readFileSync('client-sdk/typescript/package.json', 'utf8'));
-            p.version = process.argv[1];
-            fs.writeFileSync('client-sdk/typescript/package.json', JSON.stringify(p, null, 2) + '\n');
-          " "$NEW"
+          for pkg in client-sdk/typescript client-sdk/react; do
+            node -e "
+              const fs = require('fs');
+              const file = process.argv[2] + '/package.json';
+              const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+              p.version = process.argv[1];
+              fs.writeFileSync(file, JSON.stringify(p, null, 2) + '\n');
+            " "$NEW" "$pkg"
+          done
+
+          # Keep Cargo.lock's own entry in step so the next cargo command
+          # doesn't dirty the tree. Only the kerbcam-sidecar package line.
+          python3 - "$CURRENT" "$NEW" <<'EOF'
+          import sys
+          cur, new = sys.argv[1], sys.argv[2]
+          path = "sidecar/Cargo.lock"
+          s = open(path).read()
+          needle = 'name = "kerbcam-sidecar"\nversion = "%s"' % cur
+          assert needle in s, "kerbcam-sidecar %s not found in Cargo.lock" % cur
+          open(path, "w").write(s.replace(needle, 'name = "kerbcam-sidecar"\nversion = "%s"' % new))
+          EOF
 
           echo "Cargo.toml: $(grep -m1 '^version' sidecar/Cargo.toml)"
-          echo "package.json: $(node -p "require('./client-sdk/typescript/package.json').version")"
+          echo "typescript: $(node -p "require('./client-sdk/typescript/package.json').version")"
+          echo "react: $(node -p "require('./client-sdk/react/package.json').version")"
 
       - name: Commit, tag, push
         run: |
@@ -108,7 +124,9 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sidecar/Cargo.toml client-sdk/typescript/package.json
+          git add sidecar/Cargo.toml sidecar/Cargo.lock \
+                  client-sdk/typescript/package.json \
+                  client-sdk/react/package.json
           git commit -m "release: v${NEW}"
           git tag "${TAG}"
           git push origin HEAD:main "${TAG}"
