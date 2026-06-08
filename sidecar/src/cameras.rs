@@ -863,8 +863,10 @@ impl CameraRegistry {
             delta.adaptive_shed = Some((parsed.shed_level, parsed.ksp_fps));
         }
 
-        // Throttle-state changes are global — emit a SettingsState whenever
-        // the reported effective value moves (or on first poll: `last` is None).
+        /*
+         * Throttle state is global: emit a SettingsState whenever the reported
+         * effective value moves (or on first poll, when `last` is None).
+         */
         if last
             .as_ref()
             .map(|s| s.throttle_main_screen != parsed.throttle_main_screen)
