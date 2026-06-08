@@ -131,13 +131,20 @@ function CameraSeeder({ tilesSeeded, onSeed }: CameraSeederProps): null {
 const PageShell = styled.div`
   display: flex;
   flex-direction: column;
-  min-height: 100dvh;
+  /* A definite height (not just min-height) so flex children further down --
+     notably the spotlight Stage -- get a bounded height to size against.
+     Without it, the spotlit feed's aspect-ratio height resolves against an
+     indefinite parent and grows past the viewport. */
+  height: 100dvh;
   background: var(--kc-bg);
   position: relative;
 `;
 
 const MainArea = styled.main`
   flex: 1;
+  min-height: 0;
+  /* The tile area scrolls internally; the header/banner stay put above it. */
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   /* Subtle vignette to ground the tile grid */

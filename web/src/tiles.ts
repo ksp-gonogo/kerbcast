@@ -2,7 +2,8 @@
  * Tile grid persistence via localStorage.
  *
  * A tile is a slot in the camera grid. Each tile holds the flightId of the
- * camera it shows (or null for an unpointed slot).
+ * camera it shows (or null for an unpointed slot) and whether it is
+ * "spotlit" -- pinned into the enlarged spotlight stage (see Grid).
  *
  * The localStorage key is intentionally minimal -- one per page origin.
  * The key distinguishes "absent" (never set) from "empty array" (user removed
@@ -11,6 +12,7 @@
 
 export interface Tile {
   flightId: number | null;
+  spotlit: boolean;
 }
 
 const STORAGE_KEY = "kerbcam:tiles";
@@ -28,6 +30,8 @@ export function loadTiles(): Tile[] | null {
         typeof (item as { flightId?: unknown }).flightId === "number"
           ? (item as { flightId: number }).flightId
           : null,
+      // Older stored tiles predate spotlight; default to not spotlit.
+      spotlit: (item as { spotlit?: unknown }).spotlit === true,
     }));
   } catch {
     return null;
@@ -49,13 +53,13 @@ export function saveTiles(tiles: Tile[]): void {
  * Caps at 4 cameras.
  */
 export function seedTiles(flightIds: number[]): Tile[] {
-  return flightIds.slice(0, 4).map((flightId) => ({ flightId }));
+  return flightIds.slice(0, 4).map((flightId) => ({ flightId, spotlit: false }));
 }
 
 /** Add a new empty tile (returns tiles unchanged if already at max). */
 export function addTile(tiles: Tile[]): Tile[] {
   if (tiles.length >= MAX_TILES) return tiles;
-  return [...tiles, { flightId: null }];
+  return [...tiles, { flightId: null, spotlit: false }];
 }
 
 /** Remove a tile by index. */
@@ -63,13 +67,18 @@ export function removeTile(tiles: Tile[], index: number): Tile[] {
   return tiles.filter((_, i) => i !== index);
 }
 
-/** Update the flightId of a tile at an index. */
+/** Update the flightId of a tile at an index (preserves spotlight state). */
 export function updateTile(
   tiles: Tile[],
   index: number,
   flightId: number | null,
 ): Tile[] {
-  return tiles.map((t, i) => (i === index ? { flightId } : t));
+  return tiles.map((t, i) => (i === index ? { ...t, flightId } : t));
+}
+
+/** Toggle whether the tile at an index is spotlit. */
+export function toggleSpotlight(tiles: Tile[], index: number): Tile[] {
+  return tiles.map((t, i) => (i === index ? { ...t, spotlit: !t.spotlit } : t));
 }
 
 export { MAX_TILES };

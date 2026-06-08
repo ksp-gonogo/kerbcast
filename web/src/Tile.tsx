@@ -3,24 +3,42 @@ import {
   CameraFeed,
   useKerbcamCameras,
 } from "@jonpepler/kerbcam-react";
-import { Plus, X } from "lucide-react";
+import type { FeedAction } from "@jonpepler/kerbcam-react";
+import { Pin, PinOff, Plus, X } from "lucide-react";
 import { useMemo } from "react";
 import styled from "styled-components";
+
+/**
+ * How the tile is sized by its container:
+ *  - "grid": fills its grid column at 16:9 (the default flat grid).
+ *  - "cell": fills whatever grid cell it's placed in (spotlight mode). The
+ *    feed letterboxes inside via object-fit, so the cell need not be 16:9.
+ */
+export type TileVariant = "grid" | "cell";
 
 interface TileProps {
   flightId: number | null;
   index: number;
   showDebugInfo: boolean;
+  spotlit: boolean;
+  variant?: TileVariant;
+  /** True when any tile is spotlit (drives spotlight grid placement). */
+  spotlightActive?: boolean;
   onSelectCamera: (flightId: number) => void;
   onRemove: () => void;
+  onToggleSpotlight: () => void;
 }
 
 export function Tile({
   flightId,
   index,
   showDebugInfo,
+  spotlit,
+  variant = "grid",
+  spotlightActive = false,
   onSelectCamera,
   onRemove,
+  onToggleSpotlight,
 }: TileProps): React.JSX.Element {
   /*
    * Corner label: the camera's name once one is bound, the tile number
@@ -32,24 +50,52 @@ export function Tile({
     const cam = cameras.find((c) => c.flightId === flightId);
     return cam ? buildCameraLabeler(cameras)(cam) : `Tile ${index + 1}`;
   }, [cameras, flightId, index]);
+
+  /*
+   * Tile-level controls injected into the feed's action bar, so there's a
+   * single tidy cluster rather than a separate floating close button that
+   * collides with it. Spotlight only makes sense once a camera is bound.
+   */
+  const actions = useMemo<FeedAction[]>(() => {
+    if (flightId === null) return [];
+    return [
+      {
+        id: "spotlight",
+        label: spotlit ? "Remove from spotlight" : "Spotlight this feed",
+        active: spotlit,
+        icon: spotlit ? <PinOff size={14} /> : <Pin size={14} />,
+        onClick: onToggleSpotlight,
+      },
+    ];
+  }, [flightId, spotlit, onToggleSpotlight]);
+
+  // Remove sits at the far corner (after the built-in fullscreen/PiP controls).
+  const trailingActions = useMemo<FeedAction[]>(
+    () => [
+      {
+        id: "remove",
+        label: `Remove tile ${index + 1}`,
+        icon: <X size={14} />,
+        onClick: onRemove,
+      },
+    ],
+    [index, onRemove],
+  );
+
   return (
-    <TileRoot>
+    <TileRoot $variant={variant} $spotlit={spotlit} $spotlightActive={spotlightActive}>
       <FeedWrap>
         <CameraFeed
           flightId={flightId}
           showDebugInfo={showDebugInfo}
           onSelectCamera={onSelectCamera}
+          enableFullscreen
+          enablePictureInPicture
+          actions={actions}
+          trailingActions={trailingActions}
         />
       </FeedWrap>
       <TileCornerLabel>{label}</TileCornerLabel>
-      <RemoveButton
-        type="button"
-        aria-label={`Remove tile ${index + 1}`}
-        onClick={onRemove}
-        title={`Remove tile ${index + 1}`}
-      >
-        <X size={11} strokeWidth={1.75} aria-hidden="true" />
-      </RemoveButton>
     </TileRoot>
   );
 }
@@ -57,20 +103,26 @@ export function Tile({
 interface AddTileProps {
   onClick: () => void;
   isEmpty?: boolean;
+  /** Spotlight mode: render as a small 1x1 grid cell rather than a 16:9 tile. */
+  compact?: boolean;
+  /** Flat fill mode: a slim full-width bar below the feeds. */
+  bar?: boolean;
 }
 
-export function AddTile({ onClick, isEmpty }: AddTileProps): React.JSX.Element {
+export function AddTile({ onClick, isEmpty, compact, bar }: AddTileProps): React.JSX.Element {
   return (
     <AddRoot
       type="button"
       aria-label="Add tile"
       onClick={onClick}
       $isEmpty={isEmpty ?? false}
+      $compact={compact ?? false}
+      $bar={bar ?? false}
     >
       <AddIcon aria-hidden="true">
         <Plus size={20} strokeWidth={1.5} />
       </AddIcon>
-      {isEmpty && <AddLabel>Add camera</AddLabel>}
+      {(isEmpty || bar) && <AddLabel>Add camera</AddLabel>}
     </AddRoot>
   );
 }
@@ -79,7 +131,13 @@ export function AddTile({ onClick, isEmpty }: AddTileProps): React.JSX.Element {
 // Styled
 // ---------------------------------------------------------------------------
 
-const TileRoot = styled.div`
+interface TileRootProps {
+  $variant: TileVariant;
+  $spotlit: boolean;
+  $spotlightActive: boolean;
+}
+
+const TileRoot = styled.div<TileRootProps>`
   position: relative;
   display: flex;
   flex-direction: column;
@@ -87,10 +145,47 @@ const TileRoot = styled.div`
   border: 1px solid var(--kc-border);
   border-radius: var(--kc-tile-radius);
   overflow: hidden;
-  aspect-ratio: 16 / 9;
 
   /* Subtle inner shadow to give depth without distraction */
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+
+  ${(p) =>
+    p.$variant === "grid"
+      ? `
+    /* --tile-w is set by Grid in fill mode (the grid is sized to the
+       viewport); without it the tile just fills its column. aspect-ratio
+       derives the height either way, and the max-* guards keep a stale
+       measurement from overflowing. */
+    width: var(--tile-w, 100%);
+    max-width: 100%;
+    max-height: 100%;
+    aspect-ratio: 16 / 9;
+  `
+      : `
+    /* Fill the grid cell; the feed letterboxes inside (object-fit: contain),
+       so a non-16:9 cell just adds bars rather than stretching the video. */
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  `}
+
+  ${(p) =>
+    p.$spotlightActive &&
+    (p.$spotlit
+      ? `
+    /* Spotlit feeds enlarge and sort ahead of the rest. */
+    grid-column: span 2;
+    grid-row: span 2;
+    order: 0;
+  `
+      : `order: 1;`)}
+
+  ${(p) =>
+    p.$spotlit &&
+    `
+    border-color: var(--kc-accent);
+    box-shadow: 0 0 0 1px var(--kc-accent), 0 2px 8px rgba(0, 0, 0, 0.3);
+  `}
 `;
 
 /* Label: bottom-left corner, barely visible; fades out on hover because the
@@ -117,47 +212,6 @@ const TileCornerLabel = styled.span`
   }
 `;
 
-const RemoveButton = styled.button`
-  position: absolute;
-  top: 0.4rem;
-  right: 0.4rem;
-  z-index: 3;
-  width: 22px;
-  height: 22px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 4px;
-  cursor: pointer;
-  color: rgba(255, 255, 255, 0.6);
-  padding: 0;
-  opacity: 0;
-  transition: opacity 0.15s ease, color 0.15s ease, background 0.15s ease;
-  backdrop-filter: blur(4px);
-
-  ${TileRoot}:hover & {
-    opacity: 1;
-  }
-
-  &:hover {
-    color: #fff;
-    background: var(--kc-danger-bg);
-    border-color: rgba(255, 255, 255, 0.25);
-  }
-
-  &:focus-visible {
-    opacity: 1;
-    outline: 2px solid var(--kc-accent);
-    outline-offset: 2px;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    opacity: 1;
-  }
-`;
-
 const FeedWrap = styled.div`
   flex: 1;
   min-height: 0;
@@ -170,7 +224,7 @@ const FeedWrap = styled.div`
   }
 
   /* The feed's Next/Previous step buttons land exactly where the tile's
-     remove button sits, and the title menu already covers camera selection
+     action cluster sits, and the title menu already covers camera selection
      on this page, so suppress them here. */
   & button[aria-label="Next camera"],
   & button[aria-label="Previous camera"] {
@@ -180,6 +234,8 @@ const FeedWrap = styled.div`
 
 interface AddRootProps {
   $isEmpty: boolean;
+  $compact: boolean;
+  $bar: boolean;
 }
 
 const AddRoot = styled.button<AddRootProps>`
@@ -202,6 +258,25 @@ const AddRoot = styled.button<AddRootProps>`
     aspect-ratio: unset;
     min-height: 80px;
     max-height: 100px;
+  `}
+
+  ${(p) => p.$compact && `
+    /* Spotlight mode: fill a 1x1 grid cell, sorted after the feeds. */
+    aspect-ratio: unset;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    order: 1;
+  `}
+
+  ${(p) => p.$bar && `
+    /* Flat fill mode: a slim full-width bar below the feeds. */
+    grid-column: 1 / -1;
+    flex-direction: row;
+    aspect-ratio: unset;
+    min-height: 0;
+    height: 52px;
+    gap: 0.4rem;
   `}
 
   &:hover {
