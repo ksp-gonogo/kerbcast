@@ -99,14 +99,15 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: "@jonpepler"
 
-      - name: Verify version sync (tag == Cargo.toml == all package.json files)
+      - name: Verify version sync (tag == Cargo.toml == package.json == Kerbcam.version)
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
           PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
           REACT_VER="$(node -p "require('./client-sdk/react/package.json').version")"
           CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER"
-          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ]; then
+          AVC_VER="$(python3 -c "import json; v=json.load(open('GameData/Kerbcam/Kerbcam.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER avc=$AVC_VER"
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$REACT_VER" != "$AVC_VER" ]; then
             echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
             exit 1
           fi
@@ -366,7 +367,7 @@ jobs:
             -buildTarget Linux64 \
             -logFile -
 
-      - name: Assemble GameData/KerbCam
+      - name: Assemble GameData/Kerbcam
         run: |
           set -euo pipefail
           mkdir -p \
@@ -381,36 +382,34 @@ jobs:
           # in Plugin/Kerbcam/KerbcamCore.cs. Each artifact dir already holds
           # the staged contents, so a plain recursive copy reproduces the tree.
           #
-          # Tier policy: linux-x64 is tier-1 and a missing artifact is a hard
-          # failure — we never ship a release without it. osx-arm64/win-x64 are
-          # tier-2 (community-contributable, not release-quality), so a flaky
-          # mac/win build warns and omits that rid rather than blocking the
-          # tier-1 release. Users on the omitted OS fall back to launching the
-          # sidecar manually, exactly as before this per-OS work landed.
+          # Every supported rid must be present — kerbcam ships for all OSes or
+          # not at all. A failed sidecar build already blocks this job (bundle
+          # needs build-sidecar), so a missing artifact here means a build
+          # succeeded but produced nothing; refuse to cut a partial release.
           for rid in linux-x64 osx-arm64 win-x64; do
             src="sidecar-artifacts/kerbcam-sidecar-${rid}"
             if [ ! -d "$src" ]; then
-              if [ "$rid" = "linux-x64" ]; then
-                echo "::error::missing tier-1 linux-x64 sidecar artifact — refusing to cut a release without it"
-                exit 1
-              fi
-              echo "::warning::missing tier-2 ${rid} sidecar artifact; release ships without it (manual launch still works on ${rid})"
-              continue
+              echo "::error::missing ${rid} sidecar artifact — refusing to cut a release that omits an OS"
+              exit 1
             fi
             mkdir -p "GameData/Kerbcam/Sidecar/${rid}"
             cp -R "$src"/. "GameData/Kerbcam/Sidecar/${rid}/"
           done
           # Executable bits don't survive the artifact zip round-trip; restore
-          # them so the plugin can ProcessStartInfo the binaries directly.
-          # Guarded so an omitted tier-2 rid doesn't make chmod fail the job.
+          # them so the plugin can ProcessStartInfo the binaries directly. Both
+          # are guaranteed present by the loop above (Windows .exe needs no bit).
           chmod +x GameData/Kerbcam/Sidecar/linux-x64/kerbcam-sidecar
-          [ -f GameData/Kerbcam/Sidecar/osx-arm64/kerbcam-sidecar ] && \
-            chmod +x GameData/Kerbcam/Sidecar/osx-arm64/kerbcam-sidecar || true
+          chmod +x GameData/Kerbcam/Sidecar/osx-arm64/kerbcam-sidecar
 
           cp hullcam/HullCameraAssets/shaders.linux GameData/Kerbcam/HullcamShaders/
           cp ci/kerbcam-shaders/Bundles-linux/kerbcam-shaders GameData/Kerbcam/
 
           cp Plugin/settings.cfg GameData/Kerbcam/
+
+          # kerbcam's own license (CC BY-NC-SA 4.0). The GPL-3.0 notice for the
+          # Hullcam-derived shader bundle and the KSP-AVC Kerbcam.version manifest
+          # are committed under GameData/Kerbcam/ and travel via the checkout.
+          cp LICENSE GameData/Kerbcam/LICENSE
 
           echo "GameData/Kerbcam tree:"
           find GameData/Kerbcam -type f | sort

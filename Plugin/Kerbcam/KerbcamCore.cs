@@ -30,6 +30,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using HullcamVDS;
 using UnityEngine;
 using Yangrc.OpenGLAsyncReadback;
@@ -236,6 +237,8 @@ namespace Kerbcam
                     return;
                 }
 
+                EnsureExecutable(binPath);
+
                 // CLI flags forwarded from settings.cfg. The sidecar
                 // accepts every value we care about as a long-form arg,
                 // so there's no config file to keep in sync on the
@@ -363,6 +366,32 @@ namespace Kerbcam
                     return null;
             }
         }
+
+        /* CKAN installs files without preserving the Unix executable bit (its
+           install spec has no permission directive and it sets no file mode on
+           extraction), so a sidecar dropped in by CKAN lands non-executable and
+           ProcessStartInfo can't launch it. The release zip keeps the bit for
+           SpaceDock/manual installs, but chmod is idempotent and cheap, so just
+           (re)assert 0755 on Linux/macOS before every launch. No-op on Windows.
+           Non-fatal: the binary may already be executable, so let Process.Start
+           surface any real problem rather than aborting here. */
+        private static void EnsureExecutable(string path)
+        {
+            if (Application.platform == RuntimePlatform.WindowsPlayer) return;
+            try
+            {
+                const uint mode0755 = 0x1ED; /* octal 0755 */
+                if (Chmod(path, mode0755) != 0)
+                    Debug.LogWarning($"[Kerbcam] chmod 0755 on sidecar returned errno {Marshal.GetLastWin32Error()}: {path}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcam] could not chmod sidecar ({path}): {ex.Message}");
+            }
+        }
+
+        [DllImport("libc", SetLastError = true, EntryPoint = "chmod")]
+        private static extern int Chmod(string path, uint mode);
 
         private void StopSidecar()
         {

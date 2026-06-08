@@ -48,6 +48,6 @@ Thumbs.db
 local_docs/
 
 # Packaged binaries (built by CI, not committed)
-GameData/KerbCam/Sidecar/*/kerbcam-sidecar
-GameData/KerbCam/Sidecar/*/kerbcam-sidecar.exe
-GameData/KerbCam/Plugin/*.dll
+GameData/Kerbcam/Sidecar/*/kerbcam-sidecar
+GameData/Kerbcam/Sidecar/*/kerbcam-sidecar.exe
+GameData/Kerbcam/Plugins/*.dll

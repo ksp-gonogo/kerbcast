@@ -119,9 +119,26 @@ jobs:
           open(path, "w").write(s2)
           EOF
 
+          # KSP-AVC manifest: VERSION is a structured MAJOR/MINOR/PATCH object,
+          # so rewrite those fields rather than a flat string. KSP_VERSION* are
+          # left alone — they track the supported game version, not ours.
+          python3 - "$NEW" <<'EOF'
+          import json
+          import sys
+          maj, minor, pat = (int(x) for x in sys.argv[1].split("."))
+          path = "GameData/Kerbcam/Kerbcam.version"
+          with open(path) as f:
+              m = json.load(f)
+          m["VERSION"] = {"MAJOR": maj, "MINOR": minor, "PATCH": pat, "BUILD": 0}
+          with open(path, "w") as f:
+              json.dump(m, f, indent=2)
+              f.write("\n")
+          EOF
+
           echo "Cargo.toml: $(grep -m1 '^version' sidecar/Cargo.toml)"
           echo "typescript: $(node -p "require('./client-sdk/typescript/package.json').version")"
           echo "react: $(node -p "require('./client-sdk/react/package.json').version")"
+          echo "Kerbcam.version: $(python3 -c "import json; v=json.load(open('GameData/Kerbcam/Kerbcam.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
 
       - name: Commit, tag, push
         run: |
@@ -132,7 +149,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sidecar/Cargo.toml sidecar/Cargo.lock \
                   client-sdk/typescript/package.json \
-                  client-sdk/react/package.json
+                  client-sdk/react/package.json \
+                  GameData/Kerbcam/Kerbcam.version
           git commit -m "release: v${NEW}"
           git tag "${TAG}"
           git push origin HEAD:main "${TAG}"
