@@ -287,6 +287,13 @@ namespace Kerbcam
         // pass that lands the post-processed pixels into _readbackRt
         // for the existing AsyncGPUReadback path to read.
         private CameraFilter _cameraFilter;
+        /* dockingdisplay.png, passed to RenderTitlePage before each blit so
+           the shared mtShader _Title/_TitleTex uniforms are set
+           deterministically per camera rather than inherited from stale
+           shared state. Static and never destroyed: LoadTextureFile returns
+           the GameDatabase-cached instance Hullcam itself uses, so freeing it
+           would break Hullcam's own in-game reticle and every other camera. */
+        private static Texture2D _hullcamTitleTex;
         // kerbcam's own NightVision material, used instead of HullcamVDS's
         // additive-shift filter when the shader bundle is available.
         private Material _nvMaterial;
@@ -406,6 +413,10 @@ namespace Kerbcam
                     return;
                 }
                 _cameraFilter = filter;
+                if (_hullcamTitleTex == null)
+                {
+                    _hullcamTitleTex = CameraFilter.LoadTextureFile("dockingdisplay.png");
+                }
                 UnityEngine.Debug.Log($"[Kerbcam] cam={FlightId} HullcamVDS filter active: mode={mode}");
             }
             catch (Exception ex)
@@ -1488,6 +1499,18 @@ namespace Kerbcam
                 }
                 else if (_cameraFilter != null)
                 {
+                    /* Set _Title/_TitleTex on the shared mtShader before
+                       the blit so each camera's reticle state is determined
+                       by its own filter class, not by whatever the prior
+                       camera or MovieTimeFilter.OnRenderImage left behind.
+                       Passing title=true delegates the per-camera show/hide
+                       decision to RenderImageWithFilter: filters that should
+                       suppress the reticle (BWHiResTV, NightVision, etc.)
+                       overwrite _TitleTex=noneTX inside their own blit, so
+                       those cameras naturally show no reticle. Filters that
+                       leave _TitleTex alone (ColorHiResTV, DockingCam) show
+                       dockingdisplay.png, matching Hullcam's in-game view. */
+                    _cameraFilter.RenderTitlePage(true, _hullcamTitleTex);
                     _cameraFilter.RenderImageWithFilter(_captureRt, _readbackRt);
                 }
                 else
