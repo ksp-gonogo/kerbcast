@@ -27,6 +27,10 @@ kerbcam isn't ready for general consumption yet.
 
 Issues and PRs are welcome, particularly if you'd like to 'adopt' macOS or Windows support.
 
+## Install
+
+Grab the latest `kerbcam-*.zip` from the [releases page](https://github.com/jonpepler/kerbcam/releases) and follow the install steps in that release's notes. The steps live with each release rather than here because they can change between versions; the release notes are always correct for the build you download. You'll also need [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued).
+
 ## Differences to OCISLY
 
 OCISLY uses `ReadPixels` + `EncodeToJPG` on the game's main thread and ships JPEG over unary gRPC at 30 Hz. That works, but it costs real frame budget, particularly on lower powered devices, and doesn't support the visual character that Hullcam VDS encodes per part. Kerbcam aims to fix both while prioritising high performance through hardware encoding and modern Unity API use.

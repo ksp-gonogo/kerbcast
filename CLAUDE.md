@@ -34,7 +34,7 @@ KSP (Steam Deck) ── plugin DLL ──┐ shared-mem ring ┌── sidecar (
                                   └──── ◇ ─────────┘
 ```
 
-One mod download: the plugin and the per-rid sidecar binary ship together in `GameData/KerbCam/`. The plugin auto-launches the sidecar on `Awake()`, kills it on `OnDestroy()`. From the user's perspective: drop in GameData, start KSP, it works.
+One mod download: the plugin and the per-rid sidecar binary ship together in `GameData/Kerbcam/`. The plugin auto-launches the sidecar on `Awake()`, kills it on `OnDestroy()`. From the user's perspective: drop in GameData, start KSP, it works.
 
 ## Repo layout
 
@@ -109,7 +109,7 @@ The strategy / planning context for this project lives in the gonogo repo at `lo
 
 Solo-developer repo. **Conventional Commits + Semantic Versioning.** Direct commits to `main` unless a change is large enough to warrant a feature branch (rare). No `Co-Authored-By: Claude` trailer; write the commit message as if a human authored it. Same convention as gonogo.
 
-Releases: GitHub Actions builds per-rid sidecar binaries on tag, packages `GameData/KerbCam/`, attaches to a GitHub Release. Protocol package publishes to GitHub Packages (not npm) on the same tag.
+Releases: GitHub Actions builds per-rid sidecar binaries on tag, packages `GameData/Kerbcam/`, attaches to a GitHub Release. Protocol package publishes to GitHub Packages (not npm) on the same tag.
 
 ## OS support tiers
 
@@ -149,7 +149,7 @@ If Hullcam VDS isn't installed, fall back to a generic mode (Path C in the rebui
 These are deliberately not in v0.1:
 
 - macOS / Windows release-quality polish (tier-2 only)
-- Movable cameras (`KerbCamModulePanTilt`)
+- Movable cameras (`KerbcamModulePanTilt`)
 - Recording-to-disk endpoints
 - Audio capture
 - Public CKAN / SpaceDock / forum-post distribution
