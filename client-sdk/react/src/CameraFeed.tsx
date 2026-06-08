@@ -27,9 +27,61 @@ function toEvenPx(n: number): number {
   return Math.max(2, Math.round(n / 2) * 2);
 }
 
+/*
+ * Fullscreen helpers. Safari (incl. iPadOS) only exposes the webkit-prefixed
+ * API; iOS iPhone has no element fullscreen at all, which `isFullscreenSupported`
+ * reports as unsupported so the button hides.
+ */
+type FsDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitFullscreenEnabled?: boolean;
+  webkitExitFullscreen?: () => Promise<void> | void;
+};
+type FsElement = HTMLElement & {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+};
+
+function isFullscreenSupported(): boolean {
+  if (typeof document === "undefined") return false;
+  const d = document as FsDocument;
+  return Boolean(d.fullscreenEnabled || d.webkitFullscreenEnabled);
+}
+
+function currentFullscreenElement(): Element | null {
+  const d = document as FsDocument;
+  return d.fullscreenElement ?? d.webkitFullscreenElement ?? null;
+}
+
+function requestFullscreen(el: HTMLElement): void {
+  const e = el as FsElement;
+  void (e.requestFullscreen?.() ?? e.webkitRequestFullscreen?.());
+}
+
+function exitFullscreen(): void {
+  const d = document as FsDocument;
+  void (d.exitFullscreen?.() ?? d.webkitExitFullscreen?.());
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * A consumer-supplied action rendered into the feed's top-right action bar.
+ * Lets a host page (e.g. the sidecar's spotlight toggle) inject controls
+ * without the library knowing what they do.
+ */
+export interface FeedAction {
+  /** Stable identity for the React key. */
+  id: string;
+  /** Accessible label; used for aria-label and the native tooltip. */
+  label: string;
+  /** Icon node, sized by the action bar (~14px). */
+  icon: React.ReactNode;
+  /** Toggle state: renders the button highlighted and sets aria-pressed. */
+  active?: boolean;
+  onClick: () => void;
+}
 
 export interface CameraFeedProps {
   /** Override the context client for this feed only. */
@@ -53,6 +105,29 @@ export interface CameraFeedProps {
   renderSize?: "auto" | "none";
   /** Message shown when no cameras are available. */
   emptyMessage?: string;
+  /**
+   * Show a built-in fullscreen toggle that fullscreens this feed's frame.
+   * Auto-hidden where the Fullscreen API is unavailable (e.g. iOS Safari,
+   * which only fullscreens the bare <video>). Default false.
+   */
+  enableFullscreen?: boolean;
+  /**
+   * Show a built-in Picture-in-Picture toggle for this feed's video.
+   * Auto-hidden where `document.pictureInPictureEnabled` is false. Default
+   * false.
+   */
+  enablePictureInPicture?: boolean;
+  /**
+   * Consumer-injected action buttons, rendered left of the built-in
+   * fullscreen/PiP controls in the top-right action bar.
+   */
+  actions?: FeedAction[];
+  /**
+   * Consumer-injected action buttons rendered at the far end of the action
+   * bar, right of the built-in controls — the natural home for a close/remove
+   * button so it sits in the corner.
+   */
+  trailingActions?: FeedAction[];
 }
 
 export interface CameraFeedHandle {
@@ -75,6 +150,10 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       showDebugInfo = false,
       renderSize = "auto",
       emptyMessage = "No camera feeds - start a vessel with Hullcam parts installed",
+      enableFullscreen = false,
+      enablePictureInPicture = false,
+      actions,
+      trailingActions,
     },
     ref,
   ) {
@@ -122,11 +201,71 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     const stream = useKerbcamStream(flightId);
     const videoRef = useRef<HTMLVideoElement>(null);
+    // The feed frame; fullscreen targets this and ResizeObserver measures it.
+    const wrapRef = useRef<HTMLDivElement>(null);
     useEffect(() => {
       if (videoRef.current && stream) {
         videoRef.current.srcObject = stream;
       }
     }, [stream]);
+
+    // -------------------------------------------------------------------------
+    // Fullscreen + Picture-in-Picture (opt-in, feature-detected)
+    // -------------------------------------------------------------------------
+    const fullscreenAvailable = enableFullscreen && isFullscreenSupported();
+    const pipAvailable =
+      enablePictureInPicture &&
+      typeof document !== "undefined" &&
+      document.pictureInPictureEnabled === true;
+
+    const [isFullscreen, setIsFullscreen] = useState(false);
+    const [isPip, setIsPip] = useState(false);
+
+    // Keep the fullscreen icon in sync however the user enters/exits (Esc, etc).
+    useEffect(() => {
+      if (!fullscreenAvailable) return;
+      const sync = () =>
+        setIsFullscreen(currentFullscreenElement() === wrapRef.current);
+      document.addEventListener("fullscreenchange", sync);
+      document.addEventListener("webkitfullscreenchange", sync);
+      sync();
+      return () => {
+        document.removeEventListener("fullscreenchange", sync);
+        document.removeEventListener("webkitfullscreenchange", sync);
+      };
+    }, [fullscreenAvailable]);
+
+    // PiP listeners re-attach when the <video> mounts/remounts (flightId change).
+    useEffect(() => {
+      if (!pipAvailable) return;
+      const v = videoRef.current;
+      if (!v) return;
+      const onEnter = () => setIsPip(true);
+      const onLeave = () => setIsPip(false);
+      v.addEventListener("enterpictureinpicture", onEnter);
+      v.addEventListener("leavepictureinpicture", onLeave);
+      return () => {
+        v.removeEventListener("enterpictureinpicture", onEnter);
+        v.removeEventListener("leavepictureinpicture", onLeave);
+      };
+    }, [pipAvailable, flightId]);
+
+    const toggleFullscreen = useCallback(() => {
+      const el = wrapRef.current;
+      if (!el) return;
+      if (currentFullscreenElement()) exitFullscreen();
+      else requestFullscreen(el);
+    }, []);
+
+    const togglePip = useCallback(() => {
+      const v = videoRef.current;
+      if (!v) return;
+      if (document.pictureInPictureElement) {
+        void document.exitPictureInPicture().catch(() => {});
+      } else {
+        void v.requestPictureInPicture().catch(() => {});
+      }
+    }, []);
 
     const isDestroyed = camera ? isCameraDestroyed(camera) : false;
     const showPan = camera?.supportsPan && !isDestroyed;
@@ -279,7 +418,6 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // -------------------------------------------------------------------------
     // Render-size feedback (ResizeObserver, 500 ms debounce, 16:9 crop)
     // -------------------------------------------------------------------------
-    const wrapRef = useRef<HTMLDivElement>(null);
     const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {
@@ -437,12 +575,63 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       </TopOverlay>
     );
 
+    const renderAction = (a: FeedAction) => (
+      <OverlayIconButton
+        key={a.id}
+        type="button"
+        aria-label={a.label}
+        aria-pressed={a.active ?? undefined}
+        title={a.label}
+        $active={a.active ?? false}
+        onClick={a.onClick}
+      >
+        {a.icon}
+      </OverlayIconButton>
+    );
+
+    const builtInActions = flightId !== null && (pipAvailable || fullscreenAvailable);
+    const hasActionBar =
+      (actions && actions.length > 0) ||
+      (trailingActions && trailingActions.length > 0) ||
+      builtInActions;
+    const actionBar = hasActionBar ? (
+        <ActionBar>
+          {actions?.map(renderAction)}
+          {flightId !== null && pipAvailable && (
+            <OverlayIconButton
+              type="button"
+              aria-label={isPip ? "Exit picture in picture" : "Picture in picture"}
+              aria-pressed={isPip}
+              title={isPip ? "Exit picture in picture" : "Picture in picture"}
+              $active={isPip}
+              onClick={togglePip}
+            >
+              <PictureInPictureIcon />
+            </OverlayIconButton>
+          )}
+          {flightId !== null && fullscreenAvailable && (
+            <OverlayIconButton
+              type="button"
+              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              aria-pressed={isFullscreen}
+              title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              $active={isFullscreen}
+              onClick={toggleFullscreen}
+            >
+              {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+            </OverlayIconButton>
+          )}
+          {trailingActions?.map(renderAction)}
+        </ActionBar>
+      ) : null;
+
     return (
       <Stage ref={wrapRef} $pinned={chromePinned}>
         {flightId === null ? (
           <>
             <Empty>{emptyMessage}</Empty>
             {topOverlay}
+            {actionBar}
           </>
         ) : (
           <>
@@ -455,6 +644,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
               onClick={() => setChromePinned((v) => !v)}
             />
             {topOverlay}
+            {actionBar}
             {isDestroyed && (
               <SignalLostOverlay role="status" aria-label="Signal lost">
                 <SignalLostText>SIGNAL LOST</SignalLostText>
@@ -606,6 +796,43 @@ function ChevronDownIcon(props: React.SVGProps<SVGSVGElement>) {
       {...props}
     >
       <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth={1.5} fill="none" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+const iconProps = {
+  viewBox: "0 0 16 16",
+  width: 14,
+  height: 14,
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.6,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+  "aria-hidden": true as const,
+};
+
+function FullscreenEnterIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M2 6V2.5h3.5M14 6V2.5h-3.5M2 10v3.5h3.5M14 10v3.5h-3.5" />
+    </svg>
+  );
+}
+
+function FullscreenExitIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M5.5 2v3.5H2M10.5 2v3.5H14M5.5 14v-3.5H2M10.5 14v-3.5H14" />
+    </svg>
+  );
+}
+
+function PictureInPictureIcon() {
+  return (
+    <svg {...iconProps}>
+      <rect x="2" y="3" width="12" height="10" rx="1" />
+      <rect x="8" y="8" width="5" height="4" rx="0.5" fill="currentColor" stroke="none" />
     </svg>
   );
 }
@@ -879,6 +1106,24 @@ const TopMeta = styled.div`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
+/* Top-right cluster of overlay controls (custom actions + fullscreen/PiP). */
+const ActionBar = styled.div`
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+  }
+`;
+
 /*
  * Outer frame. Fills the host container: the video is absolutely
  * positioned, so without explicit width/height the Stage collapses
@@ -909,11 +1154,15 @@ const Stage = styled(Panel)<{ $pinned: boolean }>`
   &:hover ${ZoomControlsWrap},
   &:focus-within ${ZoomControlsWrap},
   &:hover ${PanControl},
-  &:focus-within ${PanControl} {
+  &:focus-within ${PanControl},
+  &:hover ${ActionBar},
+  &:focus-within ${ActionBar} {
     opacity: 1;
   }
   &:hover ${TopOverlay},
-  &:focus-within ${TopOverlay} {
+  &:focus-within ${TopOverlay},
+  &:hover ${ActionBar},
+  &:focus-within ${ActionBar} {
     pointer-events: auto;
   }
 
@@ -921,6 +1170,10 @@ const Stage = styled(Panel)<{ $pinned: boolean }>`
     p.$pinned &&
     css`
       ${TopOverlay} {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      ${ActionBar} {
         opacity: 1;
         pointer-events: auto;
       }
@@ -939,21 +1192,48 @@ const Empty = styled.div`
   text-align: center;
 `;
 
-const OverlayIconButton = styled.button`
+const OverlayIconButton = styled.button<{ $active?: boolean }>`
   width: 24px;
   height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  background: rgba(0, 0, 0, 0.5);
-  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: ${(p) =>
+    p.$active
+      ? "var(--kerbcam-accent, #00ff88)"
+      : "rgba(0, 0, 0, 0.5)"};
+  border: 1px solid
+    ${(p) =>
+      p.$active
+        ? "var(--kerbcam-accent, #00ff88)"
+        : "rgba(255, 255, 255, 0.3)"};
   border-radius: 3px;
-  color: #fff;
+  color: ${(p) => (p.$active ? "#000" : "#fff")};
   cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+
+  @media (hover: hover) {
+    &:hover {
+      background: ${(p) =>
+        p.$active
+          ? "var(--kerbcam-accent, #00ff88)"
+          : "rgba(0, 0, 0, 0.7)"};
+      border-color: rgba(255, 255, 255, 0.6);
+    }
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--kerbcam-accent, #00ff88);
+    outline-offset: 2px;
+  }
 
   &:disabled {
     opacity: 0.4;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
   }
 `;
 
