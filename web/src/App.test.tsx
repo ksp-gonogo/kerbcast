@@ -19,6 +19,7 @@ import { MockSidecar } from "@jonpepler/kerbcam/testing";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { saveTiles } from "./tiles";
 
 // ---------------------------------------------------------------------------
 // Camera fixture factory
@@ -727,5 +728,44 @@ describe("Subscribe refcount - two tiles, one subscribe", () => {
     // Still no unsubscribe (refcount went 2 -> 1)
     const unsubscribeCmds = sidecar.commands.filter((c) => c.type === "unsubscribe");
     expect(unsubscribeCmds).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tile label vs. displayed feed (bug repro)
+// ---------------------------------------------------------------------------
+
+describe("App - tile corner label reflects the displayed camera", () => {
+  // A tile whose stored flightId doesn't match any live camera (here: an
+  // unbound slot left by a prior session, so the grid won't re-seed) still
+  // shows a feed, because CameraFeed auto-picks the first available camera.
+  // The corner label, computed from the raw flightId, must follow that
+  // displayed camera rather than falling back to the placeholder "Tile N".
+  it("does not mislabel an auto-displayed feed with the placeholder slot name", async () => {
+    // Prior visit left one unbound slot; key present => CameraSeeder skips.
+    saveTiles([{ flightId: null, spotlit: false }]);
+
+    const { client, sidecar, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "NavCam" }),
+    ]);
+    await renderApp(client);
+    await act(async () => {
+      openSidecar();
+      await Promise.resolve();
+    });
+
+    // The slot auto-displays NavCam: the feed subscribes to flightId 1.
+    await waitFor(() => {
+      expect(
+        sidecar.commands.some(
+          (c) =>
+            c.type === "subscribe" &&
+            (c as { content: { flightId: number } }).content.flightId === 1,
+        ),
+      ).toBe(true);
+    });
+
+    // So the corner label must read the displayed camera, not "Tile 1".
+    expect(screen.queryByText("Tile 1")).toBeNull();
   });
 });

@@ -96,6 +96,14 @@ export interface CameraFeedProps {
    * buttons). Never called on auto-latch.
    */
   onSelectCamera?: (flightId: number) => void;
+  /**
+   * Called whenever the camera this feed actually displays changes — including
+   * auto-latch and fallback picks, not just explicit selection. The argument
+   * is the resolved flightId (null when nothing is shown). Use it to label or
+   * annotate the feed by what it is really showing rather than what was
+   * requested; the two differ whenever auto-selection kicks in.
+   */
+  onDisplayedCameraChange?: (flightId: number | null) => void;
   /** Show resolution + encoder readout. Default false. */
   showDebugInfo?: boolean;
   /**
@@ -147,6 +155,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     {
       flightId: requestedFlightId,
       onSelectCamera,
+      onDisplayedCameraChange,
       showDebugInfo = false,
       renderSize = "auto",
       emptyMessage = "No camera feeds - start a vessel with Hullcam parts installed",
@@ -194,9 +203,19 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         ? (cameras.find((c) => c.flightId === flightId) ?? null)
         : null;
 
-    // Commit on-screen camera for the auto-mode latch.
+    // Latest onDisplayedCameraChange, held in a ref so the commit effect below
+    // fires only on a resolved-flightId change, not on every render when the
+    // consumer passes an inline callback.
+    const onDisplayedRef = useRef(onDisplayedCameraChange);
+    useEffect(() => {
+      onDisplayedRef.current = onDisplayedCameraChange;
+    });
+
+    // Commit on-screen camera for the auto-mode latch, and report which camera
+    // is actually displayed so consumers can label by it (auto-picks included).
     useEffect(() => {
       displayedRef.current = flightId;
+      onDisplayedRef.current?.(flightId);
     }, [flightId]);
 
     const stream = useKerbcamStream(flightId);

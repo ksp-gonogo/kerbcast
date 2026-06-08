@@ -5,7 +5,7 @@ import {
 } from "@jonpepler/kerbcam-react";
 import type { FeedAction } from "@jonpepler/kerbcam-react";
 import { Pin, PinOff, Plus, X } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import styled from "styled-components";
 
 /**
@@ -41,15 +41,21 @@ export function Tile({
   onToggleSpotlight,
 }: TileProps): React.JSX.Element {
   /*
-   * Corner label: the camera's name once one is bound, the tile number
-   * until then. The feed's own title chrome is hover-revealed, so this
-   * is the at-a-glance identifier.
+   * Corner label: the name of the camera the feed actually displays — which
+   * follows CameraFeed's auto-latch/fallback, not just this tile's requested
+   * flightId. Tracking the requested id alone mislabels a slot that is showing
+   * a borrowed/auto-picked camera (it would read "Tile N" over a live feed).
+   * Falls back to the tile number only when the feed shows nothing. The feed's
+   * own title chrome is hover-revealed, so this is the at-a-glance identifier.
    */
   const cameras = useKerbcamCameras();
+  const [displayedFlightId, setDisplayedFlightId] = useState<number | null>(
+    flightId,
+  );
   const label = useMemo(() => {
-    const cam = cameras.find((c) => c.flightId === flightId);
+    const cam = cameras.find((c) => c.flightId === displayedFlightId);
     return cam ? buildCameraLabeler(cameras)(cam) : `Tile ${index + 1}`;
-  }, [cameras, flightId, index]);
+  }, [cameras, displayedFlightId, index]);
 
   /*
    * Tile-level controls injected into the feed's action bar, so there's a
@@ -89,6 +95,7 @@ export function Tile({
           flightId={flightId}
           showDebugInfo={showDebugInfo}
           onSelectCamera={onSelectCamera}
+          onDisplayedCameraChange={setDisplayedFlightId}
           enableFullscreen
           enablePictureInPicture
           actions={actions}
