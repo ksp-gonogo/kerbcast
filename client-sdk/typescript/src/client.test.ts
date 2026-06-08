@@ -1240,4 +1240,115 @@ describe("KerbcamClient.inboundVideoStats", () => {
     const stats = await client.inboundVideoStats();
     expect(stats.size).toBe(0);
   });
+
+  it("throttleMainScreen defaults to false before hello", () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    expect(client.throttleMainScreen).toBe(false);
+  });
+
+  it("throttleMainScreen reflects the settings-state pushed on hello", async () => {
+    const sidecar = new MockSidecar();
+    /* Seed the mock sidecar with throttle on before opening. */
+    sidecar.fireSettingsState({ throttleMainScreen: true });
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+    expect(client.throttleMainScreen).toBe(true);
+  });
+
+  it("setThrottleMainScreen sends the correct command", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+
+    await client.setThrottleMainScreen(true);
+
+    const cmd = sidecar.lastCommand("set-throttle-main-screen");
+    expect(cmd).toBeDefined();
+    expect(cmd?.content.enabled).toBe(true);
+  });
+
+  it("settings-change event fires with SettingsState payload", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+
+    const events: { throttleMainScreen: boolean }[] = [];
+    client.on("settings-change", (p) => events.push(p));
+
+    await client.setThrottleMainScreen(true);
+
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[events.length - 1].throttleMainScreen).toBe(true);
+    expect(client.throttleMainScreen).toBe(true);
+  });
+
+  it("MockSidecar.throttleMainScreen reflects set-throttle-main-screen command", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+
+    expect(sidecar.throttleMainScreen).toBe(false);
+    await client.setThrottleMainScreen(true);
+    expect(sidecar.throttleMainScreen).toBe(true);
+    await client.setThrottleMainScreen(false);
+    expect(sidecar.throttleMainScreen).toBe(false);
+  });
+
+  it("fireSettingsState pushes settings-change to the client", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    /* Register before open() so the open-time settings-state is also captured. */
+    const events: { throttleMainScreen: boolean }[] = [];
+    client.on("settings-change", (p) => events.push(p));
+
+    await client.connect();
+    sidecar.open();
+
+    /* One event from open() (false), then one more from fireSettingsState (true). */
+    expect(events).toHaveLength(1);
+    expect(events[0].throttleMainScreen).toBe(false);
+
+    sidecar.fireSettingsState({ throttleMainScreen: true });
+    expect(events).toHaveLength(2);
+    expect(events[1].throttleMainScreen).toBe(true);
+    expect(client.throttleMainScreen).toBe(true);
+  });
 });

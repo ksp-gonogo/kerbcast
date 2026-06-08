@@ -5,6 +5,7 @@ import type {
   ErrorPayload,
   Layer,
   ServerMessage,
+  SettingsStatePayload,
 } from "./__generated__/types";
 import { CameraLifecycle, ErrorSource } from "./__generated__/types";
 import { type NoisePipeline, tryCreateNoisePipeline } from "./noise";
@@ -192,6 +193,12 @@ export interface KerbcamClientEvents {
    * without intercepting at the transport layer.
    */
   ping: undefined;
+  /**
+   * Fired when a `settings-state` message arrives (after `Hello` and
+   * whenever the plugin-reported throttle state changes). Payload
+   * reflects what the plugin has applied, not just what was requested.
+   */
+  "settings-change": SettingsStatePayload;
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +656,8 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
   private _encoderBackend: string | null = null;
+  /** Last-received throttle state from `settings-state`. False until the first push. */
+  private _throttleMainScreen = false;
 
   constructor(cfg: KerbcamClientConfig, transport?: KerbcamTransport) {
     super();
@@ -674,6 +683,28 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
 
   get encoderBackend(): string | null {
     return this._encoderBackend;
+  }
+
+  /**
+   * Current effective state of the "Throttle KSP main render" setting.
+   * Reflects what the plugin has applied (from `settings-state` messages),
+   * not just what was last requested. False until the first push arrives.
+   */
+  get throttleMainScreen(): boolean {
+    return this._throttleMainScreen;
+  }
+
+  /**
+   * Send a `set-throttle-main-screen` command to the sidecar, which writes
+   * `global.control.json` for the plugin to apply. The plugin persists the
+   * change in the per-save difficulty parameter. The resulting
+   * `settings-state` broadcast reflects the applied value.
+   */
+  async setThrottleMainScreen(enabled: boolean): Promise<void> {
+    await this._send({
+      type: "set-throttle-main-screen",
+      content: { enabled },
+    });
   }
 
   /**
@@ -965,6 +996,10 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
          */
         void this._send({ type: "pong" }).catch(() => {});
         this.emit("ping", undefined);
+        break;
+      case "settings-state":
+        this._throttleMainScreen = msg.content.throttleMainScreen;
+        this.emit("settings-change", msg.content);
         break;
     }
   }

@@ -1,4 +1,4 @@
-import type { AdaptiveShedPayload, CameraState, ClientMessage, ServerMessage } from "../__generated__/types";
+import type { AdaptiveShedPayload, CameraState, ClientMessage, ServerMessage, SettingsStatePayload } from "../__generated__/types";
 import { CameraLifecycle, ErrorSource, Layer } from "../__generated__/types";
 import type {
   InboundVideoStats,
@@ -93,6 +93,7 @@ function buildCamera(init: MockCameraInit): CameraState {
 export class MockSidecar {
   private readonly _cameras = new Map<number, CameraState>();
   private readonly _commands: ClientMessage[] = [];
+  private _throttleMainScreen = false;
 
   private _openHandler: (() => void) | undefined;
   private _clientMsgHandler: ((raw: string) => void) | undefined;
@@ -174,6 +175,7 @@ export class MockSidecar {
     this._openHandler?.();
     this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock" } });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
+    this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
 
   /** Drive the underlying peer's connection-state handler. */
@@ -231,6 +233,17 @@ export class MockSidecar {
   /** Push an `adaptive-shed` event to the client. */
   fireAdaptiveShed(payload: AdaptiveShedPayload): void {
     this._sendToClient({ type: "adaptive-shed", content: payload });
+  }
+
+  /** Current mock-sidecar throttle state (reflects `set-throttle-main-screen` commands). */
+  get throttleMainScreen(): boolean {
+    return this._throttleMainScreen;
+  }
+
+  /** Push a `settings-state` event to the client (simulates a plugin-status-change broadcast). */
+  fireSettingsState(payload: SettingsStatePayload): void {
+    this._throttleMainScreen = payload.throttleMainScreen;
+    this._sendToClient({ type: "settings-state", content: payload });
   }
 
   /** Configure the slot-pool mids before connecting (dynamic mode). */
@@ -491,6 +504,17 @@ export class MockSidecar {
       case "hello":
       case "pong":
       case "request-keyframe":
+        break;
+      case "set-throttle-main-screen": {
+        /* Flip state and echo SettingsState back, mirroring the sidecar's broadcast. */
+        this._throttleMainScreen = msg.content.enabled;
+        this._sendToClient({
+          type: "settings-state",
+          content: { throttleMainScreen: this._throttleMainScreen },
+        });
+        break;
+      }
+      case "disconnect":
         break;
     }
   }
