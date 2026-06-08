@@ -55,8 +55,9 @@ namespace Kerbcam
         private float _statusCooldown;
         private const float StatusWriteIntervalSeconds = 1.0f;
 
-        /* Control file (sidecar -> plugin). Polled ~1Hz alongside status writes. */
+        /* Control file (sidecar -> plugin). Polled ~1Hz with its own cooldown. */
         private string _controlPath;
+        private float _controlCooldown;
         private ulong _lastAppliedControlSeq;
 
         // Rolling 60-sample FPS window for adaptive layer shedding.
@@ -981,11 +982,14 @@ namespace Kerbcam
          * Poll global.control.json written by the sidecar. On a new seq,
          * apply the requested throttle state: write the per-save difficulty
          * param so it persists, then drive the existing apply/restore methods.
-         * Gated by _statusCooldown so it runs ~1Hz alongside the status write.
+         * Uses its own _controlCooldown counter (~1Hz, independent of status writes).
          */
         private void MaybeApplyGlobalControl()
         {
-            if (_controlPath == null || _statusCooldown > 0f) return;
+            if (_controlPath == null) return;
+            _controlCooldown -= Time.unscaledDeltaTime;
+            if (_controlCooldown > 0f) return;
+            _controlCooldown = StatusWriteIntervalSeconds;
             try
             {
                 if (!File.Exists(_controlPath)) return;
