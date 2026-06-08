@@ -38,6 +38,11 @@ Thumbs.db
 
 # Claude Code
 .claude/
+# Browser-automation scratch output (Playwright MCP console/page dumps)
+.playwright-mcp/
+
+# Local scratch worktrees and Deck-deploy backups (binaries, scratch notes)
+.worktrees/
 
 # Local reference docs (cloned source repos, design notes, etc.)
 local_docs/
