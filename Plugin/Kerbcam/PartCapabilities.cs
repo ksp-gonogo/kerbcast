@@ -47,6 +47,16 @@ namespace Kerbcam
         /// while still travelling with the head. Null = re-express the part's
         /// <c>cameraPosition</c> into the joint frame as-is.</summary>
         public Vector3? CameraMountLocal;
+        /// <summary>When true, negate the yaw angle applied to the yaw joint
+        /// (and, since the near camera is parented rigidly to that joint, the
+        /// lens with it). Set for a yaw-only joint whose local frame turns the
+        /// rigidly-parented camera opposite to the operator's <c>+panYaw = pan
+        /// right</c> convention — TopJoint does this, so without the negation
+        /// commanding pan-right sweeps the view left. Negating flips head and
+        /// lens together, so it corrects the control direction without
+        /// reintroducing any head/lens sign split. Only consulted on the
+        /// yaw-only joint path; compound joints (LaunchCam) leave it false.</summary>
+        public bool YawInvert;
 
         public bool SupportsPan => YawMin != YawMax || PitchMin != PitchMax;
     }
@@ -113,13 +123,16 @@ namespace Kerbcam
             // without reintroducing the wide-arc "rotates about the wrong point"
             // behaviour that the earlier in-place fix removed.
             //
-            // Pan direction needs no special handling: the joint now drives both
-            // the head and the lens with one rotation and the same sign, so
-            // +panYaw sweeps the view in the operator-expected direction with no
-            // sign disagreement to reconcile and no dependence on the readback
-            // flip for pan direction. (The old YawMeshInvert flag — which negated
-            // the joint angle to paper over that disagreement back when the lens
-            // rotated in place on the part root — is therefore gone.)
+            // Pan direction: TopJoint's local frame turns the rigidly-parented
+            // lens opposite to the operator's +panYaw = pan-right convention, so
+            // without correction commanding pan-right sweeps the view left
+            // (confirmed against live KSP). YawInvert negates the joint angle;
+            // because the head and the rigidly-parented lens share that one
+            // rotation, negating moves both together — it flips the control
+            // direction without reintroducing the head/lens sign split that the
+            // rigid mount fixed. (This is the job the old YawMeshInvert did for
+            // the mesh alone, back when the lens rotated separately on the part
+            // root.)
             ["DC.TurretCam"] = new PanCapability
             {
                 YawMin = -135f, YawMax = 135f,
@@ -129,6 +142,7 @@ namespace Kerbcam
                 YawTransformName = "TopJoint",
                 PitchTransformName = "",
                 CameraMountLocal = new Vector3(0.047f, 0.046f, -0.200f),
+                YawInvert = true,
             },
 
             // LaunchCam: single joint (hc_launchcam) that carries both yaw and

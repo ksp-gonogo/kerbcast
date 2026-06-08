@@ -1257,12 +1257,16 @@ namespace Kerbcam
                     if (_yawTransform != null)
                     {
                         // The near camera is parented rigidly to this joint, so a
-                        // single +panYaw rotation drives BOTH the visible head and
-                        // the lens in the same direction — no sign disagreement to
-                        // reconcile (the lens stays at _baseRotation relative to
-                        // the joint, set in the _nearCam branch above).
+                        // single rotation drives BOTH the visible head and the
+                        // lens together (the lens stays at _baseRotation relative
+                        // to the joint, set in the _nearCam branch above) — no
+                        // head/lens sign disagreement to reconcile. YawInvert
+                        // negates the angle for a joint whose local frame would
+                        // otherwise turn the rigid head+lens opposite to the
+                        // operator's +panYaw = pan-right convention (TopJoint).
+                        float jointYaw = _panCap.YawInvert ? -_panYawCurrent : _panYawCurrent;
                         _yawTransform.localRotation = _yawRestRot
-                            * Quaternion.Euler(0f, _panYawCurrent, 0f);
+                            * Quaternion.Euler(0f, jointYaw, 0f);
                     }
                     if (_pitchTransform != null)
                         _pitchTransform.localRotation = _pitchRestRot
