@@ -142,7 +142,7 @@ Shader "Kerbcam/Bowshock"
                 // branch below). The smoothstep edges are chosen so the
                 // mesh's outer-most ring fades smoothly to nothing.
                 float baseFade = i.localPos.z >= 0.0
-                    ? smoothstep(0.0, 0.3, i.localPos.z)        // dome: fade near z=0
+                    ? smoothstep(0.0, 0.45, i.localPos.z)       // dome: fade near z=0
                     : smoothstep(-3.0, -1.5, i.localPos.z);     // cone: fade near z=-3
                 float endsFade = apexFade * baseFade;
 
@@ -166,11 +166,20 @@ Shader "Kerbcam/Bowshock"
                 // from inside or just outside paints the whole frame.
                 float nearFade = saturate(distToCam / _NearFadeDist);
 
-                // Sample KSP's tuned plasma noise texture, scrolled along the
-                // cone axis toward -Z (toward the vessel — air rushing through
-                // the shock front). Visual continuity with stock plasma.
-                float2 fxUv = float2(i.localPos.x * 0.3 + i.localPos.y * 0.2,
-                                     i.localPos.z * 0.4 - _Time.y * _ScrollSpeed * 0.15);
+                // Sample KSP's tuned plasma noise texture, scrolled toward the
+                // vessel (air rushing through the shock front). The CONE maps
+                // noise along its axis. The DOME must NOT: viewed near-axis
+                // (forward hullcam), contour lines of localPos.z are circles,
+                // so a z-keyed scroll painted concentric rings across the
+                // interior. Map the dome azimuthally instead — streaks run
+                // along meridians from the apex, i.e. parallel to the airflow
+                // wrapping the shock, never as rings across it. The azimuth
+                // tile count is an integer (3) so the texture seam wraps.
+                float2 fxUvCone = float2(i.localPos.x * 0.3 + i.localPos.y * 0.2,
+                                         i.localPos.z * 0.4 - _Time.y * _ScrollSpeed * 0.15);
+                float2 fxUvDome = float2(atan2(i.localPos.y, i.localPos.x) * (3.0 / 6.2831853),
+                                         i.localPos.z * 0.8 - _Time.y * _ScrollSpeed * 0.15);
+                float2 fxUv = lerp(fxUvCone, fxUvDome, isDome);
                 float fxNoise = tex2D(_FXMainTex, fxUv).r;
                 float shimmer = 0.7 + 0.6 * fxNoise;
 

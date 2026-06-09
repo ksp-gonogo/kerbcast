@@ -223,10 +223,10 @@ Shader "Kerbcam/Plasma"
             {
                 // Per-vertex extrusion lengths from a position hash, so adjacent
                 // edges get ragged rather than uniform-length trails.
-                float nA = hash13(wpA * 3.7);
-                float nB = hash13(wpB * 3.7);
-                float lenA = baseLen * (0.55 + nA * 1.10);
-                float lenB = baseLen * (0.55 + nB * 1.10);
+                float randA = hash13(wpA * 3.7);
+                float randB = hash13(wpB * 3.7);
+                float lenA = baseLen * (0.55 + randA * 1.10);
+                float lenB = baseLen * (0.55 + randB * 1.10);
 
                 // Side spread: widen toward the tip. Cross product between
                 // the airflow and the edge gives a sideways normal in the
