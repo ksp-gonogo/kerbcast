@@ -41,7 +41,10 @@ namespace Kerbcam
 
         // Intensity ramp — per spec, more aggressive than CoreSheath: trail
         // turns on a bit later (mach 0.9) and saturates earlier (mach 3.0).
-        private const float _minQ = 0.1f;       // kPa
+        // q is a ramp, not a gate, for the same reason as BowshockEffect:
+        // a binary cutoff popped the wake in at full strength on reentry.
+        private const float _qLow = 0.1f;        // kPa — onset
+        private const float _qHigh = 1.5f;       // kPa — full strength
         private const float _machLow = 0.9f;
         private const float _machHigh = 3.0f;
 
@@ -135,7 +138,9 @@ namespace Kerbcam
             // nearby hullcams.
             Vector3 worldPos = state.Vessel.CoM - windDir * Mathf.Max(profile.AftStandoff - 0.5f, 0f);
             float radiusScale = Mathf.Clamp(profile.WindwardRadius / _tubeStartRadius, 0.25f, 1.0f);
-            Quaternion rot = Quaternion.LookRotation(-windDir);
+            // Helper up — same degenerate-LookRotation guard as BowshockEffect.
+            Vector3 helperUp = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.right;
+            Quaternion rot = Quaternion.LookRotation(-windDir, helperUp);
             Matrix4x4 m = Matrix4x4.TRS(worldPos, rot, new Vector3(radiusScale, radiusScale, 1f));
 
             _material.SetFloat(_IntensityId, intensity);
@@ -151,8 +156,10 @@ namespace Kerbcam
 
         private static float ComputeIntensity(float mach, float dynamicPressure)
         {
-            if (dynamicPressure < _minQ) return 0f;
-            return Mathf.Clamp01(Mathf.InverseLerp(_machLow, _machHigh, mach));
+            float machRamp = Mathf.Clamp01(Mathf.InverseLerp(_machLow, _machHigh, mach));
+            float qRamp = Mathf.SmoothStep(0f, 1f,
+                Mathf.Clamp01(Mathf.InverseLerp(_qLow, _qHigh, dynamicPressure)));
+            return machRamp * qRamp;
         }
 
         // Build a hollow tapered cylinder along local +Z. uv.y = z / _tubeLength

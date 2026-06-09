@@ -41,23 +41,19 @@ namespace Kerbcam
         // (not max) so the forced pad preview reads like real supersonic flight.
         private const float _forcedIntensity = 0.6f;
 
-        // Intensity ramp (C#-side, fast loop — no CI rebuild to tune). Below
-        // _minQ there's no meaningful atmosphere; intensity ramps with mach
-        // from transonic onset up. Tuned per the bowshock spec: gate at mach
-        // 1.0 (transonic), full by mach 2.5.
-        private const float _minQ = 0.1f;       // kPa
+        // Intensity ramp (C#-side, fast loop — no CI rebuild to tune).
+        // Mach ramps from transonic onset (1.0) to full by 2.5. q is a
+        // RAMP, not a gate: on reentry mach is far past 2.5 long before the
+        // atmosphere thickens, so a binary q cutoff made the dome appear at
+        // full intensity the instant q crossed it ("just appears"). Ramping
+        // q from 0.1 → 1.5 kPa fades the shock in with the atmosphere.
+        private const float _qLow = 0.1f;        // kPa — onset
+        private const float _qHigh = 1.5f;       // kPa — full strength
         private const float _machLow = 1.0f;
         private const float _machHigh = 2.5f;
 
         // Throttled state log gate so the per-frame diagnostic doesn't spam.
         private float _lastLogTime;
-
-        // Cached half-extent of the vessel from CoM — refreshed on vessel
-        // change. Used to scale + position the cone so it sits just past the
-        // vessel's leading edge rather than at a fixed CoM offset (which
-        // placed it inside nose-mounted cameras on small vessels and far
-        // ahead on large stacks).
-        private float _vesselExtent = 5f;
 
         public bool TryInitialize(Camera nearCam)
         {
@@ -140,7 +136,13 @@ namespace Kerbcam
             // Base of the dome sits at the vessel's windward extreme along
             // the wind axis; the curved surface bulges further forward.
             Vector3 worldPos = state.Vessel.CoM + windDir * profile.ForwardStandoff;
-            Quaternion rot = Quaternion.LookRotation(windDir);
+            // Helper up avoids a degenerate LookRotation when the wind axis
+            // is near world-up (vertical ascent) — same guard as the CI
+            // preview harness. The dome is rotationally symmetric so the
+            // roll this picks is invisible, but the degenerate case spams
+            // Unity warnings and can produce frame-to-frame roll flips.
+            Vector3 helperUp = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.right;
+            Quaternion rot = Quaternion.LookRotation(windDir, helperUp);
             Matrix4x4 m = Matrix4x4.TRS(worldPos, rot, new Vector3(domeRadius, domeRadius, domeDepth));
 
             _material.SetFloat(_IntensityId, intensity);
@@ -156,8 +158,10 @@ namespace Kerbcam
 
         private static float ComputeIntensity(float mach, float dynamicPressure)
         {
-            if (dynamicPressure < _minQ) return 0f;
-            return Mathf.Clamp01(Mathf.InverseLerp(_machLow, _machHigh, mach));
+            float machRamp = Mathf.Clamp01(Mathf.InverseLerp(_machLow, _machHigh, mach));
+            float qRamp = Mathf.SmoothStep(0f, 1f,
+                Mathf.Clamp01(Mathf.InverseLerp(_qLow, _qHigh, dynamicPressure)));
+            return machRamp * qRamp;
         }
 
         // Oblate dome (flattened hemisphere). Unit-sized: base ring at z=0
