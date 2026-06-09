@@ -31,12 +31,30 @@ namespace KerbcamCI
         private const string _outputDir = "Previews";
 
         private static readonly string[] _shaderIds = { "plasma", "bowshock", "trail", "ember" };
-        // Three viewpoints chosen to actually frame the FX they're meant to
-        // showcase:
-        //   side_profile     — pulled back, full vessel + wake + bowshock in frame
-        //   aft_hullcam      — body-mounted, looking back/down — sees trail + embers
-        //   forward_hullcam  — body-mounted, looking forward/up — sees bowshock
-        private static readonly string[] _viewIds = { "side_profile", "aft_hullcam", "forward_hullcam" };
+        // Per-shader viewpoints. The previous shared external/nose_up/body_out
+        // (and later side_profile/aft/forward) sets framed the vessel, not the
+        // FX — the bowshock dome sits past the nose along the wind axis and
+        // the wake extends tens of metres astern, so both fell partly or
+        // wholly outside the frustum. Each shader now gets views aimed at the
+        // FX anchor computed from the wind direction + windward profile, so
+        // the sideways/diagonal wind fixtures frame correctly too.
+        //
+        //   side_profile       — vessel-centred side view (LLVMpipe-proven
+        //                        3.5 m; do not pull back, see 13a5697)
+        //   aft/forward_hullcam— body-mounted hullcam views (unchanged)
+        //   dome_side/3q       — aimed at the bowshock dome centre
+        //   wake_side/3q       — aimed a few metres down the trail tube
+        //   ember_three_quarter— leeward three-quarter on the ember shed
+        private static string[] ViewsFor(string shaderId)
+        {
+            switch (shaderId)
+            {
+                case "bowshock": return new[] { "dome_side", "dome_three_quarter", "forward_hullcam" };
+                case "trail":    return new[] { "wake_side", "wake_three_quarter", "aft_hullcam" };
+                case "ember":    return new[] { "side_profile", "ember_three_quarter", "aft_hullcam" };
+                default:         return new[] { "side_profile", "forward_hullcam", "aft_hullcam" };
+            }
+        }
 
         public static void RenderAll()
         {
@@ -74,7 +92,7 @@ namespace KerbcamCI
                         shaderId == "bowshock" ? bowshockShader :
                         shaderId == "trail"    ? trailShader :
                         emberShader;
-                    foreach (var viewId in _viewIds)
+                    foreach (var viewId in ViewsFor(shaderId))
                     {
                         Debug.Log($"[Kerbcam-CI]   begin {fx.name}/{shaderId}/{viewId}");
                         try
@@ -102,9 +120,16 @@ namespace KerbcamCI
                 BuildProxyVessel(sceneRoot.transform);
                 AddDirectionalLight(sceneRoot.transform);
 
+                // Wind direction + windward profile drive both the FX mesh
+                // placement and the FX-anchored camera views. Computed BEFORE
+                // any FX renderer is parented under the root so the profile
+                // only measures the proxy vessel.
+                Vector3 windDir = WindDirFromInputs(fx.inputs);
+                var profile = ComputeWindwardProfile(sceneRoot.transform, windDir);
+
                 var camGo = new GameObject("__fx_preview_camera");
                 camGo.transform.SetParent(sceneRoot.transform, false);
-                ApplyCameraPose(camGo.transform, fx.camera, viewId);
+                ApplyCameraPose(camGo.transform, fx.camera, viewId, windDir, profile);
                 var cam = camGo.AddComponent<Camera>();
                 cam.clearFlags = CameraClearFlags.SolidColor;
                 cam.backgroundColor = new Color(0.05f, 0.07f, 0.12f, 1f);
@@ -123,8 +148,8 @@ namespace KerbcamCI
                 switch (shaderId)
                 {
                     case "plasma": SetupPlasma(sceneRoot.transform, cam, mat); break;
-                    case "bowshock": SetupBowshock(sceneRoot.transform, mat, fx.inputs); break;
-                    case "trail": SetupTrail(sceneRoot.transform, mat, fx.inputs); break;
+                    case "bowshock": SetupBowshock(sceneRoot.transform, mat, windDir, profile); break;
+                    case "trail": SetupTrail(sceneRoot.transform, mat, windDir, profile); break;
                     case "ember": SetupEmber(sceneRoot.transform, cam, mat, fx.inputs); break;
                 }
 
@@ -188,11 +213,8 @@ namespace KerbcamCI
         // wider and closer to the vessel; when wind is end-on, the dome
         // is narrower and further forward. Same logic mirrored on the
         // runtime in BowshockEffect.
-        private static void SetupBowshock(Transform root, Material mat, FxFixture.Inputs inputs)
+        private static void SetupBowshock(Transform root, Material mat, Vector3 windDir, WindwardProfile profile)
         {
-            Vector3 windDir = WindDirFromInputs(inputs);
-            var profile = ComputeWindwardProfile(root, windDir);
-
             // Dome width = 1.5× vessel windward radius (shock is wider than
             // body); depth = 0.55× width (flat oblate).
             float domeRadius = Mathf.Max(profile.WindwardRadius * 1.5f, 0.5f);
@@ -225,11 +247,8 @@ namespace KerbcamCI
         // matches the vessel's profile), then a small overlap pulls the
         // head INSIDE the vessel so the cylinder occludes the top edge.
         // Mirrored on runtime in TrailEffect.
-        private static void SetupTrail(Transform root, Material mat, FxFixture.Inputs inputs)
+        private static void SetupTrail(Transform root, Material mat, Vector3 windDir, WindwardProfile profile)
         {
-            Vector3 windDir = WindDirFromInputs(inputs);
-            var profile = ComputeWindwardProfile(root, windDir);
-
             var go = new GameObject("trail_tube");
             go.transform.SetParent(root, false);
             // Position: at the vessel's aft windward edge, pulled IN by
@@ -302,32 +321,33 @@ namespace KerbcamCI
             light.color = new Color(1f, 0.96f, 0.9f, 1f);
         }
 
-        // Camera presets that actually frame the FX in question — replaces
-        // the first iteration's `external/nose_up/body_out` set which left
-        // most FX outside the visible frustum.
-        //
-        //   side_profile:    pulled-back side view at (9, 1, 0) looking at
-        //                    (0, -3, 0). Frames the whole vessel + trail
-        //                    region + bowshock cone in one shot.
-        //   aft_hullcam:     body-mounted (0.85, -0.5, 0) angled aft-down
-        //                    so the trail tube and embers fill the frame —
-        //                    the kerbcam-on-booster looking back use case.
-        //   forward_hullcam: body-mounted (0.85, 0.8, 0) angled forward
-        //                    past the nose so the bowshock + nose tip are
-        //                    in frame — the kerbcam-on-body looking up.
-        private static void ApplyCameraPose(Transform t, FxFixture.CameraPose pose, string viewId)
+        // Camera presets. The body-mounted hullcam views and the 3.5 m
+        // side_profile are unchanged (LLVMpipe-proven — pulling side_profile
+        // back to even 5 m makes the plasma extrusion take minutes/render).
+        // The dome_/wake_/ember_ views are FX-anchored: they aim at where
+        // the effect actually is, computed from the same windward profile
+        // the mesh placement uses, so they stay framed across the sideways
+        // and diagonal wind fixtures.
+        private static void ApplyCameraPose(Transform t, FxFixture.CameraPose pose, string viewId,
+            Vector3 windDir, WindwardProfile profile)
         {
+            // A stable direction perpendicular to the wind axis — the "side"
+            // the side/three-quarter views shoot from.
+            Vector3 perpHelper = Mathf.Abs(windDir.y) < 0.99f ? Vector3.up : Vector3.forward;
+            Vector3 perp = Vector3.Cross(windDir, perpHelper).normalized;
+
+            float domeRadius = Mathf.Max(profile.WindwardRadius * 1.5f, 0.5f);
+            float domeDepth = domeRadius * 0.55f;
+            Vector3 domeCentre = windDir * (profile.ForwardStandoff + domeDepth * 0.5f);
+            Vector3 wakeHead = -windDir * Mathf.Max(profile.AftStandoff - 0.5f, 0f);
+            float domeDist = Mathf.Max(4.5f, domeRadius * 3.5f);
+
             switch (viewId)
             {
                 case "side_profile":
-                    // Original close (3.5 m) position — pulling back even to
-                    // 5 m makes LLVMpipe spend minutes per render on the
-                    // plasma extrusion. Look-at centred at origin so both
-                    // bowshock (above vessel) and trail (below) get partial
-                    // visibility — neither is fully framed but both register.
                     t.localPosition = new Vector3(3.5f, 0f, 0f);
                     t.localRotation = Quaternion.LookRotation(
-                        (new Vector3(0f, 0f, 0f) - t.localPosition).normalized, Vector3.up);
+                        (Vector3.zero - t.localPosition).normalized, Vector3.up);
                     return;
                 case "aft_hullcam":
                     t.localPosition = new Vector3(0.85f, -0.5f, 0.3f);
@@ -342,6 +362,31 @@ namespace KerbcamCI
                     t.localRotation = Quaternion.LookRotation(
                         new Vector3(-0.5f, 1.6f, 0f).normalized, Vector3.forward);
                     return;
+                case "dome_side":
+                    // Square-on to the dome's silhouette — shows the rim arc
+                    // and how the base sits against the nose.
+                    PlaceLookAt(t, domeCentre, perp * domeDist);
+                    return;
+                case "dome_three_quarter":
+                    // From the windward side at 45° — shows the curved face
+                    // and the dome/vessel standoff in depth.
+                    PlaceLookAt(t, domeCentre, (perp + windDir).normalized * domeDist);
+                    return;
+                case "wake_side":
+                    // Square-on a few metres down the tube — head emergence
+                    // from the hull plus the early taper in one frame.
+                    PlaceLookAt(t, wakeHead - windDir * 4f, perp * 9f);
+                    return;
+                case "wake_three_quarter":
+                    // From astern-and-side looking back up the tube at the
+                    // vessel — the view a chase cam gets of the wake.
+                    PlaceLookAt(t, wakeHead - windDir * 2f, (perp * 0.7f - windDir * 0.7f).normalized * 9f);
+                    return;
+                case "ember_three_quarter":
+                    // Leeward three-quarter — embers shed downwind off the
+                    // heated surfaces, so frame the vessel plus its lee side.
+                    PlaceLookAt(t, -windDir * 1f, (perp - windDir * 0.8f).normalized * 4.5f);
+                    return;
                 default:
                     if (pose == null) { t.localPosition = new Vector3(3.5f, 0f, 0f); t.LookAt(Vector3.zero, Vector3.up); return; }
                     t.localPosition = ToVec3(pose.position, new Vector3(3.5f, 0f, 0f));
@@ -350,6 +395,14 @@ namespace KerbcamCI
                     else t.LookAt(Vector3.zero, Vector3.up);
                     return;
             }
+        }
+
+        private static void PlaceLookAt(Transform t, Vector3 target, Vector3 offset)
+        {
+            t.localPosition = target + offset;
+            Vector3 dir = (target - t.localPosition).normalized;
+            Vector3 up = Mathf.Abs(Vector3.Dot(dir, Vector3.up)) > 0.95f ? Vector3.forward : Vector3.up;
+            t.localRotation = Quaternion.LookRotation(dir, up);
         }
 
         // ------------------------------------------------------------------

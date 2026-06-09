@@ -98,7 +98,10 @@ jobs:
           echo "--- preview PNGs ---"
           ls -la Previews/ || true
 
+      # always() so a hung/failed render still uploads everything rendered
+      # before it — a partial artifact beats losing the whole review cycle.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: fx-previews
           path: ci/kerbcam-shaders/Previews/
