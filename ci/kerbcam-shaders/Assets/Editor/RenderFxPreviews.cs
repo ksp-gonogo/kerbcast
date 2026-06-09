@@ -149,7 +149,7 @@ namespace KerbcamCI
                 {
                     case "plasma": SetupPlasma(sceneRoot.transform, cam, mat); break;
                     case "bowshock": SetupBowshock(sceneRoot.transform, mat, windDir, profile); break;
-                    case "trail": SetupTrail(sceneRoot.transform, mat, windDir, profile); break;
+                    case "trail": SetupTrail(sceneRoot.transform, mat, windDir, profile, viewId); break;
                     case "ember": SetupEmber(sceneRoot.transform, cam, mat, fx.inputs); break;
                 }
 
@@ -250,7 +250,7 @@ namespace KerbcamCI
         // matches the vessel's profile), then a small overlap pulls the
         // head INSIDE the vessel so the cylinder occludes the top edge.
         // Mirrored on runtime in TrailEffect.
-        private static void SetupTrail(Transform root, Material mat, Vector3 windDir, WindwardProfile profile)
+        private static void SetupTrail(Transform root, Material mat, Vector3 windDir, WindwardProfile profile, string viewId)
         {
             var go = new GameObject("trail_tube");
             go.transform.SetParent(root, false);
@@ -264,11 +264,14 @@ namespace KerbcamCI
             // not a circular tube. Mirrored on the runtime in TrailEffect.
             go.transform.rotation = Quaternion.LookRotation(-windDir, profile.MinorAxis(windDir));
             // Scale each perp axis of the tube to the vessel's elliptical
-            // silhouette, CAPPED at 1.0× — the close aft_hullcam camera
-            // sits about 0.9 m from the trail head, so a tube wider than
-            // ~0.6 m starts filling the near plane and LLVMpipe hangs on
-            // the resulting near-fullscreen additive triangles.
-            float scaleMajor = Mathf.Clamp(profile.RadiusMajor / 0.6f, 0.5f, 1.0f);
+            // silhouette. The major cap of 1.0× applies ONLY to the close
+            // aft_hullcam view — its camera sits about 0.9 m from the trail
+            // head, so a wide tube fills the near plane and LLVMpipe hangs
+            // on the near-fullscreen additive triangles. The pulled-back
+            // wake views get the uncrushed broadside ribbon (the runtime
+            // tube is 4 m so its 1.0× cap never crushes a real silhouette).
+            float majorCap = viewId == "aft_hullcam" ? 1.0f : 4.5f;
+            float scaleMajor = Mathf.Clamp(profile.RadiusMajor / 0.6f, 0.5f, majorCap);
             float scaleMinor = Mathf.Clamp(profile.RadiusMinor / 0.6f, 0.3f, 1.0f);
             go.transform.localScale = new Vector3(scaleMajor, scaleMinor, 1f);
             var mf = go.AddComponent<MeshFilter>();
