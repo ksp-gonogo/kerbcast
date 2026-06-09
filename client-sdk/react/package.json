@@ -1,6 +1,6 @@
 {
   "name": "@jonpepler/kerbcam-react",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "React components and hooks for kerbcam camera feeds.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "Jon Pepler",
