@@ -18,6 +18,11 @@ on:
   push:
     paths:
       - 'ci/kerbcam-shaders/**'
+      # Shared sources the Unity project compiles via Assets/Editor symlinks,
+      # and the committed Hullcam shader bundle the determinism test loads.
+      - 'Plugin/Kerbcam/Fx/Core/**'
+      - 'Plugin/Kerbcam/HullcamBlit/**'
+      - 'GameData/Kerbcam/HullcamShaders/**'
       - '.github/workflows/build-kerbcam-shaders.yml'
   workflow_dispatch:
 
@@ -124,3 +129,23 @@ jobs:
           path: ci/kerbcam-shaders/Previews/
           retention-days: 30
           if-no-files-found: warn
+
+      # Regression net for the per-camera Hullcam filter blit (c00fe16):
+      # compiles the plugin's HullcamFilterBlit.cs verbatim (via the
+      # Assets/Editor/SharedHullcamBlit symlink), loads the committed
+      # GameData/Kerbcam/HullcamShaders/shaders.linux MovieTime shader, and
+      # asserts each filter mode's blit output is byte-identical under
+      # hostile writes to the shared static material (plus reticle on/off
+      # policy vs a no-title baseline, plus a control that the legacy
+      # shared-static path visibly flickers). Same xvfb arrangement as the
+      # FX previews: -nographics would no-op Graphics.Blit and ReadPixels.
+      - name: Hullcam filter blit determinism test
+        working-directory: ci/kerbcam-shaders
+        timeout-minutes: 10
+        run: |
+          xvfb-run -a "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcamCI.HullcamBlitDeterminism.RunAll \
+            -buildTarget Linux64 \
+            -logFile -
