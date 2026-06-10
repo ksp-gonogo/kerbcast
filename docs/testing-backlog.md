@@ -29,7 +29,7 @@ Captured 2026-05-19. Rust-side unit + integration tests are in good shape (26 pa
 ### Bigger
 
 - [ ] Subprocess synthetic-frame harness: spawn `kerbcam-sidecar --shm-path /tmp/...`, the test process writes frames into the ring, asserts the daemon's stats output (and eventually the WebRTC track's RTP packet count).
-- [ ] KSP smoke-test checklist (`tests/manual/ksp_smoke.md`): canonical scene load, vessel-switch behaviour, undock, stage event, time-warp transitions, game window kill. Run before each release.
+- [x] KSP smoke-test checklist (`tests/manual/ksp_smoke.md`): canonical scene load, vessel-switch behaviour, undock, stage event, time-warp transitions, game window kill. Run before each release. *(Added 2026-06-10.)*
 - [ ] C# plugin-side unit tests once the kerbcam plugin migrates out of the OCISLY-spike branch. xUnit or NUnit against mocked `MuMechModuleHullCamera`.
 
 ## Won't test (intentional)
