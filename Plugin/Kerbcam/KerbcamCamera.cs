@@ -72,6 +72,11 @@ namespace Kerbcam
         public float FovMax { get; }
         public float Fov { get; private set; }
 
+        /* Consecutive Refresh() exceptions, owned by KerbcamCore's capture
+           loop: reset on a clean pass, camera quarantined at the threshold
+           so one persistently-broken camera can't break the rest. */
+        public int RefreshFailureStreak;
+
         private readonly PanCapability _panCap;
         public bool SupportsPan => _panCap.SupportsPan;
         public float PanYawMin => _panCap.YawMin;

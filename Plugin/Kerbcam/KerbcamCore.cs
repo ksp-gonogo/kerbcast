@@ -44,9 +44,30 @@ namespace Kerbcam
         private const int RingSlots = 4;
         private static readonly string RingDir = ResolveRingDir();
 
+        /* ~0.5s at 60fps: long enough that a transient scene-change hiccup
+           doesn't evict a healthy camera, short enough to stop a genuinely
+           broken one from log-spamming for minutes. */
+        private const int RefreshQuarantineThreshold = 30;
+
         private KerbcamSettings _settings;
         private readonly List<KerbcamCamera> _cameras = new List<KerbcamCamera>();
         private Process _sidecar;
+
+        /* Sidecar crash recovery (driven from LateUpdate). The Exited event
+           sets _sidecarExited so the per-frame check is a field read, not a
+           Process.HasExited syscall. Attempts are bounded with a growing
+           delay so a crash-looping sidecar can't thrash the machine; a
+           sustained healthy run refunds the budget so an isolated crash
+           hours later still recovers. */
+        private const int SidecarMaxRestarts = 5;
+        private const float SidecarRestartDelaySeconds = 5f;
+        private const float SidecarHealthyUptimeSeconds = 60f;
+        private volatile bool _sidecarExited;
+        private bool _sidecarRestartArmed;
+        private bool _sidecarGaveUp;
+        private float _sidecarRestartCooldown;
+        private float _sidecarUptime;
+        private int _sidecarRestartAttempts;
 
         // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
         // changed — KSP fps, shed level, per-camera effective layers / dims.
@@ -297,9 +318,17 @@ namespace Kerbcam
                 };
                 _sidecar.Exited += (sender, e) =>
                 {
-                    Debug.LogWarning($"[Kerbcam] sidecar exited (code {_sidecar.ExitCode})");
+                    _sidecarExited = true;
+                    /* sender, not _sidecar: a restart may have replaced the
+                       field by the time this fires. ExitCode can throw if the
+                       handle is already disposed. */
+                    try { Debug.LogWarning($"[Kerbcam] sidecar exited (code {((Process)sender).ExitCode})"); }
+                    catch (Exception) { Debug.LogWarning("[Kerbcam] sidecar exited"); }
                 };
 
+                /* Before Start(): an instant-crash could fire Exited ahead of
+                   a reset placed after it, losing the exit. */
+                _sidecarExited = false;
                 _sidecar.Start();
                 _sidecar.BeginOutputReadLine();
                 _sidecar.BeginErrorReadLine();
@@ -310,6 +339,49 @@ namespace Kerbcam
                 Debug.LogError($"[Kerbcam] failed to start sidecar: {ex}");
                 _sidecar = null;
             }
+        }
+
+        /* Restart a crashed sidecar: arm a delay on the first frame the exit
+           is seen, count it down, then relaunch. Gives up for the session
+           after SidecarMaxRestarts crashes; a healthy run of
+           SidecarHealthyUptimeSeconds resets the attempt count. */
+        private void MaybeRestartSidecar()
+        {
+            if (_sidecarGaveUp) return;
+
+            if (!_sidecarExited)
+            {
+                if (_sidecar != null && _sidecarRestartAttempts > 0)
+                {
+                    _sidecarUptime += Time.unscaledDeltaTime;
+                    if (_sidecarUptime >= SidecarHealthyUptimeSeconds)
+                        _sidecarRestartAttempts = 0;
+                }
+                return;
+            }
+
+            if (_settings == null || !_settings.AutoSpawnSidecar) return;
+
+            if (!_sidecarRestartArmed)
+            {
+                if (_sidecarRestartAttempts >= SidecarMaxRestarts)
+                {
+                    _sidecarGaveUp = true;
+                    Debug.LogError($"[Kerbcam] sidecar crashed {SidecarMaxRestarts} times — giving up until scene reload");
+                    return;
+                }
+                _sidecarRestartAttempts++;
+                _sidecarRestartCooldown = SidecarRestartDelaySeconds * _sidecarRestartAttempts;
+                _sidecarRestartArmed = true;
+                Debug.LogWarning($"[Kerbcam] sidecar exited — restarting in {_sidecarRestartCooldown:0}s (attempt {_sidecarRestartAttempts}/{SidecarMaxRestarts})");
+                return;
+            }
+
+            _sidecarRestartCooldown -= Time.unscaledDeltaTime;
+            if (_sidecarRestartCooldown > 0f) return;
+            _sidecarRestartArmed = false;
+            _sidecarUptime = 0f;
+            TryStartSidecar();
         }
 
         private static string ResolveSidecarBinary()
@@ -587,6 +659,7 @@ namespace Kerbcam
         private void LateUpdate()
         {
             UpdateFpsAverage();
+            MaybeRestartSidecar();
 
             // Telemetry: sample the GC collection counters once per frame and
             // fold this frame's wall-clock duration into the interval stats, so
@@ -704,9 +777,35 @@ namespace Kerbcam
             for (int i = 0; i < camCount; i++) if (_capturePermit[i]) captured++;
             _lastCapturedCount = captured > 0 ? captured : 1;
             long capStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            for (int i = 0; i < camCount; i++)
+            /* Backwards so a quarantine removal doesn't shift the
+               permit-to-camera index alignment of cameras not yet visited. */
+            for (int i = camCount - 1; i >= 0; i--)
             {
-                _cameras[i].Refresh(_capturePermit[i]);
+                var cam = _cameras[i];
+                try
+                {
+                    cam.Refresh(_capturePermit[i]);
+                    cam.RefreshFailureStreak = 0;
+                }
+                catch (Exception ex)
+                {
+                    /* Isolate per-camera failures: one camera throwing must
+                       not abort the other cameras' captures or the control
+                       logic below. A sustained streak means the camera is
+                       broken beyond self-recovery (it would otherwise spam
+                       the log every frame forever) — dispose it like a
+                       missed-destruction part. */
+                    cam.RefreshFailureStreak++;
+                    if (cam.RefreshFailureStreak == 1)
+                        Debug.LogError($"[Kerbcam] cam={cam.FlightId} Refresh threw: {ex}");
+                    if (cam.RefreshFailureStreak >= RefreshQuarantineThreshold)
+                    {
+                        Debug.LogError($"[Kerbcam] cam={cam.FlightId} quarantined after {cam.RefreshFailureStreak} consecutive Refresh failures");
+                        _cameras.RemoveAt(i);
+                        try { cam.DisposeDestroyed(); }
+                        catch (Exception dex) { Debug.LogError($"[Kerbcam] cam={cam.FlightId} quarantine dispose threw: {dex}"); }
+                    }
+                }
             }
             double capMs = (System.Diagnostics.Stopwatch.GetTimestamp() - capStart) * _msPerTick;
             _kerbcamFrameMs = _kerbcamFrameMs <= 0.0 ? capMs : _kerbcamFrameMs * 0.8 + capMs * 0.2;

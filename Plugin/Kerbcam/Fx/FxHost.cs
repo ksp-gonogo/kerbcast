@@ -110,7 +110,26 @@ namespace Kerbcam
             var dispatched = gated
                 ? new FxFrameState(null, state.NearCam, Vector3.zero, 0f, 0f, state.Dt, state.Time)
                 : state;
-            for (int i = 0; i < _effects.Count; i++) _effects[i].Render(dispatched);
+            /* FX are cosmetic: an effect that throws is dropped rather than
+               allowed to abort the camera's whole capture frame. Backwards so
+               removal doesn't skip the next effect. The layer bit stays in
+               _enabled, so a later SetEnabledLayers toggle re-creates the
+               effect — a deliberate retry path, not a leak. */
+            for (int i = _effects.Count - 1; i >= 0; i--)
+            {
+                var fx = _effects[i];
+                try
+                {
+                    fx.Render(dispatched);
+                }
+                catch (System.Exception ex)
+                {
+                    _effects.RemoveAt(i);
+                    Debug.LogError($"[Kerbcam] FX {fx.GetType().Name} threw during Render — disabling: {ex}");
+                    try { fx.Dispose(); }
+                    catch (System.Exception dex) { Debug.LogError($"[Kerbcam] FX {fx.GetType().Name} dispose threw: {dex}"); }
+                }
+            }
         }
 
         public void Dispose()
