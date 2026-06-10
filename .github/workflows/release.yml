@@ -420,14 +420,19 @@ jobs:
           zip -r "kerbcam-${TAG}.zip" GameData/
           echo "RELEASE_ZIP=kerbcam-${TAG}.zip" >> $GITHUB_ENV
 
+      # No GITHUB_REPO env: cliff.toml uses only local commit data, and
+      # setting it makes git-cliff fetch remote metadata it never renders —
+      # a transient GitHub API 500 once killed a release at this step.
+      # continue-on-error because a missing changelog must not block a
+      # release after the expensive Unity builds; the notes fall back to a
+      # plain git log below.
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
         id: git-cliff
+        continue-on-error: true
         with:
           config: cliff.toml
           args: --latest --strip all
-        env:
-          GITHUB_REPO: ${{ github.repository }}
 
       - name: Create GitHub Release
         env:
@@ -435,6 +440,10 @@ jobs:
           CLIFF_CHANGELOG: ${{ steps.git-cliff.outputs.content }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+          if [ -z "${CLIFF_CHANGELOG}" ]; then
+            PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            CLIFF_CHANGELOG="$(git log --oneline ${PREV_TAG:+${PREV_TAG}..}${TAG})"
+          fi
           {
             echo "## Installation"
             echo ""
