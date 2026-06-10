@@ -26,8 +26,8 @@
 
   <ItemGroup>
     <!-- The golden fixture the Rust writer emits; copied next to the binary. -->
-    <None Include="../../sidecar/testdata/control_block_v1.bin"
-          Link="control_block_v1.bin"
+    <None Include="../../sidecar/testdata/control_block_v2.bin"
+          Link="control_block_v2.bin"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::encoder::{EncoderBackend, SessionHealth};
-use crate::protocol::{CameraLifecycle, CameraState as ProtocolCameraState, Layer};
+use crate::protocol::{CameraLifecycle, CameraState as ProtocolCameraState, Layer, QualityPreset};
 use crate::shared_mem::{ControlBlock, MmapFrameRing, MmapRingConfig};
 
 /// On-disk shape of `global.status.json` — the plugin → sidecar push
@@ -144,6 +144,15 @@ pub struct ControlState {
     pub pan_seq: u32,
     /// As `pan_seq`, for absolute FoV (`apply_fov_change`).
     pub fov_seq: u32,
+    /// Viewer-requested quality clamp: an index into the plugin's
+    /// `QualityClamp.ViewerScales` table (0 = full, 3 = quarter), mapped
+    /// from the protocol's `QualityPreset` by `viewer_level()`. `None` =
+    /// auto, no viewer clamp. Last write wins across peers. The plugin
+    /// combines it as max(adaptive shed level scale-wise, viewer level):
+    /// it can only lower quality below the operator ceiling, never
+    /// raise it, and never touches the adaptive machinery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_level: Option<u32>,
 }
 
 /// Public shape returned by `GET /cameras` — what a browser sees before
@@ -461,6 +470,14 @@ pub struct CameraRegistry {
      * Subsequent writes bump atomically so concurrent peer handlers compose.
      */
     global_control_seq: AtomicU64,
+    /// Cameras whose sidecar-side state (e.g. viewer quality preset)
+    /// changed and needs a `camera-state-changed` broadcast to EVERY
+    /// connected peer. The plugin-status diff in `poll_status` can't see
+    /// these (they live in the sidecar's own `ControlState`, and the
+    /// effective render dims may not move at all when a preset lands
+    /// while shed already holds the camera lower), so the consume loop
+    /// drains this set each tick and broadcasts directly.
+    dirty_cameras: Mutex<std::collections::HashSet<u32>>,
 }
 
 const STATUS_LOG_CAP: usize = 12_288;
@@ -555,6 +572,7 @@ impl CameraRegistry {
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
+            dirty_cameras: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -917,6 +935,12 @@ impl CameraRegistry {
             let Some(cam) = cameras.get(&cam_status.flight_id) else {
                 continue;
             };
+            let viewer_quality = cam
+                .control
+                .lock()
+                .await
+                .viewer_level
+                .and_then(QualityPreset::from_viewer_level);
             delta.changed_cameras.push(ProtocolCameraState {
                 flight_id: cam_status.flight_id,
                 lifecycle: if cam.destroyed.load(Ordering::Acquire) {
@@ -948,6 +972,12 @@ impl CameraRegistry {
                 encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
                 degrade_level: cam.current_degrade(),
+                viewer_quality,
+                quality_limited_by: quality_limited_reason(
+                    cam_status.operator_width,
+                    cam_status.render_width,
+                    viewer_quality,
+                ),
             });
         }
 
@@ -1090,6 +1120,166 @@ impl CameraRegistry {
     /// without holding the registry's RwLock while encoding.
     pub async fn snapshot(&self) -> Vec<Arc<CameraState>> {
         self.cameras.read().await.values().cloned().collect()
+    }
+
+    /// Apply a viewer's quality request: store the preset (last write
+    /// wins across peers — there is one server-wide slot, not one per
+    /// subscriber) and flush the mapped viewer level to the plugin's
+    /// control block. `None` clears the clamp (auto). The plugin folds
+    /// the level into the SAME resolution path the adaptive shed uses,
+    /// as min(operator ceiling, shed scale, viewer scale) — this method
+    /// never touches the adaptive controller's state. Marks the camera
+    /// dirty so the consume loop broadcasts the new authoritative state
+    /// to every peer. Errors only on an unknown camera.
+    pub async fn apply_viewer_quality(
+        &self,
+        flight_id: u32,
+        preset: Option<QualityPreset>,
+    ) -> Result<(), String> {
+        let Some(cam) = self.get(flight_id).await else {
+            return Err(format!("no camera with flight_id={flight_id}"));
+        };
+        let snapshot = {
+            let mut ctrl = cam.control.lock().await;
+            ctrl.viewer_level = preset.map(|p| p.viewer_level());
+            ctrl.clone()
+        };
+        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+            warn!(flight_id, error = %e, "viewer quality flush failed");
+            return Err(format!("control flush failed: {e}"));
+        }
+        self.mark_camera_dirty(flight_id).await;
+        Ok(())
+    }
+
+    /// Flag a camera for a state broadcast on the consume loop's next tick.
+    pub async fn mark_camera_dirty(&self, flight_id: u32) {
+        self.dirty_cameras.lock().await.insert(flight_id);
+    }
+
+    /// Drain the dirty set (cameras needing a state broadcast to all peers).
+    pub async fn take_dirty_cameras(&self) -> Vec<u32> {
+        let mut dirty = self.dirty_cameras.lock().await;
+        dirty.drain().collect()
+    }
+
+    /// Authoritative protocol-shape snapshot of one camera, merging the
+    /// last plugin-reported effective state (render dims, layers, fov,
+    /// pan — when the status file has been seen) with the sidecar-owned
+    /// control state (viewer quality preset). Used for every
+    /// `camera-state-changed` push so each consumer sees the same view.
+    /// Falls back to optimistic defaults (effective == requested) before
+    /// the first status write, exactly like the Hello snapshot always did.
+    pub async fn protocol_state(&self, flight_id: u32) -> Option<ProtocolCameraState> {
+        let cam = self.get(flight_id).await?;
+        let ctrl = cam.control.lock().await.clone();
+        let per = {
+            let status = self.last_status.lock().await;
+            status
+                .as_ref()
+                .and_then(|s| s.cameras.iter().find(|c| c.flight_id == flight_id).cloned())
+        };
+
+        let all_layers = || vec![Layer::Near, Layer::Scaled, Layer::Galaxy];
+        let fallback_layers = if ctrl.layers.is_empty() {
+            all_layers()
+        } else {
+            ctrl.layers.clone()
+        };
+        let (layers, operator_layers) = match &per {
+            Some(p) => (p.layers.clone(), p.operator_layers.clone()),
+            None => (fallback_layers.clone(), fallback_layers),
+        };
+        let operator_width = per
+            .as_ref()
+            .map(|p| p.operator_width)
+            .unwrap_or_else(|| ctrl.width.unwrap_or(cam.max_width));
+        let operator_height = per
+            .as_ref()
+            .map(|p| p.operator_height)
+            .unwrap_or_else(|| ctrl.height.unwrap_or(cam.max_height));
+        let render_width = per
+            .as_ref()
+            .map(|p| p.render_width)
+            .unwrap_or(operator_width);
+        let render_height = per
+            .as_ref()
+            .map(|p| p.render_height)
+            .unwrap_or(operator_height);
+        let fov = per
+            .as_ref()
+            .map(|p| p.fov)
+            .filter(|f| *f != 0.0)
+            .unwrap_or_else(|| ctrl.fov.unwrap_or(cam.fov_default));
+        let pan_yaw = per
+            .as_ref()
+            .map(|p| p.pan_yaw)
+            .unwrap_or_else(|| ctrl.pan_yaw.unwrap_or(0.0));
+        let pan_pitch = per
+            .as_ref()
+            .map(|p| p.pan_pitch)
+            .unwrap_or_else(|| ctrl.pan_pitch.unwrap_or(0.0));
+
+        let viewer_quality = ctrl.viewer_level.and_then(QualityPreset::from_viewer_level);
+        let quality_limited_by =
+            quality_limited_reason(operator_width, render_width, viewer_quality);
+
+        Some(ProtocolCameraState {
+            flight_id,
+            lifecycle: if cam.destroyed.load(Ordering::Acquire) {
+                CameraLifecycle::Destroyed
+            } else {
+                CameraLifecycle::Active
+            },
+            part_name: cam.part_name.clone(),
+            part_title: cam.part_title.clone(),
+            camera_name: cam.camera_name.clone(),
+            vessel_name: cam.vessel_name.clone(),
+            layers,
+            operator_layers,
+            render_width,
+            render_height,
+            operator_width,
+            operator_height,
+            supports_zoom: cam.supports_zoom,
+            fov,
+            fov_min: cam.fov_min,
+            fov_max: cam.fov_max,
+            supports_pan: cam.supports_pan,
+            pan_yaw,
+            pan_pitch,
+            pan_yaw_min: cam.pan_yaw_min,
+            pan_yaw_max: cam.pan_yaw_max,
+            pan_pitch_min: cam.pan_pitch_min,
+            pan_pitch_max: cam.pan_pitch_max,
+            encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
+            target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
+            degrade_level: cam.current_degrade(),
+            viewer_quality,
+            quality_limited_by,
+        })
+    }
+}
+
+/// Why the effective resolution differs from the viewer's request, if it
+/// does. Expected width = the operator ceiling scaled by the viewer's
+/// preset (1.0 when auto), floored to even exactly like the plugin's
+/// `QualityClamp` does. Anything below that means the adaptive perf
+/// machinery is holding the camera down: report `"throttled"` so UIs can
+/// mark the feed. The viewer request itself can never push the effective
+/// size ABOVE the expectation, so render > expected is impossible by
+/// construction (and treated as "not limited" if it ever shows up).
+pub fn quality_limited_reason(
+    operator_width: u32,
+    render_width: u32,
+    viewer_quality: Option<QualityPreset>,
+) -> Option<String> {
+    let scale = viewer_quality.map(|p| p.scale()).unwrap_or(1.0);
+    let expected = (((operator_width as f32) * scale) as u32 & !1).max(2);
+    if render_width < expected {
+        Some("throttled".to_string())
+    } else {
+        None
     }
 }
 
@@ -1377,5 +1567,168 @@ mod tests {
         assert_eq!(snap.pan_yaw, Some(12.0), "absolute pan must be untouched");
         assert_eq!(snap.pan_seq, 3, "deadman must not bump pan_seq");
         assert_eq!(snap.fov_seq, 4, "deadman must not bump fov_seq");
+    }
+
+    async fn registry_with_one_camera(
+        dir: &tempfile::TempDir,
+    ) -> (CameraRegistry, Arc<CameraState>) {
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        registry.rescan().await;
+        let cam = registry.get(1).await.expect("camera attached from ring");
+        (registry, cam)
+    }
+
+    /// `apply_viewer_quality` stores the preset's viewer level, flushes it
+    /// to the plugin's control block, and marks the camera dirty for the
+    /// all-peers broadcast. Multi-peer policy is last write wins: a second
+    /// apply (from any peer) replaces the first, and clearing (auto)
+    /// removes the field from the block entirely.
+    #[tokio::test]
+    async fn apply_viewer_quality_flushes_and_marks_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::Half))
+            .await
+            .expect("apply");
+        assert_eq!(cam.control.lock().await.viewer_level, Some(2));
+        let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+            .await
+            .expect("control block flushed");
+        let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
+        assert_eq!(snap.viewer_level, Some(2), "half preset = viewer level 2");
+        assert_eq!(registry.take_dirty_cameras().await, vec![1]);
+        assert!(
+            registry.take_dirty_cameras().await.is_empty(),
+            "dirty set drains"
+        );
+
+        // Last write wins: another peer's quarter replaces half.
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::Quarter))
+            .await
+            .expect("apply");
+        let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+            .await
+            .unwrap();
+        let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
+        assert_eq!(snap.viewer_level, Some(3));
+
+        // Auto clears the clamp (absent in the block, not zero).
+        registry.apply_viewer_quality(1, None).await.expect("apply");
+        let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+            .await
+            .unwrap();
+        let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
+        assert_eq!(snap.viewer_level, None);
+    }
+
+    #[tokio::test]
+    async fn apply_viewer_quality_rejects_unknown_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let err = registry
+            .apply_viewer_quality(999, Some(QualityPreset::Full))
+            .await
+            .expect_err("unknown camera must error");
+        assert!(err.contains("999"), "got {err}");
+        assert!(
+            registry.take_dirty_cameras().await.is_empty(),
+            "a rejected request must not broadcast"
+        );
+    }
+
+    /// The state pushed for a viewer-quality change carries the preset and
+    /// preserves the viewer's other control state (a quality request must
+    /// not clobber subscriptions / layers / fov, mirroring how every other
+    /// setter composes through the shared ControlState).
+    #[tokio::test]
+    async fn protocol_state_carries_viewer_quality() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        {
+            let mut ctrl = cam.control.lock().await;
+            ctrl.subscribed = true;
+            ctrl.fov = Some(42.0);
+        }
+
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::ThreeQuarter))
+            .await
+            .expect("apply");
+
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!(state.viewer_quality, Some(QualityPreset::ThreeQuarter));
+        // No plugin status yet: effective == requested, so nothing is limited.
+        assert_eq!(state.quality_limited_by, None);
+        let ctrl = cam.control.lock().await;
+        assert!(ctrl.subscribed, "quality apply must not clobber subscribed");
+        assert_eq!(ctrl.fov, Some(42.0), "quality apply must not clobber fov");
+    }
+
+    /// Once the plugin reports effective dims below the viewer's target,
+    /// the broadcast flags `qualityLimitedBy: "throttled"`; when the
+    /// adaptive controller recovers to (or above) the viewer target the
+    /// flag clears. The viewer request itself never *causes* the flag.
+    #[tokio::test]
+    async fn protocol_state_reports_throttled_from_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::Half))
+            .await
+            .expect("apply");
+
+        let write_status = |render_w: u32, render_h: u32| {
+            let path = dir.path().join("global.status.json");
+            let body = format!(
+                r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":1,"renderWidth":{render_w},"renderHeight":{render_h},"operatorWidth":1024,"operatorHeight":576,"layers":["NEAR"],"operatorLayers":["NEAR"],"fov":60.0,"panYaw":0.0,"panPitch":0.0}}]}}"#
+            );
+            std::fs::write(path, body).unwrap();
+        };
+
+        // Plugin honors the half preset exactly (1024 * 0.5 = 512): not limited.
+        write_status(512, 288);
+        registry.poll_status().await;
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!(state.render_width, 512);
+        assert_eq!(state.quality_limited_by, None, "request honored");
+
+        // Adaptive shed demotes below the viewer target: throttled.
+        write_status(256, 144);
+        registry.poll_status().await;
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!(state.viewer_quality, Some(QualityPreset::Half));
+        assert_eq!(state.quality_limited_by.as_deref(), Some("throttled"));
+    }
+
+    /// The pure expected-width computation: viewer scale applied to the
+    /// operator ceiling, floored to even like the plugin's QualityClamp.
+    #[test]
+    fn quality_limited_reason_thresholds() {
+        use QualityPreset::*;
+        // Auto: limited only below the operator ceiling.
+        assert_eq!(quality_limited_reason(1024, 1024, None), None);
+        assert_eq!(
+            quality_limited_reason(1024, 768, None).as_deref(),
+            Some("throttled")
+        );
+        // Half of 1024 = 512: exact match honored, below = throttled.
+        assert_eq!(quality_limited_reason(1024, 512, Some(Half)), None);
+        assert_eq!(
+            quality_limited_reason(1024, 510, Some(Half)).as_deref(),
+            Some("throttled")
+        );
+        // Render above the target (shed gentler than the preset) is fine.
+        assert_eq!(quality_limited_reason(1024, 768, Some(Half)), None);
+        // Odd products floor to even, matching the plugin's MakeEven.
+        assert_eq!(quality_limited_reason(1030, 772, Some(ThreeQuarter)), None);
     }
 }

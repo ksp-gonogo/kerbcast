@@ -1,5 +1,5 @@
 // Contract test: read the golden fixture the Rust sidecar emits
-// (sidecar/testdata/control_block_v1.bin) through the C# ControlBlock reader
+// (sidecar/testdata/control_block_v2.bin) through the C# ControlBlock reader
 // and assert it decodes to the exact values the Rust `fixture_state()` wrote.
 // Both sides validating the same bytes is what stops the hand-maintained binary
 // layout from drifting. Exit code 0 = pass, 1 = fail.
@@ -22,7 +22,7 @@ void Check(bool cond, string msg)
     }
 }
 
-string fixture = Path.Combine(AppContext.BaseDirectory, "control_block_v1.bin");
+string fixture = Path.Combine(AppContext.BaseDirectory, "control_block_v2.bin");
 Console.WriteLine($"fixture: {fixture}");
 Check(File.Exists(fixture), "golden fixture present");
 
@@ -48,6 +48,7 @@ if (block != null)
     Check(s.ZoomRate == 1.0f, "zoomRate == 1.0");
     Check(s.PanSeq == 9u, "panSeq == 9");
     Check(s.FovSeq == 4u, "fovSeq == 4");
+    Check(s.ViewerLevel == 2u, "viewerLevel == 2 (the half preset)");
     Check(s.Seq == 2L, "seqlock seq == 2 (exactly one published write)");
 
     // Change detection: re-reading the same (unchanged) block yields nothing.

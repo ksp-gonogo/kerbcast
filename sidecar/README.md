@@ -60,4 +60,4 @@ src/
 
 ## Testing
 
-`cargo test` covers the encoder backends (software everywhere, libva on Linux), ring round-trips, and two integration suites (`tests/`) that push synthetic frames through a real ring into a real encoder and assert NAL output + dropped-frame observability. The control-block layout is contract-tested from both languages against `testdata/control_block_v1.bin`.
+`cargo test` covers the encoder backends (software everywhere, libva on Linux), ring round-trips, and two integration suites (`tests/`) that push synthetic frames through a real ring into a real encoder and assert NAL output + dropped-frame observability. The control-block layout is contract-tested from both languages against `testdata/control_block_v2.bin`.

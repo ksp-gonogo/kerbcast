@@ -4,13 +4,13 @@
 //
 // Binary layout is the cross-language contract; this MUST stay byte-for-byte
 // in lockstep with `sidecar/src/shared_mem/control.rs`. Any field reorder /
-// addition is a LAYOUT_VERSION bump on both sides. `control_block_v1.bin` (the
+// addition is a LAYOUT_VERSION bump on both sides. `control_block_v2.bin` (the
 // golden fixture committed under the sidecar's testdata/) is what both sides'
 // tests validate against so they can't silently drift.
 //
 //   HEADER (4096 B, page-aligned):
 //     [0..8]   u64 magic = 0x0031424C_5254434B  ("KCTRLB1\0" little-endian)
-//     [8..12]  u32 version = 1
+//     [8..12]  u32 version = 2
 //     [12..16] padding
 //     [16..24] u64 seq  (seqlock: even = stable, odd = write in progress)
 //   BODY (at 4096; 256 B reserved):
@@ -27,6 +27,8 @@
 //     [+40]    f32 zoom_rate
 //     [+44]    u32 pan_seq
 //     [+48]    u32 fov_seq
+//     [+52]    u32 viewer_level  (viewer quality clamp: index into
+//                                 QualityClamp.ViewerScales; absent = auto)
 //
 // Seqlock read: load seq (Interlocked = acquire barrier); if odd the writer is
 // mid-write — retry; if it matches the last applied seq nothing changed — skip;
@@ -63,6 +65,9 @@ namespace Kerbcam
         public float? ZoomRate;
         public uint PanSeq;
         public uint FovSeq;
+        /// <summary>Viewer-requested quality clamp (index into
+        /// QualityClamp.ViewerScales). Null = auto, no viewer clamp.</summary>
+        public uint? ViewerLevel;
         /// <summary>The seqlock value this snapshot was read at (even).</summary>
         public long Seq;
     }
@@ -70,7 +75,7 @@ namespace Kerbcam
     public sealed class ControlBlock : IDisposable
     {
         public const ulong Magic = 0x0031_424C_5254_434BUL; // "KCTRLB1\0" LE
-        public const uint LayoutVersion = 1;
+        public const uint LayoutVersion = 2;
         public const int HeaderSize = 4096;
         public const int BodySize = 256;
         public const long TotalSize = HeaderSize + BodySize;
@@ -93,6 +98,7 @@ namespace Kerbcam
         private const int BZoomRate = HeaderSize + 40;
         private const int BPanSeq = HeaderSize + 44;
         private const int BFovSeq = HeaderSize + 48;
+        private const int BViewerLevel = HeaderSize + 52;
 
         // fields_present bits — one per Option/Vec field.
         public const uint FpLayers = 1u << 0;
@@ -104,6 +110,7 @@ namespace Kerbcam
         public const uint FpPanYawRate = 1u << 6;
         public const uint FpPanPitchRate = 1u << 7;
         public const uint FpZoomRate = 1u << 8;
+        public const uint FpViewerLevel = 1u << 9;
 
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewAccessor _view;
@@ -215,6 +222,7 @@ namespace Kerbcam
                 ZoomRate = OptF32(FpZoomRate, BZoomRate),
                 PanSeq = _view.ReadUInt32(BPanSeq),
                 FovSeq = _view.ReadUInt32(BFovSeq),
+                ViewerLevel = OptU32(FpViewerLevel, BViewerLevel),
                 Seq = seq,
             };
         }

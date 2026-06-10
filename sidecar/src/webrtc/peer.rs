@@ -48,9 +48,9 @@ use crate::cameras::CameraState as InternalCameraState;
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
-    CameraLifecycle, CameraSnapshotPayload, CameraState, CameraStateChangedPayload, ClientMessage,
-    ErrorPayload, ErrorSource, FlightIdPayload, HelloPayload, Layer, ServerMessage,
-    SetDegradePayload, SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload,
+    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorPayload, ErrorSource,
+    FlightIdPayload, HelloPayload, Layer, QualityPreset, ServerMessage, SetDegradePayload,
+    SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload,
     SetRenderSizePayload, SetThrottleMainScreenPayload, SetZoomRatePayload, SettingsStatePayload,
     SlotMapPayload,
 };
@@ -432,6 +432,9 @@ async fn handle_client_message(
         }
         ClientMessage::SetDegrade(SetDegradePayload { flight_id, level }) => {
             apply_degrade_change(&registry, &dc, peer_id, flight_id, level).await;
+        }
+        ClientMessage::SetQuality(SetQualityPayload { flight_id, preset }) => {
+            apply_quality_change(&registry, &dc, flight_id, preset).await;
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {
             // The encoder backends expose `request_keyframe()`; we call
@@ -1030,6 +1033,34 @@ async fn apply_zoom_rate_change(
     push_camera_state(registry, dc, flight_id).await;
 }
 
+/// Viewer quality preset. Validation is structural (an unknown preset
+/// string already fails the serde parse) plus the unknown-camera check
+/// inside `apply_viewer_quality`; the preset can only LOWER quality below
+/// the operator ceiling, so there is no upper bound to clamp here. Replies
+/// with the authoritative state; the registry's dirty mark makes the
+/// consume loop broadcast the same state to every other peer (last write
+/// wins, all UIs converge).
+async fn apply_quality_change(
+    registry: &Arc<CameraRegistry>,
+    dc: &Arc<RTCDataChannel>,
+    flight_id: u32,
+    preset: Option<QualityPreset>,
+) {
+    if let Err(message) = registry.apply_viewer_quality(flight_id, preset).await {
+        send_server_message(
+            dc,
+            &ServerMessage::Error(ErrorPayload {
+                message,
+                source: ErrorSource::Sidecar,
+            }),
+        )
+        .await;
+        return;
+    }
+    info!(flight_id, ?preset, "data-channel set-quality applied");
+    push_camera_state(registry, dc, flight_id).await;
+}
+
 async fn apply_degrade_change(
     registry: &Arc<CameraRegistry>,
     dc: &Arc<RTCDataChannel>,
@@ -1063,43 +1094,17 @@ async fn apply_degrade_change(
 }
 
 async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataChannel>) {
+    // Per-camera state via the registry's shared snapshot builder: the
+    // last plugin-reported effective state when one exists, optimistic
+    // operator-equals-effective defaults before the first status write.
+    // `list()` supplies the stable flight-id ordering.
     let cams = registry.list().await;
-    // Initial snapshot: optimistic defaults until the plugin's status
-    // file pushes the real effective state. Operator == effective for
-    // both layers and dims at this point; subsequent
-    // `camera-state-changed` messages from the status poller correct
-    // these once adaptive shedding kicks in.
-    let cameras: Vec<CameraState> = cams
-        .into_iter()
-        .map(|c| CameraState {
-            flight_id: c.flight_id,
-            lifecycle: c.lifecycle,
-            part_name: c.part_name,
-            part_title: c.part_title,
-            camera_name: c.camera_name,
-            vessel_name: c.vessel_name,
-            layers: vec![Layer::Near, Layer::Scaled, Layer::Galaxy],
-            operator_layers: vec![Layer::Near, Layer::Scaled, Layer::Galaxy],
-            render_width: c.max_width,
-            render_height: c.max_height,
-            operator_width: c.max_width,
-            operator_height: c.max_height,
-            supports_zoom: c.supports_zoom,
-            fov: c.fov,
-            fov_min: c.fov_min,
-            fov_max: c.fov_max,
-            supports_pan: c.supports_pan,
-            pan_yaw: 0.0,
-            pan_pitch: 0.0,
-            pan_yaw_min: c.pan_yaw_min,
-            pan_yaw_max: c.pan_yaw_max,
-            pan_pitch_min: c.pan_pitch_min,
-            pan_pitch_max: c.pan_pitch_max,
-            encoder_bitrate_bps: c.encoder_bitrate_bps,
-            target_bitrate_bps: c.target_bitrate_bps,
-            degrade_level: c.degrade_level,
-        })
-        .collect();
+    let mut cameras = Vec::with_capacity(cams.len());
+    for c in cams {
+        if let Some(state) = registry.protocol_state(c.flight_id).await {
+            cameras.push(state);
+        }
+    }
     send_server_message(
         dc,
         &ServerMessage::CameraSnapshot(CameraSnapshotPayload { cameras }),
@@ -1112,52 +1117,8 @@ async fn push_camera_state(
     dc: &Arc<RTCDataChannel>,
     flight_id: u32,
 ) {
-    let cam = match registry.get(flight_id).await {
-        Some(c) => c,
-        None => return,
-    };
-    let ctrl = cam.control.lock().await.clone();
-    let layers = if ctrl.layers.is_empty() {
-        vec![Layer::Near, Layer::Scaled, Layer::Galaxy]
-    } else {
-        ctrl.layers.clone()
-    };
-    let w = ctrl.width.unwrap_or(cam.max_width);
-    let h = ctrl.height.unwrap_or(cam.max_height);
-    let fov = ctrl.fov.unwrap_or(cam.fov_default);
-    let pan_yaw = ctrl.pan_yaw.unwrap_or(0.0);
-    let pan_pitch = ctrl.pan_pitch.unwrap_or(0.0);
-    let state = CameraState {
-        flight_id,
-        lifecycle: if cam.destroyed.load(Ordering::Acquire) {
-            CameraLifecycle::Destroyed
-        } else {
-            CameraLifecycle::Active
-        },
-        part_name: cam.part_name.clone(),
-        part_title: cam.part_title.clone(),
-        camera_name: cam.camera_name.clone(),
-        vessel_name: cam.vessel_name.clone(),
-        layers: layers.clone(),
-        operator_layers: layers,
-        render_width: w,
-        render_height: h,
-        operator_width: w,
-        operator_height: h,
-        supports_zoom: cam.supports_zoom,
-        fov,
-        fov_min: cam.fov_min,
-        fov_max: cam.fov_max,
-        supports_pan: cam.supports_pan,
-        pan_yaw,
-        pan_pitch,
-        pan_yaw_min: cam.pan_yaw_min,
-        pan_yaw_max: cam.pan_yaw_max,
-        pan_pitch_min: cam.pan_pitch_min,
-        pan_pitch_max: cam.pan_pitch_max,
-        encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
-        target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
-        degrade_level: cam.current_degrade(),
+    let Some(state) = registry.protocol_state(flight_id).await else {
+        return;
     };
     send_server_message(
         dc,

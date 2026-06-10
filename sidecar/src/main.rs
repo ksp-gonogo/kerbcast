@@ -284,6 +284,26 @@ async fn consume_loop(
             last_rescan = Instant::now();
         }
 
+        // Sidecar-side state changes (viewer quality requests) marked dirty
+        // by the data-channel handlers. Broadcast the authoritative state to
+        // EVERY peer each tick so all UIs converge on the last write —
+        // unlike the 1Hz status diff above, this also fires when the
+        // effective render dims didn't move (e.g. a preset set while the
+        // adaptive controller already holds the camera lower).
+        let dirty = registry.take_dirty_cameras().await;
+        if !dirty.is_empty() {
+            let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+            for flight_id in dirty {
+                let Some(state) = registry.protocol_state(flight_id).await else {
+                    continue;
+                };
+                let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
+                for peer in &snapshot {
+                    peer.push_message(&msg).await;
+                }
+            }
+        }
+
         // Prune dead peers — dropped Arcs propagate to the Weak refs
         // in each CameraState.tracks list, which we GC inline below.
         // Before forgetting the peer, wipe its SetDegrade entries from
@@ -454,6 +474,8 @@ async fn broadcast_destroyed_cameras(
             encoder_bitrate_bps: 0,
             target_bitrate_bps: 0,
             degrade_level: 0.0,
+            viewer_quality: None,
+            quality_limited_by: None,
         };
         let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
         for peer in &snapshot {

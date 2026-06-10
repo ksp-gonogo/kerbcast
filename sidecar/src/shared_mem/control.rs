@@ -7,7 +7,7 @@
 //! the plugin reads. The binary layout is a hard cross-language contract — it
 //! MUST stay byte-for-byte in lockstep with `Plugin/Kerbcam/ControlBlock.cs`.
 //! Any field reorder / addition is a `CONTROL_LAYOUT_VERSION` bump on both
-//! sides. `control_block_v1.bin` (in `testdata/`) is the golden fixture both
+//! sides. `control_block_v2.bin` (in `testdata/`) is the golden fixture both
 //! sides validate against so they can't silently drift.
 //!
 //! ```text
@@ -34,6 +34,9 @@
 //!   +40  4   f32 zoom_rate
 //!   +44  4   u32 pan_seq
 //!   +48  4   u32 fov_seq
+//!   +52  4   u32 viewer_level   (viewer quality clamp: index into the
+//!                                plugin's QualityClamp.ViewerScales; absent
+//!                                = auto, no viewer clamp)
 //! ```
 //!
 //! Seqlock (single writer / single reader): the writer stores `seq` odd
@@ -55,7 +58,7 @@ use crate::protocol::Layer;
 
 /// "KCTRLB1\0" little-endian. Distinct from the frame ring's "KERBCAM1".
 pub const CONTROL_MAGIC: u64 = 0x0031_424C_5254_434B;
-pub const CONTROL_LAYOUT_VERSION: u32 = 1;
+pub const CONTROL_LAYOUT_VERSION: u32 = 2;
 pub const CONTROL_HEADER_SIZE: usize = 4096;
 /// Reserved body region — far larger than the ~52 bytes used, leaving slack
 /// for future fields without a file-size change.
@@ -81,6 +84,7 @@ const B_PAN_PITCH_RATE: usize = 36;
 const B_ZOOM_RATE: usize = 40;
 const B_PAN_SEQ: usize = 44;
 const B_FOV_SEQ: usize = 48;
+const B_VIEWER_LEVEL: usize = 52;
 
 // `fields_present` bits — one per Option/Vec field that can be "unset".
 pub const FP_LAYERS: u32 = 1 << 0;
@@ -92,6 +96,7 @@ pub const FP_PAN_PITCH: u32 = 1 << 5;
 pub const FP_PAN_YAW_RATE: u32 = 1 << 6;
 pub const FP_PAN_PITCH_RATE: u32 = 1 << 7;
 pub const FP_ZOOM_RATE: u32 = 1 << 8;
+pub const FP_VIEWER_LEVEL: u32 = 1 << 9;
 
 pub fn layers_to_mask(layers: &[Layer]) -> u32 {
     let mut mask = 0u32;
@@ -192,6 +197,9 @@ impl ControlBlock {
         if s.zoom_rate.is_some() {
             present |= FP_ZOOM_RATE;
         }
+        if s.viewer_level.is_some() {
+            present |= FP_VIEWER_LEVEL;
+        }
 
         self.put_u32(B_FIELDS_PRESENT, present);
         // subscribed (u8) + 3 pad bytes.
@@ -212,6 +220,7 @@ impl ControlBlock {
         self.put_f32(B_ZOOM_RATE, s.zoom_rate.unwrap_or(0.0));
         self.put_u32(B_PAN_SEQ, s.pan_seq);
         self.put_u32(B_FOV_SEQ, s.fov_seq);
+        self.put_u32(B_VIEWER_LEVEL, s.viewer_level.unwrap_or(0));
     }
 }
 
@@ -233,6 +242,7 @@ pub struct ControlSnapshot {
     pub zoom_rate: Option<f32>,
     pub pan_seq: u32,
     pub fov_seq: u32,
+    pub viewer_level: Option<u32>,
 }
 
 fn rd_u32(buf: &[u8], at: usize) -> u32 {
@@ -246,7 +256,7 @@ fn rd_f32(buf: &[u8], at: usize) -> f32 {
 /// magic+version. Returns `None` if the bytes don't carry our layout — the
 /// reader's "not ready / wrong build" gate.
 pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
-    if buf.len() < CONTROL_HEADER_SIZE + B_FOV_SEQ + 4 {
+    if buf.len() < CONTROL_HEADER_SIZE + B_VIEWER_LEVEL + 4 {
         return None;
     }
     if u64::from_le_bytes(buf[H_MAGIC..H_MAGIC + 8].try_into().unwrap()) != CONTROL_MAGIC {
@@ -285,6 +295,7 @@ pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
         zoom_rate: opt_f32(FP_ZOOM_RATE, B_ZOOM_RATE),
         pan_seq: rd_u32(buf, b + B_PAN_SEQ),
         fov_seq: rd_u32(buf, b + B_FOV_SEQ),
+        viewer_level: opt_u32(FP_VIEWER_LEVEL, B_VIEWER_LEVEL),
     })
 }
 
@@ -309,6 +320,7 @@ mod tests {
             zoom_rate: Some(1.0),
             pan_seq: 9,
             fov_seq: 4,
+            viewer_level: Some(2), // viewer asked for the half preset
         }
     }
 
@@ -347,6 +359,15 @@ mod tests {
         assert_eq!(snap.zoom_rate, Some(1.0));
         assert_eq!(snap.pan_seq, 9);
         assert_eq!(snap.fov_seq, 4);
+        assert_eq!(snap.viewer_level, Some(2));
+
+        // Auto (no viewer clamp): the field decodes as absent, not 0.
+        let auto = ControlState {
+            viewer_level: None,
+            ..fixture_state()
+        };
+        let snap = decode(&write_to_vec(&auto)).expect("decodes");
+        assert_eq!(snap.viewer_level, None);
     }
 
     #[test]
@@ -377,7 +398,7 @@ mod tests {
     #[test]
     fn matches_golden_fixture() {
         let bytes = write_to_vec(&fixture_state());
-        let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/control_block_v1.bin");
+        let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/control_block_v2.bin");
 
         // Opt-in regeneration so the fixture is reproducible from this test.
         if std::env::var("KERBCAM_EMIT_CONTROL_FIXTURE").is_ok() {

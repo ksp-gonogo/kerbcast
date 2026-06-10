@@ -39,6 +39,58 @@ pub enum Layer {
     Galaxy,
 }
 
+/// Viewer-selectable resolution preset. Each maps to a fraction of the
+/// operator-configured render size (the settings.cfg Width/Height ceiling):
+/// full = 1.0, threeQuarter = 0.75, half = 0.5, quarter = 0.25. The steps
+/// mirror the plugin's shed-table resolution ladder so the viewer clamp and
+/// the adaptive controller move on the same grid, and a preset can never
+/// exceed the ring's allocated max (every scale is <= 1.0 of the ceiling).
+///
+/// Presets, not freeform WxH: a fixed menu keeps the unauthenticated
+/// viewer-writable surface tiny and aspect-correct by construction.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QualityPreset {
+    Full,
+    ThreeQuarter,
+    Half,
+    Quarter,
+}
+
+impl QualityPreset {
+    /// Plugin-side viewer level this preset maps to (index into the
+    /// plugin's `QualityClamp.ViewerScales` table).
+    pub fn viewer_level(self) -> u32 {
+        match self {
+            QualityPreset::Full => 0,
+            QualityPreset::ThreeQuarter => 1,
+            QualityPreset::Half => 2,
+            QualityPreset::Quarter => 3,
+        }
+    }
+
+    pub fn from_viewer_level(level: u32) -> Option<Self> {
+        match level {
+            0 => Some(QualityPreset::Full),
+            1 => Some(QualityPreset::ThreeQuarter),
+            2 => Some(QualityPreset::Half),
+            3 => Some(QualityPreset::Quarter),
+            _ => None,
+        }
+    }
+
+    /// Fraction of the operator render size this preset targets.
+    pub fn scale(self) -> f32 {
+        match self {
+            QualityPreset::Full => 1.0,
+            QualityPreset::ThreeQuarter => 0.75,
+            QualityPreset::Half => 0.5,
+            QualityPreset::Quarter => 0.25,
+        }
+    }
+}
+
 /// Lifecycle state of a camera. Transmitted in `CameraState` so clients
 /// can react to part destruction without a new message type.
 ///
@@ -131,6 +183,19 @@ pub struct CameraState {
     /// multiplies its effective bitrate by `(1 - 0.7 * level)` and
     /// skips fan-out for a fraction of frames at high levels.
     pub degrade_level: f32,
+    /// Viewer-requested resolution preset for this camera. Last write
+    /// wins across all connected peers; this broadcast is what keeps
+    /// every UI consistent. Absent/None = auto: no viewer clamp, the
+    /// operator ceiling and the adaptive controller alone decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_quality: Option<QualityPreset>,
+    /// Why the effective resolution sits below what the viewer asked
+    /// for (or below the operator ceiling when no preset is set).
+    /// `"throttled"` = the adaptive perf machinery is holding the
+    /// camera down; the viewer target is honored again on recovery.
+    /// Absent/None = the request is fully honored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_limited_by: Option<String>,
 }
 
 // Wrapper structs for the algebraic-enum content payloads. typeshare's
@@ -209,6 +274,20 @@ pub struct SetDegradePayload {
     /// subscribers so the noisiest consumer's request wins (same
     /// pattern as REMB picking the min bandwidth).
     pub level: f32,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetQualityPayload {
+    pub flight_id: u32,
+    /// Requested resolution preset, or absent/null for auto (clear the
+    /// viewer clamp). Future viewer-quality knobs are added here as
+    /// optional fields with serde defaults, so older clients keep
+    /// parsing — richer controls (bitrate, ladder toggles) stay
+    /// operator-only until deliberately opened up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<QualityPreset>,
 }
 
 #[typeshare]
@@ -357,6 +436,16 @@ pub enum ClientMessage {
     /// reduce bitrate + skip frames, which both creates the
     /// signal-loss aesthetic AND saves encoder CPU.
     SetDegrade(SetDegradePayload),
+    /// Set (or clear, with `preset: null`) a camera's viewer-requested
+    /// resolution preset. Server-wide, last write wins across peers; the
+    /// resulting `CameraStateChanged` broadcast keeps every UI
+    /// consistent. The effective resolution is always
+    /// min(operator ceiling, adaptive level, viewer preset): a preset
+    /// can never raise quality past the operator's settings.cfg
+    /// Width/Height, and the adaptive controller's demotes keep
+    /// winning until it recovers. Viewers can NOT change bitrate or
+    /// toggle the adaptive machinery through this message.
+    SetQuality(SetQualityPayload),
     /// Request an IDR (keyframe) on the next encode tick. Browsers send
     /// this when they've dropped enough frames to be unable to decode
     /// the current P-frame chain. Sidecar forwards to the camera's
@@ -482,6 +571,8 @@ mod tests {
                 encoder_bitrate_bps: 1_500_000,
                 target_bitrate_bps: 1_200_000,
                 degrade_level: 0.0,
+                viewer_quality: Some(QualityPreset::Half),
+                quality_limited_by: Some("throttled".into()),
             }],
         });
         let s = serde_json::to_string(&snap).unwrap();
@@ -494,6 +585,106 @@ mod tests {
         assert!(s.contains("\"supportsPan\":false"));
         assert!(s.contains("\"fovMin\":30"));
         assert!(s.contains("\"fovMax\":100"));
+        assert!(s.contains("\"viewerQuality\":\"half\""));
+        assert!(s.contains("\"qualityLimitedBy\":\"throttled\""));
+    }
+
+    /// Unset quality fields are omitted (not null) so the TypeScript
+    /// optional-field bindings match the wire, and old payloads without
+    /// the fields still deserialize (serde defaults).
+    #[test]
+    fn camera_state_quality_fields_optional() {
+        let state = CameraState {
+            flight_id: 1,
+            lifecycle: CameraLifecycle::Active,
+            part_name: String::new(),
+            part_title: String::new(),
+            camera_name: String::new(),
+            vessel_name: String::new(),
+            layers: vec![],
+            operator_layers: vec![],
+            render_width: 0,
+            render_height: 0,
+            operator_width: 0,
+            operator_height: 0,
+            supports_zoom: false,
+            fov: 0.0,
+            fov_min: 0.0,
+            fov_max: 0.0,
+            supports_pan: false,
+            pan_yaw: 0.0,
+            pan_pitch: 0.0,
+            pan_yaw_min: 0.0,
+            pan_yaw_max: 0.0,
+            pan_pitch_min: 0.0,
+            pan_pitch_max: 0.0,
+            encoder_bitrate_bps: 0,
+            target_bitrate_bps: 0,
+            degrade_level: 0.0,
+            viewer_quality: None,
+            quality_limited_by: None,
+        };
+        let s = serde_json::to_string(&state).unwrap();
+        assert!(!s.contains("viewerQuality"), "got {s}");
+        assert!(!s.contains("qualityLimitedBy"), "got {s}");
+
+        // Pre-quality-surface JSON (no fields at all) still parses.
+        let old = s.clone();
+        let back: CameraState = serde_json::from_str(&old).unwrap();
+        assert_eq!(back.viewer_quality, None);
+        assert_eq!(back.quality_limited_by, None);
+    }
+
+    #[test]
+    fn set_quality_roundtrips() {
+        let msg = ClientMessage::SetQuality(SetQualityPayload {
+            flight_id: 7,
+            preset: Some(QualityPreset::Quarter),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"type\":\"set-quality\""));
+        assert!(s.contains("\"flightId\":7"));
+        assert!(s.contains("\"preset\":\"quarter\""));
+        match serde_json::from_str::<ClientMessage>(&s).unwrap() {
+            ClientMessage::SetQuality(p) => {
+                assert_eq!(p.flight_id, 7);
+                assert_eq!(p.preset, Some(QualityPreset::Quarter));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Auto: explicit null AND an absent field both clear the preset.
+        let null_preset = r#"{"type":"set-quality","content":{"flightId":7,"preset":null}}"#;
+        match serde_json::from_str::<ClientMessage>(null_preset).unwrap() {
+            ClientMessage::SetQuality(p) => assert_eq!(p.preset, None),
+            _ => panic!("wrong variant"),
+        }
+        let absent_preset = r#"{"type":"set-quality","content":{"flightId":7}}"#;
+        match serde_json::from_str::<ClientMessage>(absent_preset).unwrap() {
+            ClientMessage::SetQuality(p) => assert_eq!(p.preset, None),
+            _ => panic!("wrong variant"),
+        }
+
+        // Garbage preset values are a parse error, not a silent default.
+        let garbage = r#"{"type":"set-quality","content":{"flightId":7,"preset":"8k"}}"#;
+        assert!(serde_json::from_str::<ClientMessage>(garbage).is_err());
+    }
+
+    #[test]
+    fn quality_preset_levels_roundtrip() {
+        for preset in [
+            QualityPreset::Full,
+            QualityPreset::ThreeQuarter,
+            QualityPreset::Half,
+            QualityPreset::Quarter,
+        ] {
+            assert_eq!(
+                QualityPreset::from_viewer_level(preset.viewer_level()),
+                Some(preset)
+            );
+            assert!(preset.scale() <= 1.0, "presets can only lower quality");
+        }
+        assert_eq!(QualityPreset::from_viewer_level(4), None);
     }
 
     #[test]
