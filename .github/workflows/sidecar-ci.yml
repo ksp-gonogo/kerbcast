@@ -5,8 +5,10 @@ name: sidecar-ci
 #
 # Validates: cargo fmt, cargo clippy, cargo test on every push to main and
 # every PR that touches sidecar/ or this workflow. Runs on ubuntu-latest
-# (tier-1 Linux) — macOS and Windows runners get added when their backends
-# are non-stubs and warrant the CI minutes.
+# (tier-1 Linux); macOS runners get added when their backends are
+# non-stubs and warrant the CI minutes. Windows runs a tier-2 job since
+# the Media Foundation backend landed: clippy + test on windows-2022 so
+# cfg(windows)-gated code can't rot unverified between releases.
 
 on:
   push:
@@ -192,3 +194,47 @@ jobs:
           # (kerbcam-sidecar + lib/) when consumers `gh run download -n`.
           path: staging
           if-no-files-found: error
+
+  windows-check:
+    # Tier-2 Windows lane: compiles the cfg(windows) Media Foundation
+    # backend (the `windows` crate dep only resolves on this runner) and
+    # runs the test suite. The runner has no hardware encoder MFT, so the
+    # MF probe correctly reports unavailable and the encode path itself
+    # is exercised only on real Windows+GPU machines (see
+    # live_tests/kerbcam.md); what this job locks down is type/cfg/clippy
+    # regressions that the Linux lane can't see. No perf budgets here,
+    # per the tier-2 policy in CLAUDE.md.
+    name: windows clippy + test
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: sidecar
+    steps:
+      - uses: actions/checkout@v6
+
+      # OpenH264's "source" feature compiles the codec's asm; same
+      # insurance as the win-x64 release job.
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install stable Rust + components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sidecar/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sidecar/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
