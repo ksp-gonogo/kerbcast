@@ -1,5 +1,6 @@
-// Shared loader for the kerbcam-shaders AssetBundle (built in CI by
-// build-kerbcam-shaders.yml, shipped at GameData/Kerbcam/kerbcam-shaders).
+// Shared loader for the kerbcam-shaders AssetBundle (built per platform in CI
+// by build-kerbcam-shaders.yml, shipped at GameData/Kerbcam/kerbcam-shaders
+// for Linux plus kerbcam-shaders.windows / kerbcam-shaders.osx).
 // FX effects fetch their shaders/materials through here. The bundle is loaded
 // once and cached; a missing bundle, missing shader, or shader with no variant
 // for the running graphics API returns null so callers degrade gracefully
@@ -16,7 +17,26 @@ namespace Kerbcam
         private static AssetBundle _bundle;
         private static bool _attempted;
 
+        // Internal AssetBundle name, identical across the per-platform builds
+        // (and the legacy unsuffixed Linux file on disk).
         private const string BundleName = "kerbcam-shaders";
+
+        // Shader variants are compiled per build target, so each platform
+        // ships its own bundle file. Linux keeps the unsuffixed name the
+        // pre-multi-platform releases used; Windows/macOS follow the
+        // HullcamShaders/shaders.linux platform-suffix precedent.
+        private static string PlatformBundleFileName()
+        {
+            switch (Application.platform)
+            {
+                case RuntimePlatform.WindowsPlayer:
+                    return BundleName + ".windows";
+                case RuntimePlatform.OSXPlayer:
+                    return BundleName + ".osx";
+                default:
+                    return BundleName;
+            }
+        }
 
         private static AssetBundle Bundle()
         {
@@ -36,12 +56,26 @@ namespace Kerbcam
                         return _bundle;
                     }
                 }
-                var path = Path.Combine(
-                    KSPUtil.ApplicationRootPath, "GameData", "Kerbcam", BundleName);
+                var dir = Path.Combine(
+                    KSPUtil.ApplicationRootPath, "GameData", "Kerbcam");
+                var path = Path.Combine(dir, PlatformBundleFileName());
                 if (!File.Exists(path))
                 {
-                    Debug.LogWarning($"[Kerbcam] FX shader bundle not found at {path}; atmospheric FX disabled");
-                    return null;
+                    // Installs from before the per-platform bundles ship only
+                    // the unsuffixed (Linux-built) file. Load it anyway: the
+                    // isSupported check in LoadMaterial catches a cross-platform
+                    // bundle, so this stays graceful rather than magenta.
+                    var legacy = Path.Combine(dir, BundleName);
+                    if (path != legacy && File.Exists(legacy))
+                    {
+                        Debug.LogWarning($"[Kerbcam] FX shader bundle {path} not found; falling back to legacy {legacy}");
+                        path = legacy;
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[Kerbcam] FX shader bundle not found at {path}; atmospheric FX disabled");
+                        return null;
+                    }
                 }
                 _bundle = AssetBundle.LoadFromFile(path);
                 if (_bundle == null)
