@@ -249,6 +249,41 @@ describe("CameraFeed - camera selection", () => {
     expect(style.maxHeight).toBe("min(40vh, 300px)");
   });
 
+  it("portals the open menu to document.body so tile clipping cannot cut it off", async () => {
+    const { client } = await buildConnectedSource(THREE_CAMERAS);
+
+    const { container } = renderFeed(client, { flightId: null });
+
+    fireEvent.click(screen.getByRole("button", { name: /starboard cam/i }));
+
+    const menu = screen.getByRole("menu");
+    // The menu lives on document.body, outside the tile's DOM subtree...
+    expect(menu.parentElement).toBe(document.body);
+    expect(container.contains(menu)).toBe(false);
+    // ...with fixed positioning so no ancestor overflow can clip it.
+    expect(getComputedStyle(menu).position).toBe("fixed");
+  });
+
+  it("pointer-down inside the portaled menu keeps it open; outside dismisses it", async () => {
+    const { client } = await buildConnectedSource(THREE_CAMERAS);
+
+    renderFeed(client, { flightId: null });
+
+    fireEvent.click(screen.getByRole("button", { name: /starboard cam/i }));
+    expect(screen.getByRole("menu")).toBeTruthy();
+
+    // A press inside the portaled menu is not "outside" even though it is
+    // outside the tile's subtree.
+    fireEvent.pointerDown(
+      screen.getByRole("menuitemradio", { name: /nose cam/i }),
+    );
+    expect(screen.getByRole("menu")).toBeTruthy();
+
+    // A press anywhere else dismisses.
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
   it("disambiguates same-named cameras by part title", async () => {
     const { client } = await buildConnectedSource([
       makeCamera({ flightId: 42, cameraName: "NavCam", vesselName: "Kerbal X", partTitle: "NavCam" }),

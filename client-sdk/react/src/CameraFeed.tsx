@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
 import { KerbcamProvider, useKerbcamClient } from "./context";
@@ -21,6 +22,37 @@ import { isCameraDestroyed } from "./lifecycle";
 // Tuning constants
 // ---------------------------------------------------------------------------
 const PAN_BALL_RADIUS = 15; // pixel deflection bound (full = rate 1)
+const MENU_MAX_WIDTH = 260; // matches CameraMenu's CSS cap
+const MENU_MAX_HEIGHT = 300; // matches CameraMenu's min(40vh, 300px) cap
+const MENU_GAP = 4; // trigger-to-menu spacing
+const MENU_EDGE = 8; // minimum inset from the viewport edge
+
+/*
+ * Fixed-position style for the portaled camera menu, anchored to the trigger
+ * button. Opens downward by default; flips above the trigger when there is
+ * not enough room below but there is above, otherwise clamps to the viewport.
+ */
+function computeMenuPosition(trigger: HTMLElement): React.CSSProperties {
+  const rect = trigger.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const width = Math.min(MENU_MAX_WIDTH, vw - 2 * MENU_EDGE);
+  const left = Math.min(
+    Math.max(rect.left, MENU_EDGE),
+    Math.max(MENU_EDGE, vw - width - MENU_EDGE),
+  );
+  const menuH = Math.min(0.4 * vh, MENU_MAX_HEIGHT);
+  const fitsBelow = rect.bottom + MENU_GAP + menuH <= vh - MENU_EDGE;
+  const fitsAbove = rect.top - MENU_GAP - menuH >= MENU_EDGE;
+  if (!fitsBelow && fitsAbove) {
+    return { left, bottom: vh - rect.top + MENU_GAP };
+  }
+  const top = Math.min(
+    rect.bottom + MENU_GAP,
+    Math.max(MENU_EDGE, vh - MENU_EDGE - menuH),
+  );
+  return { left, top };
+}
 
 /** Round n to the nearest even integer, minimum 2 (H.264 chroma requirement). */
 function toEvenPx(n: number): number {
@@ -482,8 +514,35 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const [menuOpen, setMenuOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
     const menuTriggerRef = useRef<HTMLButtonElement>(null);
+    const [menuPosition, setMenuPosition] = useState<React.CSSProperties | null>(
+      null,
+    );
+
+    /*
+     * The menu portals to document.body (fixed position) so the tile's
+     * overflow clipping cannot cut it off. Anchor it to the trigger at open
+     * and re-anchor on window resize/scroll while open.
+     */
+    useEffect(() => {
+      if (!menuOpen) {
+        setMenuPosition(null);
+        return;
+      }
+      const update = () => {
+        const trigger = menuTriggerRef.current;
+        if (trigger) setMenuPosition(computeMenuPosition(trigger));
+      };
+      update();
+      window.addEventListener("resize", update);
+      window.addEventListener("scroll", update, true);
+      return () => {
+        window.removeEventListener("resize", update);
+        window.removeEventListener("scroll", update, true);
+      };
+    }, [menuOpen]);
 
     // Escape closes the menu; outside pointer-down dismisses it.
+    // (menuRef points at the portaled menu, so clicks inside it stay "inside".)
     useEffect(() => {
       if (!menuOpen) return;
       const onKeyDown = (e: KeyboardEvent) => {
@@ -554,32 +613,37 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
           )}
         </TitleRow>
 
-        {menuOpen && hasCameras && (
-          <CameraMenu
-            ref={menuRef}
-            id={menuId}
-            role="menu"
-            aria-label="Camera"
-          >
-            {cameras.map((c) => (
-              <CameraMenuItem
-                key={c.flightId}
-                type="button"
-                role="menuitemradio"
-                aria-checked={c.flightId === flightId}
-                $selected={c.flightId === flightId}
-                onClick={() => {
-                  onSelectCamera?.(c.flightId);
-                  setMenuOpen(false);
-                  menuTriggerRef.current?.focus();
-                }}
-              >
-                {cameraLabel(c)} ({c.vesselName})
-                {isCameraDestroyed(c) ? " - signal lost" : ""}
-              </CameraMenuItem>
-            ))}
-          </CameraMenu>
-        )}
+        {menuOpen &&
+          hasCameras &&
+          menuPosition &&
+          createPortal(
+            <CameraMenu
+              ref={menuRef}
+              id={menuId}
+              role="menu"
+              aria-label="Camera"
+              style={menuPosition}
+            >
+              {cameras.map((c) => (
+                <CameraMenuItem
+                  key={c.flightId}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={c.flightId === flightId}
+                  $selected={c.flightId === flightId}
+                  onClick={() => {
+                    onSelectCamera?.(c.flightId);
+                    setMenuOpen(false);
+                    menuTriggerRef.current?.focus();
+                  }}
+                >
+                  {cameraLabel(c)} ({c.vesselName})
+                  {isCameraDestroyed(c) ? " - signal lost" : ""}
+                </CameraMenuItem>
+              ))}
+            </CameraMenu>,
+            document.body,
+          )}
 
         {showDebugInfo &&
           (camera ? (
@@ -1081,8 +1145,11 @@ const StepButtons = styled.div`
 `;
 
 const CameraMenu = styled.div`
-  margin-top: 4px;
-  max-width: 260px;
+  /* Portaled to document.body: fixed position (set inline from the trigger
+     rect) keeps it clear of the tile's overflow clipping. */
+  position: fixed;
+  z-index: 1000;
+  max-width: min(260px, calc(100vw - 16px));
   /* Cap the list so a long camera roster scrolls instead of spilling past
      the tile/viewport. 40vh keeps it sane on short windows; 300px on tall. */
   max-height: min(40vh, 300px);
