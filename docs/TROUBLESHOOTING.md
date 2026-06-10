@@ -68,7 +68,9 @@ string — the quickest "is it up" check.
 ## Choppy streams / low game fps
 
 This is the adaptive scaler doing its job: kerbcam caps its own main-thread
-cost and staggers captures rather than dropping quality. Tune in settings.cfg:
+cost and staggers captures rather than dropping quality. Tune in settings.cfg
+(put your changes in `GameData/Kerbcam/PluginData/settings.cfg` so they
+survive updates; see [INSTALL.md](INSTALL.md#configuration)):
 
 - `MaxKerbcamFrameBudgetMs` — main-thread ceiling for capture work.
 - `MaxCaptureFps` — per-camera stream-rate ceiling.

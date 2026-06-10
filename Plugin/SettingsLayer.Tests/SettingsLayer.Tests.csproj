@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone unit test for SettingsLayer.cs, the Unity-free key-application
+    helpers behind KerbcamSettings' layered load (shipped defaults file, then
+    the user override file on top). Compiles ONLY the helper (no KSP/Unity
+    assemblies). Run: `dotnet run`. Mirrors the ReadbackScheduler.Tests
+    pattern.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../Kerbcam/SettingsLayer.cs" />
+  </ItemGroup>
+
+</Project>

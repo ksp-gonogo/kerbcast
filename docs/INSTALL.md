@@ -25,12 +25,15 @@
 5. On the same machine, open `http://127.0.0.1:8088` in a browser. The bundled
    web page lists the vessel's cameras and starts streams when you click them.
 
-To watch from **another device** (the usual mission-control setup), edit
-`GameData/Kerbcam/settings.cfg`:
+To watch from **another device** (the usual mission-control setup), create
+`GameData/Kerbcam/PluginData/settings.cfg` (the update-proof user settings
+file, see [Configuration](#configuration)) containing:
 
 ```
-BindAddress = 0.0.0.0   // or your LAN IP
-Port = 8088
+Settings
+{
+  BindAddress = 0.0.0.0   // or your LAN IP
+}
 ```
 
 then browse to `http://<ksp-machine-ip>:8088` from the other device.
@@ -61,14 +64,37 @@ flight scene loads and stops it when you leave. Nothing else to run.
 
 ## Configuration
 
-Everything lives in `GameData/Kerbcam/settings.cfg`, which documents every
-field inline: bind address/port, capture resolution, adaptive-performance
+The shipped `GameData/Kerbcam/settings.cfg` documents every field inline:
+bind address/port, capture resolution, stream bitrate, adaptive-performance
 ceilings, Hullcam filter and atmospheric-FX toggles, and per-camera overrides.
+
+That file is part of the mod bundle, so every update replaces it. For
+settings that should survive updates, create
+`GameData/Kerbcam/PluginData/settings.cfg` (make the `PluginData` folder
+yourself; same format as the shipped file) and put only the keys you want to
+change in it, for example:
+
+```
+Settings
+{
+  BindAddress = 0.0.0.0
+  BitrateBps = 2500000
+}
+```
+
+Precedence is per key: the user file wins over the shipped file, and any key
+absent from both uses the built-in default. The release zip never contains
+`PluginData/`, so the file persists through reinstalls. KSP.log reports which
+of the two files were loaded at flight-scene start.
 
 ## Updating / uninstalling
 
-- **Update:** delete `GameData/Kerbcam/` and extract the new zip. Keep a copy
-  of your `settings.cfg` if you've customised it.
+- **Update:** delete `GameData/Kerbcam/` and extract the new zip. If you keep
+  user settings in `GameData/Kerbcam/PluginData/`, move that folder aside
+  first and restore it after (or delete everything in `GameData/Kerbcam/`
+  except `PluginData/`). Direct edits to the shipped `settings.cfg` do not
+  survive an update; the `PluginData/` user file is the supported way to
+  persist them.
 - **Uninstall:** delete `GameData/Kerbcam/`.
 
 If something doesn't work, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).

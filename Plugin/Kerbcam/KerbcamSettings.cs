@@ -3,6 +3,15 @@
 // `Settings { ... }` node parsed via KSP's ConfigNode API. All fields
 // are optional; missing ones fall back to the defaults below.
 //
+// Two files are consulted, both optional, layered key by key:
+//   GameData/Kerbcam/settings.cfg             shipped defaults; the release
+//                                             zip overwrites it on every
+//                                             update
+//   GameData/Kerbcam/PluginData/settings.cfg  user overrides; never in the
+//                                             zip, so it survives updates
+// Keys in the user file win over the shipped file; keys absent from both
+// keep the compiled-in defaults below.
+//
 // Top-level fields:
 //   BindAddress       host the sidecar's HTTP signalling endpoint binds
 //                     to. 127.0.0.1 = localhost only (the default). A LAN
@@ -273,23 +282,69 @@ namespace Kerbcam
         public static KerbcamSettings Load()
         {
             var settings = new KerbcamSettings();
-            var path = Path.Combine(
+            var defaultsPath = Path.Combine(
                 KSPUtil.ApplicationRootPath,
                 "GameData", "Kerbcam", "settings.cfg");
-            if (!File.Exists(path))
+            // User override file. Lives under PluginData/ because the release
+            // zip never contains that directory, so the file survives the
+            // documented "delete GameData/Kerbcam/ and re-extract" update flow
+            // (and CKAN-managed upgrades). PluginData/ is also exempt from
+            // ModuleManager's config scanning, which makes it the KSP-idiomatic
+            // home for files the loader shouldn't touch.
+            var userPath = Path.Combine(
+                KSPUtil.ApplicationRootPath,
+                "GameData", "Kerbcam", "PluginData", "settings.cfg");
+
+            var defaultsNode = LoadSettingsNode(defaultsPath);
+            var userNode = LoadSettingsNode(userPath);
+
+            if (defaultsNode == null && userNode == null)
             {
-                Debug.Log($"[Kerbcam] no settings.cfg at {path}; using defaults ({settings.HttpBind}, {settings.Width}×{settings.Height})");
+                Debug.Log($"[Kerbcam] no settings.cfg at {defaultsPath} or {userPath}; using built-in defaults ({settings.HttpBind}, {settings.Width}×{settings.Height})");
                 return settings;
             }
 
+            // Layered load: shipped defaults first, then the user file over
+            // the top. The Apply* helpers keep the current value when a key is
+            // absent, so a partial user file only changes the keys it names.
+            // Scalars from both files apply before any Camera nodes so the
+            // per-camera Width/Height caps see the final global dims.
+            if (defaultsNode != null) ApplyScalars(settings, defaultsNode);
+            if (userNode != null) ApplyScalars(settings, userNode);
+            if (defaultsNode != null) ApplyCameraNodes(settings, defaultsNode);
+            if (userNode != null) ApplyCameraNodes(settings, userNode);
+
+            var sources = defaultsNode == null
+                ? $"user overrides only ({userPath})"
+                : userNode == null
+                    ? defaultsPath
+                    : $"{defaultsPath} + user overrides ({userPath})";
+            var camCount = settings._initialLayers.Count;
+            Debug.Log($"[Kerbcam] settings loaded from {sources}: bind={settings.HttpBind} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
+            if (!IsLoopback(settings.BindAddress))
+            {
+                Debug.LogWarning($"[Kerbcam] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
+            }
+            return settings;
+        }
+
+        // Loads the top-level Settings node from a cfg file. Missing file is
+        // fine (returns null silently; the user file usually doesn't exist).
+        // A file that exists but has no Settings node warns and is skipped.
+        private static ConfigNode LoadSettingsNode(string path)
+        {
+            if (!File.Exists(path)) return null;
             var root = ConfigNode.Load(path);
             var node = root?.GetNode("Settings");
             if (node == null)
             {
-                Debug.LogWarning($"[Kerbcam] settings.cfg at {path} is missing a 'Settings' node; using defaults");
-                return settings;
+                Debug.LogWarning($"[Kerbcam] settings file at {path} is missing a 'Settings' node; skipping it");
             }
+            return node;
+        }
 
+        private static void ApplyScalars(KerbcamSettings settings, ConfigNode node)
+        {
             ApplyString(node, "BindAddress", v => settings.BindAddress = v);
             ApplyInt(node, "Port", v => settings.Port = v);
             ApplyInt(node, "Width", v => settings.Width = v);
@@ -314,7 +369,13 @@ namespace Kerbcam
             // seed values. Settings.cfg is the source of truth for
             // first-time-on-this-save defaults.
             ApplyBool(node, "ThrottleMainScreen", v => SeedThrottleMainScreen = v);
+        }
 
+        // Per-camera Camera{} blocks. Called once per settings file; a user
+        // file's Camera node for the same PartName overrides the defaults
+        // file's key by key, same as the scalars.
+        private static void ApplyCameraNodes(KerbcamSettings settings, ConfigNode node)
+        {
             foreach (var camNode in node.GetNodes("Camera"))
             {
                 var partName = camNode.GetValue("PartName")?.Trim();
@@ -362,14 +423,6 @@ namespace Kerbcam
                     settings._renderSize[partName] = (width, height);
                 }
             }
-
-            var camCount = settings._initialLayers.Count;
-            Debug.Log($"[Kerbcam] settings loaded: bind={settings.HttpBind} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
-            if (!IsLoopback(settings.BindAddress))
-            {
-                Debug.LogWarning($"[Kerbcam] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
-            }
-            return settings;
         }
 
         // Parse the AtmosphericFxLayers token list (CORE, BOWSHOCK, TRAIL,
@@ -414,66 +467,30 @@ namespace Kerbcam
             return mask == CameraLayers.None ? CameraLayers.All : mask;
         }
 
+        // Thin ConfigNode adapters over the Unity-free SettingsLayer helpers
+        // (unit-tested in Plugin/SettingsLayer.Tests). Absent keys keep the
+        // current value, which is what makes the defaults + user-file
+        // layering in Load() work; parse failures warn and keep the current
+        // value; floats parse with InvariantCulture.
+        private static void Warn(string msg) => Debug.LogWarning(msg);
+
         private static int? TryParseIntField(ConfigNode node, string key)
-        {
-            var raw = node.GetValue(key);
-            if (string.IsNullOrEmpty(raw)) return null;
-            if (int.TryParse(raw.Trim(), out int v)) return v;
-            Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' is not an integer; ignoring");
-            return null;
-        }
+            => SettingsLayer.TryParseInt(node.GetValue, key, Warn);
 
         private static void ApplyString(ConfigNode node, string key, System.Action<string> set)
-        {
-            var raw = node.GetValue(key);
-            if (!string.IsNullOrEmpty(raw)) set(raw.Trim());
-        }
+            => SettingsLayer.ApplyString(node.GetValue, key, set);
 
         private static void ApplyInt(ConfigNode node, string key, System.Action<int> set)
-        {
-            var raw = node.GetValue(key);
-            if (string.IsNullOrEmpty(raw)) return;
-            if (int.TryParse(raw.Trim(), out int v)) set(v);
-            else Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' is not an integer; using default");
-        }
+            => SettingsLayer.ApplyInt(node.GetValue, key, set, Warn);
 
         private static void ApplyBool(ConfigNode node, string key, System.Action<bool> set)
-        {
-            var raw = node.GetValue(key);
-            if (string.IsNullOrEmpty(raw)) return;
-            if (bool.TryParse(raw.Trim(), out bool v)) set(v);
-            else Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' is not a bool; using default");
-        }
+            => SettingsLayer.ApplyBool(node.GetValue, key, set, Warn);
 
         private static void ApplyFloat(ConfigNode node, string key, System.Action<float> set)
-        {
-            var raw = node.GetValue(key);
-            if (string.IsNullOrEmpty(raw)) return;
-            // Invariant culture: KSP config floats always use '.' as the decimal
-            // separator regardless of the player's locale.
-            if (float.TryParse(raw.Trim(), System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture, out float v))
-                set(v);
-            else Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' is not a number; using default");
-        }
+            => SettingsLayer.ApplyFloat(node.GetValue, key, set, Warn);
 
         // Parses three comma-separated floats: `x, y, z`.
         private static void ApplyVector3(ConfigNode node, string key, System.Action<Vector3> set)
-        {
-            var raw = node.GetValue(key);
-            if (string.IsNullOrEmpty(raw)) return;
-            var parts = raw.Split(',');
-            if (parts.Length != 3)
-            {
-                Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' must be three comma-separated floats; using default");
-                return;
-            }
-            if (float.TryParse(parts[0].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float x) &&
-                float.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float y) &&
-                float.TryParse(parts[2].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float z))
-                set(new Vector3(x, y, z));
-            else
-                Debug.LogWarning($"[Kerbcam] settings.cfg: {key}='{raw}' contains a non-float component; using default");
-        }
+            => SettingsLayer.ApplyFloat3(node.GetValue, key, (x, y, z) => set(new Vector3(x, y, z)), Warn);
     }
 }
