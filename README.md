@@ -1,5 +1,10 @@
 # kerbcam
 
+[![sidecar-ci](https://github.com/jonpepler/kerbcam/actions/workflows/sidecar-ci.yml/badge.svg)](https://github.com/jonpepler/kerbcam/actions/workflows/sidecar-ci.yml)
+[![plugin-ci](https://github.com/jonpepler/kerbcam/actions/workflows/plugin-ci.yml/badge.svg)](https://github.com/jonpepler/kerbcam/actions/workflows/plugin-ci.yml)
+[![protocol-ci](https://github.com/jonpepler/kerbcam/actions/workflows/protocol-ci.yml/badge.svg)](https://github.com/jonpepler/kerbcam/actions/workflows/protocol-ci.yml)
+[![web-ci](https://github.com/jonpepler/kerbcam/actions/workflows/web-ci.yml/badge.svg)](https://github.com/jonpepler/kerbcam/actions/workflows/web-ci.yml)
+
 A from-scratch successor to OCISLY for streaming Kerbal Space Program camera feeds to a browser. Hardware-accelerated H.264 over WebRTC, with full Hullcam VDS camera-type fidelity. Designed with Linux in mind.
 
 ## What it does
