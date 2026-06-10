@@ -32,6 +32,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using HullcamVDS;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
@@ -293,12 +294,33 @@ namespace Kerbcam
         // for the existing AsyncGPUReadback path to read.
         private CameraFilter _cameraFilter;
         /* dockingdisplay.png, passed to RenderTitlePage before each blit so
-           the shared mtShader _Title/_TitleTex uniforms are set
-           deterministically per camera rather than inherited from stale
-           shared state. Static and never destroyed: LoadTextureFile returns
-           the GameDatabase-cached instance Hullcam itself uses, so freeing it
-           would break Hullcam's own in-game reticle and every other camera. */
+           the _Title/_TitleTex uniforms are set deterministically per camera
+           rather than inherited from stale shared state. LoadTextureFile
+           decodes a fresh Texture2D from disk (it is NOT the GameDatabase
+           instance); the static field keeps the single copy alive for the
+           plugin's lifetime, shared by every kerbcam camera. */
         private static Texture2D _hullcamTitleTex;
+        /* Per-camera private clone of HullcamVDS's MovieTime material.
+           Hullcam's CameraFilter classes all write their uniforms onto one
+           protected static Material (mtShader) that is ALSO written every
+           display frame by Hullcam's own MovieTimeFilter on the flight
+           camera, and by every other kerbcam camera's filter blit. Blitting
+           through that shared material makes each camera's reticle and
+           filter state depend on write/draw interleaving with all the other
+           writers. Instead, each kerbcam camera blits through its own
+           Material on the same MovieTime shader: for the duration of the
+           filter call the static field is pointed at this material (see the
+           blit site in Refresh), so the filter class's uniform writes land
+           here and nobody else ever touches it. Built lazily at first blit
+           (the shared mtShader must exist to clone its shader); null until
+           then, and the blit falls back to the shared-static path. */
+        private Material _filterMaterial;
+        // Reflection handle for CameraFilter's protected static mtShader
+        // field. Resolved once; null (with the tried flag set) if the
+        // HullcamVDS assembly shape ever changes, in which case the blit
+        // keeps the legacy shared-static behaviour instead of failing.
+        private static FieldInfo s_mtShaderField;
+        private static bool s_mtShaderFieldTried;
         // kerbcam's own NightVision material, used instead of HullcamVDS's
         // additive-shift filter when the shader bundle is available.
         private Material _nvMaterial;
@@ -421,6 +443,12 @@ namespace Kerbcam
                 if (_hullcamTitleTex == null)
                 {
                     _hullcamTitleTex = CameraFilter.LoadTextureFile("dockingdisplay.png");
+                    // Hullcam clamps its own dockingDisplay instance in
+                    // InitializeAssets; LoadTextureFile leaves the default
+                    // Repeat. Match it so the reticle never tiles if a
+                    // V-hold roll offsets the title UV outside [0,1].
+                    if (_hullcamTitleTex != null)
+                        _hullcamTitleTex.wrapMode = TextureWrapMode.Clamp;
                 }
                 UnityEngine.Debug.Log($"[Kerbcam] cam={FlightId} HullcamVDS filter active: mode={mode}");
             }
@@ -428,6 +456,65 @@ namespace Kerbcam
             {
                 UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} BuildHullcamFilter failed: {ex.Message}");
             }
+        }
+
+        // CameraFilter's protected static mtShader field, resolved once.
+        private static FieldInfo MtShaderField()
+        {
+            if (!s_mtShaderFieldTried)
+            {
+                s_mtShaderFieldTried = true;
+                try
+                {
+                    s_mtShaderField = typeof(CameraFilter).GetField(
+                        "mtShader", BindingFlags.NonPublic | BindingFlags.Static);
+                }
+                catch (Exception)
+                {
+                    s_mtShaderField = null;
+                }
+                if (s_mtShaderField == null)
+                    UnityEngine.Debug.LogWarning(
+                        "[Kerbcam] CameraFilter.mtShader field not found; filter blits will use the shared material");
+            }
+            return s_mtShaderField;
+        }
+
+        // One of CameraFilter's protected static Texture2D fields
+        // (filmVignette, nvMesh, noise, ...), or null if unavailable.
+        private static Texture2D ReadFilterStaticTexture(string fieldName)
+        {
+            try
+            {
+                var f = typeof(CameraFilter).GetField(
+                    fieldName, BindingFlags.NonPublic | BindingFlags.Static);
+                return f?.GetValue(null) as Texture2D;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // Build this camera's private MovieTime material from the shared
+        // mtShader's Shader. A fresh material starts from the shader's
+        // property-block defaults (every texture slot "white", all floats
+        // at their declared defaults), so nothing stale is copied in. The
+        // three overlay texture slots are then seeded for the one filter
+        // class that never writes them itself (CameraFilterNightVision's
+        // mtShader fallback inherits _VignetteTex/_Overlay1Tex/_Overlay2Tex
+        // upstream, a pre-existing Hullcam bug); every other class
+        // overwrites all three on every blit, so the seed is inert there.
+        private static Material BuildFilterMaterial(Material sharedMtShader)
+        {
+            var mat = new Material(sharedMtShader.shader);
+            var vignette = ReadFilterStaticTexture("filmVignette");
+            var nvMesh = ReadFilterStaticTexture("nvMesh");
+            var noise = ReadFilterStaticTexture("noise");
+            if (vignette != null) mat.SetTexture("_VignetteTex", vignette);
+            if (nvMesh != null) mat.SetTexture("_Overlay1Tex", nvMesh);
+            if (noise != null) mat.SetTexture("_Overlay2Tex", noise);
+            return mat;
         }
 
         // Select (or lazily create) the pooled render-target set for this size
@@ -1504,19 +1591,62 @@ namespace Kerbcam
                 }
                 else if (_cameraFilter != null)
                 {
-                    /* Set _Title/_TitleTex on the shared mtShader before
-                       the blit so each camera's reticle state is determined
-                       by its own filter class, not by whatever the prior
-                       camera or MovieTimeFilter.OnRenderImage left behind.
-                       Passing title=true delegates the per-camera show/hide
-                       decision to RenderImageWithFilter: filters that should
-                       suppress the reticle (BWHiResTV, NightVision, etc.)
-                       overwrite _TitleTex=noneTX inside their own blit, so
-                       those cameras naturally show no reticle. Filters that
-                       leave _TitleTex alone (ColorHiResTV, DockingCam) show
-                       dockingdisplay.png, matching Hullcam's in-game view. */
-                    _cameraFilter.RenderTitlePage(true, _hullcamTitleTex);
-                    _cameraFilter.RenderImageWithFilter(_captureRt, _readbackRt);
+                    /* Run the Hullcam filter pass through THIS camera's
+                       private MovieTime material, never the shared static.
+                       CameraFilter's classes hardwire their writes and the
+                       blit to the protected static mtShader, which is also
+                       written every display frame by Hullcam's own
+                       MovieTimeFilter on the flight camera and by every
+                       other kerbcam camera's filter blit; any of those
+                       writers landing between our uniform writes and the
+                       GPU's execution of our blit flips the reticle on or
+                       off mid-stream (seen as reticle flicker on AerocamUP,
+                       mode 7, where _TitleTex is never re-written by the
+                       class itself). Pointing the static at our private
+                       material for the duration of the call routes the
+                       class's full per-blit uniform set AND the
+                       Graphics.Blit through state that only this camera
+                       ever writes, so every uniform the shader reads is
+                       deterministic regardless of interleaving.
+
+                       Reticle policy is unchanged from the original fix:
+                       title=true with dockingdisplay.png, mirroring
+                       MovieTimeFilter's hardcoded in-game state, and the
+                       per-class show/hide decision stays with the filter:
+                       BWLoResTV, BWHiResTV and NightVision overwrite
+                       _TitleTex=noneTX inside their own blit (no reticle);
+                       DockingCam, BWFilm, ColorFilm, ColorLoResTV and
+                       ColorHiResTV leave the title alone (reticle shown),
+                       matching Hullcam's in-game view of each mode.
+
+                       The finally restores the real static immediately, so
+                       Hullcam's own in-game rendering (which runs later in
+                       the frame, in OnRenderImage) is untouched. If the
+                       reflection handle or the shared material is missing,
+                       fall back to the legacy shared-static path rather
+                       than dropping the filter. */
+                    var mtField = MtShaderField();
+                    var sharedMt = mtField?.GetValue(null) as Material;
+                    if (_filterMaterial == null && sharedMt != null)
+                        _filterMaterial = BuildFilterMaterial(sharedMt);
+                    if (mtField != null && sharedMt != null && _filterMaterial != null)
+                    {
+                        mtField.SetValue(null, _filterMaterial);
+                        try
+                        {
+                            _cameraFilter.RenderTitlePage(true, _hullcamTitleTex);
+                            _cameraFilter.RenderImageWithFilter(_captureRt, _readbackRt);
+                        }
+                        finally
+                        {
+                            mtField.SetValue(null, sharedMt);
+                        }
+                    }
+                    else
+                    {
+                        _cameraFilter.RenderTitlePage(true, _hullcamTitleTex);
+                        _cameraFilter.RenderImageWithFilter(_captureRt, _readbackRt);
+                    }
                 }
                 else
                 {
@@ -1691,6 +1821,11 @@ namespace Kerbcam
                 try { _cameraFilter.Deactivate(); }
                 catch (Exception ex) { UnityEngine.Debug.LogWarning($"[Kerbcam] cam={FlightId} CameraFilter.Deactivate failed: {ex.Message}"); }
                 _cameraFilter = null;
+            }
+            if (_filterMaterial != null)
+            {
+                UnityEngine.Object.Destroy(_filterMaterial);
+                _filterMaterial = null;
             }
             // Tear down FX effects (detach their CBs, release materials) before
             // destroying the camera they're attached to.
