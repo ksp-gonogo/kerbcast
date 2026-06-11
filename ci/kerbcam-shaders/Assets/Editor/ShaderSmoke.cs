@@ -1,16 +1,31 @@
-// Per-shader render smoke test for the just-built kerbcam-shaders bundle.
+// Per-shader render smoke test for a just-built kerbcam-shaders bundle.
 //
-// Invoked from CI by:
+// Invoked from CI by (Linux bundle, glcore under xvfb):
 //   xvfb-run -a "$UNITY_EDITOR_PATH" -batchmode -quit \
 //      -projectPath . \
 //      -executeMethod KerbcamCI.ShaderSmoke.RenderAll \
 //      -buildTarget Linux64 -logFile -
+// and by the Windows job (Windows bundle, d3d11) with the env var
+// KERBCAM_SMOKE_BUNDLE_DIR=Bundles-windows selecting which bundle to load.
+//
+// VALIDATION BLIND SPOT, stated honestly: a graphics device can only create
+// and execute shader variants for its own API. The glcore run on the Linux
+// runner proves the glcore variants; it CANNOT execute d3d11 blobs, and
+// shader.isSupported is only a variant-presence check, so an invalid d3d11
+// blob sails through the Linux run green. That is exactly how v0.19.0
+// shipped a Windows bundle whose five d3d11 vertex shaders were all rejected
+// by the D3D11 runtime at draw time (E_INVALIDARG, 0x80070057): every
+// kerbcam-bundle camera streamed black and KSP.log gained 470k lines of
+// "ShaderProgram is unsupported" spam. The Windows-runner run of this same
+// test is the fix: D3D11 validates bytecode inside Create*Shader even on the
+// hosted runner's WARP rasterizer, so a bad blob fails the render there.
+// The plugin's KerbcamFxAssets render probe is the last-resort runtime net
+// for any bundle that still slips through.
 //
 // Catches "bundle built but a shader is broken" inside the blocking
 // build-kerbcam-shaders workflow, in seconds, instead of leaving it to the
 // slow FX preview render (now the non-blocking fx-previews.yml workflow).
-// For EVERY Shader asset in the freshly built Linux bundle
-// (Bundles-linux/kerbcam-shaders) it asserts:
+// For EVERY Shader asset in the freshly built bundle it asserts:
 //   (a) shader.isSupported on this graphics device;
 //   (b) the output of a small deterministic render through a material built
 //       from the shader is not Unity's magenta error pattern (the pink
@@ -67,7 +82,8 @@ namespace KerbcamCI
             var failures = new List<string>();
 
             List<Shader> shaders = LoadBundleShaders();
-            Debug.Log($"[Kerbcam-CI] ShaderSmoke: {shaders.Count} shader(s) in the Linux bundle");
+            Debug.Log($"[Kerbcam-CI] ShaderSmoke: {shaders.Count} shader(s) in {BundleDir()} "
+                + $"(device: {SystemInfo.graphicsDeviceType})");
 
             var found = new HashSet<string>();
             foreach (var s in shaders) found.Add(s.name);
@@ -93,13 +109,25 @@ namespace KerbcamCI
             Debug.Log("[Kerbcam-CI] ShaderSmoke: ALL SHADERS PASSED");
         }
 
+        /* Which Bundles-<platform> dir to smoke. The Linux job tests
+           Bundles-linux (glcore); the Windows job sets
+           KERBCAM_SMOKE_BUNDLE_DIR=Bundles-windows to test the d3d11
+           variants on a real D3D11 device. The loaded bundle's variants must
+           match the editor's own graphics API or every shader reports
+           unsupported, so each platform job tests its own bundle only. */
+        private static string BundleDir()
+        {
+            string dir = Environment.GetEnvironmentVariable("KERBCAM_SMOKE_BUNDLE_DIR");
+            return string.IsNullOrEmpty(dir) ? "Bundles-linux" : dir;
+        }
+
         /* The bundle BuildKerbcamShaders just produced, not the project's
            Assets/Shaders sources: a shader can compile as a loose asset and
            still be broken or missing in the bundle KSP loads. */
         private static List<Shader> LoadBundleShaders()
         {
             string path = Path.GetFullPath(Path.Combine(
-                Application.dataPath, "..", "Bundles-linux", "kerbcam-shaders"));
+                Application.dataPath, "..", BundleDir(), "kerbcam-shaders"));
             if (!File.Exists(path))
                 throw new FileNotFoundException(
                     $"kerbcam-shaders bundle not found at {path}; run BuildKerbcamShaders.BuildAll first");

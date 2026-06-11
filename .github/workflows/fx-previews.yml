@@ -54,11 +54,13 @@ jobs:
         with:
           unity-version: ${{ env.UNITY_VERSION }}
           version-file: 'None'
-          # Same module set as build-kerbcam-shaders.yml even though the
-          # previews only need the Linux editor: an identical install means
-          # cache-installation reuses the editor that workflow cached.
+          # Same module set as build-kerbcam-shaders.yml's build-unix job
+          # even though the previews only need the Linux editor: an identical
+          # install means cache-installation reuses the editor that workflow
+          # cached. (windows-mono left with the Linux d3d11 cross-compile;
+          # the Windows bundle now builds on a windows-2022 runner.)
           build-targets: StandaloneLinux64
-          modules: windows-mono mac-mono
+          modules: mac-mono
           cache-installation: true
 
       - name: Activate Unity Personal license

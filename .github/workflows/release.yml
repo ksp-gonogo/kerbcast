@@ -10,8 +10,17 @@ name: release
 #                             arm64 and Windows x64 (tier-2 software encode, no
 #                             native deps) — and uploads each as a per-rid
 #                             artifact.
-#   bundle         (~11 min)  collects the per-rid sidecar artifacts, builds the
-#                             plugin DLL + Linux shader bundles, assembles the
+#   build-windows-shaders     builds the kerbcam-shaders.windows bundle on a
+#                  (~15 min)  windows-2022 runner with the native Windows
+#                             shader compiler, then smoke-renders its d3d11
+#                             variants on a real D3D11 device. The Linux
+#                             editor's d3d11 cross-compile shipped invalid
+#                             vertex shader blobs in v0.19.0 (E_INVALIDARG at
+#                             draw time, black NightVision streams); see
+#                             build-kerbcam-shaders.yml for the full story.
+#   bundle         (~11 min)  collects the per-rid sidecar artifacts and the
+#                             Windows shader bundle, builds the plugin DLL +
+#                             Linux/macOS shader bundles, assembles the
 #                             complete GameData/Kerbcam/ install tree, and creates
 #                             the GitHub Release. needs publish-sdk so a Release
 #                             never claims packages that failed to publish, and a
@@ -275,9 +284,79 @@ jobs:
           path: staging-sidecar
           if-no-files-found: error
 
+  # Native-toolchain build of the Windows shader bundle. Mirrors the
+  # build-windows job in build-kerbcam-shaders.yml: the 2019.4 Linux editor's
+  # d3d11 cross-compile emits vertex shader blobs the Windows D3D11 runtime
+  # rejects with E_INVALIDARG while shader.isSupported stays true, so the
+  # Windows bundle must come from a Windows editor and be smoke-rendered on a
+  # real D3D11 device (the runner's WARP rasterizer validates the bytecode in
+  # Create*Shader). Runs in parallel with build-sidecar; the bundle job's own
+  # Unity activation happens only after this job releases the license.
+  build-windows-shaders:
+    name: build Windows shader bundle
+    runs-on: windows-2022
+    env:
+      UNITY_VERSION: 2019.4.40f1 (ffc62b691db5)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Unity Hub + Editor
+        uses: buildalon/unity-setup@v2
+        with:
+          unity-version: ${{ env.UNITY_VERSION }}
+          version-file: "None"
+          build-targets: StandaloneWindows64
+          cache-installation: true
+
+      - name: Activate Unity Personal license
+        uses: buildalon/activate-unity-license@v2
+        with:
+          license: "Personal"
+          username: ${{ secrets.UNITY_USERNAME }}
+          password: ${{ secrets.UNITY_PASSWORD }}
+
+      - name: Build kerbcam-shaders AssetBundle (windows)
+        working-directory: ci/kerbcam-shaders
+        shell: bash
+        run: |
+          status=0
+          "$UNITY_EDITOR_PATH" \
+            -batchmode -nographics -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildWindows \
+            -buildTarget Win64 \
+            -logFile unity-build.log || status=$?
+          cat unity-build.log
+          [ "$status" -eq 0 ] || exit "$status"
+          ls -la Bundles-windows/
+
+      - name: Shader render smoke test (Windows bundle, d3d11)
+        working-directory: ci/kerbcam-shaders
+        timeout-minutes: 10
+        shell: bash
+        env:
+          KERBCAM_SMOKE_BUNDLE_DIR: Bundles-windows
+        run: |
+          status=0
+          "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcamCI.ShaderSmoke.RenderAll \
+            -buildTarget Win64 \
+            -logFile unity-smoke.log || status=$?
+          cat unity-smoke.log
+          exit "$status"
+
+      - name: Upload Windows shader bundle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kerbcam-shaders-windows
+          path: ci/kerbcam-shaders/Bundles-windows/kerbcam-shaders
+          if-no-files-found: error
+
   bundle:
     name: GameData bundle + GitHub Release
-    needs: [publish-sdk, build-sidecar]
+    needs: [publish-sdk, build-sidecar, build-windows-shaders]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -336,12 +415,14 @@ jobs:
         with:
           unity-version: ${{ env.UNITY_VERSION }}
           version-file: "None"
-          # Windows/macOS player-support is for the kerbcam-shaders per-platform
-          # bundles; the HullcamVDS shaders.linux build stays Linux-only. The
-          # cross-targets must be requested as Hub module ids via `modules` —
-          # the action rejects non-host build-targets on Linux.
+          # macOS player-support is for the kerbcam-shaders.osx bundle; the
+          # HullcamVDS shaders.linux build stays Linux-only. The cross-target
+          # must be requested as a Hub module id via `modules` because the
+          # action rejects non-host build-targets on Linux. The Windows bundle comes
+          # from the build-windows-shaders job (native toolchain), not from a
+          # windows-mono cross-compile here.
           build-targets: StandaloneLinux64
-          modules: windows-mono mac-mono
+          modules: mac-mono
           cache-installation: true
 
       - name: Activate Unity Personal license
@@ -362,15 +443,23 @@ jobs:
             -logFile -
           cp Bundles-linux/shaders shaders.linux
 
-      - name: Build kerbcam-shaders (linux, windows, osx)
+      - name: Build kerbcam-shaders (linux, osx)
         working-directory: ci/kerbcam-shaders
         run: |
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildAll \
+            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildUnix \
             -buildTarget Linux64 \
             -logFile -
+
+      # The Windows bundle is built (and d3d11-smoke-tested) by the
+      # build-windows-shaders job; collect it for the assemble step.
+      - name: Download Windows shader bundle artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: kerbcam-shaders-windows
+          path: windows-shaders
 
       - name: Assemble GameData/Kerbcam
         run: |
@@ -411,7 +500,7 @@ jobs:
           # and the loader's fallback both expect it); Windows/macOS get
           # platform suffixes per the HullcamShaders/shaders.linux precedent.
           cp ci/kerbcam-shaders/Bundles-linux/kerbcam-shaders GameData/Kerbcam/
-          cp ci/kerbcam-shaders/Bundles-windows/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.windows
+          cp windows-shaders/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.windows
           cp ci/kerbcam-shaders/Bundles-osx/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.osx
 
           cp Plugin/settings.cfg GameData/Kerbcam/
