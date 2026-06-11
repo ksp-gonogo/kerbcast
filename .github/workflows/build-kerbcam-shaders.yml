@@ -164,7 +164,11 @@ jobs:
           unity-version: ${{ env.UNITY_VERSION }}
           version-file: 'None'
           build-targets: StandaloneWindows64
-          cache-installation: true
+          # NOT cached: a cache-restored Windows Unity install exits
+          # instantly without writing a log (installer/registry state is
+          # not in the cached directory; run 27330133502 vs the fresh
+          # install that passed). Fresh install costs ~10 min per run.
+          cache-installation: false
 
       - name: Activate Unity Personal license
         uses: buildalon/activate-unity-license@v2
@@ -187,7 +191,7 @@ jobs:
             -executeMethod KerbcamCI.BuildKerbcamShaders.BuildWindows \
             -buildTarget Win64 \
             -logFile unity-build.log || status=$?
-          cat unity-build.log
+          cat unity-build.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
           [ "$status" -eq 0 ] || exit "$status"
           echo "--- output bundles ---"
           ls -la Bundles-windows/
@@ -212,7 +216,7 @@ jobs:
             -executeMethod KerbcamCI.ShaderSmoke.RenderAll \
             -buildTarget Win64 \
             -logFile unity-smoke.log || status=$?
-          cat unity-smoke.log
+          cat unity-smoke.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
           exit "$status"
 
       - uses: actions/upload-artifact@v4
