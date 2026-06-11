@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use clap::Parser;
@@ -27,13 +27,14 @@ use kerbcam_sidecar::encoder::{
     resolve_bitrate_bps, select_backend, EncodeConfig, EncoderBackend, EncoderChoice, RawFrame,
     SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
 };
+use kerbcam_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
 use kerbcam_sidecar::protocol::{
     AdaptiveShedPayload, CameraLifecycle, CameraState as ProtocolCameraState,
     CameraStateChangedPayload, ServerMessage, SettingsStatePayload,
 };
 use kerbcam_sidecar::shared_mem::MmapRingConfig;
 use kerbcam_sidecar::signalling::{router, AppState};
-use kerbcam_sidecar::webrtc::KerbcamPeer;
+use kerbcam_sidecar::webrtc::{resync_after_camera_churn, KerbcamPeer};
 use kerbcam_sidecar::VERSION;
 
 /// Consecutive encode() failures before the consume loop drops a
@@ -92,6 +93,17 @@ struct Cli {
     /// test page is served at `GET /`; POST `/offer` accepts SDP.
     #[arg(long, default_value = "127.0.0.1:8088")]
     http_bind: SocketAddr,
+
+    /// Orphan protection: the KSP plugin touches `global.heartbeat` in the
+    /// shm dir ~1Hz for the whole game session. Once that file has been
+    /// seen at least once, the sidecar exits after its mtime stays stale
+    /// for longer than this many seconds on two consecutive checks
+    /// (covering a Deck suspend/resume race). Dev workflows without the
+    /// plugin never write the file, so the watch never arms. 0 disables.
+    /// Generous default: a long scene load blocks Unity's Update (and so
+    /// the heartbeat) for its whole duration.
+    #[arg(long, default_value_t = 90)]
+    heartbeat_timeout_secs: u64,
 }
 
 fn default_shm_dir() -> PathBuf {
@@ -202,6 +214,34 @@ async fn main() -> Result<()> {
         bitrate_bps,
     );
 
+    // Orphan watch: the plugin owns this process for the KSP session and
+    // kills it on a clean game exit; if KSP dies hard nothing does, so we
+    // self-exit once the plugin's heartbeat file goes stale. Pure decision
+    // logic (and the arming/streak rules) live in heartbeat::HeartbeatWatch.
+    let heartbeat_path = cli.shm_dir.join(HEARTBEAT_FILE);
+    let heartbeat_timeout = cli.heartbeat_timeout_secs;
+    let orphan_watch = async move {
+        if heartbeat_timeout == 0 {
+            std::future::pending::<()>().await;
+        }
+        let mut watch = HeartbeatWatch::new(Duration::from_secs(heartbeat_timeout));
+        loop {
+            sleep(Duration::from_secs(5)).await;
+            let mtime = tokio::fs::metadata(&heartbeat_path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if watch.observe(mtime, SystemTime::now()) {
+                info!(
+                    timeout_secs = heartbeat_timeout,
+                    path = %heartbeat_path.display(),
+                    "plugin heartbeat stale; assuming KSP exited without stopping us, shutting down",
+                );
+                break;
+            }
+        }
+    };
+
     // SIGTERM is what the plugin's process kill, systemd and container
     // runtimes send first — without a handler the runtime never unwinds
     // and the supervisor escalates to SIGKILL after its timeout. No-op
@@ -229,6 +269,9 @@ async fn main() -> Result<()> {
         }
         _ = terminate => {
             info!("SIGTERM received, shutting down");
+            Ok(())
+        }
+        _ = orphan_watch => {
             Ok(())
         }
     };
@@ -259,7 +302,17 @@ async fn consume_loop(
 
     loop {
         if last_rescan.elapsed() >= rescan_interval {
-            let newly_destroyed = registry.rescan().await;
+            let churn = registry.rescan().await;
+            // The sidecar persists across KSP scene changes, so ring churn
+            // (every camera removed on flight exit, re-attached on the next
+            // flight) happens under live peers: rebind surviving slot
+            // subscriptions to the re-attached cameras and push a fresh
+            // camera snapshot so browser lists drain and repopulate.
+            if !churn.attached.is_empty() || !churn.removed.is_empty() {
+                let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+                resync_after_camera_churn(&registry, &snapshot, &churn.attached).await;
+            }
+            let newly_destroyed = churn.newly_destroyed;
             // Status poll piggybacks on the rescan cadence — both are
             // ~1Hz and the plugin's status writer matches that rate.
             let delta = registry.poll_status().await;

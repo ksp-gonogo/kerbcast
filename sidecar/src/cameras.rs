@@ -81,6 +81,23 @@ pub struct StatusDelta {
     pub throttle_main_screen: Option<bool>,
 }
 
+/// Membership churn from one `rescan` pass over the shm dir. With the
+/// sidecar persisting for the whole KSP session, a scene change shows up
+/// as `removed` (flight exit deletes every ring) followed, one or more
+/// ticks later, by `attached` (the next flight recreates them, often
+/// with the same flight ids). The consume loop uses `attached` to rebind
+/// surviving peer subscriptions and pushes a fresh camera snapshot on
+/// any churn.
+#[derive(Debug, Default)]
+pub struct RescanOutcome {
+    /// Destroyed-tombstone transitions not yet broadcast to peers.
+    pub newly_destroyed: Vec<u32>,
+    /// Flight ids whose rings were attached this pass.
+    pub attached: Vec<u32>,
+    /// Flight ids dropped under normal teardown this pass.
+    pub removed: Vec<u32>,
+}
+
 /// In-memory mirror of a camera's control state. The data-channel message
 /// handlers mutate this struct and the registry's `flush_control` publishes the
 /// full state to the camera's shared-memory control block
@@ -646,19 +663,20 @@ impl CameraRegistry {
     /// disappeared under normal teardown. Tolerant of the directory not
     /// yet existing — the plugin may not have created it.
     ///
-    /// Returns the set of flight IDs that transitioned to `Destroyed`
-    /// this tick and have not yet had their broadcast sent. Callers
-    /// (the consume loop) use this to fan `camera-state-changed` out to
-    /// all peers, then call `acknowledge_destruction` to delete the
-    /// tombstone and mark the broadcast as sent.
-    pub async fn rescan(&self) -> Vec<u32> {
+    /// Returns the tick's membership churn. `newly_destroyed` drives the
+    /// destroyed-camera broadcast + `acknowledge_destruction`; `attached`
+    /// and `removed` let the consume loop resync long-lived peers across
+    /// a KSP scene change (the sidecar persists for the whole game
+    /// session, so a flight exit/re-entry shows up here as every ring
+    /// disappearing and then reappearing).
+    pub async fn rescan(&self) -> RescanOutcome {
         let mut found: HashMap<u32, PathBuf> = HashMap::new();
         let mut entries = match tokio::fs::read_dir(&self.shm_dir).await {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RescanOutcome::default(),
             Err(e) => {
                 warn!(dir = %self.shm_dir.display(), error = %e, "rescan read_dir failed");
-                return Vec::new();
+                return RescanOutcome::default();
             }
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -710,6 +728,7 @@ impl CameraRegistry {
 
         // --- Step 2: attach new rings (skips destroyed cameras; they have
         // no ring file, so they won't appear in `found`).
+        let mut attached: Vec<u32> = Vec::new();
         for (id, path) in &found {
             if cameras.contains_key(id) {
                 continue;
@@ -717,6 +736,7 @@ impl CameraRegistry {
             match MmapFrameRing::open(path, self.ring_cfg) {
                 Ok(ring) => {
                     let manifest = read_manifest(&self.shm_dir, *id).await;
+                    attached.push(*id);
                     info!(
                         flight_id = id,
                         path = %path.display(),
@@ -787,11 +807,15 @@ impl CameraRegistry {
             }
             still
         });
-        for id in removed {
+        for id in &removed {
             info!(flight_id = id, "camera ring removed (normal teardown)");
         }
 
-        newly_destroyed
+        RescanOutcome {
+            newly_destroyed,
+            attached,
+            removed,
+        }
     }
 
     /// Mark the destruction broadcast as sent and delete the info.json

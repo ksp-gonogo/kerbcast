@@ -8,6 +8,7 @@
 
 pub mod cameras;
 pub mod encoder;
+pub mod heartbeat;
 pub mod protocol;
 pub mod shared_mem;
 pub mod signalling;

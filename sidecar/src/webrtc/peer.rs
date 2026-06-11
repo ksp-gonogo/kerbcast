@@ -309,6 +309,34 @@ impl KerbcamPeer {
         release_all_bound(registry, &self.slots).await;
     }
 
+    /// Tracks of this peer's slots currently bound to `flight_id` (0 or 1
+    /// in practice; Subscribe never double-binds). Used by the consume
+    /// loop to rebind a surviving subscription when a camera's ring
+    /// disappears and reappears across a KSP scene change: the slot stays
+    /// bound through the gap, but the re-attached ring gets a brand-new
+    /// `CameraState` that doesn't know about this track yet.
+    pub async fn tracks_bound_to(&self, flight_id: u32) -> Vec<Arc<TrackLocalStaticSample>> {
+        self.slots
+            .lock()
+            .await
+            .iter()
+            .filter(|s| s.bound == Some(flight_id))
+            .map(|s| s.track.clone())
+            .collect()
+    }
+
+    /// Push a fresh camera snapshot over the control channel (no-op until
+    /// the channel opens). Server-initiated counterpart of the Hello-time
+    /// snapshot, used when registry membership churns mid-connection so a
+    /// browser's camera list drains and repopulates across scene changes.
+    pub async fn push_camera_snapshot(&self, registry: &Arc<CameraRegistry>) {
+        let dc = match self.control_channel.lock().await.as_ref() {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        send_camera_snapshot(registry, &dc).await;
+    }
+
     /// Server-initiated push to the browser. No-op if the control
     /// channel hasn't been opened yet (we drop the message rather than
     /// queue — pushes from the consume loop are state snapshots, so a
@@ -636,6 +664,53 @@ async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec
             }
             info!(flight_id, remaining, "released camera on peer teardown");
         }
+    }
+}
+
+/// Resync long-lived peers after registry membership churn (the consume loop
+/// calls this on every rescan that attached or removed rings). Two halves:
+///
+///   1. Rebind: a peer that stayed connected across a KSP scene change has
+///      slots still bound to flight ids whose rings just re-attached, but the
+///      re-attach built a brand-new `CameraState` with an empty track list and
+///      `subscribers == 0`. Re-add each bound slot's track and re-flush
+///      `set_subscribed(true)` so the plugin resumes rendering and the
+///      browser's existing video element picks the stream back up (the fresh
+///      encoder session opens with an IDR, so the decoder resyncs cleanly).
+///
+///   2. Snapshot push: send every peer a fresh `camera-snapshot` so browser
+///      camera lists drain and repopulate with the scene; clients already
+///      handle this message (it's the Hello-time priming snapshot).
+pub async fn resync_after_camera_churn(
+    registry: &Arc<CameraRegistry>,
+    peers: &[Arc<KerbcamPeer>],
+    attached: &[u32],
+) {
+    if peers.is_empty() {
+        return;
+    }
+    for &flight_id in attached {
+        let Some(cam) = registry.get(flight_id).await else {
+            continue;
+        };
+        let mut rebound = 0usize;
+        for peer in peers {
+            for track in peer.tracks_bound_to(flight_id).await {
+                cam.add_track(track).await;
+                rebound += 1;
+            }
+        }
+        if rebound > 0 {
+            registry.set_subscribed(flight_id, true).await;
+            info!(
+                flight_id,
+                tracks = rebound,
+                "re-attached camera rebound to surviving peer subscriptions",
+            );
+        }
+    }
+    for peer in peers {
+        peer.push_camera_snapshot(registry).await;
     }
 }
 
@@ -1233,6 +1308,70 @@ mod tests {
             freed,
             "pc.close() must release the sender's track Arc within ~2s — \
              this is the mechanism F4 relies on to free camera subscriptions"
+        );
+    }
+
+    // The persistent-sidecar scene-change contract: a peer that stays
+    // connected while every ring is deleted (flight exit) and recreated
+    // (flight re-entry, same flight id) must get its subscription rebound
+    // onto the brand-new CameraState by resync_after_camera_churn, so the
+    // stream resumes without the browser doing anything.
+    #[tokio::test]
+    async fn reattached_ring_rebinds_surviving_subscription() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let ring_path = dir.path().join("1.ring");
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf(), cfg));
+        registry.rescan().await;
+
+        let peer = Arc::new(
+            KerbcamPeer::new(registry.clone(), &[1], 2)
+                .await
+                .expect("peer"),
+        );
+        let cam = registry.get(1).await.expect("camera attached");
+        assert_eq!(
+            cam.subscribers.load(Ordering::Acquire),
+            1,
+            "initial subscription bound"
+        );
+
+        // Scene exit: the plugin deletes the ring; rescan drops the camera.
+        std::fs::remove_file(&ring_path).expect("delete ring");
+        let outcome = registry.rescan().await;
+        assert_eq!(outcome.removed, vec![1], "normal teardown reported");
+        assert!(registry.get(1).await.is_none(), "camera gone from registry");
+
+        // Scene re-entry: the same flight id reappears as a NEW CameraState
+        // that knows nothing about the still-bound peer slot.
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        let outcome = registry.rescan().await;
+        assert_eq!(outcome.attached, vec![1], "re-attach reported");
+        let cam2 = registry.get(1).await.expect("camera re-attached");
+        assert_eq!(
+            cam2.subscribers.load(Ordering::Acquire),
+            0,
+            "fresh CameraState starts unsubscribed"
+        );
+
+        resync_after_camera_churn(&registry, std::slice::from_ref(&peer), &outcome.attached).await;
+
+        assert_eq!(
+            cam2.subscribers.load(Ordering::Acquire),
+            1,
+            "subscription survives the scene change"
+        );
+        assert!(
+            cam2.control.lock().await.subscribed,
+            "plugin is told to resume rendering"
         );
     }
 }
