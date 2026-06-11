@@ -30,6 +30,15 @@ export interface KerbcamCameraHandle {
   readonly flightId: number;
   readonly state: CameraState | null;
   readonly mediaStream: MediaStream | null;
+  /**
+   * True while the camera has a live source whose frames have stopped
+   * arriving (the noise pipeline's stall detector). Always false when the
+   * noise pipeline is unavailable (no `captureStream`) or bypassed.
+   * Transitions are emitted as `stall` events.
+   */
+  readonly stalled: boolean;
+  /** Current {@link setStallStatic} setting. */
+  readonly stallStatic: boolean;
 
   setLayers(layers: Layer[]): Promise<void>;
   setRenderSize(width: number, height: number): Promise<void>;
@@ -69,6 +78,16 @@ export interface KerbcamCameraHandle {
    */
   configure(options: { noise?: Partial<NoiseConfig> }): void;
 
+  /**
+   * Choose the stall presentation baked into `mediaStream`: `true`
+   * (default) ramps the TV static in over the held last frame when the
+   * source stalls; `false` freezes the last frame with no static, leaving
+   * the staleness indication to the consumer's chrome (watch the `stall`
+   * event / {@link stalled}). Sourceless static (signal loss /
+   * camera-switch gap) is unaffected.
+   */
+  setStallStatic(enabled: boolean): void;
+
   on<K extends keyof KerbcamCameraEvents>(
     event: K,
     handler: (data: KerbcamCameraEvents[K]) => void,
@@ -81,6 +100,8 @@ export interface KerbcamCameraEvents {
   change: CameraState;
   /** Track arrival or teardown for this camera. `null` on disconnect. */
   stream: MediaStream | null;
+  /** Frames stopped arriving on a live source (`true`) / resumed (`false`). */
+  stall: boolean;
 }
 
 /** Configuration for {@link KerbcamClient} construction. */
@@ -444,6 +465,10 @@ class CameraHandle
    * intensity is pinned at full and degrade updates must not lower it.
    */
   private _sourceless = false;
+  /** Stall state mirrored from the pipeline's onStallChange callback. */
+  private _stalled = false;
+  /** Stall presentation (static vs frozen frame); survives pipeline rebuilds. */
+  private _stallStatic = true;
   private readonly client: KerbcamClient;
 
   constructor(flightId: number, client: KerbcamClient) {
@@ -460,11 +485,24 @@ class CameraHandle
     return this._mediaStream;
   }
 
+  get stalled(): boolean {
+    return this._stalled;
+  }
+
+  get stallStatic(): boolean {
+    return this._stallStatic;
+  }
+
   configure(options: { noise?: Partial<NoiseConfig> }): void {
     this._noiseOverride = options.noise ?? null;
     // Re-evaluate with the new noise setting: rebuild from whatever source
     // state we're currently in (live, sourceless, or torn down).
     this._applySource(this._rawStream);
+  }
+
+  setStallStatic(enabled: boolean): void {
+    this._stallStatic = enabled;
+    this._noisePipeline?.setStaticOnStall(enabled);
   }
 
   /** Internal — called by the client when CameraState pushes arrive. */
@@ -512,7 +550,10 @@ class CameraHandle
       // Reuse an existing pipeline; otherwise try to create one.
       if (!this._noisePipeline) {
         const initial = raw ? this._liveIntensity() : SOURCELESS_INTENSITY;
-        this._noisePipeline = tryCreateNoisePipeline(raw, initial);
+        this._noisePipeline = tryCreateNoisePipeline(raw, initial, {
+          staticOnStall: this._stallStatic,
+          onStallChange: (stalled) => this._setStalled(stalled),
+        });
       } else {
         this._noisePipeline.setSource(raw);
       }
@@ -527,6 +568,7 @@ class CameraHandle
       // Noise just got disabled — drop the pipeline and fall through to raw.
       this._noisePipeline.destroy();
       this._noisePipeline = null;
+      this._setStalled(false);
     }
 
     // Noise disabled, or captureStream unavailable (no pipeline creatable):
@@ -537,6 +579,12 @@ class CameraHandle
   private _setOutput(stream: MediaStream | null): void {
     this._mediaStream = stream;
     this.emit("stream", stream);
+  }
+
+  private _setStalled(stalled: boolean): void {
+    if (this._stalled === stalled) return;
+    this._stalled = stalled;
+    this.emit("stall", stalled);
   }
 
   private _liveIntensity(): number {
@@ -552,6 +600,7 @@ class CameraHandle
     this._noisePipeline = null;
     this._rawStream = null;
     this._sourceless = false;
+    this._setStalled(false);
     this._setOutput(null);
   }
 

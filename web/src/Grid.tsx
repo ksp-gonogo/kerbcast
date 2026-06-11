@@ -21,11 +21,12 @@ interface GridProps {
   tiles: TileData[];
   onTilesChange: (tiles: TileData[]) => void;
   showDebugInfo: boolean;
+  staticOnStale: boolean;
 }
 
 const GAP = 16; // 1rem; keep in sync with Root `gap`
 
-export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.JSX.Element {
+export function Grid({ tiles, onTilesChange, showDebugInfo, staticOnStale }: GridProps): React.JSX.Element {
   const cameras = useKerbcamCameras();
   const [showPerfNote, setShowPerfNote] = useState(false);
 
@@ -130,6 +131,7 @@ export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.
           variant={spotlightActive ? "cell" : "grid"}
           spotlightActive={spotlightActive}
           showDebugInfo={showDebugInfo}
+          staticOnStale={staticOnStale}
           onSelectCamera={(fid) => handleSelectCamera(i, fid)}
           onRemove={() => handleRemove(i)}
           onToggleSpotlight={() => handleToggleSpotlight(i)}

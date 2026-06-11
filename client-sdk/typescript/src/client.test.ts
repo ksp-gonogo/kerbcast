@@ -780,6 +780,7 @@ describe("KerbcamClient", () => {
           processedStream,
           setIntensity,
           setSource,
+          setStaticOnStall: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -823,6 +824,7 @@ describe("KerbcamClient", () => {
           processedStream,
           setIntensity: vi.fn(),
           setSource,
+          setStaticOnStall: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -941,6 +943,7 @@ describe("KerbcamClient", () => {
           processedStream,
           setIntensity: vi.fn(),
           setSource: vi.fn(),
+          setStaticOnStall: vi.fn(),
           destroy,
         });
       try {
@@ -964,6 +967,132 @@ describe("KerbcamClient", () => {
         expect(client.camera(42).mediaStream).toBeNull();
       } finally {
         createSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("stall surface (handle mirror of the pipeline's stall detector)", () => {
+    /*
+     * Stub pipeline that captures the options the handle creates it with, so
+     * tests can fire the onStallChange callback and inspect the staticOnStall
+     * seed without a real canvas.
+     */
+    function makePipelineSpy() {
+      const setStaticOnStall = vi.fn();
+      const pipeline = {
+        processedStream: new MediaStream(),
+        setIntensity: vi.fn(),
+        setSource: vi.fn(),
+        setStaticOnStall,
+        destroy: vi.fn(),
+      };
+      let opts: Parameters<typeof noise.tryCreateNoisePipeline>[2];
+      const createSpy = vi
+        .spyOn(noise, "tryCreateNoisePipeline")
+        .mockImplementation((_raw, _intensity, options) => {
+          opts = options;
+          return pipeline;
+        });
+      return {
+        setStaticOnStall,
+        createSpy,
+        fireStall: (stalled: boolean) => opts?.onStallChange?.(stalled),
+        creationOptions: () => opts,
+      };
+    }
+
+    /** Connected client with camera 42 registered; track not yet delivered. */
+    async function connectCamera42(
+      sidecar: MockSidecar,
+    ): Promise<KerbcamClient> {
+      sidecar.addCamera({ flightId: 42 });
+      const client = new KerbcamClient(
+        { host: "h", port: 1 },
+        sidecar.createTransport(),
+      );
+      vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+        Promise.resolve(MockSidecar.makeOfferResponse([42])),
+      );
+      await client.connect([42]);
+      sidecar.open();
+      return client;
+    }
+
+    it("stalled getter and stall events mirror the pipeline's transitions", async () => {
+      const spy = makePipelineSpy();
+      try {
+        const sidecar = new MockSidecar();
+        const client = await connectCamera42(sidecar);
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+
+        const cam = client.camera(42);
+        expect(cam.stalled).toBe(false);
+        const events: boolean[] = [];
+        cam.on("stall", (s) => events.push(s));
+
+        spy.fireStall(true);
+        expect(cam.stalled).toBe(true);
+        expect(events).toEqual([true]);
+
+        // Repeating the same state is deduped: no extra event.
+        spy.fireStall(true);
+        expect(events).toEqual([true]);
+
+        spy.fireStall(false);
+        expect(cam.stalled).toBe(false);
+        expect(events).toEqual([true, false]);
+      } finally {
+        spy.createSpy.mockRestore();
+      }
+    });
+
+    it("setStallStatic seeds pipeline creation and forwards live changes", async () => {
+      const spy = makePipelineSpy();
+      try {
+        const sidecar = new MockSidecar();
+        const client = await connectCamera42(sidecar);
+        const cam = client.camera(42);
+
+        // Default on; flipping before any pipeline exists just stores it.
+        expect(cam.stallStatic).toBe(true);
+        cam.setStallStatic(false);
+        expect(cam.stallStatic).toBe(false);
+        expect(spy.creationOptions()).toBeUndefined();
+
+        // The pipeline built on track arrival carries the stored setting.
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+        expect(spy.creationOptions()?.staticOnStall).toBe(false);
+
+        // Runtime flips forward to the live pipeline.
+        cam.setStallStatic(true);
+        expect(cam.stallStatic).toBe(true);
+        expect(spy.setStaticOnStall).toHaveBeenLastCalledWith(true);
+      } finally {
+        spy.createSpy.mockRestore();
+      }
+    });
+
+    it("teardown (disconnect) clears a latched stall", async () => {
+      const spy = makePipelineSpy();
+      try {
+        const sidecar = new MockSidecar();
+        const client = await connectCamera42(sidecar);
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+
+        const cam = client.camera(42);
+        const events: boolean[] = [];
+        cam.on("stall", (s) => events.push(s));
+
+        spy.fireStall(true);
+        expect(cam.stalled).toBe(true);
+
+        // The pipeline (and its stall detector) dies with the connection; a
+        // handle must not report a stale stall afterwards.
+        client.disconnect();
+        expect(cam.stalled).toBe(false);
+        expect(events).toEqual([true, false]);
+      } finally {
+        spy.createSpy.mockRestore();
       }
     });
   });

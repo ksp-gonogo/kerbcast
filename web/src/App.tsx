@@ -8,7 +8,15 @@ import { Grid } from "./Grid";
 import { Header } from "./Header";
 import { Settings } from "./SettingsPanel";
 import { ShedBanner } from "./ShedBanner";
-import { applyTheme, loadDebug, loadTheme, saveDebug, saveTheme } from "./settings";
+import {
+  applyTheme,
+  loadDebug,
+  loadStaticOnStale,
+  loadTheme,
+  saveDebug,
+  saveStaticOnStale,
+  saveTheme,
+} from "./settings";
 import type { ThemePreference } from "./settings";
 import { loadTiles, saveTiles, seedTiles } from "./tiles";
 import type { Tile as TileData } from "./tiles";
@@ -46,6 +54,9 @@ export function App({ client }: AppProps): React.JSX.Element {
     return t;
   });
   const [debug, setDebug] = useState<boolean>(() => loadDebug());
+  const [staticOnStale, setStaticOnStale] = useState<boolean>(() =>
+    loadStaticOnStale(),
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Tile state
@@ -72,8 +83,10 @@ export function App({ client }: AppProps): React.JSX.Element {
           <Settings
             theme={theme}
             debug={debug}
+            staticOnStale={staticOnStale}
             onThemeChange={(t: ThemePreference) => { saveTheme(t); applyTheme(t); setTheme(t); }}
             onDebugChange={(d: boolean) => { saveDebug(d); setDebug(d); }}
+            onStaticOnStaleChange={(s: boolean) => { saveStaticOnStale(s); setStaticOnStale(s); }}
             onClose={() => setSettingsOpen(false)}
           />
         )}
@@ -92,6 +105,7 @@ export function App({ client }: AppProps): React.JSX.Element {
             tiles={tiles}
             onTilesChange={setTiles}
             showDebugInfo={debug}
+            staticOnStale={staticOnStale}
           />
           {debug && (
             <DevPanel client={client} tileFlightIds={tileFlightIds} />

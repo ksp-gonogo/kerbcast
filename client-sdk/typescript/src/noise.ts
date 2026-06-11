@@ -11,6 +11,28 @@ const NOISE_MAX_H = 180;
  */
 const SOURCE_STALL_MS = 500;
 
+/*
+ * When a source that WAS delivering frames stalls, the full-static look
+ * ramps in over this window on top of the held last frame instead of
+ * cutting hard. Only degradation is softened: the first decoded frame
+ * drops the static outright, so recovery feels instant. Sources that
+ * never decoded a frame (fresh attach) keep the immediate full-static
+ * "waiting" look: there is no last frame to soften from.
+ */
+const STALL_RAMP_MS = 5000;
+
+export interface NoisePipelineOptions {
+  /**
+   * Composite static over a stalled-but-attached source (default true).
+   * When false a stalled source holds its last decoded frame with no
+   * static, so the consumer can mark staleness in its own chrome instead.
+   * Sourceless static (signal loss / camera-switch gap) is unaffected.
+   */
+  staticOnStall?: boolean;
+  /** Observe stall transitions (frames stopped / frames resumed). */
+  onStallChange?: (stalled: boolean) => void;
+}
+
 export interface NoisePipeline {
   readonly processedStream: MediaStream;
   setIntensity(level: number): void;
@@ -22,6 +44,8 @@ export interface NoisePipeline {
    * gap.
    */
   setSource(stream: MediaStream | null): void;
+  /** Runtime switch for {@link NoisePipelineOptions.staticOnStall}. */
+  setStaticOnStall(enabled: boolean): void;
   destroy(): void;
 }
 
@@ -35,6 +59,7 @@ export interface NoisePipeline {
 export function tryCreateNoisePipeline(
   rawStream: MediaStream | null,
   initialIntensity: number,
+  options?: NoisePipelineOptions,
 ): NoisePipeline | null {
   const canvas = document.createElement("canvas");
   if (typeof (canvas as HTMLCanvasElement & { captureStream?: unknown }).captureStream !== "function") {
@@ -55,6 +80,8 @@ export function tryCreateNoisePipeline(
   noiseCanvas.height = Math.ceil(NOISE_MAX_H / 2);
 
   let intensity = initialIntensity;
+  let staticOnStall = options?.staticOnStall ?? true;
+  const onStallChange = options?.onStallChange;
   let rafId: number | null = null;
   let destroyed = false;
 
@@ -84,6 +111,42 @@ export function tryCreateNoisePipeline(
     });
   };
 
+  /*
+   * Stall presentation state. stallStartTs anchors the static ramp;
+   * lastFrameCanvas holds a copy of the final decoded frame so each stalled
+   * draw can restore it pristine before compositing the ramping scrim and
+   * static (painting onto an unrestored canvas would accumulate to black
+   * within a few frames regardless of the ramp position).
+   */
+  let stallStartTs: number | null = null;
+  let stallHasFrame = false;
+  let lastFrameCanvas: HTMLCanvasElement | null = null;
+  let lastFrameCtx: CanvasRenderingContext2D | null = null;
+
+  const snapshotLastFrame = (): boolean => {
+    if (!lastFrameCanvas) {
+      lastFrameCanvas = document.createElement("canvas");
+      lastFrameCtx = lastFrameCanvas.getContext("2d");
+    }
+    if (!lastFrameCtx) return false;
+    lastFrameCanvas.width = canvas.width;
+    lastFrameCanvas.height = canvas.height;
+    lastFrameCtx.drawImage(canvas, 0, 0);
+    return true;
+  };
+
+  const setStalled = (next: boolean, now: number) => {
+    if (next === (stallStartTs !== null)) return;
+    if (next) {
+      stallStartTs = now;
+      stallHasFrame = lastFrameTs > 0 && snapshotLastFrame();
+    } else {
+      stallStartTs = null;
+      stallHasFrame = false;
+    }
+    onStallChange?.(next);
+  };
+
   const onMeta = () => {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
@@ -98,6 +161,8 @@ export function tryCreateNoisePipeline(
 
   const setSource = (stream: MediaStream | null) => {
     if (destroyed) return;
+    // Stall state belongs to the outgoing source; a swap starts clean.
+    setStalled(false, performance.now());
     if (stream) {
       video.srcObject = stream;
       lastFrameTs = 0; // full static until the first frame actually decodes
@@ -119,34 +184,68 @@ export function tryCreateNoisePipeline(
 
   const draw = () => {
     if (destroyed) return;
+    const now = performance.now();
     const cw = canvas.width;
     const ch = canvas.height;
     const nw = noiseCanvas.width;
     const nh = noiseCanvas.height;
 
     // A source that exists but hasn't decoded a frame recently (or yet) is
-    // shown exactly like no source at all — otherwise the decoder's starved
-    // output (macroblock smear) leaks through as a second static style.
+    // treated as stalled; otherwise the decoder's starved output
+    // (macroblock smear) leaks through as a second static style.
     const stalled =
       vfcSupported &&
       video.srcObject !== null &&
-      performance.now() - lastFrameTs > SOURCE_STALL_MS;
+      now - lastFrameTs > SOURCE_STALL_MS;
+    setStalled(stalled, now);
 
-    // Only draw the source frame when one is attached and decodable;
-    // otherwise the canvas keeps its prior contents and we composite static
-    // on top — which, sourceless, is the full-static signal-loss look.
+    /*
+     * Static strength and layer opacity for this frame. A delivering feed
+     * draws degrade-driven static at full layer opacity; a stall pins the
+     * static to full strength but ramps the LAYER in over the held last
+     * frame, so degradation eases in while recovery (the first decoded
+     * frame) is instant.
+     */
+    let eff = intensity;
+    let layerAlpha = 1;
+
     if (video.srcObject && !stalled && video.readyState >= 2) {
       ctx.drawImage(video, 0, 0, cw, ch);
-    } else if (!video.srcObject || stalled) {
-      // Sourceless or stalled: clear to black so static composites over a
-      // blank field rather than the last live frame.
+    } else if (!video.srcObject) {
+      // Sourceless: clear to black so static composites over a blank field
+      // rather than the last live frame.
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, cw, ch);
+    } else if (stalled) {
+      // Stall pins the noise to full strength; the handle's degrade-driven
+      // intensity (possibly near zero) belongs to a feed that is delivering.
+      eff = 1;
+      if (stallHasFrame && lastFrameCanvas) {
+        // Restore the held last frame, then ramp a black scrim in step with
+        // the static so the fully-ramped look matches the sourceless one.
+        ctx.drawImage(lastFrameCanvas, 0, 0, cw, ch);
+        if (!staticOnStall) {
+          // Frozen last frame, no static: the consumer's chrome carries the
+          // staleness indicator instead.
+          rafId = requestAnimationFrame(draw);
+          return;
+        }
+        layerAlpha = Math.min(1, (now - (stallStartTs ?? now)) / STALL_RAMP_MS);
+        ctx.globalAlpha = layerAlpha;
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.globalAlpha = 1;
+      } else {
+        // Never decoded a frame (waiting after attach): the established
+        // immediate full-static look; nothing to soften from.
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, cw, ch);
+        if (!staticOnStall) {
+          rafId = requestAnimationFrame(draw);
+          return;
+        }
+      }
     }
-
-    // Stall pins the noise to full strength — the handle's degrade-driven
-    // intensity (possibly near zero) belongs to a feed that is delivering.
-    const eff = stalled ? 1 : intensity;
 
     // Build noise at reduced resolution; composited up to full canvas size.
     const imageData = noiseCtx.createImageData(nw, nh);
@@ -171,7 +270,9 @@ export function tryCreateNoisePipeline(
       }
     }
     noiseCtx.putImageData(imageData, 0, 0);
+    ctx.globalAlpha = layerAlpha;
     ctx.drawImage(noiseCanvas, 0, 0, cw, ch);
+    ctx.globalAlpha = 1;
 
     rafId = requestAnimationFrame(draw);
   };
@@ -197,6 +298,9 @@ export function tryCreateNoisePipeline(
       intensity = level;
     },
     setSource,
+    setStaticOnStall(enabled: boolean) {
+      staticOnStall = enabled;
+    },
     destroy() {
       destroyed = true;
       if (rafId !== null) cancelAnimationFrame(rafId);

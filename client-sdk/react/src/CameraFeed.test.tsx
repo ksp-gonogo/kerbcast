@@ -150,6 +150,7 @@ function renderFeed(
     showDebugInfo?: boolean;
     renderSize?: "auto" | "none";
     enableQualityControl?: boolean;
+    staticOnStale?: boolean;
     ref?: React.Ref<CameraFeedHandle>;
   },
 ) {
@@ -575,6 +576,197 @@ describe("CameraFeed - SIGNAL LOST overlay", () => {
     const overlay = await screen.findByRole("status", { name: /signal lost/i });
     expect(overlay).toBeTruthy();
     expect(overlay.textContent).toMatch(/SIGNAL LOST/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stall presentation (staticOnStale)
+// ---------------------------------------------------------------------------
+
+/*
+ * The stall detector lives in the SDK's noise pipeline, which needs a canvas
+ * 2d context, captureStream, and requestVideoFrameCallback. The shared setup
+ * stubs captureStream; this adds the rest, captures the pipeline's rAF draw
+ * loop and rVFC frame callback, and mocks performance.now so tests can step
+ * a real feed into (and out of) a stall through the public client surface.
+ */
+function installStallEnv() {
+  let now = 0;
+  const fakeCtx = {
+    globalAlpha: 1,
+    fillStyle: "",
+    drawImage: vi.fn(),
+    fillRect: vi.fn(),
+    createImageData: vi.fn((w: number, h: number) => ({
+      data: new Uint8ClampedArray(w * h * 4),
+    })),
+    putImageData: vi.fn(),
+  };
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  // @ts-expect-error -- jsdom augmentation
+  HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(fakeCtx);
+
+  let rafCb: FrameRequestCallback | null = null;
+  const rafSpy = vi
+    .spyOn(globalThis, "requestAnimationFrame")
+    .mockImplementation((cb) => {
+      rafCb = cb;
+      return 1;
+    });
+  const cancelSpy = vi
+    .spyOn(globalThis, "cancelAnimationFrame")
+    .mockImplementation(() => {});
+
+  let vfcCb: (() => void) | null = null;
+  const proto = HTMLVideoElement.prototype as HTMLVideoElement & {
+    requestVideoFrameCallback?: (cb: () => void) => number;
+    cancelVideoFrameCallback?: (id: number) => void;
+  };
+  proto.requestVideoFrameCallback = (cb: () => void) => {
+    vfcCb = cb;
+    return 1;
+  };
+  proto.cancelVideoFrameCallback = () => {};
+
+  const origPause = HTMLMediaElement.prototype.pause;
+  HTMLMediaElement.prototype.pause = () => {};
+
+  const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => now);
+
+  return {
+    setNow(t: number) {
+      now = t;
+    },
+    /** Deliver one decoded frame (fires the captured rVFC callback). */
+    fireFrame() {
+      vfcCb?.();
+    },
+    /** Run one pipeline draw-loop iteration. */
+    drawOnce() {
+      rafCb?.(now);
+    },
+    restore() {
+      HTMLCanvasElement.prototype.getContext = origGetContext;
+      delete proto.requestVideoFrameCallback;
+      delete proto.cancelVideoFrameCallback;
+      HTMLMediaElement.prototype.pause = origPause;
+      rafSpy.mockRestore();
+      cancelSpy.mockRestore();
+      nowSpy.mockRestore();
+    },
+  };
+}
+
+describe("CameraFeed - stall presentation (staticOnStale)", () => {
+  it("forwards staticOnStale to the displayed camera's handle", async () => {
+    const { client } = await buildConnectedSource();
+
+    const { unmount } = renderFeed(client, { flightId: 42 });
+    // Default on.
+    expect(client.camera(42).stallStatic).toBe(true);
+    unmount();
+
+    renderFeed(client, { flightId: 42, staticOnStale: false });
+    expect(client.camera(42).stallStatic).toBe(false);
+  });
+
+  it("staticOnStale=false shows the stale badge on stall and clears it when frames resume", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      renderFeed(client, { flightId: 42, staticOnStale: false });
+
+      // Slot bound by the feed's subscription; deliver the media so the
+      // noise pipeline (and its stall detector) attaches to a live source.
+      const mid = sidecar.slotMidFor(42);
+      expect(mid).toBeDefined();
+      await act(async () => {
+        sidecar.deliverTrack(mid as string, {} as MediaStreamTrack);
+      });
+      expect(screen.queryByRole("status", { name: /feed stale/i })).toBeNull();
+
+      // A frame lands, then nothing for >500 ms: the stall detector trips
+      // and the badge appears over the frozen frame.
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+      });
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      const badge = screen.getByRole("status", { name: /feed stale/i });
+      expect(badge.textContent).toMatch(/stale/i);
+
+      // Recovery is instant: the first decoded frame clears the badge on the
+      // very next draw.
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(screen.queryByRole("status", { name: /feed stale/i })).toBeNull();
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("default mode shows no badge on stall (the in-stream static carries it)", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      renderFeed(client, { flightId: 42 });
+
+      const mid = sidecar.slotMidFor(42);
+      await act(async () => {
+        sidecar.deliverTrack(mid as string, {} as MediaStreamTrack);
+      });
+
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+      });
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+
+      // The stall IS detected (the SDK composites ramping static in-stream),
+      // but the chrome stays clean.
+      expect(client.camera(42).stalled).toBe(true);
+      expect(screen.queryByRole("status", { name: /feed stale/i })).toBeNull();
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("SIGNAL LOST supersedes the stale badge when the camera is destroyed", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      renderFeed(client, { flightId: 42, staticOnStale: false });
+
+      const mid = sidecar.slotMidFor(42);
+      await act(async () => {
+        sidecar.deliverTrack(mid as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+      });
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(screen.getByRole("status", { name: /feed stale/i })).toBeTruthy();
+
+      await act(async () => {
+        sidecar.destroyCamera(42);
+      });
+      expect(screen.getByRole("status", { name: /signal lost/i })).toBeTruthy();
+      expect(screen.queryByRole("status", { name: /feed stale/i })).toBeNull();
+    } finally {
+      env.restore();
+    }
   });
 });
 

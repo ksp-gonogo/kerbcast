@@ -8,6 +8,7 @@ export type ThemePreference = "auto" | "light" | "dark";
 
 const KEY_THEME = "kerbcam:theme";
 const KEY_DEBUG = "kerbcam:debug";
+const KEY_STATIC_ON_STALE = "kerbcam:staticOnStale";
 
 export function loadTheme(): ThemePreference {
   const raw = localStorage.getItem(KEY_THEME);
@@ -34,4 +35,13 @@ export function loadDebug(): boolean {
 
 export function saveDebug(enabled: boolean): void {
   localStorage.setItem(KEY_DEBUG, String(enabled));
+}
+
+/** Static-on-stale-feeds: defaults ON; only an explicit "false" disables. */
+export function loadStaticOnStale(): boolean {
+  return localStorage.getItem(KEY_STATIC_ON_STALE) !== "false";
+}
+
+export function saveStaticOnStale(enabled: boolean): void {
+  localStorage.setItem(KEY_STATIC_ON_STALE, String(enabled));
 }

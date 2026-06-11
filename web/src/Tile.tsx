@@ -20,6 +20,8 @@ interface TileProps {
   flightId: number | null;
   index: number;
   showDebugInfo: boolean;
+  /** Stall presentation for the feed: static ramp (true) or frozen + badge. */
+  staticOnStale: boolean;
   spotlit: boolean;
   variant?: TileVariant;
   /** True when any tile is spotlit (drives spotlight grid placement). */
@@ -33,6 +35,7 @@ export function Tile({
   flightId,
   index,
   showDebugInfo,
+  staticOnStale,
   spotlit,
   variant = "grid",
   spotlightActive = false,
@@ -94,6 +97,7 @@ export function Tile({
         <CameraFeed
           flightId={flightId}
           showDebugInfo={showDebugInfo}
+          staticOnStale={staticOnStale}
           onSelectCamera={onSelectCamera}
           onDisplayedCameraChange={setDisplayedFlightId}
           enableFullscreen

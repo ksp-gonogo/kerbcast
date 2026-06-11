@@ -1,22 +1,26 @@
 import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
-import { applyTheme, saveDebug, saveTheme } from "./settings";
+import { applyTheme, saveDebug, saveStaticOnStale, saveTheme } from "./settings";
 import type { ThemePreference } from "./settings";
 
 interface SettingsProps {
   theme: ThemePreference;
   debug: boolean;
+  staticOnStale: boolean;
   onThemeChange: (t: ThemePreference) => void;
   onDebugChange: (enabled: boolean) => void;
+  onStaticOnStaleChange: (enabled: boolean) => void;
   onClose: () => void;
 }
 
 export function Settings({
   theme,
   debug,
+  staticOnStale,
   onThemeChange,
   onDebugChange,
+  onStaticOnStaleChange,
   onClose,
 }: SettingsProps): React.JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -50,6 +54,11 @@ export function Settings({
     onDebugChange(enabled);
   };
 
+  const handleStaticOnStale = (enabled: boolean) => {
+    saveStaticOnStale(enabled);
+    onStaticOnStaleChange(enabled);
+  };
+
   return (
     <Panel ref={panelRef} role="dialog" aria-label="Settings">
       <PanelHeader>
@@ -73,6 +82,17 @@ export function Settings({
             <option value="light">Light</option>
             <option value="dark">Dark</option>
           </NativeSelect>
+        </FieldRow>
+
+        <FieldRow>
+          <FieldLabel htmlFor="kc-static-toggle">Static on stale feeds</FieldLabel>
+          <input
+            id="kc-static-toggle"
+            type="checkbox"
+            checked={staticOnStale}
+            onChange={(e) => handleStaticOnStale(e.target.checked)}
+            style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
+          />
         </FieldRow>
 
         <SectionLabel style={{ marginTop: "0.75rem" }}>Developer</SectionLabel>

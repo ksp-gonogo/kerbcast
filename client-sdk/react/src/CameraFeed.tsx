@@ -251,6 +251,16 @@ export interface CameraFeedProps {
   /** Show resolution + encoder readout. Default false. */
   showDebugInfo?: boolean;
   /**
+   * Stall presentation. `true` (default): when the feed's frames stop
+   * arriving, TV static ramps in over ~5 s on top of the last received
+   * frame, and drops the instant frames resume. `false`: the last frame
+   * stays frozen, slightly dimmed, with a small "stale" badge, so a frozen
+   * frame can never pass for a live one. Applies to the camera handle this
+   * feed displays (last mounted feed wins). Signal-lost static for
+   * destroyed cameras is unaffected.
+   */
+  staticOnStale?: boolean;
+  /**
    * "auto" (default): ResizeObserver drives `setRenderSize` at a 16:9 crop,
    * debounced 500 ms. "none": no render-size feedback.
    */
@@ -311,6 +321,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       onSelectCamera,
       onDisplayedCameraChange,
       showDebugInfo = false,
+      staticOnStale = true,
       renderSize = "auto",
       emptyMessage = "No camera feeds - start a vessel with Hullcam parts installed",
       enableFullscreen = false,
@@ -382,6 +393,27 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         videoRef.current.srcObject = stream;
       }
     }, [stream]);
+
+    // -------------------------------------------------------------------------
+    // Stall presentation. The static itself is composited in-stream by the
+    // SDK's noise pipeline; this just forwards the prop to the camera handle
+    // and mirrors the handle's stall state for the no-static badge.
+    // -------------------------------------------------------------------------
+    useEffect(() => {
+      if (flightId === null) return;
+      client.camera(flightId).setStallStatic(staticOnStale);
+    }, [client, flightId, staticOnStale]);
+
+    const [isStale, setIsStale] = useState(false);
+    useEffect(() => {
+      if (flightId === null) {
+        setIsStale(false);
+        return;
+      }
+      const cam = client.camera(flightId);
+      setIsStale(cam.stalled);
+      return cam.on("stall", setIsStale);
+    }, [client, flightId]);
 
     // -------------------------------------------------------------------------
     // Fullscreen + Picture-in-Picture (opt-in, feature-detected)
@@ -894,6 +926,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 <SignalLostText>SIGNAL LOST</SignalLostText>
               </SignalLostOverlay>
             )}
+            {!staticOnStale && isStale && !isDestroyed && (
+              <>
+                <StaleScrim aria-hidden="true" />
+                <StaleBadge role="status" aria-label="Feed stale">
+                  <StaleIcon />
+                  Stale
+                </StaleBadge>
+              </>
+            )}
             {showZoom && (
               <ZoomControlsWrap>
                 <ZoomButton
@@ -1080,6 +1121,24 @@ function QualityIcon() {
       <circle cx="10.5" cy="4.5" r="1.6" fill="currentColor" stroke="none" />
       <circle cx="5.5" cy="8" r="1.6" fill="currentColor" stroke="none" />
       <circle cx="8.5" cy="11.5" r="1.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/* Stale badge: fading signal bars (tallest dimmed). */
+function StaleIcon() {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width={10}
+      height={10}
+      fill="currentColor"
+      stroke="none"
+      aria-hidden="true"
+    >
+      <rect x="2" y="9" width="2.5" height="5" />
+      <rect x="6.5" y="6" width="2.5" height="8" />
+      <rect x="11" y="3" width="2.5" height="11" opacity="0.35" />
     </svg>
   );
 }
@@ -1589,6 +1648,40 @@ const SignalLostText = styled.span`
       opacity: 0.6;
     }
   }
+`;
+
+/*
+ * No-static stall presentation (`staticOnStale={false}`): a subtle dim over
+ * the frozen last frame plus a corner badge, so a frozen frame is never
+ * mistakable for a live one. Always visible (not hover chrome).
+ */
+const StaleScrim = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+`;
+
+const StaleBadge = styled.div`
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 179, 71, 0.6);
+  border-radius: 3px;
+  color: #ffb347;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
 `;
 
 const FovSlider = styled.input`
