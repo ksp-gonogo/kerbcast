@@ -22,7 +22,7 @@
  *  - Station (brokered) mode -- gonogo-only KerbcamDataSource.attachBroker.
  */
 
-import { KerbcamClient } from "@jonpepler/kerbcam";
+import { KerbcamClient, QualityPreset } from "@jonpepler/kerbcam";
 import type { CameraLifecycle, ClientMessage } from "@jonpepler/kerbcam";
 import { type MockCameraInit, MockSidecar } from "@jonpepler/kerbcam/testing";
 import {
@@ -102,6 +102,8 @@ function toInit(c: CameraStateLike): MockCameraInit {
     encoderBitrateBps: c.encoderBitrateBps as number | undefined,
     targetBitrateBps: c.targetBitrateBps as number | undefined,
     degradeLevel: c.degradeLevel as number | undefined,
+    viewerQuality: c.viewerQuality as QualityPreset | undefined,
+    qualityLimitedBy: c.qualityLimitedBy as string | undefined,
   };
 }
 
@@ -147,6 +149,7 @@ function renderFeed(
     onSelectCamera?: (id: number) => void;
     showDebugInfo?: boolean;
     renderSize?: "auto" | "none";
+    enableQualityControl?: boolean;
     ref?: React.Ref<CameraFeedHandle>;
   },
 ) {
@@ -578,6 +581,139 @@ describe("CameraFeed - SIGNAL LOST overlay", () => {
 // ---------------------------------------------------------------------------
 // Zoom controls
 // ---------------------------------------------------------------------------
+
+describe("CameraFeed - quality control", () => {
+  it("hidden unless enableQualityControl is set", async () => {
+    const { client } = await buildConnectedSource();
+    renderFeed(client, { flightId: 42 });
+    expect(screen.queryByRole("button", { name: /quality/i })).toBeNull();
+  });
+
+  it("menu lists Auto plus the presets with target dims from the operator size", async () => {
+    const { client } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        operatorWidth: 1024,
+        operatorHeight: 576,
+        renderWidth: 1024,
+        renderHeight: 576,
+      }),
+    ]);
+    renderFeed(client, { flightId: 42, enableQualityControl: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /quality/i }));
+
+    const items = screen
+      .getAllByRole("menuitemradio")
+      .map((el) => el.textContent);
+    expect(items).toEqual([
+      "Auto",
+      "Full (1024×576)",
+      "3/4 (768×432)",
+      "1/2 (512×288)",
+      "1/4 (256×144)",
+    ]);
+    // No request yet: Auto is the checked entry.
+    expect(
+      screen
+        .getByRole("menuitemradio", { name: "Auto" })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+    // Footer shows the effective state.
+    expect(screen.getByRole("status").textContent).toBe("now 1024×576");
+  });
+
+  it("picking a preset sends set-quality and the echoed state checks it", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        operatorWidth: 1024,
+        operatorHeight: 576,
+        renderWidth: 1024,
+        renderHeight: 576,
+      }),
+    ]);
+    renderFeed(client, { flightId: 42, enableQualityControl: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /quality/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("menuitemradio", { name: /^1\/2/ }));
+    });
+
+    expect(sidecar.lastCommand("set-quality", 42)?.content.preset).toBe(
+      QualityPreset.Half,
+    );
+
+    // Authoritative state came back: re-opened menu reflects it.
+    fireEvent.click(screen.getByRole("button", { name: /quality/i }));
+    expect(
+      screen
+        .getByRole("menuitemradio", { name: /^1\/2/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+    expect(screen.getByRole("status").textContent).toBe("now 512×288");
+
+    // Auto clears the request (preset omitted on the wire).
+    await act(async () => {
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Auto" }));
+    });
+    const last = sidecar.lastCommand("set-quality", 42);
+    expect(last && "preset" in last.content && last.content.preset).toBeFalsy();
+  });
+
+  it("marks the feed when the sidecar reports throttling below the request", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        operatorWidth: 1024,
+        operatorHeight: 576,
+        renderWidth: 512,
+        renderHeight: 288,
+        viewerQuality: QualityPreset.Half,
+      }),
+    ]);
+    renderFeed(client, { flightId: 42, enableQualityControl: true });
+
+    // Honored request: no throttled marker.
+    let button = screen.getByRole("button", { name: /quality/i });
+    expect(button.title).toBe("Quality");
+
+    // Adaptive demote pushes below the viewer target; sidecar broadcasts it.
+    await act(async () => {
+      sidecar.updateCamera(42, {
+        renderWidth: 256,
+        renderHeight: 144,
+        qualityLimitedBy: "throttled",
+      });
+    });
+
+    button = screen.getByRole("button", { name: /quality/i });
+    expect(button.title).toMatch(/throttled/i);
+    fireEvent.click(button);
+    expect(screen.getByRole("status").textContent).toBe(
+      "now 256×144 · throttled",
+    );
+    // The request itself is still shown as 1/2; it gets honored again
+    // when the controller recovers.
+    expect(
+      screen
+        .getByRole("menuitemradio", { name: /^1\/2/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+  });
+
+  it("Escape closes the quality menu", async () => {
+    const { client } = await buildConnectedSource();
+    renderFeed(client, { flightId: 42, enableQualityControl: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /quality/i }));
+    expect(screen.getByRole("menu", { name: "Quality" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("menu", { name: "Quality" })).toBeNull(),
+    );
+  });
+});
 
 describe("CameraFeed - zoom controls", () => {
   it("zoom controls appear when camera supportsZoom", async () => {

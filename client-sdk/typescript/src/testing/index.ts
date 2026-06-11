@@ -1,5 +1,5 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraLifecycle, ErrorSource, Layer } from "../__generated__/types";
+import { CameraLifecycle, ErrorSource, Layer, QualityPreset } from "../__generated__/types";
 import type {
   InboundVideoStats,
   KerbcamConnectionState,
@@ -35,6 +35,8 @@ export interface MockCameraInit {
   encoderBitrateBps?: number;
   targetBitrateBps?: number;
   degradeLevel?: number;
+  viewerQuality?: QualityPreset;
+  qualityLimitedBy?: string;
 }
 
 function buildCamera(init: MockCameraInit): CameraState {
@@ -65,7 +67,24 @@ function buildCamera(init: MockCameraInit): CameraState {
     encoderBitrateBps: init.encoderBitrateBps ?? 0,
     targetBitrateBps: init.targetBitrateBps ?? 0,
     degradeLevel: init.degradeLevel ?? 0,
+    viewerQuality: init.viewerQuality,
+    qualityLimitedBy: init.qualityLimitedBy,
   };
+}
+
+/** Fraction of the operator render size each preset targets (mirrors the
+ *  sidecar's `QualityPreset::scale`). */
+const QUALITY_PRESET_SCALE: Record<QualityPreset, number> = {
+  [QualityPreset.Full]: 1.0,
+  [QualityPreset.ThreeQuarter]: 0.75,
+  [QualityPreset.Half]: 0.5,
+  [QualityPreset.Quarter]: 0.25,
+};
+
+/** Scale + floor-to-even like the plugin's QualityClamp.ScaleDimension. */
+function scaleDim(operatorDim: number, scale: number): number {
+  const v = Math.trunc(operatorDim * scale) & ~1;
+  return v < 2 ? 2 : v;
 }
 
 /**
@@ -458,6 +477,37 @@ export class MockSidecar {
         if (cam) {
           this._cameras.set(msg.content.flightId, { ...cam, degradeLevel: msg.content.level });
         }
+        break;
+      }
+      case "set-quality": {
+        // Models the request being honored (no adaptive throttle in the
+        // mock): effective dims become the preset's fraction of the
+        // operator ceiling, and the authoritative state is echoed back as
+        // camera-state-changed, the same broadcast the sidecar fans out
+        // to every peer. Use `updateCamera` to simulate the throttled case
+        // (renderWidth below the target + qualityLimitedBy: "throttled").
+        const cam = this._cameras.get(msg.content.flightId);
+        if (!cam) {
+          this._sendToClient({
+            type: "error",
+            content: {
+              message: `no camera with flight_id=${msg.content.flightId}`,
+              source: ErrorSource.Sidecar,
+            },
+          });
+          break;
+        }
+        const preset = msg.content.preset ?? undefined;
+        const scale = preset ? QUALITY_PRESET_SCALE[preset] : 1.0;
+        const updated: CameraState = {
+          ...cam,
+          viewerQuality: preset,
+          qualityLimitedBy: undefined,
+          renderWidth: scaleDim(cam.operatorWidth, scale),
+          renderHeight: scaleDim(cam.operatorHeight, scale),
+        };
+        this._cameras.set(msg.content.flightId, updated);
+        this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
         break;
       }
       case "subscribe": {

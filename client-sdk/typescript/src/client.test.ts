@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorSource, Layer } from "./__generated__/types";
+import { ErrorSource, Layer, QualityPreset } from "./__generated__/types";
 import {
   BrowserKerbcamTransport,
   type KerbcamConnectionState,
@@ -279,6 +279,74 @@ describe("KerbcamClient", () => {
         content: { flightId: 42, level: 0.7 },
       }),
     );
+  });
+
+  it("set-quality routes onto the control channel; null preset means auto", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+
+    await client.connect();
+    captured.dc?._open();
+    captured.dc!.sent.length = 0; // drop the hello
+
+    await client.camera(42).setQuality(QualityPreset.Half);
+    await client.camera(42).setQuality(null);
+
+    expect(captured.dc?.sent).toEqual([
+      JSON.stringify({
+        type: "set-quality",
+        content: { flightId: 42, preset: "half" },
+      }),
+      // Auto: the preset field is omitted entirely (sidecar reads None).
+      JSON.stringify({ type: "set-quality", content: { flightId: 42 } }),
+    ]);
+  });
+
+  it("set-quality roundtrips through MockSidecar into camera state", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({
+      flightId: 42,
+      operatorWidth: 1024,
+      operatorHeight: 576,
+      renderWidth: 1024,
+      renderHeight: 576,
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      MockSidecar.makeOfferResponse([42]),
+    );
+
+    const client = new KerbcamClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    await client.connect([42]);
+    sidecar.open();
+
+    await client.camera(42).setQuality(QualityPreset.Half);
+    expect(sidecar.lastCommand("set-quality", 42)?.content.preset).toBe(
+      QualityPreset.Half,
+    );
+    // The mock models the honored case: effective dims follow the preset
+    // and the change event carries the authoritative quality state.
+    const state = client.camera(42).state;
+    expect(state?.viewerQuality).toBe(QualityPreset.Half);
+    expect(state?.renderWidth).toBe(512);
+    expect(state?.renderHeight).toBe(288);
+    expect(state?.qualityLimitedBy).toBeUndefined();
+
+    // Throttled-below-request is simulated by the test driving the state
+    // push directly, exactly like the real sidecar would broadcast it.
+    sidecar.updateCamera(42, {
+      renderWidth: 256,
+      renderHeight: 144,
+      qualityLimitedBy: "throttled",
+    });
+    expect(client.camera(42).state?.qualityLimitedBy).toBe("throttled");
+
+    await client.camera(42).setQuality(null);
+    expect(client.camera(42).state?.viewerQuality).toBeUndefined();
+    expect(client.camera(42).state?.renderWidth).toBe(1024);
   });
 
   it("setFov / setLayers / setRenderSize routing", async () => {

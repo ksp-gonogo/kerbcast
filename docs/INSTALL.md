@@ -104,6 +104,15 @@ It ships **off** because the no-quality-shedding behaviour is the measured
 Steam Deck (tier-1) baseline; with the flag off, nothing about that baseline
 changes.
 
+### Viewer quality requests
+
+Each feed on the web page has a quality menu: Auto, or full / 3/4 / 1/2 / 1/4
+of the configured `Width`/`Height`. The request is per camera and shared by
+all viewers (last pick wins), and it can only lower quality. The stream always
+runs at the minimum of your configured size, the adaptive level, and the
+viewer request; the menu marks the camera "throttled" while adaptive quality
+holds it below the request. Works with `AdaptiveQuality` on or off.
+
 ## Updating / uninstalling
 
 - **Update:** delete `GameData/Kerbcam/` and extract the new zip. If you keep

@@ -32,6 +32,24 @@ export enum Layer {
 }
 
 /**
+ * Viewer-selectable resolution preset. Each maps to a fraction of the
+ * operator-configured render size (the settings.cfg Width/Height ceiling):
+ * full = 1.0, threeQuarter = 0.75, half = 0.5, quarter = 0.25. The steps
+ * mirror the plugin's shed-table resolution ladder so the viewer clamp and
+ * the adaptive controller move on the same grid, and a preset can never
+ * exceed the ring's allocated max (every scale is <= 1.0 of the ceiling).
+ * 
+ * Presets, not freeform WxH: a fixed menu keeps the unauthenticated
+ * viewer-writable surface tiny and aspect-correct by construction.
+ */
+export enum QualityPreset {
+	Full = "full",
+	ThreeQuarter = "threeQuarter",
+	Half = "half",
+	Quarter = "quarter",
+}
+
+/**
  * Per-camera snapshot pushed by the sidecar on every state change
  * (operator API call, adaptive shed, vessel change). Same shape served
  * by `GET /cameras` so client UIs can treat the two interchangeably.
@@ -127,6 +145,21 @@ export interface CameraState {
 	 * skips fan-out for a fraction of frames at high levels.
 	 */
 	degradeLevel: number;
+	/**
+	 * Viewer-requested resolution preset for this camera. Last write
+	 * wins across all connected peers; this broadcast is what keeps
+	 * every UI consistent. Absent/None = auto: no viewer clamp, the
+	 * operator ceiling and the adaptive controller alone decide.
+	 */
+	viewerQuality?: QualityPreset;
+	/**
+	 * Why the effective resolution sits below what the viewer asked
+	 * for (or below the operator ceiling when no preset is set).
+	 * `"throttled"` = the adaptive perf machinery is holding the
+	 * camera down; the viewer target is honored again on recovery.
+	 * Absent/None = the request is fully honored.
+	 */
+	qualityLimitedBy?: string;
 }
 
 export interface CameraSnapshotPayload {
@@ -197,6 +230,18 @@ export interface SetPanRatePayload {
 	 * superseded.
 	 */
 	pitchRate: number;
+}
+
+export interface SetQualityPayload {
+	flightId: number;
+	/**
+	 * Requested resolution preset, or absent/null for auto (clear the
+	 * viewer clamp). Future viewer-quality knobs are added here as
+	 * optional fields with serde defaults, so older clients keep
+	 * parsing — richer controls (bitrate, ladder toggles) stay
+	 * operator-only until deliberately opened up.
+	 */
+	preset?: QualityPreset;
 }
 
 export interface SetRenderSizePayload {
@@ -320,6 +365,18 @@ export type ClientMessage =
 	 * signal-loss aesthetic AND saves encoder CPU.
 	 */
 	| { type: "set-degrade", content: SetDegradePayload }
+	/**
+	 * Set (or clear, with `preset: null`) a camera's viewer-requested
+	 * resolution preset. Server-wide, last write wins across peers; the
+	 * resulting `CameraStateChanged` broadcast keeps every UI
+	 * consistent. The effective resolution is always
+	 * min(operator ceiling, adaptive level, viewer preset): a preset
+	 * can never raise quality past the operator's settings.cfg
+	 * Width/Height, and the adaptive controller's demotes keep
+	 * winning until it recovers. Viewers can NOT change bitrate or
+	 * toggle the adaptive machinery through this message.
+	 */
+	| { type: "set-quality", content: SetQualityPayload }
 	/**
 	 * Request an IDR (keyframe) on the next encode tick. Browsers send
 	 * this when they've dropped enough frames to be unable to decode

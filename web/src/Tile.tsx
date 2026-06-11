@@ -98,6 +98,7 @@ export function Tile({
           onDisplayedCameraChange={setDisplayedFlightId}
           enableFullscreen
           enablePictureInPicture
+          enableQualityControl
           actions={actions}
           trailingActions={trailingActions}
         />

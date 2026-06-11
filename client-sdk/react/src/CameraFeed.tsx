@@ -1,5 +1,5 @@
 import type { KerbcamClient } from "@jonpepler/kerbcam";
-import { PanZoomController } from "@jonpepler/kerbcam";
+import { PanZoomController, QualityPreset } from "@jonpepler/kerbcam";
 import {
   forwardRef,
   useCallback,
@@ -57,6 +57,27 @@ function computeMenuPosition(trigger: HTMLElement): React.CSSProperties {
 /** Round n to the nearest even integer, minimum 2 (H.264 chroma requirement). */
 function toEvenPx(n: number): number {
   return Math.max(2, Math.round(n / 2) * 2);
+}
+
+/*
+ * Viewer quality presets, in menu order. Scales mirror the sidecar's
+ * QualityPreset mapping (fractions of the camera's operator render size);
+ * the target-dims hint floors to even exactly like the plugin does.
+ */
+const QUALITY_PRESETS: ReadonlyArray<{
+  preset: QualityPreset;
+  label: string;
+  scale: number;
+}> = [
+  { preset: QualityPreset.Full, label: "Full", scale: 1.0 },
+  { preset: QualityPreset.ThreeQuarter, label: "3/4", scale: 0.75 },
+  { preset: QualityPreset.Half, label: "1/2", scale: 0.5 },
+  { preset: QualityPreset.Quarter, label: "1/4", scale: 0.25 },
+];
+
+function presetDim(operatorDim: number, scale: number): number {
+  const v = Math.trunc(operatorDim * scale) & ~1;
+  return v < 2 ? 2 : v;
 }
 
 /*
@@ -158,6 +179,16 @@ export interface CameraFeedProps {
    */
   enablePictureInPicture?: boolean;
   /**
+   * Show a built-in per-camera quality control in the action bar: Auto plus
+   * the resolution presets (full / 3-4 / 1-2 / 1-4 of the operator-configured
+   * size), with the camera's effective resolution and a marker when the
+   * sidecar's adaptive machinery is throttling below the request. Requests
+   * can only lower quality; the resolution change arrives in-band over the
+   * existing WebRTC track (the video element is never remounted). Default
+   * false.
+   */
+  enableQualityControl?: boolean;
+  /**
    * Consumer-injected action buttons, rendered left of the built-in
    * fullscreen/PiP controls in the top-right action bar.
    */
@@ -193,6 +224,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       emptyMessage = "No camera feeds - start a vessel with Hullcam parts installed",
       enableFullscreen = false,
       enablePictureInPicture = false,
+      enableQualityControl = false,
       actions,
       trailingActions,
     },
@@ -571,6 +603,57 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
     const title = camera ? cameraLabel(camera) : "Camera Feed";
 
+    // -------------------------------------------------------------------------
+    // Viewer quality control (opt-in). A built-in action button + menu: Auto
+    // plus the resolution presets. Requested state = camera.viewerQuality
+    // (authoritative, broadcast by the sidecar so every UI agrees); effective
+    // state = renderWidth/Height; qualityLimitedBy marks adaptive throttling.
+    // -------------------------------------------------------------------------
+    const qualityAvailable =
+      enableQualityControl && flightId !== null && camera !== null;
+    const qualityThrottled = Boolean(camera?.qualityLimitedBy);
+    const qualityMenuId = useId();
+    const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
+    const qualityMenuRef = useRef<HTMLDivElement>(null);
+    const qualityTriggerRef = useRef<HTMLButtonElement>(null);
+
+    // Same dismissal contract as the camera menu: Escape closes (returning
+    // focus to the trigger), pointer-down outside dismisses.
+    useEffect(() => {
+      if (!qualityMenuOpen) return;
+      const onKeyDown = (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          setQualityMenuOpen(false);
+          qualityTriggerRef.current?.focus();
+        }
+      };
+      const onPointerDown = (e: PointerEvent) => {
+        if (
+          !qualityMenuRef.current?.contains(e.target as Node) &&
+          !qualityTriggerRef.current?.contains(e.target as Node)
+        ) {
+          setQualityMenuOpen(false);
+        }
+      };
+      document.addEventListener("keydown", onKeyDown);
+      document.addEventListener("pointerdown", onPointerDown);
+      return () => {
+        document.removeEventListener("keydown", onKeyDown);
+        document.removeEventListener("pointerdown", onPointerDown);
+      };
+    }, [qualityMenuOpen]);
+
+    const selectQuality = useCallback(
+      (preset: QualityPreset | null) => {
+        if (flightId === null) return;
+        void client.camera(flightId).setQuality(preset);
+        setQualityMenuOpen(false);
+        qualityTriggerRef.current?.focus();
+      },
+      [client, flightId],
+    );
+
     const topOverlay = (
       <TopOverlay>
         <TitleRow>
@@ -672,7 +755,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       </OverlayIconButton>
     );
 
-    const builtInActions = flightId !== null && (pipAvailable || fullscreenAvailable);
+    const builtInActions =
+      flightId !== null && (pipAvailable || fullscreenAvailable || qualityAvailable);
     const hasActionBar =
       (actions && actions.length > 0) ||
       (trailingActions && trailingActions.length > 0) ||
@@ -680,6 +764,26 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const actionBar = hasActionBar ? (
         <ActionBar>
           {actions?.map(renderAction)}
+          {qualityAvailable && (
+            <OverlayIconButton
+              ref={qualityTriggerRef}
+              type="button"
+              aria-label="Quality"
+              aria-haspopup="menu"
+              aria-expanded={qualityMenuOpen}
+              aria-controls={qualityMenuId}
+              title={
+                qualityThrottled
+                  ? "Quality (throttled by adaptive performance)"
+                  : "Quality"
+              }
+              $active={qualityMenuOpen}
+              onClick={() => setQualityMenuOpen((v) => !v)}
+            >
+              <QualityIcon />
+              {qualityThrottled && <ThrottledDot aria-hidden="true" />}
+            </OverlayIconButton>
+          )}
           {flightId !== null && pipAvailable && (
             <OverlayIconButton
               type="button"
@@ -728,6 +832,41 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             />
             {topOverlay}
             {actionBar}
+            {qualityAvailable && qualityMenuOpen && camera && (
+              <QualityMenu
+                ref={qualityMenuRef}
+                id={qualityMenuId}
+                role="menu"
+                aria-label="Quality"
+              >
+                <CameraMenuItem
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={camera.viewerQuality == null}
+                  $selected={camera.viewerQuality == null}
+                  onClick={() => selectQuality(null)}
+                >
+                  Auto
+                </CameraMenuItem>
+                {QUALITY_PRESETS.map(({ preset, label, scale }) => (
+                  <CameraMenuItem
+                    key={preset}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={camera.viewerQuality === preset}
+                    $selected={camera.viewerQuality === preset}
+                    onClick={() => selectQuality(preset)}
+                  >
+                    {label} ({presetDim(camera.operatorWidth, scale)}×
+                    {presetDim(camera.operatorHeight, scale)})
+                  </CameraMenuItem>
+                ))}
+                <QualityMeta role="status">
+                  now {camera.renderWidth}×{camera.renderHeight}
+                  {qualityThrottled ? " · throttled" : ""}
+                </QualityMeta>
+              </QualityMenu>
+            )}
             {isDestroyed && (
               <SignalLostOverlay role="status" aria-label="Signal lost">
                 <SignalLostText>SIGNAL LOST</SignalLostText>
@@ -907,6 +1046,18 @@ function FullscreenExitIcon() {
   return (
     <svg {...iconProps}>
       <path d="M5.5 2v3.5H2M10.5 2v3.5H14M5.5 14v-3.5H2M10.5 14v-3.5H14" />
+    </svg>
+  );
+}
+
+/* Quality control: three horizontal slider rails with offset knobs. */
+function QualityIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M2 4.5h12M2 8h12M2 11.5h12" />
+      <circle cx="10.5" cy="4.5" r="1.6" fill="currentColor" stroke="none" />
+      <circle cx="5.5" cy="8" r="1.6" fill="currentColor" stroke="none" />
+      <circle cx="8.5" cy="11.5" r="1.6" fill="currentColor" stroke="none" />
     </svg>
   );
 }
@@ -1197,6 +1348,46 @@ const TopMeta = styled.div`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
+/* The quality picker: anchored under the action bar's corner. Visible
+   whenever open (independent of the hover-revealed chrome) so it doesn't
+   vanish mid-interaction when the pointer leaves the action bar. */
+const QualityMenu = styled.div`
+  position: absolute;
+  top: 34px;
+  right: 8px;
+  z-index: 4;
+  min-width: 140px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 4px;
+  overflow: hidden;
+`;
+
+/* Effective-state footer of the quality menu: what the camera is actually
+   rendering right now, with a "throttled" marker while the adaptive
+   machinery holds it below the request. */
+const QualityMeta = styled.div`
+  padding: 5px 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.65);
+`;
+
+/* Throttled marker on the quality action button. */
+const ThrottledDot = styled.span`
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ffb347;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+`;
+
 /* Top-right cluster of overlay controls (custom actions + fullscreen/PiP). */
 const ActionBar = styled.div`
   position: absolute;
@@ -1284,6 +1475,7 @@ const Empty = styled.div`
 `;
 
 const OverlayIconButton = styled.button<{ $active?: boolean }>`
+  position: relative;
   width: 24px;
   height: 24px;
   display: flex;

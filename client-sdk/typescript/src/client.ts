@@ -4,6 +4,7 @@ import type {
   ClientMessage,
   ErrorPayload,
   Layer,
+  QualityPreset,
   ServerMessage,
   SettingsStatePayload,
 } from "./__generated__/types";
@@ -50,6 +51,16 @@ export interface KerbcamCameraHandle {
    */
   setZoomRate(rate: number): Promise<void>;
   setDegrade(level: number): Promise<void>;
+  /**
+   * Request a resolution preset for this camera, or `null` for auto
+   * (clear the viewer clamp). Server-wide and last-write-wins across
+   * peers; the authoritative result arrives as a `change` event
+   * (`state.viewerQuality` + `state.qualityLimitedBy`). The effective
+   * resolution is min(operator ceiling, adaptive level, preset): a
+   * preset can only lower quality, and the sidecar's adaptive perf
+   * machinery keeps overriding it downward while throttled.
+   */
+  setQuality(preset: QualityPreset | null): Promise<void>;
   requestKeyframe(): Promise<void>;
 
   /**
@@ -590,6 +601,15 @@ class CameraHandle
     await this.client._send({
       type: "set-degrade",
       content: { flightId: this.flightId, level },
+    });
+  }
+
+  async setQuality(preset: QualityPreset | null): Promise<void> {
+    await this.client._send({
+      type: "set-quality",
+      // null (auto) deserializes to None on the sidecar; the generated
+      // payload type marks the field optional, so widen for the wire.
+      content: { flightId: this.flightId, preset: preset ?? undefined },
     });
   }
 
