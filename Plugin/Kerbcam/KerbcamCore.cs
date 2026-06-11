@@ -1080,7 +1080,8 @@ namespace Kerbcam
             if (budget != before)
                 Debug.Log($"[Kerbcam] stagger budget={budget}/{_streamCount} streaming "
                     + $"(kerbcam {_kerbcamFrameMs:F1}ms, {msPerCam:F1}ms/cam, KSP {_fpsAvg:F0}fps, "
-                    + $"max {_settings.MaxKerbcamFrameBudgetMs:F0}ms, floor {_settings.MinKspFps:F0}fps)");
+                    + $"max {_settings.MaxKerbcamFrameBudgetMs:F0}ms, floor {_settings.MinKspFps:F0}fps) "
+                    + $"[{_staggerController.LastChangeReason}]");
 
             // Opt-in quality ladder, fed the stagger controller's own signals.
             // The budget passed is the stagger budget BEFORE the MaxCaptureFps
