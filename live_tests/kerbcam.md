@@ -90,6 +90,7 @@ Client → sidecar (`ClientMessage`):
 | `set-pan` | `{ "flightId": n, … }` | absolute; no stock parts support pan yet |
 | `set-pan-rate` / `set-zoom-rate` | `{ "flightId": n, … }` | persistent velocity, −1..=1; zero stops; `Error` reply if unsupported |
 | `set-degrade` | `{ "flightId": n, "level": 0.0–1.0 }` | max-across-subscribers wins |
+| `set-quality` | `{ "flightId": n, "preset": "half" }` | viewer resolution preset (`full`/`threeQuarter`/`half`/`quarter`; omit or null = auto); last write wins; can only lower below the operator ceiling |
 | `request-keyframe` | `{ "flightId": n }` | forces IDR next encode tick |
 | `set-throttle-main-screen` | `{ … }` | global; persists to the KSP save |
 | `pong` | – | reply to each server `ping` |
