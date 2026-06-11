@@ -8,8 +8,10 @@
 //   - Awake:    spawn AsyncReadbackUpdater (KSP loads mod DLLs after
 //               [RuntimeInitializeOnLoadMethod] would fire, so the
 //               vendored yangrc updater never auto-attaches).
-//               Ensure the rings directory exists, then spawn sidecar
-//               pointed at that directory.
+//               Ensure the rings directory exists, then notify the
+//               session-persistent KerbcamSidecarHost (which spawns the
+//               sidecar on the FIRST flight of the session and keeps it
+//               running across scene changes).
 //               Subscribe GameEvents.onPartDestroyed to detect Hullcam
 //               part destruction mid-flight.
 //   - GameEvents.onVesselChange: rebuild the camera list (which
@@ -22,15 +24,16 @@
 //               a matching onPartDestroyed event (mod interactions, etc).
 //               Also refreshes each tracked camera.
 //   - OnDestroy: unsubscribe onPartDestroyed, tear down cameras (each
-//               disposes its own ring + deletes its files) and stop the
-//               sidecar.
+//               disposes its own ring + deletes its files). The sidecar
+//               is NOT stopped: it belongs to KerbcamSidecarHost and
+//               survives scene changes (the camera-ring removals are all
+//               it observes). It dies on game exit or via the heartbeat
+//               orphan watch.
 
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
 using HullcamVDS;
 using UnityEngine;
 using Yangrc.OpenGLAsyncReadback;
@@ -51,23 +54,6 @@ namespace Kerbcam
 
         private KerbcamSettings _settings;
         private readonly List<KerbcamCamera> _cameras = new List<KerbcamCamera>();
-        private Process _sidecar;
-
-        /* Sidecar crash recovery (driven from LateUpdate). The Exited event
-           sets _sidecarExited so the per-frame check is a field read, not a
-           Process.HasExited syscall. Attempts are bounded with a growing
-           delay so a crash-looping sidecar can't thrash the machine; a
-           sustained healthy run refunds the budget so an isolated crash
-           hours later still recovers. */
-        private const int SidecarMaxRestarts = 5;
-        private const float SidecarRestartDelaySeconds = 5f;
-        private const float SidecarHealthyUptimeSeconds = 60f;
-        private volatile bool _sidecarExited;
-        private bool _sidecarRestartArmed;
-        private bool _sidecarGaveUp;
-        private float _sidecarRestartCooldown;
-        private float _sidecarUptime;
-        private int _sidecarRestartAttempts;
 
         // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
         // changed — KSP fps, shed level, per-camera effective layers / dims.
@@ -242,275 +228,10 @@ namespace Kerbcam
             _throttleEffective = _throttleDesired;
             if (_throttleEffective) ApplyMainScreenThrottle();
 
-            TryStartSidecar();
-        }
-
-        // Spawn the bundled sidecar binary if one is shipped alongside the
-        // plugin. Missing or non-executable binary is logged at warn but
-        // doesn't fail Awake — the operator can still launch the sidecar
-        // manually from another shell, which is how kerbcam was originally
-        // built and remains the dev workflow.
-        private void TryStartSidecar()
-        {
-            try
-            {
-                if (_settings != null && !_settings.AutoSpawnSidecar)
-                {
-                    Debug.Log("[Kerbcam] AutoSpawnSidecar=false; sidecar must be launched manually");
-                    return;
-                }
-
-                if (_sidecar != null && !_sidecar.HasExited)
-                {
-                    // Flight scene re-entered while a previous sidecar is
-                    // still running — leave it alone.
-                    return;
-                }
-
-                var binPath = ResolveSidecarBinary();
-                if (binPath == null)
-                {
-                    Debug.LogWarning("[Kerbcam] no bundled sidecar binary found; launch ~/personal/kerbcam/sidecar manually if you need streaming");
-                    return;
-                }
-
-                EnsureExecutable(binPath);
-
-                // CLI flags forwarded from settings.cfg. The sidecar
-                // accepts every value we care about as a long-form arg,
-                // so there's no config file to keep in sync on the
-                // sidecar side.
-                var args =
-                    $"--shm-dir \"{RingDir}\" " +
-                    $"--http-bind {_settings.HttpBind} " +
-                    $"--max-width {_settings.Width} " +
-                    $"--max-height {_settings.Height}";
-
-                // Explicit bitrate only when the operator configured one.
-                // BitrateBps = 0 (the default) means auto: omit the flag so
-                // the sidecar derives its default from the encoder backend
-                // it selects (hardware backends default higher than the
-                // software fallback).
-                if (_settings.BitrateBps > 0)
-                {
-                    args += $" --bitrate-bps {_settings.BitrateBps}";
-                }
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = binPath,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                };
-
-                // Self-contained sidecar deployment (Linux only): CI bundles
-                // the ffmpeg shared libs (libavutil/libavcodec/etc) the binary
-                // links against into a sibling lib/ directory, because SteamOS
-                // doesn't ship those .so files. Prepend lib/ to
-                // LD_LIBRARY_PATH so the dynamic linker finds the bundled
-                // copies before falling back to the system path (for libva
-                // + its GPU-driver shims, which we intentionally do NOT
-                // bundle — those have to match the host's Mesa stack).
-                //
-                // Gated on Directory.Exists, which is the cross-platform
-                // guard: macOS/Windows sidecars are software-encode (OpenH264,
-                // no exotic native deps) and ship no lib/ dir, so this block is
-                // skipped there — the OS loader finds anything beside the
-                // binary on its own. The dev workflow (manual launch, no
-                // bundled lib dir) stays harmless for the same reason.
-                //
-                // EnvironmentVariables is the cross-platform setter on
-                // .NET48/Mono despite the MSDN page tagging it Windows-only.
-                var libDir = Path.Combine(Path.GetDirectoryName(binPath) ?? string.Empty, "lib");
-                if (Directory.Exists(libDir))
-                {
-                    var existing = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH");
-                    psi.EnvironmentVariables["LD_LIBRARY_PATH"] =
-                        string.IsNullOrEmpty(existing) ? libDir : libDir + ":" + existing;
-                    Debug.Log($"[Kerbcam] LD_LIBRARY_PATH prepend: {libDir}");
-                }
-
-                _sidecar = new Process { StartInfo = psi, EnableRaisingEvents = true };
-                _sidecar.OutputDataReceived += (sender, e) =>
-                {
-                    if (!string.IsNullOrEmpty(e.Data)) Debug.Log($"[Kerbcam.sidecar] {e.Data}");
-                };
-                _sidecar.ErrorDataReceived += (sender, e) =>
-                {
-                    if (!string.IsNullOrEmpty(e.Data)) Debug.Log($"[Kerbcam.sidecar] {e.Data}");
-                };
-                _sidecar.Exited += (sender, e) =>
-                {
-                    _sidecarExited = true;
-                    /* sender, not _sidecar: a restart may have replaced the
-                       field by the time this fires. ExitCode can throw if the
-                       handle is already disposed. */
-                    try { Debug.LogWarning($"[Kerbcam] sidecar exited (code {((Process)sender).ExitCode})"); }
-                    catch (Exception) { Debug.LogWarning("[Kerbcam] sidecar exited"); }
-                };
-
-                /* Before Start(): an instant-crash could fire Exited ahead of
-                   a reset placed after it, losing the exit. */
-                _sidecarExited = false;
-                _sidecar.Start();
-                _sidecar.BeginOutputReadLine();
-                _sidecar.BeginErrorReadLine();
-                Debug.Log($"[Kerbcam] sidecar started pid={_sidecar.Id} from {binPath}");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Kerbcam] failed to start sidecar: {ex}");
-                _sidecar = null;
-            }
-        }
-
-        /* Restart a crashed sidecar: arm a delay on the first frame the exit
-           is seen, count it down, then relaunch. Gives up for the session
-           after SidecarMaxRestarts crashes; a healthy run of
-           SidecarHealthyUptimeSeconds resets the attempt count. */
-        private void MaybeRestartSidecar()
-        {
-            if (_sidecarGaveUp) return;
-
-            if (!_sidecarExited)
-            {
-                if (_sidecar != null && _sidecarRestartAttempts > 0)
-                {
-                    _sidecarUptime += Time.unscaledDeltaTime;
-                    if (_sidecarUptime >= SidecarHealthyUptimeSeconds)
-                        _sidecarRestartAttempts = 0;
-                }
-                return;
-            }
-
-            if (_settings == null || !_settings.AutoSpawnSidecar) return;
-
-            if (!_sidecarRestartArmed)
-            {
-                if (_sidecarRestartAttempts >= SidecarMaxRestarts)
-                {
-                    _sidecarGaveUp = true;
-                    Debug.LogError($"[Kerbcam] sidecar crashed {SidecarMaxRestarts} times — giving up until scene reload");
-                    return;
-                }
-                _sidecarRestartAttempts++;
-                _sidecarRestartCooldown = SidecarRestartDelaySeconds * _sidecarRestartAttempts;
-                _sidecarRestartArmed = true;
-                Debug.LogWarning($"[Kerbcam] sidecar exited — restarting in {_sidecarRestartCooldown:0}s (attempt {_sidecarRestartAttempts}/{SidecarMaxRestarts})");
-                return;
-            }
-
-            _sidecarRestartCooldown -= Time.unscaledDeltaTime;
-            if (_sidecarRestartCooldown > 0f) return;
-            _sidecarRestartArmed = false;
-            _sidecarUptime = 0f;
-            TryStartSidecar();
-        }
-
-        private static string ResolveSidecarBinary()
-        {
-            /* Per-OS bundle layout under GameData/Kerbcam/Sidecar/<rid>/:
-               the release workflow (.github/workflows/release.yml) builds one
-               sidecar per supported runtime and lays each out in its own rid
-               subdir. Casing matters — the Deck's filesystem is case-sensitive
-               and the workflow packages into "Sidecar" (capital S). Keep the
-               rid set + binary name in lockstep with release.yml's assemble
-               job. KSPUtil.ApplicationRootPath is the KSP install root. */
-            var rid = SidecarRid();
-            if (rid == null) return null;
-            var binName = Application.platform == RuntimePlatform.WindowsPlayer
-                ? "kerbcam-sidecar.exe"
-                : "kerbcam-sidecar";
-
-            var bundled = Path.Combine(
-                KSPUtil.ApplicationRootPath,
-                "GameData", "Kerbcam", "Sidecar", rid, binName);
-            if (File.Exists(bundled)) return bundled;
-
-            /* Legacy flat Linux layout (pre-per-rid releases and the
-               feature-branch Deck-deploy flow, which stage straight into
-               Sidecar/). Keep resolving it so older bundles and manually
-               staged artifacts still launch. */
-            if (rid == "linux-x64")
-            {
-                var legacy = Path.Combine(
-                    KSPUtil.ApplicationRootPath,
-                    "GameData", "Kerbcam", "Sidecar", "kerbcam-sidecar");
-                if (File.Exists(legacy)) return legacy;
-            }
-            return null;
-        }
-
-        /* Map the running KSP player to the sidecar runtime-identifier subdir
-           that release.yml ships. macOS is arm64-only (matches the documented
-           Apple-Silicon target); KSP runs x86_64 under Rosetta but the
-           separately-spawned sidecar runs native arm64. Intel-mac (osx-x64) is
-           a deferred tier-2 TODO. Unknown platforms return null so TryStartSidecar
-           logs the manual-launch hint rather than guessing a path. */
-        private static string SidecarRid()
-        {
-            switch (Application.platform)
-            {
-                case RuntimePlatform.LinuxPlayer:
-                    return "linux-x64";
-                case RuntimePlatform.OSXPlayer:
-                    return "osx-arm64";
-                case RuntimePlatform.WindowsPlayer:
-                    return "win-x64";
-                default:
-                    return null;
-            }
-        }
-
-        /* CKAN installs files without preserving the Unix executable bit (its
-           install spec has no permission directive and it sets no file mode on
-           extraction), so a sidecar dropped in by CKAN lands non-executable and
-           ProcessStartInfo can't launch it. The release zip keeps the bit for
-           SpaceDock/manual installs, but chmod is idempotent and cheap, so just
-           (re)assert 0755 on Linux/macOS before every launch. No-op on Windows.
-           Non-fatal: the binary may already be executable, so let Process.Start
-           surface any real problem rather than aborting here. */
-        private static void EnsureExecutable(string path)
-        {
-            if (Application.platform == RuntimePlatform.WindowsPlayer) return;
-            try
-            {
-                const uint mode0755 = 0x1ED; /* octal 0755 */
-                if (Chmod(path, mode0755) != 0)
-                    Debug.LogWarning($"[Kerbcam] chmod 0755 on sidecar returned errno {Marshal.GetLastWin32Error()}: {path}");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Kerbcam] could not chmod sidecar ({path}): {ex.Message}");
-            }
-        }
-
-        [DllImport("libc", SetLastError = true, EntryPoint = "chmod")]
-        private static extern int Chmod(string path, uint mode);
-
-        private void StopSidecar()
-        {
-            if (_sidecar == null) return;
-            try
-            {
-                if (!_sidecar.HasExited)
-                {
-                    _sidecar.Kill();
-                    _sidecar.WaitForExit(2000);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Kerbcam] sidecar stop threw: {ex.Message}");
-            }
-            finally
-            {
-                _sidecar.Dispose();
-                _sidecar = null;
-            }
+            /* The host owns the sidecar process for the whole KSP session;
+               this only spawns it on the first flight entry. Scene changes
+               are camera churn the running sidecar already understands. */
+            KerbcamSidecarHost.NotifyFlightEntered(_settings, RingDir);
         }
 
         private void OnVesselChange(Vessel v)
@@ -694,7 +415,6 @@ namespace Kerbcam
         private void LateUpdate()
         {
             UpdateFpsAverage();
-            MaybeRestartSidecar();
 
             // Telemetry: sample the GC collection counters once per frame and
             // fold this frame's wall-clock duration into the interval stats, so
@@ -1423,7 +1143,9 @@ namespace Kerbcam
             GameEvents.onVesselWasModified.Remove(OnVesselWasModified);
             foreach (var cam in _cameras) cam.Dispose();
             _cameras.Clear();
-            StopSidecar();
+            /* Deliberately NOT stopping the sidecar: KerbcamSidecarHost owns
+               the process for the whole KSP session. The ring-file deletions
+               above are all the sidecar needs to drain its camera list. */
 
             // Tear down the readback pump now that the cameras (and their
             // readback requests) are gone. Leaving it alive would keep firing a
