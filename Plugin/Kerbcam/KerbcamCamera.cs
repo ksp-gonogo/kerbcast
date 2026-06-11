@@ -965,7 +965,7 @@ namespace Kerbcam
         // size. _shedLevel is owned by the adaptive machinery (KerbcamCore's
         // AdaptiveQualityController via ApplyAutoShed); _viewerLevel by the
         // viewer's quality preset (control block via PollControlFile). They
-        // never touch each other — ApplyEffectiveQuality min()s their scales.
+        // never touch each other; ApplyEffectiveQuality min()s their scales.
         private int _shedLevel;
         private int _viewerLevel;
 
@@ -990,7 +990,7 @@ namespace Kerbcam
         /// <summary>
         /// Apply a viewer-requested quality clamp (sidecar control block's
         /// viewer_level; 0 = full / no clamp). Only ever lowers resolution
-        /// below the operator ceiling — layers are untouched (those belong
+        /// below the operator ceiling; layers are untouched (those belong
         /// to the operator mask and the shed cascade) and the adaptive
         /// controller's state is never read or written here.
         /// </summary>
@@ -1121,7 +1121,7 @@ namespace Kerbcam
                     Debug.Log($"[Kerbcam] cam={FlightId} operator layers → {_operatorLayers}");
                 }
 
-                // Viewer quality clamp. Absent means auto (level 0 — no
+                // Viewer quality clamp. Absent means auto (level 0, no
                 // clamp); SetViewerQualityLevel no-ops when unchanged, so
                 // re-published snapshots are free. Applies even when the
                 // AdaptiveQuality flag is off: the viewer clamp rides the

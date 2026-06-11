@@ -286,7 +286,7 @@ async fn consume_loop(
 
         // Sidecar-side state changes (viewer quality requests) marked dirty
         // by the data-channel handlers. Broadcast the authoritative state to
-        // EVERY peer each tick so all UIs converge on the last write —
+        // EVERY peer each tick so all UIs converge on the last write;
         // unlike the 1Hz status diff above, this also fires when the
         // effective render dims didn't move (e.g. a preset set while the
         // adaptive controller already holds the camera lower).

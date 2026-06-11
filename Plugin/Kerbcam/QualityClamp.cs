@@ -1,4 +1,4 @@
-// QualityClamp — the pure arithmetic behind the single resolution-change
+// QualityClamp: the pure arithmetic behind the single resolution-change
 // path in KerbcamCamera.ApplyEffectiveQuality. Combines three inputs into
 // one effective render size:
 //
@@ -8,8 +8,8 @@
 // node) is the hard ceiling: every scale here is <= 1.0 of it, so neither
 // the adaptive ladder nor a viewer request can ever exceed it (or the ring's
 // allocated max, which the ceiling is bounded by). The viewer clamp is a
-// LEVEL into ViewerScales — a fixed preset menu mirroring the shed table's
-// resolution steps — never freeform pixels, so a hostile or buggy viewer
+// LEVEL into ViewerScales (a fixed preset menu mirroring the shed table's
+// resolution steps), never freeform pixels, so a hostile or buggy viewer
 // can't request odd dims or ring-overflowing sizes. The min() means a shed
 // demote always wins over a viewer target, and when the controller promotes
 // back the viewer target is honored again, with the adaptive machinery
@@ -28,7 +28,7 @@ namespace Kerbcam
         /// Viewer-selectable resolution scales, indexed by viewer level.
         /// Derived from KerbcamCamera.ShedTable's distinct ResScale steps
         /// (1.0 / 0.75 / 0.5 / 0.25) and mirrored by the protocol's
-        /// QualityPreset (full / threeQuarter / half / quarter) — the
+        /// QualityPreset (full / threeQuarter / half / quarter): the
         /// sidecar maps preset to index, this table maps index to scale.
         /// </summary>
         public static readonly float[] ViewerScales = { 1.00f, 0.75f, 0.50f, 0.25f };
@@ -49,7 +49,7 @@ namespace Kerbcam
         /// <summary>
         /// The effective resolution scale: the smaller of the adaptive shed
         /// level's scale and the viewer's requested scale. min() is the
-        /// whole precedence model — a demote (smaller shed scale) wins over
+        /// whole precedence model: a demote (smaller shed scale) wins over
         /// the viewer target, and a recovered controller (scale back at 1.0)
         /// hands control back to the viewer target.
         /// </summary>

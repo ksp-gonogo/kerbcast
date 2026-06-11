@@ -284,7 +284,7 @@ pub struct SetQualityPayload {
     /// Requested resolution preset, or absent/null for auto (clear the
     /// viewer clamp). Future viewer-quality knobs are added here as
     /// optional fields with serde defaults, so older clients keep
-    /// parsing — richer controls (bitrate, ladder toggles) stay
+    /// parsing; richer controls (bitrate, ladder toggles) stay
     /// operator-only until deliberately opened up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<QualityPreset>,

@@ -1123,11 +1123,11 @@ impl CameraRegistry {
     }
 
     /// Apply a viewer's quality request: store the preset (last write
-    /// wins across peers — there is one server-wide slot, not one per
+    /// wins across peers; there is one server-wide slot, not one per
     /// subscriber) and flush the mapped viewer level to the plugin's
     /// control block. `None` clears the clamp (auto). The plugin folds
     /// the level into the SAME resolution path the adaptive shed uses,
-    /// as min(operator ceiling, shed scale, viewer scale) — this method
+    /// as min(operator ceiling, shed scale, viewer scale); this method
     /// never touches the adaptive controller's state. Marks the camera
     /// dirty so the consume loop broadcasts the new authoritative state
     /// to every peer. Errors only on an unknown camera.
@@ -1165,7 +1165,7 @@ impl CameraRegistry {
 
     /// Authoritative protocol-shape snapshot of one camera, merging the
     /// last plugin-reported effective state (render dims, layers, fov,
-    /// pan — when the status file has been seen) with the sidecar-owned
+    /// pan, when the status file has been seen) with the sidecar-owned
     /// control state (viewer quality preset). Used for every
     /// `camera-state-changed` push so each consumer sees the same view.
     /// Falls back to optimistic defaults (effective == requested) before

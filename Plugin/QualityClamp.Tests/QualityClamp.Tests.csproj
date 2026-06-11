@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Standalone unit test for QualityClamp.cs — the Unity-free precedence
+    Standalone unit test for QualityClamp.cs: the Unity-free precedence
     arithmetic behind KerbcamCamera.ApplyEffectiveQuality:
     effective = min(operator ceiling, shed scale, viewer scale).
     Compiles ONLY the helper (no KSP/Unity assemblies). Run: `dotnet run`.

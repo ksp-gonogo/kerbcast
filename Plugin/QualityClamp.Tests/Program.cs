@@ -7,7 +7,7 @@
 // a shed demote always wins over a viewer target, the controller's recovery
 // hands control back to the viewer target, and nothing a viewer sends can
 // raise quality past the operator ceiling. The shed scales used here mirror
-// KerbcamCamera.ShedTable (which this harness can't compile — Unity); if the
+// KerbcamCamera.ShedTable (Unity, so this harness can't compile it); if the
 // table's ResScale steps ever change, update BOTH.
 //
 // Exit code 0 = pass, 1 = fail.
