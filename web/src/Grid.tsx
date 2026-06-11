@@ -1,10 +1,20 @@
 import { useKerbcamCameras } from "@jonpepler/kerbcam-react";
-import { Video } from "lucide-react";
+import { Video, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 import { bestGrid } from "./bestGrid";
-import { AddTile, Tile } from "./Tile";
-import { addTile, removeTile, saveTiles, toggleSpotlight, updateTile } from "./tiles";
+import { AddAllTile, AddTile, Tile } from "./Tile";
+import {
+  addAllCameras,
+  addTile,
+  loadPerfNoteDismissed,
+  PERF_NOTE_TILE_THRESHOLD,
+  removeTile,
+  savePerfNoteDismissed,
+  saveTiles,
+  toggleSpotlight,
+  updateTile,
+} from "./tiles";
 import type { Tile as TileData } from "./tiles";
 
 interface GridProps {
@@ -16,8 +26,8 @@ interface GridProps {
 const GAP = 16; // 1rem; keep in sync with Root `gap`
 
 export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.JSX.Element {
-  // cameras available for use by Tile select dropdowns
-  useKerbcamCameras();
+  const cameras = useKerbcamCameras();
+  const [showPerfNote, setShowPerfNote] = useState(false);
 
   const commit = (next: TileData[]) => {
     saveTiles(next);
@@ -30,6 +40,24 @@ export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.
   const handleToggleSpotlight = (index: number) =>
     commit(toggleSpotlight(tiles, index));
   const handleAdd = () => commit(addTile(tiles));
+
+  // Cameras the grid does not show yet; drives the add-all control.
+  const shownIds = new Set(tiles.map((t) => t.flightId));
+  const missingCount = cameras.filter((c) => !shownIds.has(c.flightId)).length;
+
+  const handleAddAll = () => {
+    const next = addAllCameras(tiles, cameras.map((c) => c.flightId));
+    if (next === tiles) return;
+    commit(next);
+    if (next.length > PERF_NOTE_TILE_THRESHOLD && !loadPerfNoteDismissed()) {
+      setShowPerfNote(true);
+    }
+  };
+
+  const dismissPerfNote = () => {
+    savePerfNoteDismissed();
+    setShowPerfNote(false);
+  };
 
   const isEmpty = tiles.length === 0;
   const spotlightActive = tiles.some((t) => t.spotlit);
@@ -76,7 +104,23 @@ export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.
   }
 
   return (
-    <Root ref={rootRef} $spotlight={spotlightActive} $fill={flatFill} style={rootStyle}>
+    <>
+      {showPerfNote && (
+        <PerfNote role="status">
+          <PerfNoteText>
+            Many simultaneous streams increase load on the game machine.
+            kerbcam throttles itself automatically, but feed rates may drop.
+          </PerfNoteText>
+          <PerfNoteDismiss
+            type="button"
+            aria-label="Dismiss performance note"
+            onClick={dismissPerfNote}
+          >
+            <X size={12} strokeWidth={1.75} aria-hidden="true" />
+          </PerfNoteDismiss>
+        </PerfNote>
+      )}
+      <Root ref={rootRef} $spotlight={spotlightActive} $fill={flatFill} style={rootStyle}>
       {tiles.map((tile, i) => (
         <Tile
           key={i}
@@ -91,12 +135,22 @@ export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.
           onToggleSpotlight={() => handleToggleSpotlight(i)}
         />
       ))}
-      <AddTile
-        onClick={handleAdd}
-        isEmpty={isEmpty}
-        compact={spotlightActive}
-        bar={flatFill}
-      />
+      <AddControls $bar={flatFill}>
+        <AddTile
+          onClick={handleAdd}
+          isEmpty={isEmpty}
+          compact={spotlightActive}
+          bar={flatFill}
+        />
+        {missingCount > 0 && (
+          <AddAllTile
+            onClick={handleAddAll}
+            isEmpty={isEmpty}
+            compact={spotlightActive}
+            bar={flatFill}
+          />
+        )}
+      </AddControls>
       {isEmpty && (
         <EmptyHint>
           <EmptyIcon aria-hidden="true">
@@ -108,7 +162,8 @@ export function Grid({ tiles, onTilesChange, showDebugInfo }: GridProps): React.
           </EmptyBody>
         </EmptyHint>
       )}
-    </Root>
+      </Root>
+    </>
   );
 }
 
@@ -142,6 +197,65 @@ const Root = styled.div<{ $spotlight: boolean; $fill: boolean }>`
     grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
     align-content: start;
   `}
+`;
+
+/* Holds AddTile and AddAllTile. In flat-fill bar mode it is the single
+   full-width grid row the two bars share; otherwise it dissolves
+   (display: contents) so each button stays an ordinary grid item. */
+const AddControls = styled.div<{ $bar: boolean }>`
+  ${(p) =>
+    p.$bar
+      ? `
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 1rem;
+  `
+      : `display: contents;`}
+`;
+
+/* One-time note shown when add-all pushes the grid past the comfortable
+   simultaneous-stream count. Styled after ShedBanner; informational only. */
+const PerfNote = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 1rem;
+  background: var(--kc-warn-bg);
+  border-bottom: 1px solid var(--kc-warn);
+  color: var(--kc-warn);
+  flex-shrink: 0;
+`;
+
+const PerfNoteText = styled.span`
+  font-size: 0.78rem;
+  flex: 1;
+  letter-spacing: 0.01em;
+`;
+
+const PerfNoteDismiss = styled.button`
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--kc-warn);
+  padding: 0.15rem;
+  line-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  opacity: 0.7;
+  flex-shrink: 0;
+  transition: opacity 0.12s ease;
+
+  &:hover {
+    opacity: 1;
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--kc-warn);
+    outline-offset: 2px;
+    opacity: 1;
+  }
 `;
 
 const EmptyHint = styled.div`

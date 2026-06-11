@@ -82,3 +82,51 @@ export function updateTile(
 export function toggleSpotlight(tiles: Tile[], index: number): Tile[] {
   return tiles.map((t, i) => (i === index ? { ...t, spotlit: !t.spotlit } : t));
 }
+
+/**
+ * Point every camera not already shown at a tile: unpointed slots are filled
+ * first, then new tiles are appended. Cameras already in the grid are left
+ * alone, so the action is idempotent (returns the same array when nothing is
+ * missing).
+ */
+export function addAllCameras(tiles: Tile[], flightIds: number[]): Tile[] {
+  const present = new Set<number>();
+  for (const t of tiles) {
+    if (t.flightId !== null) present.add(t.flightId);
+  }
+  const missing = flightIds.filter((id) => !present.has(id));
+  if (missing.length === 0) return tiles;
+
+  const queue = [...missing];
+  const next = tiles.map((t) => {
+    if (t.flightId !== null) return t;
+    const id = queue.shift();
+    return id === undefined ? t : { ...t, flightId: id };
+  });
+  for (const id of queue) next.push({ flightId: id, spotlit: false });
+  return next;
+}
+
+/**
+ * One-time performance note shown when "add all cameras" lands the grid above
+ * PERF_NOTE_TILE_THRESHOLD tiles. Dismissal is remembered per origin.
+ */
+export const PERF_NOTE_TILE_THRESHOLD = 8;
+
+const PERF_NOTE_KEY = "kerbcam:perfNoteDismissed";
+
+export function loadPerfNoteDismissed(): boolean {
+  try {
+    return localStorage.getItem(PERF_NOTE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function savePerfNoteDismissed(): void {
+  try {
+    localStorage.setItem(PERF_NOTE_KEY, "true");
+  } catch {
+    // ignore (private browsing / storage full)
+  }
+}

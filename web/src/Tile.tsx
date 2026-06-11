@@ -4,7 +4,7 @@ import {
   useKerbcamCameras,
 } from "@jonpepler/kerbcam-react";
 import type { FeedAction } from "@jonpepler/kerbcam-react";
-import { Pin, PinOff, Plus, X } from "lucide-react";
+import { ListPlus, Pin, PinOff, Plus, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import styled from "styled-components";
 
@@ -130,6 +130,30 @@ export function AddTile({ onClick, isEmpty, compact, bar }: AddTileProps): React
         <Plus size={20} strokeWidth={1.5} />
       </AddIcon>
       {(isEmpty || bar) && <AddLabel>Add camera</AddLabel>}
+    </AddRoot>
+  );
+}
+
+/**
+ * "Add all cameras" sibling of AddTile: one click points a tile at every
+ * camera the grid is not already showing. Same look and sizing variants as
+ * AddTile so the two read as one control cluster.
+ */
+export function AddAllTile({ onClick, isEmpty, compact, bar }: AddTileProps): React.JSX.Element {
+  return (
+    <AddRoot
+      type="button"
+      aria-label="Add all cameras"
+      title="Add all cameras"
+      onClick={onClick}
+      $isEmpty={isEmpty ?? false}
+      $compact={compact ?? false}
+      $bar={bar ?? false}
+    >
+      <AddIcon aria-hidden="true">
+        <ListPlus size={20} strokeWidth={1.5} />
+      </AddIcon>
+      {(isEmpty || bar) && <AddLabel>Add all cameras</AddLabel>}
     </AddRoot>
   );
 }
@@ -277,8 +301,11 @@ const AddRoot = styled.button<AddRootProps>`
   `}
 
   ${(p) => p.$bar && `
-    /* Flat fill mode: a slim full-width bar below the feeds. */
+    /* Flat fill mode: a slim bar below the feeds. grid-column applies when
+       the button is a grid item; flex applies when it shares the add-controls
+       row with a sibling button. */
     grid-column: 1 / -1;
+    flex: 1;
     flex-direction: row;
     aspect-ratio: unset;
     min-height: 0;

@@ -73,9 +73,9 @@ interface AppFixture {
   openSidecar(): void;
 }
 
-function buildFixture(cameras: MockCameraInit[] = []): AppFixture {
+function buildFixture(cameras: MockCameraInit[] = [], slots = 8): AppFixture {
   const sidecar = new MockSidecar();
-  sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]);
+  sidecar.withSlots(Array.from({ length: slots }, (_, i) => String(i)));
   for (const cam of cameras) sidecar.addCamera(cam);
 
   const client = new KerbcamClient(
@@ -334,6 +334,118 @@ describe("App - tile management", () => {
 
     expect(screen.queryAllByRole("button", { name: /remove tile/i })).toHaveLength(0);
     expect(screen.getByRole("button", { name: /add tile/i })).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Add all cameras
+// ---------------------------------------------------------------------------
+
+describe("App - add all cameras", () => {
+  it("adds only the cameras not already in the grid", async () => {
+    saveTiles([{ flightId: 1, spotlit: false }]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+      makeCamera({ flightId: 3, cameraName: "Charlie" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(3);
+    const stored = JSON.parse(localStorage.getItem("kerbcam:tiles") ?? "[]") as
+      { flightId: number | null }[];
+    expect(stored.map((t) => t.flightId)).toEqual([1, 2, 3]);
+  });
+
+  it("offers no add-all control when every camera is already shown", async () => {
+    saveTiles([
+      { flightId: 1, spotlit: false },
+      { flightId: 2, spotlit: false },
+    ]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(2);
+    });
+    expect(screen.queryByRole("button", { name: /add all cameras/i })).toBeNull();
+  });
+
+  it("shows the performance note once past 8 tiles, and dismissal persists", async () => {
+    saveTiles([{ flightId: 1, spotlit: false }]);
+
+    const cameras = Array.from({ length: 9 }, (_, i) =>
+      makeCamera({ flightId: i + 1, cameraName: `Cam ${i + 1}` }),
+    );
+    const { client, openSidecar } = buildFixture(cameras, 12);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(9);
+    expect(screen.getByText(/feed rates may drop/i)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /dismiss performance note/i }));
+    });
+
+    expect(screen.queryByText(/feed rates may drop/i)).toBeNull();
+    expect(localStorage.getItem("kerbcam:perfNoteDismissed")).toBe("true");
+  });
+
+  it("never shows the performance note again once dismissed", async () => {
+    localStorage.setItem("kerbcam:perfNoteDismissed", "true");
+    saveTiles([{ flightId: 1, spotlit: false }]);
+
+    const cameras = Array.from({ length: 9 }, (_, i) =>
+      makeCamera({ flightId: i + 1, cameraName: `Cam ${i + 1}` }),
+    );
+    const { client, openSidecar } = buildFixture(cameras, 12);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(9);
+    expect(screen.queryByText(/feed rates may drop/i)).toBeNull();
+  });
+
+  it("shows no performance note at 8 tiles or fewer", async () => {
+    saveTiles([]);
+
+    const cameras = Array.from({ length: 8 }, (_, i) =>
+      makeCamera({ flightId: i + 1, cameraName: `Cam ${i + 1}` }),
+    );
+    const { client, openSidecar } = buildFixture(cameras);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(8);
+    expect(screen.queryByText(/feed rates may drop/i)).toBeNull();
   });
 });
 
