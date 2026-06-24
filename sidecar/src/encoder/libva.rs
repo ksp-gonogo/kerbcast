@@ -477,11 +477,16 @@ mod imp {
         }
 
         fn encode(&mut self, frame: &RawFrame<'_>) -> Result<Vec<Nal>, EncodeError> {
-            let cfg = self
-                .cfg
-                .as_ref()
-                .ok_or_else(|| EncodeError::Runtime("encode before init".into()))?
-                .clone();
+            /* Snapshot the dims rather than cloning the whole EncodeConfig each
+            frame: only width/height are read, and the borrow must drop before
+            the encoder is used mutably below. */
+            let (cfg_width, cfg_height) = {
+                let cfg = self
+                    .cfg
+                    .as_ref()
+                    .ok_or_else(|| EncodeError::Runtime("encode before init".into()))?;
+                (cfg.width, cfg.height)
+            };
             let expected = (frame.width as usize) * (frame.height as usize) * 4;
             if frame.data.len() != expected {
                 return Err(EncodeError::Invalid(format!(
@@ -490,10 +495,10 @@ mod imp {
                     expected
                 )));
             }
-            if frame.width != cfg.width || frame.height != cfg.height {
+            if frame.width != cfg_width || frame.height != cfg_height {
                 return Err(EncodeError::Invalid(format!(
                     "frame dims {}x{} != configured {}x{}",
-                    frame.width, frame.height, cfg.width, cfg.height
+                    frame.width, frame.height, cfg_width, cfg_height
                 )));
             }
 

@@ -201,7 +201,8 @@ namespace Kerbcam
         {
             if (string.IsNullOrEmpty(partName)) return None;
             var hit = Table.TryGetValue(partName, out var cap);
-            UnityEngine.Debug.Log($"[Kerbcam] PartCapabilities.ForPart('{partName}') → {(hit ? "matched" : "no match")} (roll={(hit ? cap.CameraRollDeg : 0):F0}°)");
+            if (KerbcamSettings.DebugCameraLogging)
+                UnityEngine.Debug.Log($"[Kerbcam] PartCapabilities.ForPart('{partName}') → {(hit ? "matched" : "no match")} (roll={(hit ? cap.CameraRollDeg : 0):F0}°)");
             return hit ? cap : None;
         }
     }

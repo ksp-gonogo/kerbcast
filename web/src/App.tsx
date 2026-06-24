@@ -68,11 +68,9 @@ export function App({ client }: AppProps): React.JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Tile state
-  const [tiles, setTiles] = useState<TileData[]>(() => {
-    const stored = loadTiles();
-    return stored ?? []; // seed deferred to effect below (cameras not yet known)
-  });
-  const [tilesSeeded, setTilesSeeded] = useState<boolean>(() => loadTiles() !== null);
+  const storedTiles = loadTiles();
+  const [tiles, setTiles] = useState<TileData[]>(() => storedTiles ?? []);
+  const [tilesSeeded, setTilesSeeded] = useState<boolean>(() => storedTiles !== null);
 
   const tileFlightIds = useMemo(
     () => tiles.map((t) => t.flightId),

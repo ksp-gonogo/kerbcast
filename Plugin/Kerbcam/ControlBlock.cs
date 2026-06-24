@@ -201,10 +201,6 @@ namespace Kerbcam
         private ControlSnapshot ReadBody(long seq)
         {
             uint present = _view.ReadUInt32(BFieldsPresent);
-            uint? OptU32(uint bit, int off) =>
-                (present & bit) != 0 ? _view.ReadUInt32(off) : (uint?)null;
-            float? OptF32(uint bit, int off) =>
-                (present & bit) != 0 ? _view.ReadSingle(off) : (float?)null;
 
             return new ControlSnapshot
             {
@@ -212,17 +208,17 @@ namespace Kerbcam
                 Subscribed = _view.ReadByte(BSubscribed) != 0,
                 HasLayers = (present & FpLayers) != 0,
                 LayersMask = _view.ReadUInt32(BLayersMask),
-                Width = OptU32(FpWidth, BWidth),
-                Height = OptU32(FpHeight, BHeight),
-                Fov = OptF32(FpFov, BFov),
-                PanYaw = OptF32(FpPanYaw, BPanYaw),
-                PanPitch = OptF32(FpPanPitch, BPanPitch),
-                PanYawRate = OptF32(FpPanYawRate, BPanYawRate),
-                PanPitchRate = OptF32(FpPanPitchRate, BPanPitchRate),
-                ZoomRate = OptF32(FpZoomRate, BZoomRate),
+                Width = (present & FpWidth) != 0 ? _view.ReadUInt32(BWidth) : (uint?)null,
+                Height = (present & FpHeight) != 0 ? _view.ReadUInt32(BHeight) : (uint?)null,
+                Fov = (present & FpFov) != 0 ? _view.ReadSingle(BFov) : (float?)null,
+                PanYaw = (present & FpPanYaw) != 0 ? _view.ReadSingle(BPanYaw) : (float?)null,
+                PanPitch = (present & FpPanPitch) != 0 ? _view.ReadSingle(BPanPitch) : (float?)null,
+                PanYawRate = (present & FpPanYawRate) != 0 ? _view.ReadSingle(BPanYawRate) : (float?)null,
+                PanPitchRate = (present & FpPanPitchRate) != 0 ? _view.ReadSingle(BPanPitchRate) : (float?)null,
+                ZoomRate = (present & FpZoomRate) != 0 ? _view.ReadSingle(BZoomRate) : (float?)null,
                 PanSeq = _view.ReadUInt32(BPanSeq),
                 FovSeq = _view.ReadUInt32(BFovSeq),
-                ViewerLevel = OptU32(FpViewerLevel, BViewerLevel),
+                ViewerLevel = (present & FpViewerLevel) != 0 ? _view.ReadUInt32(BViewerLevel) : (uint?)null,
                 Seq = seq,
             };
         }

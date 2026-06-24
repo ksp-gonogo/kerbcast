@@ -418,8 +418,8 @@ namespace Kerbcam
                 {
                     int width = w ?? settings.Width;
                     int height = h ?? settings.Height;
-                    if (width % 2 != 0) width = width - (width & 1);
-                    if (height % 2 != 0) height = height - (height & 1);
+                    width -= width & 1;
+                    height -= height & 1;
                     if (width > settings.Width || height > settings.Height)
                     {
                         Debug.LogWarning($"[Kerbcam] settings.cfg: Camera '{partName}' size {width}x{height} exceeds global max {settings.Width}x{settings.Height}; capping");

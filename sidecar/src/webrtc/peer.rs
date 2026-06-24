@@ -407,9 +407,6 @@ async fn handle_client_message(
     dc: Arc<RTCDataChannel>,
     msg: DataChannelMessage,
 ) {
-    if msg.is_string {
-        // expected branch
-    }
     let text = match std::str::from_utf8(&msg.data) {
         Ok(s) => s,
         Err(e) => {
@@ -501,11 +498,8 @@ async fn handle_client_message(
             // initialised. If not, the next encode produces an IDR
             // anyway (cold start), so the no-op is the right thing.
             if let Some(cam) = registry.get(flight_id).await {
-                let mut guard = cam.encoder.lock().await;
-                if let Some(backend) = guard.as_mut() {
-                    backend.request_keyframe();
-                    info!(flight_id, "keyframe requested");
-                }
+                request_keyframe_for(&cam).await;
+                info!(flight_id, "keyframe requested");
             }
         }
         ClientMessage::Subscribe(FlightIdPayload { flight_id }) => {
@@ -649,7 +643,7 @@ async fn handle_unsubscribe(
         let remaining = cam.remove_track(&track).await;
         if remaining == 0 {
             // Last viewer — sleep the camera promptly (the consume loop's
-            // maybe_sleep_idle_cameras would also catch this next tick).
+            // refresh_idle_subscriptions would also catch this next tick).
             registry.set_subscribed(flight_id, false).await;
         }
         info!(flight_id, remaining, "unsubscribed camera from slot");

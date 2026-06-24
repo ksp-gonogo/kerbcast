@@ -129,7 +129,6 @@ pub trait EncoderBackend: Send {
 /// Foundation), software last. Media Foundation sits after NVENC so a
 /// future NVIDIA-specific path still wins where present, while
 /// vendor-generic hardware MF encode beats software everywhere else.
-/// Keep this candidate list in lockstep with `selected_backend_name`.
 pub fn auto_select() -> Box<dyn EncoderBackend> {
     let candidates: [Box<dyn EncoderBackend>; 5] = [
         Box::new(Libva::new()),
@@ -173,24 +172,12 @@ pub fn resolve_bitrate_bps(explicit: Option<u32>, backend: &dyn EncoderBackend) 
     explicit.unwrap_or_else(|| default_bitrate_bps(backend))
 }
 
-/// Return the name of the backend that `auto_select` would choose, without
-/// allocating a full encoder. Probe results are cached via OnceLock so this
-/// is cheap after the first call. Keep this candidate list in lockstep
-/// with `auto_select`.
+/// Return the name of the backend that `auto_select` would choose. Defers
+/// to `auto_select` so the candidate list lives in exactly one place; only
+/// called off the hot path (startup / `/metrics`), so the throwaway probe
+/// allocation is fine.
 pub fn selected_backend_name() -> &'static str {
-    let candidates: [Box<dyn EncoderBackend>; 5] = [
-        Box::new(Libva::new()),
-        Box::new(VideoToolbox::new()),
-        Box::new(Nvenc::new()),
-        Box::new(MediaFoundation::new()),
-        Box::new(Software::new()),
-    ];
-    for b in candidates {
-        if b.is_available() {
-            return b.name();
-        }
-    }
-    Software::new().name()
+    auto_select().name()
 }
 
 #[cfg(test)]

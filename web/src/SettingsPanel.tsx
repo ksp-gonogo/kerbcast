@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
-import { applyTheme, saveDebug, saveShowStatic, saveTheme } from "./settings";
 import type { ThemePreference } from "./settings";
 
 interface SettingsProps {
@@ -44,22 +43,6 @@ export function Settings({
     };
   }, [onClose]);
 
-  const handleTheme = (t: ThemePreference) => {
-    saveTheme(t);
-    applyTheme(t);
-    onThemeChange(t);
-  };
-
-  const handleDebug = (enabled: boolean) => {
-    saveDebug(enabled);
-    onDebugChange(enabled);
-  };
-
-  const handleShowStatic = (enabled: boolean) => {
-    saveShowStatic(enabled);
-    onShowStaticChange(enabled);
-  };
-
   return (
     <Panel ref={panelRef} role="dialog" aria-label="Settings">
       <PanelHeader>
@@ -77,7 +60,7 @@ export function Settings({
           <NativeSelect
             id="kc-theme-select"
             value={theme}
-            onChange={(e) => handleTheme(e.target.value as ThemePreference)}
+            onChange={(e) => onThemeChange(e.target.value as ThemePreference)}
           >
             <option value="auto">Auto</option>
             <option value="light">Light</option>
@@ -94,7 +77,7 @@ export function Settings({
             id="kc-static-toggle"
             type="checkbox"
             checked={showStatic}
-            onChange={(e) => handleShowStatic(e.target.checked)}
+            onChange={(e) => onShowStaticChange(e.target.checked)}
             style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
           />
         </FieldRow>
@@ -107,7 +90,7 @@ export function Settings({
             id="kc-debug-toggle"
             type="checkbox"
             checked={debug}
-            onChange={(e) => handleDebug(e.target.checked)}
+            onChange={(e) => onDebugChange(e.target.checked)}
             style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
           />
         </FieldRow>

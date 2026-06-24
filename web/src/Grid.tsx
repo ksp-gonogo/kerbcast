@@ -1,6 +1,6 @@
 import { useKerbcamCameras } from "@jonpepler/kerbcam-react";
 import { Video, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { bestGrid } from "./bestGrid";
 import { AddAllTile, AddTile, Tile } from "./Tile";
@@ -43,8 +43,11 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
   const handleAdd = () => commit(addTile(tiles));
 
   // Cameras the grid does not show yet; drives the add-all control.
-  const shownIds = new Set(tiles.map((t) => t.flightId));
-  const missingCount = cameras.filter((c) => !shownIds.has(c.flightId)).length;
+  const { shownIds, missingCount } = useMemo(() => {
+    const shownIds = new Set(tiles.map((t) => t.flightId));
+    const missingCount = cameras.filter((c) => !shownIds.has(c.flightId)).length;
+    return { shownIds, missingCount };
+  }, [tiles, cameras]);
 
   const handleAddAll = () => {
     const next = addAllCameras(tiles, cameras.map((c) => c.flightId));

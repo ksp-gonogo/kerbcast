@@ -182,7 +182,6 @@ namespace Kerbcam
         private void ResetHeadroom()
         {
             _headroomTracking = false;
-            _headroomSince = 0.0;
         }
     }
 }

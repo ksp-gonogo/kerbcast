@@ -351,9 +351,7 @@ async fn consume_loop(
                     continue;
                 };
                 let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
-                for peer in &snapshot {
-                    peer.push_message(&msg).await;
-                }
+                broadcast(&snapshot, &msg).await;
             }
         }
 
@@ -438,6 +436,18 @@ async fn consume_loop(
     }
 }
 
+/// Fan one message out to an already-snapshotted set of peers. Best-effort:
+/// peers whose data channels aren't open silently drop it. Empty set is a
+/// no-op. Callers snapshot `peers` once and may call this several times.
+async fn broadcast(peers: &[Arc<KerbcamPeer>], msg: &ServerMessage) {
+    if peers.is_empty() {
+        return;
+    }
+    for peer in peers {
+        peer.push_message(msg).await;
+    }
+}
+
 /// Push a status delta (adaptive-shed level changes + per-camera state
 /// changes) to every connected peer's data channel. Best-effort: peers
 /// whose data channels haven't opened yet (or have closed) silently
@@ -462,25 +472,19 @@ async fn broadcast_status_delta(
             ksp_fps,
             reason,
         });
-        for peer in &snapshot {
-            peer.push_message(&msg).await;
-        }
+        broadcast(&snapshot, &msg).await;
     }
 
     for state in delta.changed_cameras {
         let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
-        for peer in &snapshot {
-            peer.push_message(&msg).await;
-        }
+        broadcast(&snapshot, &msg).await;
     }
 
     if let Some(throttle_main_screen) = delta.throttle_main_screen {
         let msg = ServerMessage::SettingsState(SettingsStatePayload {
             throttle_main_screen,
         });
-        for peer in &snapshot {
-            peer.push_message(&msg).await;
-        }
+        broadcast(&snapshot, &msg).await;
     }
 }
 
@@ -531,9 +535,7 @@ async fn broadcast_destroyed_cameras(
             quality_limited_by: None,
         };
         let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
-        for peer in &snapshot {
-            peer.push_message(&msg).await;
-        }
+        broadcast(&snapshot, &msg).await;
     }
 }
 
