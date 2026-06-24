@@ -41,7 +41,6 @@
 //!   suffices because the ring has 4 slots.
 
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -190,28 +189,22 @@ impl MmapFrameRing {
     }
 
     fn write_header(&mut self) -> Result<(), MmapRingError> {
+        let put_u32 = |buf: &mut [u8], off: usize, v: u32| {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_u64 = |buf: &mut [u8], off: usize, v: u64| {
+            buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        };
         let header = &mut self.mmap[..HEADER_SIZE];
         // Zero the whole header first so any read-during-init sees a
         // well-defined "no frames yet" state (write_index=0, sequence=0).
-        for byte in header.iter_mut() {
-            *byte = 0;
-        }
+        header.fill(0);
         // Then stamp the constants.
-        (&mut header[HEADER_OFF_MAGIC..HEADER_OFF_MAGIC + 8])
-            .write_all(&MAGIC.to_le_bytes())
-            .unwrap();
-        (&mut header[HEADER_OFF_VERSION..HEADER_OFF_VERSION + 4])
-            .write_all(&LAYOUT_VERSION.to_le_bytes())
-            .unwrap();
-        (&mut header[HEADER_OFF_SLOT_COUNT..HEADER_OFF_SLOT_COUNT + 4])
-            .write_all(&self.cfg.slot_count.to_le_bytes())
-            .unwrap();
-        (&mut header[HEADER_OFF_MAX_WIDTH..HEADER_OFF_MAX_WIDTH + 4])
-            .write_all(&self.cfg.max_width.to_le_bytes())
-            .unwrap();
-        (&mut header[HEADER_OFF_MAX_HEIGHT..HEADER_OFF_MAX_HEIGHT + 4])
-            .write_all(&self.cfg.max_height.to_le_bytes())
-            .unwrap();
+        put_u64(header, HEADER_OFF_MAGIC, MAGIC);
+        put_u32(header, HEADER_OFF_VERSION, LAYOUT_VERSION);
+        put_u32(header, HEADER_OFF_SLOT_COUNT, self.cfg.slot_count);
+        put_u32(header, HEADER_OFF_MAX_WIDTH, self.cfg.max_width);
+        put_u32(header, HEADER_OFF_MAX_HEIGHT, self.cfg.max_height);
         Ok(())
     }
 
@@ -333,19 +326,17 @@ impl MmapFrameRing {
         // updated below.
         let slot_start = self.slot_offset(next_slot);
         let slot_bytes = self.cfg.slot_bytes();
+        let put_u32 = |buf: &mut [u8], off: usize, v: u32| {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_f64 = |buf: &mut [u8], off: usize, v: f64| {
+            buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        };
         let slot = &mut self.mmap[slot_start..slot_start + slot_bytes];
-        (&mut slot[SLOT_OFF_WIDTH..SLOT_OFF_WIDTH + 4])
-            .write_all(&width.to_le_bytes())
-            .unwrap();
-        (&mut slot[SLOT_OFF_HEIGHT..SLOT_OFF_HEIGHT + 4])
-            .write_all(&height.to_le_bytes())
-            .unwrap();
-        (&mut slot[SLOT_OFF_STRIDE..SLOT_OFF_STRIDE + 4])
-            .write_all(&(width * 4).to_le_bytes())
-            .unwrap();
-        (&mut slot[SLOT_OFF_CAPTURE_TS..SLOT_OFF_CAPTURE_TS + 8])
-            .write_all(&capture_ts_ms.to_le_bytes())
-            .unwrap();
+        put_u32(slot, SLOT_OFF_WIDTH, width);
+        put_u32(slot, SLOT_OFF_HEIGHT, height);
+        put_u32(slot, SLOT_OFF_STRIDE, width * 4);
+        put_f64(slot, SLOT_OFF_CAPTURE_TS, capture_ts_ms);
         // Pixels.
         slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + rgba.len()].copy_from_slice(rgba);
 
