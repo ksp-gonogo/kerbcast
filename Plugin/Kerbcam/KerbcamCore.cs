@@ -84,7 +84,7 @@ namespace Kerbcam
         // kerbcam's OWN main-thread cost within a frametime budget by capturing
         // fewer cameras per frame — full resolution + all layers, just less
         // often. Targets kerbcam's cost (not game fps), so it's KSP-independent.
-        // kerbcam never auto-sheds quality unless AdaptiveQuality opts in.
+        // kerbcam auto-sheds quality only when AdaptiveQuality is enabled (on by default).
         // Built in Awake from settings; null until then (guarded at call sites).
         private StaggerBudgetController _staggerController;
         // Opt-in quality ladder (AdaptiveQuality=true): demotes resolution/FX
@@ -443,7 +443,7 @@ namespace Kerbcam
 
             // Regulate the capture budget from kerbcam's own frame cost (lossless
             // temporal degrade — fewer streaming cameras captured per frame).
-            // Quality stays untouched unless AdaptiveQuality opts in.
+            // Quality stays untouched unless AdaptiveQuality is enabled (on by default).
             UpdateDegradeLevel();
 
             // Reconcile the per-save Difficulty Setting against our
@@ -1059,7 +1059,7 @@ namespace Kerbcam
         // main-thread cost within MaxKerbcamFrameBudgetMs (lossless temporal
         // degrade — fewer cameras per frame, full quality each), tightening
         // further if game fps falls below the MinKspFps physics floor. Quality
-        // is untouched unless AdaptiveQuality opts in, in which case the
+        // is untouched unless AdaptiveQuality is enabled (on by default), in which case the
         // quality ladder below runs AFTER the stagger decision, off the same
         // signals: demote only once staggering is exhausted, promote only
         // after sustained headroom.
