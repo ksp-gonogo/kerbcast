@@ -80,15 +80,15 @@ namespace Kerbcam
         // software fallback). Set explicitly to trade bandwidth for image
         // quality. Applies to every stream; only read at sidecar launch.
         public int BitrateBps { get; private set; } = 0;
-        // Opt-in adaptive QUALITY ladder (resolution + FX-layer cascade,
-        // see KerbcamCamera.ShedTable) driven by AdaptiveQualityController.
-        // Default false: by default kerbcam only degrades temporally (capture
-        // staggering), which keeps full image quality, and the flag-off
-        // behaviour is bit-for-bit the pre-flag plugin: the controller is not
-        // even constructed. When true, kerbcam demotes quality once staggering
-        // is exhausted and promotes it back, slowly, after sustained headroom;
-        // it never promotes past the configured Width/Height/layers.
-        public bool AdaptiveQuality { get; private set; } = false;
+        /* Adaptive QUALITY ladder (resolution + FX-layer cascade,
+           see KerbcamCamera.ShedTable) driven by AdaptiveQualityController.
+           Default true: kerbcam demotes quality once staggering is exhausted
+           and promotes it back, slowly, after sustained headroom. It never
+           promotes above the MaxQuality ceiling configured in settings.cfg
+           (explicit Width/Height still cap it the same way). Set false to
+           revert to temporal-only degrade (capture staggering, no resolution
+           or layer changes). */
+        public bool AdaptiveQuality { get; private set; } = true;
 
         // Per-camera capture-rate CEILING (stream target). Cameras are
         // round-robined so they don't all render + read back on the same frame,
