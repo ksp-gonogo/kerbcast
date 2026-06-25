@@ -1,6 +1,6 @@
 {
   "name": "@jonpepler/kerbcam",
-  "version": "0.21.1",
+  "version": "0.21.2",
   "description": "TypeScript client for the kerbcam KSP camera-streaming sidecar. KerbcamClient wraps the WebRTC peer + control channel; wire-format types are typeshare-generated from the sidecar's Rust protocol module.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "Jon Pepler",
