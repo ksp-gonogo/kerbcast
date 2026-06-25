@@ -4,7 +4,7 @@ import {
   useKerbcamCameras,
 } from "@jonpepler/kerbcam-react";
 import type { FeedAction } from "@jonpepler/kerbcam-react";
-import { ListPlus, Pin, PinOff, Plus, X } from "lucide-react";
+import { ListPlus, Pin, PinOff, Plus, WifiOff, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import styled from "styled-components";
 
@@ -55,6 +55,18 @@ export function Tile({
   const [displayedFlightId, setDisplayedFlightId] = useState<number | null>(
     flightId,
   );
+
+  /*
+   * A tile is "missing" when it points at a flightId that no longer appears in
+   * the live cameras list: a fresh launch, a different craft, or a destroyed
+   * vessel. FlightId is stable across docking and scene changes, so absence is
+   * a genuine vanish, not a transient re-key. We must NOT mount a CameraFeed in
+   * that case (it would auto-latch onto an unrelated camera, breaking the
+   * "never remount a live feed" rule), so we render a reconnecting placeholder
+   * instead. A null flightId is an empty slot, not a missing camera.
+   */
+  const cameraMissing =
+    flightId !== null && !cameras.some((c) => c.flightId === flightId);
   const label = useMemo(() => {
     const cam = cameras.find((c) => c.flightId === displayedFlightId);
     return cam ? buildCameraLabeler(cameras)(cam) : `Tile ${index + 1}`;
@@ -90,6 +102,32 @@ export function Tile({
     ],
     [index, onRemove],
   );
+
+  if (cameraMissing) {
+    return (
+      <TileRoot $variant={variant} $spotlit={spotlit} $spotlightActive={spotlightActive}>
+        <MissingWrap>
+          <MissingIcon aria-hidden="true">
+            <WifiOff size={22} strokeWidth={1.5} />
+          </MissingIcon>
+          <MissingText>Camera reconnecting</MissingText>
+          <MissingSub>
+            Camera {flightId} is no longer reporting. It may return on a fresh
+            launch, or you can remove this tile.
+          </MissingSub>
+          <MissingRemove
+            type="button"
+            aria-label={`Remove tile ${index + 1}`}
+            onClick={onRemove}
+          >
+            <X size={14} strokeWidth={1.75} aria-hidden="true" />
+            Remove tile
+          </MissingRemove>
+        </MissingWrap>
+        <TileCornerLabel>{`Tile ${index + 1}`}</TileCornerLabel>
+      </TileRoot>
+    );
+  }
 
   return (
     <TileRoot $variant={variant} $spotlit={spotlit} $spotlightActive={spotlightActive}>
@@ -265,6 +303,67 @@ const FeedWrap = styled.div`
   & button[aria-label="Next camera"],
   & button[aria-label="Previous camera"] {
     display: none;
+  }
+`;
+
+/* Missing-camera placeholder: shown in place of the feed when the tile's
+   flightId has vanished from the live cameras list. */
+const MissingWrap = styled.div`
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1rem;
+  text-align: center;
+  color: var(--kc-text-muted);
+`;
+
+const MissingIcon = styled.span`
+  line-height: 0;
+  opacity: 0.6;
+`;
+
+const MissingText = styled.span`
+  font-size: 0.85rem;
+  letter-spacing: 0.03em;
+  color: var(--kc-text);
+`;
+
+const MissingSub = styled.span`
+  font-size: 0.7rem;
+  line-height: 1.4;
+  max-width: 26ch;
+  opacity: 0.8;
+`;
+
+const MissingRemove = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.35rem;
+  padding: 0.35rem 0.7rem;
+  font-family: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+  color: var(--kc-text-muted);
+  background: none;
+  border: 1px solid var(--kc-border);
+  border-radius: 5px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+
+  &:hover {
+    border-color: var(--kc-accent);
+    color: var(--kc-accent);
+    background: var(--kc-accent-wash);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--kc-accent);
+    outline-offset: 2px;
   }
 `;
 
