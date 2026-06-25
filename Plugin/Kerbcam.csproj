@@ -123,6 +123,7 @@
     <Compile Remove="PhaseTimings.Tests/**/*.cs" />
     <Compile Remove="SettingsLayer.Tests/**/*.cs" />
     <Compile Remove="QualityClamp.Tests/**/*.cs" />
+    <Compile Remove="QualityTier.Tests/**/*.cs" />
     <Compile Remove="SidecarLifecycle.Tests/**/*.cs" />
   </ItemGroup>
 
