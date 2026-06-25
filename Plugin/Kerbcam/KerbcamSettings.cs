@@ -63,6 +63,14 @@ namespace Kerbcam
         public int Port { get; private set; } = 8088;
         public int Width { get; private set; } = 1024;
         public int Height { get; private set; } = 576;
+        /* MaxQuality is the primary resolution+bitrate knob. Explicit Width/
+           Height/BitrateBps keys in either settings file override it; absent
+           explicit keys, dims+bitrate come from the tier table in QualityTiers.
+           No MaxQuality key + no explicit dims: Sd → (1024,576,0) = prior default.
+           Backward-compatible: an existing file with Width=1024 Height=576 resolves
+           identically (explicit == tier). MaxQuality = Hd with no explicit dims →
+           (1280,720,6_000_000). */
+        public QualityTier MaxQuality { get; private set; } = QualityTier.Sd;
         public bool AutoSpawnSidecar { get; private set; } = true;
 
         // Target H.264 bitrate forwarded to the sidecar at launch, in bits
@@ -316,6 +324,26 @@ namespace Kerbcam
             // per-camera Width/Height caps see the final global dims.
             if (defaultsNode != null) ApplyScalars(settings, defaultsNode);
             if (userNode != null) ApplyScalars(settings, userNode);
+
+            /* Resolve MaxQuality tier into dims+bitrate, then let any explicit
+               Width/Height/BitrateBps keys in either file override the tier's
+               values. HasValue checks both layers so explicit keys survive
+               regardless of which file they appear in. */
+            bool wExplicit = (defaultsNode != null && defaultsNode.HasValue("Width"))
+                          || (userNode != null && userNode.HasValue("Width"));
+            bool hExplicit = (defaultsNode != null && defaultsNode.HasValue("Height"))
+                          || (userNode != null && userNode.HasValue("Height"));
+            bool bExplicit = (defaultsNode != null && defaultsNode.HasValue("BitrateBps"))
+                          || (userNode != null && userNode.HasValue("BitrateBps"));
+            var (rw, rh, rb) = QualityTiers.Resolve(
+                settings.MaxQuality,
+                wExplicit ? settings.Width : (int?)null,
+                hExplicit ? settings.Height : (int?)null,
+                bExplicit ? settings.BitrateBps : (int?)null);
+            settings.Width = rw;
+            settings.Height = rh;
+            settings.BitrateBps = rb;
+
             if (defaultsNode != null) ApplyCameraNodes(settings, defaultsNode);
             if (userNode != null) ApplyCameraNodes(settings, userNode);
 
@@ -325,7 +353,7 @@ namespace Kerbcam
                     ? defaultsPath
                     : $"{defaultsPath} + user overrides ({userPath})";
             var camCount = settings._initialLayers.Count;
-            Debug.Log($"[Kerbcam] settings loaded from {sources}: bind={settings.HttpBind} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
+            Debug.Log($"[Kerbcam] settings loaded from {sources}: bind={settings.HttpBind} tier={settings.MaxQuality} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
             if (!IsLoopback(settings.BindAddress))
             {
                 Debug.LogWarning($"[Kerbcam] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
@@ -352,6 +380,13 @@ namespace Kerbcam
         {
             ApplyString(node, "BindAddress", v => settings.BindAddress = v);
             ApplyInt(node, "Port", v => settings.Port = v);
+            ApplyString(node, "MaxQuality", v =>
+            {
+                if (QualityTiers.TryParse(v, out var t))
+                    settings.MaxQuality = t;
+                else
+                    Debug.LogWarning($"[Kerbcam] settings.cfg: unknown MaxQuality '{v}'; valid: low, sd, hd, fullhd");
+            });
             ApplyInt(node, "Width", v => settings.Width = v);
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyInt(node, "BitrateBps", v => settings.BitrateBps = v);
