@@ -7,7 +7,7 @@
 //! ```text
 //! offset   size   field
 //! ------   ----   -----
-//! 0        8      u64 magic = 0x4B45524243414D31  ("KERBCAST1")
+//! 0        8      u64 magic = 0x4B45524243414D31  ("KERBCAM1", legacy, pinned for compat)
 //! 8        4      u32 version (this layout = 1)
 //! 12       4      u32 slot_count
 //! 16       4      u32 max_width  (per-slot pixel capacity)
