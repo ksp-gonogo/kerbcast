@@ -7,13 +7,13 @@
 // a shed demote always wins over a viewer target, the controller's recovery
 // hands control back to the viewer target, and nothing a viewer sends can
 // raise quality past the operator ceiling. The shed scales used here mirror
-// KerbcamCamera.ShedTable (Unity, so this harness can't compile it); if the
+// KerbcastCamera.ShedTable (Unity, so this harness can't compile it); if the
 // table's ResScale steps ever change, update BOTH.
 //
 // Exit code 0 = pass, 1 = fail.
 
 using System;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)
@@ -22,7 +22,7 @@ void Check(bool cond, string msg)
     else { Console.Error.WriteLine("  FAIL " + msg); failures++; }
 }
 
-// KerbcamCamera.ShedTable's ResScale column (levels 0..5).
+// KerbcastCamera.ShedTable's ResScale column (levels 0..5).
 float[] shedScales = { 1.00f, 0.75f, 0.50f, 0.50f, 0.25f, 0.25f };
 
 (int w, int h) Effective(int opW, int opH, int shedLevel, int viewerLevel)

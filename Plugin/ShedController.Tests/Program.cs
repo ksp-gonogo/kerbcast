@@ -1,6 +1,6 @@
 // Unit test for ShedController — the adaptive-shed decision state machine.
 //
-// The bug this guards against: the old inline logic in KerbcamCore re-evaluated
+// The bug this guards against: the old inline logic in KerbcastCore re-evaluated
 // the shed level every LateUpdate with only a 25<->30 fps hysteresis band. When
 // the sustainable fps at adjacent resolution levels straddles that band
 // (level-0 ~24fps, level-1 ~31fps), the controller flips level every couple of
@@ -15,7 +15,7 @@
 // Exit code 0 = pass, 1 = fail.
 
 using System;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)
@@ -151,20 +151,20 @@ const int MaxLevel = 5;
     Check(def.Evaluate(28f, 0.0) == 0, "default (quality-shed) thresholds do NOT shed at 28fps");
 }
 
-// --- 10. Cost-share gate: when kerbcam isn't a meaningful share of frame time,
+// --- 10. Cost-share gate: when kerbcast isn't a meaningful share of frame time,
 //         escalation is suppressed even below the shed threshold — so a game
-//         that's slow for non-kerbcam reasons doesn't starve every feed. ---
+//         that's slow for non-kerbcast reasons doesn't starve every feed. ---
 {
     float[] below   = { 30f, 27f, 24f, 21f, 18f };
     float[] above    = { 35f, 32f, 29f, 26f, 23f };
     var c = new ShedController(MaxLevel, shedDwellSeconds: 0.0,
         shedBelow: below, restoreAbove: above, minEscalateShare: 0.25);
-    // fps well below threshold, but kerbcam is only 10% of the frame -> hold.
-    int blocked = c.Evaluate(20f, 0.0, kerbcamShare: 0.10);
-    Check(blocked == 0, "low kerbcam cost-share blocks escalation (game-bound, not kerbcam-bound)");
-    // same fps, kerbcam now 40% of the frame -> escalate.
-    int allowed = c.Evaluate(20f, 1.0, kerbcamShare: 0.40);
-    Check(allowed == 1, "high kerbcam cost-share allows escalation (kerbcam-bound)");
+    // fps well below threshold, but kerbcast is only 10% of the frame -> hold.
+    int blocked = c.Evaluate(20f, 0.0, kerbcastShare: 0.10);
+    Check(blocked == 0, "low kerbcast cost-share blocks escalation (game-bound, not kerbcast-bound)");
+    // same fps, kerbcast now 40% of the frame -> escalate.
+    int allowed = c.Evaluate(20f, 1.0, kerbcastShare: 0.40);
+    Check(allowed == 1, "high kerbcast cost-share allows escalation (kerbcast-bound)");
     // Default share (1.0) + no gate (minEscalateShare 0) preserves old behaviour.
     var d = new ShedController(MaxLevel, shedDwellSeconds: 0.0);
     Check(d.Evaluate(5f, 0.0) == 1, "no-gate controller (default share) escalates as before");

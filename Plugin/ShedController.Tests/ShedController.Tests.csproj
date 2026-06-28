@@ -19,7 +19,7 @@
   <ItemGroup>
     <!-- Compile the controller under test directly — no project reference to
          the KSP plugin (which can't build off-Linux / needs Unity refs). -->
-    <Compile Include="../Kerbcam/ShedController.cs" />
+    <Compile Include="../Kerbcast/ShedController.cs" />
   </ItemGroup>
 
 </Project>

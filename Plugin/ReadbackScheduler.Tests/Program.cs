@@ -4,7 +4,7 @@
 // Exit code 0 = pass, 1 = fail.
 
 using System;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)

@@ -21,7 +21,7 @@
   <ItemGroup>
     <!-- Compile the reader under test directly — no project reference to the
          KSP plugin (which can't build off-Linux). -->
-    <Compile Include="../Kerbcam/ControlBlock.cs" />
+    <Compile Include="../Kerbcast/ControlBlock.cs" />
   </ItemGroup>
 
   <ItemGroup>

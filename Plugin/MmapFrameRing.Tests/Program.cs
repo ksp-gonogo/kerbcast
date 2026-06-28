@@ -18,7 +18,7 @@
 using System;
 using System.IO;
 using System.Linq;
-using Kerbcam;
+using Kerbcast;
 
 const int W = 32, H = 18, Slots = 4;
 

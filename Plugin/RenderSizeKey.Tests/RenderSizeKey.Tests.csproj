@@ -2,7 +2,7 @@
 
   <!--
     Standalone unit test for RenderSizeKey.cs — the Unity-free (width,height)
-    pack/unpack used as the key for KerbcamCamera's RenderTexture pool. Compiles
+    pack/unpack used as the key for KerbcastCamera's RenderTexture pool. Compiles
     ONLY the helper (no KSP/Unity assemblies). Run: `dotnet run`. Mirrors the
     ControlBlock.Tests / ShedController.Tests pattern.
   -->
@@ -15,7 +15,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../Kerbcam/RenderSizeKey.cs" />
+    <Compile Include="../Kerbcast/RenderSizeKey.cs" />
   </ItemGroup>
 
 </Project>

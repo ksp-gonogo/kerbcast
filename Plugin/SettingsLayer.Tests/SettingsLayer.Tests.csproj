@@ -2,7 +2,7 @@
 
   <!--
     Standalone unit test for SettingsLayer.cs, the Unity-free key-application
-    helpers behind KerbcamSettings' layered load (shipped defaults file, then
+    helpers behind KerbcastSettings' layered load (shipped defaults file, then
     the user override file on top). Compiles ONLY the helper (no KSP/Unity
     assemblies). Run: `dotnet run`. Mirrors the ReadbackScheduler.Tests
     pattern.
@@ -16,7 +16,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../Kerbcam/SettingsLayer.cs" />
+    <Compile Include="../Kerbcast/SettingsLayer.cs" />
   </ItemGroup>
 
 </Project>

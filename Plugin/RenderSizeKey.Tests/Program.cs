@@ -7,7 +7,7 @@
 
 using System;
 using System.Collections.Generic;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)
