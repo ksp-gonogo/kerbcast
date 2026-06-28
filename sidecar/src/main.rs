@@ -1,4 +1,4 @@
-//! kerbcam sidecar binary. Reads RGBA frames from the KSP plugin's
+//! kerbcast sidecar binary. Reads RGBA frames from the KSP plugin's
 //! shared-memory ring, encodes them via the selected EncoderBackend,
 //! fans the resulting NAL units out to every connected WebRTC peer.
 //! Browsers connect via the HTTP signalling endpoint at `--http-bind`.
@@ -22,20 +22,20 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use webrtc::media::Sample;
 
-use kerbcam_sidecar::cameras::{CameraRegistry, CameraState};
-use kerbcam_sidecar::encoder::{
+use kerbcast_sidecar::cameras::{CameraRegistry, CameraState};
+use kerbcast_sidecar::encoder::{
     resolve_bitrate_bps, select_backend, EncodeConfig, EncoderBackend, EncoderChoice, RawFrame,
     SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
 };
-use kerbcam_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
-use kerbcam_sidecar::protocol::{
+use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
+use kerbcast_sidecar::protocol::{
     AdaptiveShedPayload, CameraLifecycle, CameraState as ProtocolCameraState,
     CameraStateChangedPayload, ServerMessage, SettingsStatePayload,
 };
-use kerbcam_sidecar::shared_mem::MmapRingConfig;
-use kerbcam_sidecar::signalling::{router, AppState};
-use kerbcam_sidecar::webrtc::{resync_after_camera_churn, KerbcamPeer};
-use kerbcam_sidecar::VERSION;
+use kerbcast_sidecar::shared_mem::MmapRingConfig;
+use kerbcast_sidecar::signalling::{router, AppState};
+use kerbcast_sidecar::webrtc::{resync_after_camera_churn, KerbcastPeer};
+use kerbcast_sidecar::VERSION;
 
 /// Consecutive encode() failures before the consume loop drops a
 /// camera's encoder to force re-initialisation. ~1s of frames at 30fps:
@@ -44,15 +44,15 @@ use kerbcam_sidecar::VERSION;
 const ENCODE_FAILURE_REINIT_THRESHOLD: u32 = 30;
 
 #[derive(Parser, Debug)]
-#[command(name = "kerbcam-sidecar", version = VERSION, about)]
+#[command(name = "kerbcast-sidecar", version = VERSION, about)]
 struct Cli {
     #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
     encoder: EncoderChoice,
 
     /// Directory the KSP plugin drops per-camera ring files into.
-    /// Matches the plugin's `KerbcamCore.ResolveRingDir` default —
-    /// `$XDG_RUNTIME_DIR/kerbcam/` if that dir exists, else
-    /// `/tmp/kerbcam/`. Override with `--shm-dir` when running
+    /// Matches the plugin's `KerbcastCore.ResolveRingDir` default —
+    /// `$XDG_RUNTIME_DIR/kerbcast/` if that dir exists, else
+    /// `/tmp/kerbcast/`. Override with `--shm-dir` when running
     /// against a relocated install or a recorded fixture. Each file
     /// inside is named `<flight_id>.ring`.
     #[arg(long, default_value_os_t = default_shm_dir())]
@@ -112,10 +112,10 @@ fn default_shm_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
         let p = PathBuf::from(xdg);
         if p.is_dir() {
-            return p.join("kerbcam");
+            return p.join("kerbcast");
         }
     }
-    PathBuf::from("/tmp/kerbcam")
+    PathBuf::from("/tmp/kerbcast")
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
         shm_dir = %cli.shm_dir.display(),
         encoder = ?cli.encoder,
         http_bind = %cli.http_bind,
-        "kerbcam sidecar starting",
+        "kerbcast sidecar starting",
     );
 
     // Resolve the effective bitrate once, here: AppState and the consume
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
         "camera registry initialised — scanning for rings",
     );
 
-    let peers: Arc<RwLock<Vec<Arc<KerbcamPeer>>>> = Arc::new(RwLock::new(Vec::new()));
+    let peers: Arc<RwLock<Vec<Arc<KerbcastPeer>>>> = Arc::new(RwLock::new(Vec::new()));
     let state = AppState {
         registry: registry.clone(),
         peers: peers.clone(),
@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
         let interval = Duration::from_secs(5);
         loop {
             sleep(interval).await;
-            let snapshot: Vec<Arc<KerbcamPeer>> = ping_peers.read().await.clone();
+            let snapshot: Vec<Arc<KerbcastPeer>> = ping_peers.read().await.clone();
             for peer in &snapshot {
                 if peer.is_alive() {
                     peer.push_message(&ServerMessage::Ping).await;
@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn consume_loop(
     registry: Arc<CameraRegistry>,
-    peers: Arc<RwLock<Vec<Arc<KerbcamPeer>>>>,
+    peers: Arc<RwLock<Vec<Arc<KerbcastPeer>>>>,
     encoder_choice: EncoderChoice,
     poll_interval: Duration,
     idle_interval: Duration,
@@ -309,7 +309,7 @@ async fn consume_loop(
             // subscriptions to the re-attached cameras and push a fresh
             // camera snapshot so browser lists drain and repopulate.
             if !churn.attached.is_empty() || !churn.removed.is_empty() {
-                let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+                let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
                 resync_after_camera_churn(&registry, &snapshot, &churn.attached).await;
             }
             let newly_destroyed = churn.newly_destroyed;
@@ -325,7 +325,7 @@ async fn consume_loop(
             // Broadcast camera-state-changed for newly-destroyed cameras and
             // acknowledge (delete tombstone). "Clean close" is via the
             // data-channel notification rather than RTCP/track removal because
-            // KerbcamPeer doesn't store per-camera RTCRtpSender refs; the
+            // KerbcastPeer doesn't store per-camera RTCRtpSender refs; the
             // published client renders SIGNAL LOST on receipt and keeps the
             // last decoded frame visible through the HTML video element.
             if !newly_destroyed.is_empty() {
@@ -345,7 +345,7 @@ async fn consume_loop(
         // adaptive controller already holds the camera lower).
         let dirty = registry.take_dirty_cameras().await;
         if !dirty.is_empty() {
-            let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+            let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
             for flight_id in dirty {
                 let Some(state) = registry.protocol_state(flight_id).await else {
                     continue;
@@ -360,7 +360,7 @@ async fn consume_loop(
         // Before forgetting the peer, wipe its SetDegrade entries from
         // every camera it was subscribed to so the noisiest-consumer
         // max relaxes when a degrade-requesting peer leaves.
-        let dropped_peers: Vec<Arc<KerbcamPeer>> = {
+        let dropped_peers: Vec<Arc<KerbcastPeer>> = {
             let mut guard = peers.write().await;
             let mut dropped = Vec::new();
             guard.retain(|p| {
@@ -375,7 +375,7 @@ async fn consume_loop(
         };
         for peer in dropped_peers {
             // Close the RTCPeerConnection so its senders release the slot
-            // tracks. Dropping the Arc<KerbcamPeer> alone is NOT enough —
+            // tracks. Dropping the Arc<KerbcastPeer> alone is NOT enough —
             // webrtc-rs keeps the sender tasks (and their track Arcs) alive
             // until close(), so without this the camera's Weak refs never die,
             // the subscriber count stays > 0, and the plugin keeps rendering
@@ -439,7 +439,7 @@ async fn consume_loop(
 /// Fan one message out to an already-snapshotted set of peers. Best-effort:
 /// peers whose data channels aren't open silently drop it. Empty set is a
 /// no-op. Callers snapshot `peers` once and may call this several times.
-async fn broadcast(peers: &[Arc<KerbcamPeer>], msg: &ServerMessage) {
+async fn broadcast(peers: &[Arc<KerbcastPeer>], msg: &ServerMessage) {
     if peers.is_empty() {
         return;
     }
@@ -453,10 +453,10 @@ async fn broadcast(peers: &[Arc<KerbcamPeer>], msg: &ServerMessage) {
 /// whose data channels haven't opened yet (or have closed) silently
 /// drop the message — there's always another snapshot a tick later.
 async fn broadcast_status_delta(
-    peers: &Arc<RwLock<Vec<Arc<KerbcamPeer>>>>,
-    delta: kerbcam_sidecar::cameras::StatusDelta,
+    peers: &Arc<RwLock<Vec<Arc<KerbcastPeer>>>>,
+    delta: kerbcast_sidecar::cameras::StatusDelta,
 ) {
-    let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+    let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
     if snapshot.is_empty() {
         return;
     }
@@ -493,10 +493,10 @@ async fn broadcast_status_delta(
 /// connected peer so their UI can render a "SIGNAL LOST" overlay.
 async fn broadcast_destroyed_cameras(
     registry: &Arc<CameraRegistry>,
-    peers: &Arc<RwLock<Vec<Arc<KerbcamPeer>>>>,
+    peers: &Arc<RwLock<Vec<Arc<KerbcastPeer>>>>,
     flight_ids: &[u32],
 ) {
-    let snapshot: Vec<Arc<KerbcamPeer>> = peers.read().await.clone();
+    let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
     if snapshot.is_empty() {
         return;
     }
@@ -847,23 +847,23 @@ async fn encode_and_fan_out(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kerbcam_sidecar::encoder::{Nvenc, Software};
+    use kerbcast_sidecar::encoder::{Nvenc, Software};
 
     #[test]
     fn bitrate_flag_absent_is_distinguishable_from_explicit() {
         // No clap default: an omitted flag must parse as None so the
         // backend-aware default can kick in downstream.
-        let absent = Cli::try_parse_from(["kerbcam-sidecar"]).unwrap();
+        let absent = Cli::try_parse_from(["kerbcast-sidecar"]).unwrap();
         assert_eq!(absent.bitrate_bps, None);
 
         let explicit =
-            Cli::try_parse_from(["kerbcam-sidecar", "--bitrate-bps", "1500000"]).unwrap();
+            Cli::try_parse_from(["kerbcast-sidecar", "--bitrate-bps", "1500000"]).unwrap();
         assert_eq!(explicit.bitrate_bps, Some(1_500_000));
     }
 
     #[test]
     fn explicit_flag_wins_regardless_of_backend_class() {
-        let cli = Cli::try_parse_from(["kerbcam-sidecar", "--bitrate-bps", "2000000"]).unwrap();
+        let cli = Cli::try_parse_from(["kerbcast-sidecar", "--bitrate-bps", "2000000"]).unwrap();
         assert_eq!(
             resolve_bitrate_bps(cli.bitrate_bps, &Nvenc::new()),
             2_000_000

@@ -13,7 +13,7 @@
 //! (and Kotlin / Swift / Scala / Go when those consumers materialise)
 //! into `client-sdk/`. The CI workflow runs typeshare on every push to
 //! `sidecar/src/protocol/**` and publishes the resulting npm package as
-//! `@kerbcam/protocol`.
+//! `@kerbcast/protocol`.
 //!
 //! All types use camelCase JSON keys to match TypeScript convention.
 //! Enums use adjacent tagging (`tag = "type", content = "content"`)
@@ -27,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-/// Layer mask. Mirrors `Kerbcam.CameraLayers` on the plugin side.
+/// Layer mask. Mirrors `Kerbcast.CameraLayers` on the plugin side.
 /// Receiving clients use this for both the rendered-layer status reports
 /// and per-camera layer requests.
 #[typeshare]
@@ -155,7 +155,7 @@ pub struct CameraState {
     /// Equal to `fov` when `supports_zoom == false`.
     pub fov_min: f32,
     pub fov_max: f32,
-    /// Whether the part supports pan/tilt (kerbcam-side mod extension —
+    /// Whether the part supports pan/tilt (kerbcast-side mod extension —
     /// no stock Hullcam parts are steerable, but the extended mod adds
     /// pan to specific parts). False on every shipping part today;
     /// clients should hide pan controls until this flips true.
@@ -369,7 +369,7 @@ pub struct ErrorPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SetThrottleMainScreenPayload {
     /// When `true`, disable the KSP main flight cameras to free GPU for
-    /// kerbcam streams. Persists via the per-save difficulty parameter,
+    /// kerbcast streams. Persists via the per-save difficulty parameter,
     /// matching the in-game Difficulty Settings toggle.
     pub enabled: bool,
 }

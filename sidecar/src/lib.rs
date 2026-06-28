@@ -1,4 +1,4 @@
-//! kerbcam sidecar library — exposes the encoder backend trait, control
+//! kerbcast sidecar library — exposes the encoder backend trait, control
 //! protocol types, and shared-memory ring buffer used by both `main.rs`
 //! (binary entry) and integration tests.
 //!

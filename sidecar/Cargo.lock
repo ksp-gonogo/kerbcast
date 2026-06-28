@@ -1267,7 +1267,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kerbcam-sidecar"
+name = "kerbcast-sidecar"
 version = "0.21.3"
 dependencies = [
  "anyhow",

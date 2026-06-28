@@ -7,7 +7,7 @@
 //! live camera.
 //!
 //! Usage:
-//!   cargo run --example fake_camera -- /tmp/kerbcam-rings 101 "NavCam"
+//!   cargo run --example fake_camera -- /tmp/kerbcast-rings 101 "NavCam"
 //!
 //! Ring config must match the sidecar's CLI defaults (slot_count 4,
 //! max 1024x576); pass a different shm dir per camera id to run several.
@@ -17,7 +17,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kerbcam_sidecar::shared_mem::{MmapFrameRing, MmapRingConfig};
+use kerbcast_sidecar::shared_mem::{MmapFrameRing, MmapRingConfig};
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
@@ -25,7 +25,7 @@ const FPS: u64 = 30;
 
 fn main() {
     let mut args = env::args().skip(1);
-    let shm_dir = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/kerbcam-rings".into()));
+    let shm_dir = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/kerbcast-rings".into()));
     let flight_id: u32 = args
         .next()
         .unwrap_or_else(|| "101".into())

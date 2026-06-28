@@ -1,10 +1,10 @@
-# kerbcam-sidecar
+# kerbcast-sidecar
 
-Per-OS hardware H.264 encoder + WebRTC peer + shared-memory frame ingest for the kerbcam KSP camera-streaming mod. Lives next to the C# Unity plugin in the parent `kerbcam` repo; the plugin spawns this binary on `Awake()` and kills it on `OnDestroy()` (and restarts it with backoff if it crashes mid-session).
+Per-OS hardware H.264 encoder + WebRTC peer + shared-memory frame ingest for the kerbcast KSP camera-streaming mod. Lives next to the C# Unity plugin in the parent `kerbcast` repo; the plugin spawns this binary on `Awake()` and kills it on `OnDestroy()` (and restarts it with backoff if it crashes mid-session).
 
 ## Status
 
-**Fully implemented and shipping** in the per-rid release bundles under `GameData/Kerbcam/Sidecar/<rid>/`. The pipeline: mmap frame rings written by the plugin → per-camera H.264 encoder (lazy-init, auto re-init on resolution/bitrate change or sustained failure) → WebRTC video tracks + JSON control data-channel to any browser peer. An axum HTTP endpoint serves signalling and the bundled web page (`web/dist/index.html`, embedded via `include_str!`).
+**Fully implemented and shipping** in the per-rid release bundles under `GameData/Kerbcast/Sidecar/<rid>/`. The pipeline: mmap frame rings written by the plugin → per-camera H.264 encoder (lazy-init, auto re-init on resolution/bitrate change or sustained failure) → WebRTC video tracks + JSON control data-channel to any browser peer. An axum HTTP endpoint serves signalling and the bundled web page (`web/dist/index.html`, embedded via `include_str!`).
 
 Encoder tiers:
 

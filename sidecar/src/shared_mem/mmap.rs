@@ -7,7 +7,7 @@
 //! ```text
 //! offset   size   field
 //! ------   ----   -----
-//! 0        8      u64 magic = 0x4B45524243414D31  ("KERBCAM1")
+//! 0        8      u64 magic = 0x4B45524243414D31  ("KERBCAST1")
 //! 8        4      u32 version (this layout = 1)
 //! 12       4      u32 slot_count
 //! 16       4      u32 max_width  (per-slot pixel capacity)
@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
-pub const MAGIC: u64 = 0x4B45_5242_4341_4D31; // "KERBCAM1" big-endian-ish
+pub const MAGIC: u64 = 0x4B45_5242_4341_4D31; // "KERBCAST1" big-endian-ish
 pub const LAYOUT_VERSION: u32 = 1;
 
 /// Header is one page so the first slot is page-aligned. Keeps the writer's
@@ -440,7 +440,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        temp_dir().join(format!("kerbcam-mmaptest-{pid}-{nanos}-{suffix}"))
+        temp_dir().join(format!("kerbcast-mmaptest-{pid}-{nanos}-{suffix}"))
     }
 
     fn small_cfg() -> MmapRingConfig {

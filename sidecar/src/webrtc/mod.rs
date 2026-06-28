@@ -9,4 +9,4 @@
 
 pub mod peer;
 
-pub use peer::{resync_after_camera_churn, KerbcamPeer};
+pub use peer::{resync_after_camera_churn, KerbcastPeer};

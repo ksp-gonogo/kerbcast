@@ -5,7 +5,7 @@
 //! This is the mirror image of the frame ring (`mmap.rs` ↔ `MmapFrameRing.cs`):
 //! there the plugin writes and the sidecar reads; here the sidecar writes and
 //! the plugin reads. The binary layout is a hard cross-language contract — it
-//! MUST stay byte-for-byte in lockstep with `Plugin/Kerbcam/ControlBlock.cs`.
+//! MUST stay byte-for-byte in lockstep with `Plugin/Kerbcast/ControlBlock.cs`.
 //! Any field reorder / addition is a `CONTROL_LAYOUT_VERSION` bump on both
 //! sides. `control_block_v2.bin` (in `testdata/`) is the golden fixture both
 //! sides validate against so they can't silently drift.
@@ -56,7 +56,7 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::cameras::ControlState;
 use crate::protocol::Layer;
 
-/// "KCTRLB1\0" little-endian. Distinct from the frame ring's "KERBCAM1".
+/// "KCTRLB1\0" little-endian. Distinct from the frame ring's "KERBCAST1".
 pub const CONTROL_MAGIC: u64 = 0x0031_424C_5254_434B;
 pub const CONTROL_LAYOUT_VERSION: u32 = 2;
 pub const CONTROL_HEADER_SIZE: usize = 4096;
@@ -330,7 +330,7 @@ mod tests {
     static TMP_CTR: AtomicU64 = AtomicU64::new(0);
     fn unique_path(tag: &str) -> std::path::PathBuf {
         let n = TMP_CTR.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kerbcam-ctrl-{tag}-{}-{n}.bin", std::process::id()))
+        std::env::temp_dir().join(format!("kerbcast-ctrl-{tag}-{}-{n}.bin", std::process::id()))
     }
 
     fn write_to_vec(state: &ControlState) -> Vec<u8> {
@@ -394,14 +394,14 @@ mod tests {
     /// The cross-language contract: the writer's bytes for `fixture_state()`
     /// MUST equal the committed golden fixture that the C# reader also checks.
     /// If this fails after a layout change, regenerate the fixture (see
-    /// `KERBCAM_EMIT_CONTROL_FIXTURE`) and update the C# expectations too.
+    /// `KERBCAST_EMIT_CONTROL_FIXTURE`) and update the C# expectations too.
     #[test]
     fn matches_golden_fixture() {
         let bytes = write_to_vec(&fixture_state());
         let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/control_block_v2.bin");
 
         // Opt-in regeneration so the fixture is reproducible from this test.
-        if std::env::var("KERBCAM_EMIT_CONTROL_FIXTURE").is_ok() {
+        if std::env::var("KERBCAST_EMIT_CONTROL_FIXTURE").is_ok() {
             if let Some(parent) = std::path::Path::new(fixture_path).parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
@@ -413,7 +413,7 @@ mod tests {
         let golden = std::fs::read(fixture_path).unwrap_or_else(|_| {
             panic!(
                 "missing golden fixture {fixture_path}; regenerate with \
-                 KERBCAM_EMIT_CONTROL_FIXTURE=1 cargo test matches_golden_fixture"
+                 KERBCAST_EMIT_CONTROL_FIXTURE=1 cargo test matches_golden_fixture"
             )
         });
         assert_eq!(

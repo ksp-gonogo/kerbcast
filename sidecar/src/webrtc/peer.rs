@@ -1,6 +1,6 @@
-//! WebRTC peer for the kerbcam sidecar. One `KerbcamPeer` per browser
+//! WebRTC peer for the kerbcast sidecar. One `KerbcastPeer` per browser
 //! connection; each carries one H.264 video track per camera the browser
-//! subscribed to AND a "kerbcam-control" data channel for bidirectional
+//! subscribed to AND a "kerbcast-control" data channel for bidirectional
 //! protocol messages (see `crate::protocol`). webrtc-rs handles
 //! ICE/DTLS/SRTP/RTP packetisation internally.
 //!
@@ -59,7 +59,7 @@ use crate::protocol::{
     SlotMapPayload,
 };
 
-const CONTROL_CHANNEL_LABEL: &str = "kerbcam-control";
+const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
 
 /// One pre-negotiated video slot. The track stays on the peer connection
 /// for the connection's lifetime; `bound` records which camera currently
@@ -71,7 +71,7 @@ struct Slot {
     bound: Option<u32>,
 }
 
-pub struct KerbcamPeer {
+pub struct KerbcastPeer {
     pc: Arc<RTCPeerConnection>,
     /// Stable identifier for this peer for the lifetime of the
     /// connection. Used as the per-camera degrade map key (see
@@ -96,9 +96,9 @@ pub struct KerbcamPeer {
     alive: Arc<AtomicBool>,
 }
 
-impl KerbcamPeer {
+impl KerbcastPeer {
     /// Build a peer with a pool of `slot_count` pre-negotiated H.264 video
-    /// slots + a "kerbcam-control" data channel. The cameras in `initial`
+    /// slots + a "kerbcast-control" data channel. The cameras in `initial`
     /// are bound to the first slots immediately (skipping unknown/destroyed
     /// ones); the rest stay idle until the browser `Subscribe`s a camera
     /// into them. `slot_count` must equal the number of recv-only video
@@ -158,7 +158,7 @@ impl KerbcamPeer {
                     ..Default::default()
                 },
                 format!("video-slot{i}"),
-                format!("kerbcam-slot{i}"),
+                format!("kerbcast-slot{i}"),
             ));
             let rtp_sender = pc
                 .add_track(track.clone() as Arc<dyn TrackLocal + Send + Sync>)
@@ -708,7 +708,7 @@ async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec
 ///      handle this message (it's the Hello-time priming snapshot).
 pub async fn resync_after_camera_churn(
     registry: &Arc<CameraRegistry>,
-    peers: &[Arc<KerbcamPeer>],
+    peers: &[Arc<KerbcastPeer>],
     attached: &[u32],
 ) {
     if peers.is_empty() {
@@ -1351,7 +1351,7 @@ mod tests {
     use std::sync::Weak;
     use std::time::Duration;
 
-    // Build a minimal RTCPeerConnection the same way KerbcamPeer::new does, so
+    // Build a minimal RTCPeerConnection the same way KerbcastPeer::new does, so
     // the sender/track lifecycle matches production.
     async fn build_pc() -> Arc<RTCPeerConnection> {
         let mut media_engine = MediaEngine::default();
@@ -1373,7 +1373,7 @@ mod tests {
     // rendering. WITHOUT close() the sender holds the track Arc for the life of
     // the (already-dropped) peer, so the Weak never dies: that is the leak that
     // left cameras rendering after a clean disconnect (the reaper dropped the
-    // Arc<KerbcamPeer> but never called close()).
+    // Arc<KerbcastPeer> but never called close()).
     #[tokio::test]
     async fn close_releases_track_arc() {
         let pc = build_pc().await;
@@ -1438,7 +1438,7 @@ mod tests {
         registry.rescan().await;
 
         let peer = Arc::new(
-            KerbcamPeer::new(registry.clone(), &[1], 2)
+            KerbcastPeer::new(registry.clone(), &[1], 2)
                 .await
                 .expect("peer"),
         );

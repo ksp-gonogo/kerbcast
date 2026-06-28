@@ -15,7 +15,7 @@ fn build_ffi_shim() {
     for path in &lib.include_paths {
         build.include(path);
     }
-    build.compile("kerbcam_ffi_shim");
+    build.compile("kerbcast_ffi_shim");
 
     println!("cargo:rerun-if-changed=src/encoder/ffi_shim.c");
 }

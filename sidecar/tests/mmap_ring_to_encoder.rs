@@ -7,8 +7,8 @@
 use std::env::temp_dir;
 use std::fs;
 
-use kerbcam_sidecar::encoder::{EncodeConfig, EncoderBackend, RawFrame, Software};
-use kerbcam_sidecar::shared_mem::{MmapFrameRing, MmapRingConfig};
+use kerbcast_sidecar::encoder::{EncodeConfig, EncoderBackend, RawFrame, Software};
+use kerbcast_sidecar::shared_mem::{MmapFrameRing, MmapRingConfig};
 
 fn tmp_path(suffix: &str) -> std::path::PathBuf {
     let pid = std::process::id();
@@ -16,7 +16,7 @@ fn tmp_path(suffix: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    temp_dir().join(format!("kerbcam-e2e-{pid}-{nanos}-{suffix}"))
+    temp_dir().join(format!("kerbcast-e2e-{pid}-{nanos}-{suffix}"))
 }
 
 fn synthetic_rgba(width: u32, height: u32, frame_n: u32) -> Vec<u8> {
