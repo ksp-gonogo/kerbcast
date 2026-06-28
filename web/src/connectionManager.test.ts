@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "./connectionManager";
-import type { KerbcamClient } from "@jonpepler/kerbcam";
+import type { KerbcastClient } from "@jonpepler/kerbcast";
 
 /**
  * Minimal client double: just what ConnectionManager touches. The full
@@ -18,7 +18,7 @@ function fakeClient() {
       return () => handlers.delete(event);
     }),
   };
-  return { client: client as unknown as KerbcamClient, raw: client, handlers };
+  return { client: client as unknown as KerbcastClient, raw: client, handlers };
 }
 
 describe("ConnectionManager lifecycle", () => {

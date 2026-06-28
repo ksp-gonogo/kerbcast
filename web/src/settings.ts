@@ -1,14 +1,14 @@
 /**
- * Persistent settings for the kerbcam web page.
+ * Persistent settings for the kerbcast web page.
  * Backed by localStorage. Each getter reads the stored value on every call
  * so callers always see the latest.
  */
 
 export type ThemePreference = "auto" | "light" | "dark";
 
-const KEY_THEME = "kerbcam:theme";
-const KEY_DEBUG = "kerbcam:debug";
-const KEY_SHOW_STATIC = "kerbcam:showStatic";
+const KEY_THEME = "kerbcast:theme";
+const KEY_DEBUG = "kerbcast:debug";
+const KEY_SHOW_STATIC = "kerbcast:showStatic";
 
 export function loadTheme(): ThemePreference {
   const raw = localStorage.getItem(KEY_THEME);

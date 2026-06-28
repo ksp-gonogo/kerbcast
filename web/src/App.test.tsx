@@ -1,7 +1,7 @@
 /**
- * Tests for the kerbcam-web App.
+ * Tests for the kerbcast-web App.
  *
- * All tests drive the real KerbcamClient + real hooks through MockSidecar.
+ * All tests drive the real KerbcastClient + real hooks through MockSidecar.
  * The DOM stubs are installed in src/test/setup.ts via installDomStubs().
  *
  * Pattern mirrors client-sdk/react/src/CameraFeed.test.tsx but with a key
@@ -11,11 +11,11 @@
  * resulting UI state.
  */
 
-import { KerbcamClient } from "@jonpepler/kerbcam";
-import type { CameraLifecycle } from "@jonpepler/kerbcam";
-import { Layer } from "@jonpepler/kerbcam";
-import type { MockCameraInit } from "@jonpepler/kerbcam/testing";
-import { MockSidecar } from "@jonpepler/kerbcam/testing";
+import { KerbcastClient } from "@jonpepler/kerbcast";
+import type { CameraLifecycle } from "@jonpepler/kerbcast";
+import { Layer } from "@jonpepler/kerbcast";
+import type { MockCameraInit } from "@jonpepler/kerbcast/testing";
+import { MockSidecar } from "@jonpepler/kerbcast/testing";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -64,10 +64,10 @@ function makeCamera(overrides: MockCameraInit): MockCameraInit {
 // sidecar.open() + setConnectionState() to complete the mock handshake.
 // ---------------------------------------------------------------------------
 
-const createdClients: KerbcamClient[] = [];
+const createdClients: KerbcastClient[] = [];
 
 interface AppFixture {
-  client: KerbcamClient;
+  client: KerbcastClient;
   sidecar: MockSidecar;
   /** Open the mock channel and fire connected state. */
   openSidecar(): void;
@@ -78,7 +78,7 @@ function buildFixture(cameras: MockCameraInit[] = [], slots = 8): AppFixture {
   sidecar.withSlots(Array.from({ length: slots }, (_, i) => String(i)));
   for (const cam of cameras) sidecar.addCamera(cam);
 
-  const client = new KerbcamClient(
+  const client = new KerbcastClient(
     { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
     sidecar.createTransport(),
   );
@@ -94,7 +94,7 @@ function buildFixture(cameras: MockCameraInit[] = [], slots = 8): AppFixture {
   };
 }
 
-async function renderApp(client: KerbcamClient) {
+async function renderApp(client: KerbcastClient) {
   let result: ReturnType<typeof render>;
   await act(async () => {
     result = render(<App client={client} />);
@@ -122,7 +122,7 @@ beforeEach(() => {
     const urlStr = String(typeof url === "string" ? url : (url as { url?: string }).url ?? url);
     if (urlStr.endsWith("/profile")) {
       return new Response(
-        JSON.stringify({ staggerBudget: 3, kerbcamFrameMs: 0.15, kspFps: 60 }),
+        JSON.stringify({ staggerBudget: 3, kerbcastFrameMs: 0.15, kspFps: 60 }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -199,7 +199,7 @@ describe("App - connect flow", () => {
   it("shows add-tile button regardless of tile count (no cap)", async () => {
     // 8 was the old hard cap; seed past it and confirm adding still works.
     localStorage.setItem(
-      "kerbcam:tiles",
+      "kerbcast:tiles",
       JSON.stringify(Array.from({ length: 8 }, (_, i) => ({ flightId: i + 1 }))),
     );
 
@@ -264,7 +264,7 @@ describe("App - tile management", () => {
     });
 
     expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(2);
-    const stored = JSON.parse(localStorage.getItem("kerbcam:tiles") ?? "[]") as unknown[];
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as unknown[];
     expect(stored).toHaveLength(2);
   });
 
@@ -289,13 +289,13 @@ describe("App - tile management", () => {
     });
 
     expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(1);
-    const stored = JSON.parse(localStorage.getItem("kerbcam:tiles") ?? "[]") as unknown[];
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as unknown[];
     expect(stored).toHaveLength(1);
   });
 
   it("does not reseed tiles when localStorage already has a value", async () => {
     localStorage.setItem(
-      "kerbcam:tiles",
+      "kerbcast:tiles",
       JSON.stringify([{ flightId: 1 }, { flightId: 2 }]),
     );
 
@@ -318,7 +318,7 @@ describe("App - tile management", () => {
   });
 
   it("respects a stored empty-tile array (user removed all)", async () => {
-    localStorage.setItem("kerbcam:tiles", JSON.stringify([]));
+    localStorage.setItem("kerbcast:tiles", JSON.stringify([]));
 
     const { client, openSidecar } = buildFixture([
       makeCamera({ flightId: 1, cameraName: "Alpha" }),
@@ -359,7 +359,7 @@ describe("App - add all cameras", () => {
     });
 
     expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(3);
-    const stored = JSON.parse(localStorage.getItem("kerbcam:tiles") ?? "[]") as
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
       { flightId: number | null }[];
     expect(stored.map((t) => t.flightId)).toEqual([1, 2, 3]);
   });
@@ -406,11 +406,11 @@ describe("App - add all cameras", () => {
     });
 
     expect(screen.queryByText(/feed rates may drop/i)).toBeNull();
-    expect(localStorage.getItem("kerbcam:perfNoteDismissed")).toBe("true");
+    expect(localStorage.getItem("kerbcast:perfNoteDismissed")).toBe("true");
   });
 
   it("never shows the performance note again once dismissed", async () => {
-    localStorage.setItem("kerbcam:perfNoteDismissed", "true");
+    localStorage.setItem("kerbcast:perfNoteDismissed", "true");
     saveTiles([{ flightId: 1, spotlit: false }]);
 
     const cameras = Array.from({ length: 9 }, (_, i) =>
@@ -479,12 +479,12 @@ describe("App - settings", () => {
     });
 
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
-    expect(localStorage.getItem("kerbcam:theme")).toBe("dark");
+    expect(localStorage.getItem("kerbcast:theme")).toBe("dark");
   });
 
   it("selecting auto theme removes data-theme from html", async () => {
     document.documentElement.setAttribute("data-theme", "dark");
-    localStorage.setItem("kerbcam:theme", "dark");
+    localStorage.setItem("kerbcast:theme", "dark");
 
     const { client, openSidecar } = buildFixture([]);
     await renderApp(client);
@@ -537,7 +537,7 @@ describe("App - settings", () => {
       fireEvent.click(debugCb);
     });
 
-    expect(localStorage.getItem("kerbcam:debug")).toBe("true");
+    expect(localStorage.getItem("kerbcast:debug")).toBe("true");
   });
 
   it("show-static toggle is on by default and persists when switched off", async () => {
@@ -554,11 +554,11 @@ describe("App - settings", () => {
     await act(async () => {
       fireEvent.click(cb);
     });
-    expect(localStorage.getItem("kerbcam:showStatic")).toBe("false");
+    expect(localStorage.getItem("kerbcast:showStatic")).toBe("false");
   });
 
   it("show-static=off is restored on the next visit", async () => {
-    localStorage.setItem("kerbcam:showStatic", "false");
+    localStorage.setItem("kerbcast:showStatic", "false");
 
     const { client, openSidecar } = buildFixture([]);
     await renderApp(client);
@@ -881,21 +881,21 @@ describe("App - ping watchdog", () => {
 // ---------------------------------------------------------------------------
 // Shared-subscribe refcount (carried-forward gap from design doc)
 //
-// These tests verify the KerbcamProvider refcounting at the CameraFeed level.
+// These tests verify the KerbcastProvider refcounting at the CameraFeed level.
 // The App is not used here; we test the shared-subscription behaviour directly
-// via KerbcamProvider + multiple CameraFeed tiles, which is the component layer
+// via KerbcastProvider + multiple CameraFeed tiles, which is the component layer
 // where refcounting lives. This mirrors the CameraFeed.test.tsx fixture pattern.
 // ---------------------------------------------------------------------------
 
-import { CameraFeed } from "@jonpepler/kerbcam-react";
-import { KerbcamProvider } from "@jonpepler/kerbcam-react";
+import { CameraFeed } from "@jonpepler/kerbcast-react";
+import { KerbcastProvider } from "@jonpepler/kerbcast-react";
 
 async function buildConnectedFixture(cameras: MockCameraInit[] = []) {
   const sidecar = new MockSidecar();
   sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]);
   for (const cam of cameras) sidecar.addCamera(cam);
 
-  const client = new KerbcamClient(
+  const client = new KerbcastClient(
     { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
     sidecar.createTransport(),
   );
@@ -920,10 +920,10 @@ describe("Subscribe refcount - two tiles, one subscribe", () => {
 
     await act(async () => {
       render(
-        <KerbcamProvider client={client}>
+        <KerbcastProvider client={client}>
           <CameraFeed flightId={1} />
           <CameraFeed flightId={1} />
-        </KerbcamProvider>,
+        </KerbcastProvider>,
       );
     });
 
@@ -943,10 +943,10 @@ describe("Subscribe refcount - two tiles, one subscribe", () => {
 
     function TwoFeeds({ showBoth }: { showBoth: boolean }) {
       return (
-        <KerbcamProvider client={client}>
+        <KerbcastProvider client={client}>
           <CameraFeed flightId={1} />
           {showBoth && <CameraFeed flightId={1} />}
-        </KerbcamProvider>
+        </KerbcastProvider>
       );
     }
 

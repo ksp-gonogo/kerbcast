@@ -1,4 +1,4 @@
-import type { KerbcamClient } from "@jonpepler/kerbcam";
+import type { KerbcastClient } from "@jonpepler/kerbcast";
 import { Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import styled from "styled-components";
@@ -6,7 +6,7 @@ import type { ManagerStatus } from "./connectionManager";
 
 interface HeaderProps {
   status: ManagerStatus;
-  client: KerbcamClient;
+  client: KerbcastClient;
   onOpenSettings: () => void;
 }
 
@@ -40,7 +40,7 @@ export function Header({ status, client, onOpenSettings }: HeaderProps): React.J
 
   return (
     <Root>
-      <Wordmark>kerbcam</Wordmark>
+      <Wordmark>kerbcast</Wordmark>
       <Divider />
       <StatusArea>
         <StatusDot $color={statusColor} $pulse={isPulse} />

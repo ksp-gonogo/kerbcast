@@ -1,9 +1,9 @@
 import {
   buildCameraLabeler,
   CameraFeed,
-  useKerbcamCameras,
-} from "@jonpepler/kerbcam-react";
-import type { FeedAction } from "@jonpepler/kerbcam-react";
+  useKerbcastCameras,
+} from "@jonpepler/kerbcast-react";
+import type { FeedAction } from "@jonpepler/kerbcast-react";
 import { ListPlus, Pin, PinOff, Plus, WifiOff, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import styled from "styled-components";
@@ -51,7 +51,7 @@ export function Tile({
    * Falls back to the tile number only when the feed shows nothing. The feed's
    * own title chrome is hover-revealed, so this is the at-a-glance identifier.
    */
-  const cameras = useKerbcamCameras();
+  const cameras = useKerbcastCameras();
   const [displayedFlightId, setDisplayedFlightId] = useState<number | null>(
     flightId,
   );
