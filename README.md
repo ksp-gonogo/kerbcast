@@ -1,29 +1,32 @@
 # kerbcam
 
-A from-scratch successor to OCISLY for streaming Kerbal Space Program camera feeds to a browser. Hardware-accelerated H.264 over WebRTC, with full Hullcam VDS camera-type fidelity. Designed with Linux in mind.
+A from-scratch, high-performance oriented successor to OCISLY for streaming Kerbal Space Program camera feeds to a browser. Hardware-accelerated H.264 over WebRTC, with full Hullcam VDS camera-type fidelity. Designed with Linux in mind, Windows and MacOS support is a little experimental.
+
+<p align="center">
+  <img src="docs/screenshots/main-screen-example.png" alt="kerbcam's web UI: a grid of live Hullcam camera feeds in a browser" width="720">
+</p>
 
 ## What it does
 
 - Streams HullcamVDS camera sources to a browser via the bundled kerbcam web UI or through [@jonpepler/kerbcam](https://github.com/jonpepler/kerbcam/pkgs/npm/kerbcam), a TypeScript SDK
-- Supports performance tweak options to keep fps reasonable through degrading resolution, shedding render layers, and adding 'realistic' noise at source
-- Honours each camera's `cameraMode` so B&W / CRT / night-vision variants look like they do in the in-game Hullcam GUI
-- Supports a data channel for sending control data (eg zoom)
-- Fixes and patches long term issues with OCISLY and Hullcam on Linux
+- Supports performance tweak options to keep fps reasonable through degrading resolution, framerate, and shedding render layers. By default, performance should feel vastly improved over the original OCISLY mod
+- Introduces optional shaders for wind and re-entry FX (sorry, no Firefly support yet)
+- HullcamVDS implementation enhancements:
+  - Honours each camera's `cameraMode` so B&W / CRT / night-vision variants look like they do in the in-game Hullcam GUI
+  - Introduces planned but never fully implemented panning options for turret cam and launch cam
+  - Supports a data channel for sending control data from clients (eg pan/zoom)
+  - Fixes and patches long term issues on Linux
 
 ### How it does it
 
 - Captures KSP Hullcam VDS camera feeds inside the game via `AsyncGPUReadback`, with zero stall on the game's main thread
-- Encodes them in an out-of-process 'sidecar': hardware H.264 on Linux / Steam Deck (libva), with software H.264 (OpenH264) as the fallback everywhere else. The VideoToolbox (macOS) and NVENC (Windows) hardware backends are stubbed pending implementation, so tier-2 platforms currently encode in software.
+- Encodes them in an out-of-process 'sidecar': software H.264 (OpenH264) as the fallback, with hardware H.264 on Linux / Steam Deck (libva), and NVENC (Windows). VideoToolbox (macOS) is stubbed pending implementation
 - Streams them out as WebRTC media tracks, with adaptive bitrate, congestion control, and packet loss recovery for free
 - Renders cameras only when a peer is subscribed, so no idle CPU work and no in-game UI required
 
-## Status: pre-release, personal-use only
+## Status: Initial Release - expect bugs
 
-kerbcam isn't ready for general consumption yet.
-
-- Linux / Steam Deck support is tier-1.
-- macOS and Windows are experimental tier-2: code paths exist, polish does not.
-- Mod-platform listings (CKAN, SpaceDock, KSP Forums) will come at 1.0.
+Kerbcam is just becoming ready for general consumption. It supports Linux, with limited testing on Windows and MacOS.
 
 Issues and PRs are welcome, particularly if you'd like to 'adopt' macOS or Windows support.
 
@@ -31,7 +34,7 @@ Issues and PRs are welcome, particularly if you'd like to 'adopt' macOS or Windo
 
 Grab the latest `kerbcam-*.zip` from the [releases page](https://github.com/jonpepler/kerbcam/releases) and follow the install steps in that release's notes. The steps live with each release rather than here because they can change between versions; the release notes are always correct for the build you download. You'll also need [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued).
 
-For the longer version — multi-device setup, configuration, what's in the bundle — see [docs/INSTALL.md](docs/INSTALL.md). If something doesn't work, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) walks the common failures.
+For the longer version with multi-device setup, configuration, info on what's in the bundle, see [docs/INSTALL.md](docs/INSTALL.md). If something doesn't work, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) walks the common failures.
 
 ## Differences to OCISLY
 
@@ -39,16 +42,7 @@ OCISLY uses `ReadPixels` + `EncodeToJPG` on the game's main thread and ships JPE
 
 ### Performance
 
-Measured on a Steam Deck (AMD Van Gogh APU) running KSP 1.12, launchpad scene, 6 Hullcam cameras, OpenGL / Mesa:
-
-| Scenario                               | Cameras streaming | fps mean | fps p50 |
-| -------------------------------------- | ----------------- | -------- | ------- |
-| No camera mod                          | 0                 | 56.2     | 56.5    |
-| OCISLY                                 | 6                 | 13.4     | 9.0     |
-| kerbcam, 6 cams attached, 0 connected  | 0                 | 56.9     | 56.7    |
-| kerbcam, 6 cams streaming (h264_vaapi) | 6                 | 24.99    | 34.24   |
-
-The idle row (0 connected) shows that cameras attached to a vessel cost nothing until a stream to it is opened. kerbcam streaming (25 fps) is roughly double OCISLY (13 fps) at the same camera count, with `AsyncGPUReadback` keeping frame capture off the main thread and AMD VCN handling H.264 encode out-of-process via VA-API, specifically tested on Steam Deck.
+This mod was built initally for getting best performance out of Steam Deck, and it does a good job of it. Regardless of the number of camera renders streaming, Kerbcam can adjust quality and framerate to ensure KSP FPS stays within the ideal range for in-game physics. It also uses a time budget to ensure it doesn't balloon render time. Each stream is SD by default, but can be increased. Render quality will always be able to reduce to ensure streaming continues.
 
 ## Toolchain
 
@@ -58,14 +52,12 @@ The idle row (0 connected) shows that cameras attached to a vessel cost nothing 
 
 ## Companion project
 
-[gonogo](https://github.com/jonpepler/gonogo) - a mission-control browser SPA that consumes kerbcam feeds (and a few other things). Not required to use kerbcam (any WebRTC-capable browser will do).
+[gonogo](https://github.com/jonpepler/gonogo) - a WIP mission-control browser SPA that consumes kerbcam feeds (and a few other things).
 
 ## TODO
 
-- [ ] Codesign and notarise macOS sidecar binaries (Apple notarytool workflow)
-- [ ] Establish SmartScreen reputation for Windows binaries
-- [ ] Publish NetKAN metadata to CKAN's indexer
-- [ ] Create SpaceDock listing
+- [x] Publish NetKAN metadata to CKAN's indexer
+- [x] Create SpaceDock listing
 - [ ] KSP Forums post
 - [x] User-facing install and quickstart docs
 
@@ -73,4 +65,4 @@ The idle row (0 connected) shows that cameras attached to a vessel cost nothing 
 
 - [ ] Better tier-2 OS support
 - [x] Support Hullcam VDS cameras that take zoom commands
-- [ ] Extend Hullcam with a pivotable camera
+- [x] Extend Hullcam with a pivotable camera

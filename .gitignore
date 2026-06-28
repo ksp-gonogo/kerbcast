@@ -47,6 +47,16 @@ Thumbs.db
 # Local reference docs (cloned source repos, design notes, etc.)
 local_docs/
 
+# Serena project index (local tooling, not shipped)
+.serena/
+
+# docs/ ships only the two user-facing guides; everything else there is
+# local working material (agent plans, reviews, backlogs).
+docs/*
+!docs/INSTALL.md
+!docs/TROUBLESHOOTING.md
+!docs/screenshots/
+
 # Packaged binaries (built by CI, not committed)
 GameData/Kerbcam/Sidecar/*/kerbcam-sidecar
 GameData/Kerbcam/Sidecar/*/kerbcam-sidecar.exe
