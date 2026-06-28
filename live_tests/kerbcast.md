@@ -1,6 +1,6 @@
-# Live-testing kerbcam
+# Live-testing kerbcast
 
-Script-testable reference for verifying a running kerbcam sidecar — written so
+Script-testable reference for verifying a running kerbcast sidecar — written so
 a Claude session (or a human with curl) can check a live instance without
 re-deriving the protocol from source. The canonical definitions live in
 `sidecar/src/protocol/mod.rs` and `sidecar/src/signalling.rs`; if this file
@@ -10,8 +10,8 @@ and the source disagree, the source wins — and this file should be fixed.
 
 ```sh
 cd sidecar
-cargo run --example fake_camera -- /tmp/kerbcam-test-rings 101 "NavCam" &
-cargo run --bin kerbcam-sidecar -- --shm-dir /tmp/kerbcam-test-rings --encoder software
+cargo run --example fake_camera -- /tmp/kerbcast-test-rings 101 "NavCam" &
+cargo run --bin kerbcast-sidecar -- --shm-dir /tmp/kerbcast-test-rings --encoder software
 ```
 
 `fake_camera` writes `<flight_id>.info.json` + `<flight_id>.ring` and keeps
@@ -21,8 +21,8 @@ must match the sidecar defaults (4 slots, 1024×576 max).
 
 Against a real KSP install, the sidecar runs once per KSP session: the first
 flight scene spawns it and it stays up across scene changes, reverts, and
-trips through the KSC until KSP exits (KerbcamSidecarHost owns the process;
-the per-flight KerbcamCore only registers/unregisters cameras). The default
+trips through the KSC until KSP exits (KerbcastSidecarHost owns the process;
+the per-flight KerbcastCore only registers/unregisters cameras). The default
 endpoint is `127.0.0.1:8088` (settings.cfg `BindAddress` / `Port`).
 
 ### Session lifecycle / orphan protection
@@ -91,7 +91,7 @@ an error status, not a hang.
 For a real end-to-end check with a browser available, load `GET /` with
 `?mock=0` (the bundled page auto-connects) and confirm a moving test pattern.
 
-## Control data channel (`kerbcam-control`)
+## Control data channel (`kerbcast-control`)
 
 JSON messages, envelope `{ "type": "<kebab-case>", "content": { … } }`
 (serde `tag = "type", content = "content"`). TypeScript bindings are
@@ -148,10 +148,10 @@ the RX 9070 XT box:
 ```powershell
 # terminal 1
 cd sidecar
-cargo run --example fake_camera -- $env:TEMP\kerbcam-test-rings 101 "NavCam"
+cargo run --example fake_camera -- $env:TEMP\kerbcast-test-rings 101 "NavCam"
 # terminal 2
 cd sidecar
-cargo run --bin kerbcam-sidecar -- --shm-dir $env:TEMP\kerbcam-test-rings
+cargo run --bin kerbcast-sidecar -- --shm-dir $env:TEMP\kerbcast-test-rings
 ```
 
 (no `--encoder` flag: auto-select must pick Media Foundation by itself;
@@ -179,6 +179,6 @@ Checklist:
 ## Cleanup
 
 ```sh
-pkill -f fake_camera; pkill -f kerbcam-sidecar
-rm -rf /tmp/kerbcam-test-rings
+pkill -f fake_camera; pkill -f kerbcast-sidecar
+rm -rf /tmp/kerbcast-test-rings
 ```

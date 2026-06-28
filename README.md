@@ -1,14 +1,14 @@
-# kerbcam
+# kerbcast
 
 A from-scratch, high-performance oriented successor to OCISLY for streaming Kerbal Space Program camera feeds to a browser. Hardware-accelerated H.264 over WebRTC, with full Hullcam VDS camera-type fidelity. Designed with Linux in mind, Windows and MacOS support is a little experimental.
 
 <p align="center">
-  <img src="docs/screenshots/main-screen-example.png" alt="kerbcam's web UI: a grid of live Hullcam camera feeds in a browser" width="720">
+  <img src="docs/screenshots/main-screen-example.png" alt="kerbcast's web UI: a grid of live Hullcam camera feeds in a browser" width="720">
 </p>
 
 ## What it does
 
-- Streams HullcamVDS camera sources to a browser via the bundled kerbcam web UI or through [@jonpepler/kerbcam](https://github.com/jonpepler/kerbcam/pkgs/npm/kerbcam), a TypeScript SDK
+- Streams HullcamVDS camera sources to a browser via the bundled kerbcast web UI or through [@jonpepler/kerbcast](https://github.com/jonpepler/kerbcast/pkgs/npm/kerbcast), a TypeScript SDK
 - Supports performance tweak options to keep fps reasonable through degrading resolution, framerate, and shedding render layers. By default, performance should feel vastly improved over the original OCISLY mod
 - Introduces optional shaders for wind and re-entry FX (sorry, no Firefly support yet)
 - HullcamVDS implementation enhancements:
@@ -26,23 +26,23 @@ A from-scratch, high-performance oriented successor to OCISLY for streaming Kerb
 
 ## Status: Initial Release - expect bugs
 
-Kerbcam is just becoming ready for general consumption. It supports Linux, with limited testing on Windows and MacOS.
+Kerbcast is just becoming ready for general consumption. It supports Linux, with limited testing on Windows and MacOS.
 
 Issues and PRs are welcome, particularly if you'd like to 'adopt' macOS or Windows support.
 
 ## Install
 
-Grab the latest `kerbcam-*.zip` from the [releases page](https://github.com/jonpepler/kerbcam/releases) and follow the install steps in that release's notes. The steps live with each release rather than here because they can change between versions; the release notes are always correct for the build you download. You'll also need [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued).
+Grab the latest `kerbcast-*.zip` from the [releases page](https://github.com/jonpepler/kerbcast/releases) and follow the install steps in that release's notes. The steps live with each release rather than here because they can change between versions; the release notes are always correct for the build you download. You'll also need [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued).
 
 For the longer version with multi-device setup, configuration, info on what's in the bundle, see [docs/INSTALL.md](docs/INSTALL.md). If something doesn't work, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) walks the common failures.
 
 ## Differences to OCISLY
 
-OCISLY uses `ReadPixels` + `EncodeToJPG` on the game's main thread and ships JPEG over unary gRPC at 30 Hz. That works, but it costs real frame budget, particularly on lower powered devices, and doesn't support the visual character that Hullcam VDS encodes per part. Kerbcam aims to fix both while prioritising high performance through hardware encoding and modern Unity API use.
+OCISLY uses `ReadPixels` + `EncodeToJPG` on the game's main thread and ships JPEG over unary gRPC at 30 Hz. That works, but it costs real frame budget, particularly on lower powered devices, and doesn't support the visual character that Hullcam VDS encodes per part. Kerbcast aims to fix both while prioritising high performance through hardware encoding and modern Unity API use.
 
 ### Performance
 
-This mod was built initally for getting best performance out of Steam Deck, and it does a good job of it. Regardless of the number of camera renders streaming, Kerbcam can adjust quality and framerate to ensure KSP FPS stays within the ideal range for in-game physics. It also uses a time budget to ensure it doesn't balloon render time. Each stream is SD by default, but can be increased. Render quality will always be able to reduce to ensure streaming continues.
+This mod was built initally for getting best performance out of Steam Deck, and it does a good job of it. Regardless of the number of camera renders streaming, Kerbcast can adjust quality and framerate to ensure KSP FPS stays within the ideal range for in-game physics. It also uses a time budget to ensure it doesn't balloon render time. Each stream is SD by default, but can be increased. Render quality will always be able to reduce to ensure streaming continues.
 
 ## Toolchain
 
@@ -52,7 +52,7 @@ This mod was built initally for getting best performance out of Steam Deck, and 
 
 ## Companion project
 
-[gonogo](https://github.com/jonpepler/gonogo) - a WIP mission-control browser SPA that consumes kerbcam feeds (and a few other things).
+[gonogo](https://github.com/jonpepler/gonogo) - a WIP mission-control browser SPA that consumes kerbcast feeds (and a few other things).
 
 ## TODO
 

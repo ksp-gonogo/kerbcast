@@ -2,23 +2,23 @@
 
 Manual checklist against a real KSP install (the Deck for tier-1 sign-off).
 Automated CI covers the sidecar, protocol, plugin units, and web page; this
-covers the one thing it can't — kerbcam inside a live game. Budget ~15 min.
+covers the one thing it can't — kerbcast inside a live game. Budget ~15 min.
 
 Setup: a save with a launchpad vessel carrying ≥3 Hullcam parts (at least one
 zoom-capable, one with a non-Normal `cameraMode`), plus a second vessel in
-orbit. Install the release-candidate zip clean (delete `GameData/Kerbcam/`
+orbit. Install the release-candidate zip clean (delete `GameData/Kerbcast/`
 first). Browser on a second device on the LAN, `BindAddress` set accordingly.
 
 ## Lifecycle
 
-- [ ] Flight scene load: KSP.log shows `sidecar started pid=`, no `[Kerbcam]`
+- [ ] Flight scene load: KSP.log shows `sidecar started pid=`, no `[Kerbcast]`
       errors; `/health` answers from the second device.
 - [ ] `/cameras` lists every Hullcam part on the vessel within a second or two.
 - [ ] Open streams for all cameras in the bundled web page: all show live
       video; filtered modes (B&W / CRT / night vision) match the in-game
       Hullcam GUI look.
 - [ ] Leave to Space Centre: sidecar exits (log line), no orphan
-      `kerbcam-sidecar` process (`pgrep`).
+      `kerbcast-sidecar` process (`pgrep`).
 - [ ] Re-enter flight: sidecar relaunches, streams reconnect.
 - [ ] Crash recovery: `kill -9` the sidecar mid-stream. Plugin logs the exit,
       restarts it within ~5 s, streams resume after a browser reconnect.
@@ -46,7 +46,7 @@ first). Browser on a second device on the LAN, `BindAddress` set accordingly.
 - [ ] Load the game down (max physics warp at low altitude, or many streams):
       adaptive stagger engages (`adaptive-shed` message names a reason), game
       fps stays above the `MinKspFps` floor, and recovery restores rate.
-- [ ] `ThrottleMainScreen` toggle (Pause → Difficulty → Kerbcam): main view
+- [ ] `ThrottleMainScreen` toggle (Pause → Difficulty → Kerbcast): main view
       blanks with the operator warning overlay; toggling back restores it.
 
 ## Teardown
@@ -58,6 +58,6 @@ first). Browser on a second device on the LAN, `BindAddress` set accordingly.
       plasma/bowshock layers on cameras with FX enabled, and no FX-related
       errors in KSP.log.
 
-Sign-off: note KSP version, kerbcam version, OS, encoder backend
-(`[Kerbcam.sidecar]` init line), and any deviations, in the release PR /
+Sign-off: note KSP version, kerbcast version, OS, encoder backend
+(`[Kerbcast.sidecar]` init line), and any deviations, in the release PR /
 notes.
