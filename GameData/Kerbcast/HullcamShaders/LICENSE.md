@@ -1,7 +1,7 @@
 # HullcamShaders — license notice
 
-`shaders.linux` in this directory is **not** part of kerbcam's own code and is
-**not** covered by kerbcam's CC BY-NC-SA 4.0 license.
+`shaders.linux` in this directory is **not** part of kerbcast's own code and is
+**not** covered by kerbcast's CC BY-NC-SA 4.0 license.
 
 It is a Unity asset bundle built from the shader sources of
 [HullcamVDSContinued](https://github.com/linuxgurugamer/HullcamVDSContinued)
@@ -9,9 +9,9 @@ It is a Unity asset bundle built from the shader sources of
 v3.0**. The compiled bundle is therefore a derivative work of that project and
 is distributed under the **GPL-3.0** on the same terms.
 
-kerbcam ships it only as a Linux/Proton compatibility shim (the stock Hullcam
+kerbcast ships it only as a Linux/Proton compatibility shim (the stock Hullcam
 shaders do not load there) and otherwise relies on a user-installed copy of
-HullcamVDS at runtime. kerbcam's plugin and sidecar do not link this bundle;
+HullcamVDS at runtime. kerbcast's plugin and sidecar do not link this bundle;
 it travels here as a separate, independently licensed work (GPL-3.0 "mere
 aggregation").
 

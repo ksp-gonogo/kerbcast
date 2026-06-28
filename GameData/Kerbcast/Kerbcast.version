@@ -1,7 +1,7 @@
 {
-  "NAME": "Kerbcam",
-  "URL": "https://raw.githubusercontent.com/jonpepler/kerbcam/main/GameData/Kerbcam/Kerbcam.version",
-  "DOWNLOAD": "https://github.com/jonpepler/kerbcam/releases",
+  "NAME": "Kerbcast",
+  "URL": "https://raw.githubusercontent.com/jonpepler/kerbcast/main/GameData/Kerbcast/Kerbcast.version",
+  "DOWNLOAD": "https://github.com/jonpepler/kerbcast/releases",
   "VERSION": {
     "MAJOR": 0,
     "MINOR": 21,
