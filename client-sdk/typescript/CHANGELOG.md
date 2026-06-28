@@ -4,17 +4,17 @@
 
 ### Added
 
-- `BrowserKerbcamTransport` accepts an options object with `iceGatheringTimeoutMs`
+- `BrowserKerbcastTransport` accepts an options object with `iceGatheringTimeoutMs`
   (default 2000 ms). `waitForIceComplete` now resolves at the earlier of gathering
   completing or the timeout, so connect does not stall the full STUN timeout on
   LAN topologies where the STUN server is unreachable.
-- `KerbcamClientConfig.iceGatheringTimeoutMs` threads the timeout into the default
+- `KerbcastClientConfig.iceGatheringTimeoutMs` threads the timeout into the default
   transport when no custom transport is provided.
-- `BrowserKerbcamTransportOptions` exported from the package root.
-- `KerbcamPeer.getStats?()` optional method; `BrowserKerbcamTransport` implements
+- `BrowserKerbcastTransportOptions` exported from the package root.
+- `KerbcastPeer.getStats?()` optional method; `BrowserKerbcastTransport` implements
   it via `RTCPeerConnection.getStats(null)`. Third-party transports and existing
   mocks keep compiling without changes.
-- `KerbcamClient.inboundVideoStats()` returns a `Map<number, InboundVideoStats>`
+- `KerbcastClient.inboundVideoStats()` returns a `Map<number, InboundVideoStats>`
   keyed by flightId. Resolves to an empty map when not connected or when the
   transport does not implement `getStats`.
 - `InboundVideoStats` type exported from the package root.
@@ -27,13 +27,13 @@
   the previous fields continue working unchanged.
 - `PanZoomController` headless state machine for pan/zoom camera control.
   Manages rate deduplication, analog deadzone, optimistic nudge accumulators,
-  FoV slider debounce, and echo-sync idle rules. `KerbcamCameraHandle`
+  FoV slider debounce, and echo-sync idle rules. `KerbcastCameraHandle`
   satisfies `PanZoomCommandSink` structurally. Exported from the package root
   along with `PanZoomCommandSink`, `PanZoomBounds`, and `PanZoomControllerOptions`.
 
 ## 0.3.1 — 2026-05-21
 
-Export `KerbcamTransport`, `KerbcamPeer`, `KerbcamDataChannel` from
+Export `KerbcastTransport`, `KerbcastPeer`, `KerbcastDataChannel` from
 the package root. 0.3.0 introduced these as a public extension
 point for tests and non-browser consumers but didn't re-export
 them, so the only way to reference the types was a deep import
@@ -42,16 +42,16 @@ into `dist/client.d.ts`. Strictly additive — no behaviour change.
 
 ## 0.3.0 — 2026-05-21
 
-High-level `KerbcamClient` class wraps the WebRTC peer, the
-`kerbcam-control` data channel, per-camera state cache, and
+High-level `KerbcastClient` class wraps the WebRTC peer, the
+`kerbcast-control` data channel, per-camera state cache, and
 per-track `MediaStream`s. Consumers no longer hand-roll
 `RTCPeerConnection`, build JSON wire messages, or thread SDP offers
 through `fetch`.
 
 ```ts
-import { KerbcamClient, Layer } from "@jonpepler/kerbcam";
+import { KerbcastClient, Layer } from "@jonpepler/kerbcast";
 
-const client = new KerbcamClient({ host: "192.168.1.74", port: 8088 });
+const client = new KerbcastClient({ host: "192.168.1.74", port: 8088 });
 await client.connect();
 
 const cam = client.camera(2592004302);
@@ -67,19 +67,19 @@ client.on("adaptive-shed", (e) => { /* shed level + reason */ });
 
 ### Added
 
-- `KerbcamClient` owns the peer, control channel, and registry of
+- `KerbcastClient` owns the peer, control channel, and registry of
   cameras. `connect(flightIds?)`, `disconnect()`, `camera(flightId)`,
   `discover()`.
-- `KerbcamCameraHandle` exposes `setLayers`, `setRenderSize`,
+- `KerbcastCameraHandle` exposes `setLayers`, `setRenderSize`,
   `setFov`, `setPan`, `setDegrade`, `requestKeyframe`, plus a
   `mediaStream` getter that yields the per-camera `MediaStream`
   once the track arrives.
-- Typed event API on both `KerbcamClient`
+- Typed event API on both `KerbcastClient`
   (`state-change` / `cameras-change` / `adaptive-shed` / `error`)
-  and `KerbcamCameraHandle` (`change` / `stream`). Subscribing
+  and `KerbcastCameraHandle` (`change` / `stream`). Subscribing
   returns an unsubscribe function.
-- `KerbcamTransport` interface — swappable transport for tests and
-  non-browser consumers. Default `BrowserKerbcamTransport` uses
+- `KerbcastTransport` interface — swappable transport for tests and
+  non-browser consumers. Default `BrowserKerbcastTransport` uses
   `RTCPeerConnection`.
 - `client.discover()` fetches the sidecar's `/cameras` listing
   without opening a peer connection, for picking a subset to
@@ -91,7 +91,7 @@ client.on("adaptive-shed", (e) => { /* shed level + reason */ });
   `src/__generated__/types.ts`. `src/index.ts` is now hand-written
   and re-exports both the generated types and the new client.
 - Consumers that imported types from the package root keep working
-  (`import { ClientMessage } from "@jonpepler/kerbcam"` still
+  (`import { ClientMessage } from "@jonpepler/kerbcast"` still
   resolves to the same wire-format types).
 
 Version line is shared with the Rust sidecar (`sidecar/Cargo.toml`).
@@ -128,8 +128,8 @@ see the new field unless they read it.
 
 ## 0.1.0 — 2026-05-21
 
-Initial release as `@jonpepler/kerbcam` on GitHub Packages.
-TypeScript bindings for the kerbcam sidecar's WebRTC data-channel
+Initial release as `@jonpepler/kerbcast` on GitHub Packages.
+TypeScript bindings for the kerbcast sidecar's WebRTC data-channel
 protocol, generated from Rust types via
 [typeshare](https://github.com/1Password/typeshare).
 
@@ -178,7 +178,7 @@ only for what each part advertises:
 
 ### Wire format
 
-JSON-per-message over an `RTCDataChannel` labelled `kerbcam-control`,
+JSON-per-message over an `RTCDataChannel` labelled `kerbcast-control`,
 opened by the browser after SDP exchange completes. Messages use
 adjacent tagging — `{ "type": "set-layers", "content": { ... } }` —
 because that's the discriminator shape typeshare can faithfully model

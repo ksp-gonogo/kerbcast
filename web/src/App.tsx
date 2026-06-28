@@ -1,5 +1,5 @@
-import type { KerbcamClient } from "@jonpepler/kerbcam";
-import { KerbcamProvider, useKerbcamCameras } from "@jonpepler/kerbcam-react";
+import type { KerbcastClient } from "@jonpepler/kerbcast";
+import { KerbcastProvider, useKerbcastCameras } from "@jonpepler/kerbcast-react";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import styled from "styled-components";
 import { ConnectionManager } from "./connectionManager";
@@ -23,11 +23,11 @@ import { loadTiles, saveTiles, seedTiles } from "./tiles";
 import type { Tile as TileData } from "./tiles";
 
 interface AppProps {
-  client: KerbcamClient;
+  client: KerbcastClient;
 }
 
 /**
- * Root app component. Accepts a KerbcamClient injected from main.tsx (or tests).
+ * Root app component. Accepts a KerbcastClient injected from main.tsx (or tests).
  * Creates a connection manager, manages tile state, and renders the full UI.
  */
 export function App({ client }: AppProps): React.JSX.Element {
@@ -79,7 +79,7 @@ export function App({ client }: AppProps): React.JSX.Element {
   );
 
   return (
-    <KerbcamProvider client={client}>
+    <KerbcastProvider client={client}>
       <PageShell>
         <Header
           status={status}
@@ -100,7 +100,7 @@ export function App({ client }: AppProps): React.JSX.Element {
         <ShedBanner client={client} />
         <ErrorToast client={client} />
         <MainArea>
-          {/* CameraSeeder uses useKerbcamCameras inside KerbcamProvider */}
+          {/* CameraSeeder uses useKerbcastCameras inside KerbcastProvider */}
           <CameraSeeder
             tilesSeeded={tilesSeeded}
             onSeed={(seeded) => {
@@ -120,7 +120,7 @@ export function App({ client }: AppProps): React.JSX.Element {
           )}
         </MainArea>
       </PageShell>
-    </KerbcamProvider>
+    </KerbcastProvider>
   );
 }
 
@@ -134,7 +134,7 @@ interface CameraSeederProps {
 }
 
 function CameraSeeder({ tilesSeeded, onSeed }: CameraSeederProps): null {
-  const cameras = useKerbcamCameras();
+  const cameras = useKerbcastCameras();
 
   useEffect(() => {
     if (tilesSeeded) return;

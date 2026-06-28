@@ -1,4 +1,4 @@
-/* kerbcam design tokens
+/* kerbcast design tokens
  *
  * Light values are the default. Dark values apply when:
  *   - html has no data-theme attribute, and prefers-color-scheme is dark
@@ -37,8 +37,8 @@
   --kc-tile-radius: 6px;
 
   /* Forward to shared CameraFeed */
-  --kerbcam-accent: var(--kc-accent);
-  --kerbcam-accent-wash: var(--kc-accent-wash);
+  --kerbcast-accent: var(--kc-accent);
+  --kerbcast-accent-wash: var(--kc-accent-wash);
 
   font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Fira Mono", Menlo, monospace;
   color-scheme: light;

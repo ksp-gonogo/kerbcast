@@ -23,10 +23,10 @@ export interface NoiseConfig {
 }
 
 /**
- * Per-camera handle returned from {@link KerbcamClient.camera}.
+ * Per-camera handle returned from {@link KerbcastClient.camera}.
  * Stable identity per flight ID for the lifetime of the client.
  */
-export interface KerbcamCameraHandle {
+export interface KerbcastCameraHandle {
   readonly flightId: number;
   readonly state: CameraState | null;
   readonly mediaStream: MediaStream | null;
@@ -74,7 +74,7 @@ export interface KerbcamCameraHandle {
 
   /**
    * Override noise settings for this camera only. Takes precedence over the
-   * client-level default in {@link KerbcamClientConfig.noise}.
+   * client-level default in {@link KerbcastClientConfig.noise}.
    */
   configure(options: { noise?: Partial<NoiseConfig> }): void;
 
@@ -87,14 +87,14 @@ export interface KerbcamCameraHandle {
    */
   setShowStatic(enabled: boolean): void;
 
-  on<K extends keyof KerbcamCameraEvents>(
+  on<K extends keyof KerbcastCameraEvents>(
     event: K,
-    handler: (data: KerbcamCameraEvents[K]) => void,
+    handler: (data: KerbcastCameraEvents[K]) => void,
   ): () => void;
 }
 
-/** Event payloads emitted by a {@link KerbcamCameraHandle}. */
-export interface KerbcamCameraEvents {
+/** Event payloads emitted by a {@link KerbcastCameraHandle}. */
+export interface KerbcastCameraEvents {
   /** Latest `CameraState` from the sidecar's `camera-state-changed`. */
   change: CameraState;
   /** Track arrival or teardown for this camera. `null` on disconnect. */
@@ -103,8 +103,8 @@ export interface KerbcamCameraEvents {
   stall: boolean;
 }
 
-/** Configuration for {@link KerbcamClient} construction. */
-export interface KerbcamClientConfig {
+/** Configuration for {@link KerbcastClient} construction. */
+export interface KerbcastClientConfig {
   /** Sidecar host (matches the sidecar's `--http-bind`). */
   host: string;
   /** Sidecar port. */
@@ -121,7 +121,7 @@ export interface KerbcamClientConfig {
   noise?: Partial<NoiseConfig>;
   /**
    * ICE gathering timeout in milliseconds. Passed to the default
-   * {@link BrowserKerbcamTransport}; ignored when a custom transport is
+   * {@link BrowserKerbcastTransport}; ignored when a custom transport is
    * provided (the transport owns gathering). Defaults to 2000 ms.
    *
    * On LAN topologies where the STUN server is unreachable (e.g. Steam Deck
@@ -145,7 +145,7 @@ export interface KerbcamClientConfig {
 }
 
 /** WebRTC connection state surface. */
-export type KerbcamConnectionState =
+export type KerbcastConnectionState =
   | "disconnected"
   | "connecting"
   | "connected"
@@ -157,7 +157,7 @@ export type KerbcamConnectionState =
  * emitted that stat (e.g. `framesPerSecond` before the first full second).
  * `packetsReceived` and `bytesReceived` default to 0 in the same case.
  *
- * Retrieve per-camera stats via {@link KerbcamClient.inboundVideoStats}.
+ * Retrieve per-camera stats via {@link KerbcastClient.inboundVideoStats}.
  */
 export interface InboundVideoStats {
   packetsReceived: number;
@@ -169,7 +169,7 @@ export interface InboundVideoStats {
 }
 
 /**
- * Camera summary returned by {@link KerbcamClient.discover} (`GET /cameras`).
+ * Camera summary returned by {@link KerbcastClient.discover} (`GET /cameras`).
  *
  * This is the shape the sidecar serialises from its internal `CameraInfo`
  * struct. It is a discovery snapshot, not a live operating state: it carries
@@ -212,9 +212,9 @@ export interface DiscoveredCamera {
   degradeLevel: number;
 }
 
-/** Event payloads emitted by a {@link KerbcamClient}. */
-export interface KerbcamClientEvents {
-  "state-change": KerbcamConnectionState;
+/** Event payloads emitted by a {@link KerbcastClient}. */
+export interface KerbcastClientEvents {
+  "state-change": KerbcastConnectionState;
   "cameras-change": CameraState[];
   "adaptive-shed": AdaptiveShedPayload;
   error: ErrorPayload;
@@ -241,17 +241,17 @@ export interface KerbcamClientEvents {
  * (browser `RTCPeerConnection`). Tests substitute an in-memory
  * implementation to exercise the state machine without a real peer.
  */
-export interface KerbcamTransport {
-  createPeer(iceServers: RTCIceServer[]): KerbcamPeer;
+export interface KerbcastTransport {
+  createPeer(iceServers: RTCIceServer[]): KerbcastPeer;
 }
 
-export interface KerbcamPeer {
+export interface KerbcastPeer {
   addRecvOnlyTransceiver(): void;
-  createDataChannel(label: string): KerbcamDataChannel;
+  createDataChannel(label: string): KerbcastDataChannel;
   onTrack(
     handler: (track: MediaStreamTrack, idx: number, mid: string) => void,
   ): void;
-  onStateChange(handler: (state: KerbcamConnectionState) => void): void;
+  onStateChange(handler: (state: KerbcastConnectionState) => void): void;
   createOffer(): Promise<string>;
   setLocalDescription(sdp: string): Promise<void>;
   setRemoteAnswer(sdp: string): Promise<void>;
@@ -266,7 +266,7 @@ export interface KerbcamPeer {
   getStats?(): Promise<RTCStatsReport>;
 }
 
-export interface KerbcamDataChannel {
+export interface KerbcastDataChannel {
   send(payload: string): void;
   onOpen(handler: () => void): void;
   onMessage(handler: (raw: string) => void): void;
@@ -277,8 +277,8 @@ export interface KerbcamDataChannel {
 // Default transport: browser RTCPeerConnection
 // ---------------------------------------------------------------------------
 
-/** Options for {@link BrowserKerbcamTransport}. */
-export interface BrowserKerbcamTransportOptions {
+/** Options for {@link BrowserKerbcastTransport}. */
+export interface BrowserKerbcastTransportOptions {
   /**
    * Maximum time (ms) to wait for ICE gathering to complete before proceeding
    * with whatever candidates have been gathered. Defaults to 2000 ms.
@@ -290,21 +290,21 @@ export interface BrowserKerbcamTransportOptions {
   iceGatheringTimeoutMs?: number;
 }
 
-export class BrowserKerbcamTransport implements KerbcamTransport {
-  private readonly opts: Required<BrowserKerbcamTransportOptions>;
+export class BrowserKerbcastTransport implements KerbcastTransport {
+  private readonly opts: Required<BrowserKerbcastTransportOptions>;
 
-  constructor(opts: BrowserKerbcamTransportOptions = {}) {
+  constructor(opts: BrowserKerbcastTransportOptions = {}) {
     this.opts = { iceGatheringTimeoutMs: opts.iceGatheringTimeoutMs ?? 2000 };
   }
 
-  createPeer(iceServers: RTCIceServer[]): KerbcamPeer {
+  createPeer(iceServers: RTCIceServer[]): KerbcastPeer {
     const pc = new RTCPeerConnection({ iceServers });
     const { iceGatheringTimeoutMs } = this.opts;
     let trackIdx = 0;
     let onTrack:
       | ((t: MediaStreamTrack, idx: number, mid: string) => void)
       | null = null;
-    let onStateChange: ((s: KerbcamConnectionState) => void) | null = null;
+    let onStateChange: ((s: KerbcastConnectionState) => void) | null = null;
 
     pc.ontrack = (ev) => {
       // ev.transceiver.mid is the stable m-line id the sidecar keys its
@@ -373,7 +373,7 @@ export class BrowserKerbcamTransport implements KerbcamTransport {
   }
 }
 
-function wrapBrowserDataChannel(dc: RTCDataChannel): KerbcamDataChannel {
+function wrapBrowserDataChannel(dc: RTCDataChannel): KerbcastDataChannel {
   let onOpen: (() => void) | null = null;
   let onMessage: ((raw: string) => void) | null = null;
   let onClose: (() => void) | null = null;
@@ -398,7 +398,7 @@ function wrapBrowserDataChannel(dc: RTCDataChannel): KerbcamDataChannel {
   };
 }
 
-function mapPeerState(state: RTCPeerConnectionState): KerbcamConnectionState {
+function mapPeerState(state: RTCPeerConnectionState): KerbcastConnectionState {
   switch (state) {
     case "new":
     case "connecting":
@@ -448,8 +448,8 @@ class TypedEmitter<E> {
 // ---------------------------------------------------------------------------
 
 class CameraHandle
-  extends TypedEmitter<KerbcamCameraEvents>
-  implements KerbcamCameraHandle
+  extends TypedEmitter<KerbcastCameraEvents>
+  implements KerbcastCameraHandle
 {
   readonly flightId: number;
   private _state: CameraState | null = null;
@@ -468,9 +468,9 @@ class CameraHandle
   private _stalled = false;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
   private _showStatic = true;
-  private readonly client: KerbcamClient;
+  private readonly client: KerbcastClient;
 
-  constructor(flightId: number, client: KerbcamClient) {
+  constructor(flightId: number, client: KerbcastClient) {
     super();
     this.flightId = flightId;
     this.client = client;
@@ -670,18 +670,18 @@ class CameraHandle
 }
 
 // ---------------------------------------------------------------------------
-// KerbcamClient
+// KerbcastClient
 // ---------------------------------------------------------------------------
 
 /**
- * High-level kerbcam sidecar client. Owns the WebRTC peer + the
- * `kerbcam-control` data channel + the per-camera registry + the
+ * High-level kerbcast sidecar client. Owns the WebRTC peer + the
+ * `kerbcast-control` data channel + the per-camera registry + the
  * `MediaStream`s for each subscribed camera.
  *
  * Usage:
  *
  * ```ts
- * const client = new KerbcamClient({ host: "192.168.1.74", port: 8088 });
+ * const client = new KerbcastClient({ host: "192.168.1.74", port: 8088 });
  * await client.connect();
  *
  * const cam = client.camera(2592004302);
@@ -697,12 +697,12 @@ class CameraHandle
  * goes null on disconnect and is replaced when the next connect's
  * tracks arrive.
  */
-export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
-  private readonly cfg: KerbcamClientConfig;
-  private readonly transport: KerbcamTransport;
-  private peer: KerbcamPeer | null = null;
-  private control: KerbcamDataChannel | null = null;
-  private _state: KerbcamConnectionState = "disconnected";
+export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
+  private readonly cfg: KerbcastClientConfig;
+  private readonly transport: KerbcastTransport;
+  private peer: KerbcastPeer | null = null;
+  private control: KerbcastDataChannel | null = null;
+  private _state: KerbcastConnectionState = "disconnected";
   private _cameras: CameraState[] = [];
   private readonly handles = new Map<number, CameraHandle>();
   private requestedOrder: number[] = [];
@@ -727,17 +727,17 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
   /** Last-received throttle state from `settings-state`. False until the first push. */
   private _throttleMainScreen = false;
 
-  constructor(cfg: KerbcamClientConfig, transport?: KerbcamTransport) {
+  constructor(cfg: KerbcastClientConfig, transport?: KerbcastTransport) {
     super();
     this.cfg = cfg;
     this.transport =
       transport ??
-      new BrowserKerbcamTransport({
+      new BrowserKerbcastTransport({
         iceGatheringTimeoutMs: cfg.iceGatheringTimeoutMs,
       });
   }
 
-  get state(): KerbcamConnectionState {
+  get state(): KerbcastConnectionState {
     return this._state;
   }
 
@@ -838,7 +838,7 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
       }
     });
 
-    this.control = peer.createDataChannel("kerbcam-control");
+    this.control = peer.createDataChannel("kerbcast-control");
     this.control.onOpen(() => {
       void this._send({ type: "hello" });
     });
@@ -904,7 +904,7 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
    * Stable per-flight-id handle. Creates a new handle on first call
    * for a given ID; returns the same handle on subsequent calls.
    */
-  camera(flightId: number): KerbcamCameraHandle {
+  camera(flightId: number): KerbcastCameraHandle {
     return this.getOrCreateHandle(flightId);
   }
 
@@ -943,7 +943,7 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
    */
   async _send(msg: ClientMessage): Promise<void> {
     if (!this.control) {
-      throw new Error("[kerbcam] control channel not open");
+      throw new Error("[kerbcast] control channel not open");
     }
     this.control.send(JSON.stringify(msg));
   }
@@ -1072,7 +1072,7 @@ export class KerbcamClient extends TypedEmitter<KerbcamClientEvents> {
     }
   }
 
-  private setState(state: KerbcamConnectionState): void {
+  private setState(state: KerbcastConnectionState): void {
     if (this._state === state) return;
     this._state = state;
     this.emit("state-change", state);

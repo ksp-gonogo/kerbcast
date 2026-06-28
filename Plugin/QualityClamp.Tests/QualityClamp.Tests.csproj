@@ -2,7 +2,7 @@
 
   <!--
     Standalone unit test for QualityClamp.cs: the Unity-free precedence
-    arithmetic behind KerbcamCamera.ApplyEffectiveQuality:
+    arithmetic behind KerbcastCamera.ApplyEffectiveQuality:
     effective = min(operator ceiling, shed scale, viewer scale).
     Compiles ONLY the helper (no KSP/Unity assemblies). Run: `dotnet run`.
     Mirrors the ControlBlock.Tests / ShedController.Tests pattern.
@@ -16,7 +16,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../Kerbcam/QualityClamp.cs" />
+    <Compile Include="../Kerbcast/QualityClamp.cs" />
   </ItemGroup>
 
 </Project>

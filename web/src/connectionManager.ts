@@ -1,7 +1,7 @@
 /**
- * Connection manager for the kerbcam web page.
+ * Connection manager for the kerbcast web page.
  *
- * Wraps a KerbcamClient and adds:
+ * Wraps a KerbcastClient and adds:
  *  - auto-connect on start()
  *  - exponential backoff reconnect on failure (2s base, 2x each attempt, 30s max)
  *  - ping watchdog: no ping for 15s while connected triggers reconnect
@@ -11,7 +11,7 @@
  * so tests can substitute a mock-backed one.
  */
 
-import type { KerbcamClient, KerbcamConnectionState } from "@jonpepler/kerbcam";
+import type { KerbcastClient, KerbcastConnectionState } from "@jonpepler/kerbcast";
 
 const BACKOFF_BASE_MS = 2000;
 const BACKOFF_MAX_MS = 30000;
@@ -28,7 +28,7 @@ export type ManagerStatus =
 type Listener = () => void;
 
 export class ConnectionManager {
-  private readonly _client: KerbcamClient;
+  private readonly _client: KerbcastClient;
   private _status: ManagerStatus = { kind: "idle" };
   private _attempt = 0;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -38,7 +38,7 @@ export class ConnectionManager {
   private _offStateChange: (() => void) | null = null;
   private _offPing: (() => void) | null = null;
 
-  constructor(client: KerbcamClient) {
+  constructor(client: KerbcastClient) {
     this._client = client;
   }
 
@@ -94,7 +94,7 @@ export class ConnectionManager {
     }
   }
 
-  private _handleStateChange(state: KerbcamConnectionState): void {
+  private _handleStateChange(state: KerbcastConnectionState): void {
     if (this._stopped) return;
     switch (state) {
       case "connected":

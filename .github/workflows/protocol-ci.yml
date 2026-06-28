@@ -118,7 +118,7 @@ jobs:
       - name: Upload built TS dist as dev artefact
         uses: actions/upload-artifact@v7
         with:
-          name: kerbcam-protocol-typescript-dev
+          name: kerbcast-protocol-typescript-dev
           path: |
             client-sdk/typescript/dist/
             client-sdk/typescript/src/index.ts

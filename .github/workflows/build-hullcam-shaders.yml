@@ -9,7 +9,7 @@ name: Build HullcamVDS shader bundle (Linux)
 # ci/hullcam-shaders/BuildShaderBundle.cs targets StandaloneLinux64.
 #
 # Output: a `shaders.linux` AssetBundle uploaded as a workflow artifact.
-# Kerbcam picks it up at runtime via the Harmony patch in the plugin
+# Kerbcast picks it up at runtime via the Harmony patch in the plugin
 # (see HullcamFilterIntegration.cs).
 #
 # Auth: uses buildalon/activate-unity-license@v2 with UNITY_USERNAME +
@@ -51,10 +51,10 @@ jobs:
       HULLCAM_REF: master
 
     steps:
-      - name: Checkout kerbcam (for our build override)
+      - name: Checkout kerbcast (for our build override)
         uses: actions/checkout@v4
         with:
-          path: kerbcam
+          path: kerbcast
 
       - name: Checkout HullcamVDSContinued (shader source)
         uses: actions/checkout@v4
@@ -73,7 +73,7 @@ jobs:
           # StandaloneLinux64 with the modern enum.
           mkdir -p hullcam/HullCameraAssets/Assets/Editor
           rm -f hullcam/HullCameraAssets/Assets/Editor/CreateAssetBundles.cs
-          cp kerbcam/ci/hullcam-shaders/BuildShaderBundle.cs \
+          cp kerbcast/ci/hullcam-shaders/BuildShaderBundle.cs \
              hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
           ls -la hullcam/HullCameraAssets/Assets/Editor/
 
@@ -105,7 +105,7 @@ jobs:
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildShaderBundle.BuildLinux \
+            -executeMethod KerbcastCI.BuildShaderBundle.BuildLinux \
             -buildTarget Linux64 \
             -logFile -
           echo "--- output bundle ---"
@@ -116,7 +116,7 @@ jobs:
         run: |
           # Unity names the output after the AssetBundle name set in
           # the project. The bundle of interest is `shaders`; copy +
-          # rename to shaders.linux so kerbcam can ship it under
+          # rename to shaders.linux so kerbcast can ship it under
           # HullcamVDS' canonical filename if we want to.
           cp Bundles-linux/shaders shaders.linux
 

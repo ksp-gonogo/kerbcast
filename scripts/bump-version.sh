@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bump the kerbcam version across all parts of the wire contract atomically.
+# Bump the kerbcast version across all parts of the wire contract atomically.
 # The Rust sidecar's Cargo.toml is the source of truth; the TypeScript and
 # React package.json files are kept in lockstep so consumers and the sidecar
 # binary share one SemVer line.
@@ -27,7 +27,7 @@
 # fresh-clone contributor signs tags even without tag.gpgsign set in
 # their config.
 #
-# CI on the tag publishes @jonpepler/kerbcam and @jonpepler/kerbcam-react to
+# CI on the tag publishes @jonpepler/kerbcast and @jonpepler/kerbcast-react to
 # GitHub Packages. The sidecar binary's `--version` reflects the same string
 # via env!("CARGO_PKG_VERSION").
 
@@ -85,14 +85,14 @@ rm "$CARGO.bak"
 ( cd "$(dirname "$REACT_PKG")" && npm pkg set version="$NEW" >/dev/null )
 
 # Cargo.lock -- rerun cargo to refresh the lockfile's [[package]] entry for
-# kerbcam-sidecar.
+# kerbcast-sidecar.
 if command -v cargo >/dev/null 2>&1; then
-  ( cd "$(dirname "$CARGO")" && cargo update -p kerbcam-sidecar --precise "$NEW" >/dev/null 2>&1 || true )
+  ( cd "$(dirname "$CARGO")" && cargo update -p kerbcast-sidecar --precise "$NEW" >/dev/null 2>&1 || true )
 fi
 
 # Rebuild the embedded web UI so the shipped binary contains the current page.
 echo "rebuilding web UI..."
-( cd "$ROOT" && pnpm --filter kerbcam-web build >/dev/null )
+( cd "$ROOT" && pnpm --filter kerbcast-web build >/dev/null )
 echo "  $ROOT/web/dist/index.html"
 
 # Prepend a placeholder version header to each CHANGELOG. Caller fills body.

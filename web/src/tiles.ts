@@ -15,7 +15,7 @@ export interface Tile {
   spotlit: boolean;
 }
 
-const STORAGE_KEY = "kerbcam:tiles";
+const STORAGE_KEY = "kerbcast:tiles";
 
 /** Read tiles from localStorage. Returns null when the key is absent. */
 export function loadTiles(): Tile[] | null {
@@ -113,7 +113,7 @@ export function addAllCameras(tiles: Tile[], flightIds: number[]): Tile[] {
  */
 export const PERF_NOTE_TILE_THRESHOLD = 8;
 
-const PERF_NOTE_KEY = "kerbcam:perfNoteDismissed";
+const PERF_NOTE_KEY = "kerbcast:perfNoteDismissed";
 
 export function loadPerfNoteDismissed(): boolean {
   try {

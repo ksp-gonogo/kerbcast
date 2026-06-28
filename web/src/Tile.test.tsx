@@ -6,16 +6,16 @@
  * dead CameraFeed. Instead it shows a reconnecting affordance with a way to
  * repoint or remove the tile.
  *
- * The fixture mirrors App.test.tsx: a real KerbcamClient + MockSidecar wired
- * through KerbcamProvider so useKerbcamCameras() returns the live list.
+ * The fixture mirrors App.test.tsx: a real KerbcastClient + MockSidecar wired
+ * through KerbcastProvider so useKerbcastCameras() returns the live list.
  */
 
-import { KerbcamClient } from "@jonpepler/kerbcam";
-import type { CameraLifecycle } from "@jonpepler/kerbcam";
-import { Layer } from "@jonpepler/kerbcam";
-import type { MockCameraInit } from "@jonpepler/kerbcam/testing";
-import { MockSidecar } from "@jonpepler/kerbcam/testing";
-import { KerbcamProvider } from "@jonpepler/kerbcam-react";
+import { KerbcastClient } from "@jonpepler/kerbcast";
+import type { CameraLifecycle } from "@jonpepler/kerbcast";
+import { Layer } from "@jonpepler/kerbcast";
+import type { MockCameraInit } from "@jonpepler/kerbcast/testing";
+import { MockSidecar } from "@jonpepler/kerbcast/testing";
+import { KerbcastProvider } from "@jonpepler/kerbcast-react";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Tile } from "./Tile";
@@ -51,14 +51,14 @@ function makeCamera(overrides: MockCameraInit): MockCameraInit {
   };
 }
 
-const createdClients: KerbcamClient[] = [];
+const createdClients: KerbcastClient[] = [];
 
 async function buildConnectedFixture(cameras: MockCameraInit[] = []) {
   const sidecar = new MockSidecar();
   sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]);
   for (const cam of cameras) sidecar.addCamera(cam);
 
-  const client = new KerbcamClient(
+  const client = new KerbcastClient(
     { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
     sidecar.createTransport(),
   );
@@ -75,9 +75,9 @@ async function buildConnectedFixture(cameras: MockCameraInit[] = []) {
   return { client, sidecar };
 }
 
-function renderTile(client: KerbcamClient, flightId: number | null) {
+function renderTile(client: KerbcastClient, flightId: number | null) {
   return render(
-    <KerbcamProvider client={client}>
+    <KerbcastProvider client={client}>
       <Tile
         flightId={flightId}
         index={0}
@@ -88,7 +88,7 @@ function renderTile(client: KerbcamClient, flightId: number | null) {
         onRemove={() => {}}
         onToggleSpotlight={() => {}}
       />
-    </KerbcamProvider>,
+    </KerbcastProvider>,
   );
 }
 

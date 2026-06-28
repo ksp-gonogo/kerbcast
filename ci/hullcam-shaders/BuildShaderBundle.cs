@@ -8,16 +8,16 @@
 //
 // Copied into the cloned HullCameraAssets/Assets/Editor/ folder by the
 // workflow before invoking Unity in batchmode. Triggered via
-//   -executeMethod KerbcamCI.BuildShaderBundle.BuildLinux
+//   -executeMethod KerbcastCI.BuildShaderBundle.BuildLinux
 //
 // Output: writes the AssetBundle to Bundles-linux/ relative to the
 // project root. The workflow then uploads Bundles-linux/shaders as
-// `shaders.linux` artifact for kerbcam to ship.
+// `shaders.linux` artifact for kerbcast to ship.
 
 using System.IO;
 using UnityEditor;
 
-namespace KerbcamCI
+namespace KerbcastCI
 {
     public static class BuildShaderBundle
     {

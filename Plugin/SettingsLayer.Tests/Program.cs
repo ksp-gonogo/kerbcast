@@ -1,5 +1,5 @@
 // Unit test for SettingsLayer: the key-application helpers behind
-// KerbcamSettings' layered settings load. The contract under test:
+// KerbcastSettings' layered settings load. The contract under test:
 // absent/empty keys keep the current value (which is what makes
 // "shipped defaults file, then user override file on top" work),
 // unparsable values warn and keep the current value, floats parse
@@ -9,7 +9,7 @@
 
 using System;
 using System.Collections.Generic;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)
@@ -48,7 +48,7 @@ void Warn(string msg) => warnings.Add(msg);
 
 // --- Layering: user file over defaults file, key by key. ---
 {
-    // Mirrors KerbcamSettings.Load(): compiled defaults, then the shipped
+    // Mirrors KerbcastSettings.Load(): compiled defaults, then the shipped
     // defaults file, then the user override file, same helper each pass.
     int port = 8088, width = 1024, bitrate = 0;
     var defaultsFile = Node(("Port", "9000"), ("Width", "1280"));

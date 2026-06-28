@@ -15,7 +15,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../Kerbcam/ReadbackScheduler.cs" />
+    <Compile Include="../Kerbcast/ReadbackScheduler.cs" />
   </ItemGroup>
 
 </Project>

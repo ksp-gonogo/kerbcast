@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    name: "kerbcam-protocol",
+    name: "kerbcast-protocol",
     environment: "jsdom",
     globals: true,
     include: ["src/**/*.test.ts"],

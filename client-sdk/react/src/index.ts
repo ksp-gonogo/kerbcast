@@ -1,23 +1,23 @@
 /**
- * @jonpepler/kerbcam-react
+ * @jonpepler/kerbcast-react
  *
- * React components and hooks for kerbcam camera feeds. This package
- * is a peer to @jonpepler/kerbcam (the core SDK) and requires React 18+
+ * React components and hooks for kerbcast camera feeds. This package
+ * is a peer to @jonpepler/kerbcast (the core SDK) and requires React 18+
  * and styled-components 6+ as peer dependencies.
  */
 
 // Context and provider
 export {
-  KerbcamProvider,
+  KerbcastProvider,
   createClientSubscriptions,
-  useKerbcamClient,
-  useKerbcamSubscriptions,
+  useKerbcastClient,
+  useKerbcastSubscriptions,
 } from "./context";
-export type { KerbcamProviderProps, KerbcamSubscriptions } from "./context";
+export type { KerbcastProviderProps, KerbcastSubscriptions } from "./context";
 
 // Hooks
-export { useKerbcamCameras } from "./hooks/useKerbcamCameras";
-export { useKerbcamStream } from "./hooks/useKerbcamStream";
+export { useKerbcastCameras } from "./hooks/useKerbcastCameras";
+export { useKerbcastStream } from "./hooks/useKerbcastStream";
 
 // Camera label utilities
 export { buildCameraLabeler } from "./cameraLabels";

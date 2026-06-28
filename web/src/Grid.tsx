@@ -1,4 +1,4 @@
-import { useKerbcamCameras } from "@jonpepler/kerbcam-react";
+import { useKerbcastCameras } from "@jonpepler/kerbcast-react";
 import { Video, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
@@ -27,7 +27,7 @@ interface GridProps {
 const GAP = 16; // 1rem; keep in sync with Root `gap`
 
 export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridProps): React.JSX.Element {
-  const cameras = useKerbcamCameras();
+  const cameras = useKerbcastCameras();
   const [showPerfNote, setShowPerfNote] = useState(false);
 
   const commit = (next: TileData[]) => {
@@ -113,7 +113,7 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
         <PerfNote role="status">
           <PerfNoteText>
             Many simultaneous streams increase load on the game machine.
-            kerbcam throttles itself automatically, but feed rates may drop.
+            kerbcast throttles itself automatically, but feed rates may drop.
           </PerfNoteText>
           <PerfNoteDismiss
             type="button"
@@ -163,7 +163,7 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
           </EmptyIcon>
           <EmptyTitle>No cameras active</EmptyTitle>
           <EmptyBody>
-            Connect kerbcam to a running KSP session, then add a tile to watch a camera feed.
+            Connect kerbcast to a running KSP session, then add a tile to watch a camera feed.
           </EmptyBody>
         </EmptyHint>
       )}

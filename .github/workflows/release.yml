@@ -3,25 +3,25 @@ name: release
 # Triggered on v* tags. Linked jobs:
 #
 #   publish-sdk    (~1 min)   regenerates the typeshare bindings from Rust,
-#                             verifies version sync, publishes @jonpepler/kerbcam
-#                             and @jonpepler/kerbcam-react to GitHub Packages.
+#                             verifies version sync, publishes @jonpepler/kerbcast
+#                             and @jonpepler/kerbcast-react to GitHub Packages.
 #   build-sidecar  (matrix)   builds one sidecar per supported runtime — Linux
 #                             (tier-1 libva, glibc-floored + lib-bundled), macOS
 #                             arm64 and Windows x64 (tier-2 software encode, no
 #                             native deps) — and uploads each as a per-rid
 #                             artifact.
-#   build-windows-shaders     builds the kerbcam-shaders.windows bundle on a
+#   build-windows-shaders     builds the kerbcast-shaders.windows bundle on a
 #                  (~15 min)  windows-2022 runner with the native Windows
 #                             shader compiler, then smoke-renders its d3d11
 #                             variants on a real D3D11 device. The Linux
 #                             editor's d3d11 cross-compile shipped invalid
 #                             vertex shader blobs in v0.19.0 (E_INVALIDARG at
 #                             draw time, black NightVision streams); see
-#                             build-kerbcam-shaders.yml for the full story.
+#                             build-kerbcast-shaders.yml for the full story.
 #   bundle         (~11 min)  collects the per-rid sidecar artifacts and the
 #                             Windows shader bundle, builds the plugin DLL +
 #                             Linux/macOS shader bundles, assembles the
-#                             complete GameData/Kerbcam/ install tree, and creates
+#                             complete GameData/Kerbcast/ install tree, and creates
 #                             the GitHub Release. needs publish-sdk so a Release
 #                             never claims packages that failed to publish, and a
 #                             mis-cut tag fails in about a minute instead of after
@@ -108,13 +108,13 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: "@jonpepler"
 
-      - name: Verify version sync (tag == Cargo.toml == package.json == Kerbcam.version)
+      - name: Verify version sync (tag == Cargo.toml == package.json == Kerbcast.version)
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
           PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
           REACT_VER="$(node -p "require('./client-sdk/react/package.json').version")"
           CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          AVC_VER="$(python3 -c "import json; v=json.load(open('GameData/Kerbcam/Kerbcam.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          AVC_VER="$(python3 -c "import json; v=json.load(open('GameData/Kerbcast/Kerbcast.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
           echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER avc=$AVC_VER"
           if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$REACT_VER" != "$AVC_VER" ]; then
             echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
@@ -128,13 +128,13 @@ jobs:
         run: pnpm -r build
 
       # Core first so the registry has the dependency when react is indexed.
-      - name: Publish @jonpepler/kerbcam to GitHub Packages
+      - name: Publish @jonpepler/kerbcast to GitHub Packages
         working-directory: client-sdk/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm publish --no-git-checks
 
-      - name: Publish @jonpepler/kerbcam-react to GitHub Packages
+      - name: Publish @jonpepler/kerbcast-react to GitHub Packages
         working-directory: client-sdk/react
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -145,7 +145,7 @@ jobs:
   # macOS and Windows build on their native runners (VideoToolbox/MSVC can't be
   # cross-compiled from Linux) and ship the always-on software encoder only.
   # Each job produces a per-rid artifact whose contents lay out exactly as they
-  # land under GameData/Kerbcam/Sidecar/<rid>/ — the assemble job just copies.
+  # land under GameData/Kerbcast/Sidecar/<rid>/ — the assemble job just copies.
   build-sidecar:
     name: build sidecar (${{ matrix.rid }})
     strategy:
@@ -154,13 +154,13 @@ jobs:
         include:
           - rid: linux-x64
             runner: ubuntu-22.04
-            bin: kerbcam-sidecar
+            bin: kerbcast-sidecar
           - rid: osx-arm64
             runner: macos-14
-            bin: kerbcam-sidecar
+            bin: kerbcast-sidecar
           - rid: win-x64
             runner: windows-2022
-            bin: kerbcam-sidecar.exe
+            bin: kerbcast-sidecar.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -214,9 +214,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p staging-sidecar/lib
-          cp sidecar/target/release/kerbcam-sidecar staging-sidecar/
+          cp sidecar/target/release/kerbcast-sidecar staging-sidecar/
 
-          deps="$(ldd staging-sidecar/kerbcam-sidecar \
+          deps="$(ldd staging-sidecar/kerbcast-sidecar \
             | awk '/=>/ && $3 ~ /^\// {print $3}' \
             | grep -Ev '/(libc|libm|libpthread|libdl|librt|libstdc\+\+|libgcc_s)[.\-]' \
             | grep -Ev '/(ld-linux|linux-vdso)' \
@@ -224,7 +224,7 @@ jobs:
             || true)"
           if [ -z "$deps" ]; then
             echo "::error::ldd found no bundleable non-system deps — refusing to upload a non-self-contained artefact"
-            ldd staging-sidecar/kerbcam-sidecar
+            ldd staging-sidecar/kerbcast-sidecar
             exit 1
           fi
           echo "Bundling:"
@@ -280,12 +280,12 @@ jobs:
       - name: Upload per-rid sidecar artifact
         uses: actions/upload-artifact@v7
         with:
-          name: kerbcam-sidecar-${{ matrix.rid }}
+          name: kerbcast-sidecar-${{ matrix.rid }}
           path: staging-sidecar
           if-no-files-found: error
 
   # Native-toolchain build of the Windows shader bundle. Mirrors the
-  # build-windows job in build-kerbcam-shaders.yml: the 2019.4 Linux editor's
+  # build-windows job in build-kerbcast-shaders.yml: the 2019.4 Linux editor's
   # d3d11 cross-compile emits vertex shader blobs the Windows D3D11 runtime
   # rejects with E_INVALIDARG while shader.isSupported stays true, so the
   # Windows bundle must come from a Windows editor and be smoke-rendered on a
@@ -308,7 +308,7 @@ jobs:
           build-targets: StandaloneWindows64
           # NOT cached: a cache-restored Windows Unity install exits
           # instantly without writing a log (run 27330133502); see
-          # build-kerbcam-shaders.yml. Fresh install ~10 min per release.
+          # build-kerbcast-shaders.yml. Fresh install ~10 min per release.
           cache-installation: false
 
       - name: Activate Unity Personal license
@@ -318,15 +318,15 @@ jobs:
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
-      - name: Build kerbcam-shaders AssetBundle (windows)
-        working-directory: ci/kerbcam-shaders
+      - name: Build kerbcast-shaders AssetBundle (windows)
+        working-directory: ci/kerbcast-shaders
         shell: bash
         run: |
           status=0
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildWindows \
+            -executeMethod KerbcastCI.BuildKerbcastShaders.BuildWindows \
             -buildTarget Win64 \
             -logFile unity-build.log || status=$?
           cat unity-build.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
@@ -334,17 +334,17 @@ jobs:
           ls -la Bundles-windows/
 
       - name: Shader render smoke test (Windows bundle, d3d11)
-        working-directory: ci/kerbcam-shaders
+        working-directory: ci/kerbcast-shaders
         timeout-minutes: 10
         shell: bash
         env:
-          KERBCAM_SMOKE_BUNDLE_DIR: Bundles-windows
+          KERBCAST_SMOKE_BUNDLE_DIR: Bundles-windows
         run: |
           status=0
           "$UNITY_EDITOR_PATH" \
             -batchmode -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.ShaderSmoke.RenderAll \
+            -executeMethod KerbcastCI.ShaderSmoke.RenderAll \
             -buildTarget Win64 \
             -logFile unity-smoke.log || status=$?
           cat unity-smoke.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
@@ -353,8 +353,8 @@ jobs:
       - name: Upload Windows shader bundle artifact
         uses: actions/upload-artifact@v7
         with:
-          name: kerbcam-shaders-windows
-          path: ci/kerbcam-shaders/Bundles-windows/kerbcam-shaders
+          name: kerbcast-shaders-windows
+          path: ci/kerbcast-shaders/Bundles-windows/kerbcast-shaders
           if-no-files-found: error
 
   bundle:
@@ -379,7 +379,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: sidecar-artifacts
-          pattern: kerbcam-sidecar-*
+          pattern: kerbcast-sidecar-*
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
@@ -393,9 +393,9 @@ jobs:
           token: ${{ secrets.KSP_MANAGED_TOKEN }}
           path: ksp-managed
 
-      - name: Build Kerbcam.dll
+      - name: Build Kerbcast.dll
         run: |
-          dotnet build Plugin/Kerbcam.csproj -c Release \
+          dotnet build Plugin/Kerbcast.csproj -c Release \
             /p:KspManaged="${{ github.workspace }}/ksp-managed/KSP_Data/Managed" \
             /p:KspGameData="${{ github.workspace }}/ksp-managed/GameData"
 
@@ -406,7 +406,7 @@ jobs:
           ref: ${{ env.HULLCAM_REF }}
           path: hullcam
 
-      - name: Drop kerbcam build script into HullcamVDS project
+      - name: Drop kerbcast build script into HullcamVDS project
         run: |
           mkdir -p hullcam/HullCameraAssets/Assets/Editor
           rm -f hullcam/HullCameraAssets/Assets/Editor/CreateAssetBundles.cs
@@ -418,7 +418,7 @@ jobs:
         with:
           unity-version: ${{ env.UNITY_VERSION }}
           version-file: "None"
-          # macOS player-support is for the kerbcam-shaders.osx bundle; the
+          # macOS player-support is for the kerbcast-shaders.osx bundle; the
           # HullcamVDS shaders.linux build stays Linux-only. The cross-target
           # must be requested as a Hub module id via `modules` because the
           # action rejects non-host build-targets on Linux. The Windows bundle comes
@@ -441,18 +441,18 @@ jobs:
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildShaderBundle.BuildLinux \
+            -executeMethod KerbcastCI.BuildShaderBundle.BuildLinux \
             -buildTarget Linux64 \
             -logFile -
           cp Bundles-linux/shaders shaders.linux
 
-      - name: Build kerbcam-shaders (linux, osx)
-        working-directory: ci/kerbcam-shaders
+      - name: Build kerbcast-shaders (linux, osx)
+        working-directory: ci/kerbcast-shaders
         run: |
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildUnix \
+            -executeMethod KerbcastCI.BuildKerbcastShaders.BuildUnix \
             -buildTarget Linux64 \
             -logFile -
 
@@ -461,66 +461,66 @@ jobs:
       - name: Download Windows shader bundle artifact
         uses: actions/download-artifact@v8
         with:
-          name: kerbcam-shaders-windows
+          name: kerbcast-shaders-windows
           path: windows-shaders
 
-      - name: Assemble GameData/Kerbcam
+      - name: Assemble GameData/Kerbcast
         run: |
           set -euo pipefail
           mkdir -p \
-            GameData/Kerbcam/Plugins \
-            GameData/Kerbcam/Sidecar \
-            GameData/Kerbcam/HullcamShaders
+            GameData/Kerbcast/Plugins \
+            GameData/Kerbcast/Sidecar \
+            GameData/Kerbcast/HullcamShaders
 
-          cp Plugin/obj/Release/Kerbcam.dll GameData/Kerbcam/Plugins/
+          cp Plugin/obj/Release/Kerbcast.dll GameData/Kerbcast/Plugins/
 
-          # Per-rid sidecar layout: Sidecar/<rid>/kerbcam-sidecar[.exe] (+ lib/
+          # Per-rid sidecar layout: Sidecar/<rid>/kerbcast-sidecar[.exe] (+ lib/
           # on Linux). Kept in lockstep with ResolveSidecarBinary's rid switch
-          # in Plugin/Kerbcam/KerbcamCore.cs. Each artifact dir already holds
+          # in Plugin/Kerbcast/KerbcastCore.cs. Each artifact dir already holds
           # the staged contents, so a plain recursive copy reproduces the tree.
           #
-          # Every supported rid must be present — kerbcam ships for all OSes or
+          # Every supported rid must be present — kerbcast ships for all OSes or
           # not at all. A failed sidecar build already blocks this job (bundle
           # needs build-sidecar), so a missing artifact here means a build
           # succeeded but produced nothing; refuse to cut a partial release.
           for rid in linux-x64 osx-arm64 win-x64; do
-            src="sidecar-artifacts/kerbcam-sidecar-${rid}"
+            src="sidecar-artifacts/kerbcast-sidecar-${rid}"
             if [ ! -d "$src" ]; then
               echo "::error::missing ${rid} sidecar artifact — refusing to cut a release that omits an OS"
               exit 1
             fi
-            mkdir -p "GameData/Kerbcam/Sidecar/${rid}"
-            cp -R "$src"/. "GameData/Kerbcam/Sidecar/${rid}/"
+            mkdir -p "GameData/Kerbcast/Sidecar/${rid}"
+            cp -R "$src"/. "GameData/Kerbcast/Sidecar/${rid}/"
           done
           # Executable bits don't survive the artifact zip round-trip; restore
           # them so the plugin can ProcessStartInfo the binaries directly. Both
           # are guaranteed present by the loop above (Windows .exe needs no bit).
-          chmod +x GameData/Kerbcam/Sidecar/linux-x64/kerbcam-sidecar
-          chmod +x GameData/Kerbcam/Sidecar/osx-arm64/kerbcam-sidecar
+          chmod +x GameData/Kerbcast/Sidecar/linux-x64/kerbcast-sidecar
+          chmod +x GameData/Kerbcast/Sidecar/osx-arm64/kerbcast-sidecar
 
-          cp hullcam/HullCameraAssets/shaders.linux GameData/Kerbcam/HullcamShaders/
+          cp hullcam/HullCameraAssets/shaders.linux GameData/Kerbcast/HullcamShaders/
           # Linux keeps the legacy unsuffixed name (pre-multi-platform installs
           # and the loader's fallback both expect it); Windows/macOS get
           # platform suffixes per the HullcamShaders/shaders.linux precedent.
-          cp ci/kerbcam-shaders/Bundles-linux/kerbcam-shaders GameData/Kerbcam/
-          cp windows-shaders/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.windows
-          cp ci/kerbcam-shaders/Bundles-osx/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.osx
+          cp ci/kerbcast-shaders/Bundles-linux/kerbcast-shaders GameData/Kerbcast/
+          cp windows-shaders/kerbcast-shaders GameData/Kerbcast/kerbcast-shaders.windows
+          cp ci/kerbcast-shaders/Bundles-osx/kerbcast-shaders GameData/Kerbcast/kerbcast-shaders.osx
 
-          cp Plugin/settings.cfg GameData/Kerbcam/
+          cp Plugin/settings.cfg GameData/Kerbcast/
 
-          # kerbcam's own license (CC BY-NC-SA 4.0). The GPL-3.0 notice for the
-          # Hullcam-derived shader bundle and the KSP-AVC Kerbcam.version manifest
-          # are committed under GameData/Kerbcam/ and travel via the checkout.
-          cp LICENSE GameData/Kerbcam/LICENSE
+          # kerbcast's own license (CC BY-NC-SA 4.0). The GPL-3.0 notice for the
+          # Hullcam-derived shader bundle and the KSP-AVC Kerbcast.version manifest
+          # are committed under GameData/Kerbcast/ and travel via the checkout.
+          cp LICENSE GameData/Kerbcast/LICENSE
 
-          echo "GameData/Kerbcam tree:"
-          find GameData/Kerbcam -type f | sort
+          echo "GameData/Kerbcast tree:"
+          find GameData/Kerbcast -type f | sort
 
       - name: Create release zip
         run: |
           TAG="${GITHUB_REF_NAME}"
-          zip -r "kerbcam-${TAG}.zip" GameData/
-          echo "RELEASE_ZIP=kerbcam-${TAG}.zip" >> $GITHUB_ENV
+          zip -r "kerbcast-${TAG}.zip" GameData/
+          echo "RELEASE_ZIP=kerbcast-${TAG}.zip" >> $GITHUB_ENV
 
       # No GITHUB_REPO env: cliff.toml uses only local commit data, and
       # setting it makes git-cliff fetch remote metadata it never renders —
@@ -549,16 +549,16 @@ jobs:
           {
             echo "## Installation"
             echo ""
-            echo "1. Extract \`kerbcam-${TAG}.zip\` into your KSP \`GameData/\` directory."
+            echo "1. Extract \`kerbcast-${TAG}.zip\` into your KSP \`GameData/\` directory."
             echo "2. Install Hullcam VDS Continued (required)."
             echo "3. Start KSP and launch a flight with onboard camera parts."
             echo "4. Go to <ksp-ip>:<port> (configured in settings.cfg) to connect to streams."
             echo ""
             echo "## Assets"
-            echo "- \`kerbcam-${TAG}.zip\` — complete install tree (plugin + sidecar + shader bundles + settings)"
-            echo "- \`Kerbcam.dll\` — plugin DLL only (for manual installs)"
+            echo "- \`kerbcast-${TAG}.zip\` — complete install tree (plugin + sidecar + shader bundles + settings)"
+            echo "- \`Kerbcast.dll\` — plugin DLL only (for manual installs)"
             echo ""
-            echo "> TypeScript SDK \`@jonpepler/kerbcam@${TAG#v}\` and \`@jonpepler/kerbcam-react@${TAG#v}\` published to GitHub Packages."
+            echo "> TypeScript SDK \`@jonpepler/kerbcast@${TAG#v}\` and \`@jonpepler/kerbcast-react@${TAG#v}\` published to GitHub Packages."
             echo ""
             echo "<details>"
             echo "<summary>Changelog</summary>"
@@ -569,16 +569,16 @@ jobs:
           } > release-notes.md
           gh release create "${TAG}" \
             "${{ env.RELEASE_ZIP }}" \
-            Plugin/obj/Release/Kerbcam.dll \
-            --title "kerbcam ${TAG}" \
+            Plugin/obj/Release/Kerbcast.dll \
+            --title "kerbcast ${TAG}" \
             --notes-file release-notes.md
 
-      # Kerbcam.ckan pins an exact version + download URL + hashes (users
+      # Kerbcast.ckan pins an exact version + download URL + hashes (users
       # install via manual .ckan import while the repo stays off the public
       # CKAN index). Hand-pinning went stale within a day of v0.18.0, so
       # re-pin from the zip we just published. Runs on main, not the tag:
       # the pin must land where users fetch the raw file from.
-      - name: Re-pin Kerbcam.ckan on main
+      - name: Re-pin Kerbcast.ckan on main
         if: startsWith(github.ref_name, 'v')
         run: |
           set -euo pipefail
@@ -597,12 +597,12 @@ jobs:
           import json
           import sys
           tag, size, sha1, sha256 = sys.argv[1:5]
-          path = "Kerbcam.ckan"
+          path = "Kerbcast.ckan"
           with open(path) as f:
               m = json.load(f)
           m["version"] = tag.lstrip("v")
           m["download"] = [
-              f"https://github.com/jonpepler/kerbcam/releases/download/{tag}/kerbcam-{tag}.zip"
+              f"https://github.com/jonpepler/kerbcast/releases/download/{tag}/kerbcast-{tag}.zip"
           ]
           m["download_size"] = int(size)
           m["download_hash"] = {"sha1": sha1, "sha256": sha256}
@@ -611,12 +611,12 @@ jobs:
               f.write("\n")
           EOF
 
-          if git diff --quiet Kerbcam.ckan; then
-            echo "Kerbcam.ckan already pins ${TAG}; nothing to do"
+          if git diff --quiet Kerbcast.ckan; then
+            echo "Kerbcast.ckan already pins ${TAG}; nothing to do"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Kerbcam.ckan
+          git add Kerbcast.ckan
           git commit -m "chore(ckan): pin ${TAG}"
           git push origin main

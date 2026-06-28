@@ -11,7 +11,7 @@
 // Exit code 0 = pass, 1 = fail.
 
 using System;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)
@@ -149,11 +149,11 @@ int Headroom(AdaptiveQualityController c, double t) =>
 }
 
 // --- 7. Physics floor: below MinKspFps with stagger floored demotes even when
-//        kerbcam itself is under budget; headroom needs floor + hysteresis. ---
+//        kerbcast itself is under budget; headroom needs floor + hysteresis. ---
 {
     var c = Make(enabled: true);
     int l = c.Evaluate(8.0, staggerBudget: 1, camCount: Cams, gameFps: 15.0, now: 0.0);
-    Check(l == 1, $"below the fps floor demotes despite low kerbcam cost (got {l})");
+    Check(l == 1, $"below the fps floor demotes despite low kerbcast cost (got {l})");
     // fps recovers to 20 (above floor 18, below floor+hyst 22): not headroom.
     bool promoted = false;
     for (double t = 1.0; t <= 200.0; t += 1.0)

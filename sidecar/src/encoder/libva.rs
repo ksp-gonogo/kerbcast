@@ -43,7 +43,7 @@ mod imp {
     // Direct Rust struct field access uses bindgen-generated offsets that
     // can diverge from the compiled library due to FF_API_* guard differences.
     extern "C" {
-        fn kerbcam_avcodec_set_hw_frames_ctx(
+        fn kerbcast_avcodec_set_hw_frames_ctx(
             ctx: *mut ffmpeg::ffi::AVCodecContext,
             r: *mut ffmpeg::ffi::AVBufferRef,
         );
@@ -215,7 +215,7 @@ mod imp {
             ffmpeg::ffi::av_buffer_unref(&mut device_ref);
             return false;
         }
-        kerbcam_avcodec_set_hw_frames_ctx(ctx, bref);
+        kerbcast_avcodec_set_hw_frames_ctx(ctx, bref);
 
         let open_rc = ffmpeg::ffi::avcodec_open2(ctx, codec, ptr::null_mut());
         if open_rc < 0 {
@@ -446,7 +446,7 @@ mod imp {
                         "av_buffer_ref(hw_frames_ref) returned null".into(),
                     ));
                 }
-                kerbcam_avcodec_set_hw_frames_ctx(ctx_mut, frames_bref);
+                kerbcast_avcodec_set_hw_frames_ctx(ctx_mut, frames_bref);
 
                 let opened = match encoder.open_as(codec) {
                     Ok(o) => o,

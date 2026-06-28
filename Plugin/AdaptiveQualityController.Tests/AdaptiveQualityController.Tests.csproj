@@ -17,7 +17,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../Kerbcam/AdaptiveQualityController.cs" />
+    <Compile Include="../Kerbcast/AdaptiveQualityController.cs" />
   </ItemGroup>
 
 </Project>

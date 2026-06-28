@@ -10,7 +10,7 @@ importers:
 
   client-sdk/react:
     dependencies:
-      '@jonpepler/kerbcam':
+      '@jonpepler/kerbcast':
         specifier: workspace:^
         version: link:../typescript
     devDependencies:
@@ -62,10 +62,10 @@ importers:
 
   web:
     dependencies:
-      '@jonpepler/kerbcam':
+      '@jonpepler/kerbcast':
         specifier: workspace:^
         version: link:../client-sdk/typescript
-      '@jonpepler/kerbcam-react':
+      '@jonpepler/kerbcast-react':
         specifier: workspace:^
         version: link:../client-sdk/react
       lucide-react:

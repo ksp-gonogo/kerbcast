@@ -1,11 +1,11 @@
 import "./styles.css";
-import { BrowserKerbcamTransport, KerbcamClient } from "@jonpepler/kerbcam";
+import { BrowserKerbcastTransport, KerbcastClient } from "@jonpepler/kerbcast";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
 
 async function bootstrap() {
-  let client: KerbcamClient;
+  let client: KerbcastClient;
 
   // If mock=1 in query string, dynamically import the mock driver which
   // constructs and returns a MockSidecar-backed client.
@@ -15,9 +15,9 @@ async function bootstrap() {
   } else {
     const host = location.hostname;
     const port = location.port ? Number(location.port) : 8088;
-    client = new KerbcamClient(
+    client = new KerbcastClient(
       { host, port },
-      new BrowserKerbcamTransport(),
+      new BrowserKerbcastTransport(),
     );
   }
 

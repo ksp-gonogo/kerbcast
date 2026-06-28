@@ -4,11 +4,11 @@
 //!   (with `part_title`, `vessel_name`, etc); the browser fetches this
 //!   to populate its picker before opening a peer connection.
 //! - `POST /offer` takes `{ sdp, cameras: [flight_id, ...] }`, creates a
-//!   `KerbcamPeer` with one video track per selected camera AND a
-//!   "kerbcam-control" data channel, answers the SDP, and returns the
+//!   `KerbcastPeer` with one video track per selected camera AND a
+//!   "kerbcast-control" data channel, answers the SDP, and returns the
 //!   answer. Unknown camera IDs are dropped with a warning rather than
 //!   failing the whole request.
-//! - `GET /` serves the bundled kerbcam web UI (web/dist/index.html,
+//! - `GET /` serves the bundled kerbcast web UI (web/dist/index.html,
 //!   embedded at compile time via include_str!).
 //!
 //! Per-camera operational state (layer mask, render size, future zoom)
@@ -31,12 +31,12 @@ use tracing::{info, warn};
 
 use crate::cameras::{CameraInfo, CameraRegistry, StatusLogEntry};
 use crate::encoder::EncoderChoice;
-use crate::webrtc::KerbcamPeer;
+use crate::webrtc::KerbcastPeer;
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<CameraRegistry>,
-    pub peers: Arc<RwLock<Vec<Arc<KerbcamPeer>>>>,
+    pub peers: Arc<RwLock<Vec<Arc<KerbcastPeer>>>>,
     /// Carried through so peers and the consume loop initialise encoders
     /// against the same settings. Encoders themselves live in the
     /// registry; AppState just plumbs the configuration.
@@ -219,7 +219,7 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
     // (older clients) → one slot per initial camera (the old behaviour).
     let slot_count = req.slots.map(|s| s as usize).unwrap_or(requested.len());
 
-    let peer = Arc::new(KerbcamPeer::new(state.registry.clone(), &requested, slot_count).await?);
+    let peer = Arc::new(KerbcastPeer::new(state.registry.clone(), &requested, slot_count).await?);
     let answer_sdp = peer.answer_to_offer(req.sdp).await?;
     let subscribed = peer.subscribed.clone();
 

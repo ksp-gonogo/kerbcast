@@ -136,13 +136,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p staging/lib
-          cp sidecar/target/release/kerbcam-sidecar staging/
+          cp sidecar/target/release/kerbcast-sidecar staging/
 
           # Collect all resolved dep paths, then strip:
           #   - stable glibc / C++ runtime (stable ABI across all Linux)
           #   - the dynamic loader and the vDSO (not real files)
           #   - libva (driver shim, must match host Mesa — see comment above)
-          deps="$(ldd staging/kerbcam-sidecar \
+          deps="$(ldd staging/kerbcast-sidecar \
             | awk '/=>/ && $3 ~ /^\// {print $3}' \
             | grep -Ev '/(libc|libm|libpthread|libdl|librt|libstdc\+\+|libgcc_s)[.\-]' \
             | grep -Ev '/(ld-linux|linux-vdso)' \
@@ -150,7 +150,7 @@ jobs:
             || true)"
           if [ -z "$deps" ]; then
             echo "::error::ldd found no bundleable non-system deps — refusing to upload a non-self-contained artefact"
-            ldd staging/kerbcam-sidecar
+            ldd staging/kerbcast-sidecar
             exit 1
           fi
           echo "Bundling:"
@@ -189,9 +189,9 @@ jobs:
       - name: Upload dev sidecar bundle
         uses: actions/upload-artifact@v7
         with:
-          name: kerbcam-sidecar-linux-x64-dev
+          name: kerbcast-sidecar-linux-x64-dev
           # Uploading the staging directory preserves the layout
-          # (kerbcam-sidecar + lib/) when consumers `gh run download -n`.
+          # (kerbcast-sidecar + lib/) when consumers `gh run download -n`.
           path: staging
           if-no-files-found: error
 
@@ -201,7 +201,7 @@ jobs:
     # runs the test suite. The runner has no hardware encoder MFT, so the
     # MF probe correctly reports unavailable and the encode path itself
     # is exercised only on real Windows+GPU machines (see
-    # live_tests/kerbcam.md); what this job locks down is type/cfg/clippy
+    # live_tests/kerbcast.md); what this job locks down is type/cfg/clippy
     # regressions that the Linux lane can't see. No perf budgets here,
     # per the tier-2 policy in CLAUDE.md.
     name: windows clippy + test

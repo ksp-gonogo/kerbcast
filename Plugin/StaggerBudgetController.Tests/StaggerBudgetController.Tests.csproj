@@ -15,7 +15,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../Kerbcam/StaggerBudgetController.cs" />
+    <Compile Include="../Kerbcast/StaggerBudgetController.cs" />
   </ItemGroup>
 
 </Project>

@@ -1,18 +1,18 @@
 /* Unit test for StaggerBudgetController, the frametime-budget capture-budget
-   regulator. Verifies it converges the budget to fit a kerbcam-ms target,
+   regulator. Verifies it converges the budget to fit a kerbcast-ms target,
    cuts proportionately on sustained overload (a single spike sample changes
    nothing), remembers recently failed levels so it cannot sawtooth back into
    them, restores slowly, respects a deadband, keeps the MinKspFps floor
    one-way, and is bounded by the camera count.
 
    Tests 10+ replay the 2026-06 Deck field defect: 8 Hullcam cameras at
-   ~4.8ms/cam against MaxKerbcamFrameBudgetMs=24 sawtoothed 6 -> 2 -> 6 every
+   ~4.8ms/cam against MaxKerbcastFrameBudgetMs=24 sawtoothed 6 -> 2 -> 6 every
    ~20s instead of settling at the sustainable 5.
 
    Exit code 0 = pass, 1 = fail. */
 
 using System;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)
@@ -111,7 +111,7 @@ int Settle(StaggerBudgetController c, int camCount, double msPerCam, double budg
 }
 
 /* --- 7. Physics floor (one-way): cuts BELOW the ms-budget when game fps is
-       under the floor, even though kerbcam is within its cost budget. --- */
+       under the floor, even though kerbcast is within its cost budget. --- */
 {
     // Generous 100ms budget (cost never triggers a cut), floor 20fps, 8 cams.
     var c = new StaggerBudgetController(budgetMs: 100.0, initialBudget: 8,
@@ -280,9 +280,9 @@ int Settle(StaggerBudgetController c, int camCount, double msPerCam, double budg
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");
 return failures == 0 ? 0 : 1;
 
-/* Mirrors KerbcamCore's signal plumbing at 30Hz: raw per-frame cost from the
+/* Mirrors KerbcastCore's signal plumbing at 30Hz: raw per-frame cost from the
    budget actually applied last frame plus deterministic jitter, EMA alpha 0.2
-   (KerbcamCore.LateUpdate), msPerCam = ema / captured. */
+   (KerbcastCore.LateUpdate), msPerCam = ema / captured. */
 sealed class FrameSim
 {
     public const double Dt = 1.0 / 30.0;

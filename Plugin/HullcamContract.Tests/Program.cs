@@ -1,26 +1,26 @@
-// Contract test: pin the HullcamVDSContinued.dll surface that kerbcam's
-// per-camera filter blit (KerbcamCamera + HullcamFilterBlit, c00fe16)
+// Contract test: pin the HullcamVDSContinued.dll surface that kerbcast's
+// per-camera filter blit (KerbcastCamera + HullcamFilterBlit, c00fe16)
 // reflects over or behaviourally depends on, so an upstream Hullcam update
 // that renames a field, drops a filter class, or changes which classes
 // rewrite _TitleTex fails THIS test instead of silently degrading the
 // stream. Metadata-only (Mono.Cecil): no Unity, no KSP runtime.
 //
-// What is pinned, and why (traced from Plugin/Kerbcam/KerbcamCamera.cs and
-// Plugin/Kerbcam/HullcamBlit/HullcamFilterBlit.cs):
+// What is pinned, and why (traced from Plugin/Kerbcast/KerbcastCamera.cs and
+// Plugin/Kerbcast/HullcamBlit/HullcamFilterBlit.cs):
 //   - CameraFilter.mtShader        static Material, the field the blit
 //                                  redirects via reflection
 //   - filmVignette / nvMesh / noise static Texture2Ds read to seed the
 //                                  private material's NightVision slots
-//   - the nine CameraFilter* classes + eCameraMode values 0..8 (kerbcam
+//   - the nine CameraFilter* classes + eCameraMode values 0..8 (kerbcast
 //                                  casts (int)cameraMode straight to enum)
 //   - CreateFilter / Activate / Deactivate / RenderTitlePage /
-//     RenderImageWithFilter / LoadTextureFile signatures kerbcam calls
+//     RenderImageWithFilter / LoadTextureFile signatures kerbcast calls
 //   - "_Title" / "_TitleTex" written by RenderTitlePage, and the
-//     "_VignetteTex" / "_Overlay1Tex" / "_Overlay2Tex" slot names kerbcam
+//     "_VignetteTex" / "_Overlay1Tex" / "_Overlay2Tex" slot names kerbcast
 //     seeds (asserted as string literals in the DLL's own writes)
 //   - the reticle policy split: BWLoResTV / BWHiResTV / NightVision rewrite
 //     _TitleTex inside RenderImageWithFilter (reticle suppressed); the
-//     other filter classes do not (kerbcam's title=true reticle shows).
+//     other filter classes do not (kerbcast's title=true reticle shows).
 //     NightVision additionally never writes the three overlay slots, which
 //     is exactly why HullcamFilterBlit seeds them.
 // Exit code 0 = pass (or explicit SKIP when the DLL is absent), 1 = fail.
@@ -34,7 +34,7 @@ using Mono.Cecil.Cil;
 
 string dllPath =
     (args.Length > 0 ? args[0] : null)
-    ?? Environment.GetEnvironmentVariable("KERBCAM_HULLCAM_DLL")
+    ?? Environment.GetEnvironmentVariable("KERBCAST_HULLCAM_DLL")
     ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         "personal", "gonogo", "local_docs", "syncthing", "kspdata",
@@ -45,7 +45,7 @@ if (!File.Exists(dllPath))
 {
     Console.WriteLine(
         "SKIP: HullcamVDSContinued.dll not found at the path above. " +
-        "Pass the path as the first argument or set KERBCAM_HULLCAM_DLL. " +
+        "Pass the path as the first argument or set KERBCAST_HULLCAM_DLL. " +
         "(Expected on runners without the ksp-managed checkout.)");
     return 0;
 }
@@ -130,14 +130,14 @@ Check(loadTexture != null && loadTexture.IsStatic
         && loadTexture.ReturnType.FullName == "UnityEngine.Texture2D",
     "static Texture2D CameraFilter.LoadTextureFile(string) exists (dockingdisplay.png load)");
 
-// The base-class title page must still drive the two uniforms kerbcam's
+// The base-class title page must still drive the two uniforms kerbcast's
 // per-blit RenderTitlePage(true, dockingdisplay) call relies on.
 var titleLiterals = StringLiterals(renderTitlePage).ToList();
 Check(titleLiterals.Contains("_Title"), "RenderTitlePage writes \"_Title\"");
 Check(titleLiterals.Contains("_TitleTex"), "RenderTitlePage writes \"_TitleTex\"");
 
 // ------------------------------------------------------------------
-// eCameraMode: kerbcam casts (int)hullcam.cameraMode directly to this
+// eCameraMode: kerbcast casts (int)hullcam.cameraMode directly to this
 // enum, so both the names and the numeric values are load-bearing.
 // ------------------------------------------------------------------
 var modeEnum = cameraFilter.NestedTypes.FirstOrDefault(t => t.Name == "eCameraMode");
@@ -182,7 +182,7 @@ foreach (var name in filterClassNames)
 // ------------------------------------------------------------------
 // Reticle policy split (traced in c00fe16): suppressing classes rewrite
 // _TitleTex inside their own blit; showing classes leave it alone so
-// kerbcam's title=true write decides. If upstream flips one of these,
+// kerbcast's title=true write decides. If upstream flips one of these,
 // the per-class reticle trace must be re-derived.
 // ------------------------------------------------------------------
 var suppressors = new[]

@@ -165,7 +165,7 @@ namespace Yangrc.OpenGLAsyncReadback {
         }
 
         /// <summary>
-        /// kerbcam perf addition (not upstream). Zero-copy access for the OpenGL
+        /// kerbcast perf addition (not upstream). Zero-copy access for the OpenGL
         /// plugin path: returns the native plugin buffer pointer directly,
         /// skipping the Allocator.Temp NativeArray + MemMove that GetData()
         /// performs (one of two full-frame copies per readback, plus a per-frame
@@ -279,7 +279,7 @@ namespace Yangrc.OpenGLAsyncReadback {
 		}
 
         /// <summary>
-        /// kerbcam perf addition (not upstream): the native plugin buffer pointer
+        /// kerbcast perf addition (not upstream): the native plugin buffer pointer
         /// + byte length, with no copy or allocation. Same source data as
         /// GetRawData, minus the Allocator.Temp NativeArray + MemMove. Pointer is
         /// valid only until the next Update frees the task buffer — copy out now.

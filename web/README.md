@@ -1,20 +1,20 @@
-# kerbcam web
+# kerbcast web
 
 The sidecar's built-in browser UI. Served by the sidecar at `GET /`. Targets
 fresh KSP users: auto-connect on load, stream-first camera grid, camera
 picker, dev controls behind a settings toggle.
 
-Built with Vite + React, using `@jonpepler/kerbcam` and
-`@jonpepler/kerbcam-react` from this same workspace.
+Built with Vite + React, using `@jonpepler/kerbcast` and
+`@jonpepler/kerbcast-react` from this same workspace.
 
 ## Dev workflow
 
 ```sh
 # Start with a real sidecar on localhost:8088
-pnpm --filter kerbcam-web dev
+pnpm --filter kerbcast-web dev
 
 # Start without a sidecar (mock mode -- full UI, simulated cameras)
-pnpm --filter kerbcam-web dev
+pnpm --filter kerbcast-web dev
 # then open http://localhost:5173/?mock=1
 ```
 
@@ -24,16 +24,16 @@ HMR is on; TypeScript errors surface in the Vite overlay and the terminal
 ## Tests
 
 ```sh
-pnpm --filter kerbcam-web test
+pnpm --filter kerbcast-web test
 ```
 
 Runs 27 vitest tests under jsdom + testing-library, driven by a real
-`KerbcamClient` against `MockSidecar`.
+`KerbcastClient` against `MockSidecar`.
 
 ## Build and freshness rule
 
 ```sh
-pnpm --filter kerbcam-web build
+pnpm --filter kerbcast-web build
 ```
 
 `vite-plugin-singlefile` bundles the entire app (JS + CSS) into one

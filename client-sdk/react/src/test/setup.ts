@@ -1,3 +1,3 @@
-import { installDomStubs } from "@jonpepler/kerbcam/testing";
+import { installDomStubs } from "@jonpepler/kerbcast/testing";
 
 installDomStubs();

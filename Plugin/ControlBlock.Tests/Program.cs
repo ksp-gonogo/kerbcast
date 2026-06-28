@@ -6,7 +6,7 @@
 
 using System;
 using System.IO;
-using Kerbcam;
+using Kerbcast;
 
 int failures = 0;
 void Check(bool cond, string msg)

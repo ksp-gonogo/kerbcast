@@ -111,11 +111,11 @@ jobs:
           path = "sidecar/Cargo.lock"
           s = open(path).read()
           s2, n = re.subn(
-              r'(name = "kerbcam-sidecar"\nversion = ")[^"]+(")',
+              r'(name = "kerbcast-sidecar"\nversion = ")[^"]+(")',
               r"\g<1>%s\g<2>" % new,
               s,
           )
-          assert n == 1, "expected one kerbcam-sidecar entry, found %d" % n
+          assert n == 1, "expected one kerbcast-sidecar entry, found %d" % n
           open(path, "w").write(s2)
           EOF
 
@@ -126,7 +126,7 @@ jobs:
           import json
           import sys
           maj, minor, pat = (int(x) for x in sys.argv[1].split("."))
-          path = "GameData/Kerbcam/Kerbcam.version"
+          path = "GameData/Kerbcast/Kerbcast.version"
           with open(path) as f:
               m = json.load(f)
           m["VERSION"] = {"MAJOR": maj, "MINOR": minor, "PATCH": pat, "BUILD": 0}
@@ -138,7 +138,7 @@ jobs:
           echo "Cargo.toml: $(grep -m1 '^version' sidecar/Cargo.toml)"
           echo "typescript: $(node -p "require('./client-sdk/typescript/package.json').version")"
           echo "react: $(node -p "require('./client-sdk/react/package.json').version")"
-          echo "Kerbcam.version: $(python3 -c "import json; v=json.load(open('GameData/Kerbcam/Kerbcam.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          echo "Kerbcast.version: $(python3 -c "import json; v=json.load(open('GameData/Kerbcast/Kerbcast.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
 
       - name: Commit, tag, push
         run: |
@@ -150,7 +150,7 @@ jobs:
           git add sidecar/Cargo.toml sidecar/Cargo.lock \
                   client-sdk/typescript/package.json \
                   client-sdk/react/package.json \
-                  GameData/Kerbcam/Kerbcam.version
+                  GameData/Kerbcast/Kerbcast.version
           git commit -m "release: v${NEW}"
           git tag "${TAG}"
           git push origin HEAD:main "${TAG}"

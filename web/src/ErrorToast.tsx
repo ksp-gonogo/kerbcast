@@ -1,10 +1,10 @@
-import type { ErrorPayload, KerbcamClient } from "@jonpepler/kerbcam";
+import type { ErrorPayload, KerbcastClient } from "@jonpepler/kerbcast";
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
 
 interface ErrorToastProps {
-  client: KerbcamClient;
+  client: KerbcastClient;
 }
 
 interface Notice {

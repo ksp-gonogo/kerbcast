@@ -4,22 +4,22 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   resolve: {
     alias: {
-      "@jonpepler/kerbcam/testing": path.resolve(
+      "@jonpepler/kerbcast/testing": path.resolve(
         __dirname,
         "../client-sdk/typescript/src/testing/index.ts",
       ),
-      "@jonpepler/kerbcam": path.resolve(
+      "@jonpepler/kerbcast": path.resolve(
         __dirname,
         "../client-sdk/typescript/src/index.ts",
       ),
-      "@jonpepler/kerbcam-react": path.resolve(
+      "@jonpepler/kerbcast-react": path.resolve(
         __dirname,
         "../client-sdk/react/src/index.ts",
       ),
     },
   },
   test: {
-    name: "kerbcam-web",
+    name: "kerbcast-web",
     environment: "jsdom",
     globals: true,
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],

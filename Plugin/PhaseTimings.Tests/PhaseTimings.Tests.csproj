@@ -20,7 +20,7 @@
   <ItemGroup>
     <!-- Compile the unit under test directly — no project reference to the KSP
          plugin (which can't build off-Linux / needs Unity refs). -->
-    <Compile Include="../Kerbcam/PhaseTimings.cs" />
+    <Compile Include="../Kerbcast/PhaseTimings.cs" />
   </ItemGroup>
 
 </Project>

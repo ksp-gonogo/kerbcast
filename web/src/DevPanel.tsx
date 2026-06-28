@@ -8,9 +8,9 @@
  * - Per-tile RTC inbound stats (pkts/bytes/framesDecoded/jitter)
  */
 
-import type { CameraState, InboundVideoStats, KerbcamClient } from "@jonpepler/kerbcam";
-import { Layer } from "@jonpepler/kerbcam";
-import { useKerbcamCameras } from "@jonpepler/kerbcam-react";
+import type { CameraState, InboundVideoStats, KerbcastClient } from "@jonpepler/kerbcast";
+import { Layer } from "@jonpepler/kerbcast";
+import { useKerbcastCameras } from "@jonpepler/kerbcast-react";
 import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 
@@ -18,18 +18,18 @@ const ALL_LAYERS = [Layer.Near, Layer.Scaled, Layer.Galaxy] as const;
 
 interface ProfileData {
   staggerBudget?: number;
-  kerbcamFrameMs?: number;
+  kerbcastFrameMs?: number;
   kspFps?: number;
 }
 
 interface DevPanelProps {
-  client: KerbcamClient;
+  client: KerbcastClient;
   /** flightIds currently shown in tiles (for per-tile stats) */
   tileFlightIds: (number | null)[];
 }
 
 export function DevPanel({ client, tileFlightIds }: DevPanelProps): React.JSX.Element {
-  const cameras = useKerbcamCameras();
+  const cameras = useKerbcastCameras();
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [profileError, setProfileError] = useState(false);
   const [rtcStats, setRtcStats] = useState<Map<number, InboundVideoStats>>(new Map());
@@ -95,7 +95,7 @@ export function DevPanel({ client, tileFlightIds }: DevPanelProps): React.JSX.El
             ) : profile ? (
               <Mono>
                 stagger: {profile.staggerBudget ?? "?"} cam/frame
-                {" | "}kerbcam {Number(profile.kerbcamFrameMs ?? 0).toFixed(1)}ms
+                {" | "}kerbcast {Number(profile.kerbcastFrameMs ?? 0).toFixed(1)}ms
                 {" | "}KSP {Number(profile.kspFps ?? 0).toFixed(0)} fps
               </Mono>
             ) : (
@@ -152,7 +152,7 @@ export function DevPanel({ client, tileFlightIds }: DevPanelProps): React.JSX.El
 
 interface CameraRowProps {
   cam: CameraState;
-  client: KerbcamClient;
+  client: KerbcastClient;
   rtcStats?: InboundVideoStats;
 }
 

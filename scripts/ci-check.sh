@@ -43,7 +43,7 @@ esac
 echo "=== ci-check: $STEP (in $IMAGE via $RUNTIME) ==="
 "$RUNTIME" run --rm \
   -v "$REPO_ROOT/sidecar:/work/sidecar:ro" \
-  -e CARGO_TARGET_DIR=/tmp/kerbcam-target \
+  -e CARGO_TARGET_DIR=/tmp/kerbcast-target \
   -w /work/sidecar \
   "$IMAGE" \
   bash -c "$SETUP source \"\$HOME/.cargo/env\" && $CMDS"

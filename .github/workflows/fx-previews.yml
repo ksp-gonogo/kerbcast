@@ -1,6 +1,6 @@
 name: fx-previews
 
-# Renders the FX preview PNGs from the fixtures in ci/kerbcam-shaders/Fixtures.
+# Renders the FX preview PNGs from the fixtures in ci/kerbcast-shaders/Fixtures.
 # Each fixture sets up a proxy vessel + camera, applies the FX shaders via
 # CommandBuffer at AfterForwardAlpha (same hook as runtime), then renders one
 # frame to PNG. Output PNGs become a CI artifact so we can iterate on the
@@ -9,18 +9,18 @@ name: fx-previews
 #
 # NON-BLOCKING and informational: nothing depends on this workflow. The
 # blocking correctness checks (bundle build, per-shader render smoke test,
-# blit determinism) all live in build-kerbcam-shaders.yml; this one exists
+# blit determinism) all live in build-kerbcast-shaders.yml; this one exists
 # so a human can look at how the FX renders actually turned out.
 #
-# Trigger: workflow_run after build-kerbcam-shaders completes successfully,
+# Trigger: workflow_run after build-kerbcast-shaders completes successfully,
 # plus workflow_dispatch for manual runs and pushes touching this file.
 #
 # Auth: uses buildalon/activate-unity-license@v2 with UNITY_USERNAME +
-# UNITY_PASSWORD repo secrets, same as build-kerbcam-shaders.yml.
+# UNITY_PASSWORD repo secrets, same as build-kerbcast-shaders.yml.
 
 on:
   workflow_run:
-    workflows: [build-kerbcam-shaders]
+    workflows: [build-kerbcast-shaders]
     types: [completed]
   push:
     paths:
@@ -54,7 +54,7 @@ jobs:
         with:
           unity-version: ${{ env.UNITY_VERSION }}
           version-file: 'None'
-          # Same module set as build-kerbcam-shaders.yml's build-unix job
+          # Same module set as build-kerbcast-shaders.yml's build-unix job
           # even though the previews only need the Linux editor: an identical
           # install means cache-installation reuses the editor that workflow
           # cached. (windows-mono left with the Linux d3d11 cross-compile;
@@ -78,7 +78,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Render FX preview PNGs
-        working-directory: ci/kerbcam-shaders
+        working-directory: ci/kerbcast-shaders
         # LLVMpipe fill cost scales with proxy triangle count (one strip per
         # windward triangle, strip area independent of triangle size). With
         # the real-part-density nose cone the full fixture x shader x view
@@ -89,7 +89,7 @@ jobs:
           xvfb-run -a "$UNITY_EDITOR_PATH" \
             -batchmode -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.RenderFxPreviews.RenderAll \
+            -executeMethod KerbcastCI.RenderFxPreviews.RenderAll \
             -buildTarget Linux64 \
             -logFile -
           echo "--- preview PNGs ---"
@@ -101,6 +101,6 @@ jobs:
         if: always()
         with:
           name: fx-previews
-          path: ci/kerbcam-shaders/Previews/
+          path: ci/kerbcast-shaders/Previews/
           retention-days: 30
           if-no-files-found: warn

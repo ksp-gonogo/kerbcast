@@ -16,14 +16,14 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/buffer.h>
 
-void kerbcam_avcodec_set_hw_frames_ctx(AVCodecContext *ctx, AVBufferRef *ref) {
+void kerbcast_avcodec_set_hw_frames_ctx(AVCodecContext *ctx, AVBufferRef *ref) {
     ctx->hw_frames_ctx = ref;
 }
 
-AVBufferRef *kerbcam_avcodec_get_hw_frames_ctx(const AVCodecContext *ctx) {
+AVBufferRef *kerbcast_avcodec_get_hw_frames_ctx(const AVCodecContext *ctx) {
     return ctx->hw_frames_ctx;
 }
 
-void kerbcam_avcodec_set_hw_device_ctx(AVCodecContext *ctx, AVBufferRef *ref) {
+void kerbcast_avcodec_set_hw_device_ctx(AVCodecContext *ctx, AVBufferRef *ref) {
     ctx->hw_device_ctx = ref;
 }

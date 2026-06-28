@@ -2,9 +2,9 @@
 
   <!--
     Reflection-contract test for the HullcamVDSContinued.dll surface that
-    KerbcamCamera's per-camera filter blit reflects over (see c00fe16). Reads
+    KerbcastCamera's per-camera filter blit reflects over (see c00fe16). Reads
     the DLL's METADATA only via Mono.Cecil, so no Unity or KSP runtime is
-    needed; the DLL is data, located by KERBCAM_HULLCAM_DLL / argv[0] with a
+    needed; the DLL is data, located by KERBCAST_HULLCAM_DLL / argv[0] with a
     local-dev default. Skips (exit 0) with a clear message when the DLL is
     absent; plugin-ci runs it against the ksp-managed checkout. Run:
     `dotnet run`.

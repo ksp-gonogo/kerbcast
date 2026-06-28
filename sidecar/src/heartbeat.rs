@@ -1,6 +1,6 @@
 //! Orphan protection for the once-per-KSP-session sidecar.
 //!
-//! The plugin's KerbcamSidecarHost touches `global.heartbeat` in the shm
+//! The plugin's KerbcastSidecarHost touches `global.heartbeat` in the shm
 //! dir about once a second for the whole game session and kills the
 //! sidecar on a clean game exit. If KSP dies hard (crash, SIGKILL, power
 //! loss to the window manager) nothing kills the child process, so the

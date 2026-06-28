@@ -20,24 +20,24 @@ which dispatches at runtime to:
 - `AsyncGPUReadbackPlugin.cs` — C# wrapper + DllImports.
 - `AsyncReadbackUpdater.cs` — `MonoBehaviour` that pumps pending readbacks
   every frame. `[RuntimeInitializeOnLoadMethod]` is unreliable in KSP
-  (Unity loads mod DLLs after that hook fires), so the kerbcam plugin
+  (Unity loads mod DLLs after that hook fires), so the kerbcast plugin
   spawns this manually on first use.
 - `LICENSE` — upstream MIT license, preserved verbatim.
 
 ## Native plugin binary
 
 `libAsyncGPUReadbackPlugin.so` ships in
-`GameData/Kerbcam/Plugins/x86_64/`. Mono on Linux only finds it from
+`GameData/Kerbcast/Plugins/x86_64/`. Mono on Linux only finds it from
 specific paths (`KSP_Data/MonoBleedingEdge/x86_64/` or `KSP_Data/Plugins/`);
 the install script copies it to the right one. Sourced from the
 upstream's `UnityExampleProject/Assets/OpenglAsyncReadback/Plugins/Linux/`
 folder.
 
-## Local modifications (kerbcam fork)
+## Local modifications (kerbcast fork)
 
 Upstream is unmaintained, so this copy is treated as a maintained fork. MIT
 permits modification; the `LICENSE` and copyright notices are preserved
-verbatim. Divergences from upstream, all clearly marked `kerbcam … (not
+verbatim. Divergences from upstream, all clearly marked `kerbcast … (not
 upstream)` in-source:
 
 - **`AsyncGPUReadbackPlugin.cs`** — added zero-copy readback accessors so the
@@ -50,14 +50,14 @@ upstream)` in-source:
 - **`AsyncReadbackUpdater.cs`** — added `OnDestroy()` that nulls the static
   `instance` (`if (instance == this) instance = null;`). Upstream never cleared
   it, so after the pump GameObject was destroyed the static held a stale
-  reference and consumers re-checking `instance == null` (KerbcamCore re-spawning
+  reference and consumers re-checking `instance == null` (KerbcastCore re-spawning
   the pump on the next Flight scene) saw "not null" and never respawned — async
   readbacks then wedged until a full KSP restart.
   Rationale: `local_docs/perf_profiles/session_20260606.md` (pump-respawn bug).
 
 Note: the `ClearDeadRefs` dictionary-during-enumeration bug is NOT fixed in
 this source — it's patched at runtime via Harmony in
-`Plugin/Kerbcam/AsyncReadbackRegistryFix.cs` (kept that way so that file stays
+`Plugin/Kerbcast/AsyncReadbackRegistryFix.cs` (kept that way so that file stays
 closer to upstream).
 
 ## Updating
@@ -69,6 +69,6 @@ after updating (diff against git history for the exact hunks).
 cd /tmp && git clone --depth 1 https://github.com/yangrc1234/UnityOpenGLAsyncReadback.git yangrc-update
 cp /tmp/yangrc-update/UnityExampleProject/Assets/OpenglAsyncReadback/Scripts/{AsyncGPUReadbackPlugin,AsyncReadbackUpdater}.cs Plugin/Vendor/UnityOpenGLAsyncReadback/
 cp /tmp/yangrc-update/LICENSE Plugin/Vendor/UnityOpenGLAsyncReadback/
-cp /tmp/yangrc-update/UnityExampleProject/Assets/OpenglAsyncReadback/Plugins/Linux/libAsyncGPUReadbackPlugin.so <install>/GameData/Kerbcam/Plugins/x86_64/
-# then re-apply the kerbcam zero-copy accessors (see "Local modifications")
+cp /tmp/yangrc-update/UnityExampleProject/Assets/OpenglAsyncReadback/Plugins/Linux/libAsyncGPUReadbackPlugin.so <install>/GameData/Kerbcast/Plugins/x86_64/
+# then re-apply the kerbcast zero-copy accessors (see "Local modifications")
 ```

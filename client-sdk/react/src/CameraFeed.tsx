@@ -1,5 +1,5 @@
-import type { KerbcamClient } from "@jonpepler/kerbcam";
-import { PanZoomController, QualityPreset } from "@jonpepler/kerbcam";
+import type { KerbcastClient } from "@jonpepler/kerbcast";
+import { PanZoomController, QualityPreset } from "@jonpepler/kerbcast";
 import {
   forwardRef,
   useCallback,
@@ -13,9 +13,9 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
-import { KerbcamProvider, useKerbcamClient } from "./context";
-import { useKerbcamCameras } from "./hooks/useKerbcamCameras";
-import { useKerbcamStream } from "./hooks/useKerbcamStream";
+import { KerbcastProvider, useKerbcastClient } from "./context";
+import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
+import { useKerbcastStream } from "./hooks/useKerbcastStream";
 import { isCameraDestroyed } from "./lifecycle";
 
 // ---------------------------------------------------------------------------
@@ -229,7 +229,7 @@ export interface FeedAction {
 
 export interface CameraFeedProps {
   /** Override the context client for this feed only. */
-  client?: KerbcamClient;
+  client?: KerbcastClient;
   /**
    * KSP `Part.flightID` of the camera to display. `null` triggers
    * auto-selection: the first live camera in the registry is latched.
@@ -331,8 +331,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     },
     ref,
   ) {
-    const client = useKerbcamClient();
-    const cameras = useKerbcamCameras();
+    const client = useKerbcastClient();
+    const cameras = useKerbcastCameras();
 
     /*
      * Reduced-motion auto mode: when `showStatic` prop is undefined, read and
@@ -401,7 +401,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       onDisplayedRef.current?.(flightId);
     }, [flightId]);
 
-    const stream = useKerbcamStream(flightId);
+    const stream = useKerbcastStream(flightId);
     const videoRef = useRef<HTMLVideoElement>(null);
     // The feed frame; fullscreen targets this and ResizeObserver measures it.
     const wrapRef = useRef<HTMLDivElement>(null);
@@ -1068,17 +1068,17 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 // ---------------------------------------------------------------------------
 
 /**
- * Display a live kerbcam camera feed with pan/zoom controls and camera picker.
- * Must be rendered inside a `KerbcamProvider` unless the `client` prop is
+ * Display a live kerbcast camera feed with pan/zoom controls and camera picker.
+ * Must be rendered inside a `KerbcastProvider` unless the `client` prop is
  * provided (which creates an implicit inner provider for this feed only).
  */
 export const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(
   function CameraFeed({ client, ...rest }, ref) {
     if (client) {
       return (
-        <KerbcamProvider client={client}>
+        <KerbcastProvider client={client}>
           <CameraFeedInner ref={ref} {...rest} />
-        </KerbcamProvider>
+        </KerbcastProvider>
       );
     }
     return <CameraFeedInner ref={ref} {...rest} />;
@@ -1220,7 +1220,7 @@ const PanArrow = styled.button<{ $dir: "up" | "down" | "left" | "right" }>`
   @media (hover: hover) {
     &:hover:not(:disabled) {
       opacity: 1;
-      color: var(--kerbcam-accent, #00ff88);
+      color: var(--kerbcast-accent, #00ff88);
     }
   }
   &:disabled {
@@ -1228,7 +1228,7 @@ const PanArrow = styled.button<{ $dir: "up" | "down" | "left" | "right" }>`
     cursor: default;
   }
   &:focus-visible {
-    outline: 2px solid var(--kerbcam-accent, #00ff88);
+    outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: 2px;
   }
 `;
@@ -1375,7 +1375,7 @@ const TitleButton = styled.button`
   }
 
   &:focus-visible {
-    outline: 2px solid var(--kerbcam-accent, #00ff88);
+    outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: 2px;
   }
 `;
@@ -1419,7 +1419,7 @@ const CameraMenuItem = styled.button<{ $selected: boolean }>`
   text-align: left;
   background: ${(p) =>
     p.$selected
-      ? "var(--kerbcam-accent-wash, rgba(0, 255, 136, 0.15))"
+      ? "var(--kerbcast-accent-wash, rgba(0, 255, 136, 0.15))"
       : "transparent"};
   border: none;
   cursor: pointer;
@@ -1434,7 +1434,7 @@ const CameraMenuItem = styled.button<{ $selected: boolean }>`
   }
 
   &:focus-visible {
-    outline: 2px solid var(--kerbcam-accent, #00ff88);
+    outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: -2px;
   }
 `;
@@ -1584,12 +1584,12 @@ const OverlayIconButton = styled.button<{ $active?: boolean }>`
   padding: 0;
   background: ${(p) =>
     p.$active
-      ? "var(--kerbcam-accent, #00ff88)"
+      ? "var(--kerbcast-accent, #00ff88)"
       : "rgba(0, 0, 0, 0.5)"};
   border: 1px solid
     ${(p) =>
       p.$active
-        ? "var(--kerbcam-accent, #00ff88)"
+        ? "var(--kerbcast-accent, #00ff88)"
         : "rgba(255, 255, 255, 0.3)"};
   border-radius: 3px;
   color: ${(p) => (p.$active ? "#000" : "#fff")};
@@ -1600,14 +1600,14 @@ const OverlayIconButton = styled.button<{ $active?: boolean }>`
     &:hover {
       background: ${(p) =>
         p.$active
-          ? "var(--kerbcam-accent, #00ff88)"
+          ? "var(--kerbcast-accent, #00ff88)"
           : "rgba(0, 0, 0, 0.7)"};
       border-color: rgba(255, 255, 255, 0.6);
     }
   }
 
   &:focus-visible {
-    outline: 2px solid var(--kerbcam-accent, #00ff88);
+    outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: 2px;
   }
 
@@ -1629,7 +1629,7 @@ const StyledVideo = styled.video`
 `;
 
 /**
- * Shown when the sidecar reports `lifecycle: "destroyed"`. The kerbcam SDK
+ * Shown when the sidecar reports `lifecycle: "destroyed"`. The kerbcast SDK
  * keeps the camera's noise pipeline alive on the same `mediaStream`, so the
  * video behind this overlay shows live signal-loss static.
  */

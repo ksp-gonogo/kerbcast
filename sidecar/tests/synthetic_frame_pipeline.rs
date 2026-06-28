@@ -3,8 +3,8 @@
 //! harness" but in-process for now (no subprocess, no WebRTC). Real
 //! end-to-end harness lands when WebRTC is wired up.
 
-use kerbcam_sidecar::encoder::{EncodeConfig, EncoderBackend, RawFrame, Software};
-use kerbcam_sidecar::shared_mem::FrameRing;
+use kerbcast_sidecar::encoder::{EncodeConfig, EncoderBackend, RawFrame, Software};
+use kerbcast_sidecar::shared_mem::FrameRing;
 
 fn synthetic_rgba(width: u32, height: u32, frame_n: u32) -> Vec<u8> {
     // Simple gradient that varies per frame so each one is distinct — useful

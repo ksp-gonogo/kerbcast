@@ -2,10 +2,10 @@ import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, Ser
 import { CameraLifecycle, ErrorSource, Layer, QualityPreset } from "../__generated__/types";
 import type {
   InboundVideoStats,
-  KerbcamConnectionState,
-  KerbcamDataChannel,
-  KerbcamPeer,
-  KerbcamTransport,
+  KerbcastConnectionState,
+  KerbcastDataChannel,
+  KerbcastPeer,
+  KerbcastTransport,
 } from "../client";
 
 export interface MockCameraInit {
@@ -88,10 +88,10 @@ function scaleDim(operatorDim: number, scale: number): number {
 }
 
 /**
- * In-process protocol-level fake for the kerbcam sidecar.
+ * In-process protocol-level fake for the kerbcast sidecar.
  *
- * Owns a camera registry and speaks the full kerbcam wire protocol.
- * Use it in tests to exercise `KerbcamClient` behaviour without a real
+ * Owns a camera registry and speaks the full kerbcast wire protocol.
+ * Use it in tests to exercise `KerbcastClient` behaviour without a real
  * sidecar or WebRTC stack.
  *
  * ```ts
@@ -102,7 +102,7 @@ function scaleDim(operatorDim: number, scale: number): number {
  *   Promise.resolve(MockSidecar.makeOfferResponse([42]))
  * );
  *
- * const client = new KerbcamClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+ * const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
  * await client.connect([42]);
  * sidecar.open();   // fires hello + camera-snapshot
  *
@@ -116,7 +116,7 @@ export class MockSidecar {
 
   private _openHandler: (() => void) | undefined;
   private _clientMsgHandler: ((raw: string) => void) | undefined;
-  private _stateHandler: ((s: KerbcamConnectionState) => void) | undefined;
+  private _stateHandler: ((s: KerbcastConnectionState) => void) | undefined;
   private _onTrackHandler:
     | ((track: MediaStreamTrack, idx: number, mid: string) => void)
     | undefined;
@@ -143,14 +143,14 @@ export class MockSidecar {
   }
 
   /**
-   * Returns a `KerbcamTransport` backed by this mock. Pass it as the
-   * second argument to `KerbcamClient`.
+   * Returns a `KerbcastTransport` backed by this mock. Pass it as the
+   * second argument to `KerbcastClient`.
    */
-  createTransport(): KerbcamTransport {
+  createTransport(): KerbcastTransport {
     const self = this;
     return {
-      createPeer(): KerbcamPeer {
-        const channel: KerbcamDataChannel = {
+      createPeer(): KerbcastPeer {
+        const channel: KerbcastDataChannel = {
           send(payload) {
             const msg = JSON.parse(payload) as ClientMessage;
             self._commands.push(msg);
@@ -198,7 +198,7 @@ export class MockSidecar {
   }
 
   /** Drive the underlying peer's connection-state handler. */
-  setConnectionState(state: KerbcamConnectionState): void {
+  setConnectionState(state: KerbcastConnectionState): void {
     this._stateHandler?.(state);
   }
 
@@ -576,7 +576,7 @@ export class MockSidecar {
 }
 
 /**
- * Install jsdom shims needed by kerbcam component tests.
+ * Install jsdom shims needed by kerbcast component tests.
  *
  * jsdom omits several browser APIs that the SDK and React components call at
  * construction or mount time. Stubbing here keeps individual tests clean.

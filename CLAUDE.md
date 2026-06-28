@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Sister project
 
-**[gonogo](https://github.com/jonpepler/gonogo)** is a consumer of this mod: a TypeScript SPA that displays kerbcam camera feeds in a mission-control dashboard. Any WebRTC-capable browser can be a kerbcam consumer; gonogo's just the one we built alongside. The two projects share conventions (commits, semver, performance-budget patterns, the Steam-Deck-to-MacBook topology), and gonogo's `CLAUDE.md` is the canonical record of those.
+**[gonogo](https://github.com/jonpepler/gonogo)** is a consumer of this mod: a TypeScript SPA that displays kerbcast camera feeds in a mission-control dashboard. Any WebRTC-capable browser can be a kerbcast consumer; gonogo's just the one we built alongside. The two projects share conventions (commits, semver, performance-budget patterns, the Steam-Deck-to-MacBook topology), and gonogo's `CLAUDE.md` is the canonical record of those.
 
-The full design rationale for kerbcam lives in **gonogo's `local_docs/ocisly_state_and_rebuild.md`**: read it before any non-trivial architectural decision. This CLAUDE.md is an index pointing at it, not a replacement.
+The full design rationale for kerbcast lives in **gonogo's `local_docs/ocisly_state_and_rebuild.md`**: read it before any non-trivial architectural decision. This CLAUDE.md is an index pointing at it, not a replacement.
 
 ## Project status
 
@@ -14,7 +14,7 @@ The full design rationale for kerbcam lives in **gonogo's `local_docs/ocisly_sta
 
 ## Project vision
 
-**kerbcam** is a from-scratch successor to OCISLY (OfCourseIStillLoveYou), the KSP camera-streaming mod. It captures Hullcam VDS camera feeds from KSP and ships them over WebRTC to a browser, fast enough that the Steam Deck doesn't notice, faithful enough that each camera's Hullcam VDS character (B&W, CRT scanlines, night vision, etc.) is preserved.
+**kerbcast** is a from-scratch successor to OCISLY (OfCourseIStillLoveYou), the KSP camera-streaming mod. It captures Hullcam VDS camera feeds from KSP and ships them over WebRTC to a browser, fast enough that the Steam Deck doesn't notice, faithful enough that each camera's Hullcam VDS character (B&W, CRT scanlines, night vision, etc.) is preserved.
 
 The headline differences from OCISLY:
 
@@ -34,7 +34,7 @@ KSP (Steam Deck) ── plugin DLL ──┐ shared-mem ring ┌── sidecar (
                                   └──── ◇ ─────────┘
 ```
 
-One mod download: the plugin and the per-rid sidecar binary ship together in `GameData/Kerbcam/`. The sidecar runs once per KSP session: the session-persistent KerbcamSidecarHost spawns it on the first flight scene, keeps it alive across scene changes (scene exits are just camera-ring churn), and kills it on game exit; a ~1Hz heartbeat file lets the sidecar self-exit if KSP dies hard. From the user's perspective: drop in GameData, start KSP, it works.
+One mod download: the plugin and the per-rid sidecar binary ship together in `GameData/Kerbcast/`. The sidecar runs once per KSP session: the session-persistent KerbcastSidecarHost spawns it on the first flight scene, keeps it alive across scene changes (scene exits are just camera-ring churn), and kills it on game exit; a ~1Hz heartbeat file lets the sidecar self-exit if KSP dies hard. From the user's perspective: drop in GameData, start KSP, it works.
 
 ## Repo layout
 
@@ -42,14 +42,14 @@ Current layout (as of 2026-06-07):
 
 ```
 client-sdk/
-  typescript/           @jonpepler/kerbcam -- transport, KerbcamClient, MockSidecar.
+  typescript/           @jonpepler/kerbcast -- transport, KerbcastClient, MockSidecar.
                         TypeScript types generated from sidecar/src/protocol/ via
                         typeshare; SDK logic hand-written on top.
-  react/                @jonpepler/kerbcam-react -- CameraFeed component + hooks
+  react/                @jonpepler/kerbcast-react -- CameraFeed component + hooks
                         shared by gonogo and the sidecar web page.
 web/                    Vite + React app served by the sidecar at GET /.
                         Targets fresh KSP users: stream-first grid, auto-connect.
-                        Dev mode: pnpm --filter kerbcam-web dev; add ?mock=1 for
+                        Dev mode: pnpm --filter kerbcast-web dev; add ?mock=1 for
                         a sidecar-less preview. Built output (web/dist/index.html)
                         is committed; the sidecar embeds it via include_str!.
 sidecar/                Rust workspace
@@ -82,11 +82,11 @@ Now present (added since this layout was first written):
 ```
 .github/workflows/      CI: sidecar, plugin, protocol, web, shader, and release
                         workflows.
-Plugin/                 KSP-side C# (Kerbcam.csproj -> Kerbcam.dll) plus a suite
+Plugin/                 KSP-side C# (Kerbcast.csproj -> Kerbcast.dll) plus a suite
                         of xUnit test projects. Builds locally on macOS against
                         KSP's net48 reference assemblies. See the plugin-build
                         memory.
-GameData/Kerbcam/       committed install-tree pieces (currently HullcamShaders/).
+GameData/Kerbcast/       committed install-tree pieces (currently HullcamShaders/).
                         The full per-rid tree (plugin DLL plus Sidecar/<rid>/
                         binary) is assembled by CI at release time.
 live_tests/             Claude-runnable test docs (HTTP endpoints, control-channel
@@ -96,27 +96,27 @@ docs/                   user-facing INSTALL/TROUBLESHOOTING plus internal notes
                         (testing backlog, perf analyses).
 ```
 
-The strategy / planning context for this project lives in the gonogo repo at `local_docs/kerbcam/`: design decisions, performance baselines, ongoing notes. Update both repos when something architectural shifts.
+The strategy / planning context for this project lives in the gonogo repo at `local_docs/kerbcast/`: design decisions, performance baselines, ongoing notes. Update both repos when something architectural shifts.
 
 ## Toolchain
 
-- **Plugin:** C# / .NET Framework 4.8, builds against KSP's Unity 2019.4 LTS assemblies. Lives in this repo at `Plugin/Kerbcam.csproj`. Builds locally on macOS with `dotnet build` against KSP's net48 reference assemblies (see the plugin-build memory for the `KspManaged`/`KspGameData` paths).
+- **Plugin:** C# / .NET Framework 4.8, builds against KSP's Unity 2019.4 LTS assemblies. Lives in this repo at `Plugin/Kerbcast.csproj`. Builds locally on macOS with `dotnet build` against KSP's net48 reference assemblies (see the plugin-build memory for the `KspManaged`/`KspGameData` paths).
 - **Sidecar:** Rust (stable). In addition to the base deps (`tokio`, `anyhow`, `thiserror`, `serde`, `serde_json`, `tracing`, `tracing-subscriber`, `clap`), the load-bearing pieces are now wired up in `sidecar/Cargo.toml`: `webrtc` (browser transport), `memmap2` (plugin/sidecar frame ring), `openh264` (software encode, bundled source), `axum`/`tower-http` (signalling + bundled web page), `ffmpeg-next` (tier-1 VA-API, gated to `cfg(target_os = "linux")`), and `windows` (tier-2 Media Foundation, gated to `cfg(windows)`).
 - **Protocol:** Rust types in `sidecar/src/protocol/`; TypeScript bindings in `client-sdk/typescript/` (generated by typeshare, committed). React component package in `client-sdk/react/`.
-- **Web page:** Vite + React in `web/`; `pnpm --filter kerbcam-web build` emits `web/dist/index.html` (committed, embedded by the sidecar). No Node in the cargo build.
-- **Workflow:** `cargo build` / `cargo test` for sidecar, `pnpm -r test` for all TS packages + web page, `dotnet build` for plugin (via gonogo's `gonogo_claude_tools.sh build kerbcam`).
+- **Web page:** Vite + React in `web/`; `pnpm --filter kerbcast-web build` emits `web/dist/index.html` (committed, embedded by the sidecar). No Node in the cargo build.
+- **Workflow:** `cargo build` / `cargo test` for sidecar, `pnpm -r test` for all TS packages + web page, `dotnet build` for plugin (via gonogo's `gonogo_claude_tools.sh build kerbcast`).
 
 ## Workflow
 
 Solo-developer repo. **Conventional Commits + Semantic Versioning.** Direct commits to `main` unless a change is large enough to warrant a feature branch (rare). No `Co-Authored-By: Claude` trailer; write the commit message as if a human authored it. Same convention as gonogo.
 
-Releases: GitHub Actions builds per-rid sidecar binaries on tag, packages `GameData/Kerbcam/`, attaches to a GitHub Release. Protocol package publishes to GitHub Packages (not npm) on the same tag.
+Releases: GitHub Actions builds per-rid sidecar binaries on tag, packages `GameData/Kerbcast/`, attaches to a GitHub Release. Protocol package publishes to GitHub Packages (not npm) on the same tag.
 
 ## OS support tiers
 
 - **Linux (Steam Deck): tier-1.** All perf budgets, all integration tests, all manual smoke tests target the Deck. libva H.264 is the default encoder backend.
 - **macOS: tier-2.** `VideoToolboxEncoder` backend exists. Not perf-budgeted. Code may build and run; not held to release-quality.
-- **Windows: tier-2.** `MediaFoundation` backend (vendor-generic hardware H.264 encoder MFTs: AMD VCN, Intel Quick Sync, NVIDIA NVENC) plus a `NvencEncoder` stub for a future NVIDIA-specific path. CI runs clippy + tests on windows-2022 but can't exercise hardware encode; see `live_tests/kerbcam.md` for the real-hardware smoke test. Community-contributable.
+- **Windows: tier-2.** `MediaFoundation` backend (vendor-generic hardware H.264 encoder MFTs: AMD VCN, Intel Quick Sync, NVIDIA NVENC) plus a `NvencEncoder` stub for a future NVIDIA-specific path. CI runs clippy + tests on windows-2022 but can't exercise hardware encode; see `live_tests/kerbcast.md` for the real-hardware smoke test. Community-contributable.
 - **Software fallback:** `OpenH264Encoder` always present.
 
 When adding tier-2 code, document explicitly that it's tier-2 in the PR description and don't gate CI on its perf budgets.
@@ -143,14 +143,14 @@ If Hullcam VDS isn't installed, fall back to a generic mode (Path C in the rebui
 - **Unit:** sidecar (`cargo test`), plugin (xUnit or NUnit against mocked Hullcam parts).
 - **Integration:** synthetic-frame harness runs on every PR via GitHub Actions on `ubuntu-latest`. Mocks Unity; generates known frames; runs real sidecar binary; asserts WebRTC roundtrip + control-channel + lifecycle.
 - **Perf:** gated behind a `perf` label, runs only on Deck/M4 locally. Container-runner timing isn't comparable.
-- **Live test for Claude:** `live_tests/kerbcam.md` documents HTTP endpoints, control-channel shapes, and how to verify a running kerbcam. Future Claude sessions should be able to script-test without re-deriving the protocol.
+- **Live test for Claude:** `live_tests/kerbcast.md` documents HTTP endpoints, control-channel shapes, and how to verify a running kerbcast. Future Claude sessions should be able to script-test without re-deriving the protocol.
 
 ## Status: explicit out-of-scope items
 
 These are deliberately not in v0.1:
 
 - macOS / Windows release-quality polish (tier-2 only)
-- Movable cameras (`KerbcamModulePanTilt`)
+- Movable cameras (`KerbcastModulePanTilt`)
 - Recording-to-disk endpoints
 - Audio capture
 - Public CKAN / SpaceDock / forum-post distribution

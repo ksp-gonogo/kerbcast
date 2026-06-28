@@ -5,7 +5,7 @@ name: web-ci
 # on `git diff --exit-code web/dist/index.html` on both push and PRs rather
 # than using an auto-commit loop (unlike protocol-ci's typeshare regen, which
 # is intentionally authoritative). If the diff check ever flakes, the fix is
-# to re-run `pnpm --filter kerbcam-web build` locally and commit the result;
+# to re-run `pnpm --filter kerbcast-web build` locally and commit the result;
 # it is NOT acceptable to skip the gate or weaken it to a parse check.
 #
 # Determinism evidence: two sequential local builds with the same node_modules
@@ -50,25 +50,25 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build the SDK packages first: @jonpepler/kerbcam and
-      # @jonpepler/kerbcam-react resolve from dist/ (package.json exports
+      # Build the SDK packages first: @jonpepler/kerbcast and
+      # @jonpepler/kerbcast-react resolve from dist/ (package.json exports
       # point at dist/index.d.ts). Without this step, typecheck and the web
       # build fail with "cannot find module / its type declarations".
       - name: Build SDK packages
-        run: pnpm --filter "@jonpepler/kerbcam" --filter "@jonpepler/kerbcam-react" build
+        run: pnpm --filter "@jonpepler/kerbcast" --filter "@jonpepler/kerbcast-react" build
 
-      - name: Test (kerbcam-web)
-        run: pnpm --filter kerbcam-web test
+      - name: Test (kerbcast-web)
+        run: pnpm --filter kerbcast-web test
 
-      - name: Typecheck (kerbcam-web)
-        run: pnpm --filter kerbcam-web typecheck
+      - name: Typecheck (kerbcast-web)
+        run: pnpm --filter kerbcast-web typecheck
 
-      - name: Build (kerbcam-web)
-        run: pnpm --filter kerbcam-web build
+      - name: Build (kerbcast-web)
+        run: pnpm --filter kerbcast-web build
 
       - name: Freshness gate - web/dist/index.html must be up to date
         run: |
           if ! git diff --exit-code web/dist/index.html; then
-            echo "::error::web/dist/index.html is stale. Run \`pnpm --filter kerbcam-web build\` locally and commit the result."
+            echo "::error::web/dist/index.html is stale. Run \`pnpm --filter kerbcast-web build\` locally and commit the result."
             exit 1
           fi

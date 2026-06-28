@@ -21,7 +21,7 @@
   <ItemGroup>
     <!-- Compile the machine under test directly: no project reference to
          the KSP plugin (which can't build off-Linux / needs Unity refs). -->
-    <Compile Include="../Kerbcam/SidecarLifecycle.cs" />
+    <Compile Include="../Kerbcast/SidecarLifecycle.cs" />
   </ItemGroup>
 
 </Project>

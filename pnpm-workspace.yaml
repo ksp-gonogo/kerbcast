@@ -1,5 +1,5 @@
 packages:
   # Core SDK and React UI packages.
   - 'client-sdk/*'
-  # Sidecar embedded web page (joins when kerbcam/web/ is scaffolded).
+  # Sidecar embedded web page (joins when kerbcast/web/ is scaffolded).
   - 'web'

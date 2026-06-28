@@ -12,8 +12,8 @@ namespace Yangrc.OpenGLAsyncReadback {
         private void Awake() {
             instance = this;
         }
-        // kerbcam fix (not upstream): clear the static on destroy so a consumer
-        // that re-checks `instance == null` (e.g. KerbcamCore re-spawning the
+        // kerbcast fix (not upstream): clear the static on destroy so a consumer
+        // that re-checks `instance == null` (e.g. KerbcastCore re-spawning the
         // pump on the next Flight scene) reliably sees null. Upstream never
         // nulled it, leaving a stale reference after the GameObject was
         // destroyed; the pump then failed to re-spawn and async readbacks wedged

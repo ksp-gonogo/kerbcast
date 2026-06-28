@@ -4,16 +4,16 @@
  * Loaded dynamically only when location.search contains mock=1.
  * Never imported statically from the app entry.
  *
- * Creates a KerbcamClient backed by MockSidecar. Registers 4 plausible
+ * Creates a KerbcastClient backed by MockSidecar. Registers 4 plausible
  * cameras and delivers animated canvas captureStream tracks to each slot.
  *
  * One camera starts destroyed to demonstrate SIGNAL LOST.
  * /profile fetch is intercepted to return plausible stagger numbers.
  */
 
-import { CameraLifecycle, KerbcamClient } from "@jonpepler/kerbcam";
-import type { MockCameraInit } from "@jonpepler/kerbcam/testing";
-import { MockSidecar } from "@jonpepler/kerbcam/testing";
+import { CameraLifecycle, KerbcastClient } from "@jonpepler/kerbcast";
+import type { MockCameraInit } from "@jonpepler/kerbcast/testing";
+import { MockSidecar } from "@jonpepler/kerbcast/testing";
 
 const MOCK_CAMERAS: MockCameraInit[] = [
   {
@@ -89,14 +89,14 @@ const MOCK_CAMERAS: MockCameraInit[] = [
 const CAMERA_HUES = [210, 30, 140, 0];
 
 /**
- * Create a KerbcamClient backed by a MockSidecar.
+ * Create a KerbcastClient backed by a MockSidecar.
  *
  * The app's ConnectionManager owns connect(); the mock completes its half
  * of the handshake from inside the negotiate override so it survives the
  * manager's own connect/reconnect cycles (a pre-connected client would be
  * torn down by the manager's first connect()).
  */
-export async function createMockClient(): Promise<KerbcamClient> {
+export async function createMockClient(): Promise<KerbcastClient> {
   const sidecar = new MockSidecar();
   sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]);
 
@@ -128,7 +128,7 @@ export async function createMockClient(): Promise<KerbcamClient> {
     }
   };
 
-  const mockClient = new KerbcamClient(
+  const mockClient = new KerbcastClient(
     {
       host: "mock",
       port: 0,
@@ -230,7 +230,7 @@ function interceptProfileFetch(): void {
     if (url === "/profile" || url.endsWith("/profile")) {
       const data = {
         staggerBudget: 3 + Math.floor(Math.random() * 3),
-        kerbcamFrameMs: 0.1 + Math.random() * 0.2,
+        kerbcastFrameMs: 0.1 + Math.random() * 0.2,
         kspFps: 55 + Math.random() * 10,
       };
       return Promise.resolve(

@@ -1,18 +1,18 @@
 [package]
-name = "kerbcam-sidecar"
+name = "kerbcast-sidecar"
 version = "0.21.3"
 edition = "2021"
-description = "kerbcam KSP camera-streaming sidecar (per-OS hardware encode + WebRTC)"
+description = "kerbcast KSP camera-streaming sidecar (per-OS hardware encode + WebRTC)"
 license = "CC-BY-NC-SA-4.0"
 publish = false
-default-run = "kerbcam-sidecar"
+default-run = "kerbcast-sidecar"
 
 [lib]
-name = "kerbcam_sidecar"
+name = "kerbcast_sidecar"
 path = "src/lib.rs"
 
 [[bin]]
-name = "kerbcam-sidecar"
+name = "kerbcast-sidecar"
 path = "src/main.rs"
 
 [dependencies]

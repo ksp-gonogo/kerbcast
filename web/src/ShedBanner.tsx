@@ -1,11 +1,11 @@
-import type { AdaptiveShedPayload } from "@jonpepler/kerbcam";
-import type { KerbcamClient } from "@jonpepler/kerbcam";
+import type { AdaptiveShedPayload } from "@jonpepler/kerbcast";
+import type { KerbcastClient } from "@jonpepler/kerbcast";
 import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
 
 interface ShedBannerProps {
-  client: KerbcamClient;
+  client: KerbcastClient;
 }
 
 export function ShedBanner({ client }: ShedBannerProps): React.JSX.Element | null {
