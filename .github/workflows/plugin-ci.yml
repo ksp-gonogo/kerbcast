@@ -1,6 +1,6 @@
 name: plugin-ci
 
-# Builds Kerbcam.dll on every push/PR that touches the plugin.
+# Builds Kerbcast.dll on every push/PR that touches the plugin.
 #
 # The KSP Unity assemblies and HullcamVDS plugin are not redistributable and
 # live in the private repo jonpepler/ksp-managed. A PAT with read access to
@@ -44,17 +44,17 @@ jobs:
         with:
           dotnet-version: '8.x'
 
-      - name: Build Kerbcam.dll
+      - name: Build Kerbcast.dll
         run: |
-          dotnet build Plugin/Kerbcam.csproj -c Release \
+          dotnet build Plugin/Kerbcast.csproj -c Release \
             /p:KspManaged="${{ github.workspace }}/ksp-managed/KSP_Data/Managed" \
             /p:KspGameData="${{ github.workspace }}/ksp-managed/GameData"
 
-      - name: Upload Kerbcam.dll
+      - name: Upload Kerbcast.dll
         uses: actions/upload-artifact@v7
         with:
-          name: kerbcam-plugin
-          path: Plugin/obj/Release/Kerbcam.dll
+          name: kerbcast-plugin
+          path: Plugin/obj/Release/Kerbcast.dll
           if-no-files-found: error
 
   # The Plugin/*.Tests projects are Unity-free harnesses (exit 0 = pass):
@@ -101,8 +101,8 @@ jobs:
 
       - name: Run Hullcam reflection-contract test
         env:
-          KERBCAM_HULLCAM_DLL: ${{ github.workspace }}/ksp-managed/GameData/HullCameraVDS/Plugins/HullcamVDSContinued.dll
+          KERBCAST_HULLCAM_DLL: ${{ github.workspace }}/ksp-managed/GameData/HullCameraVDS/Plugins/HullcamVDSContinued.dll
         run: |
           # Hard-fail rather than silently SKIP if the checkout layout moves.
-          test -f "$KERBCAM_HULLCAM_DLL"
+          test -f "$KERBCAST_HULLCAM_DLL"
           dotnet run --project Plugin/HullcamContract.Tests -c Release

@@ -1,11 +1,11 @@
-name: build-kerbcam-shaders
+name: build-kerbcast-shaders
 
-# Builds the kerbcam-shaders AssetBundle for Linux, Windows and macOS using
+# Builds the kerbcast-shaders AssetBundle for Linux, Windows and macOS using
 # Unity 2019.4 LTS, matching KSP 1.12.5's engine version. Shader variants are
 # compiled per build target, so each platform needs its own bundle file.
-# Output ships alongside the plugin as GameData/Kerbcam/kerbcam-shaders
+# Output ships alongside the plugin as GameData/Kerbcast/kerbcast-shaders
 # (Linux keeps the legacy unsuffixed name so existing installs are untouched)
-# plus kerbcam-shaders.windows and kerbcam-shaders.osx, following the
+# plus kerbcast-shaders.windows and kerbcast-shaders.osx, following the
 # HullcamShaders/shaders.linux platform-suffix precedent.
 #
 # Runner split: the Linux job builds the Linux + macOS bundles; the Windows
@@ -13,14 +13,14 @@ name: build-kerbcam-shaders
 # Linux editor (Hub windows-mono module), but the 2019.4 Linux toolchain
 # emitted d3d11 vertex shader blobs the Windows D3D11 runtime rejects at
 # draw time with E_INVALIDARG (0x80070057) while shader.isSupported stayed
-# true. Field result in v0.19.0: every kerbcam-bundle camera (NightVision
+# true. Field result in v0.19.0: every kerbcast-bundle camera (NightVision
 # class) streamed black and KSP.log filled with 470k "ShaderProgram is
 # unsupported" lines. Building on a real Windows editor uses the real
 # Windows shader compiler, and the smoke test there executes the d3d11
 # blobs on the runner's WARP rasterizer, where Create*Shader validates the
 # bytecode the Linux run never could. The macOS metal cross-compile from
 # Linux carries the same theoretical risk; macOS is tier-2, has no field
-# failure, and the plugin's KerbcamFxAssets render probe degrades a bad
+# failure, and the plugin's KerbcastFxAssets render probe degrades a bad
 # bundle gracefully at runtime, so it stays on the Linux job for now.
 #
 # Blocking checks: bundle builds, a per-shader render smoke test on each
@@ -39,13 +39,13 @@ name: build-kerbcam-shaders
 on:
   push:
     paths:
-      - 'ci/kerbcam-shaders/**'
+      - 'ci/kerbcast-shaders/**'
       # Shared sources the Unity project compiles via Assets/Editor symlinks,
       # and the committed Hullcam shader bundle the determinism test loads.
-      - 'Plugin/Kerbcam/Fx/Core/**'
-      - 'Plugin/Kerbcam/HullcamBlit/**'
-      - 'GameData/Kerbcam/HullcamShaders/**'
-      - '.github/workflows/build-kerbcam-shaders.yml'
+      - 'Plugin/Kerbcast/Fx/Core/**'
+      - 'Plugin/Kerbcast/HullcamBlit/**'
+      - 'GameData/Kerbcast/HullcamShaders/**'
+      - '.github/workflows/build-kerbcast-shaders.yml'
   workflow_dispatch:
 
 permissions:
@@ -81,13 +81,13 @@ jobs:
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
-      - name: Build kerbcam-shaders AssetBundles (linux, osx)
-        working-directory: ci/kerbcam-shaders
+      - name: Build kerbcast-shaders AssetBundles (linux, osx)
+        working-directory: ci/kerbcast-shaders
         run: |
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildUnix \
+            -executeMethod KerbcastCI.BuildKerbcastShaders.BuildUnix \
             -buildTarget Linux64 \
             -logFile -
           echo "--- output bundles ---"
@@ -108,42 +108,42 @@ jobs:
       # bundle (see the build-windows job). Judging how the FX actually LOOK
       # stays with the fx-previews.yml renders.
       - name: Shader render smoke test (Linux bundle, glcore)
-        working-directory: ci/kerbcam-shaders
+        working-directory: ci/kerbcast-shaders
         timeout-minutes: 10
         run: |
           xvfb-run -a "$UNITY_EDITOR_PATH" \
             -batchmode -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.ShaderSmoke.RenderAll \
+            -executeMethod KerbcastCI.ShaderSmoke.RenderAll \
             -buildTarget Linux64 \
             -logFile -
 
       # Regression net for the per-camera Hullcam filter blit (c00fe16):
       # compiles the plugin's HullcamFilterBlit.cs verbatim (via the
       # Assets/Editor/SharedHullcamBlit symlink), loads the committed
-      # GameData/Kerbcam/HullcamShaders/shaders.linux MovieTime shader, and
+      # GameData/Kerbcast/HullcamShaders/shaders.linux MovieTime shader, and
       # asserts each filter mode's blit output is byte-identical under
       # hostile writes to the shared static material (plus reticle on/off
       # policy vs a no-title baseline, plus a control that the legacy
       # shared-static path visibly flickers). Same xvfb arrangement as the
       # smoke test: -nographics would no-op Graphics.Blit and ReadPixels.
       - name: Hullcam filter blit determinism test
-        working-directory: ci/kerbcam-shaders
+        working-directory: ci/kerbcast-shaders
         timeout-minutes: 10
         run: |
           xvfb-run -a "$UNITY_EDITOR_PATH" \
             -batchmode -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.HullcamBlitDeterminism.RunAll \
+            -executeMethod KerbcastCI.HullcamBlitDeterminism.RunAll \
             -buildTarget Linux64 \
             -logFile -
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kerbcam-shaders-unix
+          name: kerbcast-shaders-unix
           path: |
-            ci/kerbcam-shaders/Bundles-linux/kerbcam-shaders
-            ci/kerbcam-shaders/Bundles-osx/kerbcam-shaders
+            ci/kerbcast-shaders/Bundles-linux/kerbcast-shaders
+            ci/kerbcast-shaders/Bundles-osx/kerbcast-shaders
           if-no-files-found: error
           retention-days: 30
 
@@ -180,15 +180,15 @@ jobs:
       # Native Windows shader compiler: the whole point of this job. The
       # Linux editor's d3d11 cross-compile shipped invalid vertex shader
       # blobs in v0.19.0 (see the workflow header).
-      - name: Build kerbcam-shaders AssetBundle (windows)
-        working-directory: ci/kerbcam-shaders
+      - name: Build kerbcast-shaders AssetBundle (windows)
+        working-directory: ci/kerbcast-shaders
         shell: bash
         run: |
           status=0
           "$UNITY_EDITOR_PATH" \
             -batchmode -nographics -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.BuildKerbcamShaders.BuildWindows \
+            -executeMethod KerbcastCI.BuildKerbcastShaders.BuildWindows \
             -buildTarget Win64 \
             -logFile unity-build.log || status=$?
           cat unity-build.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
@@ -203,17 +203,17 @@ jobs:
       # instead of on a player's machine. No xvfb needed on Windows; just
       # batchmode WITHOUT -nographics so a device exists.
       - name: Shader render smoke test (Windows bundle, d3d11)
-        working-directory: ci/kerbcam-shaders
+        working-directory: ci/kerbcast-shaders
         timeout-minutes: 10
         shell: bash
         env:
-          KERBCAM_SMOKE_BUNDLE_DIR: Bundles-windows
+          KERBCAST_SMOKE_BUNDLE_DIR: Bundles-windows
         run: |
           status=0
           "$UNITY_EDITOR_PATH" \
             -batchmode -quit \
             -projectPath "$(pwd)" \
-            -executeMethod KerbcamCI.ShaderSmoke.RenderAll \
+            -executeMethod KerbcastCI.ShaderSmoke.RenderAll \
             -buildTarget Win64 \
             -logFile unity-smoke.log || status=$?
           cat unity-smoke.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
@@ -221,16 +221,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kerbcam-shaders-windows
-          path: ci/kerbcam-shaders/Bundles-windows/kerbcam-shaders
+          name: kerbcast-shaders-windows
+          path: ci/kerbcast-shaders/Bundles-windows/kerbcast-shaders
           if-no-files-found: error
           retention-days: 30
 
-  # Merge the per-runner bundles into the single kerbcam-shaders artifact
+  # Merge the per-runner bundles into the single kerbcast-shaders artifact
   # downstream consumers (deck-deploy staging, manual installs) expect, laid
-  # out exactly as they land in GameData/Kerbcam/.
+  # out exactly as they land in GameData/Kerbcast/.
   assemble:
-    name: Assemble kerbcam-shaders artifact
+    name: Assemble kerbcast-shaders artifact
     needs: [build-unix, build-windows]
     runs-on: ubuntu-22.04
     steps:
@@ -239,21 +239,21 @@ jobs:
         with:
           path: bundles
 
-      - name: Lay out GameData/Kerbcam
+      - name: Lay out GameData/Kerbcast
         run: |
           set -euo pipefail
-          mkdir -p GameData/Kerbcam
-          cp bundles/kerbcam-shaders-unix/Bundles-linux/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders
-          cp bundles/kerbcam-shaders-unix/Bundles-osx/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.osx
-          cp bundles/kerbcam-shaders-windows/kerbcam-shaders GameData/Kerbcam/kerbcam-shaders.windows
-          ls -la GameData/Kerbcam/
+          mkdir -p GameData/Kerbcast
+          cp bundles/kerbcast-shaders-unix/Bundles-linux/kerbcast-shaders GameData/Kerbcast/kerbcast-shaders
+          cp bundles/kerbcast-shaders-unix/Bundles-osx/kerbcast-shaders GameData/Kerbcast/kerbcast-shaders.osx
+          cp bundles/kerbcast-shaders-windows/kerbcast-shaders GameData/Kerbcast/kerbcast-shaders.windows
+          ls -la GameData/Kerbcast/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kerbcam-shaders
+          name: kerbcast-shaders
           path: |
-            GameData/Kerbcam/kerbcam-shaders
-            GameData/Kerbcam/kerbcam-shaders.windows
-            GameData/Kerbcam/kerbcam-shaders.osx
+            GameData/Kerbcast/kerbcast-shaders
+            GameData/Kerbcast/kerbcast-shaders.windows
+            GameData/Kerbcast/kerbcast-shaders.osx
           if-no-files-found: error
           retention-days: 30
