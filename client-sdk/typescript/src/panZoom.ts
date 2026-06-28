@@ -4,7 +4,7 @@
  * accumulators for discrete nudges, debounced FoV slider, and echo-sync
  * while idle -- all without any DOM or React dependency.
  *
- * `KerbcamCameraHandle` satisfies `PanZoomCommandSink` structurally: pass a
+ * `KerbcastCameraHandle` satisfies `PanZoomCommandSink` structurally: pass a
  * camera handle directly as the sink and the controller will drive it.
  *
  * ```ts
@@ -37,7 +37,7 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Command sink that the controller writes to. `KerbcamCameraHandle`
+ * Command sink that the controller writes to. `KerbcastCameraHandle`
  * satisfies this interface structurally -- no adapter needed.
  */
 export interface PanZoomCommandSink {

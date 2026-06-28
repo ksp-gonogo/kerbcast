@@ -1,17 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorSource, Layer, QualityPreset } from "./__generated__/types";
 import {
-  BrowserKerbcamTransport,
-  type KerbcamConnectionState,
-  type KerbcamDataChannel,
-  type KerbcamPeer,
-  type KerbcamTransport,
-  KerbcamClient,
+  BrowserKerbcastTransport,
+  type KerbcastConnectionState,
+  type KerbcastDataChannel,
+  type KerbcastPeer,
+  type KerbcastTransport,
+  KerbcastClient,
 } from "./client";
 import { MockSidecar } from "./testing";
 import * as noise from "./noise";
 
-interface FakeChannel extends KerbcamDataChannel {
+interface FakeChannel extends KerbcastDataChannel {
   sent: string[];
   _open: () => void;
   _msg: (raw: string) => void;
@@ -22,7 +22,7 @@ function makeFakeTransport() {
   const captured: {
     dc?: FakeChannel;
     onTrack?: (t: MediaStreamTrack, idx: number) => void;
-    onState?: (s: KerbcamConnectionState) => void;
+    onState?: (s: KerbcastConnectionState) => void;
     closed: boolean;
   } = { closed: false };
 
@@ -46,9 +46,9 @@ function makeFakeTransport() {
     return ch;
   }
 
-  const transport: KerbcamTransport = {
+  const transport: KerbcastTransport = {
     createPeer: () => {
-      const peer: KerbcamPeer = {
+      const peer: KerbcastPeer = {
         addRecvOnlyTransceiver: () => {},
         createDataChannel: () => {
           const ch = makeFakeChannel();
@@ -178,13 +178,13 @@ beforeEach(() => {
   }
 });
 
-describe("KerbcamClient", () => {
+describe("KerbcastClient", () => {
   it("starts disconnected and emits state-change on connect", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     expect(client.state).toBe("disconnected");
 
-    const states: KerbcamConnectionState[] = [];
+    const states: KerbcastConnectionState[] = [];
     client.on("state-change", (s) => states.push(s));
 
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
@@ -199,7 +199,7 @@ describe("KerbcamClient", () => {
 
   it("sends `hello` automatically once the control channel opens", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -210,7 +210,7 @@ describe("KerbcamClient", () => {
 
   it("populates the camera registry from a snapshot push", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -258,13 +258,13 @@ describe("KerbcamClient", () => {
 
   it("camera handles are stable across calls", () => {
     const { transport } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     expect(client.camera(42)).toBe(client.camera(42));
   });
 
   it("set-degrade routes onto the control channel via the handle", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -283,7 +283,7 @@ describe("KerbcamClient", () => {
 
   it("set-quality routes onto the control channel; null preset means auto", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -316,7 +316,7 @@ describe("KerbcamClient", () => {
       MockSidecar.makeOfferResponse([42]),
     );
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -351,7 +351,7 @@ describe("KerbcamClient", () => {
 
   it("setFov / setLayers / setRenderSize routing", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -378,7 +378,7 @@ describe("KerbcamClient", () => {
 
   it("disconnect tears down peer + emits null MediaStream events", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
 
     await client.connect([42]);
@@ -399,12 +399,12 @@ describe("KerbcamClient", () => {
 
   it("non-OK /offer response throws with status code and transitions to failed", async () => {
     const { transport } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("service unavailable", { status: 503 }),
     );
 
-    const states: KerbcamConnectionState[] = [];
+    const states: KerbcastConnectionState[] = [];
     client.on("state-change", (s) => states.push(s));
 
     await expect(client.connect()).rejects.toThrow("503");
@@ -414,7 +414,7 @@ describe("KerbcamClient", () => {
 
   it("discover() returns the camera list from /cameras", async () => {
     const { transport } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     const mockCameras = [
       {
         flightId: 99,
@@ -444,7 +444,7 @@ describe("KerbcamClient", () => {
 
   it("sidecar error message emits error event with correct payload including source", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -464,7 +464,7 @@ describe("KerbcamClient", () => {
 
   it("malformed JSON emits error event with source: client", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -483,17 +483,17 @@ describe("KerbcamClient", () => {
 
   it("_send rejects when control channel is not open", async () => {
     const { transport } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
 
     // camera() and setFov() before connect — control channel is null
     await expect(client.camera(1).setFov(30)).rejects.toThrow(
-      "[kerbcam] control channel not open",
+      "[kerbcast] control channel not open",
     );
   });
 
   it("adaptive-shed message emits adaptive-shed event with correct payload", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -517,7 +517,7 @@ describe("KerbcamClient", () => {
 
   it("cameras-change fires and camera state updates on camera-state-changed", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -548,7 +548,7 @@ describe("KerbcamClient", () => {
 
   it("setPan and requestKeyframe route correct JSON onto the control channel", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -569,7 +569,7 @@ describe("KerbcamClient", () => {
 
   it("setPanRate and setZoomRate route correct JSON onto the control channel", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
     await client.connect();
@@ -593,7 +593,7 @@ describe("KerbcamClient", () => {
 
   it("peer failed state emits failed and tears down streams", async () => {
     const { transport, captured } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
 
     await client.connect([42]);
@@ -603,7 +603,7 @@ describe("KerbcamClient", () => {
     captured.onTrack?.(fakeTrack, 0);
     expect(client.camera(42).mediaStream).not.toBeNull();
 
-    const states: KerbcamConnectionState[] = [];
+    const states: KerbcastConnectionState[] = [];
     client.on("state-change", (s) => states.push(s));
 
     // Trigger peer failed state
@@ -621,7 +621,7 @@ describe("KerbcamClient", () => {
 
     it("noise is enabled by default (no explicit config)", async () => {
       const { transport, captured } = makeFakeTransport();
-      const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
       // _resolveNoise with null override and no cfg.noise should return true
       expect(client._resolveNoise(null)).toBe(true);
       vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([1]));
@@ -633,14 +633,14 @@ describe("KerbcamClient", () => {
 
     it("noise can be disabled at the client level", () => {
       const { transport } = makeFakeTransport();
-      const client = new KerbcamClient({ host: "h", port: 1, noise: { enabled: false } }, transport);
+      const client = new KerbcastClient({ host: "h", port: 1, noise: { enabled: false } }, transport);
       expect(client._resolveNoise(null)).toBe(false);
     });
 
     it("per-camera configure() overrides client default", () => {
       const { transport } = makeFakeTransport();
-      const clientOn = new KerbcamClient({ host: "h", port: 1 }, transport);
-      const clientOff = new KerbcamClient({ host: "h", port: 1, noise: { enabled: false } }, transport);
+      const clientOn = new KerbcastClient({ host: "h", port: 1 }, transport);
+      const clientOff = new KerbcastClient({ host: "h", port: 1, noise: { enabled: false } }, transport);
 
       // Per-camera enable overrides client-off
       expect(clientOff._resolveNoise({ enabled: true })).toBe(true);
@@ -650,7 +650,7 @@ describe("KerbcamClient", () => {
 
     it("configure() triggers stream re-emit", async () => {
       const { transport, captured } = makeFakeTransport();
-      const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
       vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([5]));
 
       await client.connect([5]);
@@ -670,7 +670,7 @@ describe("KerbcamClient", () => {
 
     it("_setState updates noise intensity and does not break without a stream", async () => {
       const { transport, captured } = makeFakeTransport();
-      const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
       vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
 
       await client.connect();
@@ -689,7 +689,7 @@ describe("KerbcamClient", () => {
 
     it("disconnect destroys noise pipeline and sets stream to null", async () => {
       const { transport, captured } = makeFakeTransport();
-      const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
       vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([7]));
 
       await client.connect([7]);
@@ -721,7 +721,7 @@ describe("KerbcamClient", () => {
 
       try {
         const { transport, captured } = makeFakeTransport();
-        const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+        const client = new KerbcastClient({ host: "h", port: 1 }, transport);
         vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([3]));
 
         await client.connect([3]);
@@ -744,7 +744,7 @@ describe("KerbcamClient", () => {
       try {
         const sidecar = new MockSidecar();
         sidecar.addCamera({ flightId: 42 });
-        const client = new KerbcamClient(
+        const client = new KerbcastClient(
           { host: "h", port: 1 },
           sidecar.createTransport(),
         );
@@ -786,7 +786,7 @@ describe("KerbcamClient", () => {
       try {
         const sidecar = new MockSidecar();
         sidecar.addCamera({ flightId: 42, degradeLevel: 0.3 });
-        const client = new KerbcamClient(
+        const client = new KerbcastClient(
           { host: "h", port: 1 },
           sidecar.createTransport(),
         );
@@ -830,7 +830,7 @@ describe("KerbcamClient", () => {
       try {
         const sidecar = new MockSidecar().withSlots(["a"]);
         sidecar.addCamera({ flightId: 1 });
-        const client = new KerbcamClient(
+        const client = new KerbcastClient(
           { host: "h", port: 1 },
           sidecar.createTransport(),
         );
@@ -910,7 +910,7 @@ describe("KerbcamClient", () => {
       try {
         const sidecar = new MockSidecar().withSlots(["a"]);
         sidecar.addCamera({ flightId: 9 });
-        const client = new KerbcamClient(
+        const client = new KerbcastClient(
           { host: "h", port: 1 },
           sidecar.createTransport(),
         );
@@ -949,7 +949,7 @@ describe("KerbcamClient", () => {
       try {
         const sidecar = new MockSidecar();
         sidecar.addCamera({ flightId: 42 });
-        const client = new KerbcamClient(
+        const client = new KerbcastClient(
           { host: "h", port: 1 },
           sidecar.createTransport(),
         );
@@ -1004,9 +1004,9 @@ describe("KerbcamClient", () => {
     /** Connected client with camera 42 registered; track not yet delivered. */
     async function connectCamera42(
       sidecar: MockSidecar,
-    ): Promise<KerbcamClient> {
+    ): Promise<KerbcastClient> {
       sidecar.addCamera({ flightId: 42 });
-      const client = new KerbcamClient(
+      const client = new KerbcastClient(
         { host: "h", port: 1 },
         sidecar.createTransport(),
       );
@@ -1098,10 +1098,10 @@ describe("KerbcamClient", () => {
   });
 });
 
-describe("KerbcamClient — dynamic slot subscription", () => {
+describe("KerbcastClient — dynamic slot subscription", () => {
   it("subscribe binds a slot and routes its track; unsubscribe clears it", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1129,7 +1129,7 @@ describe("KerbcamClient — dynamic slot subscription", () => {
 
   it("reuses a freed slot for a different camera (the switch path)", async () => {
     const sidecar = new MockSidecar().withSlots(["a"]); // single slot
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1157,7 +1157,7 @@ describe("KerbcamClient — dynamic slot subscription", () => {
 
   it("surfaces a sidecar error when no slot is free", async () => {
     const sidecar = new MockSidecar().withSlots(["only"]);
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1182,7 +1182,7 @@ describe("KerbcamClient — dynamic slot subscription", () => {
       (offer: { sdp: string; cameras: number[]; slots?: number }) =>
         sidecar.negotiate(offer),
     );
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1, negotiate },
       sidecar.createTransport(),
     );
@@ -1205,7 +1205,7 @@ describe("KerbcamClient — dynamic slot subscription", () => {
 });
 
 // ---------------------------------------------------------------------------
-// BrowserKerbcamTransport: ICE gathering timeout
+// BrowserKerbcastTransport: ICE gathering timeout
 // ---------------------------------------------------------------------------
 
 /**
@@ -1259,13 +1259,13 @@ function makeFakeRTCPeerConnection(
   return pc;
 }
 
-describe("BrowserKerbcamTransport: waitForIceComplete", () => {
+describe("BrowserKerbcastTransport: waitForIceComplete", () => {
   it("resolves immediately when already complete", async () => {
     const pc = makeFakeRTCPeerConnection("complete");
     // @ts-expect-error -- stub replaces the real constructor
     globalThis.RTCPeerConnection = class { constructor() { return pc; } };
     try {
-      const transport = new BrowserKerbcamTransport({ iceGatheringTimeoutMs: 500 });
+      const transport = new BrowserKerbcastTransport({ iceGatheringTimeoutMs: 500 });
       const peer = transport.createPeer([]);
       const start = Date.now();
       await peer.waitForIceComplete();
@@ -1282,7 +1282,7 @@ describe("BrowserKerbcamTransport: waitForIceComplete", () => {
     // @ts-expect-error -- stub replaces the real constructor
     globalThis.RTCPeerConnection = class { constructor() { return pc; } };
     try {
-      const transport = new BrowserKerbcamTransport({ iceGatheringTimeoutMs: 2000 });
+      const transport = new BrowserKerbcastTransport({ iceGatheringTimeoutMs: 2000 });
       const peer = transport.createPeer([]);
       const done = vi.fn();
       void peer.waitForIceComplete().then(done);
@@ -1305,7 +1305,7 @@ describe("BrowserKerbcamTransport: waitForIceComplete", () => {
     // @ts-expect-error -- stub replaces the real constructor
     globalThis.RTCPeerConnection = class { constructor() { return pc; } };
     try {
-      const transport = new BrowserKerbcamTransport({ iceGatheringTimeoutMs: 2000 });
+      const transport = new BrowserKerbcastTransport({ iceGatheringTimeoutMs: 2000 });
       const peer = transport.createPeer([]);
       const done = vi.fn();
       void peer.waitForIceComplete().then(done);
@@ -1329,20 +1329,20 @@ describe("BrowserKerbcamTransport: waitForIceComplete", () => {
 });
 
 // ---------------------------------------------------------------------------
-// KerbcamClient.inboundVideoStats
+// KerbcastClient.inboundVideoStats
 // ---------------------------------------------------------------------------
 
-describe("KerbcamClient.inboundVideoStats", () => {
+describe("KerbcastClient.inboundVideoStats", () => {
   it("returns empty map when disconnected", async () => {
     const { transport } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     const stats = await client.inboundVideoStats();
     expect(stats.size).toBe(0);
   });
 
   it("returns empty map when the transport has no getStats", async () => {
     const { transport } = makeFakeTransport();
-    const client = new KerbcamClient({ host: "h", port: 1 }, transport);
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
     await client.connect([42]);
     // makeFakeTransport does not implement getStats, so the peer lacks it.
@@ -1353,7 +1353,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
   it("returns stats keyed by flightId in legacy mode (trackIdentifier match)", async () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1388,7 +1388,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
   it("returns stats keyed by flightId in dynamic mode (mid match)", async () => {
     const sidecar = new MockSidecar().withSlots(["a"]);
     sidecar.addCamera({ flightId: 7 });
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1420,7 +1420,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
   it("returns empty map after disconnect", async () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 5 });
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1440,7 +1440,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
 
   it("throttleMainScreen defaults to false before hello", () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1451,7 +1451,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
     const sidecar = new MockSidecar();
     /* Seed the mock sidecar with throttle on before opening. */
     sidecar.fireSettingsState({ throttleMainScreen: true });
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1465,7 +1465,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
 
   it("setThrottleMainScreen sends the correct command", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1484,7 +1484,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
 
   it("settings-change event fires with SettingsState payload", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1506,7 +1506,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
 
   it("MockSidecar.throttleMainScreen reflects set-throttle-main-screen command", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );
@@ -1525,7 +1525,7 @@ describe("KerbcamClient.inboundVideoStats", () => {
 
   it("fireSettingsState pushes settings-change to the client", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1 },
       sidecar.createTransport(),
     );

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CameraLifecycle, Layer } from "./__generated__/types";
-import { KerbcamClient } from "./index";
+import { KerbcastClient } from "./index";
 import { MockSidecar } from "./testing/index";
 
 beforeEach(() => {
@@ -14,7 +14,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -34,7 +34,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -48,7 +48,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -69,7 +69,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -87,7 +87,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -106,7 +106,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42 });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -125,7 +125,7 @@ describe("MockSidecar", () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42, layers: [Layer.Near] });
 
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );
@@ -139,7 +139,7 @@ describe("MockSidecar", () => {
 
   it("setConnectionState drives client state-change events", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "localhost", port: 8088 },
       sidecar.createTransport(),
     );

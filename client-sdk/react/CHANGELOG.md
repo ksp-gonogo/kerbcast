@@ -2,7 +2,7 @@
 
 ## 0.12.0 - 2026-06-07
 
-Initial release. Versioned in lockstep with `@jonpepler/kerbcam` and the
+Initial release. Versioned in lockstep with `@jonpepler/kerbcast` and the
 sidecar binary.
 
 ### Added
@@ -16,11 +16,11 @@ sidecar binary.
 - `CameraFeedHandle` imperative ref (`stepCamera`, `setZoomRate`,
   `setPanAxis`, `nudgeZoom`, `nudgePan`) for host platforms that drive the
   feed from their own input systems.
-- `KerbcamProvider` / `useKerbcamClient` context carrying the
-  `KerbcamClient`, plus a pluggable `KerbcamSubscriptions` seam with a
+- `KerbcastProvider` / `useKerbcastClient` context carrying the
+  `KerbcastClient`, plus a pluggable `KerbcastSubscriptions` seam with a
   refcounting default (`createClientSubscriptions`).
-- `useKerbcamCameras` and `useKerbcamStream` hooks.
+- `useKerbcastCameras` and `useKerbcastStream` hooks.
 - `buildCameraLabeler` and `isCameraDestroyed` utilities.
-- Theming hooks: accent colors read `--kerbcam-accent` /
-  `--kerbcam-accent-wash` CSS custom properties with the original values as
+- Theming hooks: accent colors read `--kerbcast-accent` /
+  `--kerbcast-accent-wash` CSS custom properties with the original values as
   fallbacks.

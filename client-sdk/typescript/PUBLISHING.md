@@ -1,4 +1,4 @@
-# Publishing `@jonpepler/kerbcam`
+# Publishing `@jonpepler/kerbcast`
 
 Packages are published to **GitHub Packages**, not npmjs.com. The
 two halves of the wire contract (the Rust sidecar's `Cargo.toml`
@@ -42,8 +42,8 @@ CI then runs the `publish-sdk` job in `release.yml`:
 2. Verifies the tag, `Cargo.toml`, and both package.json files all
    carry `0.1.1`.
 3. Builds the workspace with `tsc`.
-4. `pnpm publish` for `@jonpepler/kerbcam`, then
-   `@jonpepler/kerbcam-react`, to `npm.pkg.github.com`.
+4. `pnpm publish` for `@jonpepler/kerbcast`, then
+   `@jonpepler/kerbcast-react`, to `npm.pkg.github.com`.
 
 If any check fails the job exits without publishing, and the
 GameData bundle job (which `needs` it) never creates a GitHub
@@ -52,7 +52,7 @@ form.
 
 ## Installing as a consumer
 
-`@jonpepler/kerbcam` is hosted on GitHub Packages, which requires
+`@jonpepler/kerbcast` is hosted on GitHub Packages, which requires
 the installing machine (or CI job) to authenticate even for public
 packages.
 
@@ -68,7 +68,7 @@ For local dev, generate a Personal Access Token at GitHub's
 with `read:packages` scope, export it as `GITHUB_TOKEN`, then:
 
 ```sh
-pnpm add @jonpepler/kerbcam
+pnpm add @jonpepler/kerbcast
 ```
 
 In other GitHub Actions workflows, the auto-injected
@@ -83,7 +83,7 @@ cd client-sdk/typescript
 pnpm install
 pnpm run build
 
-# Auth: PAT with write:packages scope on the jonpepler/kerbcam repo.
+# Auth: PAT with write:packages scope on the jonpepler/kerbcast repo.
 export GITHUB_TOKEN=ghp_…
 npm publish
 ```

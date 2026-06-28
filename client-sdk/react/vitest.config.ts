@@ -4,20 +4,20 @@ import path from "path";
 export default defineConfig({
   resolve: {
     alias: {
-      // Resolve @jonpepler/kerbcam imports to source so tests run without
+      // Resolve @jonpepler/kerbcast imports to source so tests run without
       // a prior `pnpm -r build` in the monorepo.
-      "@jonpepler/kerbcam/testing": path.resolve(
+      "@jonpepler/kerbcast/testing": path.resolve(
         __dirname,
         "../typescript/src/testing/index.ts",
       ),
-      "@jonpepler/kerbcam": path.resolve(
+      "@jonpepler/kerbcast": path.resolve(
         __dirname,
         "../typescript/src/index.ts",
       ),
     },
   },
   test: {
-    name: "kerbcam-react",
+    name: "kerbcast-react",
     environment: "jsdom",
     globals: true,
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],

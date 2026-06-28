@@ -6,7 +6,7 @@
  *  - the camera-selection layer (picker, Next/Previous buttons, handle API,
  *    status indicator and empty state).
  *
- * Everything drives the real `KerbcamClient` + real hooks through the SDK's
+ * Everything drives the real `KerbcastClient` + real hooks through the SDK's
  * canonical `MockSidecar`. The only thing faked is the WebRTC transport,
  * because jsdom can't produce a real `MediaStream`. Multi-camera scenarios
  * are expressed by populating the sidecar's registry (`addCamera` /
@@ -19,12 +19,12 @@
  *    CameraFeedHandle ref; handle-based equivalents cover the same paths.
  *  - CameraFeedConfigPanel -- not part of this package.
  *  - CommNet degrade -- gonogo-only data source integration.
- *  - Station (brokered) mode -- gonogo-only KerbcamDataSource.attachBroker.
+ *  - Station (brokered) mode -- gonogo-only KerbcastDataSource.attachBroker.
  */
 
-import { KerbcamClient, QualityPreset } from "@jonpepler/kerbcam";
-import type { CameraLifecycle, ClientMessage } from "@jonpepler/kerbcam";
-import { type MockCameraInit, MockSidecar } from "@jonpepler/kerbcam/testing";
+import { KerbcastClient, QualityPreset } from "@jonpepler/kerbcast";
+import type { CameraLifecycle, ClientMessage } from "@jonpepler/kerbcast";
+import { type MockCameraInit, MockSidecar } from "@jonpepler/kerbcast/testing";
 import {
   act,
   cleanup,
@@ -37,7 +37,7 @@ import { createRef } from "react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CameraFeed, type CameraFeedHandle } from "./CameraFeed";
-import { KerbcamProvider } from "./context";
+import { KerbcastProvider } from "./context";
 
 // ---------------------------------------------------------------------------
 // Camera-state fixture factory
@@ -108,21 +108,21 @@ function toInit(c: CameraStateLike): MockCameraInit {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture: connected KerbcamClient + MockSidecar
+// Fixture: connected KerbcastClient + MockSidecar
 // ---------------------------------------------------------------------------
 
-const createdClients: KerbcamClient[] = [];
+const createdClients: KerbcastClient[] = [];
 
 async function buildConnectedSource(
   cameras: CameraStateLike[] = [
     makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
   ],
-): Promise<{ client: KerbcamClient; sidecar: MockSidecar }> {
+): Promise<{ client: KerbcastClient; sidecar: MockSidecar }> {
   const sidecar = new MockSidecar();
   for (const c of cameras) {
     sidecar.addCamera(toInit(c));
   }
-  const client = new KerbcamClient(
+  const client = new KerbcastClient(
     { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
     sidecar.createTransport(),
   );
@@ -143,7 +143,7 @@ async function buildConnectedSource(
 // ---------------------------------------------------------------------------
 
 function renderFeed(
-  client: KerbcamClient,
+  client: KerbcastClient,
   props: {
     flightId: number | null;
     onSelectCamera?: (id: number) => void;
@@ -156,29 +156,29 @@ function renderFeed(
 ) {
   const { ref, ...rest } = props;
   return render(
-    <KerbcamProvider client={client}>
+    <KerbcastProvider client={client}>
       <CameraFeed ref={ref ?? null} {...rest} />
-    </KerbcamProvider>,
+    </KerbcastProvider>,
   );
 }
 
 // A stateful wrapper: holds `flightId` in state, feeds its own setter as
 // `onSelectCamera`. Lets selection tests exercise the real round-trip.
 function renderStatefulFeed(
-  client: KerbcamClient,
+  client: KerbcastClient,
   initial: number | null,
   ref?: React.Ref<CameraFeedHandle>,
 ) {
   function Harness() {
     const [flightId, setFlightId] = useState<number | null>(initial);
     return (
-      <KerbcamProvider client={client}>
+      <KerbcastProvider client={client}>
         <CameraFeed
           ref={ref ?? null}
           flightId={flightId}
           onSelectCamera={setFlightId}
         />
-      </KerbcamProvider>
+      </KerbcastProvider>
     );
   }
   return render(<Harness />);
@@ -496,16 +496,16 @@ describe("CameraFeed - empty state and status", () => {
 
   it("renders the empty state gracefully when the source is disconnected", async () => {
     const sidecar = new MockSidecar();
-    const client = new KerbcamClient(
+    const client = new KerbcastClient(
       { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
       sidecar.createTransport(),
     );
     createdClients.push(client);
 
     render(
-      <KerbcamProvider client={client}>
+      <KerbcastProvider client={client}>
         <CameraFeed flightId={null} />
-      </KerbcamProvider>,
+      </KerbcastProvider>,
     );
 
     expect(screen.getByText(/start a vessel with hullcam parts/i)).toBeTruthy();
@@ -1511,7 +1511,7 @@ describe("CameraFeed - client prop override", () => {
       makeCamera({ flightId: 42, cameraName: "Override Cam", vesselName: "Test" }),
     ]);
 
-    // Render without a KerbcamProvider -- client prop provides it implicitly.
+    // Render without a KerbcastProvider -- client prop provides it implicitly.
     render(<CameraFeed client={client} flightId={42} />);
 
     await waitFor(() => {

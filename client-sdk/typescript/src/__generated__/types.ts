@@ -21,7 +21,7 @@ export enum CameraLifecycle {
 }
 
 /**
- * Layer mask. Mirrors `Kerbcam.CameraLayers` on the plugin side.
+ * Layer mask. Mirrors `Kerbcast.CameraLayers` on the plugin side.
  * Receiving clients use this for both the rendered-layer status reports
  * and per-camera layer requests.
  */
@@ -110,7 +110,7 @@ export interface CameraState {
 	fovMin: number;
 	fovMax: number;
 	/**
-	 * Whether the part supports pan/tilt (kerbcam-side mod extension —
+	 * Whether the part supports pan/tilt (kerbcast-side mod extension —
 	 * no stock Hullcam parts are steerable, but the extended mod adds
 	 * pan to specific parts). False on every shipping part today;
 	 * clients should hide pan controls until this flips true.
@@ -253,7 +253,7 @@ export interface SetRenderSizePayload {
 export interface SetThrottleMainScreenPayload {
 	/**
 	 * When `true`, disable the KSP main flight cameras to free GPU for
-	 * kerbcam streams. Persists via the per-save difficulty parameter,
+	 * kerbcast streams. Persists via the per-save difficulty parameter,
 	 * matching the in-game Difficulty Settings toggle.
 	 */
 	enabled: boolean;

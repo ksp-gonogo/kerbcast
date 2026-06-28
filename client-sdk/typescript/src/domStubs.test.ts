@@ -2,7 +2,7 @@ import { describe, beforeEach, it, expect } from "vitest";
 import { installDomStubs } from "./testing/index";
 
 // Tests confirm the stubs install cleanly and expose the minimum surface
-// that kerbcam component tests rely on.
+// that kerbcast component tests rely on.
 
 describe("installDomStubs", () => {
   beforeEach(() => {

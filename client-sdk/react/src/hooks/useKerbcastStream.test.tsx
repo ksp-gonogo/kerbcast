@@ -1,22 +1,22 @@
 /**
- * useKerbcamStream slot-subscription lifecycle.
+ * useKerbcastStream slot-subscription lifecycle.
  *
- * Renders a probe component through the real hook + real KerbcamClient,
+ * Renders a probe component through the real hook + real KerbcastClient,
  * with only the WebRTC transport faked by the SDK's canonical MockSidecar.
  * Asserts the hook drives the dynamic-mode subscription: a slot binds while a
  * camera is on screen, switches when the selected flightId changes, and frees
  * on unmount.
  */
 
-import { KerbcamClient } from "@jonpepler/kerbcam";
-import { MockSidecar } from "@jonpepler/kerbcam/testing";
+import { KerbcastClient } from "@jonpepler/kerbcast";
+import { MockSidecar } from "@jonpepler/kerbcast/testing";
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { KerbcamProvider } from "../context";
-import { useKerbcamStream } from "./useKerbcamStream";
+import { KerbcastProvider } from "../context";
+import { useKerbcastStream } from "./useKerbcastStream";
 
 function StreamProbe({ flightId }: { flightId: number | null }): null {
-  useKerbcamStream(flightId);
+  useKerbcastStream(flightId);
   return null;
 }
 
@@ -24,24 +24,24 @@ function Wrapper({
   client,
   flightId,
 }: {
-  client: KerbcamClient;
+  client: KerbcastClient;
   flightId: number | null;
 }): React.JSX.Element {
   return (
-    <KerbcamProvider client={client}>
+    <KerbcastProvider client={client}>
       <StreamProbe flightId={flightId} />
-    </KerbcamProvider>
+    </KerbcastProvider>
   );
 }
 
 async function connectedSource(
   flightIds: number[] = [42, 43],
-): Promise<{ client: KerbcamClient; sidecar: MockSidecar }> {
+): Promise<{ client: KerbcastClient; sidecar: MockSidecar }> {
   const sidecar = new MockSidecar();
   for (const flightId of flightIds) {
     sidecar.addCamera({ flightId });
   }
-  const client = new KerbcamClient(
+  const client = new KerbcastClient(
     { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
     sidecar.createTransport(),
   );
@@ -57,7 +57,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("useKerbcamStream - slot subscription lifecycle", () => {
+describe("useKerbcastStream - slot subscription lifecycle", () => {
   it("subscribes the camera on mount and releases it on unmount", async () => {
     const { client, sidecar } = await connectedSource();
 

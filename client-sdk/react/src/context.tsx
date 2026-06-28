@@ -1,4 +1,4 @@
-import type { KerbcamClient } from "@jonpepler/kerbcam";
+import type { KerbcastClient } from "@jonpepler/kerbcast";
 import {
   createContext,
   useContext,
@@ -16,15 +16,15 @@ import {
  * implementation refcounts so multiple widgets sharing the same flightId
  * share one slot.
  */
-export interface KerbcamSubscriptions {
+export interface KerbcastSubscriptions {
   acquire(flightId: number): void;
   release(flightId: number): void;
 }
 
 /** Build the default refcounted subscriptions implementation for a client. */
 export function createClientSubscriptions(
-  client: KerbcamClient,
-): KerbcamSubscriptions {
+  client: KerbcastClient,
+): KerbcastSubscriptions {
   const refcounts = new Map<number, number>();
   return {
     acquire(flightId: number): void {
@@ -50,36 +50,36 @@ export function createClientSubscriptions(
 // Context shape
 // ---------------------------------------------------------------------------
 
-interface KerbcamContextValue {
-  client: KerbcamClient;
-  subscriptions: KerbcamSubscriptions;
+interface KerbcastContextValue {
+  client: KerbcastClient;
+  subscriptions: KerbcastSubscriptions;
 }
 
-const KerbcamContext = createContext<KerbcamContextValue | null>(null);
+const KerbcastContext = createContext<KerbcastContextValue | null>(null);
 
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
-export interface KerbcamProviderProps {
-  client: KerbcamClient;
+export interface KerbcastProviderProps {
+  client: KerbcastClient;
   /** Override the subscription manager. Defaults to a refcounted per-client impl. */
-  subscriptions?: KerbcamSubscriptions;
+  subscriptions?: KerbcastSubscriptions;
   children: ReactNode;
 }
 
 /**
- * Provide a `KerbcamClient` (and optional subscriptions override) to the
+ * Provide a `KerbcastClient` (and optional subscriptions override) to the
  * component subtree. Hooks and `CameraFeed` read both from this context.
  */
-export function KerbcamProvider({
+export function KerbcastProvider({
   client,
   subscriptions: subscriptionsProp,
   children,
-}: KerbcamProviderProps): React.JSX.Element {
+}: KerbcastProviderProps): React.JSX.Element {
   // Create default subscriptions once per client. A ref so the object is
   // stable across renders even if the parent re-renders.
-  const defaultSubsRef = useRef<KerbcamSubscriptions | null>(null);
+  const defaultSubsRef = useRef<KerbcastSubscriptions | null>(null);
   if (defaultSubsRef.current === null) {
     defaultSubsRef.current = createClientSubscriptions(client);
   }
@@ -94,7 +94,7 @@ export function KerbcamProvider({
   );
 
   return (
-    <KerbcamContext.Provider value={value}>{children}</KerbcamContext.Provider>
+    <KerbcastContext.Provider value={value}>{children}</KerbcastContext.Provider>
   );
 }
 
@@ -103,26 +103,26 @@ export function KerbcamProvider({
 // ---------------------------------------------------------------------------
 
 /**
- * Return the `KerbcamClient` from the nearest `KerbcamProvider`.
+ * Return the `KerbcastClient` from the nearest `KerbcastProvider`.
  * Throws if called outside a provider.
  */
-export function useKerbcamClient(): KerbcamClient {
-  const ctx = useContext(KerbcamContext);
+export function useKerbcastClient(): KerbcastClient {
+  const ctx = useContext(KerbcastContext);
   if (!ctx) {
-    throw new Error("useKerbcamClient must be used inside a KerbcamProvider");
+    throw new Error("useKerbcastClient must be used inside a KerbcastProvider");
   }
   return ctx.client;
 }
 
 /**
- * Return the `KerbcamSubscriptions` from the nearest `KerbcamProvider`.
+ * Return the `KerbcastSubscriptions` from the nearest `KerbcastProvider`.
  * Throws if called outside a provider.
  */
-export function useKerbcamSubscriptions(): KerbcamSubscriptions {
-  const ctx = useContext(KerbcamContext);
+export function useKerbcastSubscriptions(): KerbcastSubscriptions {
+  const ctx = useContext(KerbcastContext);
   if (!ctx) {
     throw new Error(
-      "useKerbcamSubscriptions must be used inside a KerbcamProvider",
+      "useKerbcastSubscriptions must be used inside a KerbcastProvider",
     );
   }
   return ctx.subscriptions;

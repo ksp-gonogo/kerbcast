@@ -1,22 +1,22 @@
 // Re-export every type the typeshare codegen emits from the Rust
 // protocol module. New code should prefer the higher-level
-// `KerbcamClient` re-exported below, but the underlying wire types
+// `KerbcastClient` re-exported below, but the underlying wire types
 // stay available for consumers that want to roll their own transport.
 export * from "./__generated__/types";
 
 export {
-  KerbcamClient,
-  BrowserKerbcamTransport,
-  type BrowserKerbcamTransportOptions,
+  KerbcastClient,
+  BrowserKerbcastTransport,
+  type BrowserKerbcastTransportOptions,
   type InboundVideoStats,
-  type KerbcamCameraHandle,
-  type KerbcamClientConfig,
-  type KerbcamConnectionState,
-  type KerbcamClientEvents,
-  type KerbcamCameraEvents,
-  type KerbcamTransport,
-  type KerbcamPeer,
-  type KerbcamDataChannel,
+  type KerbcastCameraHandle,
+  type KerbcastClientConfig,
+  type KerbcastConnectionState,
+  type KerbcastClientEvents,
+  type KerbcastCameraEvents,
+  type KerbcastTransport,
+  type KerbcastPeer,
+  type KerbcastDataChannel,
   type DiscoveredCamera,
   type NoiseConfig,
 } from "./client";

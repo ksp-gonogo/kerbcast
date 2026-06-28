@@ -1,9 +1,9 @@
-# @jonpepler/kerbcam
+# @jonpepler/kerbcast
 
-TypeScript client for the kerbcam sidecar. Used by browsers and other
+TypeScript client for the kerbcast sidecar. Used by browsers and other
 clients that consume the sidecar's H.264 streams.
 
-`KerbcamClient` owns the WebRTC peer, the `kerbcam-control` data
+`KerbcastClient` owns the WebRTC peer, the `kerbcast-control` data
 channel, and the per-camera state cache and `MediaStream`s.
 Consumers get a high-level RPC surface plus typed event
 subscriptions. The wire-format types are still exported for anyone
@@ -25,15 +25,15 @@ Hosted on GitHub Packages. In `.npmrc`:
 `secrets.GITHUB_TOKEN` already has it.
 
 ```sh
-npm add @jonpepler/kerbcam
+npm add @jonpepler/kerbcast
 ```
 
 ## Use
 
 ```ts
-import { KerbcamClient, Layer } from "@jonpepler/kerbcam";
+import { KerbcastClient, Layer } from "@jonpepler/kerbcast";
 
-const client = new KerbcamClient({ host: "192.168.1.74", port: 8088 });
+const client = new KerbcastClient({ host: "192.168.1.74", port: 8088 });
 await client.connect();
 
 const cam = client.camera(2592004302);
@@ -71,7 +71,7 @@ roll their own transport (a Node.js consumer outside a browser, a
 test harness, an alternative-language gateway, etc).
 
 ```ts
-import type { ClientMessage } from "@jonpepler/kerbcam";
+import type { ClientMessage } from "@jonpepler/kerbcast";
 
 declare const controlChannel: RTCDataChannel;
 
@@ -110,11 +110,11 @@ hand-written shim.
 
 ## License
 
-[CC BY-NC-SA 4.0](https://github.com/jonpepler/kerbcam/blob/main/LICENSE).
+[CC BY-NC-SA 4.0](https://github.com/jonpepler/kerbcast/blob/main/LICENSE).
 
 ## Versioning
 
 [SemVer](https://semver.org/) against the wire format and client
-API. See [CHANGELOG.md](https://github.com/jonpepler/kerbcam/blob/main/client-sdk/typescript/CHANGELOG.md).
+API. See [CHANGELOG.md](https://github.com/jonpepler/kerbcast/blob/main/client-sdk/typescript/CHANGELOG.md).
 While the protocol is at `0.x`, any minor bump may require consumer
 updates. Strict SemVer applies at `1.0.0`.

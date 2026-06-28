@@ -1,20 +1,20 @@
 {
-  "name": "@jonpepler/kerbcam",
+  "name": "@jonpepler/kerbcast",
   "version": "0.21.3",
-  "description": "TypeScript client for the kerbcam KSP camera-streaming sidecar. KerbcamClient wraps the WebRTC peer + control channel; wire-format types are typeshare-generated from the sidecar's Rust protocol module.",
+  "description": "TypeScript client for the kerbcast KSP camera-streaming sidecar. KerbcastClient wraps the WebRTC peer + control channel; wire-format types are typeshare-generated from the sidecar's Rust protocol module.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "Jon Pepler",
-  "homepage": "https://github.com/jonpepler/kerbcam#readme",
+  "homepage": "https://github.com/jonpepler/kerbcast#readme",
   "bugs": {
-    "url": "https://github.com/jonpepler/kerbcam/issues"
+    "url": "https://github.com/jonpepler/kerbcast/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonpepler/kerbcam.git",
+    "url": "git+https://github.com/jonpepler/kerbcast.git",
     "directory": "client-sdk/typescript"
   },
   "keywords": [
-    "kerbcam",
+    "kerbcast",
     "ksp",
     "kerbal-space-program",
     "webrtc",
