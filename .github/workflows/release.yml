@@ -573,6 +573,56 @@ jobs:
             --title "kerbcast ${TAG}" \
             --notes-file release-notes.md
 
+      # Mirror the release onto SpaceDock so its version list (and the CKAN
+      # entry that indexes off SpaceDock) tracks GitHub automatically.
+      # SpaceDock has no API tokens; auth is cookie-based, so the credentials
+      # live in repo secrets and the mod id in a repo variable. The step skips
+      # cleanly until all three are configured. Runs on the tag, before the
+      # ckan re-pin switches the working tree to main, so the assembled zip and
+      # Kerbcast.version are still on disk.
+      - name: Publish to SpaceDock
+        if: startsWith(github.ref_name, 'v')
+        env:
+          SPACEDOCK_USERNAME: ${{ secrets.SPACEDOCK_USERNAME }}
+          SPACEDOCK_PASSWORD: ${{ secrets.SPACEDOCK_PASSWORD }}
+          SPACEDOCK_MOD_ID: ${{ vars.SPACEDOCK_MOD_ID }}
+          CLIFF_CHANGELOG: ${{ steps.git-cliff.outputs.content }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SPACEDOCK_USERNAME:-}" ] || [ -z "${SPACEDOCK_PASSWORD:-}" ] || [ -z "${SPACEDOCK_MOD_ID:-}" ]; then
+            echo "::warning::SpaceDock not configured (need secrets SPACEDOCK_USERNAME, SPACEDOCK_PASSWORD and variable SPACEDOCK_MOD_ID); skipping upload"
+            exit 0
+          fi
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          ZIP="${{ env.RELEASE_ZIP }}"
+          GAME_VERSION="$(python3 -c "import json; v=json.load(open('GameData/Kerbcast/Kerbcast.version'))['KSP_VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          CHANGELOG="${CLIFF_CHANGELOG}"
+          if [ -z "$CHANGELOG" ]; then
+            PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            CHANGELOG="$(git log --oneline ${PREV_TAG:+${PREV_TAG}..}${TAG})"
+          fi
+          printf '%s\n' "$CHANGELOG" > sd-changelog.md
+
+          # 1) cookie login (SpaceDock has no API tokens)
+          login="$(curl -sS -F username="$SPACEDOCK_USERNAME" -F password="$SPACEDOCK_PASSWORD" -c ./sd-cookies https://spacedock.info/api/login)"
+          if printf '%s' "$login" | grep -q '"error"[[:space:]]*:[[:space:]]*true'; then
+            echo "::error::SpaceDock login failed: $login"; exit 1
+          fi
+          # 2) upload the new version (multipart)
+          resp="$(curl -sS -b ./sd-cookies \
+            -F version="$VERSION" \
+            -F "changelog=<sd-changelog.md" \
+            -F game-version="$GAME_VERSION" \
+            -F notify-followers=yes \
+            -F zipball=@"$ZIP" \
+            "https://spacedock.info/api/mod/${SPACEDOCK_MOD_ID}/update")"
+          if printf '%s' "$resp" | grep -q '"error"[[:space:]]*:[[:space:]]*true'; then
+            echo "::error::SpaceDock upload failed: $resp"; exit 1
+          fi
+          rm -f ./sd-cookies sd-changelog.md
+          echo "SpaceDock mod ${SPACEDOCK_MOD_ID} updated to ${VERSION} (KSP ${GAME_VERSION})"
+
       # Kerbcast.ckan pins an exact version + download URL + hashes (users
       # install via manual .ckan import while the repo stays off the public
       # CKAN index). Hand-pinning went stale within a day of v0.18.0, so
