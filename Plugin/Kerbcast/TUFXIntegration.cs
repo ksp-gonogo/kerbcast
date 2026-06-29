@@ -1,29 +1,19 @@
-// TUFX (TexturesUnlimitedFX) post-processing integration. Lifted
-// near-verbatim from JustReadTheInstructions (RELMYMathieu's KSP
-// camera-streaming mod) — three implementations of the same problem
-// space (OCISLY, JTI, kerbcast) and JTI's TUFX hookup is the most
-// recent / most reflection-isolated.
+// TUFX (TexturesUnlimitedFX) post-processing for kerbcast's capture cameras.
 //
-// Reflection-only on purpose: kerbcast has zero compile-time
-// reference to TUFX. AssemblyLoader scan at IsAvailable check picks
-// TUFX up at runtime if installed, otherwise the integration
-// silently no-ops. The plugin compiles + ships fine without TUFX.
+// kerbcast renders each Hullcam view through its own offscreen camera stack, so
+// the post-processing the player configures in TUFX's in-game UI does not reach
+// the stream unless we attach it to our cameras ourselves. This wires a
+// PostProcessLayer + a global PostProcessVolume onto each capture camera so the
+// composited frame carries the same tonemap / bloom / colour grading the player
+// sees. Without it, Kerbin's wide-dynamic-range horizon clips dark even with HDR
+// on (the "dark Kerbin" look in early streaming tests).
 //
-// Wired into KerbcastCamera.SetCameras: applied to ALL THREE layered
-// cameras (Near / Scaled / Galaxy) when EnableTUFX=true in
-// settings.cfg. Matches JTI's pattern, not OCISLY's near-only call —
-// JTI is the more recently maintained codebase and the all-three
-// choice is the more current data point.
-//
-// Without TUFX, kerbcast streams suffer the "dark Kerbin / black
-// hole horizon" issue: atmospheric scattering on Kerbin has very
-// wide dynamic range that needs tonemapping post-process to display
-// correctly. HDR (allowHDR=true) alone helps but doesn't close it.
-// TUFX provides the tonemap + bloom + colour-grading pass KSP
-// players already configure via the TUFX in-game UI; we inherit
-// that config per-camera here.
+// Everything here is reflection-only: kerbcast has no compile-time reference to
+// TUFX. We locate the "TUFX" assembly at runtime; if it is absent or a version
+// we do not recognise, every method no-ops and the plugin runs unaffected.
 
 using System;
+using System.Collections;
 using System.Linq;
 using System.Reflection;
 using UnityEngine;
@@ -32,310 +22,203 @@ namespace Kerbcast
 {
     internal static class TUFXIntegration
     {
-        private static bool? _isAvailable;
-        private static Type _postProcessLayerType;
-        private static Type _postProcessVolumeType;
-        private static Type _texturesUnlimitedFXLoaderType;
-        private static Type _tufxProfileType;
-        private static MethodInfo _addOrGetComponentMethod;
-        private static MethodInfo _initMethod;
-        private static PropertyInfo _resourcesProperty;
-        private static FieldInfo _volumeLayerField;
-        private static FieldInfo _isGlobalField;
-        private static FieldInfo _priorityField;
-        // Profile-lookup plumbing. All four nullable independently; any
-        // null means the profile-attach step in ApplyToCamera falls
-        // through and the volume inherits TUFX's global selection
-        // (today's pre-profile-bundling behaviour).
-        private static FieldInfo _instanceField;
-        private static PropertyInfo _profilesProperty;
-        private static MethodInfo _createPostProcessProfileMethod;
-        private static FieldInfo _sharedProfileField;
-        // Log-once gate so the "profile not in registry" path doesn't
-        // spam KSP.log per camera per attach.
-        private static string _missingProfileLogged;
+        private const string LogTag = "[Kerbcast-TUFX]";
+
+        // Resolved once on first use; null until then. _ready gates every
+        // public entry point so a failed probe disables the feature cleanly.
+        private static bool _probed;
+        private static bool _ready;
+
+        private static Type _layerType;     // PostProcessLayer
+        private static Type _volumeType;    // PostProcessVolume
+        private static MethodInfo _layerInit;        // PostProcessLayer.Init(resources)
+        private static FieldInfo _layerVolumeMask;   // PostProcessLayer.volumeLayer
+        private static PropertyInfo _loaderResources; // TexturesUnlimitedFXLoader.Resources (static)
+        private static FieldInfo _volumeIsGlobal;    // PostProcessVolume.isGlobal
+        private static FieldInfo _volumePriority;    // PostProcessVolume.priority
+        private static FieldInfo _volumeProfile;     // PostProcessVolume.sharedProfile
+
+        // Optional profile lookup. When all of these resolve we can pin a named
+        // profile per camera; otherwise volumes inherit whatever the player has
+        // selected globally in TUFX, which is a perfectly good fallback.
+        private static FieldInfo _loaderInstance;    // TexturesUnlimitedFXLoader.INSTANCE (nonpublic static)
+        private static PropertyInfo _loaderProfiles; // TexturesUnlimitedFXLoader.Profiles (nonpublic instance)
+        private static MethodInfo _profileMaterialise; // TUFXProfile.CreatePostProcessProfile()
+        private static bool _profilesResolvable;
+        private static string _warnedMissingProfile;
 
         public static bool IsAvailable
         {
             get
             {
-                if (_isAvailable.HasValue)
-                    return _isAvailable.Value;
-
-                try
-                {
-                    var tufxAssembly = AssemblyLoader.loadedAssemblies
-                        .FirstOrDefault(a => a.name == "TUFX")?.assembly;
-
-                    if (tufxAssembly == null)
-                    {
-                        Debug.Log("[Kerbcast-TUFX] TUFX not found - post-processing disabled");
-                        _isAvailable = false;
-                        return false;
-                    }
-
-                    _postProcessLayerType = tufxAssembly.GetType("UnityEngine.Rendering.PostProcessing.PostProcessLayer");
-                    _postProcessVolumeType = tufxAssembly.GetType("UnityEngine.Rendering.PostProcessing.PostProcessVolume");
-                    _texturesUnlimitedFXLoaderType = tufxAssembly.GetType("TUFX.TexturesUnlimitedFXLoader");
-
-                    if (_postProcessLayerType == null || _postProcessVolumeType == null || _texturesUnlimitedFXLoaderType == null)
-                    {
-                        Debug.LogWarning("[Kerbcast-TUFX] TUFX types not found - incompatible version?");
-                        _isAvailable = false;
-                        return false;
-                    }
-
-                    _resourcesProperty = _texturesUnlimitedFXLoaderType.GetProperty("Resources",
-                        BindingFlags.Public | BindingFlags.Static);
-                    _initMethod = _postProcessLayerType.GetMethod("Init",
-                        BindingFlags.Public | BindingFlags.Instance);
-                    _volumeLayerField = _postProcessLayerType.GetField("volumeLayer",
-                        BindingFlags.Public | BindingFlags.Instance);
-                    _isGlobalField = _postProcessVolumeType.GetField("isGlobal",
-                        BindingFlags.Public | BindingFlags.Instance);
-                    _priorityField = _postProcessVolumeType.GetField("priority",
-                        BindingFlags.Public | BindingFlags.Instance);
-
-                    // Profile-lookup plumbing — separate from the main
-                    // integration probe above. Any failure here disables
-                    // ONLY the profile attach; the layer + volume + global
-                    // inheritance still works (strictly better fallback
-                    // than disabling the whole integration). TUFX's
-                    // INSTANCE field is `internal static` and Profiles is
-                    // an `internal` auto-property — both need NonPublic
-                    // binding flags; Public would silently return null
-                    // and the bug would only surface at runtime.
-                    _tufxProfileType = tufxAssembly.GetType("TUFX.TUFXProfile");
-                    if (_tufxProfileType != null)
-                    {
-                        _instanceField = _texturesUnlimitedFXLoaderType.GetField(
-                            "INSTANCE", BindingFlags.NonPublic | BindingFlags.Static);
-                        _profilesProperty = _texturesUnlimitedFXLoaderType.GetProperty(
-                            "Profiles", BindingFlags.NonPublic | BindingFlags.Instance);
-                        _createPostProcessProfileMethod = _tufxProfileType.GetMethod(
-                            "CreatePostProcessProfile", BindingFlags.Public | BindingFlags.Instance);
-                        _sharedProfileField = _postProcessVolumeType.GetField(
-                            "sharedProfile", BindingFlags.Public | BindingFlags.Instance);
-                        if (_instanceField == null || _profilesProperty == null
-                            || _createPostProcessProfileMethod == null || _sharedProfileField == null)
-                        {
-                            Debug.LogWarning("[Kerbcast-TUFX] profile-lookup members missing — volumes will inherit global TUFX profile");
-                            _instanceField = null;
-                            _profilesProperty = null;
-                            _createPostProcessProfileMethod = null;
-                            _sharedProfileField = null;
-                        }
-                    }
-                    else
-                    {
-                        Debug.LogWarning("[Kerbcast-TUFX] TUFX.TUFXProfile type not found — volumes will inherit global TUFX profile");
-                    }
-
-                    var extensionsType = typeof(GameObject).Assembly.GetType("UnityEngine.GameObjectExtensions")
-                        ?? typeof(GameObject);
-                    _addOrGetComponentMethod = extensionsType.GetMethod("AddOrGetComponent",
-                        BindingFlags.Public | BindingFlags.Static,
-                        null,
-                        new[] { typeof(GameObject), typeof(Type) },
-                        null);
-
-                    if (_addOrGetComponentMethod == null)
-                    {
-                        Debug.Log("[Kerbcast-TUFX] using fallback AddOrGetComponent");
-                    }
-
-                    _isAvailable = true;
-                    Debug.Log("[Kerbcast-TUFX] integration enabled");
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError($"[Kerbcast-TUFX] error checking availability: {ex.Message}");
-                    _isAvailable = false;
-                    return false;
-                }
+                Probe();
+                return _ready;
             }
         }
 
-        public static void ApplyToCamera(Camera camera)
+        private static void Probe()
         {
-            if (!IsAvailable || camera == null)
-                return;
+            if (_probed) return;
+            _probed = true;
 
             try
             {
-                Component layer = AddOrGetComponent(camera.gameObject, _postProcessLayerType);
-
-                if (layer == null)
+                var tufx = AssemblyLoader.loadedAssemblies
+                    .FirstOrDefault(a => a.name == "TUFX")?.assembly;
+                if (tufx == null)
                 {
-                    Debug.LogWarning($"[Kerbcast-TUFX] failed to add PostProcessLayer to {camera.name}");
+                    Debug.Log($"{LogTag} TUFX not installed; post-processing passthrough disabled");
                     return;
                 }
 
-                var resources = _resourcesProperty?.GetValue(null);
-                if (resources != null && _initMethod != null)
+                _layerType = tufx.GetType("UnityEngine.Rendering.PostProcessing.PostProcessLayer");
+                _volumeType = tufx.GetType("UnityEngine.Rendering.PostProcessing.PostProcessVolume");
+                var loaderType = tufx.GetType("TUFX.TexturesUnlimitedFXLoader");
+                if (_layerType == null || _volumeType == null || loaderType == null)
                 {
-                    _initMethod.Invoke(layer, new[] { resources });
-                }
-                else
-                {
-                    Debug.LogWarning($"[Kerbcast-TUFX] resources not found - removing PostProcessLayer from {camera.name}");
-                    UnityEngine.Object.Destroy(layer);
+                    Debug.LogWarning($"{LogTag} expected TUFX types missing; unsupported TUFX version");
                     return;
                 }
 
-                if (_volumeLayerField != null)
-                {
-                    LayerMask allLayers = ~0;
-                    _volumeLayerField.SetValue(layer, allLayers);
-                }
+                const BindingFlags PubInst = BindingFlags.Public | BindingFlags.Instance;
+                _layerInit = _layerType.GetMethod("Init", PubInst);
+                _layerVolumeMask = _layerType.GetField("volumeLayer", PubInst);
+                _loaderResources = loaderType.GetProperty("Resources", BindingFlags.Public | BindingFlags.Static);
+                _volumeIsGlobal = _volumeType.GetField("isGlobal", PubInst);
+                _volumePriority = _volumeType.GetField("priority", PubInst);
+                _volumeProfile = _volumeType.GetField("sharedProfile", PubInst);
 
-                Component volume = AddOrGetComponent(camera.gameObject, _postProcessVolumeType);
-
-                if (volume == null)
+                if (_layerInit == null || _loaderResources == null || _volumeIsGlobal == null)
                 {
-                    Debug.LogWarning($"[Kerbcast-TUFX] failed to add PostProcessVolume - removing PostProcessLayer from {camera.name}");
-                    UnityEngine.Object.Destroy(layer);
+                    Debug.LogWarning($"{LogTag} expected TUFX members missing; unsupported TUFX version");
                     return;
                 }
 
-                if (_isGlobalField != null)
+                // Named-profile pinning is best-effort and independent of the
+                // core hookup above. INSTANCE is internal-static and Profiles is
+                // an internal instance property, so both need NonPublic flags.
+                var profileType = tufx.GetType("TUFX.TUFXProfile");
+                if (profileType != null)
                 {
-                    _isGlobalField.SetValue(volume, true);
+                    _loaderInstance = loaderType.GetField("INSTANCE", BindingFlags.NonPublic | BindingFlags.Static);
+                    _loaderProfiles = loaderType.GetProperty("Profiles", BindingFlags.NonPublic | BindingFlags.Instance);
+                    _profileMaterialise = profileType.GetMethod("CreatePostProcessProfile", PubInst);
+                    _profilesResolvable =
+                        _loaderInstance != null && _loaderProfiles != null
+                        && _profileMaterialise != null && _volumeProfile != null;
                 }
+                if (!_profilesResolvable)
+                    Debug.Log($"{LogTag} per-camera profile pinning unavailable; volumes inherit the global TUFX profile");
 
-                if (_priorityField != null)
-                {
-                    _priorityField.SetValue(volume, 100);
-                }
-
-                // Attach kerbcast's curated profile to this volume so
-                // operators get sensible defaults regardless of which
-                // profile they've selected in TUFX's main UI. Falls
-                // through silently if our profile isn't loaded — volume
-                // inherits the operator's global selection.
-                if (_sharedProfileField != null && !string.IsNullOrEmpty(KerbcastSettings.TUFXProfile))
-                {
-                    var profile = TryGetProfile(KerbcastSettings.TUFXProfile);
-                    if (profile != null)
-                    {
-                        _sharedProfileField.SetValue(volume, profile);
-                    }
-                }
-
-                Debug.Log($"[Kerbcast-TUFX] applied post-processing to {camera.name}");
+                _ready = true;
+                Debug.Log($"{LogTag} integration enabled");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[Kerbcast-TUFX] failed to apply to {camera.name}: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"{LogTag} probe failed: {ex.Message}");
+                _ready = false;
+            }
+        }
 
-                try
+        // Attach a TUFX post-process layer + global volume to one capture camera.
+        // Safe to call repeatedly: the volume/layer are reused if already present.
+        public static void ApplyToCamera(Camera camera)
+        {
+            if (camera == null) return;
+            Probe();
+            if (!_ready) return;
+
+            try
+            {
+                var resources = _loaderResources.GetValue(null);
+                if (resources == null)
                 {
-                    var layer = camera.gameObject.GetComponent(_postProcessLayerType);
-                    if (layer != null) UnityEngine.Object.Destroy(layer);
-
-                    var volume = camera.gameObject.GetComponent(_postProcessVolumeType);
-                    if (volume != null) UnityEngine.Object.Destroy(volume);
+                    Debug.LogWarning($"{LogTag} TUFX resources not loaded yet; skipping {camera.name}");
+                    return;
                 }
-                catch { }
+
+                var layer = GetOrAdd(camera.gameObject, _layerType);
+                _layerInit.Invoke(layer, new[] { resources });
+                _layerVolumeMask?.SetValue(layer, (LayerMask)(~0));
+
+                var volume = GetOrAdd(camera.gameObject, _volumeType);
+                _volumeIsGlobal.SetValue(volume, true);
+                _volumePriority?.SetValue(volume, 100);
+
+                PinProfile(volume);
+
+                Debug.Log($"{LogTag} applied to {camera.name}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"{LogTag} apply to {camera.name} failed: {ex.Message}");
+                Strip(camera); // leave the camera clean rather than half-wired
             }
         }
 
         public static void RemoveFromCamera(Camera camera)
         {
-            if (camera == null)
-                return;
+            if (camera == null || !_probed) return;
+            Strip(camera);
+        }
+
+        private static void PinProfile(Component volume)
+        {
+            if (!_profilesResolvable) return;
+            var name = KerbcastSettings.TUFXProfile;
+            if (string.IsNullOrEmpty(name)) return;
 
             try
             {
-                if (_postProcessLayerType != null)
+                var loader = _loaderInstance.GetValue(null);
+                var profiles = loader != null ? _loaderProfiles.GetValue(loader) as IDictionary : null;
+                if (profiles == null || !profiles.Contains(name))
                 {
-                    var layer = camera.gameObject.GetComponent(_postProcessLayerType);
-                    if (layer != null)
+                    if (_warnedMissingProfile != name)
                     {
-                        UnityEngine.Object.Destroy(layer);
+                        Debug.Log($"{LogTag} profile '{name}' not registered; inheriting global");
+                        _warnedMissingProfile = name;
                     }
+                    return;
                 }
 
-                if (_postProcessVolumeType != null)
-                {
-                    var volume = camera.gameObject.GetComponent(_postProcessVolumeType);
-                    if (volume != null)
-                    {
-                        UnityEngine.Object.Destroy(volume);
-                    }
-                }
-
-                Debug.Log($"[Kerbcast-TUFX] removed from {camera.name}");
+                var entry = profiles[name];
+                var materialised = entry != null
+                    ? _profileMaterialise.Invoke(entry, null) as UnityEngine.Object
+                    : null;
+                if (materialised != null)
+                    _volumeProfile.SetValue(volume, materialised);
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[Kerbcast-TUFX] error removing from {camera.name}: {ex.Message}");
+                Debug.LogWarning($"{LogTag} profile pin for '{name}' failed: {ex.Message}");
             }
         }
 
-        // Look up a TUFX profile by name in the loader's Profiles
-        // dictionary and ask TUFX to materialise a PostProcessProfile
-        // ScriptableObject for it. Returns null on any failure — caller
-        // skips the sharedProfile attach and the volume inherits the
-        // operator's global selection (today's pre-bundle behaviour).
-        //
-        // CreatePostProcessProfile() allocates a fresh ScriptableObject
-        // per call; the volume will own the reference until Unity GCs
-        // it at scene unload. Not pooled / not shared across volumes.
-        private static UnityEngine.Object TryGetProfile(string profileName)
+        private static void Strip(Camera camera)
         {
-            if (_instanceField == null || _profilesProperty == null
-                || _createPostProcessProfileMethod == null || _sharedProfileField == null)
-            {
-                return null;
-            }
             try
             {
-                var loaderInstance = _instanceField.GetValue(null);
-                if (loaderInstance == null) return null;
-                var profiles = _profilesProperty.GetValue(loaderInstance) as System.Collections.IDictionary;
-                if (profiles == null) return null;
-                if (!profiles.Contains(profileName))
+                if (_volumeType != null)
                 {
-                    if (_missingProfileLogged != profileName)
-                    {
-                        Debug.Log($"[Kerbcast-TUFX] profile '{profileName}' not found in TUFX registry — inheriting global");
-                        _missingProfileLogged = profileName;
-                    }
-                    return null;
+                    var v = camera.gameObject.GetComponent(_volumeType);
+                    if (v != null) UnityEngine.Object.Destroy(v);
                 }
-                var tufxProfile = profiles[profileName];
-                if (tufxProfile == null) return null;
-                return _createPostProcessProfileMethod.Invoke(tufxProfile, null) as UnityEngine.Object;
+                if (_layerType != null)
+                {
+                    var l = camera.gameObject.GetComponent(_layerType);
+                    if (l != null) UnityEngine.Object.Destroy(l);
+                }
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[Kerbcast-TUFX] TryGetProfile('{profileName}') threw: {ex.Message}");
-                return null;
+                Debug.LogError($"{LogTag} strip from {camera.name} failed: {ex.Message}");
             }
         }
 
-        private static Component AddOrGetComponent(GameObject gameObject, Type componentType)
+        private static Component GetOrAdd(GameObject go, Type type)
         {
-            if (_addOrGetComponentMethod != null)
-            {
-                try
-                {
-                    return (Component)_addOrGetComponentMethod.Invoke(null, new object[] { gameObject, componentType });
-                }
-                catch
-                {
-                    // Ignore, fallback handles that
-                }
-            }
-
-            // Manual fallback
-            var existing = gameObject.GetComponent(componentType);
-            if (existing != null)
-                return existing;
-
-            return gameObject.AddComponent(componentType);
+            return go.GetComponent(type) ?? go.AddComponent(type);
         }
     }
 }

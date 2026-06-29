@@ -669,7 +669,7 @@ namespace Kerbcast
             // Offscreen RT cameras shouldn't run Unity's occlusion logic —
             // it's computed against the main viewport's frustum and either
             // wastes cycles or incorrectly culls objects in our cameras'
-            // frusta. JustReadTheInstructions does this on every layer.
+            // frusta. Disabled on every layer.
             _nearCam.useOcclusionCulling = false;
             // Add kerbcast's FX-only layer so ember ParticleSystems (and any
             // future GameObject-based effects on AtmoFxConstants.Layer) render
@@ -739,9 +739,9 @@ namespace Kerbcast
             galaxyGo.AddComponent<CanvasHack>();
 
             // TUFX (TexturesUnlimitedFX) post-processing. Reflection-only
-            // — silently no-ops when TUFX isn't installed. Applied to ALL
-            // THREE layers (not just near, per JustReadTheInstructions'
-            // pattern, the more recent reference implementation). The
+            // — silently no-ops when TUFX isn't installed. Applied to every
+            // layered camera (not just near) so the post stack matches what
+            // the player sees in-game across the whole composite. The
             // near cam carries the heaviest tonemap+bloom load since it
             // sees the highest-luminance content (engines, near-vessel
             // atmosphere); the scaled cam handles the wide-DR atmospheric

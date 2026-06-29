@@ -10,7 +10,7 @@
 // the restore is a no-op too. Doesn't fix the broader Mesa-OpenGL black-
 // planet-surface issue documented in local_docs/kerbcast/known_issues.md in
 // the gonogo repo — that issue affects every offscreen-Scaled-camera mod
-// on this stack including OCISLY and JustReadTheInstructions.
+// on this rendering stack.
 
 using System.Collections.Generic;
 using System.Reflection;
