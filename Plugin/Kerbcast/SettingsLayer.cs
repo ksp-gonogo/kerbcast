@@ -89,7 +89,7 @@ namespace Kerbcast
         /* Parses a comma-separated Layers value from settings.cfg into a
            CameraLayers mask. Tokens are case-insensitive; unknown tokens warn
            and are skipped. An empty or all-invalid list returns All rather
-           than None — almost certainly not what the operator intended. */
+           than None, almost certainly not what the operator intended. */
         public static CameraLayers ParseCameraLayers(string raw, Action<string> warn)
         {
             var mask = CameraLayers.None;

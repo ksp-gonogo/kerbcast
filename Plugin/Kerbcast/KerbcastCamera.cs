@@ -772,7 +772,7 @@ namespace Kerbcast
             }
             else
             {
-                Debug.LogWarning($"[Kerbcast] cam={FlightId} 'Camera 01' not found — far layer skipped");
+                Debug.LogWarning($"[Kerbcast] cam={FlightId} 'Camera 01' not found: far layer skipped");
             }
 
             // TUFX (TexturesUnlimitedFX) post-processing. Reflection-only
@@ -817,7 +817,7 @@ namespace Kerbcast
                     Debug.LogWarning($"[Kerbcast] cam={FlightId} yaw-base transform '{_panCap.YawBaseTransformName}' not found on {Hullcam.part.name}");
             }
 
-            /* All cameras are permanently disabled — Unity must not
+            /* All cameras are permanently disabled; Unity must not
                auto-render them. Refresh() drives explicit camera.Render()
                calls each tick; disabled cameras still participate in
                LayerCamRotator.OnPreRender (which fires on camera.Render())
