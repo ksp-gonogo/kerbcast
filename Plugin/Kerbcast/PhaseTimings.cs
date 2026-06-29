@@ -29,8 +29,8 @@ namespace Kerbcast
     {
         Galaxy = 0,   // _galaxyCam.Render()
         Scaled = 1,   // _scaledCam.Render() (+ fader override bookkeeping)
-        Near = 2,     // BuildFxFrameState() + _fxHost.Render() + _nearCam.Render()
-        Far = 3,      // _farCam.Render() (mid-range terrain; provisional tier pending Deck baseline)
+        Far = 2,      // _farCam.Render() (mid-range terrain; provisional tier pending Deck baseline)
+        Near = 3,     // BuildFxFrameState() + _fxHost.Render() + _nearCam.Render()
         Blit = 4,     // capture→readback Blit(es) + horizontal-flip correction
         Readback = 5, // Request() issue + ProcessReadback() drain (ring memcpy)
         Count = 6,
