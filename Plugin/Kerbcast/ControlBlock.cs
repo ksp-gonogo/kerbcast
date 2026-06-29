@@ -16,7 +16,7 @@
 //   BODY (at 4096; 256 B reserved):
 //     [+0..4]  u32 fields_present  (bitmask of which Option fields are set)
 //     [+4]     u8  subscribed       (+3 pad)
-//     [+8..12] u32 layers_mask      (Near=1, Scaled=2, Galaxy=4)
+//     [+8..12] u32 layers_mask      (Near=1, Scaled=2, Far=8, Galaxy=4)
 //     [+12]    u32 width
 //     [+16]    u32 height
 //     [+20]    f32 fov

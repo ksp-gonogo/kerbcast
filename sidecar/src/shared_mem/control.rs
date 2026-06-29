@@ -23,7 +23,7 @@
 //!                                 mirrors serde skip_serializing_if=None)
 //!   +4   1   u8  subscribed
 //!   +5   3   padding
-//!   +8   4   u32 layers_mask     (Near=1, Scaled=2, Galaxy=4)
+//!   +8   4   u32 layers_mask     (Near=1, Scaled=2, Far=8, Galaxy=4)
 //!   +12  4   u32 width
 //!   +16  4   u32 height
 //!   +20  4   f32 fov
@@ -104,6 +104,7 @@ pub fn layers_to_mask(layers: &[Layer]) -> u32 {
         mask |= match l {
             Layer::Near => 1,
             Layer::Scaled => 2,
+            Layer::Far => 8,
             Layer::Galaxy => 4,
         };
     }

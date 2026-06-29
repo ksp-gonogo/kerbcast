@@ -28,6 +28,7 @@ export enum CameraLifecycle {
 export enum Layer {
 	Near = "NEAR",
 	Scaled = "SCALED",
+	Far = "FAR",
 	Galaxy = "GALAXY",
 }
 

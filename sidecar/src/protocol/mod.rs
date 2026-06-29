@@ -36,6 +36,7 @@ use typeshare::typeshare;
 pub enum Layer {
     Near,
     Scaled,
+    Far,
     Galaxy,
 }
 
