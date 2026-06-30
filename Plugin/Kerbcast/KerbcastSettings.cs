@@ -163,6 +163,12 @@ namespace Kerbcast
         // installed.
         public static bool EnableEVE { get; private set; } = true;
 
+        // Enable Scatterer atmosphere, sky, scattering and ocean capture onto
+        // kerbcast's cloned cameras (per-clone singleton camera swap). Default
+        // true; no effect if Scatterer is not installed. Forces MSAA off on the
+        // capture cameras when active.
+        public static bool EnableScatterer { get; private set; } = true;
+
         // Name of the installed TUFX profile to attach to kerbcast's per-camera
         // volumes. Default empty: volumes inherit TUFX's own scene selection
         // (whatever the operator picked in TUFX's UI for Flight). No effect
@@ -410,6 +416,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
             ApplyBool(node, "EnableEVE", v => EnableEVE = v);
+            ApplyBool(node, "EnableScatterer", v => EnableScatterer = v);
             ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
