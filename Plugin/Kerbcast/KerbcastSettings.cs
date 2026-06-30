@@ -158,6 +158,11 @@ namespace Kerbcast
         // when TUFX is not installed. Static so KerbcastCamera can read it.
         public static bool EnableTUFX { get; private set; } = true;
 
+        // Enable EVE cloud/atmosphere/city-lights/celestial-shadow replication
+        // onto kerbcast's cloned cameras. Default true; no effect if EVE is not
+        // installed.
+        public static bool EnableEVE { get; private set; } = true;
+
         // Name of the installed TUFX profile to attach to kerbcast's per-camera
         // volumes. Default empty: volumes inherit TUFX's own scene selection
         // (whatever the operator picked in TUFX's UI for Flight). No effect
@@ -404,6 +409,7 @@ namespace Kerbcast
             ApplyString(node, "AtmosphericFxLayers", v => settings.AtmosphericFxLayers = ParseAtmoFxLayers(v));
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
+            ApplyBool(node, "EnableEVE", v => EnableEVE = v);
             ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);

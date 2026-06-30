@@ -26,6 +26,7 @@ namespace Kerbcast
             _integrations = new List<ICameraModIntegration>
             {
                 new TUFXIntegration(),
+                new EVEIntegration(),
             };
         }
 
