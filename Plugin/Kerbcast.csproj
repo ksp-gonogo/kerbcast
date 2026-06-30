@@ -125,6 +125,7 @@
     <Compile Remove="QualityClamp.Tests/**/*.cs" />
     <Compile Remove="QualityTier.Tests/**/*.cs" />
     <Compile Remove="SidecarLifecycle.Tests/**/*.cs" />
+    <Compile Remove="IntegrationPolicy.Tests/**/*.cs" />
   </ItemGroup>
 
 </Project>
