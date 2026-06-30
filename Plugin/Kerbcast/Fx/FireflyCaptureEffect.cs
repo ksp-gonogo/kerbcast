@@ -103,6 +103,8 @@ namespace Kerbcast
             /* Build this frame's set of Firefly buffers and reconcile against what
                we have attached: add new, remove stale (Firefly rebuilds its buffer
                object on ReloadCommandBuffer, so track by object identity). */
+            // Keyed by buffer instance; assumes Firefly holds each CommandBuffer at
+            // one CameraEvent (its source registers one buffer per event).
             var current = new Dictionary<CommandBuffer, CameraEvent>();
             foreach (var item in list)
             {

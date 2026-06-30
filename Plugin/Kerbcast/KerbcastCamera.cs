@@ -1881,6 +1881,20 @@ namespace Kerbcast
             // destroying the camera they're attached to.
             _fxHost?.Dispose();
             _fxHost = null;
+            // Detach visual-mod integrations before destroying the cameras: this
+            // restores any third-party global/singleton state and removes the
+            // components/buffers each integration added, mirroring the per-layer
+            // ApplyToLayer calls in SetCameras. Destroying the GameObjects also
+            // fires each swap component's OnDisable, but calling RemoveFromLayer
+            // makes the apply/remove contract explicit rather than implicit.
+            if (_integrationHost != null)
+            {
+                if (_nearCam != null) _integrationHost.RemoveFromLayer(_nearCam, CameraLayers.Near);
+                if (_scaledCam != null) _integrationHost.RemoveFromLayer(_scaledCam, CameraLayers.Scaled);
+                if (_galaxyCam != null) _integrationHost.RemoveFromLayer(_galaxyCam, CameraLayers.Galaxy);
+                if (_farCam != null) _integrationHost.RemoveFromLayer(_farCam, CameraLayers.Far);
+                _integrationHost = null;
+            }
             if (_nearCam != null) UnityEngine.Object.Destroy(_nearCam.gameObject);
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);
