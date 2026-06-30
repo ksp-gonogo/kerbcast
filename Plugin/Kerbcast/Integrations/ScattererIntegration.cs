@@ -32,7 +32,7 @@ namespace Kerbcast
         private FieldInfo _farField;            // Instance.farCamera
         private FieldInfo _unifiedField;        // Instance.unifiedCameraMode (may be null on old versions)
 
-        private readonly Dictionary<Camera, Component> _added = new Dictionary<Camera, Component>();
+        private readonly Dictionary<Camera, List<Component>> _added = new Dictionary<Camera, List<Component>>();
 
         public string Name => "Scatterer";
         public bool ForcesNoMsaa => true;
@@ -110,7 +110,7 @@ namespace Kerbcast
                 var swap = cam.gameObject.AddComponent<ScattererCameraSwap>();
                 swap.InstanceProperty = _instanceProp;
                 swap.CameraField = field;
-                _added[cam] = swap;
+                Track(cam, swap);
             }
             catch (Exception ex)
             {
@@ -130,14 +130,25 @@ namespace Kerbcast
             catch { return false; }
         }
 
+        private void Track(Camera cam, Component c)
+        {
+            if (!_added.TryGetValue(cam, out var list))
+            {
+                list = new List<Component>();
+                _added[cam] = list;
+            }
+            list.Add(c);
+        }
+
         public void RemoveFromLayer(Camera cam, CameraLayers layer)
         {
             if (cam == null) return;
             try
             {
-                if (_added.TryGetValue(cam, out var c))
+                if (_added.TryGetValue(cam, out var list))
                 {
-                    if (c != null) UnityEngine.Object.Destroy(c); // OnDisable restores
+                    foreach (var c in list)
+                        if (c != null) UnityEngine.Object.Destroy(c); // OnDisable restores
                     _added.Remove(cam);
                 }
             }
