@@ -54,7 +54,11 @@ namespace Kerbcast
                     return;
                 }
                 // EVE ships its shader loader under the ShaderLoader assembly; its
-                // presence is the install signal across both EVE generations.
+                // presence is the install signal across both EVE generations. We probe
+                // ShaderLoaderClass (EVE-owned, not stock KSP) rather than the sheet's
+                // Atmosphere.CloudsObject because ShaderLoaderClass also exposes a
+                // "loaded" readiness flag and the ShaderLoader assembly name is
+                // unambiguously EVE's; the cloud types still resolve below as needed.
                 var shaderLoader = AssemblyLoader.loadedAssemblies
                     .FirstOrDefault(a => a.name == "ShaderLoader")?.assembly;
                 if (shaderLoader == null ||
