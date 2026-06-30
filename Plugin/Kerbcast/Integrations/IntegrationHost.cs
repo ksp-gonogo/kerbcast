@@ -19,12 +19,12 @@ namespace Kerbcast
         public IntegrationHost()
         {
             // Registration list: the ONE place new integrations are added.
-            // TUFX is the first; Scatterer/EVE/Parallax/Deferred slot in here
-            // as they are built. Order matters only where one integration sets
-            // a whole-camera mode another reads (Deferred before EVE/Scatterer);
-            // keep that ordering when those land.
+            // Order matters where one integration sets a whole-camera mode
+            // another reads: Deferred must be first (it establishes the
+            // rendering path that EVE and Scatterer key off).
             _integrations = new List<ICameraModIntegration>
             {
+                new DeferredIntegration(),
                 new TUFXIntegration(),
                 new EVEIntegration(),
                 new ScattererIntegration(),

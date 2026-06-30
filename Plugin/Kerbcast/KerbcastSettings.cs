@@ -174,6 +174,11 @@ namespace Kerbcast
         // stream. Default true; no effect if ParallaxContinued is not installed.
         public static bool EnableParallax { get; private set; } = true;
 
+        // Add Deferred's ForwardRenderingCompatibility component to kerbcast's
+        // deferred near/far clones so they render correctly instead of black.
+        // Default true; no effect if the Deferred mod is not installed.
+        public static bool EnableDeferred { get; private set; } = true;
+
         // Name of the installed TUFX profile to attach to kerbcast's per-camera
         // volumes. Default empty: volumes inherit TUFX's own scene selection
         // (whatever the operator picked in TUFX's UI for Flight). No effect
@@ -423,6 +428,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableEVE", v => EnableEVE = v);
             ApplyBool(node, "EnableScatterer", v => EnableScatterer = v);
             ApplyBool(node, "EnableParallax", v => EnableParallax = v);
+            ApplyBool(node, "EnableDeferred", v => EnableDeferred = v);
             ApplyString(node, "TUFXProfile", v => TUFXProfile = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
