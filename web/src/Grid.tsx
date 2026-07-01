@@ -7,6 +7,7 @@ import { AddAllTile, AddTile, Tile } from "./Tile";
 import {
   addAllCameras,
   addTile,
+  cameraKey,
   loadPerfNoteDismissed,
   PERF_NOTE_TILE_THRESHOLD,
   removeTile,
@@ -35,8 +36,11 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
     onTilesChange(next);
   };
 
-  const handleSelectCamera = (index: number, flightId: number) =>
-    commit(updateTile(tiles, index, flightId));
+  const handleSelectCamera = (index: number, flightId: number) => {
+    const cam = cameras.find((c) => c.flightId === flightId);
+    const key = cam ? cameraKey(cam) : null;
+    commit(updateTile(tiles, index, flightId, key));
+  };
   const handleRemove = (index: number) => commit(removeTile(tiles, index));
   const handleToggleSpotlight = (index: number) =>
     commit(toggleSpotlight(tiles, index));
@@ -50,7 +54,7 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
   }, [tiles, cameras]);
 
   const handleAddAll = () => {
-    const next = addAllCameras(tiles, cameras.map((c) => c.flightId));
+    const next = addAllCameras(tiles, cameras);
     if (next === tiles) return;
     commit(next);
     if (next.length > PERF_NOTE_TILE_THRESHOLD && !loadPerfNoteDismissed()) {

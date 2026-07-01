@@ -1013,3 +1013,89 @@ describe("App - tile corner label reflects the displayed camera", () => {
     expect(screen.queryByText("Tile 1")).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tile rebind after KSP revert/recover (camera key reconciliation)
+// ---------------------------------------------------------------------------
+
+describe("App - tile rebind after flightId reassignment", () => {
+  /*
+   * KSP revert/recover keeps the same physical cameras but reassigns
+   * part.flightID. The sidecar pushes a fresh camera-snapshot with the new
+   * ids. CameraReconciler must rebind each tile whose old flightId is gone but
+   * whose stable key (vesselName|partName|cameraName) matches a live camera.
+   */
+  it("rebinds a tile to the camera's new flightId after a revert", async () => {
+    // Stored tile from a previous launch: flightId 1, with stable key.
+    saveTiles([{
+      flightId: 1,
+      spotlit: false,
+      key: "Kerbal X|mumech.MuMechModuleHullCamera|FwdCam",
+    }]);
+
+    // Initial session: camera appears at flightId 1 -- matches stored tile.
+    const { client, sidecar, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "FwdCam" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(1);
+    });
+
+    // KSP revert: same camera returns under a new flightId (10).
+    await act(async () => {
+      sidecar.setCameras([makeCamera({ flightId: 10, cameraName: "FwdCam" })]);
+    });
+
+    // The tile must NOT show "camera reconnecting" -- it should rebind.
+    await waitFor(() => {
+      expect(screen.queryByText(/camera reconnecting/i)).toBeNull();
+    });
+
+    // Tile remove button still present (tile survives).
+    expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(1);
+
+    // Rebind persisted to localStorage.
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null; key: string | null }[];
+    expect(stored[0].flightId).toBe(10);
+  });
+
+  it("shows reconnecting placeholder when key has no live match (truly gone camera)", async () => {
+    // Tile stored with a key that won't match any live camera.
+    saveTiles([{
+      flightId: 99,
+      spotlit: false,
+      key: "Kerbal X|mumech.MuMechModuleHullCamera|GoneCam",
+    }]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "OtherCam" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    // No key match => tile stays as "reconnecting".
+    await waitFor(() => {
+      expect(screen.getByText(/camera reconnecting/i)).toBeTruthy();
+    });
+  });
+
+  it("does not rebind old tiles that have no key stored (legacy tiles)", async () => {
+    // Old tile from before key support: no key field.
+    saveTiles([{ flightId: 99, spotlit: false, key: null }]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Cam" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    // No rebind: flightId 99 is stale, no key to match on.
+    await waitFor(() => {
+      expect(screen.getByText(/camera reconnecting/i)).toBeTruthy();
+    });
+  });
+});

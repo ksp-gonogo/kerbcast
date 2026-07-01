@@ -1,6 +1,6 @@
 import type { KerbcastClient } from "@jonpepler/kerbcast";
 import { KerbcastProvider, useKerbcastCameras } from "@jonpepler/kerbcast-react";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import styled from "styled-components";
 import { ConnectionManager } from "./connectionManager";
 import { DevPanel } from "./DevPanel";
@@ -19,7 +19,7 @@ import {
   saveTheme,
 } from "./settings";
 import type { ThemePreference } from "./settings";
-import { loadTiles, saveTiles, seedTiles } from "./tiles";
+import { loadTiles, reconcileTiles, saveTiles, seedTiles } from "./tiles";
 import type { Tile as TileData } from "./tiles";
 
 interface AppProps {
@@ -78,6 +78,11 @@ export function App({ client }: AppProps): React.JSX.Element {
     [tiles],
   );
 
+  const handleReconcile = useCallback((reconciled: TileData[]) => {
+    setTiles(reconciled);
+    saveTiles(reconciled);
+  }, []);
+
   return (
     <KerbcastProvider client={client}>
       <PageShell>
@@ -100,7 +105,7 @@ export function App({ client }: AppProps): React.JSX.Element {
         <ShedBanner client={client} />
         <ErrorToast client={client} />
         <MainArea>
-          {/* CameraSeeder uses useKerbcastCameras inside KerbcastProvider */}
+          {/* CameraSeeder and CameraReconciler use useKerbcastCameras inside KerbcastProvider */}
           <CameraSeeder
             tilesSeeded={tilesSeeded}
             onSeed={(seeded) => {
@@ -108,6 +113,10 @@ export function App({ client }: AppProps): React.JSX.Element {
               saveTiles(seeded);
               setTilesSeeded(true);
             }}
+          />
+          <CameraReconciler
+            tiles={tiles}
+            onReconcile={handleReconcile}
           />
           <Grid
             tiles={tiles}
@@ -139,9 +148,39 @@ function CameraSeeder({ tilesSeeded, onSeed }: CameraSeederProps): null {
   useEffect(() => {
     if (tilesSeeded) return;
     if (cameras.length === 0) return;
-    onSeed(seedTiles(cameras.map((c) => c.flightId)));
+    onSeed(seedTiles(cameras));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameras, tilesSeeded]);
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// CameraReconciler: rebinds stale tile flightIds after KSP revert/recover
+// ---------------------------------------------------------------------------
+
+interface CameraReconcilerProps {
+  tiles: TileData[];
+  onReconcile: (tiles: TileData[]) => void;
+}
+
+/*
+ * Watches the live camera list and rebinds any tile whose flightId has gone
+ * missing but whose stable key (vesselName|partName|cameraName) matches a
+ * live camera under a new flightId. This covers KSP revert/recover, which
+ * reassigns part.flightID while the camera itself survives.
+ *
+ * Tiles without a key (stored before this feature shipped) are left as
+ * "reconnecting" until the user manually rebinds them.
+ */
+function CameraReconciler({ tiles, onReconcile }: CameraReconcilerProps): null {
+  const cameras = useKerbcastCameras();
+
+  useEffect(() => {
+    if (cameras.length === 0) return;
+    const reconciled = reconcileTiles(tiles, cameras);
+    if (reconciled !== tiles) onReconcile(reconciled);
+  }, [cameras, tiles, onReconcile]);
 
   return null;
 }

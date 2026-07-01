@@ -58,12 +58,14 @@ export function Tile({
 
   /*
    * A tile is "missing" when it points at a flightId that no longer appears in
-   * the live cameras list: a fresh launch, a different craft, or a destroyed
-   * vessel. FlightId is stable across docking and scene changes, so absence is
-   * a genuine vanish, not a transient re-key. We must NOT mount a CameraFeed in
-   * that case (it would auto-latch onto an unrelated camera, breaking the
-   * "never remount a live feed" rule), so we render a reconnecting placeholder
-   * instead. A null flightId is an empty slot, not a missing camera.
+   * the live cameras list. KSP can reassign part.flightID on revert/recover, so
+   * CameraReconciler (in App.tsx) first attempts to rebind the tile by stable
+   * identity (vesselName|partName|cameraName) before we reach here. A tile that
+   * is still missing after reconciliation is genuinely gone: a destroyed vessel,
+   * a different craft, or a camera whose name changed. We must NOT mount a
+   * CameraFeed in that case (it would auto-latch onto an unrelated camera,
+   * breaking the "never remount a live feed" rule), so we render a reconnecting
+   * placeholder instead. A null flightId is an empty slot, not a missing camera.
    */
   const cameraMissing =
     flightId !== null && !cameras.some((c) => c.flightId === flightId);
