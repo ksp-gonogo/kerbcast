@@ -1510,19 +1510,22 @@ namespace Kerbcast
 
             try
             {
-                // Manual render sequence: galaxy → scaled → near.
+                // Manual render sequence: galaxy → scaled → far → near.
                 // Cameras are permanently disabled (enabled=false) so
                 // Unity's auto-render never fires them; we drive each
                 // layer explicitly here and gate on the current layer mask
                 // (mirroring the old enabled-flag gating).
                 //
-                // The Scaled layer is bracketed by strip/restore of the
-                // "Composite Shadows" CommandBuffer on scaledSunLight —
-                // defensive measure for Scatterer-installed configs where
-                // KSP's deferred renderer attaches such a buffer. No-op
-                // on configs without that buffer attached (our case at
-                // dev time, but anyone running Scatterer would need it).
-                // try/finally ensures restore even if Render() throws.
+                // Strip Scatterer's screen-space shadow CommandBuffers off the
+                // sun light(s) for the WHOLE composite, restoring after the near
+                // render (and in the outer catch, as a safety net). Those buffers
+                // are attached to the sun light for the session and would
+                // otherwise fire during each clone layer render without their
+                // per-camera fade compensator, painting fixed-position, depth-
+                // occluded dark bands at planet depth. No-op when Scatterer (or
+                // another buffer-attaching mod) is absent.
+                ScaledSunLightHelper.StripCompositeShadowsBuffer();
+
                 if (_galaxyCam != null && (_layers & CameraLayers.Galaxy) != 0)
                 {
                     long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -1539,7 +1542,6 @@ namespace Kerbcast
                 long scaledStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 if (_scaledCam != null && (_layers & CameraLayers.Scaled) != 0)
                 {
-                    ScaledSunLightHelper.StripCompositeShadowsBuffer();
                     // ScaledSpaceFader disables scaled-body renderers globally
                     // based on the main camera's angular size. Our camera renders
                     // from a different position, so we manage visibility ourselves:
@@ -1623,7 +1625,6 @@ namespace Kerbcast
                             state.Renderer.SetPropertyBlock(_faderMpb);
                             state.Renderer.enabled = state.WasEnabled;
                         }
-                        ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
                     }
                 }
                 if (_telemetry && _scaledCam != null && (_layers & CameraLayers.Scaled) != 0)
@@ -1655,6 +1656,12 @@ namespace Kerbcast
                         _phaseTimings.Record(RenderPhase.Near,
                             (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
                 }
+
+                // Composite done: re-attach Scatterer's sun-light shadow buffers
+                // so the main flight render this frame gets correct shadows. The
+                // outer catch also restores, so a throw mid-composite cannot leave
+                // them stripped.
+                ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
 
                 // Blit the depth-bundled capture RT into the clean readback RT.
                 // When a HullcamVDS filter is active (NightVision etc), it
@@ -1755,6 +1762,11 @@ namespace Kerbcast
             catch (Exception ex)
             {
                 _readbackInFlight = false;
+                // Safety net: if a layer Render() threw mid-composite, the normal
+                // restore above was skipped. Re-attach here so the main flight
+                // render never loses Scatterer's sun-light shadow buffers. No-op
+                // if the normal path already restored (the saved list is cleared).
+                ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
                 LogRateLimited($"capture pipeline threw: {ex.GetType().Name}: {ex.Message}");
             }
         }
