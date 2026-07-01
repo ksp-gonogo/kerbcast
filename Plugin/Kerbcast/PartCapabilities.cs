@@ -119,16 +119,12 @@ namespace Kerbcast
             // without reintroducing the wide-arc "rotates about the wrong point"
             // behaviour that the earlier in-place fix removed.
             //
-            // Pan direction: TopJoint's local frame turns the rigidly-parented
-            // lens opposite to the operator's +panYaw = pan-right convention, so
-            // without correction commanding pan-right sweeps the view left
-            // (confirmed against live KSP). YawInvert negates the joint angle;
-            // because the head and the rigidly-parented lens share that one
-            // rotation, negating moves both together — it flips the control
-            // direction without reintroducing the head/lens sign split that the
-            // rigid mount fixed. (This is the job the old YawMeshInvert did for
-            // the mesh alone, back when the lens rotated separately on the part
-            // root.)
+            // Pan direction: the yaw sense was originally calibrated against the
+            // mirrored feed (the old capture readback flipped horizontally). Now
+            // that the readback flips vertically instead, the streamed image is
+            // no longer mirrored, so TopJoint's rotation matches the operator's
+            // +panYaw = pan-right convention directly and no inversion is needed.
+            // Inverting it here sweeps the view the wrong way.
             ["DC.TurretCam"] = new PanCapability
             {
                 YawMin = -135f, YawMax = 135f,
@@ -138,7 +134,7 @@ namespace Kerbcast
                 YawTransformName = "TopJoint",
                 PitchTransformName = "",
                 CameraMountLocal = new Vector3(0.047f, 0.046f, -0.200f),
-                YawInvert = true,
+                YawInvert = false,
             },
 
             // LaunchCam: single joint (hc_launchcam) that carries both yaw and
