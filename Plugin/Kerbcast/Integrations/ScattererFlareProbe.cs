@@ -30,6 +30,9 @@ namespace Kerbcast
         public FieldInfo NearField;           // Instance.nearCamera
         public FieldInfo ScaledField;         // Instance.scaledSpaceCamera
         public FieldInfo SourceScaledTransformField; // SunFlare.sourceScaledTransform
+        public FieldInfo SourceField;         // SunFlare.source (CelestialBody)
+        public FieldInfo CbmField;            // Scatterer.scattererCelestialBodiesManager
+        public FieldInfo UnderwaterField;     // <cbm>.underwater
 
         private int _preCull;
         private int _preRender;
@@ -60,11 +63,40 @@ namespace Kerbcast
                         sst.position - scaledCam.transform.position).ToString("F1");
                 }
 
+                // Replicate Scatterer's two occlusion raycasts (updateProperties):
+                // near-space toward the CelestialBody on layers 0|15, then, if clear,
+                // scaled-space toward the scaled sun on layer 10. Either hit -> flare
+                // gated off. No 10km filter (unlike our flarelog): any hit counts.
+                string r1 = "n/a";
+                var src = SourceField?.GetValue(flare) as CelestialBody;
+                if (nearCam != null && src != null && src.transform != null)
+                {
+                    Vector3 o = nearCam.transform.position;
+                    Vector3 d = (src.transform.position - o).normalized;
+                    r1 = Physics.Raycast(o, d, out var h1, Mathf.Infinity, 32769)
+                        ? $"HIT {h1.collider?.name}@{h1.distance:F0}m" : "clear";
+                }
+                string r2 = "n/a";
+                if (scaledCam != null && sst != null)
+                {
+                    Vector3 o = scaledCam.transform.position;
+                    Vector3 d = (sst.position - o).normalized;
+                    r2 = Physics.Raycast(o, d, out var h2, Mathf.Infinity, 1024)
+                        ? $"HIT {h2.collider?.name}@{h2.distance:F0}m" : "clear";
+                }
+                string uw = "?";
+                if (inst != null && CbmField != null && UnderwaterField != null)
+                {
+                    var cbm = CbmField.GetValue(inst);
+                    if (cbm != null) uw = UnderwaterField.GetValue(cbm).ToString();
+                }
+
                 Debug.Log(
                     $"[Kerbcast-flareprobe-in] cam={name} " +
                     $"Instance.near='{(nearCam != null ? nearCam.name : "null")}' " +
                     $"Instance.scaled='{(scaledCam != null ? scaledCam.name : "null")}' " +
-                    $"scaledCamSunAngle={angStr} val={valStr}");
+                    $"scaledCamSunAngle={angStr} val={valStr} " +
+                    $"ray1(near|0,15)={r1} ray2(scaled|10)={r2} underwater={uw}");
             }
             catch (Exception ex)
             {

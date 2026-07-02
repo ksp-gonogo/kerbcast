@@ -52,6 +52,9 @@ namespace Kerbcast
         private FieldInfo _flareMaterialField;  // SunFlare.sunglareMaterial
         private FieldInfo _flareGoField;        // SunFlare.sunflareGameObject (nonpublic)
         private FieldInfo _flareSourceScaledField; // SunFlare.sourceScaledTransform
+        private FieldInfo _flareSourceField;    // SunFlare.source (CelestialBody)
+        private FieldInfo _cbmField;            // Scatterer.scattererCelestialBodiesManager
+        private FieldInfo _underwaterField;     // <cbm>.underwater
 
         private readonly Dictionary<Camera, List<Component>> _added = new Dictionary<Camera, List<Component>>();
 
@@ -120,6 +123,10 @@ namespace Kerbcast
                     _flareGoField = flareType.GetField("sunflareGameObject",
                         BindingFlags.NonPublic | BindingFlags.Instance);
                     _flareSourceScaledField = flareType.GetField("sourceScaledTransform", PubInst);
+                    _flareSourceField = flareType.GetField("source", PubInst);
+                    _cbmField = t.GetField("scattererCelestialBodiesManager", PubInst);
+                    if (_cbmField != null)
+                        _underwaterField = _cbmField.FieldType.GetField("underwater", PubInst);
                 }
 
                 _ready = true;
@@ -242,6 +249,9 @@ namespace Kerbcast
             probe.NearField = _nearField;
             probe.ScaledField = _scaledField;
             probe.SourceScaledTransformField = _flareSourceScaledField;
+            probe.SourceField = _flareSourceField;
+            probe.CbmField = _cbmField;
+            probe.UnderwaterField = _underwaterField;
             Track(cam, probe);
         }
 
