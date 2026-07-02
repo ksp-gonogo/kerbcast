@@ -352,6 +352,11 @@ namespace Kerbcast
             {
                 FovMin = zoomable.cameraFoVMin;
                 FovMax = zoomable.cameraFoVMax;
+                // Clamp a fisheye-wide authored max (TurretCam maxes at 100).
+                // Applied here so the initial Fov clamp below and SetFov both
+                // respect the capped maximum.
+                if (_panCap.FovMaxCap.HasValue)
+                    FovMax = Mathf.Min(FovMax, _panCap.FovMaxCap.Value);
             }
             else
             {

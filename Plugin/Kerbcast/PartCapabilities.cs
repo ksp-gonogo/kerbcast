@@ -54,6 +54,12 @@ namespace Kerbcast
         /// yaw-only joint path; compound joints (LaunchCam) leave it false.</summary>
         public bool YawInvert;
 
+        /// <summary>Optional cap on the widest usable FoV, overriding the part's
+        /// authored cameraFoVMax. Wide-angle parts (TurretCam authors 100) look
+        /// fisheye and exaggerate pan parallax from an off-axis mount; clamp to a
+        /// rectilinear-sane maximum. Null leaves the authored range untouched.</summary>
+        public float? FovMaxCap;
+
         public bool SupportsPan => YawMin != YawMax || PitchMin != PitchMax;
     }
 
@@ -129,12 +135,19 @@ namespace Kerbcast
             {
                 YawMin = -135f, YawMax = 135f,
                 PitchMin = 0f,  PitchMax = 0f,
-                SlewDegPerSec = 180f,
+                // Slew halved from 180 to match LaunchCam: under staggered
+                // capture the mesh advances every frame but only streams on
+                // permit frames, so a fast slew streams big per-frame jumps
+                // (judder). 90 lets the current chase the target gradually.
+                SlewDegPerSec = 90f,
                 PanRateDegPerSec = 25f,
                 YawTransformName = "TopJoint",
                 PitchTransformName = "",
                 CameraMountLocal = new Vector3(0.047f, 0.046f, -0.200f),
                 YawInvert = false,
+                // Authored cameraFoVMax is 100, which reads as fisheye and
+                // magnifies the off-axis-mount pan parallax. Cap to 70.
+                FovMaxCap = 70f,
             },
 
             // LaunchCam: single joint (hc_launchcam) that carries both yaw and
