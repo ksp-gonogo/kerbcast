@@ -1,50 +1,35 @@
-// Scatterer capture for kerbcast's cloned cameras. Two parts:
-//
-// 1. A per-clone ScattererCameraSwap points Scatterer's singleton camera at the
-//    clone during its render (then restores), so Scatterer's atmosphere /
-//    scattering / ocean command buffers self-attach to the clone.
-//
-// 2. Copy Scatterer's SunflareCameraHook from the matching stock camera onto the
-//    clone (with its fields). The hook's OnPreRender sets renderOnCurrentCamera=1,
-//    which stops the shared sunflare mesh (layer 15) being culled for the clone -
-//    that is what makes the flare draw at all. Its useDbufferOnCamera is carried
-//    over from the source hook as-is (near=1, scaled=0); the working state
-//    captured on video used the source value, so we do not override it. On the
-//    scaled clone the copied hook runs as-is; on the near clone it is held
-//    disabled and a ScattererSunflareDriver performs its writes instead (see 5).
-//
-// 3. Keep the copied hook's flare reference live. Scatterer's SunflareManager
-//    DestroyImmediates every SunFlare on teardown (scene change, re-init) and
-//    builds fresh ones; the copied hook would then hold a destroyed flare and
-//    its OnPreRender silently no-ops (Unity null check), so the flare vanishes
-//    from the stream. PerFrame re-points the hook at the current live SunFlare
-//    (Scatterer.Instance.sunflareManager.scattererSunFlares) before each clone
-//    render.
-//
-// 4. Gate the flare per clone. Scatterer's renderSunFlare shader float is a
-//    single shared value computed from the main view, so a copied hook left
-//    always-enabled draws the flare on every clone whenever the PLAYER faces
-//    the sun. PerFrame enables each copied hook (or its driver, see 5) only
-//    while the sun projects into that clone's own viewport (with a margin for
-//    off-edge ghosts); disabled hooks get no OnPreRender, leaving
-//    renderOnCurrentCamera at 0 so the shared mesh is culled for that clone.
-//
-// 5. Widen occlusion on the near clone. Scatterer's updateProperties casts a
-//    single ray at the sun's center, so the flare pops off the instant a part
-//    edge crosses it while most of the disk still shows. ScattererSunflareDriver
-//    replaces the copied hook's render-time writes on the near clone: it calls
-//    updateProperties itself, then re-tests a blocked verdict with a ring of
-//    rays across the sun's apparent disk and keeps renderSunFlare=1 while any
-//    ray is clear. The copied hook stays disabled (single writer; OnPreRender
-//    order between components is undocumented) and only holds the flare
-//    reference that PerFrame keeps live.
-//
-// Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based effects
-// break under MSAA, so this integration reports ForcesNoMsaa = true; the host
-// then drives every clone and the capture RT with MSAA off.
-//
-// Reflection-only: no compile-time Scatterer reference. Absent or disabled
-// Scatterer no-ops.
+/* Scatterer capture for kerbcast's cloned cameras.
+
+   1. A per-clone ScattererCameraSwap points Scatterer's singleton camera at
+      the clone during its render (then restores), so Scatterer's atmosphere /
+      scattering / ocean command buffers self-attach to the clone.
+
+   2. Scatterer's SunflareCameraHook is copied (with its fields) from the
+      matching stock camera onto the clone. Its OnPreRender sets
+      renderOnCurrentCamera=1, which stops the shared sunflare mesh (layer 15)
+      being culled for the clone; useDbufferOnCamera carries over from the
+      source hook as-is. The scaled clone runs the copy directly; the near
+      clone holds it disabled and a ScattererSunflareDriver performs its
+      writes instead (see 4).
+
+   3. PerFrame keeps each copied hook's flare reference live (Scatterer
+      DestroyImmediates its SunFlares on scene change / re-init; a hook left
+      holding a dead flare silently no-ops) and gates the hook (or driver) on
+      the sun being inside that clone's own viewport. Scatterer's shared
+      renderSunFlare float follows the MAIN view, so an always-enabled copy
+      would draw the flare on every clone whenever the player faces the sun.
+
+   4. On the near clone the ScattererSunflareDriver widens Scatterer's
+      single-center-ray occlusion to a multi-point disk test, so the flare
+      stays on until the sun is fully hidden instead of popping off when a
+      part edge crosses the sun's center.
+
+   Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based
+   effects break under MSAA, so ForcesNoMsaa = true; the host then drives
+   every clone and the capture RT with MSAA off.
+
+   Reflection-only: no compile-time Scatterer reference. Absent or disabled
+   Scatterer no-ops. */
 
 using System;
 using System.Collections.Generic;
@@ -67,9 +52,8 @@ namespace Kerbcast
         private FieldInfo _unifiedField;        // Instance.unifiedCameraMode (may be null on old versions)
         private Type[] _scattererHookTypes;     // CameraRenderingHook + SunflareCameraHook types
 
-        // Sunflare reflection, resolved in Probe. The hook/flare/manager members
-        // drive the per-frame live-flare refresh (PerFrame); the rest feed the
-        // diagnostic ScattererFlareProbe when DebugCameraLogging is on.
+        /* Sunflare reflection, resolved in Probe. Consumed by PerFrame's
+           live-flare refresh + gate and by the ScattererSunflareDriver. */
         private Type _sunflareHookType;
         private FieldInfo _hookFlareField;      // SunflareCameraHook.flare
         private FieldInfo _hookDbufferField;    // SunflareCameraHook.useDbufferOnCamera
@@ -80,9 +64,7 @@ namespace Kerbcast
         private FieldInfo _flareSourceNameField; // SunFlare.sourceName
         private PropertyInfo _flareRenderingProp; // SunFlare.FlareRendering
         private FieldInfo _flareMaterialField;  // SunFlare.sunglareMaterial
-        private FieldInfo _flareGoField;        // SunFlare.sunflareGameObject (nonpublic)
         private FieldInfo _flareSourceScaledField; // SunFlare.sourceScaledTransform
-        private FieldInfo _flareSourceField;    // SunFlare.source (CelestialBody)
         private FieldInfo _cbmField;            // Scatterer.scattererCelestialBodiesManager
         private FieldInfo _underwaterField;     // <cbm>.underwater
 
@@ -153,8 +135,8 @@ namespace Kerbcast
                         && (x.Name.Contains("CameraRenderingHook") || x.Name.Contains("SunflareCameraHook")))
                     .ToArray();
 
-                // Sunflare reflection: refresh members first, then probe-only ones
-                // (all harmless if absent; the refresh just stays inert).
+                // Sunflare reflection: all harmless if absent; the refresh,
+                // gate, and driver just stay inert.
                 _sunflareHookType = asm.GetType("Scatterer.SunflareCameraHook");
                 var flareType = asm.GetType("Scatterer.SunFlare");
                 if (_sunflareHookType != null && flareType != null)
@@ -170,10 +152,7 @@ namespace Kerbcast
                             .GetField("scattererSunFlares", PubInst);
                     _flareRenderingProp = flareType.GetProperty("FlareRendering", PubInst);
                     _flareMaterialField = flareType.GetField("sunglareMaterial", PubInst);
-                    _flareGoField = flareType.GetField("sunflareGameObject",
-                        BindingFlags.NonPublic | BindingFlags.Instance);
                     _flareSourceScaledField = flareType.GetField("sourceScaledTransform", PubInst);
-                    _flareSourceField = flareType.GetField("source", PubInst);
                     _cbmField = t.GetField("scattererCelestialBodiesManager", PubInst);
                     if (_cbmField != null)
                         _underwaterField = _cbmField.FieldType.GetField("underwater", PubInst);
@@ -183,16 +162,6 @@ namespace Kerbcast
                 Debug.Log($"{LogTag} integration enabled " +
                     $"(scaled={_scaledField != null} far={_farField != null} " +
                     $"unified={_unifiedField != null} hooks={_scattererHookTypes.Length})");
-
-                if (KerbcastSettings.DebugCameraLogging)
-                {
-                    var inst = _instanceProp.GetValue(null, null);
-                    var nearCam = inst != null ? _nearField.GetValue(inst) as Camera : null;
-                    var scaledCam = inst != null && _scaledField != null
-                        ? _scaledField.GetValue(inst) as Camera : null;
-                    Debug.Log($"{LogTag} real cameras near='{(nearCam != null ? nearCam.name : "null")}' " +
-                        $"scaled='{(scaledCam != null ? scaledCam.name : "null")}'");
-                }
             }
             catch (Exception ex)
             {
@@ -228,17 +197,16 @@ namespace Kerbcast
                 // Camera ScaledSpace. Far reuses the near swap and needs no hooks.
                 if (layer == CameraLayers.Near)
                 {
-                    // Only nearCamera is swapped to the clone (above). We deliberately
-                    // do NOT repoint scaledSpaceCamera here: Scatterer's sunflare gate
-                    // (updateProperties) must run against the real scaled camera so its
-                    // sun-occlusion self-reset works. Each near clone then draws the
-                    // shared flare mesh at its OWN GPU-projected sun position, so the
-                    // flare is per-camera for free. The shared renderSunFlare float
-                    // still follows the main view; PerFrame compensates by enabling
-                    // the copied hook only while the sun is in this clone's view.
+                    /* Only nearCamera is swapped to the clone (above); we
+                       deliberately do NOT repoint scaledSpaceCamera. Scatterer's
+                       sunflare gate (updateProperties) must run against the real
+                       scaled camera so its sun-occlusion self-reset works. Each
+                       near clone still draws the shared flare mesh at its OWN
+                       GPU-projected sun position, so the flare is per-camera for
+                       free; PerFrame's sun-in-view gate covers the shared
+                       renderSunFlare float following the main view. */
                     CopyRenderingHooks("Camera 00", cam);
                     AttachFlareDriver(cam);
-                    if (KerbcastSettings.DebugCameraLogging) AttachFlareProbe(cam);
                 }
                 else if (layer == CameraLayers.Scaled)
                     CopyRenderingHooks("Camera ScaledSpace", cam);
@@ -251,37 +219,13 @@ namespace Kerbcast
         }
 
         // Attach a camera-reference swap to the clone for one Scatterer singleton
-        // field, tracked so RemoveFromLayer tears it down. A clone can carry more
-        // than one (the near clone swaps both nearCamera and scaledSpaceCamera).
-        private void AddSwap(Camera cam, FieldInfo field, Camera swapIn = null)
+        // field, tracked so RemoveFromLayer tears it down.
+        private void AddSwap(Camera cam, FieldInfo field)
         {
             var swap = cam.gameObject.AddComponent<ScattererCameraSwap>();
             swap.InstanceProperty = _instanceProp;
             swap.CameraField = field;
-            swap.SwapInOverride = swapIn;
             Track(cam, swap);
-        }
-
-        // Diagnostic-only: attach a probe that logs Scatterer's live flare state on
-        // the clone. Caller gates on DebugCameraLogging.
-        private void AttachFlareProbe(Camera cam)
-        {
-            if (_sunflareHookType == null) return;
-            var probe = cam.gameObject.AddComponent<ScattererFlareProbe>();
-            probe.HookType = _sunflareHookType;
-            probe.HookFlareField = _hookFlareField;
-            probe.FlareRenderingProp = _flareRenderingProp;
-            probe.MaterialField = _flareMaterialField;
-            probe.FlareGoField = _flareGoField;
-            probe.HookDbufferField = _hookDbufferField;
-            probe.InstanceProp = _instanceProp;
-            probe.NearField = _nearField;
-            probe.ScaledField = _scaledField;
-            probe.SourceScaledTransformField = _flareSourceScaledField;
-            probe.SourceField = _flareSourceField;
-            probe.CbmField = _cbmField;
-            probe.UnderwaterField = _underwaterField;
-            Track(cam, probe);
         }
 
         /* Give the near clone a driver that performs the copied hook's render-
@@ -339,19 +283,11 @@ namespace Kerbcast
         {
             if (_scattererHookTypes == null || _scattererHookTypes.Length == 0) return;
             var source = Camera.allCameras.FirstOrDefault(c => c.name == sourceCameraName);
-            if (source == null)
-            {
-                if (KerbcastSettings.DebugCameraLogging)
-                    Debug.Log($"{LogTag} copyhooks target={target.name} src='{sourceCameraName}' FOUND=false");
-                return;
-            }
+            if (source == null) return;
             foreach (var hookType in _scattererHookTypes)
             {
                 if (target.gameObject.GetComponent(hookType) != null) continue;
                 var src = source.gameObject.GetComponent(hookType);
-                if (KerbcastSettings.DebugCameraLogging)
-                    Debug.Log($"{LogTag} copyhooks target={target.name} src='{sourceCameraName}' " +
-                        $"{hookType.Name} srcExists={src != null}");
                 if (src == null) continue;
                 var dst = target.gameObject.AddComponent(hookType);
                 if (dst == null) continue;
@@ -424,32 +360,20 @@ namespace Kerbcast
             }
         }
 
-        // Called just before each clone layer renders. Two jobs for clones that
-        // carry a copied flare hook (near, scaled):
-        //
-        // 1. Re-point: Scatterer's SunflareManager DestroyImmediates its SunFlares
-        //    on teardown / re-init and builds fresh ones; a copied hook left
-        //    holding the dead flare silently stops driving the flare (its
-        //    OnPreRender Unity-null-checks it). Re-point the hook at the current
-        //    live SunFlare whenever its reference has gone stale. Runs regardless
-        //    of the gate below so the reference is live when the hook re-enables.
-        //
-        // 2. Gate: enable the copied hook (or, on the near clone, its
-        //    ScattererSunflareDriver) only when the sun is in THIS clone's
-        //    view. Scatterer's renderSunFlare float is shared and computed from
-        //    the MAIN view (Instance.scaledSpaceCamera is never swapped), so when
-        //    the player faces the sun every enabled copy would draw the flare on
-        //    its clone, even one pointing away from the sun. A disabled hook gets
-        //    no OnPreRender, so renderOnCurrentCamera stays 0 (every enabled
-        //    hook's OnPostRender resets it) and the shared flare mesh is culled
-        //    for that clone's manual Render().
+        /* Called just before each clone layer renders. For clones carrying a
+           copied flare hook (near, scaled): re-point the hook's flare reference
+           if Scatterer has rebuilt its SunFlares (runs regardless of the gate
+           so the reference is live on re-enable), then enable the hook - or, on
+           the near clone, its driver - only while the sun is in THIS clone's
+           view. A disabled hook gets no OnPreRender, so renderOnCurrentCamera
+           stays 0 and the shared flare mesh is culled for that clone. */
         public void PerFrame(Camera cam, CameraLayers layer, in IntegrationFrameState state)
         {
             if (!_ready || _hookFlareField == null || cam == null) return;
             if (!_flareHooks.TryGetValue(cam, out var hook) || hook == null) return;
             try
             {
-                RefreshFlareReference(cam, hook);
+                RefreshFlareReference(hook);
                 /* The gate owns the enabled state from here on. Cheap: Unity only
                    fires OnEnable/OnDisable on an actual change. Where a driver
                    exists (near clone) it is gated instead and the copied hook is
@@ -473,7 +397,7 @@ namespace Kerbcast
             }
         }
 
-        private void RefreshFlareReference(Camera cam, Behaviour hook)
+        private void RefreshFlareReference(Behaviour hook)
         {
             var current = _hookFlareField.GetValue(hook) as UnityEngine.Object;
             if (current != null) return; // flare still live (Unity liveness check)
@@ -482,8 +406,6 @@ namespace Kerbcast
             if (live == null) return; // Scatterer mid-rebuild; retry next frame
 
             _hookFlareField.SetValue(hook, live);
-            var liveName = _flareSourceNameField?.GetValue(live) as string ?? "?";
-            Debug.Log($"{LogTag} re-pointed flare hook on '{cam.name}' to live SunFlare '{liveName}'");
         }
 
         // Sun inside this clone's viewport (in front of the camera, within the

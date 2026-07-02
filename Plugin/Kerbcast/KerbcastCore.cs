@@ -466,17 +466,6 @@ namespace Kerbcast
             if (_throttleEffective && !_fxCamSuppressed)
                 TrySuppressFxCamera();
 
-            // Debug: periodic cullingMask divergence check. ~once per
-            // minute (3600 LateUpdates at 60fps; degrades gracefully
-            // at lower fps). Gated inside the cam itself so this is a
-            // single nullary call per tick when off.
-            if (--_debugMaskCheckCountdown <= 0)
-            {
-                _debugMaskCheckCountdown = 3600;
-                for (int i = 0; i < _cameras.Count; i++)
-                    _cameras[i].LogCullingMaskIfDiverged();
-            }
-
             // Defensive: scan for cameras whose Hullcam part has gone null
             // (e.g. a destruction event we missed, or a KSP internal teardown
             // that doesn't fire onPartDestroyed). DisposeDestroyed + remove them
@@ -615,7 +604,6 @@ namespace Kerbcast
         // FXCamera doesn't escape suppression.
         private bool _fxCamSuppressed;
         private GUIStyle _throttleWarnStyle;
-        private int _debugMaskCheckCountdown = 60;
 
         // Read the operator-set Difficulty value, with a fallback to
         // the settings.cfg seed when no save is active (shouldn't

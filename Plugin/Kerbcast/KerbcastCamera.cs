@@ -231,8 +231,6 @@ namespace Kerbcast
         private bool _disposed;
         private bool _firstRender = true;
         private bool _firstPixelCheck = true;
-        private int _bufferDumpFrame; // dumps once at frame 120, after lazy buffers attach
-        private float _lastFlareLog;  // throttle for the per-camera sunflare-decision log
         private struct FaderState
         {
             public Renderer Renderer;
@@ -847,25 +845,6 @@ namespace Kerbcast
             _scaledCam.enabled = false;
             _galaxyCam.enabled = false;
 
-            // Debug log of per-camera cullingMask + source-camera
-            // cullingMask. Gated on settings.cfg DebugCameraLogging
-            // (default off). Hook for the cam-stream-FX investigation
-            // — we suspect KSP dynamically modifies Camera 00's mask
-            // after our one-shot CopyFrom and that's why atmospheric
-            // effects are missing from streams. Logging both sides
-            // lets the operator catch the divergence in KSP.log.
-            if (KerbcastSettings.DebugCameraLogging)
-            {
-                long srcNearMask = sourceNear != null ? sourceNear.cullingMask : 0;
-                long srcScaledMask = sourceScaled != null ? sourceScaled.cullingMask : 0;
-                long srcGalaxyMask = sourceGalaxy != null ? sourceGalaxy.cullingMask : 0;
-                Debug.Log(
-                    $"[Kerbcast-debug] cam={FlightId} cullingMasks " +
-                    $"near=src:0x{srcNearMask:X8}/ours:0x{_nearCam.cullingMask:X8} " +
-                    $"scaled=src:0x{srcScaledMask:X8}/ours:0x{_scaledCam.cullingMask:X8} " +
-                    $"galaxy=src:0x{srcGalaxyMask:X8}/ours:0x{_galaxyCam.cullingMask:X8}");
-            }
-
             // Build the pluggable atmospheric-FX host for the near camera. The
             // effective layer set folds the master toggle in (off → no effects,
             // a genuine no-op). Each effect owns its own rendering surface.
@@ -959,25 +938,6 @@ namespace Kerbcast
                when the set is unchanged. */
             _fxHost?.SetEnabledLayers(EffectiveFxLayers());
             _fxHost?.OnVesselChanged(Hullcam != null ? Hullcam.vessel : null);
-        }
-
-        // Periodic cullingMask diff between our cams and their KSP
-        // source cameras. Catches the case where KSP mutates the
-        // source cam's mask after we CopyFrom'd — our cams would
-        // miss whatever the new layer is. Gated, called once per
-        // minute by KerbcastCore so the log stays readable.
-        public void LogCullingMaskIfDiverged()
-        {
-            if (!KerbcastSettings.DebugCameraLogging) return;
-            var srcNear = FindKspCamera("Camera 00");
-            if (srcNear == null || _nearCam == null) return;
-            if (srcNear.cullingMask != _nearCam.cullingMask)
-            {
-                Debug.Log(
-                    $"[Kerbcast-debug] cam={FlightId} near cullingMask DIVERGED — " +
-                    $"src:0x{srcNear.cullingMask:X8} ours:0x{_nearCam.cullingMask:X8} " +
-                    $"missing-from-ours:0x{srcNear.cullingMask & ~_nearCam.cullingMask:X8}");
-            }
         }
 
         private static Camera FindKspCamera(string name)
@@ -1137,80 +1097,6 @@ namespace Kerbcast
                 if (r != null) _scaledBodyRenderers.Add(r);
             }
             return _scaledBodyRenderers;
-        }
-
-        // Diagnostic: dump the CommandBuffers attached to a clone camera at every
-        // CameraEvent. Traces which screen-space pass draws the fixed-position
-        // dark bands (suspected a Scatterer buffer sampling a main-camera-sized
-        // texture on our differently-sized clone RT). Gated on DebugCameraLogging;
-        // runs once per camera.
-        private void DumpCameraBuffers(Camera cam, string label)
-        {
-            if (cam == null) return;
-            foreach (UnityEngine.Rendering.CameraEvent ev in
-                     System.Enum.GetValues(typeof(UnityEngine.Rendering.CameraEvent)))
-            {
-                foreach (var b in cam.GetCommandBuffers(ev))
-                    Debug.Log($"[Kerbcast] cam={FlightId} {label} cmdbuffer event={ev} name='{b.name}'");
-            }
-        }
-
-        // Diagnostic: a clone camera's effective render state. Confirms whether the
-        // galaxy Forward force actually took (actualRenderingPath) and whether the
-        // cullingMask still includes the layer the galaxy cube renders on.
-        private void DumpCameraState(Camera cam, string label)
-        {
-            if (cam == null) return;
-            Debug.Log($"[Kerbcast] cam={FlightId} {label} state path={cam.actualRenderingPath} " +
-                $"cullingMask=0x{cam.cullingMask:X} clearFlags={cam.clearFlags} " +
-                $"hdr={cam.allowHDR} bg={cam.backgroundColor}");
-        }
-
-        // Diagnostic: the galaxy cube's renderers - whether they exist, are enabled,
-        // what layer they are on, and whether the galaxy clone's cullingMask renders
-        // that layer. Pins why the galaxy clone shows nothing.
-        private void DumpGalaxyCube()
-        {
-            var ctrl = UnityEngine.Object.FindObjectOfType<GalaxyCubeControl>();
-            if (ctrl == null) { Debug.Log($"[Kerbcast] cam={FlightId} galaxy cube: GalaxyCubeControl not found"); return; }
-            var rends = ctrl.GetComponentsInChildren<Renderer>();
-            int mask = _galaxyCam != null ? _galaxyCam.cullingMask : 0;
-            foreach (var r in rends)
-            {
-                if (r == null) continue;
-                bool inMask = (mask & (1 << r.gameObject.layer)) != 0;
-                Debug.Log($"[Kerbcast] cam={FlightId} galaxy cube renderer '{r.name}' " +
-                    $"enabled={r.enabled} layer={r.gameObject.layer} inGalaxyMask={inMask}");
-            }
-        }
-
-        // Diagnostic: the per-camera inputs to Scatterer's sunflare decision, to
-        // test whether the flare tracks THIS clone's facing. Logs the near clone's
-        // angle to the sun and where the sun projects in the clone's own viewport
-        // (z sign = in front / behind, onScreen = within the frame). Cross-ref with
-        // the video: if the flare shows while the sun is behind (z-) or off-screen,
-        // the flare is ignoring this clone's facing.
-        private void LogFlareDecision()
-        {
-            if (_nearCam == null || Planetarium.fetch == null || Planetarium.fetch.Sun == null) return;
-            Vector3 sunPos = (Vector3)Planetarium.fetch.Sun.position;
-            Vector3 fwd = _nearCam.transform.forward;
-            Vector3 sunDir = (sunPos - _nearCam.transform.position).normalized;
-            float angle = Vector3.Angle(fwd, sunDir);
-            Vector3 vp = _nearCam.WorldToViewportPoint(sunPos);
-            bool onScreen = vp.z > 0f && vp.x >= 0f && vp.x <= 1f && vp.y >= 0f && vp.y <= 1f;
-            // Replicate Scatterer's occlusion test: raycast from the lens toward
-            // the sun on the part/scenery layers. A near hit = a vessel part
-            // blocks the flare for this camera; name it so the operator can see
-            // what to move. A hit only at planetary distance is effectively clear.
-            Vector3 camPos = _nearCam.transform.position;
-            string los = "clear";
-            if (UnityEngine.Physics.Raycast(camPos, sunDir, out var hit, Mathf.Infinity, (1 << 0) | (1 << 15))
-                && hit.distance < 10000f)
-                los = $"BLOCKED:{hit.collider?.name}@{hit.distance:F0}m";
-            Debug.Log($"[Kerbcast] flarelog cam={FlightId} name='{Hullcam?.cameraName}' " +
-                $"sunAngle={angle:F1} sunVP=({vp.x:F2},{vp.y:F2},z{(vp.z >= 0f ? "+" : "-")}) " +
-                $"onScreen={onScreen} los={los}");
         }
 
         private void ApplyLayers()
@@ -1625,14 +1511,6 @@ namespace Kerbcast
                 // another buffer-attaching mod) is absent.
                 ScaledSunLightHelper.StripCompositeShadowsBuffer();
 
-                // Per-camera sunflare-decision log, throttled to ~2 Hz. Transforms
-                // are current here (pan/orientation already applied this tick).
-                if (KerbcastSettings.DebugCameraLogging && Time.unscaledTime - _lastFlareLog >= 0.5f)
-                {
-                    _lastFlareLog = Time.unscaledTime;
-                    LogFlareDecision();
-                }
-
                 if (_galaxyCam != null && (_layers & CameraLayers.Galaxy) != 0)
                 {
                     long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -1769,27 +1647,6 @@ namespace Kerbcast
                 // outer catch also restores, so a throw mid-composite cannot leave
                 // them stripped.
                 ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
-
-                // One-shot diagnostic (DebugCameraLogging): dump the command
-                // buffers on each clone camera once, at frame 120 rather than the
-                // first composite - Scatterer's lazy buffers land during geometry
-                // render over the first seconds, so dumping too early logs nothing.
-                // Also logs each clone's actual rendering path / cullingMask /
-                // clearFlags to trace the still-black galaxy after the Forward fix.
-                if (KerbcastSettings.DebugCameraLogging && _bufferDumpFrame < 121)
-                {
-                    _bufferDumpFrame++;
-                    if (_bufferDumpFrame == 120)
-                    {
-                        DumpCameraBuffers(_nearCam, "near");
-                        DumpCameraBuffers(_scaledCam, "scaled");
-                        DumpCameraBuffers(_farCam, "far");
-                        DumpCameraBuffers(_galaxyCam, "galaxy");
-                        DumpCameraState(_galaxyCam, "galaxy");
-                        DumpCameraState(_scaledCam, "scaled");
-                        DumpGalaxyCube();
-                    }
-                }
 
                 // Blit the depth-bundled capture RT into the clean readback RT.
                 // When a HullcamVDS filter is active (NightVision etc), it
