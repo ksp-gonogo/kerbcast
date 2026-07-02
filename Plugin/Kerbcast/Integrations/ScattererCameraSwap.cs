@@ -24,6 +24,13 @@ namespace Kerbcast
         public PropertyInfo InstanceProperty;
         public FieldInfo CameraField;
 
+        // Camera to write into CameraField during the swap. Defaults to this
+        // component's own camera; set to a sibling when a clone must masquerade as a
+        // DIFFERENT Scatterer camera than itself (the near clone points
+        // scaledSpaceCamera at the scaled clone so the sunflare's scaled-space
+        // viewport math is computed in the right coordinate space).
+        public Camera SwapInOverride;
+
         private Camera _cam;
         private object _savedInstance;
         private object _savedValue;
@@ -39,9 +46,11 @@ namespace Kerbcast
             {
                 var inst = InstanceProperty.GetValue(null, null);
                 if (inst == null) return;
+                var swapIn = SwapInOverride != null ? SwapInOverride : _cam;
+                if (swapIn == null) return;
                 _savedInstance = inst;
                 _savedValue = CameraField.GetValue(inst);
-                CameraField.SetValue(inst, _cam);
+                CameraField.SetValue(inst, swapIn);
                 _swapped = true;
             }
             catch (Exception ex)

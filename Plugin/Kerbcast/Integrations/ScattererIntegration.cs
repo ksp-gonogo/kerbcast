@@ -171,13 +171,21 @@ namespace Kerbcast
                 {
                     // Scatterer's sunflare reads Instance.scaledSpaceCamera in
                     // updateProperties for its render gate, scale and screen
-                    // position, so the flare only shows when THAT camera faces the
-                    // sun. The flare mesh renders on the near clone (layer 15), so
-                    // point scaledSpaceCamera at the near clone during its render
-                    // too; without this the flare tracks the player's main view
-                    // instead of the stream and never appears on a clone.
+                    // position, computing the sun's viewport from a SCALED-SPACE
+                    // camera. The flare mesh renders on the near clone (layer 15),
+                    // so during the near clone's render point scaledSpaceCamera at
+                    // the matching SCALED clone (not the near clone: a local-space
+                    // camera projects the scaled-space sun position to a bogus
+                    // viewport, val.z<=0, and the gate never passes). This makes the
+                    // flare track the clone's view instead of the player's.
                     if (_scaledField != null && _scaledField != field)
-                        AddSwap(cam, _scaledField);
+                    {
+                        var scaledSibling = FindScaledSibling(cam);
+                        AddSwap(cam, _scaledField, scaledSibling);
+                        if (KerbcastSettings.DebugCameraLogging)
+                            Debug.Log($"{LogTag} near clone {cam.name} scaled-sibling=" +
+                                $"{(scaledSibling != null ? scaledSibling.name : "NOT FOUND")}");
+                    }
                     CopyRenderingHooks("Camera 00", cam);
                     if (KerbcastSettings.DebugCameraLogging) AttachFlareProbe(cam);
                 }
@@ -194,12 +202,26 @@ namespace Kerbcast
         // Attach a camera-reference swap to the clone for one Scatterer singleton
         // field, tracked so RemoveFromLayer tears it down. A clone can carry more
         // than one (the near clone swaps both nearCamera and scaledSpaceCamera).
-        private void AddSwap(Camera cam, FieldInfo field)
+        private void AddSwap(Camera cam, FieldInfo field, Camera swapIn = null)
         {
             var swap = cam.gameObject.AddComponent<ScattererCameraSwap>();
             swap.InstanceProperty = _instanceProp;
             swap.CameraField = field;
+            swap.SwapInOverride = swapIn;
             Track(cam, swap);
+        }
+
+        // Find the scaled clone that pairs with a near clone. They are named
+        // "Kerbcast_<id>_Near" / "Kerbcast_<id>_Scaled". Uses FindObjectsOfTypeAll so
+        // a disabled clone (ours are enabled=false) is still found.
+        private static Camera FindScaledSibling(Camera nearClone)
+        {
+            if (nearClone == null || nearClone.name == null || !nearClone.name.EndsWith("_Near"))
+                return null;
+            var scaledName = nearClone.name.Substring(0, nearClone.name.Length - "_Near".Length) + "_Scaled";
+            foreach (var c in Resources.FindObjectsOfTypeAll<Camera>())
+                if (c != null && c.name == scaledName) return c;
+            return null;
         }
 
         // Diagnostic-only: attach a probe that logs Scatterer's live flare state on
