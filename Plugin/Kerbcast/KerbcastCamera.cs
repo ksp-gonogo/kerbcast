@@ -748,6 +748,14 @@ namespace Kerbcast
             _galaxyCam.allowHDR = true;
             _galaxyCam.allowMSAA = allowMsaa;
             _galaxyCam.useOcclusionCulling = false;
+            // Force Forward, same as the scaled clone. With the Deferred mod the
+            // game runs deferred and this clone inherits DeferredShading via
+            // CopyFrom, but deferred offscreen RTs render pure black on Mesa/
+            // OpenGL (the Deck): the galaxy cube is a forward-authored skybox and
+            // vanished entirely. DeferredIntegration only force-forwards near/far,
+            // so the galaxy clone was the one layer left deferred. The galaxy has
+            // no scene lights, so Forward costs nothing.
+            _galaxyCam.renderingPath = RenderingPath.Forward;
             var galaxyRot = galaxyGo.AddComponent<LayerCamRotator>();
             galaxyRot.NearCamera = _nearCam;
             galaxyRot.UseScaledSpace = false;
