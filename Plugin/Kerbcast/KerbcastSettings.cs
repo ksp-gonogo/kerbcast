@@ -185,11 +185,15 @@ namespace Kerbcast
         // Firefly is installed. No effect if Firefly isn't installed.
         public static bool EnableFirefly { get; private set; } = true;
 
-        // Name of the installed TUFX profile to attach to kerbcast's per-camera
-        // volumes. Default empty: volumes inherit TUFX's own scene selection
-        // (whatever the operator picked in TUFX's UI for Flight). No effect
+        // Name of the TUFX profile to attach to kerbcast's per-camera volumes.
+        // Defaults to the shipped clone-safe profile (Kerbcast-TUFX-Profile.cfg):
+        // TUFX's AmbientOcclusion and AutoExposure break offscreen clone rendering
+        // (fixed-position dark bands, a blacked galaxy layer, a dimmed reticle), so
+        // the clones get a profile with just bloom + AA while the player keeps
+        // their own. Set to another profile name to override, or empty to inherit
+        // the player's profile (which reintroduces those artifacts). No effect
         // without TUFX installed.
-        public static string TUFXProfile { get; private set; } = "";
+        public static string TUFXProfile { get; private set; } = "Kerbcast-Clone";
 
         // When true (default), kerbcast Harmony-patches HullcamVDS's
         // CameraFilter.LoadBundle to substitute our rebuilt shaders.linux.
