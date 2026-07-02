@@ -231,7 +231,7 @@ namespace Kerbcast
         private bool _disposed;
         private bool _firstRender = true;
         private bool _firstPixelCheck = true;
-        private bool _firstBufferDump = true;
+        private int _bufferDumpFrame; // dumps once at frame 120, after lazy buffers attach
         private struct FaderState
         {
             public Renderer Renderer;
@@ -1154,6 +1154,35 @@ namespace Kerbcast
             }
         }
 
+        // Diagnostic: a clone camera's effective render state. Confirms whether the
+        // galaxy Forward force actually took (actualRenderingPath) and whether the
+        // cullingMask still includes the layer the galaxy cube renders on.
+        private void DumpCameraState(Camera cam, string label)
+        {
+            if (cam == null) return;
+            Debug.Log($"[Kerbcast] cam={FlightId} {label} state path={cam.actualRenderingPath} " +
+                $"cullingMask=0x{cam.cullingMask:X} clearFlags={cam.clearFlags} " +
+                $"hdr={cam.allowHDR} bg={cam.backgroundColor}");
+        }
+
+        // Diagnostic: the galaxy cube's renderers - whether they exist, are enabled,
+        // what layer they are on, and whether the galaxy clone's cullingMask renders
+        // that layer. Pins why the galaxy clone shows nothing.
+        private void DumpGalaxyCube()
+        {
+            var ctrl = UnityEngine.Object.FindObjectOfType<GalaxyCubeControl>();
+            if (ctrl == null) { Debug.Log($"[Kerbcast] cam={FlightId} galaxy cube: GalaxyCubeControl not found"); return; }
+            var rends = ctrl.GetComponentsInChildren<Renderer>();
+            int mask = _galaxyCam != null ? _galaxyCam.cullingMask : 0;
+            foreach (var r in rends)
+            {
+                if (r == null) continue;
+                bool inMask = (mask & (1 << r.gameObject.layer)) != 0;
+                Debug.Log($"[Kerbcast] cam={FlightId} galaxy cube renderer '{r.name}' " +
+                    $"enabled={r.enabled} layer={r.gameObject.layer} inGalaxyMask={inMask}");
+            }
+        }
+
         private void ApplyLayers()
         {
             // Cameras are permanently disabled (enabled=false) — Unity's
@@ -1703,17 +1732,25 @@ namespace Kerbcast
                 // them stripped.
                 ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
 
-                // One-shot diagnostic (DebugCameraLogging): after the first full
-                // composite, dump the command buffers now attached to each clone
-                // camera. Lazy Scatterer buffers land during the geometry render,
-                // so they are present by here. Traces the fixed-position dark bands.
-                if (KerbcastSettings.DebugCameraLogging && _firstBufferDump)
+                // One-shot diagnostic (DebugCameraLogging): dump the command
+                // buffers on each clone camera once, at frame 120 rather than the
+                // first composite - Scatterer's lazy buffers land during geometry
+                // render over the first seconds, so dumping too early logs nothing.
+                // Also logs each clone's actual rendering path / cullingMask /
+                // clearFlags to trace the still-black galaxy after the Forward fix.
+                if (KerbcastSettings.DebugCameraLogging && _bufferDumpFrame < 121)
                 {
-                    _firstBufferDump = false;
-                    DumpCameraBuffers(_nearCam, "near");
-                    DumpCameraBuffers(_scaledCam, "scaled");
-                    DumpCameraBuffers(_farCam, "far");
-                    DumpCameraBuffers(_galaxyCam, "galaxy");
+                    _bufferDumpFrame++;
+                    if (_bufferDumpFrame == 120)
+                    {
+                        DumpCameraBuffers(_nearCam, "near");
+                        DumpCameraBuffers(_scaledCam, "scaled");
+                        DumpCameraBuffers(_farCam, "far");
+                        DumpCameraBuffers(_galaxyCam, "galaxy");
+                        DumpCameraState(_galaxyCam, "galaxy");
+                        DumpCameraState(_scaledCam, "scaled");
+                        DumpGalaxyCube();
+                    }
                 }
 
                 // Blit the depth-bundled capture RT into the clean readback RT.
