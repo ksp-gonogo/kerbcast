@@ -15,6 +15,14 @@
 //    gross occlusion by terrain and parts is kept; only per-pixel core occlusion is
 //    dropped, which a stream does not need.
 //
+// 3. Keep the copied hook's flare reference live. Scatterer's SunflareManager
+//    DestroyImmediates every SunFlare on teardown (scene change, re-init) and
+//    builds fresh ones; the copied hook would then hold a destroyed flare and
+//    its OnPreRender silently no-ops (Unity null check), so the flare vanishes
+//    from the stream. PerFrame re-points the hook at the current live SunFlare
+//    (Scatterer.Instance.sunflareManager.scattererSunFlares) before each clone
+//    render.
+//
 // Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based effects
 // break under MSAA, so this integration reports ForcesNoMsaa = true; the host
 // then drives every clone and the capture RT with MSAA off.
@@ -43,11 +51,15 @@ namespace Kerbcast
         private FieldInfo _unifiedField;        // Instance.unifiedCameraMode (may be null on old versions)
         private Type[] _scattererHookTypes;     // CameraRenderingHook + SunflareCameraHook types
 
-        // Diagnostic reflection, resolved in Probe, used only when
-        // DebugCameraLogging is on (ScattererFlareProbe reads the live flare state).
+        // Sunflare reflection, resolved in Probe. The hook/flare/manager members
+        // drive the per-frame live-flare refresh (PerFrame); the rest feed the
+        // diagnostic ScattererFlareProbe when DebugCameraLogging is on.
         private Type _sunflareHookType;
         private FieldInfo _hookFlareField;      // SunflareCameraHook.flare
         private FieldInfo _hookDbufferField;    // SunflareCameraHook.useDbufferOnCamera
+        private FieldInfo _sunflareManagerField; // Instance.sunflareManager
+        private FieldInfo _flaresDictField;     // SunflareManager.scattererSunFlares
+        private FieldInfo _flareSourceNameField; // SunFlare.sourceName
         private PropertyInfo _flareRenderingProp; // SunFlare.FlareRendering
         private FieldInfo _flareMaterialField;  // SunFlare.sunglareMaterial
         private FieldInfo _flareGoField;        // SunFlare.sunflareGameObject (nonpublic)
@@ -58,9 +70,14 @@ namespace Kerbcast
 
         private readonly Dictionary<Camera, List<Component>> _added = new Dictionary<Camera, List<Component>>();
 
+        // Copied SunflareCameraHook per clone, for the per-frame live-flare refresh.
+        private readonly Dictionary<Camera, Behaviour> _flareHooks = new Dictionary<Camera, Behaviour>();
+
         public string Name => "Scatterer";
         public bool ForcesNoMsaa => true;
-        public bool NeedsPerFrame => false;
+        // Per-frame work: keep each copied flare hook pointed at the live SunFlare
+        // (Scatterer destroys and rebuilds its flares on scene change / re-init).
+        public bool NeedsPerFrame => true;
         // Near, scaled, and (dual-cam only) far. Scatterer never touches galaxy.
         public CameraLayers AppliesToLayers =>
             CameraLayers.Near | CameraLayers.Scaled | CameraLayers.Far;
@@ -111,13 +128,19 @@ namespace Kerbcast
                         && (x.Name.Contains("CameraRenderingHook") || x.Name.Contains("SunflareCameraHook")))
                     .ToArray();
 
-                // Diagnostic reflection for ScattererFlareProbe (harmless if absent).
+                // Sunflare reflection: refresh members first, then probe-only ones
+                // (all harmless if absent; the refresh just stays inert).
                 _sunflareHookType = asm.GetType("Scatterer.SunflareCameraHook");
                 var flareType = asm.GetType("Scatterer.SunFlare");
                 if (_sunflareHookType != null && flareType != null)
                 {
                     _hookFlareField = _sunflareHookType.GetField("flare", PubInst);
                     _hookDbufferField = _sunflareHookType.GetField("useDbufferOnCamera", PubInst);
+                    _flareSourceNameField = flareType.GetField("sourceName", PubInst);
+                    _sunflareManagerField = t.GetField("sunflareManager", PubInst);
+                    if (_sunflareManagerField != null)
+                        _flaresDictField = _sunflareManagerField.FieldType
+                            .GetField("scattererSunFlares", PubInst);
                     _flareRenderingProp = flareType.GetProperty("FlareRendering", PubInst);
                     _flareMaterialField = flareType.GetField("sunglareMaterial", PubInst);
                     _flareGoField = flareType.GetField("sunflareGameObject",
@@ -277,7 +300,13 @@ namespace Kerbcast
                 // Scatterer holds no reference to our copy, so it never toggles it
                 // back off.
                 if (dst is Behaviour hookBehaviour)
+                {
                     hookBehaviour.enabled = true;
+                    // Remember the flare hook so PerFrame can keep its flare
+                    // reference live across Scatterer rebuilds.
+                    if (hookType == _sunflareHookType)
+                        _flareHooks[target] = hookBehaviour;
+                }
                 Track(target, dst);
             }
         }
@@ -321,6 +350,7 @@ namespace Kerbcast
                         if (c != null) UnityEngine.Object.Destroy(c); // OnDisable restores
                     _added.Remove(cam);
                 }
+                _flareHooks.Remove(cam);
             }
             catch (Exception ex)
             {
@@ -328,6 +358,64 @@ namespace Kerbcast
             }
         }
 
-        public void PerFrame(Camera cam, CameraLayers layer, in IntegrationFrameState state) { }
+        // Called just before each clone layer renders. Scatterer's SunflareManager
+        // DestroyImmediates its SunFlares on teardown / re-init and builds fresh
+        // ones; a copied hook left holding the dead flare silently stops driving
+        // the flare (its OnPreRender Unity-null-checks it). Re-point the hook at
+        // the current live SunFlare whenever its reference has gone stale.
+        public void PerFrame(Camera cam, CameraLayers layer, in IntegrationFrameState state)
+        {
+            if (!_ready || _hookFlareField == null || cam == null) return;
+            if (!_flareHooks.TryGetValue(cam, out var hook) || hook == null) return;
+            try
+            {
+                var current = _hookFlareField.GetValue(hook) as UnityEngine.Object;
+                if (current != null) return; // flare still live (Unity liveness check)
+
+                var live = ResolveLiveFlare(current);
+                if (live == null) return; // Scatterer mid-rebuild; retry next frame
+
+                _hookFlareField.SetValue(hook, live);
+                // Scatterer never touches our copy, but re-assert enabled so a
+                // refresh always leaves a working hook.
+                if (!hook.enabled) hook.enabled = true;
+                var liveName = _flareSourceNameField?.GetValue(live) as string ?? "?";
+                Debug.Log($"{LogTag} re-pointed flare hook on '{cam.name}' to live SunFlare '{liveName}'");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"{LogTag} flare refresh on {cam.name} failed: {ex.Message}");
+            }
+        }
+
+        // Resolve the current live SunFlare from Scatterer's sunflare manager,
+        // preferring the entry whose key matches the stale flare's sourceName
+        // (multi-star systems), else the first live entry (stock: the Sun).
+        private object ResolveLiveFlare(object staleFlare)
+        {
+            if (_sunflareManagerField == null || _flaresDictField == null || _instanceProp == null)
+                return null;
+            var inst = _instanceProp.GetValue(null, null);
+            if (inst == null) return null;
+            var mgr = _sunflareManagerField.GetValue(inst) as UnityEngine.Object;
+            if (mgr == null) return null; // manager absent or torn down; rebuild pending
+            var dict = _flaresDictField.GetValue(mgr) as System.Collections.IDictionary;
+            if (dict == null) return null;
+
+            // sourceName is a plain managed field, still readable on a destroyed flare.
+            string wantName = null;
+            if (staleFlare != null && _flareSourceNameField != null)
+                wantName = _flareSourceNameField.GetValue(staleFlare) as string;
+
+            object first = null;
+            foreach (System.Collections.DictionaryEntry e in dict)
+            {
+                var f = e.Value as UnityEngine.Object;
+                if (f == null) continue; // destroyed entry
+                if (wantName != null && (e.Key as string) == wantName) return f;
+                if (first == null) first = f;
+            }
+            return first;
+        }
     }
 }
