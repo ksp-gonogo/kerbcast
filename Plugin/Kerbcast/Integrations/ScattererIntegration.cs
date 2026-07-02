@@ -263,6 +263,15 @@ namespace Kerbcast
                         BindingFlags.Public | BindingFlags.Instance);
                     dbuffer?.SetValue(dst, 0f);
                 }
+                // In unified-camera mode Scatterer drives the flare through the
+                // unified camera and leaves the stock near/scaled flare hooks
+                // DISABLED; CopyPublicMembers carries that enabled=false across, so
+                // the copy never runs on the clone (its OnPreRender never calls
+                // updateProperties or sets renderOnCurrentCamera). Force it enabled -
+                // Scatterer holds no reference to our copy, so it never toggles it
+                // back off.
+                if (dst is Behaviour hookBehaviour)
+                    hookBehaviour.enabled = true;
                 Track(target, dst);
             }
         }
