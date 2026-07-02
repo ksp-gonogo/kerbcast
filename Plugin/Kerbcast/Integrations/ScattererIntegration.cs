@@ -5,15 +5,13 @@
 //    scattering / ocean command buffers self-attach to the clone.
 //
 // 2. Copy Scatterer's SunflareCameraHook from the matching stock camera onto the
-//    clone (with its fields). The hook's OnPreRender sets renderOnCurrentCamera=1,
-//    which stops the shared sunflare mesh (layer 15) being culled for the clone -
-//    that is what makes the flare draw at all. We then force the copied hook's
-//    useDbufferOnCamera to 0. The near hook ships with it at 1, which depth-occludes
-//    the flare CORE against a depth buffer that belongs to the main camera, not the
-//    clone, so the core reads as blocked and only the ghosts survive. Scatterer's
-//    own line-of-sight raycast (in updateProperties) still gates the whole flare, so
-//    gross occlusion by terrain and parts is kept; only per-pixel core occlusion is
-//    dropped, which a stream does not need.
+//    clone (with its fields) and force it enabled. The hook's OnPreRender sets
+//    renderOnCurrentCamera=1, which stops the shared sunflare mesh (layer 15) being
+//    culled for the clone - that is what makes the flare draw at all. Its
+//    useDbufferOnCamera is carried over from the source hook as-is (near=1,
+//    scaled=0); the working state captured on video used the source value, so we
+//    do not override it. Scatterer's own line-of-sight raycast (in updateProperties)
+//    gates the whole flare, so terrain and part occlusion is preserved.
 //
 // 3. Keep the copied hook's flare reference live. Scatterer's SunflareManager
 //    DestroyImmediates every SunFlare on teardown (scene change, re-init) and
