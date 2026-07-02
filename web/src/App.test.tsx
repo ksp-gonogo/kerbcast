@@ -450,6 +450,107 @@ describe("App - add all cameras", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Add all cameras: skips Destroyed tombstones
+// ---------------------------------------------------------------------------
+
+describe("App - add all skips dead cameras", () => {
+  it("does not add a Destroyed (SIGNAL LOST) camera", async () => {
+    saveTiles([]);
+
+    const { client, sidecar, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    // Kill camera 2: it becomes a tombstone but lingers in the snapshot.
+    await act(async () => { sidecar.destroyCamera(2); });
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    // Only the live camera (1) is added; the tombstone is skipped.
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null }[];
+    expect(stored.map((t) => t.flightId)).toEqual([1]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Remove-all and remove-lost controls
+// ---------------------------------------------------------------------------
+
+describe("App - remove controls", () => {
+  it("remove-all clears the grid", async () => {
+    saveTiles([
+      { flightId: 1, spotlit: false },
+      { flightId: 2, spotlit: false },
+    ]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => screen.getByRole("button", { name: /^remove all cameras$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^remove all cameras$/i }));
+    });
+
+    expect(screen.queryAllByRole("button", { name: /remove tile/i })).toHaveLength(0);
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as unknown[];
+    expect(stored).toEqual([]);
+  });
+
+  it("remove-lost drops SIGNAL LOST tiles but keeps live ones", async () => {
+    saveTiles([
+      { flightId: 1, spotlit: false, key: "Kerbal X|mumech.MuMechModuleHullCamera|Alpha" },
+      { flightId: 2, spotlit: false, key: "Kerbal X|mumech.MuMechModuleHullCamera|Bravo" },
+    ]);
+
+    const { client, sidecar, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    // Kill camera 2 so its tile becomes SIGNAL LOST.
+    await act(async () => { sidecar.destroyCamera(2); });
+
+    await waitFor(() => screen.getByRole("button", { name: /remove all lost cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /remove all lost cameras/i }));
+    });
+
+    // Only the live tile (camera 1) survives.
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null }[];
+    expect(stored.map((t) => t.flightId)).toEqual([1]);
+  });
+
+  it("offers no remove-lost control when nothing is lost", async () => {
+    saveTiles([{ flightId: 1, spotlit: false }]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(1);
+    });
+    expect(screen.queryByRole("button", { name: /remove all lost cameras/i })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Settings: theme + debug
 // ---------------------------------------------------------------------------
 
@@ -1115,8 +1216,39 @@ describe("App - tile rebind after flightId reassignment", () => {
     expect(stored[0].flightId).toBe(10);
   });
 
-  it("shows reconnecting placeholder when key has no live match (truly gone camera)", async () => {
-    // Tile stored with a key that won't match any live camera.
+  it("shows reconnecting placeholder when a gone tile has no live camera to take", async () => {
+    // Two tiles: one gone (key won't match), one live. The only live camera is
+    // already shown by the live tile, so there is no unshown live camera for
+    // the gone tile to be repurposed to; it stays reconnecting.
+    saveTiles([
+      {
+        flightId: 99,
+        spotlit: false,
+        key: "Kerbal X|mumech.MuMechModuleHullCamera|GoneCam",
+      },
+      {
+        flightId: 1,
+        spotlit: false,
+        key: "Kerbal X|mumech.MuMechModuleHullCamera|OtherCam",
+      },
+    ]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "OtherCam" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    // No key match and no free live camera => gone tile stays "reconnecting".
+    await waitFor(() => {
+      expect(screen.getByText(/camera reconnecting/i)).toBeTruthy();
+    });
+  });
+
+  it("repurposes an un-rebindable gone tile to an unshown live camera", async () => {
+    // Tile stored with a key that won't match any live camera, but a live
+    // camera (flightId 1) is not shown anywhere. The gone tile is repurposed
+    // to it rather than lingering as SIGNAL LOST.
     saveTiles([{
       flightId: 99,
       spotlit: false,
@@ -1129,14 +1261,19 @@ describe("App - tile rebind after flightId reassignment", () => {
     await renderApp(client);
     await act(async () => { openSidecar(); });
 
-    // No key match => tile stays as "reconnecting".
+    // Repurposed onto the live camera: no reconnecting placeholder remains.
     await waitFor(() => {
-      expect(screen.getByText(/camera reconnecting/i)).toBeTruthy();
+      expect(screen.queryByText(/camera reconnecting/i)).toBeNull();
     });
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null; key: string | null }[];
+    expect(stored[0].flightId).toBe(1);
   });
 
-  it("does not rebind old tiles that have no key stored (legacy tiles)", async () => {
-    // Old tile from before key support: no key field.
+  it("repurposes a legacy keyless gone tile to an unshown live camera", async () => {
+    // Old tile from before key support: no key field, so it can never rebind by
+    // identity. With a live camera unshown, it is repurposed rather than left
+    // reconnecting.
     saveTiles([{ flightId: 99, spotlit: false, key: null }]);
 
     const { client, openSidecar } = buildFixture([
@@ -1145,9 +1282,11 @@ describe("App - tile rebind after flightId reassignment", () => {
     await renderApp(client);
     await act(async () => { openSidecar(); });
 
-    // No rebind: flightId 99 is stale, no key to match on.
     await waitFor(() => {
-      expect(screen.getByText(/camera reconnecting/i)).toBeTruthy();
+      expect(screen.queryByText(/camera reconnecting/i)).toBeNull();
     });
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null; key: string | null }[];
+    expect(stored[0].flightId).toBe(1);
   });
 });

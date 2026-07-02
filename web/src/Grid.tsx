@@ -3,19 +3,22 @@ import { Video, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { bestGrid } from "./bestGrid";
-import { AddAllTile, AddTile, Tile } from "./Tile";
+import { AddAllTile, AddTile, RemoveAllTile, RemoveLostTile, Tile } from "./Tile";
 import {
   addAllCameras,
   addTile,
   cameraKey,
   loadPerfNoteDismissed,
   PERF_NOTE_TILE_THRESHOLD,
+  removeAllCameras,
+  removeAllLostCameras,
   removeTile,
   savePerfNoteDismissed,
   saveTiles,
   toggleSpotlight,
   updateTile,
 } from "./tiles";
+import { CameraLifecycle } from "@jonpepler/kerbcast";
 import type { Tile as TileData } from "./tiles";
 
 interface GridProps {
@@ -46,11 +49,23 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
     commit(toggleSpotlight(tiles, index));
   const handleAdd = () => commit(addTile(tiles));
 
-  // Cameras the grid does not show yet; drives the add-all control.
-  const { shownIds, missingCount } = useMemo(() => {
+  // Cameras the grid does not show yet (drives add-all) and tiles pointing at a
+  // dead/absent camera (drives remove-lost). Only live cameras count as shown
+  // targets; Destroyed tombstones are neither missing targets nor live tiles.
+  const { missingCount, lostCount } = useMemo(() => {
+    const liveIds = new Set(
+      cameras
+        .filter((c) => c.lifecycle !== CameraLifecycle.Destroyed)
+        .map((c) => c.flightId),
+    );
     const shownIds = new Set(tiles.map((t) => t.flightId));
-    const missingCount = cameras.filter((c) => !shownIds.has(c.flightId)).length;
-    return { shownIds, missingCount };
+    const missingCount = cameras.filter(
+      (c) => c.lifecycle !== CameraLifecycle.Destroyed && !shownIds.has(c.flightId),
+    ).length;
+    const lostCount = tiles.filter(
+      (t) => t.flightId !== null && !liveIds.has(t.flightId),
+    ).length;
+    return { missingCount, lostCount };
   }, [tiles, cameras]);
 
   const handleAddAll = () => {
@@ -60,6 +75,12 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
     if (next.length > PERF_NOTE_TILE_THRESHOLD && !loadPerfNoteDismissed()) {
       setShowPerfNote(true);
     }
+  };
+  const handleRemoveAll = () => commit(removeAllCameras(tiles));
+  const handleRemoveLost = () => {
+    const next = removeAllLostCameras(tiles, cameras);
+    if (next.length === tiles.length) return;
+    commit(next);
   };
 
   const dismissPerfNote = () => {
@@ -154,6 +175,22 @@ export function Grid({ tiles, onTilesChange, showDebugInfo, showStatic }: GridPr
         {missingCount > 0 && (
           <AddAllTile
             onClick={handleAddAll}
+            isEmpty={isEmpty}
+            compact={spotlightActive}
+            bar={flatFill}
+          />
+        )}
+        {lostCount > 0 && (
+          <RemoveLostTile
+            onClick={handleRemoveLost}
+            isEmpty={isEmpty}
+            compact={spotlightActive}
+            bar={flatFill}
+          />
+        )}
+        {!isEmpty && (
+          <RemoveAllTile
+            onClick={handleRemoveAll}
             isEmpty={isEmpty}
             compact={spotlightActive}
             bar={flatFill}

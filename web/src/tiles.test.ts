@@ -6,6 +6,8 @@ import {
   loadPerfNoteDismissed,
   loadTiles,
   reconcileTiles,
+  removeAllCameras,
+  removeAllLostCameras,
   savePerfNoteDismissed,
   saveTiles,
   seedTiles,
@@ -28,6 +30,16 @@ function cam(
   cameraName = "Camera",
 ) {
   return { flightId, vesselName, partName, cameraName };
+}
+
+/** A Destroyed tombstone camera (lingers in the snapshot as SIGNAL LOST). */
+function deadCam(
+  flightId: number,
+  vesselName = "Kerbal X",
+  partName = "hull.cam",
+  cameraName = "Camera",
+) {
+  return { ...cam(flightId, vesselName, partName, cameraName), lifecycle: "destroyed" as const };
 }
 
 // ---------------------------------------------------------------------------
@@ -114,11 +126,13 @@ describe("reconcileTiles", () => {
     expect(reconcileTiles(tiles, liveCameras)).toBe(tiles);
   });
 
-  it("leaves tiles with no key as reconnecting (cannot rebind)", () => {
-    const tiles = [tile(99, false, null)];
+  it("leaves keyless tiles unrebound by identity when no live camera is free", () => {
+    // Keyless dead tile cannot rebind by identity. The one live camera is
+    // already shown by another tile, so there is nothing to repurpose it to.
+    const tiles = [tile(1, false, "Kerbal X|hull.cam|FwdCam"), tile(99, false, null)];
     const liveCameras = [cam(1, "Kerbal X", "hull.cam", "FwdCam")];
     expect(reconcileTiles(tiles, liveCameras)).toBe(tiles);
-    expect(reconcileTiles(tiles, liveCameras)[0].flightId).toBe(99);
+    expect(reconcileTiles(tiles, liveCameras)[1].flightId).toBe(99);
   });
 
   it("leaves tiles whose key has no live match as reconnecting", () => {
@@ -181,6 +195,74 @@ describe("reconcileTiles", () => {
     const liveCameras = [
       { ...cam(1, "Kerbal X", "hull.cam", "Camera"), lifecycle: "destroyed" as const },
     ];
+    expect(reconcileTiles(tiles, liveCameras)).toBe(tiles);
+  });
+
+  // ---- change #4: repurpose un-rebindable dead tiles -----------------------
+
+  it("repurposes an un-rebindable dead tile to an unshown live camera", () => {
+    // Tile points at a dead id whose key has no live match: it can never
+    // rebind. A live camera (2) is not shown anywhere, so the dead tile takes
+    // it rather than lingering as SIGNAL LOST.
+    const tiles = [tile(1, false, "Kerbal X|hull.cam|GoneCam")];
+    const liveCameras = [cam(2, "Kerbal X", "hull.cam", "FreshCam")];
+    const result = reconcileTiles(tiles, liveCameras);
+    expect(result[0].flightId).toBe(2);
+    expect(result[0].key).toBe("Kerbal X|hull.cam|FreshCam");
+  });
+
+  it("repurposes a keyless dead tile to an unshown live camera", () => {
+    const tiles = [tile(99, false, null)];
+    const liveCameras = [cam(2, "Kerbal X", "hull.cam", "FreshCam")];
+    const result = reconcileTiles(tiles, liveCameras);
+    expect(result[0].flightId).toBe(2);
+    expect(result[0].key).toBe("Kerbal X|hull.cam|FreshCam");
+  });
+
+  it("does not repurpose a dead tile when no live camera is unshown", () => {
+    // The only live camera is already displayed by another tile, so the dead
+    // tile stays SIGNAL LOST (nothing to repurpose it to).
+    const tiles = [
+      tile(1, false, "Kerbal X|hull.cam|Live"),
+      tile(99, false, "Kerbal X|hull.cam|GoneCam"),
+    ];
+    const liveCameras = [cam(1, "Kerbal X", "hull.cam", "Live")];
+    const result = reconcileTiles(tiles, liveCameras);
+    expect(result[0].flightId).toBe(1);
+    expect(result[1].flightId).toBe(99);
+  });
+
+  it("prefers key rebind over repurpose (revert/recover path intact)", () => {
+    // The dead tile CAN rebind by key to the same physical camera (new id 5),
+    // so it must take its own camera, not an unrelated unshown live one.
+    const tiles = [tile(1, false, "Kerbal X|hull.cam|FwdCam")];
+    const liveCameras = [
+      cam(5, "Kerbal X", "hull.cam", "FwdCam"),
+      cam(6, "Kerbal X", "hull.cam", "OtherCam"),
+    ];
+    const result = reconcileTiles(tiles, liveCameras);
+    expect(result[0].flightId).toBe(5);
+  });
+
+  it("leaves surviving live tiles untouched during repurpose", () => {
+    const liveTile = tile(1, true, "Kerbal X|hull.cam|Live");
+    const deadTile = tile(99, false, "Kerbal X|hull.cam|GoneCam");
+    const tiles = [liveTile, deadTile];
+    const liveCameras = [
+      cam(1, "Kerbal X", "hull.cam", "Live"),
+      cam(2, "Kerbal X", "hull.cam", "FreshCam"),
+    ];
+    const result = reconcileTiles(tiles, liveCameras);
+    // Live tile keeps its exact object reference (no feed remount).
+    expect(result[0]).toBe(liveTile);
+    // Dead tile repurposed to the unshown live camera.
+    expect(result[1].flightId).toBe(2);
+  });
+
+  it("does not repurpose a dead tile to a destroyed camera", () => {
+    const tiles = [tile(99, false, "Kerbal X|hull.cam|GoneCam")];
+    const liveCameras = [deadCam(2, "Kerbal X", "hull.cam", "AlsoDead")];
+    // No active camera to take, so the tile stays SIGNAL LOST.
     expect(reconcileTiles(tiles, liveCameras)).toBe(tiles);
   });
 });
@@ -259,6 +341,64 @@ describe("addAllCameras", () => {
   it("handles an empty grid", () => {
     const next = addAllCameras([], [cam(5), cam(6)]);
     expect(next.map((t) => t.flightId)).toEqual([5, 6]);
+  });
+
+  it("skips Destroyed cameras", () => {
+    // Only live cameras (1, 3) get added; the tombstone (2) is skipped.
+    const next = addAllCameras([], [cam(1), deadCam(2), cam(3)]);
+    expect(next.map((t) => t.flightId)).toEqual([1, 3]);
+  });
+
+  it("is idempotent when the only missing camera is Destroyed", () => {
+    const tiles = [tile(1)];
+    expect(addAllCameras(tiles, [cam(1), deadCam(2)])).toBe(tiles);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// removeAllCameras
+// ---------------------------------------------------------------------------
+
+describe("removeAllCameras", () => {
+  it("clears the grid", () => {
+    expect(removeAllCameras([tile(1), tile(2), tile(null)])).toEqual([]);
+  });
+
+  it("returns an empty array for an already-empty grid", () => {
+    expect(removeAllCameras([])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// removeAllLostCameras
+// ---------------------------------------------------------------------------
+
+describe("removeAllLostCameras", () => {
+  it("keeps live tiles and empty slots, drops lost tiles", () => {
+    const live = tile(1, false, "Ship|part|Live");
+    const empty = tile(null);
+    const lost = tile(99, false, "Ship|part|Gone");
+    const result = removeAllLostCameras([live, empty, lost], [cam(1)]);
+    expect(result).toEqual([live, empty]);
+  });
+
+  it("treats a Destroyed camera's tile as lost", () => {
+    const lost = tile(2, false, "Ship|part|Dead");
+    const result = removeAllLostCameras([tile(1), lost], [cam(1), deadCam(2)]);
+    expect(result.map((t) => t.flightId)).toEqual([1]);
+  });
+
+  it("preserves surviving live tiles by identity (never remounts a feed)", () => {
+    const live = tile(1, true, "Ship|part|Live");
+    const result = removeAllLostCameras([live, tile(99)], [cam(1)]);
+    // Same object reference: React key/props unchanged for the live tile.
+    expect(result[0]).toBe(live);
+  });
+
+  it("returns all tiles when nothing is lost", () => {
+    const tiles = [tile(1), tile(2), tile(null)];
+    const result = removeAllLostCameras(tiles, [cam(1), cam(2)]);
+    expect(result.map((t) => t.flightId)).toEqual([1, 2, null]);
   });
 });
 

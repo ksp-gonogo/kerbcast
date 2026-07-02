@@ -106,6 +106,13 @@ export function seedTiles(cameras: Pick<CameraState, "flightId" | "vesselName" |
  * vessel), only the first is rebound; the second is left as "reconnecting" to
  * avoid pointing two tiles at the same camera silently.
  *
+ * Second, un-rebindable dead tiles are repurposed rather than left as SIGNAL
+ * LOST forever. A tile that points at a dead/absent flightId with NO stable-key
+ * match among live cameras can never rebind to its original camera; if there is
+ * a live camera not currently shown in any tile, that dead tile is pointed at
+ * the unshown live camera instead. This only repurposes an otherwise-useless
+ * dead tile; it never removes a tile or touches a surviving live one.
+ *
  * Returns the same array reference if nothing changed (safe for React state
  * comparison).
  */
@@ -136,7 +143,8 @@ export function reconcileTiles(
   const next = tiles.map((tile) => {
     // Already live, or an empty slot: leave untouched.
     if (tile.flightId === null || liveIds.has(tile.flightId)) return tile;
-    // No stable key stored: can't rebind; leave as "reconnecting".
+    // No stable key stored: can't rebind by identity; leave for the repurpose
+    // pass below.
     if (tile.key == null) return tile;
 
     const match = keyToLive.get(tile.key);
@@ -147,6 +155,31 @@ export function reconcileTiles(
     changed = true;
     return { ...tile, flightId: match.flightId };
   });
+
+  // Repurpose pass: a dead tile that could not rebind to its own camera (no
+  // stable-key match among live cameras) is pointed at a live camera not shown
+  // in any tile, rather than lingering as SIGNAL LOST while a live camera has no
+  // slot. Tiles the identity pass rebound above already point at live ids and
+  // are skipped here.
+  const shownIds = new Set<number>();
+  for (const t of next) {
+    if (t.flightId !== null) shownIds.add(t.flightId);
+  }
+  const unshownLive = active.filter((c) => !shownIds.has(c.flightId));
+  if (unshownLive.length > 0) {
+    let cursor = 0;
+    for (let i = 0; i < next.length && cursor < unshownLive.length; i++) {
+      const tile = next[i];
+      // Skip live tiles, empty slots, and tiles that CAN still rebind by key
+      // (keep the revert/recover path intact).
+      if (tile.flightId === null || liveIds.has(tile.flightId)) continue;
+      if (tile.key != null && keyToLive.has(tile.key)) continue;
+
+      const cam = unshownLive[cursor++];
+      next[i] = { ...tile, flightId: cam.flightId, key: cameraKey(cam) };
+      changed = true;
+    }
+  }
 
   return changed ? next : tiles;
 }
@@ -163,6 +196,29 @@ export function addTile(tiles: Tile[]): Tile[] {
 /** Remove a tile by index. */
 export function removeTile(tiles: Tile[], index: number): Tile[] {
   return tiles.filter((_, i) => i !== index);
+}
+
+/** Clear the grid entirely: no tiles remain. */
+export function removeAllCameras(_tiles: Tile[]): Tile[] {
+  return [];
+}
+
+/**
+ * Drop only the SIGNAL-LOST / gone tiles: remove tiles whose flightId is not
+ * among the currently-live (non-Destroyed) cameras. Live tiles and empty
+ * (flightId === null) slots are kept. Surviving live tiles keep their identity
+ * (same object reference), so their feeds never remount.
+ */
+export function removeAllLostCameras(
+  tiles: Tile[],
+  cameras: Pick<CameraState, "flightId" | "lifecycle">[],
+): Tile[] {
+  const liveIds = new Set(
+    cameras
+      .filter((c) => c.lifecycle !== CameraLifecycle.Destroyed)
+      .map((c) => c.flightId),
+  );
+  return tiles.filter((t) => t.flightId === null || liveIds.has(t.flightId));
 }
 
 /** Update the flightId of a tile at an index (preserves spotlight state and key). */
@@ -185,20 +241,23 @@ export function toggleSpotlight(tiles: Tile[], index: number): Tile[] {
 }
 
 /**
- * Point every camera not already shown at a tile: unpointed slots are filled
- * first, then new tiles are appended. Cameras already in the grid are left
- * alone, so the action is idempotent (returns the same array when nothing is
- * missing).
+ * Point every live camera not already shown at a tile: unpointed slots are
+ * filled first, then new tiles are appended. Cameras already in the grid are
+ * left alone, so the action is idempotent (returns the same array when nothing
+ * is missing). Destroyed tombstones are skipped: "add all" only pulls in live
+ * cameras, never SIGNAL LOST feeds.
  */
 export function addAllCameras(
   tiles: Tile[],
-  cameras: Pick<CameraState, "flightId" | "vesselName" | "partName" | "cameraName">[],
+  cameras: Pick<CameraState, "flightId" | "vesselName" | "partName" | "cameraName" | "lifecycle">[],
 ): Tile[] {
   const present = new Set<number>();
   for (const t of tiles) {
     if (t.flightId !== null) present.add(t.flightId);
   }
-  const missing = cameras.filter((c) => !present.has(c.flightId));
+  const missing = cameras.filter(
+    (c) => c.lifecycle !== CameraLifecycle.Destroyed && !present.has(c.flightId),
+  );
   if (missing.length === 0) return tiles;
 
   const queue = [...missing];

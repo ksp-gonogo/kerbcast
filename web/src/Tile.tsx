@@ -4,7 +4,7 @@ import {
   useKerbcastCameras,
 } from "@jonpepler/kerbcast-react";
 import type { FeedAction } from "@jonpepler/kerbcast-react";
-import { Check, ListPlus, Pencil, Pin, PinOff, Plus, WifiOff, X } from "lucide-react";
+import { Check, ListPlus, ListX, Pencil, Pin, PinOff, Plus, Trash2, WifiOff, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { loadLabel, saveLabel } from "./labels";
@@ -291,6 +291,53 @@ export function AddAllTile({ onClick, isEmpty, compact, bar }: AddTileProps): Re
         <ListPlus size={20} strokeWidth={1.5} />
       </AddIcon>
       {(isEmpty || bar) && <AddLabel>Add all cameras</AddLabel>}
+    </AddRoot>
+  );
+}
+
+/**
+ * "Remove all lost cameras" sibling of AddAllTile: one click drops every
+ * SIGNAL-LOST tile, keeping live feeds and empty slots. Same look and sizing
+ * variants as AddTile so the controls read as one cluster.
+ */
+export function RemoveLostTile({ onClick, isEmpty, compact, bar }: AddTileProps): React.JSX.Element {
+  return (
+    <AddRoot
+      type="button"
+      aria-label="Remove all lost cameras"
+      title="Remove all lost cameras"
+      onClick={onClick}
+      $isEmpty={isEmpty ?? false}
+      $compact={compact ?? false}
+      $bar={bar ?? false}
+    >
+      <AddIcon aria-hidden="true">
+        <ListX size={20} strokeWidth={1.5} />
+      </AddIcon>
+      {(isEmpty || bar) && <AddLabel>Remove lost cameras</AddLabel>}
+    </AddRoot>
+  );
+}
+
+/**
+ * "Remove all cameras" sibling of AddAllTile: one click clears the grid. Same
+ * look and sizing variants as AddTile so the controls read as one cluster.
+ */
+export function RemoveAllTile({ onClick, isEmpty, compact, bar }: AddTileProps): React.JSX.Element {
+  return (
+    <AddRoot
+      type="button"
+      aria-label="Remove all cameras"
+      title="Remove all cameras"
+      onClick={onClick}
+      $isEmpty={isEmpty ?? false}
+      $compact={compact ?? false}
+      $bar={bar ?? false}
+    >
+      <AddIcon aria-hidden="true">
+        <Trash2 size={20} strokeWidth={1.5} />
+      </AddIcon>
+      {(isEmpty || bar) && <AddLabel>Remove all cameras</AddLabel>}
     </AddRoot>
   );
 }
