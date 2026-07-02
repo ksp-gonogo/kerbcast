@@ -47,6 +47,7 @@ namespace Kerbcast
         // DebugCameraLogging is on (ScattererFlareProbe reads the live flare state).
         private Type _sunflareHookType;
         private FieldInfo _hookFlareField;      // SunflareCameraHook.flare
+        private FieldInfo _hookDbufferField;    // SunflareCameraHook.useDbufferOnCamera
         private PropertyInfo _flareRenderingProp; // SunFlare.FlareRendering
         private FieldInfo _flareMaterialField;  // SunFlare.sunglareMaterial
         private FieldInfo _flareGoField;        // SunFlare.sunflareGameObject (nonpublic)
@@ -112,6 +113,7 @@ namespace Kerbcast
                 if (_sunflareHookType != null && flareType != null)
                 {
                     _hookFlareField = _sunflareHookType.GetField("flare", PubInst);
+                    _hookDbufferField = _sunflareHookType.GetField("useDbufferOnCamera", PubInst);
                     _flareRenderingProp = flareType.GetProperty("FlareRendering", PubInst);
                     _flareMaterialField = flareType.GetField("sunglareMaterial", PubInst);
                     _flareGoField = flareType.GetField("sunflareGameObject",
@@ -211,6 +213,7 @@ namespace Kerbcast
             probe.FlareRenderingProp = _flareRenderingProp;
             probe.MaterialField = _flareMaterialField;
             probe.FlareGoField = _flareGoField;
+            probe.HookDbufferField = _hookDbufferField;
             Track(cam, probe);
         }
 
