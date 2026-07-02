@@ -5,6 +5,16 @@
 // self-attach to the clone via their own OnWillRenderObject once the swap points
 // the singleton at the clone, so no buffer copying is needed for the core look.
 //
+// The sunflare needs one more piece. Scatterer draws each flare as a layer-15
+// quad the flare shader culls unless renderOnCurrentCamera == 1, a flag raised
+// only by Scatterer's own SunflareCameraHook running on the real near camera. On
+// the near clone we add a ScattererSunflareUncull that raises that same flag for
+// the clone's render (and lowers it after), so the quad draws. It does NOT run
+// the flare's occlusion raycast: that stays Scatterer's own decision, made by
+// the real-camera hook from its external clear-view. The clone gets a forced
+// depth pass so the flare shader's soft occlusion against near geometry reads
+// valid depth; RemoveFromLayer clears exactly that.
+//
 // Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based effects
 // break under MSAA, so this integration reports ForcesNoMsaa = true; the host
 // then drives every clone and the capture RT with MSAA off.
@@ -32,7 +42,17 @@ namespace Kerbcast
         private FieldInfo _farField;            // Instance.farCamera
         private FieldInfo _unifiedField;        // Instance.unifiedCameraMode (may be null on old versions)
 
+        // Sunflare un-cull wiring, all optional: if any resolves to null the swap
+        // still ships and the sunflare copy simply no-ops (dark blob, logged).
+        private FieldInfo _sunflareManagerField;   // Instance.sunflareManager
+        private FieldInfo _scattererSunFlaresField; // SunflareManager.scattererSunFlares (Dictionary<string,SunFlare>)
+        private FieldInfo _sunglareMaterialField;   // SunFlare.sunglareMaterial (Material)
+        private bool _sunflareReady;
+
         private readonly Dictionary<Camera, List<Component>> _added = new Dictionary<Camera, List<Component>>();
+        // Cameras we forced depthTextureMode Depth on, so RemoveFromLayer clears
+        // exactly what it set.
+        private readonly HashSet<Camera> _depthSet = new HashSet<Camera>();
 
         public string Name => "Scatterer";
         public bool ForcesNoMsaa => true;
@@ -78,9 +98,20 @@ namespace Kerbcast
                     return;
                 }
 
+                // Sunflare un-cull wiring is optional: a null anywhere here only
+                // drops the sunflare copy, never the swap.
+                _sunflareManagerField = t.GetField("sunflareManager", PubInst);
+                var managerType = _sunflareManagerField?.FieldType;
+                _scattererSunFlaresField = managerType?.GetField("scattererSunFlares", PubInst);
+                var sunFlareType = asm.GetType("Scatterer.SunFlare");
+                _sunglareMaterialField = sunFlareType?.GetField("sunglareMaterial", PubInst);
+                _sunflareReady = _sunflareManagerField != null && _scattererSunFlaresField != null
+                    && _sunglareMaterialField != null;
+
                 _ready = true;
                 Debug.Log($"{LogTag} integration enabled " +
-                    $"(scaled={_scaledField != null} far={_farField != null} unified={_unifiedField != null})");
+                    $"(scaled={_scaledField != null} far={_farField != null} " +
+                    $"unified={_unifiedField != null} sunflare={_sunflareReady})");
             }
             catch (Exception ex)
             {
@@ -112,12 +143,34 @@ namespace Kerbcast
                 swap.InstanceProperty = _instanceProp;
                 swap.CameraField = field;
                 Track(cam, swap);
+
+                // The flare quad is layer 15 in flight, rendered only by the near
+                // clone, and needs its cull flag raised for the clone (see header).
+                if (layer == CameraLayers.Near && _sunflareReady)
+                    AddSunflareUncull(cam);
             }
             catch (Exception ex)
             {
                 Debug.LogError($"{LogTag} apply to {cam.name} ({layer}) failed: {ex.Message}");
                 RemoveFromLayer(cam, layer);
             }
+        }
+
+        // Attach the flare un-cull to the near clone and force a depth pass so the
+        // flare shader's soft occlusion (useDbufferOnCamera = 1) reads valid depth.
+        // The component lowers the cull flag in its own OnPostRender/OnDisable, so
+        // the player's main view is never left with the flag raised.
+        private void AddSunflareUncull(Camera cam)
+        {
+            cam.depthTextureMode |= DepthTextureMode.Depth;
+            _depthSet.Add(cam);
+
+            var uncull = cam.gameObject.AddComponent<ScattererSunflareUncull>();
+            uncull.InstanceProperty = _instanceProp;
+            uncull.SunflareManagerField = _sunflareManagerField;
+            uncull.ScattererSunFlaresField = _scattererSunFlaresField;
+            uncull.SunglareMaterialField = _sunglareMaterialField;
+            Track(cam, uncull);
         }
 
         private bool IsUnifiedCameraMode()
@@ -152,6 +205,8 @@ namespace Kerbcast
                         if (c != null) UnityEngine.Object.Destroy(c); // OnDisable restores
                     _added.Remove(cam);
                 }
+                if (_depthSet.Remove(cam))
+                    cam.depthTextureMode &= ~DepthTextureMode.Depth;
             }
             catch (Exception ex)
             {
