@@ -43,6 +43,14 @@ namespace Kerbcast
         private FieldInfo _unifiedField;        // Instance.unifiedCameraMode (may be null on old versions)
         private Type[] _scattererHookTypes;     // CameraRenderingHook + SunflareCameraHook types
 
+        // Diagnostic reflection, resolved in Probe, used only when
+        // DebugCameraLogging is on (ScattererFlareProbe reads the live flare state).
+        private Type _sunflareHookType;
+        private FieldInfo _hookFlareField;      // SunflareCameraHook.flare
+        private PropertyInfo _flareRenderingProp; // SunFlare.FlareRendering
+        private FieldInfo _flareMaterialField;  // SunFlare.sunglareMaterial
+        private FieldInfo _flareGoField;        // SunFlare.sunflareGameObject (nonpublic)
+
         private readonly Dictionary<Camera, List<Component>> _added = new Dictionary<Camera, List<Component>>();
 
         public string Name => "Scatterer";
@@ -98,10 +106,32 @@ namespace Kerbcast
                         && (x.Name.Contains("CameraRenderingHook") || x.Name.Contains("SunflareCameraHook")))
                     .ToArray();
 
+                // Diagnostic reflection for ScattererFlareProbe (harmless if absent).
+                _sunflareHookType = asm.GetType("Scatterer.SunflareCameraHook");
+                var flareType = asm.GetType("Scatterer.SunFlare");
+                if (_sunflareHookType != null && flareType != null)
+                {
+                    _hookFlareField = _sunflareHookType.GetField("flare", PubInst);
+                    _flareRenderingProp = flareType.GetProperty("FlareRendering", PubInst);
+                    _flareMaterialField = flareType.GetField("sunglareMaterial", PubInst);
+                    _flareGoField = flareType.GetField("sunflareGameObject",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                }
+
                 _ready = true;
                 Debug.Log($"{LogTag} integration enabled " +
                     $"(scaled={_scaledField != null} far={_farField != null} " +
                     $"unified={_unifiedField != null} hooks={_scattererHookTypes.Length})");
+
+                if (KerbcastSettings.DebugCameraLogging)
+                {
+                    var inst = _instanceProp.GetValue(null, null);
+                    var nearCam = inst != null ? _nearField.GetValue(inst) as Camera : null;
+                    var scaledCam = inst != null && _scaledField != null
+                        ? _scaledField.GetValue(inst) as Camera : null;
+                    Debug.Log($"{LogTag} real cameras near='{(nearCam != null ? nearCam.name : "null")}' " +
+                        $"scaled='{(scaledCam != null ? scaledCam.name : "null")}'");
+                }
             }
             catch (Exception ex)
             {
@@ -147,6 +177,7 @@ namespace Kerbcast
                     if (_scaledField != null && _scaledField != field)
                         AddSwap(cam, _scaledField);
                     CopyRenderingHooks("Camera 00", cam);
+                    if (KerbcastSettings.DebugCameraLogging) AttachFlareProbe(cam);
                 }
                 else if (layer == CameraLayers.Scaled)
                     CopyRenderingHooks("Camera ScaledSpace", cam);
@@ -169,6 +200,20 @@ namespace Kerbcast
             Track(cam, swap);
         }
 
+        // Diagnostic-only: attach a probe that logs Scatterer's live flare state on
+        // the clone. Caller gates on DebugCameraLogging.
+        private void AttachFlareProbe(Camera cam)
+        {
+            if (_sunflareHookType == null) return;
+            var probe = cam.gameObject.AddComponent<ScattererFlareProbe>();
+            probe.HookType = _sunflareHookType;
+            probe.HookFlareField = _hookFlareField;
+            probe.FlareRenderingProp = _flareRenderingProp;
+            probe.MaterialField = _flareMaterialField;
+            probe.FlareGoField = _flareGoField;
+            Track(cam, probe);
+        }
+
         private bool IsUnifiedCameraMode()
         {
             if (_unifiedField == null || _instanceProp == null) return false;
@@ -188,11 +233,19 @@ namespace Kerbcast
         {
             if (_scattererHookTypes == null || _scattererHookTypes.Length == 0) return;
             var source = Camera.allCameras.FirstOrDefault(c => c.name == sourceCameraName);
-            if (source == null) return;
+            if (source == null)
+            {
+                if (KerbcastSettings.DebugCameraLogging)
+                    Debug.Log($"{LogTag} copyhooks target={target.name} src='{sourceCameraName}' FOUND=false");
+                return;
+            }
             foreach (var hookType in _scattererHookTypes)
             {
                 if (target.gameObject.GetComponent(hookType) != null) continue;
                 var src = source.gameObject.GetComponent(hookType);
+                if (KerbcastSettings.DebugCameraLogging)
+                    Debug.Log($"{LogTag} copyhooks target={target.name} src='{sourceCameraName}' " +
+                        $"{hookType.Name} srcExists={src != null}");
                 if (src == null) continue;
                 var dst = target.gameObject.AddComponent(hookType);
                 if (dst == null) continue;
