@@ -21,6 +21,14 @@
 //    (Scatterer.Instance.sunflareManager.scattererSunFlares) before each clone
 //    render.
 //
+// 4. Gate the flare per clone. Scatterer's renderSunFlare shader float is a
+//    single shared value computed from the main view, so a copied hook left
+//    always-enabled draws the flare on every clone whenever the PLAYER faces
+//    the sun. PerFrame enables each copied hook only while the sun projects
+//    into that clone's own viewport (with a margin for off-edge ghosts);
+//    disabled hooks get no OnPreRender, leaving renderOnCurrentCamera at 0 so
+//    the shared mesh is culled for that clone.
+//
 // Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based effects
 // break under MSAA, so this integration reports ForcesNoMsaa = true; the host
 // then drives every clone and the capture RT with MSAA off.
@@ -74,7 +82,8 @@ namespace Kerbcast
         public string Name => "Scatterer";
         public bool ForcesNoMsaa => true;
         // Per-frame work: keep each copied flare hook pointed at the live SunFlare
-        // (Scatterer destroys and rebuilds its flares on scene change / re-init).
+        // (Scatterer destroys and rebuilds its flares on scene change / re-init)
+        // and gate the hook on the sun being in that clone's view.
         public bool NeedsPerFrame => true;
         // Near, scaled, and (dual-cam only) far. Scatterer never touches galaxy.
         public CameraLayers AppliesToLayers =>
@@ -204,9 +213,9 @@ namespace Kerbcast
                     // (updateProperties) must run against the real scaled camera so its
                     // sun-occlusion self-reset works. Each near clone then draws the
                     // shared flare mesh at its OWN GPU-projected sun position, so the
-                    // flare is per-camera for free. The gate itself follows the main
-                    // view (shared renderSunFlare); that is a known limitation in
-                    // unified-camera mode, not worth breaking the working flare over.
+                    // flare is per-camera for free. The shared renderSunFlare float
+                    // still follows the main view; PerFrame compensates by enabling
+                    // the copied hook only while the sun is in this clone's view.
                     CopyRenderingHooks("Camera 00", cam);
                     if (KerbcastSettings.DebugCameraLogging) AttachFlareProbe(cam);
                 }
@@ -294,9 +303,10 @@ namespace Kerbcast
                 // unified camera and leaves the stock near/scaled flare hooks
                 // DISABLED; CopyPublicMembers carries that enabled=false across, so
                 // the copy never runs on the clone (its OnPreRender never calls
-                // updateProperties or sets renderOnCurrentCamera). Force it enabled -
-                // Scatterer holds no reference to our copy, so it never toggles it
-                // back off.
+                // updateProperties or sets renderOnCurrentCamera). Force it enabled
+                // here as the initial state; from then on PerFrame owns the flare
+                // hook's enabled flag (sun-in-view gate). Scatterer holds no
+                // reference to our copy, so it never toggles it back off.
                 if (dst is Behaviour hookBehaviour)
                 {
                     hookBehaviour.enabled = true;
@@ -356,34 +366,71 @@ namespace Kerbcast
             }
         }
 
-        // Called just before each clone layer renders. Scatterer's SunflareManager
-        // DestroyImmediates its SunFlares on teardown / re-init and builds fresh
-        // ones; a copied hook left holding the dead flare silently stops driving
-        // the flare (its OnPreRender Unity-null-checks it). Re-point the hook at
-        // the current live SunFlare whenever its reference has gone stale.
+        // Called just before each clone layer renders. Two jobs for clones that
+        // carry a copied flare hook (near, scaled):
+        //
+        // 1. Re-point: Scatterer's SunflareManager DestroyImmediates its SunFlares
+        //    on teardown / re-init and builds fresh ones; a copied hook left
+        //    holding the dead flare silently stops driving the flare (its
+        //    OnPreRender Unity-null-checks it). Re-point the hook at the current
+        //    live SunFlare whenever its reference has gone stale. Runs regardless
+        //    of the gate below so the reference is live when the hook re-enables.
+        //
+        // 2. Gate: enable the copied hook only when the sun is in THIS clone's
+        //    view. Scatterer's renderSunFlare float is shared and computed from
+        //    the MAIN view (Instance.scaledSpaceCamera is never swapped), so when
+        //    the player faces the sun every enabled copy would draw the flare on
+        //    its clone, even one pointing away from the sun. A disabled hook gets
+        //    no OnPreRender, so renderOnCurrentCamera stays 0 (every enabled
+        //    hook's OnPostRender resets it) and the shared flare mesh is culled
+        //    for that clone's manual Render().
         public void PerFrame(Camera cam, CameraLayers layer, in IntegrationFrameState state)
         {
             if (!_ready || _hookFlareField == null || cam == null) return;
             if (!_flareHooks.TryGetValue(cam, out var hook) || hook == null) return;
             try
             {
-                var current = _hookFlareField.GetValue(hook) as UnityEngine.Object;
-                if (current != null) return; // flare still live (Unity liveness check)
-
-                var live = ResolveLiveFlare(current);
-                if (live == null) return; // Scatterer mid-rebuild; retry next frame
-
-                _hookFlareField.SetValue(hook, live);
-                // Scatterer never touches our copy, but re-assert enabled so a
-                // refresh always leaves a working hook.
-                if (!hook.enabled) hook.enabled = true;
-                var liveName = _flareSourceNameField?.GetValue(live) as string ?? "?";
-                Debug.Log($"{LogTag} re-pointed flare hook on '{cam.name}' to live SunFlare '{liveName}'");
+                RefreshFlareReference(cam, hook);
+                // The gate owns the hook's enabled state from here on (copy-time
+                // force-enable is just the initial value). Cheap: Unity only
+                // fires OnEnable/OnDisable on an actual change.
+                hook.enabled = SunInView(cam);
             }
             catch (Exception ex)
             {
                 Debug.LogError($"{LogTag} flare refresh on {cam.name} failed: {ex.Message}");
             }
+        }
+
+        private void RefreshFlareReference(Camera cam, Behaviour hook)
+        {
+            var current = _hookFlareField.GetValue(hook) as UnityEngine.Object;
+            if (current != null) return; // flare still live (Unity liveness check)
+
+            var live = ResolveLiveFlare(current);
+            if (live == null) return; // Scatterer mid-rebuild; retry next frame
+
+            _hookFlareField.SetValue(hook, live);
+            var liveName = _flareSourceNameField?.GetValue(live) as string ?? "?";
+            Debug.Log($"{LogTag} re-pointed flare hook on '{cam.name}' to live SunFlare '{liveName}'");
+        }
+
+        // Sun inside this clone's viewport (in front of the camera, within the
+        // frame plus a margin). The margin keeps the flare's ghosts and streaks
+        // alive while the sun dot sits just off the frame edge. No occlusion
+        // raycast here: Scatterer's own line-of-sight test in updateProperties
+        // raycasts from Instance.nearCamera, which the swap points at the clone
+        // during its render, so part/terrain blocking is already per-clone.
+        private const float FlareViewMargin = 0.15f;
+
+        private static bool SunInView(Camera cam)
+        {
+            if (Planetarium.fetch == null || Planetarium.fetch.Sun == null) return false;
+            Vector3 sunPos = (Vector3)Planetarium.fetch.Sun.position;
+            Vector3 vp = cam.WorldToViewportPoint(sunPos);
+            return vp.z > 0f
+                && vp.x >= -FlareViewMargin && vp.x <= 1f + FlareViewMargin
+                && vp.y >= -FlareViewMargin && vp.y <= 1f + FlareViewMargin;
         }
 
         // Resolve the current live SunFlare from Scatterer's sunflare manager,
