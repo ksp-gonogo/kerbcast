@@ -4,13 +4,16 @@
 //    clone during its render (then restores), so Scatterer's atmosphere /
 //    scattering / ocean command buffers self-attach to the clone.
 //
-// 2. Copy Scatterer's per-camera hooks (CameraRenderingHook + SunflareCameraHook)
-//    from the matching stock camera onto the clone, with their fields. This makes
-//    the clone a first-class Scatterer camera: CameraRenderingHook sets up the
-//    per-camera depth the sunflare's dbuffer occlusion needs, and SunflareCameraHook
-//    (carrying its flare + useDbufferOnCamera) draws the lens flare. The swap alone
-//    left the flare unoccluded (drawn on top of everything); copying the hooks
-//    gives the clone the per-camera depth setup the flare's occlusion needs.
+// 2. Copy Scatterer's SunflareCameraHook from the matching stock camera onto the
+//    clone (with its fields). The hook's OnPreRender sets renderOnCurrentCamera=1,
+//    which stops the shared sunflare mesh (layer 15) being culled for the clone -
+//    that is what makes the flare draw at all. We then force the copied hook's
+//    useDbufferOnCamera to 0. The near hook ships with it at 1, which depth-occludes
+//    the flare CORE against a depth buffer that belongs to the main camera, not the
+//    clone, so the core reads as blocked and only the ghosts survive. Scatterer's
+//    own line-of-sight raycast (in updateProperties) still gates the whole flare, so
+//    gross occlusion by terrain and parts is kept; only per-pixel core occlusion is
+//    dropped, which a stream does not need.
 //
 // Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based effects
 // break under MSAA, so this integration reports ForcesNoMsaa = true; the host
@@ -87,8 +90,9 @@ namespace Kerbcast
                 }
 
                 // Per-camera hook types we clone onto each camera (name-matched so
-                // a version rename is tolerated). CameraRenderingHook carries the
-                // per-camera scattering/depth setup; SunflareCameraHook the flare.
+                // a version rename is tolerated). SunflareCameraHook draws the lens
+                // flare; CameraRenderingHook (absent in unified-camera builds) would
+                // carry per-camera scattering/depth setup where a build has it.
                 _scattererHookTypes = asm.GetTypes()
                     .Where(x => !x.IsAbstract && typeof(MonoBehaviour).IsAssignableFrom(x)
                         && (x.Name.Contains("CameraRenderingHook") || x.Name.Contains("SunflareCameraHook")))
@@ -174,6 +178,16 @@ namespace Kerbcast
                 var dst = target.gameObject.AddComponent(hookType);
                 if (dst == null) continue;
                 CopyPublicMembers(src, dst);
+                // The near hook copies useDbufferOnCamera=1, which depth-occludes
+                // the flare core against the main camera's depth buffer (not the
+                // clone's) and kills the core on the stream. Force it off so the
+                // core draws; Scatterer's own raycast still gates the flare.
+                if (hookType.Name.Contains("SunflareCameraHook"))
+                {
+                    var dbuffer = hookType.GetField("useDbufferOnCamera",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    dbuffer?.SetValue(dst, 0f);
+                }
                 Track(target, dst);
             }
         }
