@@ -27,10 +27,12 @@ Tier 2 (isolation, only if Tier 1 fails):
       the streams; main view definitely unaffected (confirms attribution).
 - [ ] `modswap.sh disable scatterer`, restart: clean Scatterer-absent baseline.
 
-Follow-up (record, do not block this slice): list the Scatterer effects that were
-missing on the stream (e.g. sunflare, exact sky uniforms) so a later pass can copy the
-specific stock-camera hooks (SunflareCameraHook, per-camera SkyNode uniforms,
-DepthToDistanceCommandBuffer) the build-sheet identified.
+Follow-up (record, do not block this slice): the SunflareCameraHook copy is done and
+the flare core now renders (the copied hook's useDbufferOnCamera is forced to 0 so the
+core is not depth-occluded against the wrong camera's depth buffer). If the core is
+still missing, suspect the near clone reading the main scaledSpaceCamera for the flare
+gate and scale. List any other Scatterer effects still missing (e.g. exact sky
+uniforms) for a later pass.
 
 Perf notes: /metrics near/scaled phase delta with EnableScatterer on vs off; note the
 MSAA-off effect on overall cost.
