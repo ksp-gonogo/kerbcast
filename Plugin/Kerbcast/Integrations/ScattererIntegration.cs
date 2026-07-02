@@ -1,9 +1,16 @@
-// Scatterer capture for kerbcast's cloned cameras. Attaches a per-clone
-// ScattererCameraSwap so Scatterer renders its atmosphere/scattering/ocean onto
-// each clone during the clone's render, then restores the stock camera
-// reference. Scatterer's screen-space scattering and ocean command buffers
-// self-attach to the clone via their own OnWillRenderObject once the swap points
-// the singleton at the clone, so no buffer copying is needed for the core look.
+// Scatterer capture for kerbcast's cloned cameras. Two parts:
+//
+// 1. A per-clone ScattererCameraSwap points Scatterer's singleton camera at the
+//    clone during its render (then restores), so Scatterer's atmosphere /
+//    scattering / ocean command buffers self-attach to the clone.
+//
+// 2. Copy Scatterer's per-camera hooks (CameraRenderingHook + SunflareCameraHook)
+//    from the matching stock camera onto the clone, with their fields. This makes
+//    the clone a first-class Scatterer camera: CameraRenderingHook sets up the
+//    per-camera depth the sunflare's dbuffer occlusion needs, and SunflareCameraHook
+//    (carrying its flare + useDbufferOnCamera) draws the lens flare. The swap alone
+//    left the flare unoccluded (drawn on top of everything); copying the hooks
+//    gives the clone the per-camera depth setup the flare's occlusion needs.
 //
 // Scatterer forces QualitySettings.antiAliasing = 0 and its depth-based effects
 // break under MSAA, so this integration reports ForcesNoMsaa = true; the host
@@ -31,6 +38,7 @@ namespace Kerbcast
         private FieldInfo _scaledField;         // Instance.scaledSpaceCamera (fallback scaledCamera)
         private FieldInfo _farField;            // Instance.farCamera
         private FieldInfo _unifiedField;        // Instance.unifiedCameraMode (may be null on old versions)
+        private Type[] _scattererHookTypes;     // CameraRenderingHook + SunflareCameraHook types
 
         private readonly Dictionary<Camera, List<Component>> _added = new Dictionary<Camera, List<Component>>();
 
@@ -78,9 +86,18 @@ namespace Kerbcast
                     return;
                 }
 
+                // Per-camera hook types we clone onto each camera (name-matched so
+                // a version rename is tolerated). CameraRenderingHook carries the
+                // per-camera scattering/depth setup; SunflareCameraHook the flare.
+                _scattererHookTypes = asm.GetTypes()
+                    .Where(x => !x.IsAbstract && typeof(MonoBehaviour).IsAssignableFrom(x)
+                        && (x.Name.Contains("CameraRenderingHook") || x.Name.Contains("SunflareCameraHook")))
+                    .ToArray();
+
                 _ready = true;
                 Debug.Log($"{LogTag} integration enabled " +
-                    $"(scaled={_scaledField != null} far={_farField != null} unified={_unifiedField != null})");
+                    $"(scaled={_scaledField != null} far={_farField != null} " +
+                    $"unified={_unifiedField != null} hooks={_scattererHookTypes.Length})");
             }
             catch (Exception ex)
             {
@@ -112,6 +129,15 @@ namespace Kerbcast
                 swap.InstanceProperty = _instanceProp;
                 swap.CameraField = field;
                 Track(cam, swap);
+
+                // Copy Scatterer's per-camera hooks from the matching stock camera
+                // so the clone renders the full per-camera look (flare + occlusion),
+                // not just the swapped atmosphere. Near <- Camera 00, Scaled <-
+                // Camera ScaledSpace. Far reuses the near swap and needs no hooks.
+                if (layer == CameraLayers.Near)
+                    CopyRenderingHooks("Camera 00", cam);
+                else if (layer == CameraLayers.Scaled)
+                    CopyRenderingHooks("Camera ScaledSpace", cam);
             }
             catch (Exception ex)
             {
@@ -129,6 +155,45 @@ namespace Kerbcast
                 return inst != null && (bool)_unifiedField.GetValue(inst);
             }
             catch { return false; }
+        }
+
+        // Clone Scatterer's per-camera hooks (CameraRenderingHook,
+        // SunflareCameraHook) from the named stock camera onto the target clone,
+        // copying their public fields/properties (flare, useDbufferOnCamera, etc.).
+        // Each added hook is tracked so RemoveFromLayer tears it down.
+        private void CopyRenderingHooks(string sourceCameraName, Camera target)
+        {
+            if (_scattererHookTypes == null || _scattererHookTypes.Length == 0) return;
+            var source = Camera.allCameras.FirstOrDefault(c => c.name == sourceCameraName);
+            if (source == null) return;
+            foreach (var hookType in _scattererHookTypes)
+            {
+                if (target.gameObject.GetComponent(hookType) != null) continue;
+                var src = source.gameObject.GetComponent(hookType);
+                if (src == null) continue;
+                var dst = target.gameObject.AddComponent(hookType);
+                if (dst == null) continue;
+                CopyPublicMembers(src, dst);
+                Track(target, dst);
+            }
+        }
+
+        // Copy public instance fields and read/write properties from one component
+        // to another. Skips the Unity identity members that must not be reassigned.
+        private static void CopyPublicMembers(Component source, Component target)
+        {
+            var type = source.GetType();
+            foreach (var f in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (f.IsLiteral || f.IsInitOnly) continue;
+                try { f.SetValue(target, f.GetValue(source)); } catch { }
+            }
+            foreach (var p in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!p.CanRead || !p.CanWrite) continue;
+                if (p.Name == "name" || p.Name == "tag" || p.Name == "hideFlags") continue;
+                try { p.SetValue(target, p.GetValue(source, null), null); } catch { }
+            }
         }
 
         private void Track(Camera cam, Component c)

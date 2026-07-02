@@ -730,7 +730,7 @@ namespace Kerbcast
             // fails (vessel-load race, scene weirdness), at least we
             // render a predictable solid-black backdrop instead of
             // whatever Unity defaults Camera to. CopyFrom overwrites
-            // these when it succeeds. JTI does the same.
+            // these when it succeeds.
             _galaxyCam.clearFlags = CameraClearFlags.SolidColor;
             _galaxyCam.backgroundColor = Color.black;
             var sourceGalaxy = FindKspCamera("GalaxyCamera");
