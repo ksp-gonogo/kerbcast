@@ -31,6 +31,7 @@ namespace Kerbcast
         Bowshock = 2,  // shock cone ahead of the vessel
         Trail = 4,     // plasma wake behind the vessel
         Embers = 8,    // shedding spark/ember particles
+        Firefly = 16,  // capture the Firefly mod's reentry plasma instead of the kerbcast plasma
         All = Core | Bowshock | Trail | Embers,
     }
 

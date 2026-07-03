@@ -45,6 +45,7 @@ namespace Kerbcast
             AddIfEnabled(AtmoFxLayers.Bowshock);
             AddIfEnabled(AtmoFxLayers.Trail);
             AddIfEnabled(AtmoFxLayers.Embers);
+            AddIfEnabled(AtmoFxLayers.Firefly);
         }
 
         private void AddIfEnabled(AtmoFxLayers layer)
@@ -74,6 +75,7 @@ namespace Kerbcast
                 case AtmoFxLayers.Bowshock: return new BowshockEffect();
                 case AtmoFxLayers.Trail: return new TrailEffect();
                 case AtmoFxLayers.Embers: return new EmbersEffect();
+                case AtmoFxLayers.Firefly: return new FireflyCaptureEffect();
                 default: return null;
             }
         }
