@@ -27,6 +27,26 @@ use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{CameraLifecycle, CameraState as ProtocolCameraState, Layer, QualityPreset};
 use crate::shared_mem::{ControlBlock, MmapFrameRing, MmapRingConfig};
 
+/// Filesystem identity for a `.ring` file: distinguishes "same path, same
+/// underlying file" from "same path, file was unlinked and a new one
+/// created in its place" (mtime alone can't, on a same-second delete+recreate).
+#[cfg(unix)]
+fn ring_file_identity(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(windows)]
+fn ring_file_identity(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_index().unwrap_or(0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ring_file_identity(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
 /// On-disk shape of `global.status.json` — the plugin → sidecar push
 /// half of the IPC. The plugin rewrites this file at ~1Hz with the
 /// current effective state for every tracked camera plus the global
@@ -255,6 +275,16 @@ struct InfoManifest {
 pub struct CameraState {
     pub flight_id: u32,
     pub ring: MmapFrameRing,
+    /// Filesystem identity (inode on unix, file index on windows) of the
+    /// `.ring` file this entry attached to. `RebuildCameraList` on the
+    /// plugin side can delete and recreate a ring at the same path within
+    /// one Unity frame for a camera whose part persists across a vessel
+    /// switch, without writing a `destroyed` tombstone (that's reserved for
+    /// actual part destruction). A same-second delete+recreate can share an
+    /// mtime, so identity — not mtime — is what `rescan` compares to notice
+    /// the file underneath changed and reattach instead of leaving the mmap
+    /// pointed at the unlinked original.
+    pub ring_identity: u64,
     pub max_width: u32,
     pub max_height: u32,
     pub part_name: String,
@@ -730,14 +760,35 @@ impl CameraRegistry {
         // no ring file, so they won't appear in `found`).
         let mut attached: Vec<u32> = Vec::new();
         for (id, path) in &found {
+            let found_identity = match tokio::fs::metadata(path).await {
+                Ok(meta) => ring_file_identity(&meta),
+                Err(_) => 0,
+            };
             // A ring that reappears for a flight_id we already hold as a
             // destroyed tombstone means KSP reused that part.flightID for a
             // freshly spawned camera (it recycles ids across revert/recover),
             // so fall through and resurrect it: the insert below replaces the
             // tombstone with a fresh active entry and the attach is announced
-            // to peers so their tiles rebind. A live entry is left untouched.
+            // to peers so their tiles rebind. A live entry with an unchanged
+            // ring file identity is left untouched.
+            //
+            // A live (non-destroyed) entry whose ring identity *has* changed
+            // means the plugin deleted and recreated the ring at this path
+            // without a destroyed tombstone — e.g. RebuildCameraList tearing
+            // down and rebuilding a camera on `onVesselChange` whose part
+            // persisted across the switch. Without this check the old mmap
+            // stays pointed at the unlinked file and the feed goes stale
+            // forever, since nothing else in the registry ever changes to
+            // signal a reattach is needed.
             let resurrecting = match cameras.get(id) {
                 Some(existing) if existing.destroyed.load(Ordering::Acquire) => true,
+                Some(existing) if existing.ring_identity != found_identity => {
+                    info!(
+                        flight_id = id,
+                        "ring file identity changed with no destroyed tombstone — reattaching"
+                    );
+                    true
+                }
                 Some(_) => continue,
                 None => false,
             };
@@ -759,6 +810,7 @@ impl CameraRegistry {
                         Arc::new(CameraState {
                             flight_id: *id,
                             ring,
+                            ring_identity: found_identity,
                             max_width: self.ring_cfg.max_width,
                             max_height: self.ring_cfg.max_height,
                             part_name: manifest.part_name,
@@ -1544,6 +1596,61 @@ mod tests {
         assert!(
             outcome.attached.contains(&id),
             "resurrection must be announced as an attach so peers rebind"
+        );
+    }
+
+    // Reproduces the vessel-switch stale-feed bug (kerbcast#2): a camera
+    // whose part persists across `onVesselChange` gets torn down and rebuilt
+    // by RebuildCameraList without a destroyed tombstone (that path is
+    // reserved for actual part destruction), deleting and recreating the
+    // ring at the same flight_id within one frame. Before the ring_identity
+    // check this was silently ignored by rescan (the entry wasn't flagged
+    // destroyed) and the old mmap stayed pointed at the unlinked file
+    // forever — no browser refresh could recover it.
+    #[tokio::test]
+    async fn live_camera_reattaches_when_ring_recreated_without_destroyed_tombstone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let id: u32 = 7;
+        let write_manifest = || {
+            let content = format!(
+                r#"{{"lifecycle":"active","flight_id":{id},"part_name":"hc.navcam","part_title":"NavCam","camera_name":"NavCam","vessel_name":"booster","supports_zoom":false,"fov":60.0,"fov_min":10.0,"fov_max":90.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+            );
+            std::fs::write(shm.join(format!("{id}.info.json")), content).unwrap();
+        };
+        let ring_path = shm.join(format!("{id}.ring"));
+        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+
+        // 1. Fresh camera attaches active.
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        write_manifest();
+        registry.rescan().await;
+        let first = registry.get(id).await.expect("camera attached");
+        assert!(!first.destroyed.load(Ordering::Acquire));
+
+        // 2. Vessel switch: plugin's normal (non-destroyed) teardown deletes
+        // the ring and info.json with no tombstone, then RebuildCameraList
+        // immediately recreates the same flight_id — all within one frame,
+        // well before the sidecar's next ~1Hz rescan tick.
+        std::fs::remove_file(&ring_path).unwrap();
+        std::fs::remove_file(shm.join(format!("{id}.info.json"))).unwrap();
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        write_manifest();
+
+        let outcome = registry.rescan().await;
+        assert!(
+            outcome.attached.contains(&id),
+            "reattach must be announced so peers rebind and stop reading the stale mmap"
+        );
+        let second = registry.get(id).await.expect("camera still present");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "the registry entry must be replaced, not left pointing at the unlinked ring"
         );
     }
 

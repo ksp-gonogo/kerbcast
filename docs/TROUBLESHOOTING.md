@@ -109,5 +109,13 @@ leaves your own game view untouched.
 
 ## Still stuck?
 
-Open an issue at <https://github.com/jonpepler/kerbcast/issues> with the
-`[Kerbcast]`/`[Kerbcast.sidecar]` slice of KSP.log and your OS + KSP version.
+1. Turn on verbose logging: uncomment `DebugCameraLogging = true` in
+   `GameData/Kerbcast/PluginData/settings.cfg` (see
+   [INSTALL.md](INSTALL.md#configuration) for where per-camera settings
+   live).
+2. Reproduce the problem, then quit KSP so the log file is flushed.
+3. Open an issue at <https://github.com/jonpepler/kerbcast/issues> with:
+   - the `[Kerbcast]`/`[Kerbcast.sidecar]` slice of KSP.log
+   - your OS + KSP version
+   - which vessel/camera part was affected, and what you were doing right
+     before it happened (vessel switch, revert, scene change, …)
