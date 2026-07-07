@@ -268,12 +268,19 @@ namespace Kerbcast
             if (affected != null) MarkFxDirtyForVessel(affected);
         }
 
-        // Decoupling, staging, fairing jettison etc. change a vessel's part set
-        // without firing onPartDestroyed for our tracked part. Rebuild the FX
-        // draw lists so they match the current parts.
+        // Decoupling, staging, docking, fairing jettison etc. change a
+        // vessel's part set without firing onVesselChange (no pilot switch)
+        // or onPartDestroyed for our tracked parts. Pick up any newly-joined
+        // parts (e.g. a docking partner's cameras) immediately rather than
+        // waiting for an incidental later vessel switch — additive only, see
+        // RebuildCameraList's disposeMissing doc comment for why staged-off
+        // debris must not be torn down here. Also rebuild the FX draw lists
+        // so they match the current parts.
         private void OnVesselWasModified(Vessel v)
         {
-            if (v != null) MarkFxDirtyForVessel(v);
+            if (v == null) return;
+            RebuildCameraList(v, disposeMissing: false);
+            MarkFxDirtyForVessel(v);
         }
 
         private void MarkFxDirtyForVessel(Vessel v)
@@ -306,10 +313,24 @@ namespace Kerbcast
             }
         }
 
-        private void RebuildCameraList(Vessel vessel)
+        // disposeMissing=true (onVesselChange — an actual pilot switch): scope
+        // the camera list to `vessel`, tearing down anything not on it. This
+        // is the documented "leaving a vessel drops its cameras" behavior.
+        //
+        // disposeMissing=false (onVesselWasModified — dock/stage without a
+        // pilot switch): additive only. A part leaving `vessel` via staging
+        // is still physically out there on debris and should only stop
+        // streaming when it's actually destroyed (physics range /
+        // onPartDestroyed), not because this vessel's membership changed —
+        // so nothing already tracked gets touched, and only cameras for
+        // newly-appeared parts (e.g. a docking partner's) get added.
+        private void RebuildCameraList(Vessel vessel, bool disposeMissing = true)
         {
-            foreach (var cam in _cameras) cam.Dispose();
-            _cameras.Clear();
+            if (disposeMissing)
+            {
+                foreach (var cam in _cameras) cam.Dispose();
+                _cameras.Clear();
+            }
 
             if (vessel == null) return;
 
@@ -365,6 +386,11 @@ namespace Kerbcast
                         // get a deterministic hash of (flightID, cameraName)
                         // so they're stable across loads.
                         uint flightId = SyntheticFlightId(part.flightID, moduleIdx, hullcam.cameraName);
+                        if (!disposeMissing && _cameras.Any(c => c.FlightId == flightId))
+                        {
+                            moduleIdx++;
+                            continue;
+                        }
                         var panCap = PartCapabilities.ForPart(hullcam.part.partInfo?.name ?? "");
                         _cameras.Add(new KerbcastCamera(
                             hullcam,
