@@ -1610,6 +1610,12 @@ mod tests {
     // check this was silently ignored by rescan (the entry wasn't flagged
     // destroyed) and the old mmap stayed pointed at the unlinked file
     // forever — no browser refresh could recover it.
+    //
+    // unix-only: the identity check is exact there (inode). The non-unix
+    // fallback (mtime) can't distinguish two files created back-to-back
+    // within the same tick, which is exactly what this test does — that's
+    // an inherent limit of the tier-2 fallback, not something to assert on.
+    #[cfg(unix)]
     #[tokio::test]
     async fn live_camera_reattaches_when_ring_recreated_without_destroyed_tombstone() {
         let dir = tempfile::tempdir().expect("tempdir");
