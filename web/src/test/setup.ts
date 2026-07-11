@@ -1,3 +1,3 @@
-import { installDomStubs } from "@jonpepler/kerbcast/testing";
+import { installDomStubs } from "@ksp-gonogo/kerbcast/testing";
 
 installDomStubs();

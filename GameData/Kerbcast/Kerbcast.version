@@ -1,7 +1,7 @@
 {
   "NAME": "Kerbcast",
-  "URL": "https://raw.githubusercontent.com/jonpepler/kerbcast/main/GameData/Kerbcast/Kerbcast.version",
-  "DOWNLOAD": "https://github.com/jonpepler/kerbcast/releases",
+  "URL": "https://raw.githubusercontent.com/ksp-gonogo/kerbcast/main/GameData/Kerbcast/Kerbcast.version",
+  "DOWNLOAD": "https://github.com/ksp-gonogo/kerbcast/releases",
   "VERSION": {
     "MAJOR": 1,
     "MINOR": 4,

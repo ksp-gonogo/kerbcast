@@ -8,9 +8,9 @@
  * - Per-tile RTC inbound stats (pkts/bytes/framesDecoded/jitter)
  */
 
-import type { CameraState, InboundVideoStats, KerbcastClient } from "@jonpepler/kerbcast";
-import { Layer } from "@jonpepler/kerbcast";
-import { useKerbcastCameras } from "@jonpepler/kerbcast-react";
+import type { CameraState, InboundVideoStats, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { Layer } from "@ksp-gonogo/kerbcast";
+import { useKerbcastCameras } from "@ksp-gonogo/kerbcast-react";
 import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 

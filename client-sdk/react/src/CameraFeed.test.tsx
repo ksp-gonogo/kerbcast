@@ -22,9 +22,9 @@
  *  - Station (brokered) mode -- gonogo-only KerbcastDataSource.attachBroker.
  */
 
-import { KerbcastClient, QualityPreset } from "@jonpepler/kerbcast";
-import type { CameraLifecycle, ClientMessage } from "@jonpepler/kerbcast";
-import { type MockCameraInit, MockSidecar } from "@jonpepler/kerbcast/testing";
+import { KerbcastClient, QualityPreset } from "@ksp-gonogo/kerbcast";
+import type { CameraLifecycle, ClientMessage } from "@ksp-gonogo/kerbcast";
+import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
   act,
   cleanup,

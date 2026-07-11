@@ -11,11 +11,11 @@
  * resulting UI state.
  */
 
-import { KerbcastClient } from "@jonpepler/kerbcast";
-import type { CameraLifecycle } from "@jonpepler/kerbcast";
-import { Layer } from "@jonpepler/kerbcast";
-import type { MockCameraInit } from "@jonpepler/kerbcast/testing";
-import { MockSidecar } from "@jonpepler/kerbcast/testing";
+import { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { CameraLifecycle } from "@ksp-gonogo/kerbcast";
+import { Layer } from "@ksp-gonogo/kerbcast";
+import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
+import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -1040,8 +1040,8 @@ describe("App - ping watchdog", () => {
 // where refcounting lives. This mirrors the CameraFeed.test.tsx fixture pattern.
 // ---------------------------------------------------------------------------
 
-import { CameraFeed } from "@jonpepler/kerbcast-react";
-import { KerbcastProvider } from "@jonpepler/kerbcast-react";
+import { CameraFeed } from "@ksp-gonogo/kerbcast-react";
+import { KerbcastProvider } from "@ksp-gonogo/kerbcast-react";
 
 async function buildConnectedFixture(cameras: MockCameraInit[] = []) {
   const sidecar = new MockSidecar();

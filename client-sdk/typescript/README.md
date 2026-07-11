@@ -1,4 +1,4 @@
-# @jonpepler/kerbcast
+# @ksp-gonogo/kerbcast
 
 TypeScript client for the kerbcast sidecar. Used by browsers and other
 clients that consume the sidecar's H.264 streams.
@@ -14,24 +14,16 @@ bumped together by `./scripts/bump-version.sh`.
 
 ## Install
 
-Hosted on GitHub Packages. In `.npmrc`:
-
-```ini
-@jonpepler:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
-```
-
-`GITHUB_TOKEN` needs `read:packages`. CI's auto-injected
-`secrets.GITHUB_TOKEN` already has it.
+Hosted on public npm. No registry route or auth needed:
 
 ```sh
-npm add @jonpepler/kerbcast
+npm add @ksp-gonogo/kerbcast
 ```
 
 ## Use
 
 ```ts
-import { KerbcastClient, Layer } from "@jonpepler/kerbcast";
+import { KerbcastClient, Layer } from "@ksp-gonogo/kerbcast";
 
 const client = new KerbcastClient({ host: "192.168.1.74", port: 8088 });
 await client.connect();
@@ -71,7 +63,7 @@ roll their own transport (a Node.js consumer outside a browser, a
 test harness, an alternative-language gateway, etc).
 
 ```ts
-import type { ClientMessage } from "@jonpepler/kerbcast";
+import type { ClientMessage } from "@ksp-gonogo/kerbcast";
 
 declare const controlChannel: RTCDataChannel;
 
@@ -110,11 +102,11 @@ hand-written shim.
 
 ## License
 
-[CC BY-NC-SA 4.0](https://github.com/jonpepler/kerbcast/blob/main/LICENSE).
+[CC BY-NC-SA 4.0](https://github.com/ksp-gonogo/kerbcast/blob/main/LICENSE).
 
 ## Versioning
 
 [SemVer](https://semver.org/) against the wire format and client
-API. See [CHANGELOG.md](https://github.com/jonpepler/kerbcast/blob/main/client-sdk/typescript/CHANGELOG.md).
+API. See [CHANGELOG.md](https://github.com/ksp-gonogo/kerbcast/blob/main/client-sdk/typescript/CHANGELOG.md).
 While the protocol is at `0.x`, any minor bump may require consumer
 updates. Strict SemVer applies at `1.0.0`.

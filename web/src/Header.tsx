@@ -1,4 +1,4 @@
-import type { KerbcastClient } from "@jonpepler/kerbcast";
+import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
 import { Settings } from "lucide-react";
 import { useEffect, useState } from "react";
 import styled from "styled-components";

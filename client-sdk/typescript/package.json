@@ -1,16 +1,16 @@
 {
-  "name": "@jonpepler/kerbcast",
+  "name": "@ksp-gonogo/kerbcast",
   "version": "1.4.0",
   "description": "TypeScript client for the kerbcast KSP camera-streaming sidecar. KerbcastClient wraps the WebRTC peer + control channel; wire-format types are typeshare-generated from the sidecar's Rust protocol module.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "Jon Pepler",
-  "homepage": "https://github.com/jonpepler/kerbcast#readme",
+  "homepage": "https://github.com/ksp-gonogo/kerbcast#readme",
   "bugs": {
-    "url": "https://github.com/jonpepler/kerbcast/issues"
+    "url": "https://github.com/ksp-gonogo/kerbcast/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonpepler/kerbcast.git",
+    "url": "git+https://github.com/ksp-gonogo/kerbcast.git",
     "directory": "client-sdk/typescript"
   },
   "keywords": [
@@ -48,8 +48,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "publishConfig": {
-    "access": "public",
-    "registry": "https://npm.pkg.github.com"
+    "access": "public"
   },
   "devDependencies": {
     "jsdom": "^29.0.2",

@@ -10,12 +10,12 @@
  * through KerbcastProvider so useKerbcastCameras() returns the live list.
  */
 
-import { KerbcastClient } from "@jonpepler/kerbcast";
-import type { CameraLifecycle } from "@jonpepler/kerbcast";
-import { Layer } from "@jonpepler/kerbcast";
-import type { MockCameraInit } from "@jonpepler/kerbcast/testing";
-import { MockSidecar } from "@jonpepler/kerbcast/testing";
-import { KerbcastProvider } from "@jonpepler/kerbcast-react";
+import { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { CameraLifecycle } from "@ksp-gonogo/kerbcast";
+import { Layer } from "@ksp-gonogo/kerbcast";
+import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
+import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
+import { KerbcastProvider } from "@ksp-gonogo/kerbcast-react";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Tile } from "./Tile";

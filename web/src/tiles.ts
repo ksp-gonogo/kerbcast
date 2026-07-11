@@ -16,8 +16,8 @@
  * all tiles). Seeding from cameras only happens on the first visit (key absent).
  */
 
-import { CameraLifecycle } from "@jonpepler/kerbcast";
-import type { CameraState } from "@jonpepler/kerbcast";
+import { CameraLifecycle } from "@ksp-gonogo/kerbcast";
+import type { CameraState } from "@ksp-gonogo/kerbcast";
 
 export interface Tile {
   flightId: number | null;

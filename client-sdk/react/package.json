@@ -1,16 +1,16 @@
 {
-  "name": "@jonpepler/kerbcast-react",
+  "name": "@ksp-gonogo/kerbcast-react",
   "version": "1.4.0",
   "description": "React components and hooks for kerbcast camera feeds.",
   "license": "CC-BY-NC-SA-4.0",
   "author": "Jon Pepler",
-  "homepage": "https://github.com/jonpepler/kerbcast#readme",
+  "homepage": "https://github.com/ksp-gonogo/kerbcast#readme",
   "bugs": {
-    "url": "https://github.com/jonpepler/kerbcast/issues"
+    "url": "https://github.com/ksp-gonogo/kerbcast/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonpepler/kerbcast.git",
+    "url": "git+https://github.com/ksp-gonogo/kerbcast.git",
     "directory": "client-sdk/react"
   },
   "keywords": [
@@ -42,11 +42,10 @@
     "prepublishOnly": "pnpm run build"
   },
   "publishConfig": {
-    "access": "public",
-    "registry": "https://npm.pkg.github.com"
+    "access": "public"
   },
   "dependencies": {
-    "@jonpepler/kerbcast": "workspace:^"
+    "@ksp-gonogo/kerbcast": "workspace:^"
   },
   "peerDependencies": {
     "react": "^18 || ^19",

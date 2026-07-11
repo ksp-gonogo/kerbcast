@@ -1,17 +1,15 @@
-# Publishing `@jonpepler/kerbcast`
+# Publishing `@ksp-gonogo/kerbcast`
 
-Packages are published to **GitHub Packages**, not npmjs.com. The
-two halves of the wire contract (the Rust sidecar's `Cargo.toml`
-and this TypeScript `package.json`) share a single SemVer line;
-CI verifies they agree before letting a tag publish.
+Packages are published to **public npmjs.com**. The two halves of
+the wire contract (the Rust sidecar's `Cargo.toml` and this
+TypeScript `package.json`) share a single SemVer line; CI verifies
+they agree before letting a tag publish.
 
-The npm scope is `@jonpepler` because GitHub Packages requires the
-scope to match the repo owner. If the project later moves to an
-umbrella GitHub org, the scope changes to that org's name in one
-search-replace, with no other restructuring needed.
-
-No manual secret setup. The workflow uses the built-in
-`GITHUB_TOKEN` to write to the repo's own Packages registry.
+Publish auth is **npm OIDC trusted publishing**: npmjs.com trusts
+this repo's `release.yml` workflow directly, so nothing is stored
+or rotated. The workflow requests a short-lived id-token via the
+`id-token: write` permission and npm exchanges it for a publish
+grant at publish time. No `NPM_TOKEN` secret exists for this repo.
 
 ## Cutting a release
 
@@ -42,8 +40,8 @@ CI then runs the `publish-sdk` job in `release.yml`:
 2. Verifies the tag, `Cargo.toml`, and both package.json files all
    carry `0.1.1`.
 3. Builds the workspace with `tsc`.
-4. `pnpm publish` for `@jonpepler/kerbcast`, then
-   `@jonpepler/kerbcast-react`, to `npm.pkg.github.com`.
+4. `npm publish` for `@ksp-gonogo/kerbcast`, then
+   `@ksp-gonogo/kerbcast-react`, to `registry.npmjs.org` via OIDC.
 
 If any check fails the job exits without publishing, and the
 GameData bundle job (which `needs` it) never creates a GitHub
@@ -52,39 +50,26 @@ form.
 
 ## Installing as a consumer
 
-`@jonpepler/kerbcast` is hosted on GitHub Packages, which requires
-the installing machine (or CI job) to authenticate even for public
-packages.
-
-Add an `.npmrc` next to your `package.json`:
-
-```ini
-@jonpepler:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
-```
-
-For local dev, generate a Personal Access Token at GitHub's
-`Settings → Developer settings → Personal access tokens (classic)`
-with `read:packages` scope, export it as `GITHUB_TOKEN`, then:
+`@ksp-gonogo/kerbcast` is hosted on public npm — no registry route,
+no auth, no token:
 
 ```sh
-pnpm add @jonpepler/kerbcast
+npm add @ksp-gonogo/kerbcast
 ```
-
-In other GitHub Actions workflows, the auto-injected
-`secrets.GITHUB_TOKEN` already has `read:packages` permission.
 
 ## Manual publish (fallback)
 
-If CI isn't an option (token rotation, urgent fix, etc.):
+OIDC trusted publishing only works from the trusted GitHub Actions
+workflow, so a manual publish needs a real npm account with publish
+rights on the `@ksp-gonogo` scope (not a workaround for a broken
+trusted-publisher config — fix that instead where possible):
 
 ```sh
 cd client-sdk/typescript
 pnpm install
 pnpm run build
 
-# Auth: PAT with write:packages scope on the jonpepler/kerbcast repo.
-export GITHUB_TOKEN=ghp_…
+npm login   # account with publish rights on @ksp-gonogo
 npm publish
 ```
 
@@ -105,18 +90,20 @@ is loose: assume any minor bump might require consumer updates.
 Tighten this to strict SemVer once the protocol stabilises at
 `1.0.0`.
 
-## Why GitHub Packages and not npmjs.com
+## Why public npm and OIDC
 
-- One auth surface (GitHub login + PAT covers both source and the
-  registry); no separate npm account to manage.
-- The workflow's built-in `GITHUB_TOKEN` publishes with zero
-  per-repo secret setup.
-- Provenance attestation is first-class.
-- Public packages don't cost anything on the GitHub Free tier;
-  storage / bandwidth caps don't apply to public scope.
+- Zero-friction installs: `npm add @ksp-gonogo/kerbcast` works for
+  anyone, no `.npmrc` registry route or token — required for the
+  eventual public KSP-mod marketplace use case.
+- OIDC trusted publishing means no `NPM_TOKEN` to store, rotate, or
+  leak; npmjs.com verifies the publish came from this exact repo's
+  release workflow and stamps provenance automatically.
+- Matches where the rest of the `@ksp-gonogo` scope (gonogo's own
+  publishable packages) is heading.
 
-The trade-off is that consumers have to configure their `.npmrc`
-to pull from the GitHub registry. Acceptable for a niche
-KSP-streaming protocol package; npmjs.com is the move if the
-consumer surface ever broadens enough to make that friction
-matter.
+The repo previously published to GitHub Packages under
+`@jonpepler`, which kept consumer auth on the same GitHub login as
+the source but required every installer to configure a registry
+route and token even for a public package. That trade-off no longer
+made sense once the project moved to the shared `@ksp-gonogo` scope
+with a public-marketplace goal.

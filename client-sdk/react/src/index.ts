@@ -1,8 +1,8 @@
 /**
- * @jonpepler/kerbcast-react
+ * @ksp-gonogo/kerbcast-react
  *
  * React components and hooks for kerbcast camera feeds. This package
- * is a peer to @jonpepler/kerbcast (the core SDK) and requires React 18+
+ * is a peer to @ksp-gonogo/kerbcast (the core SDK) and requires React 18+
  * and styled-components 6+ as peer dependencies.
  */
 

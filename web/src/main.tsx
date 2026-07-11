@@ -1,5 +1,5 @@
 import "./styles.css";
-import { BrowserKerbcastTransport, KerbcastClient } from "@jonpepler/kerbcast";
+import { BrowserKerbcastTransport, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";

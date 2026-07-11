@@ -50,12 +50,12 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
-      # Build the SDK packages first: @jonpepler/kerbcast and
-      # @jonpepler/kerbcast-react resolve from dist/ (package.json exports
+      # Build the SDK packages first: @ksp-gonogo/kerbcast and
+      # @ksp-gonogo/kerbcast-react resolve from dist/ (package.json exports
       # point at dist/index.d.ts). Without this step, typecheck and the web
       # build fail with "cannot find module / its type declarations".
       - name: Build SDK packages
-        run: pnpm --filter "@jonpepler/kerbcast" --filter "@jonpepler/kerbcast-react" build
+        run: pnpm --filter "@ksp-gonogo/kerbcast" --filter "@ksp-gonogo/kerbcast-react" build
 
       - name: Test (kerbcast-web)
         run: pnpm --filter kerbcast-web test

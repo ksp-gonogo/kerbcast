@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Sister project
 
-**[gonogo](https://github.com/jonpepler/gonogo)** is a consumer of this mod: a TypeScript SPA that displays kerbcast camera feeds in a mission-control dashboard. Any WebRTC-capable browser can be a kerbcast consumer; gonogo's just the one we built alongside. The two projects share conventions (commits, semver, performance-budget patterns, the Steam-Deck-to-MacBook topology), and gonogo's `CLAUDE.md` is the canonical record of those.
+**[gonogo](https://github.com/ksp-gonogo/gonogo)** is a consumer of this mod: a TypeScript SPA that displays kerbcast camera feeds in a mission-control dashboard. Any WebRTC-capable browser can be a kerbcast consumer; gonogo's just the one we built alongside. The two projects share conventions (commits, semver, performance-budget patterns, the Steam-Deck-to-MacBook topology), and gonogo's `CLAUDE.md` is the canonical record of those.
 
 The full design rationale for kerbcast lives in **gonogo's `local_docs/ocisly_state_and_rebuild.md`**: read it before any non-trivial architectural decision. This CLAUDE.md is an index pointing at it, not a replacement.
 
@@ -42,10 +42,10 @@ Current layout (as of 2026-06-07):
 
 ```
 client-sdk/
-  typescript/           @jonpepler/kerbcast -- transport, KerbcastClient, MockSidecar.
+  typescript/           @ksp-gonogo/kerbcast -- transport, KerbcastClient, MockSidecar.
                         TypeScript types generated from sidecar/src/protocol/ via
                         typeshare; SDK logic hand-written on top.
-  react/                @jonpepler/kerbcast-react -- CameraFeed component + hooks
+  react/                @ksp-gonogo/kerbcast-react -- CameraFeed component + hooks
                         shared by gonogo and the sidecar web page.
 web/                    Vite + React app served by the sidecar at GET /.
                         Targets fresh KSP users: stream-first grid, auto-connect.

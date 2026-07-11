@@ -1,4 +1,4 @@
-import type { ErrorPayload, KerbcastClient } from "@jonpepler/kerbcast";
+import type { ErrorPayload, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";

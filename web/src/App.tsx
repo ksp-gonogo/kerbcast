@@ -1,5 +1,5 @@
-import type { KerbcastClient } from "@jonpepler/kerbcast";
-import { KerbcastProvider, useKerbcastCameras } from "@jonpepler/kerbcast-react";
+import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { KerbcastProvider, useKerbcastCameras } from "@ksp-gonogo/kerbcast-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import styled from "styled-components";
 import { ConnectionManager } from "./connectionManager";

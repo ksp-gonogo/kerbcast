@@ -1,5 +1,9 @@
 # kerbcast
 
+[![SpaceDock](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fspacedock.info%2Fapi%2Fmod%2F4366&label=SpaceDock&query=%24.versions%5B0%5D.friendly_version)](https://spacedock.info/mod/4366/Kerbcast)
+[![npm: @ksp-gonogo/kerbcast](https://img.shields.io/npm/v/%40ksp-gonogo%2Fkerbcast?label=%40ksp-gonogo%2Fkerbcast)](https://www.npmjs.com/package/@ksp-gonogo/kerbcast)
+[![npm: @ksp-gonogo/kerbcast-react](https://img.shields.io/npm/v/%40ksp-gonogo%2Fkerbcast-react?label=%40ksp-gonogo%2Fkerbcast-react)](https://www.npmjs.com/package/@ksp-gonogo/kerbcast-react)
+
 A from-scratch, high-performance oriented successor to OCISLY for streaming Kerbal Space Program camera feeds to a browser. Hardware-accelerated H.264 over WebRTC, with full Hullcam VDS camera-type fidelity. Designed with Linux in mind, Windows and MacOS support is a little experimental.
 
 <p align="center">
@@ -8,7 +12,7 @@ A from-scratch, high-performance oriented successor to OCISLY for streaming Kerb
 
 ## What it does
 
-- Streams HullcamVDS camera sources to a browser via the bundled kerbcast web UI or through [@jonpepler/kerbcast](https://github.com/jonpepler/kerbcast/pkgs/npm/kerbcast), a TypeScript SDK
+- Streams HullcamVDS camera sources to a browser via the bundled kerbcast web UI or through [@ksp-gonogo/kerbcast](https://www.npmjs.com/package/@ksp-gonogo/kerbcast), a TypeScript SDK
 - Supports performance tweak options to keep fps reasonable through degrading resolution, framerate, and shedding render layers. By default, performance should feel vastly improved over the original OCISLY mod
 - Introduces optional shaders for wind and re-entry FX
 - Supports popular visual mods so their effects show on the camera feeds: Scatterer, EVE, TUFX, Deferred, Firefly, and Parallax
@@ -33,7 +37,7 @@ Issues and PRs are welcome, particularly if you'd like to 'adopt' macOS or Windo
 
 ## Install
 
-Easiest is **CKAN**. Otherwise grab the latest `kerbcast-*.zip` from the [releases page](https://github.com/jonpepler/kerbcast/releases) (or the [SpaceDock listing](https://spacedock.info/mod/4366/Kerbcast)) and follow the install steps in that release's notes. For a manual install, ensure you also install [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued) and [Harmony 2](https://github.com/KSPModdingLibs/HarmonyKSP).
+Easiest is **CKAN**. Otherwise grab the latest `kerbcast-*.zip` from the [releases page](https://github.com/ksp-gonogo/kerbcast/releases) (or the [SpaceDock listing](https://spacedock.info/mod/4366/Kerbcast)) and follow the install steps in that release's notes. For a manual install, ensure you also install [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued) and [Harmony 2](https://github.com/KSPModdingLibs/HarmonyKSP).
 
 For the longer version with multi-device setup, configuration, info on what's in the bundle, see [docs/INSTALL.md](docs/INSTALL.md). If something doesn't work, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) walks the common failures.
 
@@ -53,5 +57,5 @@ This mod was built initally for getting best performance out of Steam Deck, and 
 
 ## Companion project
 
-[gonogo](https://github.com/jonpepler/gonogo) - a WIP mission-control browser SPA that consumes kerbcast feeds (and a few other things).
+[gonogo](https://github.com/ksp-gonogo/gonogo) - a WIP mission-control browser SPA that consumes kerbcast feeds (and a few other things).
 

@@ -4,8 +4,8 @@ The sidecar's built-in browser UI. Served by the sidecar at `GET /`. Targets
 fresh KSP users: auto-connect on load, stream-first camera grid, camera
 picker, dev controls behind a settings toggle.
 
-Built with Vite + React, using `@jonpepler/kerbcast` and
-`@jonpepler/kerbcast-react` from this same workspace.
+Built with Vite + React, using `@ksp-gonogo/kerbcast` and
+`@ksp-gonogo/kerbcast-react` from this same workspace.
 
 ## Dev workflow
 

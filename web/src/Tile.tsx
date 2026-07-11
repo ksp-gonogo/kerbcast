@@ -2,8 +2,8 @@ import {
   buildCameraLabeler,
   CameraFeed,
   useKerbcastCameras,
-} from "@jonpepler/kerbcast-react";
-import type { FeedAction } from "@jonpepler/kerbcast-react";
+} from "@ksp-gonogo/kerbcast-react";
+import type { FeedAction } from "@ksp-gonogo/kerbcast-react";
 import { Check, ListPlus, ListX, Pencil, Pin, PinOff, Plus, Trash2, WifiOff, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";

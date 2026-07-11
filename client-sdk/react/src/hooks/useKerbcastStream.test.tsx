@@ -8,8 +8,8 @@
  * on unmount.
  */
 
-import { KerbcastClient } from "@jonpepler/kerbcast";
-import { MockSidecar } from "@jonpepler/kerbcast/testing";
+import { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { KerbcastProvider } from "../context";

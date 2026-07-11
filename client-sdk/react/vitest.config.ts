@@ -4,13 +4,13 @@ import path from "path";
 export default defineConfig({
   resolve: {
     alias: {
-      // Resolve @jonpepler/kerbcast imports to source so tests run without
+      // Resolve @ksp-gonogo/kerbcast imports to source so tests run without
       // a prior `pnpm -r build` in the monorepo.
-      "@jonpepler/kerbcast/testing": path.resolve(
+      "@ksp-gonogo/kerbcast/testing": path.resolve(
         __dirname,
         "../typescript/src/testing/index.ts",
       ),
-      "@jonpepler/kerbcast": path.resolve(
+      "@ksp-gonogo/kerbcast": path.resolve(
         __dirname,
         "../typescript/src/index.ts",
       ),

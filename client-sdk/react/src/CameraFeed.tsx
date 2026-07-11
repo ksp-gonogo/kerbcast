@@ -1,5 +1,5 @@
-import type { KerbcastClient } from "@jonpepler/kerbcast";
-import { PanZoomController, QualityPreset } from "@jonpepler/kerbcast";
+import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { PanZoomController, QualityPreset } from "@ksp-gonogo/kerbcast";
 import {
   forwardRef,
   useCallback,

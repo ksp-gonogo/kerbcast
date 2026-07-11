@@ -11,7 +11,7 @@
  * so tests can substitute a mock-backed one.
  */
 
-import type { KerbcastClient, KerbcastConnectionState } from "@jonpepler/kerbcast";
+import type { KerbcastClient, KerbcastConnectionState } from "@ksp-gonogo/kerbcast";
 
 const BACKOFF_BASE_MS = 2000;
 const BACKOFF_MAX_MS = 30000;

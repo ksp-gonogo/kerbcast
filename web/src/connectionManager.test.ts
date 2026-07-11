@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "./connectionManager";
-import type { KerbcastClient } from "@jonpepler/kerbcast";
+import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
 
 /**
  * Minimal client double: just what ConnectionManager touches. The full

@@ -112,7 +112,7 @@ leaves your own game view untouched.
 1. Turn on verbose logging: uncomment `DebugCameraLogging = true` in
    `GameData/Kerbcast/PluginData/settings.cfg`.
 2. Reproduce the problem, then quit KSP so the log file is flushed.
-3. Open an issue at <https://github.com/jonpepler/kerbcast/issues> with:
+3. Open an issue at <https://github.com/ksp-gonogo/kerbcast/issues> with:
    - At least the `[Kerbcast]`/`[Kerbcast.sidecar]` slice of KSP.log
    - your OS + KSP version
    - which vessel/camera part was affected, and what you were doing right

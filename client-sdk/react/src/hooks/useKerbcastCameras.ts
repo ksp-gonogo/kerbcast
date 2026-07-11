@@ -1,4 +1,4 @@
-import type { CameraState } from "@jonpepler/kerbcast";
+import type { CameraState } from "@ksp-gonogo/kerbcast";
 import { useEffect, useState } from "react";
 import { useKerbcastClient } from "../context";
 

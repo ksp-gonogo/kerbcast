@@ -1,5 +1,5 @@
-import type { CameraState } from "@jonpepler/kerbcast";
-import { CameraLifecycle } from "@jonpepler/kerbcast";
+import type { CameraState } from "@ksp-gonogo/kerbcast";
+import { CameraLifecycle } from "@ksp-gonogo/kerbcast";
 
 export type { CameraLifecycle };
 

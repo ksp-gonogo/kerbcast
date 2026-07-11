@@ -14,7 +14,7 @@ Kerbcast is on CKAN. If installing there, skip to Running.
 ## Manual install (GitHub or SpaceDock)
 
 1. Download `kerbcast-vX.Y.Z.zip` from the
-   [releases page](https://github.com/jonpepler/kerbcast/releases) or the
+   [releases page](https://github.com/ksp-gonogo/kerbcast/releases) or the
    [SpaceDock listing](https://spacedock.info/mod/4366/Kerbcast).
 2. Extract it into your KSP install so that `GameData/Kerbcast/` exists
    (the zip already contains the `GameData/` folder - extract at the KSP root).

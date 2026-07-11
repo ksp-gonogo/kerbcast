@@ -1,4 +1,4 @@
-import { useKerbcastCameras } from "@jonpepler/kerbcast-react";
+import { useKerbcastCameras } from "@ksp-gonogo/kerbcast-react";
 import { Video, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
@@ -18,7 +18,7 @@ import {
   toggleSpotlight,
   updateTile,
 } from "./tiles";
-import { CameraLifecycle } from "@jonpepler/kerbcast";
+import { CameraLifecycle } from "@ksp-gonogo/kerbcast";
 import type { Tile as TileData } from "./tiles";
 
 interface GridProps {

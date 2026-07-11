@@ -15,15 +15,15 @@ export default defineConfig(({ command }) => ({
   ],
   resolve: {
     alias: {
-      "@jonpepler/kerbcast/testing": path.resolve(
+      "@ksp-gonogo/kerbcast/testing": path.resolve(
         __dirname,
         "../client-sdk/typescript/src/testing/index.ts",
       ),
-      "@jonpepler/kerbcast": path.resolve(
+      "@ksp-gonogo/kerbcast": path.resolve(
         __dirname,
         "../client-sdk/typescript/src/index.ts",
       ),
-      "@jonpepler/kerbcast-react": path.resolve(
+      "@ksp-gonogo/kerbcast-react": path.resolve(
         __dirname,
         "../client-sdk/react/src/index.ts",
       ),

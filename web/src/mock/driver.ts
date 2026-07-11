@@ -11,9 +11,9 @@
  * /profile fetch is intercepted to return plausible stagger numbers.
  */
 
-import { CameraLifecycle, KerbcastClient } from "@jonpepler/kerbcast";
-import type { MockCameraInit } from "@jonpepler/kerbcast/testing";
-import { MockSidecar } from "@jonpepler/kerbcast/testing";
+import { CameraLifecycle, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
+import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 
 const MOCK_CAMERAS: MockCameraInit[] = [
   {

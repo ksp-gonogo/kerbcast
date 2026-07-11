@@ -10,8 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@jonpepler/kerbcast": "workspace:^",
-    "@jonpepler/kerbcast-react": "workspace:^",
+    "@ksp-gonogo/kerbcast": "workspace:^",
+    "@ksp-gonogo/kerbcast-react": "workspace:^",
     "lucide-react": "^1.17.0",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",

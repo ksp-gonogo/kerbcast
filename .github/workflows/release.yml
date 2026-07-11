@@ -3,8 +3,9 @@ name: release
 # Triggered on v* tags. Linked jobs:
 #
 #   publish-sdk    (~1 min)   regenerates the typeshare bindings from Rust,
-#                             verifies version sync, publishes @jonpepler/kerbcast
-#                             and @jonpepler/kerbcast-react to GitHub Packages.
+#                             verifies version sync, publishes @ksp-gonogo/kerbcast
+#                             and @ksp-gonogo/kerbcast-react to public npm via
+#                             OIDC trusted publishing.
 #   build-sidecar  (matrix)   builds one sidecar per supported runtime — Linux
 #                             (tier-1 libva, glibc-floored + lib-bundled), macOS
 #                             arm64 and Windows x64 (tier-2 software encode, no
@@ -36,13 +37,13 @@ name: release
 # encode only (OpenH264, statically built) so they carry no host-glibc concern
 # and bundle no sibling libs.
 #
-# GitHub Packages requires the npm scope to match the repo's owner; we use
-# `@jonpepler` because that's where the repo lives today. pnpm rewrites
-# workspace:^ to real semver ranges in the published tarballs. pnpm 9 does
-# not support --provenance; attestation is deferred until it does.
+# Publishes to public npm under the @ksp-gonogo scope via OIDC trusted
+# publishing (npmjs.com trusts this repo's release workflow — no NPM_TOKEN
+# stored or rotated). pnpm rewrites workspace:^ to real semver ranges in the
+# published tarballs. Requires npm >= 11.5.1 and `permissions: id-token: write`.
 #
 # Secrets required:
-#   KSP_MANAGED_TOKEN — fine-grained PAT (Contents: read) for jonpepler/ksp-managed
+#   KSP_MANAGED_TOKEN — fine-grained PAT (Contents: read) for ksp-gonogo/ksp-managed
 #   UNITY_USERNAME / UNITY_PASSWORD — Unity Personal license for shader builds
 #
 # Signing secrets (optional — steps skip gracefully when absent, so the build
@@ -65,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -99,14 +100,19 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
 
-      - name: Setup Node + GitHub Packages registry
+      - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-          registry-url: https://npm.pkg.github.com
-          scope: "@jonpepler"
+          registry-url: https://registry.npmjs.org
+          scope: "@ksp-gonogo"
+
+      # OIDC trusted publishing needs npm >= 11.5.1; setup-node's bundled npm
+      # is older than that on the Node 22 runner image.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
 
       - name: Verify version sync (tag == Cargo.toml == package.json == Kerbcast.version)
         run: |
@@ -128,17 +134,15 @@ jobs:
         run: pnpm -r build
 
       # Core first so the registry has the dependency when react is indexed.
-      - name: Publish @jonpepler/kerbcast to GitHub Packages
+      # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates via the
+      # id-token permission above, not a stored credential.
+      - name: Publish @ksp-gonogo/kerbcast to npm
         working-directory: client-sdk/typescript
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm publish --no-git-checks
+        run: npm publish
 
-      - name: Publish @jonpepler/kerbcast-react to GitHub Packages
+      - name: Publish @ksp-gonogo/kerbcast-react to npm
         working-directory: client-sdk/react
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm publish --no-git-checks
+        run: npm publish
 
   # One sidecar per supported runtime. Linux must build on ubuntu-22.04 (glibc
   # floor) with ffmpeg/libva for the tier-1 libva backend + sibling-lib bundle;
@@ -389,7 +393,7 @@ jobs:
       - name: Checkout KSP assemblies
         uses: actions/checkout@v6
         with:
-          repository: jonpepler/ksp-managed
+          repository: ksp-gonogo/ksp-managed
           token: ${{ secrets.KSP_MANAGED_TOKEN }}
           path: ksp-managed
 
@@ -558,7 +562,7 @@ jobs:
             echo "- \`kerbcast-${TAG}.zip\` — complete install tree (plugin + sidecar + shader bundles + settings)"
             echo "- \`Kerbcast.dll\` — plugin DLL only (for manual installs)"
             echo ""
-            echo "> TypeScript SDK \`@jonpepler/kerbcast@${TAG#v}\` and \`@jonpepler/kerbcast-react@${TAG#v}\` published to GitHub Packages."
+            echo "> TypeScript SDK \`@ksp-gonogo/kerbcast@${TAG#v}\` and \`@ksp-gonogo/kerbcast-react@${TAG#v}\` published to npm."
             echo ""
             echo "<details>"
             echo "<summary>Changelog</summary>"
@@ -623,11 +627,13 @@ jobs:
           rm -f ./sd-cookies sd-changelog.md
           echo "SpaceDock mod ${SPACEDOCK_MOD_ID} updated to ${VERSION} (KSP ${GAME_VERSION})"
 
-      # Kerbcast.ckan pins an exact version + download URL + hashes (users
-      # install via manual .ckan import while the repo stays off the public
-      # CKAN index). Hand-pinning went stale within a day of v0.18.0, so
-      # re-pin from the zip we just published. Runs on main, not the tag:
-      # the pin must land where users fetch the raw file from.
+      # Kerbcast.ckan pins an exact version + download URL + hashes for manual
+      # .ckan-file installs. The public NetKAN index resolves independently
+      # via the SpaceDock listing (see the "Publish to SpaceDock" step above),
+      # so this file isn't what CKAN users actually install from, but it goes
+      # stale fast if left unpinned (went stale within a day of v0.18.0), so
+      # re-pin from the zip we just published. Runs on main, not the tag: the
+      # pin must land where users fetch the raw file from.
       - name: Re-pin Kerbcast.ckan on main
         if: startsWith(github.ref_name, 'v')
         run: |
@@ -652,7 +658,7 @@ jobs:
               m = json.load(f)
           m["version"] = tag.lstrip("v")
           m["download"] = [
-              f"https://github.com/jonpepler/kerbcast/releases/download/{tag}/kerbcast-{tag}.zip"
+              f"https://github.com/ksp-gonogo/kerbcast/releases/download/{tag}/kerbcast-{tag}.zip"
           ]
           m["download_size"] = int(size)
           m["download_hash"] = {"sha1": sha1, "sha256": sha256}
