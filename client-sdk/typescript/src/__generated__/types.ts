@@ -190,6 +190,16 @@ export interface HelloPayload {
 	encoderBackend: string;
 }
 
+/**
+ * Scene-state change: whether KSP is currently in a flight scene. Sent
+ * after `Hello` (priming) and whenever the polled in-flight flag flips,
+ * so clients can show a calm out-of-flight standby instead of per-camera
+ * SIGNAL LOST when the whole scene unloads.
+ */
+export interface SceneStateChangedPayload {
+	inFlight: boolean;
+}
+
 export interface SetDegradePayload {
 	flightId: number;
 	/**
@@ -484,5 +494,10 @@ export type ServerMessage =
 	 * so a freshly-connected client shows correct state immediately, and
 	 * re-broadcast whenever the polled plugin status shows a change.
 	 */
-	| { type: "settings-state", content: SettingsStatePayload };
+	| { type: "settings-state", content: SettingsStatePayload }
+	/**
+	 * Whether KSP is in a flight scene. Primed after `Hello` and
+	 * re-broadcast when the polled in-flight flag changes.
+	 */
+	| { type: "scene-state-changed", content: SceneStateChangedPayload };
 
