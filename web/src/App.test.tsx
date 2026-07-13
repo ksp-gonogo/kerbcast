@@ -1290,3 +1290,33 @@ describe("App - tile rebind after flightId reassignment", () => {
     expect(stored[0].flightId).toBe(1);
   });
 });
+
+describe("App - out-of-flight standby", () => {
+  it("shows the flight-scene standby when out of flight, hides it in flight", async () => {
+    const { client, sidecar, openSidecar } = buildFixture([]);
+    await renderApp(client);
+
+    await act(async () => {
+      openSidecar();
+    });
+
+    /* Unknown scene on connect => no standby flash. */
+    expect(
+      screen.queryByText(/camera feeds activate in a flight scene/i),
+    ).toBeNull();
+
+    await act(async () => {
+      sidecar.fireSceneState(false);
+    });
+    expect(
+      screen.getByText(/camera feeds activate in a flight scene/i),
+    ).toBeTruthy();
+
+    await act(async () => {
+      sidecar.fireSceneState(true);
+    });
+    expect(
+      screen.queryByText(/camera feeds activate in a flight scene/i),
+    ).toBeNull();
+  });
+});

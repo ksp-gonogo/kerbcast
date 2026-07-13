@@ -9,6 +9,7 @@ import { Grid } from "./Grid";
 import { Header } from "./Header";
 import { Settings } from "./SettingsPanel";
 import { ShedBanner } from "./ShedBanner";
+import { StandbyOverlay } from "./StandbyOverlay";
 import {
   applyTheme,
   loadDebug,
@@ -110,28 +111,31 @@ export function App({ client }: AppProps): React.JSX.Element {
         {showPerfWarnings && <ShedBanner client={client} />}
         <ErrorToast client={client} />
         <MainArea>
-          {/* CameraSeeder and CameraReconciler use useKerbcastCameras inside KerbcastProvider */}
-          <CameraSeeder
-            tilesSeeded={tilesSeeded}
-            onSeed={(seeded) => {
-              setTiles(seeded);
-              saveTiles(seeded);
-              setTilesSeeded(true);
-            }}
-          />
-          <CameraReconciler
-            tiles={tiles}
-            onReconcile={handleReconcile}
-          />
-          <Grid
-            tiles={tiles}
-            onTilesChange={setTiles}
-            showDebugInfo={debug}
-            showStatic={showStatic}
-          />
-          {debug && (
-            <DevPanel client={client} tileFlightIds={tileFlightIds} />
-          )}
+          <ScrollArea>
+            {/* CameraSeeder and CameraReconciler use useKerbcastCameras inside KerbcastProvider */}
+            <CameraSeeder
+              tilesSeeded={tilesSeeded}
+              onSeed={(seeded) => {
+                setTiles(seeded);
+                saveTiles(seeded);
+                setTilesSeeded(true);
+              }}
+            />
+            <CameraReconciler
+              tiles={tiles}
+              onReconcile={handleReconcile}
+            />
+            <Grid
+              tiles={tiles}
+              onTilesChange={setTiles}
+              showDebugInfo={debug}
+              showStatic={showStatic}
+            />
+            {debug && (
+              <DevPanel client={client} tileFlightIds={tileFlightIds} />
+            )}
+          </ScrollArea>
+          <StandbyOverlay />
         </MainArea>
       </PageShell>
     </KerbcastProvider>
@@ -207,6 +211,18 @@ const PageShell = styled.div`
 `;
 
 const MainArea = styled.main`
+  flex: 1;
+  min-height: 0;
+  /* Positioned, non-scrolling frame so the out-of-flight standby scrim
+     covers the content area (not the header) and stays put while the tile
+     grid scrolls inside ScrollArea. */
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+`;
+
+const ScrollArea = styled.div`
   flex: 1;
   min-height: 0;
   /* The tile area scrolls internally; the header/banner stay put above it. */
