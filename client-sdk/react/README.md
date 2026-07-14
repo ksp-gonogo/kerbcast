@@ -98,7 +98,10 @@ message and the per-feed indicator use one consistent mark:
 import { StandbyIcon, useKerbcastInFlight } from "@ksp-gonogo/kerbcast-react";
 
 function StandbyOverlay() {
-  if (useKerbcastInFlight() !== false) return null;
+  const inFlight = useKerbcastInFlight();
+  // Only show once we know we are out of flight; stays hidden while
+  // the signal is still undefined so it never flashes on connect.
+  if (inFlight !== false) return null;
   return (
     <div className="scrim">
       <StandbyIcon size={44} />
