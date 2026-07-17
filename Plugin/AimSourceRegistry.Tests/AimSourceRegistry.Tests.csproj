@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone contract test for AimSourceRegistry.cs. Compiles ONLY the
+    Unity-free / kOS-free lifecycle core (no KSP/Unity/kOS assemblies),
+    mirroring the PanAim.Tests pattern. Pins the poll/apply/re-arm rules via a
+    fake IAimLease so a lifecycle regression is caught here rather than only on
+    the Deck. Run: `dotnet run`.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../KerbcastKos/AimSourceRegistry.cs" />
+  </ItemGroup>
+
+</Project>

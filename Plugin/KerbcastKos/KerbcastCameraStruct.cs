@@ -19,6 +19,10 @@ namespace Kerbcast.Kos
         readonly uint id;
         readonly IKerbcastControl control;
 
+        /* The kerboscript delegate currently supplying AIM targets, or null
+           when cleared. Held so the getter can echo it back. */
+        UserDelegate currentDel;
+
         public KerbcastCameraStruct(SharedObjects shared, uint id, IKerbcastControl control)
         {
             this.shared = shared;
@@ -47,7 +51,29 @@ namespace Kerbcast.Kos
             AddSuffix("PANYAWMAX", new Suffix<ScalarValue>(() => V()?.PanYawMax ?? 0f));
             AddSuffix("PANPITCHMIN", new Suffix<ScalarValue>(() => V()?.PanPitchMin ?? 0f));
             AddSuffix("PANPITCHMAX", new Suffix<ScalarValue>(() => V()?.PanPitchMax ?? 0f));
+
+            /* AIM: a callback returning the aim target as a Vector, re-evaluated
+               each frame by the pump. Set 0 (NoDelegate) to clear. No-op set on
+               cameras that can't pan, mirroring the PAN write gate. */
+            AddSuffix("AIM", new SetSuffix<UserDelegate>(
+                () => CallbackGetter(currentDel),
+                v =>
+                {
+                    if (!(V()?.SupportsPan ?? false)) return;
+                    currentDel = CallbackSetter(v);
+                    KerbcastAddon.SetAim(id, currentDel);
+                }));
+
+            /* LOOKAT: a one-shot aim at a fixed target vector. Returns whether
+               the seam accepted it (false when the camera can't pan / is gone). */
+            AddSuffix("LOOKAT", new OneArgsSuffix<BooleanValue, kOS.Suffixed.Vector>(
+                pos => control.AimAt(id, pos.X, pos.Y, pos.Z) ? BooleanValue.True : BooleanValue.False));
         }
+
+        /* Mirror kOS Widget: hand kerboscript a NoDelegate instead of a raw
+           null, and treat an incoming NoDelegate as "clear". */
+        static UserDelegate CallbackGetter(UserDelegate d) => d ?? NoDelegate.Instance;
+        static UserDelegate CallbackSetter(UserDelegate d) => d is NoDelegate ? null : d;
 
         /* Fresh view each read: reflects live slewed state, and returns null
            once the camera is gone (getters above degrade gracefully). */

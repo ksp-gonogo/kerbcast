@@ -17,11 +17,41 @@ namespace Kerbcast.Kos
     {
         public static IKerbcastControl Control;   // test seam; defaulted lazily below
 
+        /* Unity-free lifecycle core for AIM callbacks. The MonoBehaviour pump
+           (created lazily by EnsurePump) drives it once per frame. */
+        public static readonly AimSourceRegistry AimRegistry = new AimSourceRegistry();
+        static KerbcastKosPump pump;
+
         public KerbcastAddon(SharedObjects shared) : base(shared)
         {
             if (Control == null) Control = new RealKerbcastControl();
             AddSuffix("CAMERAS", new Suffix<ListValue>(GetCameras));
             AddSuffix("CAMERA", new OneArgsSuffix<KerbcastCameraStruct, StringValue>(GetCamera));
+        }
+
+        /* Register/replace/clear the AIM source for a camera. A null or
+           NoDelegate delegate clears it (the kerboscript "unset" idiom). Kept
+           here (not in the struct) so the Unity/pump-touching code JITs only
+           when AIM is actually used, keeping the struct headless-loadable. */
+        public static void SetAim(uint id, UserDelegate del)
+        {
+            EnsurePump();
+            AimRegistry.SetSource(
+                id,
+                del == null || del is NoDelegate ? null : new UserDelegateAimLease(del));
+        }
+
+        /* Create the single main-thread pump on first AIM use and wire it to
+           the shared registry + control seam. DontDestroyOnLoad so it survives
+           scene changes for the KSP session. */
+        static void EnsurePump()
+        {
+            if (pump != null) return;
+            var go = new UnityEngine.GameObject("KerbcastKosPump");
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            pump = go.AddComponent<KerbcastKosPump>();
+            pump.Registry = AimRegistry;
+            pump.Control = Control;
         }
 
         public override BooleanValue Available() => Control.IsActive && shared.Vessel != null;
