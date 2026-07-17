@@ -134,6 +134,8 @@
     <Compile Remove="InFlightSignal.Tests/**/*.cs" />
     <Compile Remove="PanAim.Tests/**/*.cs" />
     <Compile Remove="KosSpike/**/*.cs" />
+    <Compile Remove="KerbcastKos/**/*.cs" />
+    <Compile Remove="KerbcastKos.Tests/**/*.cs" />
   </ItemGroup>
 
 </Project>

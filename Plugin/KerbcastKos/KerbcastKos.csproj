@@ -1,0 +1,93 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    KerbcastKos — the kOS bridge addon for kerbcast. Builds
+    KerbcastKos.dll, a SEPARATE, optional deployable (its own
+    GameData/KerbcastKos folder + its own CKAN listing). It direct-links
+    kOS (GPLv3), so this assembly is GPL-3.0-only, distinct from
+    kerbcast's CC BY-NC-SA core (see NOTICE-KOS.txt).
+
+    Kept out of Kerbcast.dll on purpose: kOS.Safe types must never load
+    into the plugin (kOS.Safe re-entrant load-trap). The addon calls the
+    plugin only through the Unity-free IKerbcastControl seam, wrapping the
+    public Kerbcast.KerbcastControl facade via RealKerbcastControl.
+
+    Build:
+      dotnet build Plugin/KerbcastKos/KerbcastKos.csproj \
+        /p:KspManaged=/path/to/KSP_Data/Managed \
+        /p:KspGameData=/path/to/GameData
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <RootNamespace>Kerbcast.Kos</RootNamespace>
+    <AssemblyName>Kerbcast.Kos</AssemblyName>
+    <OutputType>Library</OutputType>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+  </PropertyGroup>
+
+  <!-- net48 reference assemblies (works without a Mono / Windows SDK
+       install). Same approach as Kerbcast.csproj; not flowed transitively
+       from the plugin ProjectReference (PrivateAssets=all there). -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <!-- KspManaged / KspGameData: roots for the portable reference DLLs
+       below. Mirrors Kerbcast.csproj: default to a non-existent path so a
+       plain build without /p: overrides fails loudly; CI/dev pass the real
+       KSP_Data/Managed and GameData roots. -->
+  <PropertyGroup>
+    <KspManaged Condition=" '$(KspManaged)' == '' ">__pass_KspManaged__</KspManaged>
+    <KspGameData Condition=" '$(KspGameData)' == '' ">__pass_KspGameData__</KspGameData>
+  </PropertyGroup>
+
+  <!-- KSP / Unity reference assemblies. Private=false: never copied to
+       output; KSP's own KSP_Data/Managed satisfies the load at runtime.
+       Only RealKerbcastControl.cs touches these; the seam types stay
+       Unity-free. -->
+  <ItemGroup>
+    <Reference Include="UnityEngine" Private="false">
+      <HintPath>$(KspManaged)/UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule" Private="false">
+      <HintPath>$(KspManaged)/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="Assembly-CSharp" Private="false">
+      <HintPath>$(KspManaged)/Assembly-CSharp.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <!-- kOS — the GPLv3 link that makes this assembly GPL (see NOTICE-KOS.txt).
+       Loaded from the live KSP install's own kOS mod folder; Private=false:
+       kOS ships and updates itself, KerbcastKos must never bundle a copy. -->
+  <ItemGroup>
+    <Reference Include="kOS" Private="false">
+      <HintPath>$(KspGameData)/kOS/Plugins/kOS.dll</HintPath>
+    </Reference>
+    <Reference Include="kOS.Safe" Private="false">
+      <HintPath>$(KspGameData)/kOS/Plugins/kOS.Safe.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <!-- The kerbcast plugin. Compile-time only for the public
+       Kerbcast.KerbcastControl facade + KerbcastCameraView; KSP loads the
+       plugin's own GameData/Kerbcast/Plugins/Kerbcast.dll at runtime, so
+       this addon must NOT bundle a copy. -->
+  <ItemGroup>
+    <ProjectReference Include="../Kerbcast.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

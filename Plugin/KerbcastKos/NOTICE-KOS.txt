@@ -1,0 +1,16 @@
+KerbcastKos licensing notice
+============================
+
+KerbcastKos.dll (this assembly) is licensed under the GNU General Public
+License v3.0 only (GPL-3.0-only).
+
+It direct-links kOS (kOS.dll / kOS.Safe.dll), which is distributed under
+the GNU General Public License v3.0. Because this addon compile-time links
+that GPLv3 code, the addon itself is GPL-3.0.
+
+This is distinct from the kerbcast core (Kerbcast.dll and the rest of the
+kerbcast project), which is licensed under CC BY-NC-SA. KerbcastKos is a
+separate, optional deployable with its own GameData/KerbcastKos folder and
+its own distribution listing; it does not change the licence of the
+kerbcast core, and it bundles neither kOS nor the kerbcast plugin (both are
+referenced, never copied).
