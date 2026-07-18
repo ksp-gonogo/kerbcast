@@ -51,9 +51,9 @@ This mod was built initally for getting best performance out of Steam Deck, and 
 
 ## Toolchain
 
-- Plugin: C# / .NET Framework 4.8, against KSP's Unity 2019.4 LTS assemblies.
-- Sidecar: Rust (stable), out-of-process H.264 encoder and WebRTC signalling.
-- Protocol: Rust types in `sidecar/src/protocol/`, TypeScript SDK at `client-sdk/typescript/`.
+- Plugin: C# / .NET Framework 4.8, against KSP's Unity 2019.4 LTS assemblies
+- Sidecar: Rust (stable), out-of-process H.264 encoder and WebRTC signalling
+- Protocol: Rust types in `sidecar/src/protocol/`, TypeScript SDK at `client-sdk/typescript/`
 
 ## kOS addon (optional)
 

@@ -90,14 +90,14 @@ On the kerbcast stream (browser/gonogo):
 
 The `Example` snippets in `GameData/KerbcastKos/README.md` are the addon's
 advertised surface, so they have to work exactly as printed. Copy each one from
-that README (do not retype from here — the point is to prove what a user actually
+that README (do not retype from here; the point is to prove what a user actually
 reads) into its own file and run it:
 
-1. **List cameras and capabilities** — prints one line per camera with FOV and
+1. **List cameras and capabilities**. Prints one line per camera with FOV and
    `pan` flag. Pass: no exception, one line per Hullcam on the vessel.
-2. **Zoom the first zoom-capable camera in** — pass: that camera's view narrows
+2. **Zoom the first zoom-capable camera in**. Pass: that camera's view narrows
    on the stream, no exception.
-3. **Track the current target, then stop** — needs a target set (`HASTARGET` true)
+3. **Track the current target, then stop**. Needs a target set (`HASTARGET` true)
    and a steerable mount aboard. Pass: the mount tracks the target for ~10s, then
    holds its last angle after `c:STOPAIM()`.
 
@@ -112,7 +112,7 @@ The README's `Demo: track a target with the whole craft` script uses `:BORESIGHT
 and `:POSITION` to steer the vessel so a camera holds a moving target, with a
 steerable mount fine-tracking on top. It needs a target set **and** control
 authority (reaction wheels / RCS) to turn the craft, so it only makes sense in
-flight, not on the pad. Not a v1 pass gate — but it's the headline demo, so run
+flight, not on the pad. Not a v1 pass gate, but it's the headline demo, so run
 it if you can: pass = the target stays framed on the stream while the craft slews
 to follow, and (with a steerable camera) the mount makes the fine corrections.
 The steering math is unverified in sim; if the craft points the wrong way or

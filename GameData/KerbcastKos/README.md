@@ -3,13 +3,12 @@
 A [kOS](https://github.com/KSP-KOS/KOS) addon for [kerbcast](https://github.com/ksp-gonogo/kerbcast). It lets a
 kerboscript running on a vessel's own CPU enumerate that vessel's kerbcast
 cameras and control them: set field of view, pan steerable mounts, and
-target-track a moving point. No ground link is involved, so control is
-immediate.
+target-track a moving point.
 
 ## Requirements
 
-- kerbcast (the camera mod itself).
-- kOS.
+- kerbcast (the camera mod itself)
+- kOS
 
 Install both alongside this addon. On CKAN the dependencies are declared, so it
 pulls them in for you.
@@ -39,7 +38,7 @@ Each camera has:
 | `:PANYAWMIN` / `:PANYAWMAX` | scalar | Yaw limits. |
 | `:PANPITCHMIN` / `:PANPITCHMAX` | scalar | Pitch limits. |
 | `:AIM` | vector or delegate | Set to a **vector** to aim once at that point and hold; set to a **callback** returning a vector (e.g. `{ RETURN TARGET:POSITION. }`) to track it continuously. Targets are ship-relative, like `TARGET:POSITION`. |
-| `:STOPAIM()` | — | Stop tracking; the mount holds its last angle. |
+| `:STOPAIM()` | method | Stop tracking; the mount holds its last angle. |
 | `:LOOKAT(vector)` | bool | Aim once at a point (same as `SET cam:AIM TO vector`), returning whether it was accepted. |
 | `:BORESIGHT` | vector | World-space unit forward of the stream (where it currently points). |
 | `:POSITION` | vector | Lens position in the same frame as `TARGET:POSITION`. |
@@ -84,7 +83,7 @@ pointing at it. `:LOOKAT(v)` is the one-shot equivalent for a fixed point.
 > **Run continuous `:AIM` tracking from a program, not the terminal.** A kOS
 > callback (`{ ... }`) lives only as long as the context that created it, and
 > typing `LOCK STEERING` / `UNLOCK STEERING` at the interpreter can leave the CPU
-> in a state where scheduled callbacks — `:AIM` tracking included — quietly stop
+> in a state where scheduled callbacks (`:AIM` tracking included) quietly stop
 > running. This is a kOS quirk, not something the addon can prevent. If tracking
 > goes unresponsive, `REBOOT.` the CPU to clear it. Putting your script in a
 > `.ks` file and running it with `RUN` avoids the problem entirely: the callback
