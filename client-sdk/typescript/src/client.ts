@@ -15,6 +15,13 @@ import { type NoisePipeline, tryCreateNoisePipeline } from "./noise";
 const SOURCELESS_INTENSITY = 1.0;
 /** Floor applied to the degrade-driven intensity of a live feed. */
 const LIVE_INTENSITY_FLOOR = 0.05;
+/**
+ * While a feed is stalled, how often to re-request a keyframe. A stall is
+ * usually a wedged decoder that only a fresh IDR clears; the first request or
+ * its keyframe can be lost during the same outage, so we keep asking until
+ * frames resume.
+ */
+const STALL_KEYFRAME_RETRY_MS = 2000;
 
 /** Controls the digital-static noise overlay baked into `cam.mediaStream`. */
 export interface NoiseConfig {
@@ -473,6 +480,8 @@ class CameraHandle
   private _sourceless = false;
   /** Stall state mirrored from the pipeline's onStallChange callback. */
   private _stalled = false;
+  /** Interval that re-requests keyframes while stalled; null when not stalled. */
+  private _keyframeRetry: ReturnType<typeof setInterval> | null = null;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
   private _showStatic = true;
   private readonly client: KerbcastClient;
@@ -625,6 +634,29 @@ class CameraHandle
     if (this._stalled === stalled) return;
     this._stalled = stalled;
     this.emit("stall", stalled);
+    if (stalled) {
+      // A stall usually means the browser decoder is wedged (broken H.264
+      // reference chain after packet loss or heavy degrade), which only a
+      // fresh keyframe clears. Force one now and keep asking while stalled,
+      // rather than waiting on the browser's rate-limited PLI.
+      this._requestKeyframeForRecovery();
+      if (this._keyframeRetry === null) {
+        this._keyframeRetry = setInterval(
+          () => this._requestKeyframeForRecovery(),
+          STALL_KEYFRAME_RETRY_MS,
+        );
+      }
+    } else if (this._keyframeRetry !== null) {
+      clearInterval(this._keyframeRetry);
+      this._keyframeRetry = null;
+    }
+  }
+
+  private _requestKeyframeForRecovery(): void {
+    this.requestKeyframe().catch(() => {
+      // Best effort; a failed send (disconnected) is retried on the next tick,
+      // or cleared when the stall ends.
+    });
   }
 
   private _liveIntensity(): number {
@@ -636,6 +668,10 @@ class CameraHandle
    * the persistent pipeline, stops its rAF loop, and nulls the stream.
    */
   _teardown(): void {
+    if (this._keyframeRetry !== null) {
+      clearInterval(this._keyframeRetry);
+      this._keyframeRetry = null;
+    }
     this._noisePipeline?.destroy();
     this._noisePipeline = null;
     this._rawStream = null;
