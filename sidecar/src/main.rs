@@ -398,13 +398,15 @@ async fn consume_loop(
             // NEW frame to encode, which capture staggering can starve, leaving
             // a disconnected viewer's cameras rendering indefinitely (fps never
             // recovers until a KSP restart).
+            // Snapshot what this peer was driving BEFORE release_all: it
+            // take()s every slot.bound, so reading bound_flight_ids() after
+            // it would see nothing and the deadman below would silently no-op.
+            let driven_flight_ids = peer.bound_flight_ids().await;
             peer.release_all(&registry).await;
             // Deadman: a browser that dropped mid-hold must not leave a
             // camera drifting to its travel limit. Zero the persistent
-            // pan/zoom rates on every camera this peer was driving — using
-            // the live slot bindings (dynamic Subscribe keeps them current),
-            // not the stale construction-time `subscribed` list.
-            for flight_id in peer.bound_flight_ids().await {
+            // pan/zoom rates on every camera this peer was driving.
+            for flight_id in driven_flight_ids {
                 registry.zero_rates(flight_id).await;
             }
         }
