@@ -402,13 +402,12 @@ pub struct CameraState {
     /// the peer's RTCP drain loop; consume loop reads + takes the min
     /// to produce `target_bitrate_bps`.
     pub bandwidth_estimates: Mutex<std::collections::HashMap<u32, u32>>,
-    /// Per-SSRC SetDegrade requests from active subscribers
-    /// (0.0..=1.0). Like bandwidth_estimates but max-across-
-    /// subscribers — the noisiest consumer's request wins, mirroring
-    /// the slowest-consumer-wins logic for bandwidth.
-    pub degrade_levels: Mutex<std::collections::HashMap<u32, f32>>,
-    /// Cached max-across-subscribers degrade level. Recomputed when
-    /// any peer's SetDegrade lands; encode loop reads atomically.
+    /// SetDegrade level (0.0..=1.0), last-writer-wins. Degrade is a
+    /// property of the camera's game state (a vessel's comms strength),
+    /// not of any one viewer, and the single shared encoder can only
+    /// emit one degrade anyway — so this is a single per-camera scalar,
+    /// not a per-peer reduction. Whichever subscriber wrote last owns it;
+    /// a well-behaved driver (e.g. gonogo) re-asserts every tick.
     /// Stored as bits-of-f32 in an AtomicU32 to keep the hot path
     /// lock-free (encode_and_fan_out runs per-frame, the f32 is
     /// already bit-pattern-stable for our levels).
@@ -488,28 +487,14 @@ impl CameraState {
         self.target_bitrate_bps.store(min, Ordering::Release);
     }
 
-    /// Record a SetDegrade request from a subscriber. Recomputes
-    /// `effective_degrade` as the max across all known requests so
-    /// the noisiest consumer wins (mirrors how `target_bitrate_bps`
-    /// picks the *slowest* receiver — both are "worst case from any
-    /// subscriber" reductions).
-    pub async fn record_degrade(&self, ssrc: u32, level: f32) {
-        let mut levels = self.degrade_levels.lock().await;
-        let clamped = level.clamp(0.0, 1.0);
-        levels.insert(ssrc, clamped);
-        let max = levels.values().copied().fold(0.0f32, |acc, v| acc.max(v));
+    /// Apply a SetDegrade request. Last-writer-wins: the level is a
+    /// per-camera property (comms strength), so we store it directly
+    /// rather than reduce across subscribers. No per-peer state means
+    /// nothing to leak when a peer leaves — a departed peer's value is
+    /// simply overwritten by the next subscriber's write.
+    pub fn set_degrade(&self, level: f32) {
         self.effective_degrade
-            .store(max.to_bits(), Ordering::Release);
-    }
-
-    /// Forget a subscriber's degrade request. Recomputes the max so
-    /// the level relaxes once the noisiest consumer drops.
-    pub async fn forget_degrade(&self, ssrc: u32) {
-        let mut levels = self.degrade_levels.lock().await;
-        levels.remove(&ssrc);
-        let max = levels.values().copied().fold(0.0f32, |acc, v| acc.max(v));
-        self.effective_degrade
-            .store(max.to_bits(), Ordering::Release);
+            .store(level.clamp(0.0, 1.0).to_bits(), Ordering::Release);
     }
 
     /// Snapshot of the current effective degrade level. Lock-free
@@ -919,7 +904,6 @@ impl CameraRegistry {
                             session_health: std::sync::Mutex::new(SessionHealth::new()),
                             target_bitrate_bps: AtomicU32::new(0),
                             bandwidth_estimates: Mutex::new(std::collections::HashMap::new()),
-                            degrade_levels: Mutex::new(std::collections::HashMap::new()),
                             effective_degrade: AtomicU32::new(0),
                             last_encoded_at: Mutex::new(None),
                             last_sequence: AtomicU64::new(0),

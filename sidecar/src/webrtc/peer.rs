@@ -20,10 +20,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Monotonic counter for per-peer identifiers. Used as the key on
-/// each camera's `degrade_levels` map (SetDegrade arrives via the
-/// data channel rather than RTCP, so we don't have an SSRC to lean
-/// on — peer_id fills the same slot).
+/// Monotonic counter for per-peer identifiers. Identifies a peer for
+/// logging and slot bookkeeping (SetDegrade arrives via the data
+/// channel rather than RTCP, so there's no SSRC to lean on).
 static NEXT_PEER_ID: AtomicU32 = AtomicU32::new(1);
 
 use anyhow::{anyhow, Result};
@@ -74,8 +73,7 @@ struct Slot {
 pub struct KerbcastPeer {
     pc: Arc<RTCPeerConnection>,
     /// Stable identifier for this peer for the lifetime of the
-    /// connection. Used as the per-camera degrade map key (see
-    /// `CameraState.degrade_levels`).
+    /// connection. Used for logging and slot bookkeeping.
     pub peer_id: u32,
     /// The pre-negotiated slot pool. `Subscribe` binds a camera to a free
     /// slot; `Unsubscribe` frees one — no renegotiation. Dropping the peer
@@ -1189,7 +1187,7 @@ async fn apply_degrade_change(
             return;
         }
     };
-    cam.record_degrade(peer_id, level).await;
+    cam.set_degrade(level);
     info!(
         flight_id,
         peer_id,

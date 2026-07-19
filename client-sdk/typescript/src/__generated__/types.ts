@@ -139,8 +139,8 @@ export interface CameraState {
 	 */
 	targetBitrateBps: number;
 	/**
-	 * Effective degrade level (max across subscribers' SetDegrade
-	 * requests). 0.0 = perfect, 1.0 = max degradation. Applied
+	 * Effective degrade level (last-writer-wins across subscribers'
+	 * SetDegrade requests). 0.0 = perfect, 1.0 = max degradation. Applied
 	 * alongside operator render-size + adaptive shed; the encoder
 	 * multiplies its effective bitrate by `(1 - 0.7 * level)` and
 	 * skips fan-out for a fraction of frames at high levels.
@@ -203,10 +203,12 @@ export interface SceneStateChangedPayload {
 export interface SetDegradePayload {
 	flightId: number;
 	/**
-	 * 0.0 = perfect quality, 1.0 = maximum degradation. Caps and
-	 * is per-subscriber: the sidecar applies max across active
-	 * subscribers so the noisiest consumer's request wins (same
-	 * pattern as REMB picking the min bandwidth).
+	 * 0.0 = perfect quality, 1.0 = maximum degradation. Clamped.
+	 * Last-writer-wins: degrade is a property of the camera's game
+	 * state (comms strength), shared by all viewers of the single
+	 * encoded stream, so the sidecar stores the latest value rather
+	 * than reducing across subscribers. A well-behaved driver
+	 * re-asserts every tick.
 	 */
 	level: number;
 }
@@ -385,11 +387,12 @@ export type ClientMessage =
 	| { type: "set-zoom-rate", content: SetZoomRatePayload }
 	/**
 	 * Request artificial signal degradation. 0.0 = perfect quality,
-	 * 1.0 = maximum degradation. Per-subscriber: the sidecar
-	 * applies max across active subscribers (slowest consumer
-	 * wins, same pattern as REMB bandwidth). Lets consumers signal
-	 * to the sidecar "I want to look like the in-game CommNet
-	 * antenna is struggling"; sidecar takes the opportunity to
+	 * 1.0 = maximum degradation. Last-writer-wins: the sidecar stores
+	 * the latest value on the camera (degrade is shared across all
+	 * viewers of the one encoded stream), so a departed peer can't
+	 * pin it. Lets consumers signal to the sidecar "I want to look
+	 * like the in-game CommNet antenna is struggling"; sidecar takes
+	 * the opportunity to
 	 * reduce bitrate + skip frames, which both creates the
 	 * signal-loss aesthetic AND saves encoder CPU.
 	 */

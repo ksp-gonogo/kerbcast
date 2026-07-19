@@ -178,8 +178,8 @@ pub struct CameraState {
     /// significantly diverged. Zero until the first REMB packet
     /// arrives — encoder falls back to the sidecar's CLI default.
     pub target_bitrate_bps: u32,
-    /// Effective degrade level (max across subscribers' SetDegrade
-    /// requests). 0.0 = perfect, 1.0 = max degradation. Applied
+    /// Effective degrade level (last-writer-wins across subscribers'
+    /// SetDegrade requests). 0.0 = perfect, 1.0 = max degradation. Applied
     /// alongside operator render-size + adaptive shed; the encoder
     /// multiplies its effective bitrate by `(1 - 0.7 * level)` and
     /// skips fan-out for a fraction of frames at high levels.
@@ -270,10 +270,12 @@ pub struct SetZoomRatePayload {
 #[serde(rename_all = "camelCase")]
 pub struct SetDegradePayload {
     pub flight_id: u32,
-    /// 0.0 = perfect quality, 1.0 = maximum degradation. Caps and
-    /// is per-subscriber: the sidecar applies max across active
-    /// subscribers so the noisiest consumer's request wins (same
-    /// pattern as REMB picking the min bandwidth).
+    /// 0.0 = perfect quality, 1.0 = maximum degradation. Clamped.
+    /// Last-writer-wins: degrade is a property of the camera's game
+    /// state (comms strength), shared by all viewers of the single
+    /// encoded stream, so the sidecar stores the latest value rather
+    /// than reducing across subscribers. A well-behaved driver
+    /// re-asserts every tick.
     pub level: f32,
 }
 
@@ -455,11 +457,12 @@ pub enum ClientMessage {
     /// `SetPanRate` composes with `SetPan`.
     SetZoomRate(SetZoomRatePayload),
     /// Request artificial signal degradation. 0.0 = perfect quality,
-    /// 1.0 = maximum degradation. Per-subscriber: the sidecar
-    /// applies max across active subscribers (slowest consumer
-    /// wins, same pattern as REMB bandwidth). Lets consumers signal
-    /// to the sidecar "I want to look like the in-game CommNet
-    /// antenna is struggling"; sidecar takes the opportunity to
+    /// 1.0 = maximum degradation. Last-writer-wins: the sidecar stores
+    /// the latest value on the camera (degrade is shared across all
+    /// viewers of the one encoded stream), so a departed peer can't
+    /// pin it. Lets consumers signal to the sidecar "I want to look
+    /// like the in-game CommNet antenna is struggling"; sidecar takes
+    /// the opportunity to
     /// reduce bitrate + skip frames, which both creates the
     /// signal-loss aesthetic AND saves encoder CPU.
     SetDegrade(SetDegradePayload),

@@ -399,24 +399,6 @@ async fn consume_loop(
             // a disconnected viewer's cameras rendering indefinitely (fps never
             // recovers until a KSP restart).
             peer.release_all(&registry).await;
-            // Use the live slot bindings, not the stale construction-time
-            // `subscribed` list: a camera subscribed dynamically via Subscribe
-            // after connect is never in that list, so its degrade entry would
-            // leak on reap. Mirrors the pan/zoom deadman below.
-            for flight_id in peer.bound_flight_ids().await {
-                if let Some(cam) = registry.get(flight_id).await {
-                    cam.forget_degrade(peer.peer_id).await;
-                    // The reload/stale-peer tell: if a departed peer was
-                    // pinning effective via the noisiest-consumer max, this
-                    // shows the level relaxing the moment it is reaped.
-                    info!(
-                        peer_id = peer.peer_id,
-                        flight_id,
-                        effective = cam.current_degrade(),
-                        "peer reaped: degrade forgotten",
-                    );
-                }
-            }
             // Deadman: a browser that dropped mid-hold must not leave a
             // camera drifting to its travel limit. Zero the persistent
             // pan/zoom rates on every camera this peer was driving — using
