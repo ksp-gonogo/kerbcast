@@ -39,8 +39,10 @@ name: release
 #
 # Publishes to public npm under the @ksp-gonogo scope via OIDC trusted
 # publishing (npmjs.com trusts this repo's release workflow — no NPM_TOKEN
-# stored or rotated). pnpm rewrites workspace:^ to real semver ranges in the
-# published tarballs. Requires npm >= 11.5.1 and `permissions: id-token: write`.
+# stored or rotated). Requires npm >= 11.5.1 and `permissions: id-token: write`.
+# npm publish (unlike pnpm publish) does NOT resolve pnpm's workspace: protocol,
+# so the publish-sdk job rewrites it to the concrete version first (see the
+# "Resolve workspace protocol before publish" step).
 #
 # Secrets required:
 #   KSP_MANAGED_TOKEN — fine-grained PAT (Contents: read) for ksp-gonogo/ksp-managed
@@ -136,6 +138,37 @@ jobs:
 
       - name: Build all packages
         run: pnpm -r build
+
+      # `npm publish` (used below for OIDC) does NOT rewrite pnpm's workspace:
+      # protocol the way `pnpm publish` does, so a raw workspace:^ leaked into
+      # the published kerbcast-react from 1.5.0 on and made it unresolvable for
+      # external consumers. Resolve it to the concrete lockstep version (all
+      # packages share the tag version) before publishing, and fail loudly if any
+      # workspace: string survives.
+      - name: Resolve workspace protocol before publish
+        run: |
+          export VER="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs"); const ver = process.env.VER;
+            for (const dir of ["client-sdk/typescript", "client-sdk/react"]) {
+              const f = dir + "/package.json";
+              const p = JSON.parse(fs.readFileSync(f, "utf8")); let ch = false;
+              for (const k of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+                if (!p[k]) continue;
+                for (const d of Object.keys(p[k])) {
+                  const m = String(p[k][d]).match(/^workspace:(.*)$/); if (!m) continue;
+                  const r = m[1];
+                  p[k][d] = (r === "*" || r === "") ? ver : (r === "^" || r === "~") ? r + ver : r;
+                  ch = true;
+                }
+              }
+              if (ch) { fs.writeFileSync(f, JSON.stringify(p, null, 2) + "\n"); console.log("rewrote workspace deps in " + f); }
+            }
+          '
+          if grep -rIl "workspace:" client-sdk/typescript/package.json client-sdk/react/package.json; then
+            echo "::error::workspace: protocol still present after rewrite"; exit 1
+          fi
+          echo "workspace protocol resolved to ^${VER}"
 
       # Core first so the registry has the dependency when react is indexed.
       # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates via the
