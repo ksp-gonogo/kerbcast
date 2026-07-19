@@ -25,6 +25,11 @@ pub struct Software {
     /// to avoid per-frame allocation in the hot path.
     rgb_scratch: Vec<u8>,
     frames_encoded: u64,
+    /// Force an IDR every N encoded frames so a decoder that lost the
+    /// reference chain (packet loss / heavy degrade) always recovers within a
+    /// bounded window. OpenH264 emits no periodic intra on its own; libva
+    /// sets an equivalent GOP. 0 disables (pre-init).
+    intra_period: u64,
 }
 
 impl Software {
@@ -35,6 +40,7 @@ impl Software {
             keyframe_requested: false,
             rgb_scratch: Vec::new(),
             frames_encoded: 0,
+            intra_period: 0,
         }
     }
 }
@@ -94,6 +100,8 @@ impl EncoderBackend for Software {
             fps = cfg.fps,
             "Software encoder initialised"
         );
+        // ~2s GOP, matching the libva backend's set_gop(fps*2).
+        self.intra_period = (cfg.fps as u64).saturating_mul(2);
         self.cfg = Some(cfg);
         self.encoder = Some(encoder);
         self.keyframe_requested = false;
@@ -144,7 +152,13 @@ impl EncoderBackend for Software {
         );
         let yuv = YUVBuffer::from_rgb_source(rgb_source);
 
-        if self.keyframe_requested {
+        // Periodic IDR (every intra_period encoded frames) plus any on-demand
+        // request. Frame 0 is already an IDR from OpenH264, so the periodic
+        // check skips it. Keeps every backend recoverable within one GOP.
+        let periodic = self.intra_period > 0
+            && self.frames_encoded > 0
+            && self.frames_encoded.is_multiple_of(self.intra_period);
+        if self.keyframe_requested || periodic {
             encoder.force_intra_frame();
             self.keyframe_requested = false;
         }
@@ -266,6 +280,58 @@ mod tests {
             "NAL too short to contain a start code + payload: {} bytes",
             first.len()
         );
+    }
+
+    #[test]
+    fn periodic_idr_fires_within_a_gop() {
+        let mut e = Software::new();
+        let c = cfg();
+        let (w, h, fps) = (c.width, c.height, c.fps);
+        e.init(c).unwrap();
+        let gop = fps * 2; // matches init's intra_period
+        let mut idr_at = Vec::new();
+        for n in 0..(gop + 2) {
+            let frame = synthetic_rgba(w, h, n);
+            let nals = e
+                .encode(&RawFrame {
+                    width: w,
+                    height: h,
+                    data: &frame,
+                    capture_ts_ms: 0.0,
+                })
+                .unwrap();
+            if nals.iter().any(|nal| has_idr(&nal.0)) {
+                idr_at.push(n);
+            }
+        }
+        assert!(
+            idr_at.contains(&0),
+            "frame 0 should be an IDR, got {idr_at:?}"
+        );
+        assert!(
+            idr_at.iter().any(|&n| n > 0 && n <= gop),
+            "a periodic IDR should fire within one GOP, got {idr_at:?}"
+        );
+    }
+
+    /// Annex-B scan for an IDR slice (nal_unit_type == 5).
+    fn has_idr(bytes: &[u8]) -> bool {
+        let mut i = 0;
+        while i + 4 < bytes.len() {
+            let (hdr, past) = if bytes[i..i + 4] == [0u8, 0, 0, 1] {
+                (bytes[i + 4], i + 5)
+            } else if bytes[i..i + 3] == [0u8, 0, 1] {
+                (bytes[i + 3], i + 4)
+            } else {
+                i += 1;
+                continue;
+            };
+            if hdr & 0x1F == 5 {
+                return true;
+            }
+            i = past;
+        }
+        false
     }
 
     #[test]
