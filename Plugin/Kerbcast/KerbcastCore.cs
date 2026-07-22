@@ -19,6 +19,10 @@
 //   - GameEvents.onPartDestroyed: write lifecycle:"destroyed" tombstone
 //               to the camera's info.json, close the ring, then leave
 //               info.json for the sidecar to clean up.
+//   - GameEvents.onVesselCrewWasModified: crew-scoped rescan (board /
+//               transfer / EVA / re-seat within the same vessel). Clean-
+//               removes vacated kerbal cams (Dispose, not a tombstone)
+//               and adds newly-seated ones via CrewProvider only.
 //   - LateUpdate: defensive null-check sweep before the main Refresh()
 //               loop catches cameras whose part/vessel went null without
 //               a matching onPartDestroyed event (mod interactions, etc).
@@ -62,6 +66,9 @@ namespace Kerbcast
         private KerbcastSettings _settings;
         private readonly List<ICamera> _cameras = new List<ICamera>();
         private List<ICameraSourceProvider> _providers;
+        // Typed reference into _providers for the crew-scoped rescan
+        // (OnVesselCrewWasModified must not touch HullcamProvider).
+        private CrewProvider _crewProvider;
 
         // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
         // changed — KSP fps, shed level, per-camera effective layers / dims.
@@ -165,10 +172,11 @@ namespace Kerbcast
             Debug.Log("[Kerbcast] KerbcastCore.Awake — initialising");
 
             _settings = KerbcastSettings.Load();
+            _crewProvider = new CrewProvider(RingDir, RingSlots, _settings.Width, _settings.Height);
             _providers = new List<ICameraSourceProvider>
             {
                 new HullcamProvider(_settings, RingDir, RingSlots),
-                new CrewProvider(RingDir, RingSlots, _settings.Width, _settings.Height),
+                _crewProvider,
             };
             _staggerController = BuildStaggerController(_settings);
             if (_settings.AdaptiveQuality)
@@ -219,6 +227,7 @@ namespace Kerbcast
             GameEvents.onVesselChange.Add(OnVesselChange);
             GameEvents.onPartDestroyed.Add(OnPartDestroyed);
             GameEvents.onVesselWasModified.Add(OnVesselWasModified);
+            GameEvents.onVesselCrewWasModified.Add(OnVesselCrewWasModified);
             /* Mission-time discontinuities: a scene load or a quickload makes
                universal time jump (revert/quickload run backward). Bump the
                capture epoch so a clock consumer flushes rather than waiting on
@@ -305,6 +314,37 @@ namespace Kerbcast
             if (v == null) return;
             RebuildCameraList(v, disposeMissing: false);
             MarkFxDirtyForVessel(v);
+        }
+
+        // Board / transfer / EVA / re-seat: a kerbal camera's liveness (seat
+        // membership) can change WITHOUT onVesselChange or onVesselWasModified
+        // firing (same vessel, no part-set change). Crew-scoped only: part
+        // cameras are handled by their own events, so HullcamProvider is never
+        // touched here.
+        //
+        // Clean-remove first: a seat vacate is a normal state change, not a
+        // destruction, so Dispose() (no tombstone), not DisposeDestroyed().
+        // Then add-pass: newly-seated kerbals via CrewProvider only.
+        private void OnVesselCrewWasModified(Vessel v)
+        {
+            if (v == null) return;
+
+            for (int i = _cameras.Count - 1; i >= 0; i--)
+            {
+                if (_cameras[i] is KerbalFaceCamera kfc && !kfc.IsAlive)
+                {
+                    Debug.Log($"[Kerbcast] crew modified, vacated cam={kfc.FlightId}");
+                    _cameras.RemoveAt(i);
+                    kfc.Dispose();
+                }
+            }
+
+            if (_crewProvider == null) return;
+            var existing = new HashSet<uint>(_cameras.Select(c => c.FlightId));
+            foreach (var cam in _crewProvider.Enumerate(v, existing))
+            {
+                _cameras.Add(cam);
+            }
         }
 
         /* Scene load / quickload: universal time is about to jump, so mark a
@@ -1139,6 +1179,7 @@ namespace Kerbcast
             GameEvents.onVesselChange.Remove(OnVesselChange);
             GameEvents.onPartDestroyed.Remove(OnPartDestroyed);
             GameEvents.onVesselWasModified.Remove(OnVesselWasModified);
+            GameEvents.onVesselCrewWasModified.Remove(OnVesselCrewWasModified);
             GameEvents.onGameSceneLoadRequested.Remove(OnGameSceneLoadRequested);
             GameEvents.onGameStatePostLoad.Remove(OnGameStatePostLoad);
             foreach (var cam in _cameras) cam.Dispose();
