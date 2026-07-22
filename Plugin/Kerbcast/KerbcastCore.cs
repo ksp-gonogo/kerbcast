@@ -34,7 +34,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
-using HullcamVDS;
 using UnityEngine;
 using Yangrc.OpenGLAsyncReadback;
 using Debug = UnityEngine.Debug;
@@ -62,6 +61,7 @@ namespace Kerbcast
 
         private KerbcastSettings _settings;
         private readonly List<KerbcastCamera> _cameras = new List<KerbcastCamera>();
+        private readonly ICameraSourceProvider _hullcamProvider = new HullcamProvider();
 
         // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
         // changed — KSP fps, shed level, per-camera effective layers / dims.
@@ -274,9 +274,9 @@ namespace Kerbcast
             for (int i = _cameras.Count - 1; i >= 0; i--)
             {
                 var cam = _cameras[i];
-                if (cam.Hullcam != null && cam.Hullcam.part == part)
+                if (cam.Mount.OwnsPart(part))
                 {
-                    if (affected == null) affected = cam.Hullcam.vessel;
+                    if (affected == null) affected = cam.Mount.Vessel;
                     Debug.Log($"[Kerbcast] part destroyed — disposing cam={cam.FlightId} ({part.name})");
                     _cameras.RemoveAt(i);
                     cam.DisposeDestroyed();
@@ -312,31 +312,7 @@ namespace Kerbcast
         private void MarkFxDirtyForVessel(Vessel v)
         {
             foreach (var cam in _cameras)
-                if (cam.Hullcam != null && cam.Hullcam.vessel == v) cam.MarkFxDirty();
-        }
-
-        // Derive a unique FlightId per Hullcam module on a part. Module 0
-        // (and parts with a single module — the common case) keep the bare
-        // part.flightID for wire compatibility. Additional modules get a
-        // hash of (baseId, cameraName) — deterministic across loads, and
-        // a 32-bit space with at most a handful of cameras per vessel
-        // makes collisions vanishingly unlikely. We use the Knuth golden-
-        // ratio multiplier (2654435761) so consecutive modules don't
-        // produce neighbouring hashes that could clash with another
-        // part's flightID (which KSP assigns sequentially).
-        private static uint SyntheticFlightId(uint baseId, int moduleIdx, string cameraName)
-        {
-            if (moduleIdx == 0) return baseId;
-            unchecked
-            {
-                uint h = baseId;
-                h = h * 2654435761u + (uint)moduleIdx;
-                if (!string.IsNullOrEmpty(cameraName))
-                {
-                    foreach (var ch in cameraName) h = h * 2654435761u + ch;
-                }
-                return h;
-            }
+                if (cam.Mount.Vessel == v) cam.MarkFxDirty();
         }
 
         // disposeMissing=true (onVesselChange — an actual pilot switch): scope
@@ -387,56 +363,36 @@ namespace Kerbcast
                 RestoreMainScreen();
             }
 
-            foreach (var part in vessel.parts)
+            foreach (var descriptor in _hullcamProvider.Enumerate(vessel))
             {
-                // A part can carry multiple Hullcam modules — the booster
-                // segment ships with both Fwd and Aft camera modules on a
-                // single part. FindModuleImplementing returns only the
-                // first match, so iterate every module of the type.
-                int moduleIdx = 0;
-                foreach (var hullcam in part.Modules.OfType<MuMechModuleHullCamera>())
+                try
                 {
-                    try
+                    var partName = descriptor.PartName;
+                    var initialLayers = _settings.GetInitialLayers(partName);
+                    var enableFx = _settings.GetEnableAtmosphericFx(partName);
+                    var fxLayers = _settings.GetAtmosphericFxLayers(partName);
+                    var (renderW, renderH) = _settings.GetRenderSize(partName);
+                    uint flightId = descriptor.FlightId;
+                    if (!disposeMissing && _cameras.Any(c => c.FlightId == flightId))
                     {
-                        var partName = part.partInfo?.name ?? string.Empty;
-                        var initialLayers = _settings.GetInitialLayers(partName);
-                        var enableFx = _settings.GetEnableAtmosphericFx(partName);
-                        var fxLayers = _settings.GetAtmosphericFxLayers(partName);
-                        var (renderW, renderH) = _settings.GetRenderSize(partName);
-                        // Camera identity is per-module, not per-part — but
-                        // the ring + info + control file names are keyed on
-                        // FlightId, so two modules on the same part used to
-                        // collide and silently drop the second camera.
-                        // Module 0 keeps part.flightID for wire compat with
-                        // single-cam parts (the common case). Modules 1+
-                        // get a deterministic hash of (flightID, cameraName)
-                        // so they're stable across loads.
-                        uint flightId = SyntheticFlightId(part.flightID, moduleIdx, hullcam.cameraName);
-                        if (!disposeMissing && _cameras.Any(c => c.FlightId == flightId))
-                        {
-                            moduleIdx++;
-                            continue;
-                        }
-                        var panCap = PartCapabilities.ForPart(hullcam.part.partInfo?.name ?? "");
-                        _cameras.Add(new KerbcastCamera(
-                            hullcam,
-                            flightId,
-                            RingDir,
-                            RingSlots,
-                            _settings.Width,
-                            _settings.Height,
-                            renderW,
-                            renderH,
-                            initialLayers,
-                            enableFx,
-                            fxLayers,
-                            panCap));
+                        continue;
                     }
-                    catch (Exception ex)
-                    {
-                        Debug.LogError($"[Kerbcast] failed to attach to {part.name}: {ex}");
-                    }
-                    moduleIdx++;
+                    _cameras.Add(new KerbcastCamera(
+                        descriptor.Source,
+                        flightId,
+                        RingDir,
+                        RingSlots,
+                        _settings.Width,
+                        _settings.Height,
+                        renderW,
+                        renderH,
+                        initialLayers,
+                        enableFx,
+                        fxLayers));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[Kerbcast] failed to attach to {descriptor.PartName}: {ex}");
                 }
             }
             Debug.Log($"[Kerbcast] tracking {_cameras.Count} Hullcam VDS camera(s)");
@@ -527,9 +483,9 @@ namespace Kerbcast
             for (int i = _cameras.Count - 1; i >= 0; i--)
             {
                 var cam = _cameras[i];
-                if (cam.Hullcam == null || cam.Hullcam.part == null || cam.Hullcam.vessel == null)
+                if (!cam.IsAlive)
                 {
-                    Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null Hullcam/part/vessel — disposing (missed destruction event?)");
+                    Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null part/vessel — disposing (missed destruction event?)");
                     _cameras.RemoveAt(i);
                     cam.DisposeDestroyed();
                 }

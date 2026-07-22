@@ -41,7 +41,7 @@ namespace Kerbcast
             for (int i = 0; i < cams.Count; i++)
             {
                 var c = cams[i];
-                if (c.Hullcam != null && c.Hullcam.vessel == vessel)
+                if (c.Mount.Vessel == vessel)
                     result.Add(ToView(c));
             }
             return result;
@@ -70,7 +70,7 @@ namespace Kerbcast
         public static bool AimAt(uint flightId, Vector3 aimPoint)
         {
             var c = Find(flightId); if (c == null) return false;
-            var vessel = c.Hullcam != null ? c.Hullcam.vessel : null;
+            var vessel = c.Mount.Vessel;
             Vector3 worldPoint = vessel != null ? (Vector3)vessel.CoM + aimPoint : aimPoint;
             c.AimAt(worldPoint);
             return true;
@@ -90,12 +90,13 @@ namespace Kerbcast
             // Lens position relative to the vessel CoM (falls back to raw world
             // if the vessel is gone), matching kOS's ship-relative frame.
             Vector3 pos = c.PositionWorld;
-            var vessel = c.Hullcam != null ? c.Hullcam.vessel : null;
+            var vessel = c.Mount.Vessel;
             if (vessel != null) pos -= vessel.CoM;
+            var part = c.Mount.OwningPart;
             return new KerbcastCameraView
             {
                 FlightId = c.FlightId,
-                PartFlightId = c.Hullcam != null && c.Hullcam.part != null ? c.Hullcam.part.flightID : 0u,
+                PartFlightId = part != null ? part.flightID : 0u,
                 CameraName = c.CameraName, PartName = c.PartName, PartTitle = c.PartTitle,
                 SupportsZoom = c.SupportsZoom, SupportsPan = c.SupportsPan,
                 Fov = c.Fov, FovMin = c.FovMin, FovMax = c.FovMax,
@@ -104,7 +105,7 @@ namespace Kerbcast
                 PanPitchMin = c.PanPitchMin, PanPitchMax = c.PanPitchMax,
                 BoresightX = fwd.x, BoresightY = fwd.y, BoresightZ = fwd.z,
                 PositionX = pos.x, PositionY = pos.y, PositionZ = pos.z,
-                Part = c.Hullcam != null ? c.Hullcam.part : null,
+                Part = part,
             };
         }
     }

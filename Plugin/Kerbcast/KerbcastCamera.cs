@@ -44,7 +44,11 @@ namespace Kerbcast
     internal sealed class KerbcastCamera
     {
         public uint FlightId { get; }
-        public MuMechModuleHullCamera Hullcam { get; }
+        /* Placement + identity + optional zoom/pan capabilities, decoupled from
+           MuMechModuleHullCamera. Every former Hullcam read now goes through this. */
+        public ICameraMountSource Mount { get; }
+        /* Part liveness, used by KerbcastCore's churn sweeps. */
+        public bool IsAlive => Mount.IsAlive;
         public int MaxWidth { get; }
         public int MaxHeight { get; }
         public int RenderWidth { get; private set; }
@@ -54,11 +58,10 @@ namespace Kerbcast
         public int OperatorWidth { get; private set; }
         public int OperatorHeight { get; private set; }
 
-        /// <summary>True iff the part is a `MuMechModuleHullCameraZoom`
-        /// — the zoom-capable Hullcam VDS subclass. 19 of 21 stock
-        /// Hullcam parts are zoom-capable; the base
-        /// `MuMechModuleHullCamera` (Basic Hull Camera Deluxe) is the
-        /// only fixed-FoV exception.</summary>
+        /// <summary>True when the mount exposes a zoom capability with a
+        /// real range (`Mount.Zoom != null` and `FovMax > FovMin`). A
+        /// fixed-FoV or zero-width source reports false and hides the zoom
+        /// control.</summary>
         public bool SupportsZoom { get; }
         public float FovMin { get; }
         public float FovMax { get; }
@@ -69,12 +72,16 @@ namespace Kerbcast
            so one persistently-broken camera can't break the rest. */
         public int RefreshFailureStreak;
 
-        private readonly PanCapability _panCap;
-        public bool SupportsPan => _panCap.SupportsPan;
-        public float PanYawMin => _panCap.YawMin;
-        public float PanYawMax => _panCap.YawMax;
-        public float PanPitchMin => _panCap.PitchMin;
-        public float PanPitchMax => _panCap.PitchMax;
+        /* Pan capability from the mount (null when the part can't pan). Owns the
+           joint resolution + the YawInvert/axis mapping; core keeps the target
+           solve, rate integration, slew and clamp. Held typed so core can read
+           the slew/rate config + resolved joint that aren't on IPanCapability. */
+        private readonly HullcamPanCapability _pan;
+        public bool SupportsPan => _pan != null;
+        public float PanYawMin => _pan != null ? _pan.YawMin : 0f;
+        public float PanYawMax => _pan != null ? _pan.YawMax : 0f;
+        public float PanPitchMin => _pan != null ? _pan.PitchMin : 0f;
+        public float PanPitchMax => _pan != null ? _pan.PitchMax : 0f;
         /// <summary>Current interpolated yaw (degrees). Use this for
         /// status reporting — not the target — so operators see what
         /// is actually on-screen, not the commanded position.</summary>
@@ -193,17 +200,9 @@ namespace Kerbcast
         // as baseRot * Euler(-pitch, yaw, 0) so the camera's natural forward
         // direction is the zero point.
         private Quaternion _baseRotation;
-        // Mesh transform nodes driven by pan slew. Null when the capability
-        // table leaves the transform name empty (no animated joint in the mesh).
-        private Transform _yawTransform;
-        private Quaternion _yawRestRot;
-        private Vector3 _yawRestLocalPos;
-        private Transform _pitchTransform;
-        private Quaternion _pitchRestRot;
-        // Optional co-rotating base (yaw-only, no pitch) to prevent the
-        // moving head from clipping into a symmetric fixed base.
-        private Transform _yawBaseTransform;
-        private Quaternion _yawBaseRestRot;
+        /* Mesh joints + rest poses live in HullcamPanCapability now; core reads
+           the resolved yaw joint (for near-camera parenting + the aim solve)
+           through _pan and drives the joints via _pan.Steer. */
 
         private CameraLayers _layers = CameraLayers.All;
         /// <summary>
@@ -315,7 +314,7 @@ namespace Kerbcast
         private Material _nvMaterial;
 
         public KerbcastCamera(
-            MuMechModuleHullCamera hullcam,
+            ICameraMountSource mount,
             uint flightId,
             string ringDir,
             int slotCount,
@@ -325,11 +324,12 @@ namespace Kerbcast
             int renderHeight,
             CameraLayers initialLayers,
             bool enableAtmosphericFx,
-            AtmoFxLayers fxLayers,
-            PanCapability panCap = default)
+            AtmoFxLayers fxLayers)
         {
-            Hullcam = hullcam;
-            _panCap = panCap;
+            Mount = mount;
+            // Pan is delivered through the mount now; held typed so core can read
+            // the slew/rate config + resolved joint that IPanCapability omits.
+            _pan = mount.Pan as HullcamPanCapability;
             FlightId = flightId;
             MaxWidth = maxWidth;
             MaxHeight = maxHeight;
@@ -342,48 +342,26 @@ namespace Kerbcast
             _enableFx = enableAtmosphericFx;
             _fxLayers = fxLayers;
 
-            // Zoom capability: the zoom subclass `MuMechModuleHullCameraZoom`
-            // carries cameraFoVMin / cameraFoVMax fields the base module
-            // doesn't. `is` check + cast lets us reflect zoom support
-            // without taking a hard reference to the subclass type for
-            // parts where it's not present.
-            var zoomable = hullcam as MuMechModuleHullCameraZoom;
-            if (zoomable != null)
-            {
-                FovMin = zoomable.cameraFoVMin;
-                FovMax = zoomable.cameraFoVMax;
-                // Clamp a fisheye-wide authored max (TurretCam maxes at 100).
-                // Applied here so the initial Fov clamp below and SetFov both
-                // respect the capped maximum.
-                if (_panCap.FovMaxCap.HasValue)
-                    FovMax = Mathf.Min(FovMax, _panCap.FovMaxCap.Value);
-            }
-            else
-            {
-                FovMin = hullcam.cameraFoV;
-                FovMax = hullcam.cameraFoV;
-            }
-            // Zoom needs a real FoV range, not just the subclass type. Several
-            // MuMechModuleHullCameraZoom parts pin cameraFoVMin == cameraFoVMax
-            // (DC.munCam 25/25, DC.aerocam2 45/45, RoverCam, base mumech.hullcam
-            // 30/30). With a zero-width range SetFov's Clamp pegs every request
-            // to the single value, so zoom "works once" off the default FoV then
-            // never again. Treat that as non-zoomable so the browser hides the
-            // control and set-fov / set-zoom-rate are honest no-ops.
-            SupportsZoom = zoomable != null && FovMax > FovMin + 0.01f;
+            // Capability-derived zoom range (the subclass check + FovMaxCap clamp
+            // live inside HullcamZoomCapability). The zero-width verdict stays
+            // here: a zero-width range (e.g. DC.munCam 25/25) still yields a
+            // capability, but the range isn't wide enough to call zoomable.
+            SupportsZoom = mount.Zoom != null && mount.Zoom.FovMax > mount.Zoom.FovMin + 0.01f;
+            FovMin = mount.Zoom != null ? mount.Zoom.FovMin : mount.DefaultFieldOfView;
+            FovMax = mount.Zoom != null ? mount.Zoom.FovMax : mount.DefaultFieldOfView;
             // Snap both the displayed FoV and the slew target so a fresh camera
             // starts settled (SetFov now only moves _fovTarget; the constructor
             // is the one place that snaps Fov directly).
-            Fov = _fovTarget = Mathf.Clamp(hullcam.cameraFoV, FovMin, FovMax);
+            Fov = _fovTarget = Mathf.Clamp(mount.DefaultFieldOfView, FovMin, FovMax);
 
-            // Cache identity fields now while the Part is guaranteed live.
-            // WriteDestroyedManifest (called from Dispose, which may be
-            // invoked from a part-destruction event) reads these instead of
-            // touching Hullcam.part, which may already be null by that point.
-            _cachedPartName = hullcam.part.partInfo?.name ?? "unknown";
-            _cachedPartTitle = hullcam.part.partInfo?.title ?? _cachedPartName;
-            _cachedCameraName = string.IsNullOrEmpty(hullcam.cameraName) ? _cachedPartTitle : hullcam.cameraName;
-            _cachedVesselName = hullcam.vessel?.GetDisplayName() ?? hullcam.vessel?.vesselName ?? "<unknown>";
+            // Cache identity fields now while the Part is guaranteed live. The
+            // mount snapshots them off its part; WriteDestroyedManifest (called
+            // from Dispose during part destruction) reads these cached values so
+            // it never touches a dying part.
+            _cachedPartName = mount.PartName;
+            _cachedPartTitle = mount.PartTitle;
+            _cachedCameraName = mount.CameraName; // mount guarantees non-empty (empty -> PartTitle)
+            _cachedVesselName = mount.VesselDisplayName;
 
             _filterRenderPass = RenderFilterPass;
 
@@ -418,7 +396,7 @@ namespace Kerbcast
             if (!KerbcastSettings.EnableHullcamEffects) return;
             try
             {
-                int modeInt = (int)Hullcam.cameraMode;
+                int modeInt = Mount.FilterMode;
                 var mode = (CameraFilter.eCameraMode)modeInt;
                 if (mode == CameraFilter.eCameraMode.Normal) return;
 
@@ -545,13 +523,13 @@ namespace Kerbcast
             ApplyEffectiveQuality();
         }
 
-        private static void DumpModelTransforms(Part part)
+        private void DumpModelTransforms()
         {
             var sb = new System.Text.StringBuilder();
-            var root = part.FindModelTransform("model");
-            if (root == null) root = part.transform;
+            var root = Mount.FindModelTransform("model");
+            if (root == null) root = Mount.PartTransform;
             WalkTransforms(root, 0, sb);
-            Debug.Log($"[Kerbcast] model transforms for {part.name}:\n{sb}");
+            Debug.Log($"[Kerbcast] model transforms for {Mount.PartName}:\n{sb}");
         }
 
         private static void WalkTransforms(Transform t, int depth, System.Text.StringBuilder sb)
@@ -590,12 +568,12 @@ namespace Kerbcast
            readback against the RT captures the composite frame. */
         private void SetCameras()
         {
-            var partTransform = string.IsNullOrEmpty(Hullcam.cameraTransformName)
-                ? Hullcam.part.transform
-                : Hullcam.part.FindModelTransform(Hullcam.cameraTransformName);
+            var partTransform = string.IsNullOrEmpty(Mount.CameraTransformName)
+                ? Mount.PartTransform
+                : Mount.FindModelTransform(Mount.CameraTransformName);
             if (partTransform == null)
             {
-                Debug.LogWarning($"[Kerbcast] cam={FlightId} cameraTransformName '{Hullcam.cameraTransformName}' not found on part {Hullcam.part.name}");
+                Debug.LogWarning($"[Kerbcast] cam={FlightId} cameraTransformName '{Mount.CameraTransformName}' not found on part {Mount.PartName}");
                 return;
             }
 
@@ -607,22 +585,11 @@ namespace Kerbcast
             bool integrationsForceNoMsaa = _integrationHost.ForceNoMsaa;
             bool allowMsaa = !integrationsForceNoMsaa;
 
-            // Resolve the yaw mesh transform before camera setup so we can
-            // parent the near camera to it. Must happen here, at rest pose,
-            // so InverseTransformPoint reads the unrotated frame correctly.
-            DumpModelTransforms(Hullcam.part);
-            if (!string.IsNullOrEmpty(_panCap.YawTransformName))
-            {
-                _yawTransform = Hullcam.part.FindModelTransform(_panCap.YawTransformName);
-                if (_yawTransform != null)
-                {
-                    _yawRestRot = _yawTransform.localRotation;
-                    _yawRestLocalPos = _yawTransform.localPosition;
-                    Debug.Log($"[Kerbcast] cam={FlightId} yaw transform '{_panCap.YawTransformName}' found, restRot={_yawRestRot} restPos={_yawRestLocalPos}");
-                }
-                else
-                    Debug.LogWarning($"[Kerbcast] cam={FlightId} yaw transform '{_panCap.YawTransformName}' not found on {Hullcam.part.name}");
-            }
+            // The yaw joint (if any) was resolved by the pan capability at rest
+            // pose when the mount was built; read it here to parent the near
+            // camera. Null for a non-pan or no-joint camera.
+            DumpModelTransforms();
+            Transform yawJoint = _pan?.YawJoint;
 
             // Camera parenting strategy:
             //
@@ -648,31 +615,31 @@ namespace Kerbcast
             // localRotation for pan.
             Transform nearParent;
             Vector3 nearLocalPos;
-            if (_yawTransform != null)
+            if (yawJoint != null)
             {
                 // Joint present: camera follows the joint; re-express in joint frame.
-                if (_panCap.CameraMountLocal.HasValue)
+                if (_pan.CameraMountLocal.HasValue)
                 {
                     // Authored mount is already given in the joint's local frame.
-                    nearLocalPos = _panCap.CameraMountLocal.Value;
+                    nearLocalPos = _pan.CameraMountLocal.Value;
                 }
                 else
                 {
-                    Vector3 worldPos = partTransform.TransformPoint(Hullcam.cameraPosition);
-                    nearLocalPos = _yawTransform.InverseTransformPoint(worldPos);
+                    Vector3 worldPos = partTransform.TransformPoint(Mount.CameraPosition);
+                    nearLocalPos = yawJoint.InverseTransformPoint(worldPos);
                 }
-                Vector3 worldFwd = partTransform.TransformDirection(Hullcam.cameraForward);
-                Vector3 worldUp  = partTransform.TransformDirection(Hullcam.cameraUp);
+                Vector3 worldFwd = partTransform.TransformDirection(Mount.CameraForward);
+                Vector3 worldUp  = partTransform.TransformDirection(Mount.CameraUp);
                 _baseRotation = Quaternion.LookRotation(
-                    _yawTransform.InverseTransformDirection(worldFwd),
-                    _yawTransform.InverseTransformDirection(worldUp));
-                nearParent = _yawTransform;
+                    yawJoint.InverseTransformDirection(worldFwd),
+                    yawJoint.InverseTransformDirection(worldUp));
+                nearParent = yawJoint;
             }
             else
             {
                 // No joint: camera stays on partTransform and rotates in place.
-                nearLocalPos = Hullcam.cameraPosition;
-                _baseRotation = Quaternion.LookRotation(Hullcam.cameraForward, Hullcam.cameraUp);
+                nearLocalPos = Mount.CameraPosition;
+                _baseRotation = Quaternion.LookRotation(Mount.CameraForward, Mount.CameraUp);
                 nearParent = partTransform;
             }
 
@@ -685,8 +652,8 @@ namespace Kerbcast
             nearGo.transform.parent = nearParent;
             nearGo.transform.localPosition = nearLocalPos;
             nearGo.transform.localRotation = _baseRotation;
-            _nearCam.fieldOfView = Hullcam.cameraFoV;
-            _nearCam.nearClipPlane = Hullcam.cameraClip;
+            _nearCam.fieldOfView = Fov;
+            _nearCam.nearClipPlane = Mount.NearClip;
             _nearCam.targetTexture = _captureRt;
             // HDR + MSAA explicit on every layer. CopyFrom only inherits
             // whatever the source KSP camera was last left with, which in
@@ -724,7 +691,7 @@ namespace Kerbcast
             scaledGo.transform.localRotation = Quaternion.identity;
             scaledGo.transform.localPosition = Vector3.zero;
             scaledGo.transform.localScale = Vector3.one;
-            _scaledCam.fieldOfView = Hullcam.cameraFoV;
+            _scaledCam.fieldOfView = Fov;
             _scaledCam.targetTexture = _captureRt;
             _scaledCam.allowHDR = true;
             _scaledCam.allowMSAA = allowMsaa;
@@ -759,7 +726,7 @@ namespace Kerbcast
             galaxyGo.transform.position = Vector3.zero;
             galaxyGo.transform.localRotation = Quaternion.identity;
             galaxyGo.transform.localScale = Vector3.one;
-            _galaxyCam.fieldOfView = Hullcam.cameraFoV;
+            _galaxyCam.fieldOfView = Fov;
             _galaxyCam.targetTexture = _captureRt;
             _galaxyCam.allowHDR = true;
             _galaxyCam.allowMSAA = allowMsaa;
@@ -793,7 +760,7 @@ namespace Kerbcast
                 farGo.transform.parent = nearParent;
                 farGo.transform.localPosition = nearLocalPos;
                 farGo.transform.localRotation = _baseRotation;
-                _farCam.fieldOfView = Hullcam.cameraFoV;
+                _farCam.fieldOfView = Fov;
                 _farCam.targetTexture = _captureRt;
                 _farCam.allowHDR = true;
                 _farCam.allowMSAA = allowMsaa;
@@ -835,30 +802,9 @@ namespace Kerbcast
             StripMapViewLayers(_galaxyCam);
             StripMapViewLayers(_farCam);
 
-            // Pitch transform — resolved here rather than above because it
-            // doesn't affect camera parenting in the current design.
-            if (!string.IsNullOrEmpty(_panCap.PitchTransformName))
-            {
-                _pitchTransform = Hullcam.part.FindModelTransform(_panCap.PitchTransformName);
-                if (_pitchTransform != null)
-                    _pitchRestRot = _pitchTransform.localRotation;
-                else
-                    Debug.LogWarning($"[Kerbcast] cam={FlightId} pitch transform '{_panCap.PitchTransformName}' not found on {Hullcam.part.name}");
-            }
-
-            // Yaw-base transform: a fixed base that co-rotates in yaw so the
-            // moving head doesn't clip through it. No pitch — the base is static.
-            if (!string.IsNullOrEmpty(_panCap.YawBaseTransformName))
-            {
-                _yawBaseTransform = Hullcam.part.FindModelTransform(_panCap.YawBaseTransformName);
-                if (_yawBaseTransform != null)
-                {
-                    _yawBaseRestRot = _yawBaseTransform.localRotation;
-                    Debug.Log($"[Kerbcast] cam={FlightId} yaw-base transform '{_panCap.YawBaseTransformName}' found");
-                }
-                else
-                    Debug.LogWarning($"[Kerbcast] cam={FlightId} yaw-base transform '{_panCap.YawBaseTransformName}' not found on {Hullcam.part.name}");
-            }
+            // Pitch + yaw-base joints are resolved (and their rest poses
+            // captured) by HullcamPanCapability when the mount is built; the
+            // per-frame drive applies them through _pan.Steer.
 
             /* All cameras are permanently disabled; Unity must not
                auto-render them. Refresh() drives explicit camera.Render()
@@ -876,7 +822,7 @@ namespace Kerbcast
             // a genuine no-op). Each effect owns its own rendering surface.
             _fxHost = new FxHost(_nearCam);
             _fxHost.SetEnabledLayers(EffectiveFxLayers());
-            _fxHost.OnVesselChanged(Hullcam?.vessel);
+            _fxHost.OnVesselChanged(Mount.Vessel);
         }
 
         /* Master gate folded into the layer set: FX off => no layers => no effects.
@@ -895,7 +841,7 @@ namespace Kerbcast
         // derive their own intensities from these.
         private FxFrameState BuildFxFrameState()
         {
-            var v = Hullcam != null ? Hullcam.vessel : null;
+            var v = Mount.Vessel;
             Vector3 vel = v != null ? (Vector3)v.srf_velocity : Vector3.zero;
             float mach = v != null ? (float)v.mach : 0f;
             float q = v != null ? (float)v.dynamicPressurekPa : 0f;
@@ -931,7 +877,7 @@ namespace Kerbcast
         // Mirrors BuildFxFrameState's quantities so FX and integrations agree.
         private IntegrationFrameState BuildIntegrationFrameState(CameraLayers layer)
         {
-            var v = Hullcam != null ? Hullcam.vessel : null;
+            var v = Mount.Vessel;
             float mach = v != null ? (float)v.mach : 0f;
             float q = v != null ? (float)v.dynamicPressurekPa : 0f;
             double alt = v != null ? v.altitude : 0d;
@@ -963,7 +909,7 @@ namespace Kerbcast
                last setup, flipping the provider selection. SetEnabledLayers no-ops
                when the set is unchanged. */
             _fxHost?.SetEnabledLayers(EffectiveFxLayers());
-            _fxHost?.OnVesselChanged(Hullcam != null ? Hullcam.vessel : null);
+            _fxHost?.OnVesselChanged(Mount.Vessel);
         }
 
         private static Camera FindKspCamera(string name)
@@ -1026,11 +972,11 @@ namespace Kerbcast
         /// can't reach. Falls back to the part's forward before the camera is
         /// built.</summary>
         public UnityEngine.Vector3 BoresightWorld =>
-            _nearCam != null ? _nearCam.transform.forward : Hullcam.part.transform.forward;
+            _nearCam != null ? _nearCam.transform.forward : Mount.PartTransform.forward;
 
         /// <summary>World-space position of the capture camera's lens.</summary>
         public UnityEngine.Vector3 PositionWorld =>
-            _nearCam != null ? _nearCam.transform.position : Hullcam.part.transform.position;
+            _nearCam != null ? _nearCam.transform.position : Mount.PartTransform.position;
 
         /// <summary>
         /// Set the pan slew target (degrees) directly. Clamps to the part's pan
@@ -1041,8 +987,8 @@ namespace Kerbcast
         public void SetPanTarget(float yaw, float pitch)
         {
             if (!SupportsPan) return;
-            _panYawTarget = Mathf.Clamp(yaw, _panCap.YawMin, _panCap.YawMax);
-            _panPitchTarget = Mathf.Clamp(pitch, _panCap.PitchMin, _panCap.PitchMax);
+            _panYawTarget = Mathf.Clamp(yaw, _pan.YawMin, _pan.YawMax);
+            _panPitchTarget = Mathf.Clamp(pitch, _pan.PitchMin, _pan.PitchMax);
         }
 
         /// <summary>
@@ -1054,17 +1000,23 @@ namespace Kerbcast
         public void AimAt(UnityEngine.Vector3 worldPoint)
         {
             if (!SupportsPan) return;
-            var lens = _nearCam != null ? _nearCam.transform : Hullcam.part.transform;
+            var lens = _nearCam != null ? _nearCam.transform : Mount.PartTransform;
             UnityEngine.Vector3 dirWorld = (worldPoint - lens.position).normalized;
 
-            if (_yawTransform == null)
+            // Resolved yaw joint (null for a no-joint pan camera) + its rest
+            // rotation come from the pan capability; the YawInvert flag is read
+            // from the same capability so this solve and _pan.Steer stay on one
+            // sign convention.
+            UnityEngine.Transform yawJoint = _pan.YawJoint;
+
+            if (yawJoint == null)
             {
                 // No joint: the lens carries the whole pan as
                 // _baseRotation * Euler(-pitch, yaw, 0) in the part frame. Solve in
                 // the part frame, which does not rotate with pan, so the angles are
                 // absolute and stable.
                 UnityEngine.Vector3 local = UnityEngine.Quaternion.Inverse(_baseRotation)
-                    * Hullcam.part.transform.InverseTransformDirection(dirWorld);
+                    * Mount.PartTransform.InverseTransformDirection(dirWorld);
                 float y, p;
                 Kerbcast.PanAim.YawPitch(new Kerbcast.Vec3(local.x, local.y, local.z), out y, out p);
                 SetPanTarget(y, p);
@@ -1077,9 +1029,9 @@ namespace Kerbcast
             // target the residual angle collapses to zero, so the target is pulled
             // back to rest and it oscillates (judder). Solve against the joint's
             // REST pose so the angles are absolute.
-            UnityEngine.Transform basis = _yawTransform.parent != null
-                ? _yawTransform.parent : Hullcam.part.transform;
-            UnityEngine.Vector3 t = UnityEngine.Quaternion.Inverse(_yawRestRot)
+            UnityEngine.Transform basis = yawJoint.parent != null
+                ? yawJoint.parent : Mount.PartTransform;
+            UnityEngine.Vector3 t = UnityEngine.Quaternion.Inverse(_pan.YawJointRestRot)
                 * basis.InverseTransformDirection(dirWorld);           // target in the joint rest frame
             UnityEngine.Vector3 f0 = _baseRotation * UnityEngine.Vector3.forward;  // lens forward in the joint frame
             // Yaw about the joint's local Y and pitch about local X, each the angle
@@ -1089,7 +1041,7 @@ namespace Kerbcast
             float yaw = Mathf.Atan2(t.x, t.z) * Mathf.Rad2Deg - Mathf.Atan2(f0.x, f0.z) * Mathf.Rad2Deg;
             float pitch = Mathf.Asin(Mathf.Clamp(t.y, -1f, 1f)) * Mathf.Rad2Deg
                         - Mathf.Asin(Mathf.Clamp(f0.y, -1f, 1f)) * Mathf.Rad2Deg;
-            if (_panCap.YawInvert) yaw = -yaw;
+            if (_pan.YawInvert) yaw = -yaw;
             SetPanTarget(yaw, pitch);
         }
 
@@ -1262,7 +1214,7 @@ namespace Kerbcast
                         if (SupportsZoom)
                         {
                             Fov = _fovTarget;
-                            Hullcam.cameraFoV = Fov;
+                            Mount.Zoom?.SetFov(Fov);
                             if (_nearCam != null) _nearCam.fieldOfView = Fov;
                             if (_scaledCam != null) _scaledCam.fieldOfView = Fov;
                             if (_galaxyCam != null) _galaxyCam.fieldOfView = Fov;
@@ -1313,9 +1265,9 @@ namespace Kerbcast
                     if (panSeq != _lastPanSeq)
                     {
                         if (snap.PanYaw.HasValue)
-                            _panYawTarget = Mathf.Clamp(snap.PanYaw.Value, _panCap.YawMin, _panCap.YawMax);
+                            _panYawTarget = Mathf.Clamp(snap.PanYaw.Value, _pan.YawMin, _pan.YawMax);
                         if (snap.PanPitch.HasValue)
-                            _panPitchTarget = Mathf.Clamp(snap.PanPitch.Value, _panCap.PitchMin, _panCap.PitchMax);
+                            _panPitchTarget = Mathf.Clamp(snap.PanPitch.Value, _pan.PitchMin, _pan.PitchMax);
                     }
                     _lastPanSeq = panSeq;
                     // Pan rates. Absent leaves the current rate unchanged; an
@@ -1454,86 +1406,35 @@ namespace Kerbcast
                 if (_panYawRate != 0f || _panPitchRate != 0f)
                 {
                     _panYawTarget = Mathf.Clamp(
-                        _panYawTarget + _panYawRate * _panCap.PanRateDegPerSec * Time.deltaTime,
-                        _panCap.YawMin, _panCap.YawMax);
+                        _panYawTarget + _panYawRate * _pan.PanRateDegPerSec * Time.deltaTime,
+                        _pan.YawMin, _pan.YawMax);
                     _panPitchTarget = Mathf.Clamp(
-                        _panPitchTarget + _panPitchRate * _panCap.PanRateDegPerSec * Time.deltaTime,
-                        _panCap.PitchMin, _panCap.PitchMax);
+                        _panPitchTarget + _panPitchRate * _pan.PanRateDegPerSec * Time.deltaTime,
+                        _pan.PitchMin, _pan.PitchMax);
                 }
 
-                float maxDelta = _panCap.SlewDegPerSec * Time.deltaTime;
+                float maxDelta = _pan.SlewDegPerSec * Time.deltaTime;
                 _panYawCurrent = Mathf.MoveTowards(_panYawCurrent, _panYawTarget, maxDelta);
                 _panPitchCurrent = Mathf.MoveTowards(_panPitchCurrent, _panPitchTarget, maxDelta);
 
-                // When yaw and pitch share a single joint (e.g. launchcam's
-                // hc_launchcam), applying them separately would fight — the
-                // second assignment overwrites the first. Apply a single compound
-                // Euler so both axes land in one rotation.
-                bool compoundJoint = _yawTransform != null && _pitchTransform != null
-                    && ReferenceEquals(_yawTransform, _pitchTransform);
-
+                // Near camera (core owns it): a joint carries the pan, so the
+                // camera rests at _baseRotation relative to the joint; a no-joint
+                // camera carries the full pan itself. Positive pan_yaw = turn
+                // right; positive pan_pitch = up (Unity X-rotation is positive-
+                // down, hence the negation).
                 if (_nearCam != null)
                 {
-                    if (_yawTransform != null)
-                    {
-                        // A joint (compound or yaw-only) is present and the near
-                        // camera is parented to it, so the joint's rotation IS the
-                        // camera's pan. The camera stays at rest relative to the
-                        // joint; applying pan here too would double it.
+                    if (_pan.YawJoint != null)
                         _nearCam.transform.localRotation = _baseRotation;
-                    }
                     else
-                    {
-                        // No joint: the camera is parented to partTransform and
-                        // carries the full pan itself. Positive pan_yaw = camera
-                        // turns right; positive pan_pitch = up. Negate pitch
-                        // because Unity's X-rotation is positive-down.
                         _nearCam.transform.localRotation = _baseRotation
                             * Quaternion.Euler(-_panPitchCurrent, _panYawCurrent, 0f);
-                    }
                 }
-                if (compoundJoint)
-                {
-                    var rotation = _yawRestRot
-                        * Quaternion.Euler(-_panPitchCurrent, _panYawCurrent, 0f);
 
-                    if (_panCap.PitchPivotLocalY != 0f)
-                    {
-                        // The physical hinge sits above the transform origin.
-                        // Rotating around the origin would swing the whole head
-                        // from the base; instead, rotate around the hinge by
-                        // adjusting localPosition so the pivot stays fixed.
-                        var pivot = _yawRestLocalPos + new Vector3(0f, _panCap.PitchPivotLocalY, 0f);
-                        _yawTransform.localPosition = pivot + rotation * (_yawRestLocalPos - pivot);
-                    }
-                    _yawTransform.localRotation = rotation;
-
-                    // Co-rotate the static base in yaw so the moving head
-                    // doesn't clip into it (pitch is not applied to the base).
-                    if (_yawBaseTransform != null)
-                        _yawBaseTransform.localRotation = _yawBaseRestRot
-                            * Quaternion.Euler(0f, _panYawCurrent, 0f);
-                }
-                else
-                {
-                    if (_yawTransform != null)
-                    {
-                        // The near camera is parented rigidly to this joint, so a
-                        // single rotation drives BOTH the visible head and the
-                        // lens together (the lens stays at _baseRotation relative
-                        // to the joint, set in the _nearCam branch above) — no
-                        // head/lens sign disagreement to reconcile. YawInvert
-                        // negates the angle for a joint whose local frame would
-                        // otherwise turn the rigid head+lens opposite to the
-                        // operator's +panYaw = pan-right convention (TopJoint).
-                        float jointYaw = _panCap.YawInvert ? -_panYawCurrent : _panYawCurrent;
-                        _yawTransform.localRotation = _yawRestRot
-                            * Quaternion.Euler(0f, jointYaw, 0f);
-                    }
-                    if (_pitchTransform != null)
-                        _pitchTransform.localRotation = _pitchRestRot
-                            * Quaternion.Euler(-_panPitchCurrent, 0f, 0f);
-                }
+                // Joint mesh application (compound vs yaw-only, YawInvert, pitch
+                // pivot, co-rotating base) lives in the capability so core never
+                // sees the flip. No-op for a no-joint camera.
+                _pan.Steer(_panYawCurrent, _panPitchCurrent);
             }
 
             // Zoom: integrate the persistent zoom rate into the FoV target, then
@@ -1552,11 +1453,13 @@ namespace Kerbcast
                 if (Mathf.Abs(Fov - _fovTarget) > 0.001f)
                 {
                     Fov = Mathf.MoveTowards(Fov, _fovTarget, _zoomCap.FovSlewDegPerSec * Time.deltaTime);
-                    // Keep the Hullcam module's FoV (right-click GUI) in sync with
-                    // the actually-displayed FoV — this assignment used to live in
-                    // SetFov but now tracks the slewing value, including rate-driven
-                    // zoom, so the GUI matches the stream throughout the animation.
-                    Hullcam.cameraFoV = Fov;
+                    // Keep the module's FoV (right-click GUI) in sync with the
+                    // actually-displayed FoV — the zoom capability applies it to
+                    // the underlying module. Tracks the slewing value, including
+                    // rate-driven zoom, so the GUI matches the stream throughout.
+                    // No-op when the camera can't zoom (a non-zoom camera never
+                    // changes Fov, so this is never reached for one anyway).
+                    Mount.Zoom?.SetFov(Fov);
                     if (_nearCam != null) _nearCam.fieldOfView = Fov;
                     if (_scaledCam != null) _scaledCam.fieldOfView = Fov;
                     if (_galaxyCam != null) _galaxyCam.fieldOfView = Fov;
