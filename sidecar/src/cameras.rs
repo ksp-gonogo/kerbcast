@@ -1108,6 +1108,9 @@ impl CameraRegistry {
                 } else {
                     CameraLifecycle::Active
                 },
+                kind: Default::default(),
+                kerbal_persistent_id: None,
+                crew_location: None,
                 part_name: cam.part_name.clone(),
                 part_title: cam.part_title.clone(),
                 camera_name: cam.camera_name.clone(),
@@ -1391,6 +1394,9 @@ impl CameraRegistry {
             } else {
                 CameraLifecycle::Active
             },
+            kind: Default::default(),
+            kerbal_persistent_id: None,
+            crew_location: None,
             part_name: cam.part_name.clone(),
             part_title: cam.part_title.clone(),
             camera_name: cam.camera_name.clone(),

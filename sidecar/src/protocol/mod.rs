@@ -106,6 +106,28 @@ pub enum CameraLifecycle {
     Destroyed,
 }
 
+/// Distinguishes an existing Hullcam part camera (`Part`) from a
+/// per-kerbal face camera (`Kerbal`).
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CameraKind {
+    #[default]
+    Part,
+    Kerbal,
+}
+
+/// Which source a kerbal camera is currently rendering: a seated IVA
+/// portrait, or the kerbal's own view while on EVA. Only meaningful when
+/// `CameraState.kind == Kerbal`.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrewLocation {
+    Seat,
+    Eva,
+}
+
 /// Per-camera snapshot pushed by the sidecar on every state change
 /// (operator API call, adaptive shed, vessel change). Same shape served
 /// by `GET /cameras` so client UIs can treat the two interchangeably.
@@ -126,6 +148,19 @@ pub struct CameraState {
     /// surface a "SIGNAL LOST" overlay and keep the last frame visible.
     #[serde(default)]
     pub lifecycle: CameraLifecycle,
+    /// Whether this is a Hullcam part camera or a per-kerbal face camera.
+    /// Defaults to `Part` so existing payloads are unaffected.
+    #[serde(default)]
+    pub kind: CameraKind,
+    /// The kerbal's real `ProtoCrewMember.persistentID`: the stable key a
+    /// consumer correlates against. `None` for part cameras. Distinct from
+    /// `flight_id`, which identifies the camera instance, not the kerbal.
+    #[serde(default)]
+    pub kerbal_persistent_id: Option<u32>,
+    /// Which source a kerbal camera is currently rendering. `None` for
+    /// part cameras.
+    #[serde(default)]
+    pub crew_location: Option<CrewLocation>,
     pub part_name: String,
     pub part_title: String,
     pub camera_name: String,
@@ -510,6 +545,11 @@ pub enum ClientMessage {
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "content", rename_all = "kebab-case")]
+/* CameraState carries per-camera state (now including the kerbal-camera
+ * fields), dwarfing the other variants. Boxing it would ripple across
+ * every construction site for no behaviour change, so allow the size
+ * skew instead. */
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
     /// Reply to `Hello`. Carries server version + the active encoder
     /// backend's name.
@@ -580,6 +620,9 @@ mod tests {
             cameras: vec![CameraState {
                 flight_id: 99,
                 lifecycle: CameraLifecycle::Active,
+                kind: CameraKind::Part,
+                kerbal_persistent_id: None,
+                crew_location: None,
                 part_name: "navCam1".into(),
                 part_title: "NavCam".into(),
                 camera_name: "NavCam".into(),
@@ -630,6 +673,9 @@ mod tests {
         let state = CameraState {
             flight_id: 1,
             lifecycle: CameraLifecycle::Active,
+            kind: CameraKind::Part,
+            kerbal_persistent_id: None,
+            crew_location: None,
             part_name: String::new(),
             part_title: String::new(),
             camera_name: String::new(),
@@ -997,5 +1043,92 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// Pre-kerbal-camera JSON (none of `kind` / `kerbalPersistentId` /
+    /// `crewLocation` present) still deserialises, defaulting to a part
+    /// camera. Back-compat guarantee for the sidecar's own history and
+    /// any consumer built against the pre-Stage-2 wire shape.
+    #[test]
+    fn camera_state_without_kerbal_fields_defaults_to_part() {
+        let json = r#"{
+            "flightId": 1,
+            "partName": "",
+            "partTitle": "",
+            "cameraName": "",
+            "vesselName": "",
+            "layers": [],
+            "operatorLayers": [],
+            "renderWidth": 0,
+            "renderHeight": 0,
+            "operatorWidth": 0,
+            "operatorHeight": 0,
+            "supportsZoom": false,
+            "fov": 0.0,
+            "fovMin": 0.0,
+            "fovMax": 0.0,
+            "supportsPan": false,
+            "panYaw": 0.0,
+            "panPitch": 0.0,
+            "panYawMin": 0.0,
+            "panYawMax": 0.0,
+            "panPitchMin": 0.0,
+            "panPitchMax": 0.0,
+            "encoderBitrateBps": 0,
+            "targetBitrateBps": 0,
+            "degradeLevel": 0.0
+        }"#;
+        let back: CameraState = serde_json::from_str(json).unwrap();
+        assert_eq!(back.kind, CameraKind::Part);
+        assert_eq!(back.kerbal_persistent_id, None);
+        assert_eq!(back.crew_location, None);
+    }
+
+    /// A kerbal face camera round-trips its `kind`, `kerbalPersistentId`
+    /// and `crewLocation` intact, honoring the camelCase wire names.
+    #[test]
+    fn kerbal_camera_state_roundtrips() {
+        let state = CameraState {
+            flight_id: 42,
+            lifecycle: CameraLifecycle::Active,
+            kind: CameraKind::Kerbal,
+            kerbal_persistent_id: Some(123456),
+            crew_location: Some(CrewLocation::Eva),
+            part_name: String::new(),
+            part_title: String::new(),
+            camera_name: "Jebediah Kerman".into(),
+            vessel_name: "Perf Test 1".into(),
+            layers: vec![],
+            operator_layers: vec![],
+            render_width: 0,
+            render_height: 0,
+            operator_width: 0,
+            operator_height: 0,
+            supports_zoom: false,
+            fov: 0.0,
+            fov_min: 0.0,
+            fov_max: 0.0,
+            supports_pan: false,
+            pan_yaw: 0.0,
+            pan_pitch: 0.0,
+            pan_yaw_min: 0.0,
+            pan_yaw_max: 0.0,
+            pan_pitch_min: 0.0,
+            pan_pitch_max: 0.0,
+            encoder_bitrate_bps: 0,
+            target_bitrate_bps: 0,
+            degrade_level: 0.0,
+            viewer_quality: None,
+            quality_limited_by: None,
+        };
+        let s = serde_json::to_string(&state).unwrap();
+        assert!(s.contains("\"kind\":\"kerbal\""));
+        assert!(s.contains("\"kerbalPersistentId\":123456"));
+        assert!(s.contains("\"crewLocation\":\"eva\""));
+
+        let back: CameraState = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.kind, CameraKind::Kerbal);
+        assert_eq!(back.kerbal_persistent_id, Some(123456));
+        assert_eq!(back.crew_location, Some(CrewLocation::Eva));
     }
 }

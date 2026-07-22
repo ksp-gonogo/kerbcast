@@ -21,6 +21,25 @@ export enum CameraLifecycle {
 }
 
 /**
+ * Distinguishes an existing Hullcam part camera (`Part`) from a
+ * per-kerbal face camera (`Kerbal`).
+ */
+export enum CameraKind {
+	Part = "part",
+	Kerbal = "kerbal",
+}
+
+/**
+ * Which source a kerbal camera is currently rendering: a seated IVA
+ * portrait, or the kerbal's own view while on EVA. Only meaningful when
+ * `CameraState.kind == Kerbal`.
+ */
+export enum CrewLocation {
+	Seat = "seat",
+	Eva = "eva",
+}
+
+/**
  * Layer mask. Mirrors `Kerbcast.CameraLayers` on the plugin side.
  * Receiving clients use this for both the rendered-layer status reports
  * and per-camera layer requests.
@@ -70,6 +89,22 @@ export interface CameraState {
 	 * surface a "SIGNAL LOST" overlay and keep the last frame visible.
 	 */
 	lifecycle?: CameraLifecycle;
+	/**
+	 * Whether this is a Hullcam part camera or a per-kerbal face camera.
+	 * Defaults to `Part` so existing payloads are unaffected.
+	 */
+	kind?: CameraKind;
+	/**
+	 * The kerbal's real `ProtoCrewMember.persistentID`: the stable key a
+	 * consumer correlates against. `None` for part cameras. Distinct from
+	 * `flight_id`, which identifies the camera instance, not the kerbal.
+	 */
+	kerbalPersistentId?: number;
+	/**
+	 * Which source a kerbal camera is currently rendering. `None` for
+	 * part cameras.
+	 */
+	crewLocation?: CrewLocation;
 	partName: string;
 	partTitle: string;
 	cameraName: string;
