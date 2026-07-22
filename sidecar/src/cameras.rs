@@ -28,7 +28,7 @@ use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CrewLocation, Layer,
     QualityPreset, SettingsStatePayload,
 };
-use crate::shared_mem::{ControlBlock, MmapFrameRing, MmapRingConfig};
+use crate::shared_mem::{ControlBlock, MmapFrameRing};
 
 /// Filesystem identity for a `.ring` file: distinguishes "same path, same
 /// underlying file" from "same path, file was unlinked and a new one
@@ -534,7 +534,6 @@ impl CameraState {
 /// from the plugin so the consume loop can diff against it.
 pub struct CameraRegistry {
     shm_dir: PathBuf,
-    ring_cfg: MmapRingConfig,
     pub cameras: RwLock<HashMap<u32, Arc<CameraState>>>,
     last_status: Mutex<Option<GlobalStatusFile>>,
     /// Last-seen value of the `global.inflight` file, cached so the consume
@@ -672,10 +671,9 @@ struct GlobalControlFile {
 }
 
 impl CameraRegistry {
-    pub fn new(shm_dir: PathBuf, ring_cfg: MmapRingConfig) -> Self {
+    pub fn new(shm_dir: PathBuf) -> Self {
         Self {
             shm_dir,
-            ring_cfg,
             cameras: RwLock::new(HashMap::new()),
             last_status: Mutex::new(None),
             last_in_flight: Mutex::new(None),
@@ -885,14 +883,18 @@ impl CameraRegistry {
                 Some(_) => continue,
                 None => false,
             };
-            match MmapFrameRing::open(path, self.ring_cfg) {
+            match MmapFrameRing::open_self_describing(path) {
                 Ok(ring) => {
+                    // Each ring self-describes its geometry; a kerbal face ring
+                    // (512²) is smaller than a full-tier part-camera ring, so we
+                    // take the dims from the ring, not from any global default.
+                    let ring_dims = ring.config();
                     let manifest = read_manifest(&self.shm_dir, *id).await;
                     attached.push(*id);
                     info!(
                         flight_id = id,
                         path = %path.display(),
-                        max_dims = format!("{}x{}", self.ring_cfg.max_width, self.ring_cfg.max_height),
+                        max_dims = format!("{}x{}", ring_dims.max_width, ring_dims.max_height),
                         part_title = %manifest.part_title,
                         vessel = %manifest.vessel_name,
                         resurrected = resurrecting,
@@ -904,8 +906,8 @@ impl CameraRegistry {
                             flight_id: *id,
                             ring,
                             ring_identity: found_identity,
-                            max_width: self.ring_cfg.max_width,
-                            max_height: self.ring_cfg.max_height,
+                            max_width: ring_dims.max_width,
+                            max_height: ring_dims.max_height,
                             kind: camera_kind_from_manifest(&manifest.kind),
                             kerbal_persistent_id: manifest.kerbal_persistent_id,
                             crew_location: crew_location_from_manifest(
@@ -1547,6 +1549,7 @@ fn crew_location_from_manifest(location: Option<&str>) -> Option<CrewLocation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared_mem::MmapRingConfig;
 
     #[test]
     fn parse_in_flight_reads_one_zero() {
@@ -1560,12 +1563,7 @@ mod tests {
     async fn poll_in_flight_fires_only_on_change() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm = dir.path();
-        let cfg = MmapRingConfig {
-            slot_count: 4,
-            max_width: 1280,
-            max_height: 720,
-        };
-        let reg = CameraRegistry::new(shm.to_path_buf(), cfg);
+        let reg = CameraRegistry::new(shm.to_path_buf());
         let path = shm.join(INFLIGHT_FILE);
 
         // No file yet => None, no change from the initial None cache.
@@ -1587,12 +1585,7 @@ mod tests {
     async fn poll_status_emits_capture_clock_on_change() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm = dir.path();
-        let cfg = MmapRingConfig {
-            slot_count: 4,
-            max_width: 1280,
-            max_height: 720,
-        };
-        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        let registry = CameraRegistry::new(shm.to_path_buf());
         let status_path = shm.join("global.status.json");
 
         let write = |ut: f64| {
@@ -1718,7 +1711,7 @@ mod tests {
             .await
             .unwrap();
 
-        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        let registry = CameraRegistry::new(shm.to_path_buf());
         registry.rescan().await;
 
         let cam = registry.get(flight_id).await.expect("camera attached");
@@ -1759,7 +1752,7 @@ mod tests {
             .await
             .unwrap();
 
-        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        let registry = CameraRegistry::new(shm.to_path_buf());
         registry.rescan().await;
 
         let cam = registry.get(flight_id).await.expect("camera attached");
@@ -1795,7 +1788,7 @@ mod tests {
             max_height: 64,
         };
         MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
-        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
         registry.rescan().await;
         let cam = registry.get(1).await.expect("camera attached from ring");
 
@@ -1849,7 +1842,7 @@ mod tests {
             std::fs::write(shm.join(format!("{id}.info.json")), content).unwrap();
         };
         let ring_path = shm.join(format!("{id}.ring"));
-        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        let registry = CameraRegistry::new(shm.to_path_buf());
 
         // 1. Fresh camera attaches active.
         MmapFrameRing::create(&ring_path, cfg).expect("create ring");
@@ -1931,7 +1924,7 @@ mod tests {
             std::fs::write(shm.join(format!("{id}.info.json")), content).unwrap();
         };
         let ring_path = shm.join(format!("{id}.ring"));
-        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        let registry = CameraRegistry::new(shm.to_path_buf());
 
         // 1. Fresh camera attaches active.
         MmapFrameRing::create(&ring_path, cfg).expect("create ring");
@@ -1973,7 +1966,7 @@ mod tests {
             max_height: 64,
         };
         MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
-        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
         registry.rescan().await;
         let cam = registry.get(1).await.expect("camera attached from ring");
         let cams = vec![cam.clone()];
@@ -2046,7 +2039,7 @@ mod tests {
             max_height: 64,
         };
         MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
-        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
         registry.rescan().await;
         let cam = registry.get(1).await.expect("camera attached from ring");
 
@@ -2098,7 +2091,7 @@ mod tests {
             max_height: 64,
         };
         MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
-        let registry = CameraRegistry::new(dir.path().to_path_buf(), cfg);
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
         registry.rescan().await;
         let cam = registry.get(1).await.expect("camera attached from ring");
         (registry, cam)

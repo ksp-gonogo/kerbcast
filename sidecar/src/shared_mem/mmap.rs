@@ -94,6 +94,14 @@ pub enum MmapRingError {
         req_h: u32,
         req_slots: u32,
     },
+    #[error(
+        "ring header declares implausible geometry: {slot_count} slots of {max_width}x{max_height}"
+    )]
+    BadGeometry {
+        slot_count: u32,
+        max_width: u32,
+        max_height: u32,
+    },
     #[error("frame size mismatch: got {got} bytes, expected {expected}")]
     SizeMismatch { got: usize, expected: usize },
     #[error("frame too large: {width}x{height} exceeds capacity {max_w}x{max_h}")]
@@ -186,6 +194,91 @@ impl MmapFrameRing {
         let ring = Self { mmap, cfg };
         ring.validate_header()?;
         Ok(ring)
+    }
+
+    /// Open an existing ring, taking its geometry (slot count and per-slot
+    /// pixel capacity) from the file's own header rather than a caller-supplied
+    /// config. Cameras allocate different-sized rings — a 512² kerbal face ring
+    /// is smaller than a full-tier part-camera ring — so a reader can't assume
+    /// one global geometry; it learns each ring's shape from the header the
+    /// writer stamped.
+    pub fn open_self_describing(path: &Path) -> Result<Self, MmapRingError> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let meta = file.metadata()?;
+        if meta.len() < HEADER_SIZE as u64 {
+            return Err(MmapRingError::FileTooSmall {
+                got: meta.len(),
+                need: HEADER_SIZE as u64,
+            });
+        }
+        // Peek the header page to read the stamped geometry. Magic and version
+        // are checked here so a garbage header can't drive a wild allocation
+        // size before the full open re-validates.
+        let header = unsafe { MmapOptions::new().len(HEADER_SIZE).map(&file)? };
+        let got_magic = u64::from_le_bytes(
+            header[HEADER_OFF_MAGIC..HEADER_OFF_MAGIC + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if got_magic != MAGIC {
+            return Err(MmapRingError::BadMagic { got: got_magic });
+        }
+        let got_version = u32::from_le_bytes(
+            header[HEADER_OFF_VERSION..HEADER_OFF_VERSION + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if got_version != LAYOUT_VERSION {
+            return Err(MmapRingError::BadVersion { got: got_version });
+        }
+        let slot_count = u32::from_le_bytes(
+            header[HEADER_OFF_SLOT_COUNT..HEADER_OFF_SLOT_COUNT + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let max_width = u32::from_le_bytes(
+            header[HEADER_OFF_MAX_WIDTH..HEADER_OFF_MAX_WIDTH + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let max_height = u32::from_le_bytes(
+            header[HEADER_OFF_MAX_HEIGHT..HEADER_OFF_MAX_HEIGHT + 4]
+                .try_into()
+                .unwrap(),
+        );
+        drop(header);
+        // A torn/corrupt header (matching magic+version by luck) could carry
+        // wild dims; reject implausible geometry before total_bytes() can
+        // overflow and a later slot slice panics. The plugin never writes
+        // anything near these bounds (tier max well under 8K, ≤ a few slots).
+        const MAX_DIM: u32 = 8192;
+        const MAX_SLOTS: u32 = 64;
+        if slot_count == 0
+            || slot_count > MAX_SLOTS
+            || max_width == 0
+            || max_width > MAX_DIM
+            || max_height == 0
+            || max_height > MAX_DIM
+        {
+            return Err(MmapRingError::BadGeometry {
+                slot_count,
+                max_width,
+                max_height,
+            });
+        }
+        let cfg = MmapRingConfig {
+            slot_count,
+            max_width,
+            max_height,
+        };
+        Self::open(path, cfg)
+    }
+
+    /// The ring's geometry as it was created / opened. After
+    /// `open_self_describing` this reflects the writer's actual per-camera
+    /// dimensions, which may be smaller than any global default.
+    pub fn config(&self) -> MmapRingConfig {
+        self.cfg
     }
 
     fn write_header(&mut self) -> Result<(), MmapRingError> {
@@ -533,6 +626,66 @@ mod tests {
         match MmapFrameRing::open(&path, bigger) {
             Ok(_) => panic!("expected open to fail with mismatched dims"),
             Err(MmapRingError::FileTooSmall { .. } | MmapRingError::LayoutMismatch { .. }) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_self_describing_reads_geometry_from_header() {
+        // A ring created at one geometry opens self-describing at that same
+        // geometry without the reader knowing the dims in advance — the case
+        // that broke kerbal (512²) rings when the reader assumed global dims.
+        let path = tmp_path("self-describing");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 512,
+            max_height: 512,
+        };
+        let _writer = MmapFrameRing::create(&path, cfg).unwrap();
+        let reader = MmapFrameRing::open_self_describing(&path).unwrap();
+        let got = reader.config();
+        assert_eq!(got.slot_count, 4);
+        assert_eq!(got.max_width, 512);
+        assert_eq!(got.max_height, 512);
+        drop(reader);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_self_describing_rejects_bad_magic() {
+        let path = tmp_path("self-describing-bad");
+        std::fs::write(&path, vec![0u8; HEADER_SIZE + 16]).unwrap();
+        match MmapFrameRing::open_self_describing(&path) {
+            Ok(_) => panic!("expected open to fail on a zeroed (bad-magic) header"),
+            Err(MmapRingError::BadMagic { .. }) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_self_describing_rejects_implausible_geometry() {
+        // A valid magic+version header but with a wild max_width (as a torn
+        // write could leave) is refused before total_bytes() can overflow.
+        let path = tmp_path("self-describing-wild");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let _writer = MmapFrameRing::create(&path, cfg).unwrap();
+        // Stomp the max_width field (offset 16) with a huge value in place.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(HEADER_OFF_MAX_WIDTH as u64))
+                .unwrap();
+            f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        }
+        match MmapFrameRing::open_self_describing(&path) {
+            Ok(_) => panic!("expected open to reject wild geometry"),
+            Err(MmapRingError::BadGeometry { .. }) => {}
             Err(other) => panic!("unexpected error: {other:?}"),
         }
         fs::remove_file(&path).ok();

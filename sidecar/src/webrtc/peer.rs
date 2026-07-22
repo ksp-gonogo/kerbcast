@@ -1439,7 +1439,7 @@ mod tests {
         };
         let ring_path = dir.path().join("1.ring");
         MmapFrameRing::create(&ring_path, cfg).expect("create ring");
-        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf(), cfg));
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
         registry.rescan().await;
 
         let peer = Arc::new(

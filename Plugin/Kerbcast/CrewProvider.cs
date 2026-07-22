@@ -33,6 +33,10 @@ namespace Kerbcast
                 foreach (var pcm in part.protoModuleCrew)
                 {
                     if (pcm.type == ProtoCrewMember.KerbalType.Tourist) continue;
+                    /* persistentID 0 is KSP's "unassigned" sentinel, not a real
+                       seated kerbal (seen on dev-tool-spawned crew). Every such
+                       entry would also collide at wire-id 0x80000000, so skip. */
+                    if (pcm.persistentID == 0) continue;
                     uint flightId = CameraId.KerbalWireId(pcm.persistentID);
                     if (existingFlightIds.Contains(flightId)) continue;
 

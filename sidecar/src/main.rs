@@ -160,12 +160,12 @@ async fn main() -> Result<()> {
         max_height: cli.max_height,
     };
 
-    let registry = Arc::new(CameraRegistry::new(cli.shm_dir.clone(), ring_cfg));
+    let registry = Arc::new(CameraRegistry::new(cli.shm_dir.clone()));
     info!(
         dir = %cli.shm_dir.display(),
         slot_count = ring_cfg.slot_count,
         max_dims = format!("{}x{}", ring_cfg.max_width, ring_cfg.max_height),
-        "camera registry initialised — scanning for rings",
+        "camera registry initialised — scanning for rings (per-ring geometry)",
     );
 
     let peers: Arc<RwLock<Vec<Arc<KerbcastPeer>>>> = Arc::new(RwLock::new(Vec::new()));
