@@ -25,7 +25,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
-    CameraLifecycle, CameraState as ProtocolCameraState, Layer, QualityPreset, SettingsStatePayload,
+    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CrewLocation, Layer,
+    QualityPreset, SettingsStatePayload,
 };
 use crate::shared_mem::{ControlBlock, MmapFrameRing, MmapRingConfig};
 
@@ -248,6 +249,13 @@ pub struct CameraInfo {
     /// the UI can show a "SIGNAL LOST" badge until the next vessel change
     /// clears the registry. `"active"` for live cameras.
     pub lifecycle: CameraLifecycle,
+    /// Whether this is a Hullcam part camera or a per-kerbal face camera.
+    pub kind: CameraKind,
+    /// The kerbal's `ProtoCrewMember.persistentID`. `None` for part cameras.
+    pub kerbal_persistent_id: Option<u32>,
+    /// Which source a kerbal camera is currently rendering. `None` for
+    /// part cameras.
+    pub crew_location: Option<CrewLocation>,
     pub max_width: u32,
     pub max_height: u32,
     pub part_name: String,
@@ -311,6 +319,16 @@ struct InfoManifest {
     pan_pitch_min: f32,
     #[serde(default)]
     pan_pitch_max: f32,
+    /// `"part"` or `"kerbal"`. Empty/absent (existing part cameras predate
+    /// this field) is treated as `"part"`: see `CameraKind`.
+    #[serde(default)]
+    kind: String,
+    /// The kerbal's `ProtoCrewMember.persistentID`. `None` for part cameras.
+    #[serde(default)]
+    kerbal_persistent_id: Option<u32>,
+    /// `"seat"` or `"eva"`. `None` for part cameras.
+    #[serde(default)]
+    crew_location: Option<String>,
 }
 
 pub struct CameraState {
@@ -328,6 +346,13 @@ pub struct CameraState {
     pub ring_identity: u64,
     pub max_width: u32,
     pub max_height: u32,
+    /// Whether this is a Hullcam part camera or a per-kerbal face camera.
+    pub kind: CameraKind,
+    /// The kerbal's `ProtoCrewMember.persistentID`. `None` for part cameras.
+    pub kerbal_persistent_id: Option<u32>,
+    /// Which source a kerbal camera is currently rendering. `None` for
+    /// part cameras.
+    pub crew_location: Option<CrewLocation>,
     pub part_name: String,
     pub part_title: String,
     pub camera_name: String,
@@ -881,6 +906,11 @@ impl CameraRegistry {
                             ring_identity: found_identity,
                             max_width: self.ring_cfg.max_width,
                             max_height: self.ring_cfg.max_height,
+                            kind: camera_kind_from_manifest(&manifest.kind),
+                            kerbal_persistent_id: manifest.kerbal_persistent_id,
+                            crew_location: crew_location_from_manifest(
+                                manifest.crew_location.as_deref(),
+                            ),
                             part_name: manifest.part_name,
                             part_title: manifest.part_title,
                             camera_name: manifest.camera_name,
@@ -981,6 +1011,9 @@ impl CameraRegistry {
                 } else {
                     CameraLifecycle::Active
                 },
+                kind: s.kind,
+                kerbal_persistent_id: s.kerbal_persistent_id,
+                crew_location: s.crew_location,
                 max_width: s.max_width,
                 max_height: s.max_height,
                 part_name: s.part_name.clone(),
@@ -1108,9 +1141,9 @@ impl CameraRegistry {
                 } else {
                     CameraLifecycle::Active
                 },
-                kind: Default::default(),
-                kerbal_persistent_id: None,
-                crew_location: None,
+                kind: cam.kind,
+                kerbal_persistent_id: cam.kerbal_persistent_id,
+                crew_location: cam.crew_location,
                 part_name: cam.part_name.clone(),
                 part_title: cam.part_title.clone(),
                 camera_name: cam.camera_name.clone(),
@@ -1394,9 +1427,9 @@ impl CameraRegistry {
             } else {
                 CameraLifecycle::Active
             },
-            kind: Default::default(),
-            kerbal_persistent_id: None,
-            crew_location: None,
+            kind: cam.kind,
+            kerbal_persistent_id: cam.kerbal_persistent_id,
+            crew_location: cam.crew_location,
             part_name: cam.part_name.clone(),
             part_title: cam.part_title.clone(),
             camera_name: cam.camera_name.clone(),
@@ -1471,6 +1504,9 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
         pan_yaw_max: 0.0,
         pan_pitch_min: 0.0,
         pan_pitch_max: 0.0,
+        kind: String::new(),
+        kerbal_persistent_id: None,
+        crew_location: None,
     };
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
@@ -1486,6 +1522,25 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
             warn!(flight_id, path = %path.display(), error = %e, "info manifest parse failed");
             empty
         }
+    }
+}
+
+/// Manifest `kind` string -> protocol enum. Empty/unrecognised (existing
+/// part cameras predate this field) maps to `Part`.
+fn camera_kind_from_manifest(kind: &str) -> CameraKind {
+    match kind {
+        "kerbal" => CameraKind::Kerbal,
+        _ => CameraKind::Part,
+    }
+}
+
+/// Manifest `crew_location` string -> protocol enum. Absent/unrecognised
+/// maps to `None` (part cameras never set this field).
+fn crew_location_from_manifest(location: Option<&str>) -> Option<CrewLocation> {
+    match location {
+        Some("seat") => Some(CrewLocation::Seat),
+        Some("eva") => Some(CrewLocation::Eva),
+        _ => None,
     }
 }
 
@@ -1639,6 +1694,88 @@ mod tests {
             CameraLifecycle::Active,
             "unknown lifecycle in info.json should be treated as Active"
         );
+    }
+
+    /// A kerbal-camera manifest (`kind:"kerbal"`, a persistent id, a crew
+    /// location) threads through `rescan` into both the internal
+    /// `CameraState` and the `GET /cameras` `CameraInfo` shape.
+    #[tokio::test]
+    async fn rescan_populates_kerbal_camera_kind_from_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 9_010;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
+
+        let content = format!(
+            r#"{{"flight_id":{flight_id},"kind":"kerbal","kerbal_persistent_id":42,"crew_location":"seat","part_name":"","part_title":"","camera_name":"Jeb's Face","vessel_name":"Kerbal X","supports_zoom":false,"fov":60.0,"fov_min":60.0,"fov_max":60.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+        );
+        tokio::fs::write(shm.join(format!("{flight_id}.info.json")), content)
+            .await
+            .unwrap();
+
+        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        registry.rescan().await;
+
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        assert_eq!(cam.kind, CameraKind::Kerbal);
+        assert_eq!(cam.kerbal_persistent_id, Some(42));
+        assert_eq!(cam.crew_location, Some(CrewLocation::Seat));
+
+        let info = registry
+            .list()
+            .await
+            .into_iter()
+            .find(|c| c.flight_id == flight_id)
+            .expect("camera in list");
+        assert_eq!(info.kind, CameraKind::Kerbal);
+        assert_eq!(info.kerbal_persistent_id, Some(42));
+        assert_eq!(info.crew_location, Some(CrewLocation::Seat));
+    }
+
+    /// A part manifest with no `kind` field at all (every manifest written
+    /// before this feature) defaults to `Part`/`None`/`None`: additive,
+    /// existing cameras are unaffected.
+    #[tokio::test]
+    async fn rescan_defaults_to_part_camera_kind_when_manifest_omits_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 9_011;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
+
+        let content = format!(
+            r#"{{"flight_id":{flight_id},"part_name":"testPart","part_title":"Test Camera","camera_name":"Cam 1","vessel_name":"Kerbal X","supports_zoom":false,"fov":60.0,"fov_min":10.0,"fov_max":90.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+        );
+        tokio::fs::write(shm.join(format!("{flight_id}.info.json")), content)
+            .await
+            .unwrap();
+
+        let registry = CameraRegistry::new(shm.to_path_buf(), cfg);
+        registry.rescan().await;
+
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        assert_eq!(cam.kind, CameraKind::Part);
+        assert_eq!(cam.kerbal_persistent_id, None);
+        assert_eq!(cam.crew_location, None);
+
+        let info = registry
+            .list()
+            .await
+            .into_iter()
+            .find(|c| c.flight_id == flight_id)
+            .expect("camera in list");
+        assert_eq!(info.kind, CameraKind::Part);
+        assert_eq!(info.kerbal_persistent_id, None);
+        assert_eq!(info.crew_location, None);
     }
 
     /// `add_track` / `remove_track` drive the subscriber count that gates

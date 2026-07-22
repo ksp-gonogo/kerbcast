@@ -41,12 +41,15 @@ using Yangrc.OpenGLAsyncReadback;
 
 namespace Kerbcast
 {
-    internal sealed class KerbcastCamera
+    internal sealed class KerbcastCamera : ICamera
     {
         public uint FlightId { get; }
         /* Placement + identity + optional zoom/pan capabilities, decoupled from
            MuMechModuleHullCamera. Every former Hullcam read now goes through this. */
         public ICameraMountSource Mount { get; }
+        /* Promoted for ICamera: core no longer reaches through Mount directly. */
+        public bool OwnsPart(Part part) => Mount.OwnsPart(part);
+        public Vessel Vessel => Mount.Vessel;
         /* Part liveness, used by KerbcastCore's churn sweeps. */
         public bool IsAlive => Mount.IsAlive;
         public int MaxWidth { get; }
@@ -70,7 +73,7 @@ namespace Kerbcast
         /* Consecutive Refresh() exceptions, owned by KerbcastCore's capture
            loop: reset on a clean pass, camera quarantined at the threshold
            so one persistently-broken camera can't break the rest. */
-        public int RefreshFailureStreak;
+        public int RefreshFailureStreak { get; set; }
 
         /* Pan capability from the mount (null when the part can't pan). Owns the
            joint resolution + the YawInvert/axis mapping; core keeps the target
@@ -1297,7 +1300,7 @@ namespace Kerbcast
         // the constructor) rather than from Hullcam.part directly so the
         // same code path stays safe when called from Dispose during part
         // destruction (where Hullcam.part may already be null).
-        private void WriteInfoManifest()
+        public void WriteInfoManifest()
         {
             WriteManifest("active");
         }
@@ -1324,6 +1327,7 @@ namespace Kerbcast
             {
                 var json = "{\n"
                     + $"  \"lifecycle\": \"{lifecycle}\",\n"
+                    + $"  \"kind\": \"part\",\n"
                     + $"  \"flight_id\": {FlightId},\n"
                     + $"  \"part_name\": \"{EscapeJson(_cachedPartName)}\",\n"
                     + $"  \"part_title\": \"{EscapeJson(_cachedPartTitle)}\",\n"

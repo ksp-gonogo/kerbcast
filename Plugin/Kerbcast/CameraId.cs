@@ -22,5 +22,10 @@ namespace Kerbcast
                 return h;
             }
         }
+
+        /* Wire id for a kerbal camera: the kerbal's persistentID with the top bit
+           set, keeping it disjoint from part flightIDs (which are small and top-bit
+           clear). Stable across seat/EVA since persistentID is. */
+        public static uint KerbalWireId(uint persistentId) => persistentId | 0x80000000u;
     }
 }

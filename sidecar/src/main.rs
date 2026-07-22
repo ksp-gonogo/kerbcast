@@ -509,9 +509,9 @@ async fn broadcast_destroyed_cameras(
         let state = ProtocolCameraState {
             flight_id,
             lifecycle: CameraLifecycle::Destroyed,
-            kind: Default::default(),
-            kerbal_persistent_id: None,
-            crew_location: None,
+            kind: cam.kind,
+            kerbal_persistent_id: cam.kerbal_persistent_id,
+            crew_location: cam.crew_location,
             part_name: cam.part_name.clone(),
             part_title: cam.part_title.clone(),
             camera_name: cam.camera_name.clone(),

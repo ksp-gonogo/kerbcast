@@ -40,8 +40,8 @@ namespace Kerbcast
             if (cams == null || vessel == null) return result;
             for (int i = 0; i < cams.Count; i++)
             {
-                var c = cams[i];
-                if (c.Mount.Vessel == vessel)
+                // Kerbal cameras aren't exposed to kOS this stage.
+                if (cams[i] is KerbcastCamera c && c.Vessel == vessel)
                     result.Add(ToView(c));
             }
             return result;
@@ -80,7 +80,8 @@ namespace Kerbcast
         {
             var cams = KerbcastCore.Instance?.Cameras;
             if (cams == null) return null;
-            for (int i = 0; i < cams.Count; i++) if (cams[i].FlightId == flightId) return cams[i];
+            for (int i = 0; i < cams.Count; i++)
+                if (cams[i] is KerbcastCamera kc && kc.FlightId == flightId) return kc;
             return null;
         }
 

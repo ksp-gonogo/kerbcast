@@ -52,7 +52,7 @@ namespace Kerbcast
         public static KerbcastCore Instance { get; private set; }
 
         // Read-only view of the tracked cameras for the KerbcastControl facade.
-        internal System.Collections.Generic.IReadOnlyList<KerbcastCamera> Cameras => _cameras;
+        internal System.Collections.Generic.IReadOnlyList<ICamera> Cameras => _cameras;
 
         /* ~0.5s at 60fps: long enough that a transient scene-change hiccup
            doesn't evict a healthy camera, short enough to stop a genuinely
@@ -60,8 +60,8 @@ namespace Kerbcast
         private const int RefreshQuarantineThreshold = 30;
 
         private KerbcastSettings _settings;
-        private readonly List<KerbcastCamera> _cameras = new List<KerbcastCamera>();
-        private readonly ICameraSourceProvider _hullcamProvider = new HullcamProvider();
+        private readonly List<ICamera> _cameras = new List<ICamera>();
+        private List<ICameraSourceProvider> _providers;
 
         // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
         // changed — KSP fps, shed level, per-camera effective layers / dims.
@@ -165,6 +165,11 @@ namespace Kerbcast
             Debug.Log("[Kerbcast] KerbcastCore.Awake — initialising");
 
             _settings = KerbcastSettings.Load();
+            _providers = new List<ICameraSourceProvider>
+            {
+                new HullcamProvider(_settings, RingDir, RingSlots),
+                new CrewProvider(RingDir, RingSlots, _settings.Width, _settings.Height),
+            };
             _staggerController = BuildStaggerController(_settings);
             if (_settings.AdaptiveQuality)
             {
@@ -274,9 +279,9 @@ namespace Kerbcast
             for (int i = _cameras.Count - 1; i >= 0; i--)
             {
                 var cam = _cameras[i];
-                if (cam.Mount.OwnsPart(part))
+                if (cam.OwnsPart(part))
                 {
-                    if (affected == null) affected = cam.Mount.Vessel;
+                    if (affected == null) affected = cam.Vessel;
                     Debug.Log($"[Kerbcast] part destroyed — disposing cam={cam.FlightId} ({part.name})");
                     _cameras.RemoveAt(i);
                     cam.DisposeDestroyed();
@@ -312,7 +317,7 @@ namespace Kerbcast
         private void MarkFxDirtyForVessel(Vessel v)
         {
             foreach (var cam in _cameras)
-                if (cam.Mount.Vessel == v) cam.MarkFxDirty();
+                if (cam.Vessel == v) cam.MarkFxDirty();
         }
 
         // disposeMissing=true (onVesselChange — an actual pilot switch): scope
@@ -363,36 +368,13 @@ namespace Kerbcast
                 RestoreMainScreen();
             }
 
-            foreach (var descriptor in _hullcamProvider.Enumerate(vessel))
+            var existing = new HashSet<uint>(_cameras.Select(c => c.FlightId));
+            foreach (var provider in _providers)
             {
-                try
+                foreach (var cam in provider.Enumerate(vessel, existing))
                 {
-                    var partName = descriptor.PartName;
-                    var initialLayers = _settings.GetInitialLayers(partName);
-                    var enableFx = _settings.GetEnableAtmosphericFx(partName);
-                    var fxLayers = _settings.GetAtmosphericFxLayers(partName);
-                    var (renderW, renderH) = _settings.GetRenderSize(partName);
-                    uint flightId = descriptor.FlightId;
-                    if (!disposeMissing && _cameras.Any(c => c.FlightId == flightId))
-                    {
-                        continue;
-                    }
-                    _cameras.Add(new KerbcastCamera(
-                        descriptor.Source,
-                        flightId,
-                        RingDir,
-                        RingSlots,
-                        _settings.Width,
-                        _settings.Height,
-                        renderW,
-                        renderH,
-                        initialLayers,
-                        enableFx,
-                        fxLayers));
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError($"[Kerbcast] failed to attach to {descriptor.PartName}: {ex}");
+                    _cameras.Add(cam);
+                    existing.Add(cam.FlightId);
                 }
             }
             Debug.Log($"[Kerbcast] tracking {_cameras.Count} Hullcam VDS camera(s)");
@@ -854,22 +836,28 @@ namespace Kerbcast
                 sb.Append($"  \"staggerBudget\": {_staggerBudget},\n");
                 sb.Append($"  \"kerbcastFrameMs\": {_kerbcastFrameMs.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 sb.Append("  \"cameras\": [\n");
-                for (int i = 0; i < _cameras.Count; i++)
+                // Diagnostic fields are KerbcastCamera-specific; kerbal cameras
+                // contribute no diagnostics this stage. Filter first so the
+                // trailing-comma logic below keys on the filtered count, not
+                // the raw index — otherwise a skipped camera landing last
+                // leaves a dangling comma on the entry before it.
+                var streaming = _cameras.OfType<KerbcastCamera>().ToList();
+                for (int i = 0; i < streaming.Count; i++)
                 {
-                    var cam = _cameras[i];
+                    var kc = streaming[i];
                     sb.Append("    {\n");
-                    sb.Append($"      \"flightId\": {cam.FlightId},\n");
-                    sb.Append($"      \"renderWidth\": {cam.RenderWidth},\n");
-                    sb.Append($"      \"renderHeight\": {cam.RenderHeight},\n");
-                    sb.Append($"      \"operatorWidth\": {cam.OperatorWidth},\n");
-                    sb.Append($"      \"operatorHeight\": {cam.OperatorHeight},\n");
-                    sb.Append($"      \"layers\": {LayersToJson(cam.Layers)},\n");
-                    sb.Append($"      \"operatorLayers\": {LayersToJson(cam.OperatorLayers)},\n");
-                    sb.Append($"      \"enableAtmosphericFx\": {(cam.EnableFx ? "true" : "false")},\n");
-                    sb.Append($"      \"fov\": {cam.Fov.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
-                    sb.Append($"      \"panYaw\": {cam.PanYaw.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
-                    sb.Append($"      \"panPitch\": {cam.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n");
-                    sb.Append(i == _cameras.Count - 1 ? "    }\n" : "    },\n");
+                    sb.Append($"      \"flightId\": {kc.FlightId},\n");
+                    sb.Append($"      \"renderWidth\": {kc.RenderWidth},\n");
+                    sb.Append($"      \"renderHeight\": {kc.RenderHeight},\n");
+                    sb.Append($"      \"operatorWidth\": {kc.OperatorWidth},\n");
+                    sb.Append($"      \"operatorHeight\": {kc.OperatorHeight},\n");
+                    sb.Append($"      \"layers\": {LayersToJson(kc.Layers)},\n");
+                    sb.Append($"      \"operatorLayers\": {LayersToJson(kc.OperatorLayers)},\n");
+                    sb.Append($"      \"enableAtmosphericFx\": {(kc.EnableFx ? "true" : "false")},\n");
+                    sb.Append($"      \"fov\": {kc.Fov.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    sb.Append($"      \"panYaw\": {kc.PanYaw.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    sb.Append($"      \"panPitch\": {kc.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n");
+                    sb.Append(i == streaming.Count - 1 ? "    }\n" : "    },\n");
                 }
                 sb.Append("  ]");
 
@@ -892,7 +880,7 @@ namespace Kerbcast
                     // rolling-max, so the next write reflects the next ~1s window.
                     _gcTracker.ResetInterval();
                     for (int i = 0; i < _cameras.Count; i++)
-                        _cameras[i].PhaseTimings.ResetMax();
+                        if (_cameras[i] is KerbcastCamera kc) kc.PhaseTimings.ResetMax();
                 }
 
                 // Atomic write: drop into .tmp + rename so the sidecar
@@ -1027,7 +1015,9 @@ namespace Kerbcast
             double maxMax = 0.0;
             for (int i = 0; i < _cameras.Count; i++)
             {
-                var pt = _cameras[i].PhaseTimings;
+                // Diagnostic-only; kerbal cameras contribute no phase timings this stage.
+                if (!(_cameras[i] is KerbcastCamera kc)) continue;
+                var pt = kc.PhaseTimings;
                 sumLast += pt.Last(phase);
                 sumEma += pt.Ema(phase);
                 double m = pt.Max(phase);

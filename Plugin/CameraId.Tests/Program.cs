@@ -18,5 +18,10 @@ Check(CameraId.Synthetic(100u, 1, "fwd") != 100u, "module 1 != baseId");
 Check(CameraId.Synthetic(100u, 1, "fwd") != CameraId.Synthetic(101u, 1, "fwd"), "baseId perturbs");
 Check(CameraId.Synthetic(100u, 1, "fwd") != CameraId.Synthetic(100u, 1, "aft"), "cameraName perturbs");
 
+// Kerbal wire ids set the top bit so they never collide with part flightIDs.
+Check((CameraId.KerbalWireId(0u) & 0x80000000u) != 0, "kerbal id top-bit set");
+Check(CameraId.KerbalWireId(123u) == (123u | 0x80000000u), "kerbal id = pid | top-bit");
+Check(CameraId.KerbalWireId(5u) != CameraId.Synthetic(5u, 0, ""), "kerbal id disjoint from part id 5");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
