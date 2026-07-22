@@ -111,7 +111,7 @@ namespace Kerbcast
                     _controlBlock = ControlBlock.Open(_controlPath, out var openRes);
                     if (openRes == ControlBlock.OpenResult.VersionMismatch)
                     {
-                        UnityEngine.Debug.LogError(
+                        Debug.LogError(
                             $"[Kerbcast] kerbal cam={FlightId} control-block layout version mismatch: "
                             + "sidecar and plugin are out of sync; capture disabled until they match");
                     }
@@ -122,12 +122,12 @@ namespace Kerbcast
                 if (snap.Subscribed != _subscribed)
                 {
                     _subscribed = snap.Subscribed;
-                    UnityEngine.Debug.Log($"[Kerbcast] kerbal cam={FlightId} subscribed → {_subscribed}");
+                    Debug.Log($"[Kerbcast] kerbal cam={FlightId} subscribed → {_subscribed}");
                 }
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} control block read failed: {ex.Message}");
+                Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} control block read failed: {ex.Message}");
             }
         }
 
@@ -139,8 +139,13 @@ namespace Kerbcast
         {
             if (_capture == null)
             {
-                _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
-                _capture.BuildTargets(512, 512);
+                // Build into a local and only assign the field once BuildTargets
+                // succeeds: a throw there (e.g. RenderTexture.Create() failing)
+                // must leave _capture null so the next tick retries construction,
+                // rather than latching a half-initialized capture tail.
+                var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
+                capture.BuildTargets(512, 512);
+                _capture = capture;
             }
             return _capture;
         }
@@ -149,7 +154,7 @@ namespace Kerbcast
         {
             // 1-in-300 frames at 30fps = at most one log per 10s per camera.
             if (_consecutiveErrors == 0 || _consecutiveErrors % 300 == 0)
-                UnityEngine.Debug.Log($"[Kerbcast] kerbal cam={FlightId} {message}");
+                Debug.Log($"[Kerbcast] kerbal cam={FlightId} {message}");
             _consecutiveErrors++;
         }
 
@@ -162,55 +167,70 @@ namespace Kerbcast
             PollSubscription();
             if (!_subscribed) return;
 
-            var capture = EnsureCapture();
-            if (!mayIssueReadback) return;
-
-            // One-in-flight invariant: CaptureCore.Publish assumes at most one
-            // readback outstanding. If the previous one hasn't completed, skip
-            // issuing another this tick (it drains via the Drain above).
-            if (capture.ReadbackInFlight) return;
-
-            // Re-resolve the live IVA avatar every tick; never cache it. A null
-            // KerbalRef means the avatar isn't spawned (portrait not visible):
-            // no frame this tick, but NOT death (IsAlive stays keyed on the seat).
-            var k = _pcm.KerbalRef;
-            if (k == null) return;
-
-            // Prefer the seat's portrait camera (the IVA portrait KSP renders in
-            // the crew tray); fall back to the kerbal's own cam.
-            bool usedSeatCam = _pcm.seat != null && _pcm.seat.portraitCamera != null;
-            var cam = usedSeatCam ? _pcm.seat.portraitCamera : k.kerbalCam;
-            if (cam == null) return;
-
-            var prevTarget = cam.targetTexture;
-            cam.targetTexture = capture.CaptureRt;
-
-            // Null Canvas.willRenderCanvases around the manual render (KSP's own
-            // portrait path), restoring it (and the camera target) in finally.
-            object canvasCb = null;
-            bool nulledCanvas = false;
-            if (_willRenderCanvasesField != null)
-            {
-                canvasCb = _willRenderCanvasesField.GetValue(null);
-                _willRenderCanvasesField.SetValue(null, null);
-                nulledCanvas = true;
-            }
+            // CaptureCore.Publish sets its in-flight flag BEFORE issuing the
+            // AsyncGPUReadback request, which can throw (Deck/Mesa GPU-readback
+            // quirks). Wrap the whole capture attempt so a throw anywhere in
+            // here (including EnsureCapture's BuildTargets) aborts the in-flight
+            // flag instead of leaving it stuck true, which would otherwise make
+            // every later Refresh return early at the ReadbackInFlight guard
+            // forever, silently freezing this camera. Mirrors KerbcastCamera.
             try
             {
-                // Seat portrait uses RenderDontRestore (KSP's kerbalSeatCamUpdate
-                // path); the fallback kerbal cam uses a plain Render.
-                if (usedSeatCam) cam.RenderDontRestore();
-                else cam.Render();
-            }
-            finally
-            {
-                if (nulledCanvas) _willRenderCanvasesField.SetValue(null, canvasCb);
-                cam.targetTexture = prevTarget;
-            }
+                var capture = EnsureCapture();
+                if (!mayIssueReadback) return;
 
-            // Plain blit (no Hullcam filter); CaptureCore applies the flip and
-            // issues the readback under the one-in-flight invariant.
-            capture.Publish(Time.unscaledTime * 1000.0, (c, r) => Graphics.Blit(c, r));
+                // One-in-flight invariant: CaptureCore.Publish assumes at most one
+                // readback outstanding. If the previous one hasn't completed, skip
+                // issuing another this tick (it drains via the Drain above).
+                if (capture.ReadbackInFlight) return;
+
+                // Re-resolve the live IVA avatar every tick; never cache it. A null
+                // KerbalRef means the avatar isn't spawned (portrait not visible):
+                // no frame this tick, but NOT death (IsAlive stays keyed on the seat).
+                var k = _pcm.KerbalRef;
+                if (k == null) return;
+
+                // Prefer the seat's portrait camera (the IVA portrait KSP renders in
+                // the crew tray); fall back to the kerbal's own cam.
+                bool usedSeatCam = _pcm.seat != null && _pcm.seat.portraitCamera != null;
+                var cam = usedSeatCam ? _pcm.seat.portraitCamera : k.kerbalCam;
+                if (cam == null) return;
+
+                var prevTarget = cam.targetTexture;
+                cam.targetTexture = capture.CaptureRt;
+
+                // Null Canvas.willRenderCanvases around the manual render (KSP's own
+                // portrait path), restoring it (and the camera target) in finally.
+                object canvasCb = null;
+                bool nulledCanvas = false;
+                if (_willRenderCanvasesField != null)
+                {
+                    canvasCb = _willRenderCanvasesField.GetValue(null);
+                    _willRenderCanvasesField.SetValue(null, null);
+                    nulledCanvas = true;
+                }
+                try
+                {
+                    // Seat portrait uses RenderDontRestore (KSP's kerbalSeatCamUpdate
+                    // path); the fallback kerbal cam uses a plain Render.
+                    if (usedSeatCam) cam.RenderDontRestore();
+                    else cam.Render();
+                }
+                finally
+                {
+                    if (nulledCanvas) _willRenderCanvasesField.SetValue(null, canvasCb);
+                    cam.targetTexture = prevTarget;
+                }
+
+                // Plain blit (no Hullcam filter); CaptureCore applies the flip and
+                // issues the readback under the one-in-flight invariant.
+                capture.Publish(Time.unscaledTime * 1000.0, (c, r) => Graphics.Blit(c, r));
+            }
+            catch (Exception ex)
+            {
+                _capture?.AbortInFlight();
+                LogRateLimited($"capture pipeline threw: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         public void ApplyAutoShed(int level) { /* no adaptive quality this stage */ }
@@ -253,7 +273,7 @@ namespace Kerbcast
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} info manifest write failed (lifecycle={lifecycle}): {ex.Message}");
+                Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} info manifest write failed (lifecycle={lifecycle}): {ex.Message}");
             }
         }
 
@@ -305,7 +325,7 @@ namespace Kerbcast
             {
                 // Failure here must never block the cleanup path.
                 try { WriteManifest("destroyed"); }
-                catch (Exception ex) { UnityEngine.Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} destroyed manifest write failed: {ex.Message}"); }
+                catch (Exception ex) { Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} destroyed manifest write failed: {ex.Message}"); }
             }
 
             // Release the capture tail's pooled RTs before the ring: the camera
@@ -323,7 +343,7 @@ namespace Kerbcast
             }
             catch (Exception ex)
             {
-                UnityEngine.Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} ring file delete failed: {ex.Message}");
+                Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} ring file delete failed: {ex.Message}");
             }
         }
     }
