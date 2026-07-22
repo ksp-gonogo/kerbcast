@@ -35,9 +35,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using HullcamVDS;
-using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
-using Yangrc.OpenGLAsyncReadback;
 
 namespace Kerbcast
 {
@@ -120,31 +118,15 @@ namespace Kerbcast
         private FxHost _fxHost;
         // Which FX layers this camera runs (subject to the _enableFx master).
         private AtmoFxLayers _fxLayers;
-        // The *current* render-target pair (also held in _rtPool). Refresh()
-        // renders + blits + issues new readbacks against these.
-        private RenderTexture _captureRt;
-        private RenderTexture _readbackRt; // depth=0, GL_TEXTURE_2D-clean
-        // RenderTexture pool keyed by render size (RenderSizeKey.Pack). Adaptive
-        // shedding switches between pooled sets instead of destroying and
-        // reallocating: destroying a RenderTexture while an AsyncGPUReadback is
-        // still in flight against it orphans the native readback task (the
-        // bundled OpenGL plugin exposes no cancel/free API), and that orphan is
-        // then walked every frame by the DontDestroyOnLoad updater for the rest
-        // of the process. Pooling never destroys mid-flight (so nothing is
-        // orphaned) and removes the per-change realloc hitch. The shed cascade
-        // yields ≤6 distinct sizes, so the pool stays small and bounded.
-        private struct RenderTargetSet
-        {
-            public RenderTexture Capture;
-            public RenderTexture Readback;
-        }
-        private readonly Dictionary<long, RenderTargetSet> _rtPool =
-            new Dictionary<long, RenderTargetSet>();
-        // The in-flight readback is described independently of the *current*
-        // target so a resolution change mid-readback still drains the pending
-        // frame at its original dimensions before switching. The decoupling
-        // logic is unit-tested in ReadbackTargetTracker.Tests.
-        private readonly ReadbackTargetTracker _targets = new ReadbackTargetTracker();
+        // Reusable capture tail: owns the pooled capture/readback RT pair, the
+        // in-flight readback bookkeeping, the ReadbackTargetTracker and the ring
+        // write. This camera renders its layer stack into _capture.CaptureRt then
+        // hands the blit/flip/readback/produce tail to CaptureCore. Shared with
+        // future camera types (kerbal-face) so the streaming path stays one impl.
+        private CaptureCore _capture;
+        // Cached blit delegate for _capture.Publish (assigned once, no per-frame
+        // closure allocation on the hot path).
+        private readonly Action<RenderTexture, RenderTexture> _captureBlit;
         private readonly MmapFrameRing _ring;
         private readonly string _ringPath;
         private readonly string _infoPath;
@@ -256,9 +238,6 @@ namespace Kerbcast
         private List<Renderer> _scaledBodyRenderers;
         private static readonly int _fadeAltitudeId = Shader.PropertyToID("_FadeAltitude");
 
-        private UniversalAsyncGPUReadbackRequest _pendingRequest;
-        private bool _readbackInFlight;
-        private double _pendingCaptureTsMs;
         private int _consecutiveErrors;
 
         // Per-phase render-timing accumulator (last / EMA / rolling-max per
@@ -272,11 +251,9 @@ namespace Kerbcast
         public PhaseTimings PhaseTimings => _phaseTimings;
         // Cached for this Refresh tick (read once at the top). When false, every
         // timing bracket is skipped so the OFF path makes zero GetTimestamp
-        // calls. When true, drain (ProcessReadback) timing accumulates here so
-        // it can be combined with the Request-issue timing into one Readback
-        // sample at the end of the tick.
+        // calls. Passed to _capture.BeginTick so the capture tail's Blit/Readback
+        // samples share the same per-tick snapshot.
         private bool _telemetry;
-        private double _readbackDrainMs;
         // Milliseconds per Stopwatch tick — computed once. Stopwatch.GetTimestamp
         // returns raw ticks (no allocation, no shared mutable Stopwatch state);
         // multiply the tick delta by this to get milliseconds.
@@ -288,10 +265,10 @@ namespace Kerbcast
         // HullcamVDS.CameraFilter.eCameraMode). Created from
         // hullcam.cameraMode at attach; null if the mode is Normal
         // (no filter), if creation failed, or if EnableHullcamEffects
-        // is false in settings.cfg. When non-null, replaces the
-        // capture-RT → readback-RT blit in Refresh() with a filter
-        // pass that lands the post-processed pixels into _readbackRt
-        // for the existing AsyncGPUReadback path to read.
+        // is false in settings.cfg. When non-null, replaces the plain
+        // capture-RT to readback-RT blit in CaptureBlit with a filter pass
+        // that lands the post-processed pixels into the readback RT for the
+        // existing AsyncGPUReadback path to read.
         private CameraFilter _cameraFilter;
         /* dockingdisplay.png, passed to RenderTitlePage before each blit so
            the _Title/_TitleTex uniforms are set deterministically per camera
@@ -367,6 +344,7 @@ namespace Kerbcast
             _cachedVesselName = mount.VesselDisplayName;
 
             _filterRenderPass = RenderFilterPass;
+            _captureBlit = CaptureBlit;
 
             _ringPath = Path.Combine(ringDir, $"{FlightId}.ring");
             _infoPath = Path.Combine(ringDir, $"{FlightId}.info.json");
@@ -378,7 +356,13 @@ namespace Kerbcast
             _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight);
             WriteInfoManifest();
 
-            BuildRenderTargets(renderWidth, renderHeight);
+            // Failure-streak (_consecutiveErrors + LogRateLimited) and the
+            // PhaseTimings sink stay owned here; the tail invokes them so a
+            // readback error and a render error share one rate-limit counter and
+            // one telemetry object.
+            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
+
+            _capture.BuildTargets(renderWidth, renderHeight);
             SetCameras();
             ApplyLayers();
             BuildHullcamFilter();
@@ -454,32 +438,49 @@ namespace Kerbcast
             _cameraFilter.RenderImageWithFilter(src, dst);
         }
 
-        // Select (or lazily create) the pooled render-target set for this size
-        // and make it current. Never destroys — see the _rtPool field comment.
-        private void BuildRenderTargets(int width, int height)
+        // The capture->readback blit for this camera type: HullcamVDS filter
+        // (NightVision etc), or the plain Blit when no filter is active. Passed
+        // to _capture.Publish, which then applies the flip and issues the
+        // readback. Cached as _captureBlit so there's no per-frame closure alloc.
+        //
+        // When a HullcamVDS filter is active it replaces the plain Blit with its
+        // own shader pass that post-processes src -> dst in one step; the
+        // AsyncGPUReadback path then reads the already-filtered pixels, no extra
+        // round-trip needed.
+        private void CaptureBlit(RenderTexture src, RenderTexture dst)
         {
-            long key = RenderSizeKey.Pack(width, height);
-            if (!_rtPool.TryGetValue(key, out var set))
+            if (_nvMaterial != null)
             {
-                var capture = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
-                {
-                    antiAliasing = 1,
-                };
-                capture.Create();
-
-                // depth=0 so GetNativeTexturePtr returns a vanilla GL_TEXTURE_2D
-                // handle on Mesa OpenGL. With depth=24 (the capture RT) the
-                // yangrc plugin's glGetTexLevelParameteriv reads back zero
-                // dimensions and silently does nothing.
-                var readback = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
-                readback.Create();
-
-                set = new RenderTargetSet { Capture = capture, Readback = readback };
-                _rtPool[key] = set;
+                Graphics.Blit(src, dst, _nvMaterial);
             }
-            _captureRt = set.Capture;
-            _readbackRt = set.Readback;
-            _targets.SetCurrent(width, height);
+            else if (_cameraFilter != null)
+            {
+                /* Run the Hullcam filter pass through THIS camera's private
+                   MovieTime material, never the shared static; the mtShader
+                   redirect mechanism lives in HullcamFilterBlit (shared source
+                   with the headless determinism test in ci/kerbcast-shaders,
+                   which proves the output is byte-identical under hostile writes
+                   to the shared static).
+
+                   Reticle policy is unchanged from the original fix: title=true
+                   with dockingdisplay.png, mirroring MovieTimeFilter's hardcoded
+                   in-game state, and the per-class show/hide decision stays with
+                   the filter: BWLoResTV, BWHiResTV and NightVision overwrite
+                   _TitleTex=noneTX inside their own blit (no reticle); DockingCam,
+                   BWFilm, ColorFilm, ColorLoResTV and ColorHiResTV leave the title
+                   alone (reticle shown), matching Hullcam's in-game view.
+
+                   On top-left-UV-origin APIs (D3D11, Metal) Run also measures the
+                   pass's vertical orientation once and appends a compensating flip
+                   when the pass inverts; see the HullcamFilterBlit header. Gate is
+                   SystemInfo.graphicsUVStartsAtTop, so the GL/Deck path is
+                   untouched. */
+                _filterBlit.Run(_filterRenderPass, src, dst);
+            }
+            else
+            {
+                Graphics.Blit(src, dst);
+            }
         }
 
         /// <summary>
@@ -499,14 +500,14 @@ namespace Kerbcast
             // the pool (never destroyed), so a readback still in flight against
             // it drains safely at its captured dimensions (_pendingW/_pendingH/
             // _pendingScratch) — nothing is orphaned, and there's no realloc.
-            BuildRenderTargets(width, height);
+            _capture.BuildTargets(width, height);
             RenderWidth = width;
             RenderHeight = height;
 
-            if (_nearCam != null) _nearCam.targetTexture = _captureRt;
-            if (_scaledCam != null) _scaledCam.targetTexture = _captureRt;
-            if (_galaxyCam != null) _galaxyCam.targetTexture = _captureRt;
-            if (_farCam != null) _farCam.targetTexture = _captureRt;
+            if (_nearCam != null) _nearCam.targetTexture = _capture.CaptureRt;
+            if (_scaledCam != null) _scaledCam.targetTexture = _capture.CaptureRt;
+            if (_galaxyCam != null) _galaxyCam.targetTexture = _capture.CaptureRt;
+            if (_farCam != null) _farCam.targetTexture = _capture.CaptureRt;
 
             Debug.Log($"[Kerbcast] cam={FlightId} render size → {width}×{height}");
         }
@@ -657,7 +658,7 @@ namespace Kerbcast
             nearGo.transform.localRotation = _baseRotation;
             _nearCam.fieldOfView = Fov;
             _nearCam.nearClipPlane = Mount.NearClip;
-            _nearCam.targetTexture = _captureRt;
+            _nearCam.targetTexture = _capture.CaptureRt;
             // HDR + MSAA explicit on every layer. CopyFrom only inherits
             // whatever the source KSP camera was last left with, which in
             // practice ships HDR off for the layered triple — atmospheric
@@ -695,7 +696,7 @@ namespace Kerbcast
             scaledGo.transform.localPosition = Vector3.zero;
             scaledGo.transform.localScale = Vector3.one;
             _scaledCam.fieldOfView = Fov;
-            _scaledCam.targetTexture = _captureRt;
+            _scaledCam.targetTexture = _capture.CaptureRt;
             _scaledCam.allowHDR = true;
             _scaledCam.allowMSAA = allowMsaa;
             _scaledCam.useOcclusionCulling = false;
@@ -730,7 +731,7 @@ namespace Kerbcast
             galaxyGo.transform.localRotation = Quaternion.identity;
             galaxyGo.transform.localScale = Vector3.one;
             _galaxyCam.fieldOfView = Fov;
-            _galaxyCam.targetTexture = _captureRt;
+            _galaxyCam.targetTexture = _capture.CaptureRt;
             _galaxyCam.allowHDR = true;
             _galaxyCam.allowMSAA = allowMsaa;
             _galaxyCam.useOcclusionCulling = false;
@@ -764,7 +765,7 @@ namespace Kerbcast
                 farGo.transform.localPosition = nearLocalPos;
                 farGo.transform.localRotation = _baseRotation;
                 _farCam.fieldOfView = Fov;
-                _farCam.targetTexture = _captureRt;
+                _farCam.targetTexture = _capture.CaptureRt;
                 _farCam.allowHDR = true;
                 _farCam.allowMSAA = allowMsaa;
                 _farCam.useOcclusionCulling = false;
@@ -1376,11 +1377,11 @@ namespace Kerbcast
         public void Refresh(bool mayIssueReadback)
         {
             // Read the telemetry gate once per tick so the OFF path makes zero
-            // GetTimestamp calls (zero-cost when disabled). Reset the per-tick
-            // drain accumulator; ProcessReadback adds to it when it drains a
-            // completed readback this frame.
+            // GetTimestamp calls (zero-cost when disabled). BeginTick hands the
+            // snapshot to the capture tail and resets its per-tick drain
+            // accumulator.
             _telemetry = KerbcastSettings.EnableTelemetry;
-            _readbackDrainMs = 0.0;
+            _capture.BeginTick(_telemetry);
 
             // Control-file poll every frame (~60Hz at 60fps). PollControlFile
             // reads the (tiny, tmpfs-backed) file and compares its contents, so
@@ -1478,21 +1479,15 @@ namespace Kerbcast
             // next path.
             if (!_subscribed)
             {
-                if (_readbackInFlight && _pendingRequest.done)
-                {
-                    ProcessReadback(_pendingRequest);
-                    _readbackInFlight = false;
-                }
+                _capture.Drain();
                 return;
             }
 
-            // Poll: drain a completed readback before issuing a new one.
-            if (_readbackInFlight)
-            {
-                if (!_pendingRequest.done) return;
-                ProcessReadback(_pendingRequest);
-                _readbackInFlight = false;
-            }
+            // Poll: drain a completed readback before issuing a new one. If one
+            // is still in flight (not done), skip this tick so the one-in-flight
+            // invariant holds — no new readback is issued below.
+            if (_capture.ReadbackInFlight && !_capture.ReadbackReady) return;
+            _capture.Drain();
 
             // Capture staggering: KerbcastCore grants only a round-robin subset of
             // cameras a new capture each frame, so they don't all render + read
@@ -1599,9 +1594,9 @@ namespace Kerbcast
                         {
                             _firstPixelCheck = false;
                             var prev = RenderTexture.active;
-                            RenderTexture.active = _captureRt;
+                            RenderTexture.active = _capture.CaptureRt;
                             var sample = new Texture2D(1, 1, TextureFormat.RGBA32, false);
-                            sample.ReadPixels(new Rect(_captureRt.width / 2, _captureRt.height / 2, 1, 1), 0, 0);
+                            sample.ReadPixels(new Rect(_capture.CaptureRt.width / 2, _capture.CaptureRt.height / 2, 1, 1), 0, 0);
                             sample.Apply();
                             var px = sample.GetPixel(0, 0);
                             UnityEngine.Object.Destroy(sample);
@@ -1662,171 +1657,26 @@ namespace Kerbcast
                 // them stripped.
                 ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
 
-                // Blit the depth-bundled capture RT into the clean readback RT.
-                // When a HullcamVDS filter is active (NightVision etc), it
-                // replaces the plain Blit with its own shader pass that
-                // post-processes _captureRt → _readbackRt in one step. The
-                // existing AsyncGPUReadback path then reads the
-                // already-filtered pixels — no extra round-trip needed.
-                // Blit phase: the filter/nv/plain capture→readback blit AND the
-                // vertical-flip correction below, all the main-thread Blit
-                // dispatch this tick.
-                long blitStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                if (_nvMaterial != null)
-                {
-                    Graphics.Blit(_captureRt, _readbackRt, _nvMaterial);
-                }
-                else if (_cameraFilter != null)
-                {
-                    /* Run the Hullcam filter pass through THIS camera's
-                       private MovieTime material, never the shared static;
-                       the mtShader redirect mechanism lives in
-                       HullcamFilterBlit (shared source with the headless
-                       determinism test in ci/kerbcast-shaders, which proves
-                       the output is byte-identical under hostile writes to
-                       the shared static).
-
-                       Reticle policy is unchanged from the original fix:
-                       title=true with dockingdisplay.png, mirroring
-                       MovieTimeFilter's hardcoded in-game state, and the
-                       per-class show/hide decision stays with the filter:
-                       BWLoResTV, BWHiResTV and NightVision overwrite
-                       _TitleTex=noneTX inside their own blit (no reticle);
-                       DockingCam, BWFilm, ColorFilm, ColorLoResTV and
-                       ColorHiResTV leave the title alone (reticle shown),
-                       matching Hullcam's in-game view of each mode.
-
-                       On top-left-UV-origin APIs (D3D11, Metal) Run also
-                       measures the pass's vertical orientation once and
-                       appends a compensating flip when the pass inverts;
-                       see the HullcamFilterBlit header. Gate is
-                       SystemInfo.graphicsUVStartsAtTop, so the GL/Deck
-                       path is untouched. */
-                    _filterBlit.Run(_filterRenderPass, _captureRt, _readbackRt);
-                }
-                else
-                {
-                    Graphics.Blit(_captureRt, _readbackRt);
-                }
-
-                // Vertical-flip correction. On bottom-left-origin graphics APIs
-                // (OpenGL, the Deck) AsyncGPUReadback returns the frame
-                // vertically inverted relative to KSP's top-down screen
-                // pipeline, so every camera reads back upside down. Compensate
-                // with one final blit that mirrors V. Top-left-origin APIs
-                // (D3D11, Metal) read upright and need no correction here; the
-                // HullcamFilterBlit handles its own top-left flip case. Done in
-                // place via a temp RT so all three capture paths above benefit.
-                if (!SystemInfo.graphicsUVStartsAtTop)
-                {
-                    var flipTmp = RenderTexture.GetTemporary(_readbackRt.descriptor);
-                    Graphics.Blit(_readbackRt, flipTmp, new Vector2(1f, -1f), new Vector2(0f, 1f));
-                    Graphics.Blit(flipTmp, _readbackRt);
-                    RenderTexture.ReleaseTemporary(flipTmp);
-                }
-                if (_telemetry)
-                    _phaseTimings.Record(RenderPhase.Blit,
-                        (System.Diagnostics.Stopwatch.GetTimestamp() - blitStart) * _msPerTick);
-
-                // INVARIANT: at most one readback is in flight per camera. The
-                // drain guards above (both the !_subscribed branch and the main
-                // path) early-return until _pendingRequest.done and clear the
-                // flag before we reach here, so this Request only runs when none
-                // is pending. The pending-dims snapshot below relies on this —
-                // if a second request were ever issued before the first drained,
-                // _pendingScratch/_pendingW/_pendingH would be clobbered and
-                // ProcessReadback would corrupt the in-flight frame.
-                _readbackInFlight = true;
-                // Snapshot the target this readback belongs to, so a resolution
-                // change before it completes doesn't make ProcessReadback use
-                // the new (mismatched) dimensions / scratch texture.
-                _targets.CapturePending();
-                _pendingCaptureTsMs = Time.unscaledTime * 1000.0;
-                long reqStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                _pendingRequest = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
-                if (_telemetry)
-                {
-                    // Readback phase = this tick's drain of the PREVIOUS frame's
-                    // capture (the ring memcpy in ProcessReadback, accumulated
-                    // into _readbackDrainMs at the top of Refresh) + the cheap
-                    // Request() issue here. Recording them combined keeps the
-                    // single "readback" column meaningful even though the work
-                    // straddles two frames — both halves are main-thread time
-                    // spent on this tick.
-                    double issueMs = (System.Diagnostics.Stopwatch.GetTimestamp() - reqStart) * _msPerTick;
-                    _phaseTimings.Record(RenderPhase.Readback, _readbackDrainMs + issueMs);
-                    _phaseTimings.FrameComplete();
-                }
+                // Capture tail: blit _capture.CaptureRt -> ReadbackRt (via this
+                // camera's filter/nightvision/plain _captureBlit), apply the
+                // vertical-flip correction, issue the readback under the
+                // one-in-flight invariant, and record the Blit/Readback phase
+                // timings. All of it lives in CaptureCore so a second camera type
+                // reuses the exact streaming path. Time.unscaledTime is
+                // frame-constant, so reading it here yields the same value the
+                // pre-extraction Request site read.
+                double captureTsMs = Time.unscaledTime * 1000.0;
+                _capture.Publish(captureTsMs, _captureBlit);
             }
             catch (Exception ex)
             {
-                _readbackInFlight = false;
+                _capture.AbortInFlight();
                 // Safety net: if a layer Render() threw mid-composite, the normal
                 // restore above was skipped. Re-attach here so the main flight
                 // render never loses Scatterer's sun-light shadow buffers. No-op
                 // if the normal path already restored (the saved list is cleared).
                 ScaledSunLightHelper.RestoreCompositeShadowsBuffer();
                 LogRateLimited($"capture pipeline threw: {ex.GetType().Name}: {ex.Message}");
-            }
-        }
-
-        private unsafe void ProcessReadback(UniversalAsyncGPUReadbackRequest request)
-        {
-            // Time the drain (the full-frame ring memcpy in Produce, the main-
-            // thread cost commit 458016a was about) and accumulate into the
-            // per-tick drain total. Called from both the !_subscribed branch and
-            // the main drain path — accumulating covers both. The Readback-phase
-            // sample is recorded once at the Request site, combining this with
-            // the issue cost.
-            long drainStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            try
-            {
-                if (request.hasError)
-                {
-                    LogRateLimited("AsyncGPUReadback returned hasError");
-                    return;
-                }
-
-                // Write the readback bytes straight into the ring — no
-                // intermediate Texture2D, no pointless GPU Apply(). The readback
-                // target is RGBA32, so the bytes are already the exact pixel
-                // layout the ring expects; this is byte-identical to the old
-                // LoadRawTextureData→GetRawTextureData path (proven in
-                // MmapFrameRing.Tests). Dimensions come from the snapshot taken
-                // when the readback was issued, since the current render size may
-                // have changed in the meantime (pooled-set switch).
-                //
-                // On the OpenGL plugin path (the Deck), read the native plugin
-                // buffer pointer directly — skipping GetData's Allocator.Temp
-                // NativeArray + MemMove (one of two full-frame copies per
-                // readback, plus a per-frame Temp alloc; readback_investigation.md
-                // change #1). Pointer is valid only until the next readback
-                // Update, so Produce (which copies into the ring) runs now. On the
-                // Unity-native path GetData is already a zero-copy view — use it.
-                byte* src;
-                int length;
-                if (request.TryGetRawPtr(out var rawPtr, out length))
-                {
-                    src = (byte*)rawPtr;
-                }
-                else
-                {
-                    var data = request.GetData<byte>();
-                    src = (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
-                    length = data.Length;
-                }
-                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, src, length);
-                _consecutiveErrors = 0;
-            }
-            catch (Exception ex)
-            {
-                LogRateLimited($"readback callback threw: {ex.GetType().Name}: {ex.Message}");
-            }
-            finally
-            {
-                if (_telemetry)
-                    _readbackDrainMs +=
-                        (System.Diagnostics.Stopwatch.GetTimestamp() - drainStart) * _msPerTick;
             }
         }
 
@@ -1910,16 +1760,11 @@ namespace Kerbcast
             if (_scaledCam != null) UnityEngine.Object.Destroy(_scaledCam.gameObject);
             if (_galaxyCam != null) UnityEngine.Object.Destroy(_galaxyCam.gameObject);
             if (_farCam != null) UnityEngine.Object.Destroy(_farCam.gameObject);
-            // Destroy every pooled render-target set (the current _captureRt /
-            // _readbackRt are members of one of these, so this covers them).
-            // Safe here because the camera is being torn down — no further
-            // readbacks will be issued.
-            foreach (var set in _rtPool.Values)
-            {
-                if (set.Capture != null) { set.Capture.Release(); UnityEngine.Object.Destroy(set.Capture); }
-                if (set.Readback != null) { set.Readback.Release(); UnityEngine.Object.Destroy(set.Readback); }
-            }
-            _rtPool.Clear();
+            // Release the capture tail's pooled render-target sets (its current
+            // capture/readback pair are members of one of these, so this covers
+            // them). Safe here because the camera is being torn down — no further
+            // readbacks will be issued. The ring is owned here, disposed below.
+            _capture?.Dispose();
 
             _ring?.Dispose();
             _controlBlock?.Dispose();
