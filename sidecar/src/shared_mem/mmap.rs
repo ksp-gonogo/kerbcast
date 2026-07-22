@@ -94,6 +94,14 @@ pub enum MmapRingError {
         req_h: u32,
         req_slots: u32,
     },
+    #[error(
+        "ring header declares implausible geometry: {slot_count} slots of {max_width}x{max_height}"
+    )]
+    BadGeometry {
+        slot_count: u32,
+        max_width: u32,
+        max_height: u32,
+    },
     #[error("frame size mismatch: got {got} bytes, expected {expected}")]
     SizeMismatch { got: usize, expected: usize },
     #[error("frame too large: {width}x{height} exceeds capacity {max_w}x{max_h}")]
@@ -239,6 +247,25 @@ impl MmapFrameRing {
                 .unwrap(),
         );
         drop(header);
+        // A torn/corrupt header (matching magic+version by luck) could carry
+        // wild dims; reject implausible geometry before total_bytes() can
+        // overflow and a later slot slice panics. The plugin never writes
+        // anything near these bounds (tier max well under 8K, ≤ a few slots).
+        const MAX_DIM: u32 = 8192;
+        const MAX_SLOTS: u32 = 64;
+        if slot_count == 0
+            || slot_count > MAX_SLOTS
+            || max_width == 0
+            || max_width > MAX_DIM
+            || max_height == 0
+            || max_height > MAX_DIM
+        {
+            return Err(MmapRingError::BadGeometry {
+                slot_count,
+                max_width,
+                max_height,
+            });
+        }
         let cfg = MmapRingConfig {
             slot_count,
             max_width,
@@ -632,6 +659,33 @@ mod tests {
         match MmapFrameRing::open_self_describing(&path) {
             Ok(_) => panic!("expected open to fail on a zeroed (bad-magic) header"),
             Err(MmapRingError::BadMagic { .. }) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_self_describing_rejects_implausible_geometry() {
+        // A valid magic+version header but with a wild max_width (as a torn
+        // write could leave) is refused before total_bytes() can overflow.
+        let path = tmp_path("self-describing-wild");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let _writer = MmapFrameRing::create(&path, cfg).unwrap();
+        // Stomp the max_width field (offset 16) with a huge value in place.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(HEADER_OFF_MAX_WIDTH as u64))
+                .unwrap();
+            f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        }
+        match MmapFrameRing::open_self_describing(&path) {
+            Ok(_) => panic!("expected open to reject wild geometry"),
+            Err(MmapRingError::BadGeometry { .. }) => {}
             Err(other) => panic!("unexpected error: {other:?}"),
         }
         fs::remove_file(&path).ok();
