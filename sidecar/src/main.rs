@@ -511,7 +511,7 @@ async fn broadcast_destroyed_cameras(
             lifecycle: CameraLifecycle::Destroyed,
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
-            crew_location: cam.crew_location,
+            crew_location: cam.crew_location(),
             part_name: cam.part_name.clone(),
             part_title: cam.part_title.clone(),
             camera_name: cam.camera_name.clone(),

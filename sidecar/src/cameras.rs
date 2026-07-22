@@ -351,8 +351,12 @@ pub struct CameraState {
     /// The kerbal's `ProtoCrewMember.persistentID`. `None` for part cameras.
     pub kerbal_persistent_id: Option<u32>,
     /// Which source a kerbal camera is currently rendering. `None` for
-    /// part cameras.
-    pub crew_location: Option<CrewLocation>,
+    /// part cameras. Interior-mutable: a kerbal's feed reuses one ring
+    /// across the seat<->EVA switch, so `rescan` updates this in place on
+    /// the live `Arc<CameraState>` when the plugin rewrites the manifest
+    /// (a fresh attach is never triggered by the switch). Read via
+    /// `crew_location()`.
+    crew_location: std::sync::Mutex<Option<CrewLocation>>,
     pub part_name: String,
     pub part_title: String,
     pub camera_name: String,
@@ -526,6 +530,25 @@ impl CameraState {
     /// read for the per-frame encode path.
     pub fn current_degrade(&self) -> f32 {
         f32::from_bits(self.effective_degrade.load(Ordering::Acquire))
+    }
+
+    /// Current crew location (seat vs EVA) for a kerbal camera; `None` for
+    /// part cameras. Cheap copy out of the interior-mutable cell.
+    pub fn crew_location(&self) -> Option<CrewLocation> {
+        *self.crew_location.lock().unwrap()
+    }
+
+    /// Overwrite the crew location on the live camera. Called by `rescan`
+    /// when the plugin rewrites a kerbal manifest's `crew_location` across
+    /// the seat<->EVA switch. Returns true when the value actually changed
+    /// (the caller then marks the camera dirty to relabel subscribers).
+    fn set_crew_location(&self, next: Option<CrewLocation>) -> bool {
+        let mut cur = self.crew_location.lock().unwrap();
+        if *cur == next {
+            return false;
+        }
+        *cur = next;
+        true
     }
 }
 
@@ -827,6 +850,9 @@ impl CameraRegistry {
         // the tombstone. Re-reading info.json for every known camera at ~1Hz
         // is cheap (6 files, ~200 bytes each).
         let mut newly_destroyed: Vec<u32> = Vec::new();
+        // Kerbal cameras whose crew_location flipped this pass — marked dirty
+        // after the loop so subscribers get a fresh camera-state-changed.
+        let mut crew_relabeled: Vec<u32> = Vec::new();
         for (id, cam) in cameras.iter() {
             if cam.destroyed.load(Ordering::Acquire) {
                 // Already flagged — check if broadcast is still pending.
@@ -844,7 +870,32 @@ impl CameraRegistry {
                     "camera part destroyed — stopping encode, notifying peers",
                 );
                 newly_destroyed.push(*id);
+                continue;
             }
+            // A kerbal's feed reuses one ring across the seat<->EVA switch, so
+            // no fresh attach fires; pick up a live crew_location flip from the
+            // manifest (the plugin rewrites it on the switch) and update the
+            // existing CameraState in place. Scoped to kerbal cameras: part
+            // manifests never carry the field, and the manifest read above
+            // already happened for destroyed detection, so this adds no extra
+            // I/O.
+            if cam.kind == CameraKind::Kerbal {
+                let next = crew_location_from_manifest(manifest.crew_location.as_deref());
+                if cam.set_crew_location(next) {
+                    info!(
+                        flight_id = id,
+                        crew_location = ?next,
+                        "kerbal crew_location changed — relabeling subscribers",
+                    );
+                    crew_relabeled.push(*id);
+                }
+            }
+        }
+        // Mark relabeled kerbal cameras dirty (independent lock from the
+        // cameras guard held here) so the consume loop pushes a fresh
+        // camera-state-changed and browser tiles update seat<->EVA live.
+        for id in &crew_relabeled {
+            self.mark_camera_dirty(*id).await;
         }
 
         // --- Step 2: attach new rings (skips destroyed cameras; they have
@@ -910,9 +961,9 @@ impl CameraRegistry {
                             max_height: ring_dims.max_height,
                             kind: camera_kind_from_manifest(&manifest.kind),
                             kerbal_persistent_id: manifest.kerbal_persistent_id,
-                            crew_location: crew_location_from_manifest(
+                            crew_location: std::sync::Mutex::new(crew_location_from_manifest(
                                 manifest.crew_location.as_deref(),
-                            ),
+                            )),
                             part_name: manifest.part_name,
                             part_title: manifest.part_title,
                             camera_name: manifest.camera_name,
@@ -1015,7 +1066,7 @@ impl CameraRegistry {
                 },
                 kind: s.kind,
                 kerbal_persistent_id: s.kerbal_persistent_id,
-                crew_location: s.crew_location,
+                crew_location: s.crew_location(),
                 max_width: s.max_width,
                 max_height: s.max_height,
                 part_name: s.part_name.clone(),
@@ -1145,7 +1196,7 @@ impl CameraRegistry {
                 },
                 kind: cam.kind,
                 kerbal_persistent_id: cam.kerbal_persistent_id,
-                crew_location: cam.crew_location,
+                crew_location: cam.crew_location(),
                 part_name: cam.part_name.clone(),
                 part_title: cam.part_title.clone(),
                 camera_name: cam.camera_name.clone(),
@@ -1431,7 +1482,7 @@ impl CameraRegistry {
             },
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
-            crew_location: cam.crew_location,
+            crew_location: cam.crew_location(),
             part_name: cam.part_name.clone(),
             part_title: cam.part_title.clone(),
             camera_name: cam.camera_name.clone(),
@@ -1717,7 +1768,7 @@ mod tests {
         let cam = registry.get(flight_id).await.expect("camera attached");
         assert_eq!(cam.kind, CameraKind::Kerbal);
         assert_eq!(cam.kerbal_persistent_id, Some(42));
-        assert_eq!(cam.crew_location, Some(CrewLocation::Seat));
+        assert_eq!(cam.crew_location(), Some(CrewLocation::Seat));
 
         let info = registry
             .list()
@@ -1728,6 +1779,62 @@ mod tests {
         assert_eq!(info.kind, CameraKind::Kerbal);
         assert_eq!(info.kerbal_persistent_id, Some(42));
         assert_eq!(info.crew_location, Some(CrewLocation::Seat));
+    }
+
+    /// A kerbal camera's `crew_location` updates LIVE when the plugin
+    /// rewrites the manifest across the seat<->EVA switch. The feed reuses
+    /// one ring (no destroyed tombstone, unchanged ring identity), so a
+    /// fresh attach never fires; `rescan` must re-read the manifest for the
+    /// live camera, update the existing `CameraState` in place, mark it
+    /// dirty so subscribers relabel, and surface the new value in
+    /// `/cameras`.
+    #[tokio::test]
+    async fn rescan_updates_kerbal_crew_location_live_across_eva_switch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 9_012;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
+
+        let manifest = |loc: &str| {
+            format!(
+                r#"{{"flight_id":{flight_id},"kind":"kerbal","kerbal_persistent_id":42,"crew_location":"{loc}","part_name":"","part_title":"","camera_name":"Jeb's Face","vessel_name":"Kerbal X","supports_zoom":false,"fov":0.0,"fov_min":0.0,"fov_max":0.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+            )
+        };
+        let info_path = shm.join(format!("{flight_id}.info.json"));
+        tokio::fs::write(&info_path, manifest("seat"))
+            .await
+            .unwrap();
+
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        // Hold a handle to the live camera; interior mutability means this
+        // same Arc must observe the update below.
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        assert_eq!(cam.crew_location(), Some(CrewLocation::Seat));
+        // Drain any attach-driven dirty state so we can isolate the relabel.
+        let _ = registry.take_dirty_cameras().await;
+
+        // Plugin flips the SAME manifest to EVA (same ring, no tombstone).
+        tokio::fs::write(&info_path, manifest("eva")).await.unwrap();
+        registry.rescan().await;
+
+        // Live CameraState reflects the flip in place...
+        assert_eq!(cam.crew_location(), Some(CrewLocation::Eva));
+        // ...the `/cameras` shape carries it...
+        let info = registry
+            .list()
+            .await
+            .into_iter()
+            .find(|c| c.flight_id == flight_id)
+            .expect("camera in list");
+        assert_eq!(info.crew_location, Some(CrewLocation::Eva));
+        // ...and the camera is marked dirty so subscribers relabel live.
+        assert!(registry.take_dirty_cameras().await.contains(&flight_id));
     }
 
     /// A part manifest with no `kind` field at all (every manifest written
@@ -1758,7 +1865,7 @@ mod tests {
         let cam = registry.get(flight_id).await.expect("camera attached");
         assert_eq!(cam.kind, CameraKind::Part);
         assert_eq!(cam.kerbal_persistent_id, None);
-        assert_eq!(cam.crew_location, None);
+        assert_eq!(cam.crew_location(), None);
 
         let info = registry
             .list()
