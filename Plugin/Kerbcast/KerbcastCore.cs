@@ -364,6 +364,16 @@ namespace Kerbcast
         // the camera list to `vessel`, tearing down anything not on it. This
         // is the documented "leaving a vessel drops its cameras" behavior.
         //
+        // EXCEPTION for kerbal-face feed continuity: a KerbalFaceCamera whose
+        // kerbal is still live AND now on `vessel` is PRESERVED (kept in
+        // _cameras, not disposed+recreated), so a seat<->EVA switch — which
+        // fires onVesselChange as control follows the kerbal onto/off the EVA
+        // vessel — keeps the same ring/info/control + subscription instead of
+        // dropping the feed. Every part camera, and every kerbal camera not on
+        // `vessel`, is disposed exactly as before: part-camera behaviour is
+        // unchanged (a part camera is never kept here, even on `vessel` — it is
+        // disposed and rebuilt below just like today).
+        //
         // disposeMissing=false (onVesselWasModified — dock/stage without a
         // pilot switch): additive only. A part leaving `vessel` via staging
         // is still physically out there on debris and should only stop
@@ -375,8 +385,17 @@ namespace Kerbcast
         {
             if (disposeMissing)
             {
-                foreach (var cam in _cameras) cam.Dispose();
-                _cameras.Clear();
+                for (int i = _cameras.Count - 1; i >= 0; i--)
+                {
+                    var cam = _cameras[i];
+                    // IsAlive is evaluated first (it re-resolves the kerbal's current
+                    // part, so cam.Vessel then reflects a just-completed seat<->EVA
+                    // move); short-circuit means Vessel is only read when alive.
+                    bool keep = cam is KerbalFaceCamera && cam.IsAlive && cam.Vessel == vessel;
+                    if (keep) continue;
+                    cam.Dispose();
+                    _cameras.RemoveAt(i);
+                }
             }
 
             if (vessel == null) return;
