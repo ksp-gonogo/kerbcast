@@ -61,5 +61,18 @@ Check(!TrackAim.ShouldAim(TrackAim.ModeNone, true, true),
 Check(TrackAim.ShouldAim(TrackAim.ModeActiveVessel, true, true),
     "tracking pan+zoom -> auto-zoom runs (same gate as the aim)");
 
+// --- Anti-loop seq policy (THE load-bearing EC invariant, pinned) ---
+// (b) A control-block DOWN apply happens ONLY on a track_seq EDGE, not on a
+// repeated same-seq flush (the sidecar re-writes full state every flush).
+Check(TrackAim.ShouldApplyDown(5u, 4u), "down applies on a track_seq edge");
+Check(!TrackAim.ShouldApplyDown(5u, 5u), "down does NOT apply on a repeated same seq");
+// (a) A DOWN apply must NEVER advance the up-report seq (else it feeds back into
+// the sidecar adopt and loops). ReportSeqAfterDownApply is identity.
+Check(TrackAim.ReportSeqAfterDownApply(7u) == 7u, "DOWN apply leaves the up-report seq unchanged");
+Check(TrackAim.ReportSeqAfterDownApply(0u) == 0u, "DOWN apply identity at zero");
+// (c) A kOS set DOES advance the up-report seq (so the sidecar adopts it once).
+Check(TrackAim.ReportSeqAfterKosSet(7u) == 8u, "kOS set advances the up-report seq");
+Check(TrackAim.ReportSeqAfterKosSet(uint.MaxValue) == 0u, "kOS set wraps (u32) rather than overflows");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

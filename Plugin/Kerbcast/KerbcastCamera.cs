@@ -1081,7 +1081,14 @@ namespace Kerbcast
         /// block (the DOWN path). Called by PollControlFile on a track_seq edge.
         /// Does NOT bump the up-report seq (that is reserved for a kOS set — the
         /// anti-loop guard). Only acted on for a pan+zoom camera.</summary>
-        public void SetTrackMode(int mode) => _trackMode = mode;
+        public void SetTrackMode(int mode)
+        {
+            _trackMode = mode;
+            // Route through the pinned policy (identity): the DOWN path must never
+            // advance the up-report seq. Explicit so a future edit can't quietly
+            // turn this into a feedback loop.
+            _trackReportSeq = TrackAim.ReportSeqAfterDownApply(_trackReportSeq);
+        }
 
         /// <summary>Set the auto-track mode from kOS (the UP path). Synchronous
         /// + optimistic-local: applies immediately (the camera aims at once) and
@@ -1091,7 +1098,7 @@ namespace Kerbcast
         public void RequestTrackMode(int mode)
         {
             _trackMode = mode;
-            _trackReportSeq++;
+            _trackReportSeq = TrackAim.ReportSeqAfterKosSet(_trackReportSeq);
         }
 
         /// <summary>Current applied auto-track mode (0=none/1=active-vessel/
@@ -1366,7 +1373,7 @@ namespace Kerbcast
                 // still lands. Absent bit => none (the sidecar writes full state,
                 // so absent means not-tracking). Uses SetTrackMode (the DOWN
                 // path) so it does NOT bump the up-report seq.
-                if (snap.TrackSeq != _lastTrackSeq)
+                if (TrackAim.ShouldApplyDown(snap.TrackSeq, _lastTrackSeq))
                 {
                     _lastTrackSeq = snap.TrackSeq;
                     SetTrackMode((int)(snap.TrackMode ?? 0u));

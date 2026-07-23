@@ -39,5 +39,40 @@ namespace Kerbcast
             if (fov > fovMax) return fovMax;
             return fov;
         }
+
+        /* --- Anti-loop seq policy (the linked-track_mode EC invariant) ---
+           track_mode has two write paths that must NOT feed back into each other:
+           the DOWN path (control-block apply, driven by the sidecar's track_seq)
+           and the UP path (a kOS-facade set, which stages an up-report the sidecar
+           adopts). These pure decisions centralise + pin the policy so a future
+           edit can't silently reintroduce the feedback loop the v1.6.3 class warns
+           against; KerbcastCamera routes its inline (KSP-bound) methods through
+           them, and TrackAim.Tests pins them headlessly. */
+
+        /* DOWN edge: apply a control-block track_mode ONLY when its seq advanced.
+           The sidecar re-serialises full state every flush, so without this the
+           stale track_mode would clobber a kOS-set mode every poll. */
+        public static bool ShouldApplyDown(uint incomingSeq, uint lastAppliedSeq)
+        {
+            return incomingSeq != lastAppliedSeq;
+        }
+
+        /* A control-block DOWN apply NEVER advances the up-report seq (identity):
+           reporting a down-applied value back up would loop through the sidecar's
+           adopt. THE anti-loop guard — only ReportSeqAfterKosSet advances it. */
+        public static uint ReportSeqAfterDownApply(uint currentReportSeq)
+        {
+            return currentReportSeq;
+        }
+
+        /* A kOS-facade set advances the up-report seq (wrapping u32) so the sidecar
+           adopts the kOS-proposed mode exactly once as authoritative. */
+        public static uint ReportSeqAfterKosSet(uint currentReportSeq)
+        {
+            unchecked
+            {
+                return currentReportSeq + 1u;
+            }
+        }
     }
 }
