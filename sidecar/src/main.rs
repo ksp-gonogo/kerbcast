@@ -364,9 +364,9 @@ async fn consume_loop(
 
         // Prune dead peers — dropped Arcs propagate to the Weak refs
         // in each CameraState.tracks list, which we GC inline below.
-        // Before forgetting the peer, wipe its SetDegrade entries from
-        // every camera it was subscribed to so the noisiest-consumer
-        // max relaxes when a degrade-requesting peer leaves.
+        // Each dropped peer also gets its per-consumer state cleared so no
+        // stale entry pins a camera high (pan/zoom rates zeroed; reported
+        // display size forgotten peer-wide).
         let dropped_peers: Vec<Arc<KerbcastPeer>> = {
             let mut guard = peers.write().await;
             let mut dropped = Vec::new();
@@ -409,6 +409,12 @@ async fn consume_loop(
             for flight_id in driven_flight_ids {
                 registry.zero_rates(flight_id).await;
             }
+            // Peer-scoped display-size clear: forget this peer's reported size
+            // across EVERY camera, not just the ones it bound — a report can
+            // exist for a camera it never bound (report + slot-exhausted
+            // Subscribe), which a binding-scoped clear would leak forever
+            // (the v1.6.3 pin-high class).
+            registry.forget_display_size_all(peer.peer_id).await;
         }
 
         let cameras = registry.snapshot().await;

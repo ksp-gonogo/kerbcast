@@ -40,12 +40,18 @@ namespace Kerbcast
         private readonly string _controlPath;
         private bool _disposed;
 
-        // Square capture side: min(512, tier width, tier height), so the ring
-        // and the capture RT can never drift apart. Below-512 tiers (e.g. low
-        // at 640x360) previously produced 512x512 frames into a ring sized for
-        // the tier, throwing on every frame; this clamps the capture itself
-        // down to whatever the tier actually allows.
-        private readonly int _captureDim;
+        // Largest square the face will ever render/encode: min(512, tier width,
+        // tier height), rounded even. The RING is allocated at THIS max, so a live
+        // shrink or grow within [MinSide, _maxSide] is an RT-pool switch only — no
+        // ring re-create, no sidecar re-attach. (Below-512 tiers, e.g. low at
+        // 640x360, cap at the tier so we never exceed the ring's slot capacity.)
+        private readonly int _maxSide;
+        // Current square render side. Starts at _maxSide (full) and auto-resolution
+        // shrinks it toward the max consumer display size (squared). EnsureCapture
+        // builds the capture targets at this side.
+        private int _renderSide;
+        // Floor for auto-resolution so a face never encodes an unreadable thumbnail.
+        private const int MinSide = 64;
 
         // Shared-memory control block written by the sidecar. Opened lazily
         // once the file appears (mirrors KerbcastCamera). Kerbal cameras only
@@ -66,7 +72,7 @@ namespace Kerbcast
 
         // Reusable capture tail: pooled capture/readback RT pair + in-flight
         // readback bookkeeping + ring write. Built lazily on first subscribe at
-        // 512x512, reused across ticks, disposed at teardown. Shared impl with
+        // _renderSide, reused across ticks, disposed at teardown. Shared impl with
         // KerbcastCamera so the streaming path stays single-source.
         private CaptureCore _capture;
         private readonly PhaseTimings _phaseTimings = new PhaseTimings();
@@ -99,11 +105,12 @@ namespace Kerbcast
             _ringPath = Path.Combine(ringDir, $"{FlightId}.ring");
             _infoPath = Path.Combine(ringDir, $"{FlightId}.info.json");
             _controlPath = Path.Combine(ringDir, $"{FlightId}.control.bin");
-            _captureDim = Math.Min(512, Math.Min(width, height));
-            // Ring sized to match the capture dim exactly: the capture stage
-            // (EnsureCapture) renders at the same _captureDim, so ring and
-            // frame can never disagree regardless of quality tier.
-            _ring = MmapFrameRing.Create(_ringPath, ringSlots, _captureDim, _captureDim);
+            _maxSide = MakeEven(Math.Min(512, Math.Min(width, height)));
+            _renderSide = _maxSide;
+            // Ring allocated at the SQUARE MAX so live auto-resolution stays
+            // RT-pool-only. Each slot's header carries the actual content side, so
+            // the sidecar (self-describing ring open) encodes at the current side.
+            _ring = MmapFrameRing.Create(_ringPath, ringSlots, _maxSide, _maxSide);
             // A kerbal discovered already on EVA (CrewProvider's EVA sweep) must
             // stamp its FIRST manifest "eva", not the default "seat" — otherwise an
             // EVA cam that is never subscribed reports "seat" in /cameras until the
@@ -159,6 +166,19 @@ namespace Kerbcast
                     _subscribed = snap.Subscribed;
                     Debug.Log($"[Kerbcast] kerbal cam={FlightId} subscribed → {_subscribed}");
                 }
+
+                // Auto-resolution: the sidecar writes the effective max-consumer
+                // size into Width/Height (both present-flag gated). A face is
+                // square, so fit it to the smaller reported side, rounded even and
+                // clamped to [MinSide, _maxSide]. SetRenderSize no-ops when unchanged
+                // (re-published snapshots are free).
+                if (snap.Width.HasValue && snap.Height.HasValue)
+                {
+                    int even = MakeEven((int)Math.Min(snap.Width.Value, snap.Height.Value));
+                    int lo = Math.Min(MinSide, _maxSide);
+                    int side = Math.Max(lo, Math.Min(_maxSide, even));
+                    SetRenderSize(side);
+                }
             }
             catch (Exception ex)
             {
@@ -166,11 +186,13 @@ namespace Kerbcast
             }
         }
 
-        // Lazily build the capture tail on first subscribe. Filterless: a plain
-        // Blit passed to Publish, minimal failure/reset callbacks (kerbal
-        // cameras have no telemetry columns of their own). _captureDim matches
-        // the ring exactly (both derived in the ctor), so capture never
-        // exceeds the ring's slot capacity on any tier.
+        // Lazily build the capture tail on first subscribe, and reconcile the
+        // render side when auto-resolution changed it. Filterless: a plain Blit
+        // passed to Publish, minimal failure/reset callbacks (kerbal cameras have
+        // no telemetry columns of their own). _renderSide is always <= _maxSide
+        // (the ring's slot capacity), so capture never exceeds it on any tier.
+        // All BuildTargets calls funnel through here, which runs inside Refresh's
+        // try/catch, so a RenderTexture.Create() throw is caught.
         private CaptureCore EnsureCapture()
         {
             if (_capture == null)
@@ -180,11 +202,33 @@ namespace Kerbcast
                 // must leave _capture null so the next tick retries construction,
                 // rather than latching a half-initialized capture tail.
                 var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
-                capture.BuildTargets(_captureDim, _captureDim);
+                capture.BuildTargets(_renderSide, _renderSide);
                 _capture = capture;
+            }
+            else if (_capture.CaptureRt == null || _capture.CaptureRt.width != _renderSide)
+            {
+                // Auto-resolution moved the side: switch the pooled RT set. O(1)
+                // for a size seen before, one alloc for a new one — never destroys,
+                // so an in-flight readback drains safely at its captured dims.
+                _capture.BuildTargets(_renderSide, _renderSide);
             }
             return _capture;
         }
+
+        // Square resize onto the shared CaptureCore path — the facecam mirror of
+        // KerbcastCamera.SetRenderSize with w==h. Records the requested side; the
+        // pooled-RT switch happens in EnsureCapture (inside Refresh's try, so a
+        // BuildTargets throw is caught). Even (H.264 chroma) and within
+        // (0, _maxSide]; faces have no layers/zoom/pan, so there is no
+        // ApplyEffectiveQuality machinery.
+        public void SetRenderSize(int side)
+        {
+            if (side <= 0 || side % 2 != 0 || side > _maxSide || side == _renderSide) return;
+            _renderSide = side;
+            Debug.Log($"[Kerbcast] kerbal cam={FlightId} render side → {side}");
+        }
+
+        private static int MakeEven(int v) => v & ~1; // round down to even
 
         private void LogRateLimited(string message)
         {

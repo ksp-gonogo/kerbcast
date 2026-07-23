@@ -1246,6 +1246,25 @@ namespace Kerbcast
                 SetViewerQualityLevel(
                     snap.ViewerLevel.HasValue ? (int)snap.ViewerLevel.Value : 0);
 
+                // Auto-resolution: the sidecar writes the effective max-consumer
+                // size (already capped at manual SetRenderSize) into Width/Height.
+                // Apply it as the runtime operator CEILING; the adaptive-shed and
+                // viewer-clamp min() still ride underneath via ApplyEffectiveQuality.
+                // Both fields must be present (a size needs both); the even/clamp/
+                // <=max guards live in SetOperatorRenderSize -> SetRenderSize, so no
+                // duplication here. Changed-check avoids re-applying the same
+                // ceiling when an unrelated field triggered this poll.
+                if (snap.Width.HasValue && snap.Height.HasValue)
+                {
+                    int w = (int)snap.Width.Value;
+                    int h = (int)snap.Height.Value;
+                    if (w != OperatorWidth || h != OperatorHeight)
+                    {
+                        SetOperatorRenderSize(w, h);
+                        Debug.Log($"[Kerbcast] cam={FlightId} operator render size → {w}×{h}");
+                    }
+                }
+
                 // Absolute FoV is applied only when its seq changes (see
                 // _lastFovSeq) so the stale fov re-published on unrelated writes /
                 // the zoom-rate-stop write doesn't snap a drifting _fovTarget back.

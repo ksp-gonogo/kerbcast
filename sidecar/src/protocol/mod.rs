@@ -256,6 +256,21 @@ pub struct SetRenderSizePayload {
     pub height: u32,
 }
 
+/// A consumer reporting its OWN current display size in px for one camera.
+/// Unlike `SetRenderSizePayload` (an operator command that sets the shared
+/// render size directly, last-writer-wins), this is a per-consumer input the
+/// sidecar aggregates MAX-across-consumers to drive auto-resolution
+/// (meet-the-minimum-need). Shape mirrors `SetRenderSizePayload`; `width` and
+/// `height` are the consumer's display px for this feed.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportDisplaySizePayload {
+    pub flight_id: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -460,9 +475,18 @@ pub enum ClientMessage {
     /// Override the operator layer mask for one camera. Server-wide
     /// state — all consumers see the change.
     SetLayers(SetLayersPayload),
-    /// Override the operator render size for one camera. Even pixels
-    /// only (H.264 chroma); server caps at the ring's allocated max.
+    /// Cap the auto-resolution for one camera. As of Stage 6 this is a
+    /// CEILING on the demand-driven size (effective = min(auto max-across-
+    /// consumers, this cap)), NOT an authoritative set: it cannot force a
+    /// camera larger than current consumers report, only smaller. Even
+    /// pixels only (H.264 chroma); server caps at the ring's allocated max.
     SetRenderSize(SetRenderSizePayload),
+    /// A consumer reporting its OWN current display size in px; the sidecar
+    /// aggregates MAX-across-consumers to drive auto-resolution
+    /// (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
+    /// command: this is a per-consumer input, not a shared override — a
+    /// departing consumer's size is cleared so the max relaxes.
+    ReportDisplaySize(ReportDisplaySizePayload),
     /// Set the camera's field-of-view (degrees). Silently ignored for
     /// parts whose Hullcam module is the fixed base (`supportsZoom ==
     /// false`); clients are expected to clamp to `fovMin / fovMax`
@@ -609,6 +633,33 @@ mod tests {
             ClientMessage::SetLayers(p) => {
                 assert_eq!(p.flight_id, 123);
                 assert_eq!(p.layers, vec![Layer::Near, Layer::Scaled]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn report_display_size_roundtrips() {
+        // A consumer reporting its own display px (an aggregatable input for
+        // auto-resolution), using the adjacently-tagged kebab-case + `content`
+        // wrapper convention every ClientMessage variant shares.
+        let msg = ClientMessage::ReportDisplaySize(ReportDisplaySizePayload {
+            flight_id: 1,
+            width: 40,
+            height: 40,
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"type\":\"report-display-size\""));
+        assert!(s.contains("\"content\":"));
+        assert!(s.contains("\"flightId\":1"));
+        assert!(s.contains("\"width\":40"));
+        assert!(s.contains("\"height\":40"));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMessage::ReportDisplaySize(p) => {
+                assert_eq!(p.flight_id, 1);
+                assert_eq!(p.width, 40);
+                assert_eq!(p.height, 40);
             }
             _ => panic!("wrong variant"),
         }

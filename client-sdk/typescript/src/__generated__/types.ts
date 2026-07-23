@@ -226,6 +226,20 @@ export interface HelloPayload {
 }
 
 /**
+ * A consumer reporting its OWN current display size in px for one camera.
+ * Unlike `SetRenderSizePayload` (an operator command that sets the shared
+ * render size directly, last-writer-wins), this is a per-consumer input the
+ * sidecar aggregates MAX-across-consumers to drive auto-resolution
+ * (meet-the-minimum-need). Shape mirrors `SetRenderSizePayload`; `width` and
+ * `height` are the consumer's display px for this feed.
+ */
+export interface ReportDisplaySizePayload {
+	flightId: number;
+	width: number;
+	height: number;
+}
+
+/**
  * Scene-state change: whether KSP is currently in a flight scene. Sent
  * after `Hello` (priming) and whenever the polled in-flight flag flips,
  * so clients can show a calm out-of-flight standby instead of per-camera
@@ -384,6 +398,14 @@ export type ClientMessage =
 	 * only (H.264 chroma); server caps at the ring's allocated max.
 	 */
 	| { type: "set-render-size", content: SetRenderSizePayload }
+	/**
+	 * A consumer reporting its OWN current display size in px; the sidecar
+	 * aggregates MAX-across-consumers to drive auto-resolution
+	 * (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
+	 * command: this is a per-consumer input, not a shared override — a
+	 * departing consumer's size is cleared so the max relaxes.
+	 */
+	| { type: "report-display-size", content: ReportDisplaySizePayload }
 	/**
 	 * Set the camera's field-of-view (degrees). Silently ignored for
 	 * parts whose Hullcam module is the fixed base (`supportsZoom ==
