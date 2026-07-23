@@ -156,6 +156,7 @@ function renderFeed(
     enableQualityControl?: boolean;
     showStatic?: boolean;
     showStandbyIcon?: boolean;
+    showActions?: boolean;
     ref?: React.Ref<CameraFeedHandle>;
   },
 ) {
@@ -1351,28 +1352,61 @@ describe("CameraFeed - ResizeObserver render-size feedback", () => {
     resizeCallback = undefined;
   });
 
-  it("render-size observer fires set-render-size command", async () => {
+  it("reports the measured display size (report-display-size, real w x h)", async () => {
     const { client, sidecar } = await buildConnectedSource();
 
     renderFeed(client, { flightId: 42 });
 
+    // First measurement reports promptly (no debounce wait).
     await act(async () => {
       resizeCallback?.(
-        [{ contentRect: { width: 400, height: 400 } }] as ResizeObserverEntry[],
+        [{ contentRect: { width: 400, height: 224 } }] as ResizeObserverEntry[],
         {} as ResizeObserver,
       );
     });
 
-    await act(async () => {
-      vi.advanceTimersByTime(501);
-    });
+    const msg = sidecar.lastCommand("report-display-size");
+    expect(msg).toBeTruthy();
+    // Measured w x h (no synthetic 16:9 crop), bucketed to a 16-multiple:
+    // 400 -> 400, 224 -> 224.
+    expect(msg?.content.width).toBe(400);
+    expect(msg?.content.height).toBe(224);
+    // Measurement no longer drives the operator set-render-size (that path is
+    // the manual quality cap only).
+    expect(sidecar.commands.some((c) => c.type === "set-render-size")).toBe(false);
+  });
 
-    const renderSizeMsg = sidecar.lastCommand("set-render-size");
-    expect(renderSizeMsg).toBeTruthy();
-    // Width as-is (already even); height derived 16:9 then rounded to even px:
-    // 400 * 9/16 = 225 -> 226.
-    expect(renderSizeMsg?.content.width).toBe(400);
-    expect(renderSizeMsg?.content.height).toBe(226);
+  it("does not report when renderSize is none", async () => {
+    const { client, sidecar } = await buildConnectedSource();
+
+    renderFeed(client, { flightId: 42, renderSize: "none" });
+
+    // The observer is never armed when reporting is disabled.
+    expect(resizeCallback).toBeUndefined();
+    expect(sidecar.commands.some((c) => c.type === "report-display-size")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// showActions
+// ---------------------------------------------------------------------------
+
+describe("CameraFeed - showActions", () => {
+  it("renders the action bar by default", async () => {
+    const { client } = await buildConnectedSource();
+    const { queryByLabelText } = renderFeed(client, { flightId: 42 });
+    // The camera step buttons live in the action bar.
+    expect(queryByLabelText("Next camera")).toBeTruthy();
+  });
+
+  it("hides the action bar when showActions is false", async () => {
+    const { client } = await buildConnectedSource();
+    const { queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      showActions: false,
+    });
+    expect(queryByLabelText("Next camera")).toBeNull();
+    expect(queryByLabelText("Previous camera")).toBeNull();
   });
 });
 

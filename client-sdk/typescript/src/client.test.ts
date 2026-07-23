@@ -381,6 +381,25 @@ describe("KerbcastClient", () => {
     ]);
   });
 
+  it("reportDisplaySize sends a report-display-size command", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+
+    await client.connect();
+    captured.dc?._open();
+    captured.dc!.sent.length = 0;
+
+    await client.reportDisplaySize(3, 40, 40);
+
+    expect(captured.dc?.sent).toEqual([
+      JSON.stringify({
+        type: "report-display-size",
+        content: { flightId: 3, width: 40, height: 40 },
+      }),
+    ]);
+  });
+
   it("disconnect tears down peer + emits null MediaStream events", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);

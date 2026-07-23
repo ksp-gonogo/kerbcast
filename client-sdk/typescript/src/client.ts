@@ -1041,6 +1041,18 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * Report this consumer's own displayed pixel size for a camera, driving the
+   * sidecar's auto-resolution. Unlike `setRenderSize` (an operator command that
+   * sets the shared render size directly, last-writer-wins), this is a
+   * per-consumer input the sidecar aggregates MAX-across-consumers, so a big
+   * spotlight bumps the stream up while tiny avatars leave it small. The SDK's
+   * feed primitives self-measure and call this; consumers do not report by hand.
+   */
+  async reportDisplaySize(flightId: number, width: number, height: number): Promise<void> {
+    await this._send({ type: "report-display-size", content: { flightId, width, height } });
+  }
+
+  /**
    * Internal — resolves the effective noise enabled state for a camera,
    * merging the per-camera override (if any) with the client-level default.
    */

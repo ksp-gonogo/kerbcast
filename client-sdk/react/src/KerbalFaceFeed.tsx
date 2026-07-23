@@ -23,6 +23,7 @@ import styled from "styled-components";
 import { FeedAction, CameraStreamHook } from "./CameraFeed";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
+import { useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { isCameraDestroyed } from "./lifecycle";
 import { StandbyIcon } from "./StandbyIcon";
 
@@ -39,17 +40,32 @@ export interface KerbalFaceFeedProps {
   /** Wire-id (`CameraState.flightId`) of the kerbal face camera to display. */
   flightId: number;
   /**
-   * Square side in px. When omitted the feed fills its parent's width at a 1:1
-   * aspect ratio. Also the natural source for the future display-size report
-   * (Stage 6 auto-resolution) — a wrapper sizing the tile passes the same px.
+   * Explicit square side in px, for LAYOUT only. When omitted the feed fills
+   * its parent's width at a 1:1 aspect ratio. This does NOT drive resolution:
+   * the primitive always self-measures its rendered box and reports that to the
+   * sidecar (auto-resolution). Pass it to fix the element's size, not to
+   * request a stream resolution.
    */
   size?: number;
+  /**
+   * Report the self-measured display size to the sidecar to drive
+   * auto-resolution. Default true. Set false for a fixed-resolution feed that
+   * should not participate in auto-res. Independent of {@link showActions}
+   * (a resolution concern, not a UI one).
+   */
+  reportSize?: boolean;
   /**
    * Consumer action buttons, rendered as a minimal top-right bar (the shared
    * {@link FeedAction} shape). Omit for no bar — the common case, since a crew
    * bar usually composes its controls in `children` instead.
    */
   actions?: FeedAction[];
+  /**
+   * Render the feed's action UI (the top-right action bar). Default true. Set
+   * false to suppress the bar entirely (e.g. a tiny avatar where hover controls
+   * add nothing). Does not affect display-size reporting.
+   */
+  showActions?: boolean;
   /**
    * Overlay content layered OVER the square face: name label, IVA/EVA badge,
    * click target, a custom destroyed treatment. Absolutely positioned to fill
@@ -141,7 +157,9 @@ const ActionButton = styled.button<{ $active?: boolean }>`
 export function KerbalFaceFeed({
   flightId,
   size,
+  reportSize = true,
   actions,
+  showActions = true,
   children,
   onFeedStateChange,
   showStandby = true,
@@ -163,6 +181,12 @@ export function KerbalFaceFeed({
       ? "live"
       : "no-signal";
 
+  // Self-measure the square frame and report it to the sidecar (auto-res).
+  // Reporting follows the mount lifecycle; the registry collapses multiple
+  // feeds of the same kerbal to one MAX report.
+  const frameRef = useRef<HTMLDivElement>(null);
+  useReportDisplaySize(flightId, frameRef, { square: true, enabled: reportSize });
+
   // Bind the stream to the persistent <video> without remounting it — the
   // element stays mounted across every re-layout / prop change, only its
   // srcObject is (re)assigned. A stall (stream -> null) leaves the last frame.
@@ -181,7 +205,7 @@ export function KerbalFaceFeed({
   }, [state]);
 
   return (
-    <Frame $size={size} data-testid="kerbal-face-feed" data-feed-state={state}>
+    <Frame ref={frameRef} $size={size} data-testid="kerbal-face-feed" data-feed-state={state}>
       <Face ref={videoRef} autoPlay playsInline muted controls={false} />
       {state === "destroyed" && <DestroyedScrim />}
       {showStandby && state !== "live" && (
@@ -189,7 +213,7 @@ export function KerbalFaceFeed({
           <StandbyIcon size={Math.round((size ?? 96) * 0.32)} />
         </StandbyLayer>
       )}
-      {actions && actions.length > 0 && (
+      {showActions && actions && actions.length > 0 && (
         <ActionBar>
           {actions.map((a) => (
             <ActionButton

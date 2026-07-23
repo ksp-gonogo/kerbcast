@@ -9,10 +9,10 @@
 import { KerbcastClient } from "@ksp-gonogo/kerbcast";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { act, cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { KerbalFaceFeed, type KerbalFeedState } from "./KerbalFaceFeed";
-import { KerbcastProvider } from "./context";
+import { KerbcastProvider, type KerbcastDisplaySizes } from "./context";
 
 const KERBAL_ID = 0x8000_002a; // a kerbal wire-id (top bit set)
 
@@ -103,5 +103,101 @@ describe("KerbalFaceFeed", () => {
     );
     const after = container.querySelector("video");
     expect(after).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Display-size reporting + showActions
+// ---------------------------------------------------------------------------
+
+function recordingRegistry() {
+  const reports: Array<{ flightId: number; w: number; h: number }> = [];
+  const clears: Array<{ flightId: number }> = [];
+  const displaySizes: KerbcastDisplaySizes = {
+    report: (flightId, _id, w, h) => reports.push({ flightId, w, h }),
+    clear: (flightId) => clears.push({ flightId }),
+  };
+  return { displaySizes, reports, clears };
+}
+
+describe("KerbalFaceFeed - reporting + showActions", () => {
+  let resizeCallback:
+    | ((entries: ResizeObserverEntry[], observer: ResizeObserver) => void)
+    | undefined;
+  const originalResizeObserver = globalThis.ResizeObserver;
+
+  beforeEach(() => {
+    globalThis.ResizeObserver = class {
+      constructor(cb: (entries: ResizeObserverEntry[], observer: ResizeObserver) => void) {
+        resizeCallback = cb;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+  });
+
+  afterEach(() => {
+    cleanup();
+    globalThis.ResizeObserver = originalResizeObserver;
+    resizeCallback = undefined;
+  });
+
+  it("reports a SQUARE self-measured display size for the face", async () => {
+    const client = await buildConnected();
+    const { displaySizes, reports } = recordingRegistry();
+    render(
+      <KerbcastProvider client={client} displaySizes={displaySizes}>
+        <KerbalFaceFeed flightId={KERBAL_ID} />
+      </KerbcastProvider>,
+    );
+    // A non-square measured box still reports square (min edge, bucketed): the
+    // face capture is square, so 50x40 -> min 40 -> 48x48.
+    act(() => {
+      resizeCallback?.(
+        [{ contentRect: { width: 50, height: 40 } }] as ResizeObserverEntry[],
+        {} as ResizeObserver,
+      );
+    });
+    expect(reports.at(-1)).toEqual({ flightId: KERBAL_ID, w: 48, h: 48 });
+  });
+
+  it("does not report when reportSize is false", async () => {
+    const client = await buildConnected();
+    const { displaySizes, reports } = recordingRegistry();
+    render(
+      <KerbcastProvider client={client} displaySizes={displaySizes}>
+        <KerbalFaceFeed flightId={KERBAL_ID} reportSize={false} />
+      </KerbcastProvider>,
+    );
+    expect(resizeCallback).toBeUndefined();
+    expect(reports).toEqual([]);
+  });
+
+  it("renders supplied actions by default", async () => {
+    const client = await buildConnected();
+    const { getByLabelText } = render(
+      <KerbcastProvider client={client}>
+        <KerbalFaceFeed
+          flightId={KERBAL_ID}
+          actions={[{ id: "s", label: "Spotlight", icon: null, onClick: () => {} }]}
+        />
+      </KerbcastProvider>,
+    );
+    expect(getByLabelText("Spotlight")).toBeTruthy();
+  });
+
+  it("hides the action bar when showActions is false", async () => {
+    const client = await buildConnected();
+    const { queryByLabelText } = render(
+      <KerbcastProvider client={client}>
+        <KerbalFaceFeed
+          flightId={KERBAL_ID}
+          showActions={false}
+          actions={[{ id: "s", label: "Spotlight", icon: null, onClick: () => {} }]}
+        />
+      </KerbcastProvider>,
+    );
+    expect(queryByLabelText("Spotlight")).toBeNull();
   });
 });

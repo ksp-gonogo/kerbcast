@@ -585,6 +585,11 @@ export class MockSidecar {
       // the mock has no frame clock, so it doesn't model their *effect* on
       // panYaw/fov. They're still recorded in `_commands`, so consumer tests
       // can assert the command was sent via `lastCommand("set-pan-rate")`.
+      // Advisory per-consumer display-size input. The real sidecar aggregates
+      // it MAX-across-consumers to drive auto-resolution; the mock has no
+      // aggregator, so it just records the command (via `_commands`) and does
+      // NOT mutate camera render dims (unlike the operator `set-render-size`).
+      case "report-display-size":
       case "set-pan-rate":
       case "set-zoom-rate":
       case "hello":

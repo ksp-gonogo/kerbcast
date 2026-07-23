@@ -121,6 +121,27 @@ describe("MockSidecar", () => {
     expect(last?.content.fov).toBe(60);
   });
 
+  it("accepts and records report-display-size as an advisory command", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+
+    const client = new KerbcastClient(
+      { host: "localhost", port: 8088 },
+      sidecar.createTransport(),
+    );
+    await client.connect([42]);
+    sidecar.open();
+
+    // Must not throw on the new message type, and must be retrievable.
+    await client.reportDisplaySize(42, 40, 40);
+
+    const cmd = sidecar.lastCommand("report-display-size", 42);
+    expect(cmd?.content).toEqual({ flightId: 42, width: 40, height: 40 });
+    // Advisory: reporting a display size must NOT be translated into an
+    // operator set-render-size command (that path is the manual cap only).
+    expect(sidecar.commands.some((c) => c.type === "set-render-size")).toBe(false);
+  });
+
   it("updateCamera pushes state-change to the client", async () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42, layers: [Layer.Near] });

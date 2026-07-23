@@ -17,6 +17,7 @@ import { KerbcastProvider, useKerbcastClient } from "./context";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
+import { useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
 
@@ -145,11 +146,6 @@ function usePortalMenu({ maxWidth, maxHeight, align }: MenuAnchor) {
   }, []);
 
   return { open, toggle, close, position, menuRef, triggerRef };
-}
-
-/** Round n to the nearest even integer, minimum 2 (H.264 chroma requirement). */
-function toEvenPx(n: number): number {
-  return Math.max(2, Math.round(n / 2) * 2);
 }
 
 /*
@@ -291,8 +287,12 @@ export interface CameraFeedProps {
    */
   showStandbyIcon?: boolean;
   /**
-   * "auto" (default): ResizeObserver drives `setRenderSize` at a 16:9 crop,
-   * debounced 500 ms. "none": no render-size feedback.
+   * "auto" (default): the feed self-measures its rendered pixel box and reports
+   * it to the sidecar via the per-consumer `reportDisplaySize` (auto-resolution;
+   * the sidecar maxes across consumers). "none": no reporting, for a
+   * fixed-resolution feed. This drives the AUTO signal, not the operator
+   * `setRenderSize` (which, with the quality presets, is the manual cap:
+   * effective = min(auto, cap)).
    */
   renderSize?: "auto" | "none";
   /** Message shown when no cameras are available. */
@@ -330,6 +330,13 @@ export interface CameraFeedProps {
    * button so it sits in the corner.
    */
   trailingActions?: FeedAction[];
+  /**
+   * Render the feed's action UI (the top-right action bar: camera stepper,
+   * custom actions, quality / fullscreen / PiP). Default true. Set false to
+   * suppress the whole bar (e.g. a small tile where hover controls add
+   * nothing). Does not affect display-size reporting.
+   */
+  showActions?: boolean;
   /**
    * Override how the displayed video stream is sourced for the resolved
    * flightId. Omit (the default) to use the built-in `useKerbcastStream` —
@@ -369,6 +376,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enableQualityControl = false,
       actions,
       trailingActions,
+      showActions = true,
       useStream,
     },
     ref,
@@ -695,35 +703,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     );
 
     // -------------------------------------------------------------------------
-    // Render-size feedback (ResizeObserver, 500 ms debounce, 16:9 crop)
+    // Display-size reporting (auto-resolution). The feed self-measures its
+    // rendered box and reports it per-consumer; the sidecar maxes across
+    // consumers. Reports the real w x h (part cams are not square). Disabled by
+    // `renderSize="none"`. See useReportDisplaySize for debounce / bucketing.
     // -------------------------------------------------------------------------
-    const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    useEffect(() => {
-      if (renderSize !== "auto" || flightId === null) return;
-      const el = wrapRef.current;
-      if (!el) return;
-      const cam = client.camera(flightId);
-
-      const observer = new ResizeObserver((entries) => {
-        const entry = entries[0];
-        if (!entry) return;
-        const { width } = entry.contentRect;
-        if (resizeTimerRef.current !== null) clearTimeout(resizeTimerRef.current);
-        resizeTimerRef.current = setTimeout(() => {
-          const w = toEvenPx(width);
-          const h = toEvenPx((width * 9) / 16);
-          void cam.setRenderSize(w, h);
-        }, 500);
-      });
-
-      observer.observe(el);
-
-      return () => {
-        observer.disconnect();
-        if (resizeTimerRef.current !== null) clearTimeout(resizeTimerRef.current);
-      };
-    }, [client, flightId, renderSize]);
+    useReportDisplaySize(flightId, wrapRef, { enabled: renderSize === "auto" });
 
     // -------------------------------------------------------------------------
     // UI state
@@ -859,10 +844,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const builtInActions =
       flightId !== null && (pipAvailable || fullscreenAvailable || qualityAvailable);
     const hasActionBar =
-      hasCameras ||
-      (actions && actions.length > 0) ||
-      (trailingActions && trailingActions.length > 0) ||
-      builtInActions;
+      showActions &&
+      (hasCameras ||
+        (actions && actions.length > 0) ||
+        (trailingActions && trailingActions.length > 0) ||
+        builtInActions);
     const actionBar = hasActionBar ? (
         <ActionBar>
           {hasCameras && (
