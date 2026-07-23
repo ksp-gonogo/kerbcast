@@ -1,11 +1,14 @@
 /**
- * Tests for the CrewBar: it renders the kerbal face cams (not part cams), with
- * IVA/EVA badges and a SIGNAL LOST treatment for a destroyed kerbal, and it
- * reflows across placement modes + the dissolved (inline) variant.
+ * Tests for the CrewBar (merge OFF) and the merge-ON grid path.
  *
- * Fixture mirrors Tile.test.tsx / App.test.tsx: a real KerbcastClient +
- * MockSidecar wired through KerbcastProvider so useKerbcastCameras() returns
- * the live list.
+ * CrewBar: renders the OPEN kerbal face cams (not part cams), with IVA/EVA
+ * badges + SIGNAL LOST, reflows across placement modes, and drives the
+ * open/close model (close a face -> onClose; the Add crew menu lists closed
+ * kerbals -> onOpen). Merge ON: a kerbal cam flows through the regular Grid
+ * tile path (CameraFeed hosts it), so it's not filtered out.
+ *
+ * Fixture mirrors Tile.test.tsx: a real KerbcastClient + MockSidecar through
+ * KerbcastProvider so useKerbcastCameras() returns the live list.
  */
 
 import { CameraKind, CrewLocation, KerbcastClient } from "@ksp-gonogo/kerbcast";
@@ -13,9 +16,10 @@ import type { CameraLifecycle } from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { KerbcastProvider } from "@ksp-gonogo/kerbcast-react";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CrewBar } from "./CrewBar";
+import { Grid } from "./Grid";
 import type { CrewBarPlacement } from "./settings";
 
 const createdClients: KerbcastClient[] = [];
@@ -42,19 +46,29 @@ async function buildConnectedFixture(cameras: MockCameraInit[]) {
   return { client, sidecar };
 }
 
-function renderCrewBar(
-  client: KerbcastClient,
-  props: { placement?: CrewBarPlacement; inline?: boolean; minimised?: boolean } = {},
-) {
+interface CrewProps {
+  placement?: CrewBarPlacement;
+  minimised?: boolean;
+  closed?: ReadonlySet<number>;
+  onClose?: (id: number) => void;
+  onOpen?: (id: number) => void;
+}
+
+function renderCrewBar(client: KerbcastClient, props: CrewProps = {}) {
   return render(
     <KerbcastProvider client={client}>
-      <CrewBar placement={props.placement ?? "row"} inline={props.inline} minimised={props.minimised} />
+      <CrewBar
+        placement={props.placement ?? "row"}
+        minimised={props.minimised ?? false}
+        onToggleMinimise={() => {}}
+        closed={props.closed ?? new Set()}
+        onClose={props.onClose ?? (() => {})}
+        onOpen={props.onOpen ?? (() => {})}
+      />
     </KerbcastProvider>,
   );
 }
 
-// A representative roster: one part cam (must NOT appear in the bar), three
-// seated kerbals, one on EVA, one destroyed.
 const ROSTER: MockCameraInit[] = [
   { flightId: 101, cameraName: "NavCam", partName: "mumech.MuMechModuleHullCamera" },
   { flightId: 201, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Seat, cameraName: "Jebediah Kerman" },
@@ -82,7 +96,7 @@ afterEach(() => {
 });
 
 describe("CrewBar", () => {
-  it("renders the kerbal faces (not part cams), with IVA/EVA badges and SIGNAL LOST", async () => {
+  it("renders open kerbal faces (not part cams), with IVA/EVA badges and SIGNAL LOST", async () => {
     const { client } = await buildConnectedFixture(ROSTER);
 
     let container!: HTMLElement;
@@ -90,68 +104,113 @@ describe("CrewBar", () => {
       ({ container } = renderCrewBar(client));
     });
 
-    // Each kerbal is present; the part cam is not.
     expect(screen.getByText("Jebediah Kerman")).toBeTruthy();
     expect(screen.getByText("Valentina Kerman")).toBeTruthy();
     expect(screen.getByText("Kirrim Kerman")).toBeTruthy();
     expect(screen.queryByText("NavCam")).toBeNull();
 
-    // One face per kerbal, keyed by flightId.
-    const faces = container.querySelectorAll('[data-testid="crew-face"]');
-    expect(faces.length).toBe(3);
-
-    // Badges: two IVA (seated Jeb + Kirrim), one EVA (Val).
+    expect(container.querySelectorAll('[data-testid="crew-face"]').length).toBe(3);
     expect(screen.getAllByText("IVA").length).toBe(2);
     expect(screen.getAllByText("EVA").length).toBe(1);
-
-    // Destroyed kerbal shows SIGNAL LOST.
     expect(screen.getByText(/signal lost/i)).toBeTruthy();
-    const destroyed = container.querySelector('[data-flight-id="203"]');
-    expect(destroyed?.getAttribute("data-destroyed")).toBe("true");
+    expect(container.querySelector('[data-flight-id="203"]')?.getAttribute("data-destroyed")).toBe("true");
   });
 
   it("reflows across placement modes without changing the roster", async () => {
     const { client } = await buildConnectedFixture(ROSTER);
-
     for (const placement of ["row", "column", "wrap"] as CrewBarPlacement[]) {
       let container!: HTMLElement;
       await act(async () => {
         ({ container } = renderCrewBar(client, { placement }));
       });
-      const bar = container.querySelector('[data-testid="crew-bar"]');
-      expect(bar?.getAttribute("data-placement")).toBe(placement);
+      expect(container.querySelector('[data-testid="crew-bar"]')?.getAttribute("data-placement")).toBe(placement);
       expect(container.querySelectorAll('[data-testid="crew-face"]').length).toBe(3);
       cleanup();
     }
   });
 
-  it("dissolved (inline) renders the same faces as a wrap flow, no dock chrome", async () => {
+  it("closing a face calls onClose; a closed face is hidden and offered in Add crew", async () => {
     const { client } = await buildConnectedFixture(ROSTER);
+    const onOpen = vi.fn();
 
+    // Jeb (201) is closed: hidden from the faces, present in the Add crew menu.
     let container!: HTMLElement;
     await act(async () => {
-      ({ container } = renderCrewBar(client, { inline: true }));
+      ({ container } = renderCrewBar(client, { closed: new Set([201]), onOpen }));
     });
 
-    const bar = container.querySelector('[data-testid="crew-bar"]');
-    expect(bar?.getAttribute("data-inline")).toBe("true");
-    // Inline forces a wrap flow regardless of the placement prop.
-    expect(bar?.getAttribute("data-placement")).toBe("wrap");
-    // Same crew content.
-    expect(container.querySelectorAll('[data-testid="crew-face"]').length).toBe(3);
-    // No docked-bar minimise control in inline mode.
-    expect(screen.queryByRole("button", { name: /crew/i })).toBeNull();
+    // Only Val + Kirrim shown as faces; Jeb hidden.
+    expect(container.querySelectorAll('[data-testid="crew-face"]').length).toBe(2);
+    expect(container.querySelector('[data-flight-id="201"]')).toBeNull();
+
+    // Add crew menu lists the closed Jeb; picking it re-opens (onOpen(201)).
+    // The menu is a native <details>; open it directly (jsdom doesn't toggle on
+    // a summary click reliably) then pick the item.
+    expect(screen.getByText(/add crew/i)).toBeTruthy();
+    await act(async () => { container.querySelector("details")?.setAttribute("open", ""); });
+    const jebItem = screen.getByRole("button", { name: "Jebediah Kerman" });
+    await act(async () => { fireEvent.click(jebItem); });
+    expect(onOpen).toHaveBeenCalledWith(201);
+  });
+
+  it("close (x) on a face calls onClose with its flightId", async () => {
+    const { client } = await buildConnectedFixture(ROSTER);
+    const onClose = vi.fn();
+
+    await act(async () => { renderCrewBar(client, { onClose }); });
+
+    // The close action is the primitive's action button labelled "Close".
+    const closeButtons = screen.getAllByRole("button", { name: /^close$/i });
+    await act(async () => { fireEvent.click(closeButtons[0]); });
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("renders the header (Add crew) when all crew are closed", async () => {
+    const { client } = await buildConnectedFixture(ROSTER);
+    let container!: HTMLElement;
+    await act(async () => {
+      ({ container } = renderCrewBar(client, { closed: new Set([201, 202, 203]) }));
+    });
+    // Bar still present (so Add crew is reachable), but no faces.
+    expect(container.querySelector('[data-testid="crew-bar"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-testid="crew-face"]').length).toBe(0);
+    expect(screen.getByText(/add crew/i)).toBeTruthy();
   });
 
   it("renders nothing when there are no kerbal cams", async () => {
     const { client } = await buildConnectedFixture([
       { flightId: 101, cameraName: "NavCam", partName: "mumech.MuMechModuleHullCamera" },
     ]);
+    let container!: HTMLElement;
+    await act(async () => { ({ container } = renderCrewBar(client)); });
+    expect(container.querySelector('[data-testid="crew-bar"]')).toBeNull();
+  });
+});
+
+describe("merge (crew in the regular grid)", () => {
+  it("a kerbal cam renders as a grid tile via CameraFeed when merged", async () => {
+    const { client } = await buildConnectedFixture([
+      { flightId: 201, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Seat, cameraName: "Jebediah Kerman" },
+    ]);
 
     let container!: HTMLElement;
     await act(async () => {
-      ({ container } = renderCrewBar(client));
+      ({ container } = render(
+        <KerbcastProvider client={client}>
+          <Grid
+            mergeCrew={true}
+            tiles={[{ flightId: 201, spotlit: false, key: null }]}
+            onTilesChange={() => {}}
+            showDebugInfo={false}
+            showStatic={false}
+          />
+        </KerbcastProvider>,
+      ));
     });
-    expect(container.querySelector('[data-testid="crew-bar"]')).toBeNull();
+
+    // CameraFeed hosts the kerbal cam (a <video> is mounted, not the
+    // reconnecting placeholder) — it flows through the same tile path as parts.
+    expect(container.querySelector("video")).not.toBeNull();
+    expect(screen.queryByText(/camera reconnecting/i)).toBeNull();
   });
 });

@@ -10,13 +10,13 @@ interface SettingsProps {
   showStatic: boolean;
   showPerfWarnings: boolean;
   crewPlacement: CrewBarPlacement;
-  crewDissolve: boolean;
+  crewMerge: boolean;
   onThemeChange: (t: ThemePreference) => void;
   onDebugChange: (enabled: boolean) => void;
   onShowStaticChange: (enabled: boolean) => void;
   onShowPerfWarningsChange: (enabled: boolean) => void;
   onCrewPlacementChange: (placement: CrewBarPlacement) => void;
-  onCrewDissolveChange: (dissolve: boolean) => void;
+  onCrewMergeChange: (merge: boolean) => void;
   onClose: () => void;
 }
 
@@ -26,13 +26,13 @@ export function Settings({
   showStatic,
   showPerfWarnings,
   crewPlacement,
-  crewDissolve,
+  crewMerge,
   onThemeChange,
   onDebugChange,
   onShowStaticChange,
   onShowPerfWarningsChange,
   onCrewPlacementChange,
-  onCrewDissolveChange,
+  onCrewMergeChange,
   onClose,
 }: SettingsProps): React.JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -112,14 +112,14 @@ export function Settings({
 
         <FieldRow>
           <div>
-            <FieldLabel htmlFor="kc-crew-dissolve-toggle">Dissolve crew bar</FieldLabel>
-            <FieldHint>Show crew faces inline with the grid instead of a docked bar</FieldHint>
+            <FieldLabel htmlFor="kc-crew-merge-toggle">Merge crew into the camera list</FieldLabel>
+            <FieldHint>Show crew as ordinary camera tiles instead of a separate crew bar</FieldHint>
           </div>
           <input
-            id="kc-crew-dissolve-toggle"
+            id="kc-crew-merge-toggle"
             type="checkbox"
-            checked={crewDissolve}
-            onChange={(e) => onCrewDissolveChange(e.target.checked)}
+            checked={crewMerge}
+            onChange={(e) => onCrewMergeChange(e.target.checked)}
             style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
           />
         </FieldRow>
@@ -129,7 +129,7 @@ export function Settings({
           <NativeSelect
             id="kc-crew-placement-select"
             value={crewPlacement}
-            disabled={crewDissolve}
+            disabled={crewMerge}
             onChange={(e) => onCrewPlacementChange(e.target.value as CrewBarPlacement)}
           >
             <option value="row">Bottom row</option>

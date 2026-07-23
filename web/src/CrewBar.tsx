@@ -1,88 +1,105 @@
 /**
- * CrewBar — the crew face-camera surface.
+ * CrewBar — the crew face-camera surface (shown when crew are NOT merged into
+ * the regular camera list).
  *
- * Camera-driven: renders every `kind === "kerbal"` camera as a square
+ * Camera-driven: renders every OPEN `kind === "kerbal"` camera as a square
  * KerbalFaceFeed (keyed by flightId), with a name label, an IVA/EVA badge from
- * crewLocation, and a SIGNAL LOST treatment for a destroyed kerbal. Kerbal cams
- * are never part of the part-camera tile grid, so this is their single home.
+ * crewLocation, and a SIGNAL LOST treatment for a destroyed kerbal.
+ *
+ * Open/close mirrors the part cameras' add/remove: each face has a close (x);
+ * closed crew move into an "Add crew" menu in the header and can be reopened.
+ * The open/closed set is owned + persisted by the App (like the tile grid), so
+ * it survives reload; default (nothing stored) is all-open.
  *
  * Placement (row / column / wrap) and minimise are CSS-only reflows of the SAME
- * mounted feeds — the "never remount a live feed on re-layout" rule: switching
- * placement or minimising never unmounts a KerbalFaceFeed. `inline` mode (crew
- * bar dissolved) drops the dock chrome and always wraps, so the faces read as
- * part of the main content flow instead of a docked bar.
+ * mounted feeds — switching either never remounts a KerbalFaceFeed.
  */
 
 import { CrewLocation } from "@ksp-gonogo/kerbcast";
 import type { CameraState } from "@ksp-gonogo/kerbcast";
-import { KerbalFaceFeed, isCameraDestroyed, useKerbcastCameras } from "@ksp-gonogo/kerbcast-react";
+import { KerbalFaceFeed, buildCameraLabeler, isCameraDestroyed, useKerbcastCameras } from "@ksp-gonogo/kerbcast-react";
 import type { FeedAction } from "@ksp-gonogo/kerbcast-react";
-import { Maximize2, PanelBottomClose, PanelBottomOpen, X } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { PanelBottomClose, PanelBottomOpen, Plus, X } from "lucide-react";
+import { useMemo, useRef } from "react";
 import styled from "styled-components";
 import type { CrewBarPlacement } from "./settings";
 
 interface CrewBarProps {
-  /** Dock layout (ignored when `inline`, which always wraps). */
   placement: CrewBarPlacement;
-  /** Dissolved: render inline in the content flow, no dock chrome / minimise. */
-  inline?: boolean;
-  /** Collapsed out of the way (feeds stay mounted). Docked mode only. */
-  minimised?: boolean;
-  onToggleMinimise?: () => void;
+  /** Collapsed out of the way (feeds stay mounted). Transient. */
+  minimised: boolean;
+  onToggleMinimise: () => void;
+  /** Wire-ids of closed (hidden) crew faces. */
+  closed: ReadonlySet<number>;
+  onClose: (flightId: number) => void;
+  onOpen: (flightId: number) => void;
 }
 
 export function CrewBar({
   placement,
-  inline = false,
-  minimised = false,
+  minimised,
   onToggleMinimise,
+  closed,
+  onClose,
+  onOpen,
 }: CrewBarProps): React.JSX.Element | null {
   const cameras = useKerbcastCameras();
   const kerbals = useMemo(
     () => cameras.filter((c) => c.kind === "kerbal"),
     [cameras],
   );
+  const labelFor = useMemo(() => buildCameraLabeler(cameras), [cameras]);
 
-  // Dismissed faces (session-only: a user hiding a face this visit).
-  const [dismissed, setDismissed] = useState<ReadonlySet<number>>(() => new Set());
-  const dismiss = (flightId: number) =>
-    setDismissed((prev) => {
-      const next = new Set(prev);
-      next.add(flightId);
-      return next;
-    });
+  // No crew cameras at all -> render nothing (don't reserve empty space). When
+  // crew exist but are all closed we still render the header so "Add crew" is
+  // reachable to reopen them.
+  if (kerbals.length === 0) return null;
 
-  const visible = kerbals.filter((k) => !dismissed.has(k.flightId));
-
-  // Nothing to show: no crew cameras at all (or all dismissed) -> render
-  // nothing, so the bar doesn't reserve empty space.
-  if (visible.length === 0) return null;
-
-  // Inline (dissolved) always wraps; docked uses the chosen placement.
-  const effPlacement: CrewBarPlacement = inline ? "wrap" : placement;
+  const open = kerbals.filter((k) => !closed.has(k.flightId));
+  const closedKerbals = kerbals.filter((k) => closed.has(k.flightId));
 
   return (
-    <Root $placement={effPlacement} $inline={inline} data-testid="crew-bar" data-placement={effPlacement} data-inline={inline}>
-      {!inline && (
-        <Bar>
-          <BarTitle>Crew</BarTitle>
-          {onToggleMinimise && (
-            <MinButton
-              type="button"
-              aria-label={minimised ? "Show crew" : "Hide crew"}
-              aria-pressed={minimised}
-              onClick={onToggleMinimise}
-            >
-              {minimised ? <PanelBottomOpen size={15} aria-hidden="true" /> : <PanelBottomClose size={15} aria-hidden="true" />}
-            </MinButton>
+    <Root $placement={placement} data-testid="crew-bar" data-placement={placement}>
+      <Bar>
+        <BarTitle>Crew</BarTitle>
+        <BarControls>
+          {closedKerbals.length > 0 && (
+            <AddCrew>
+              <AddCrewSummary aria-label="Add crew">
+                <Plus size={14} strokeWidth={2} aria-hidden="true" />
+                Add crew
+              </AddCrewSummary>
+              <AddCrewMenu>
+                {closedKerbals.map((k) => (
+                  <AddCrewItem
+                    key={k.flightId}
+                    type="button"
+                    onClick={(e) => {
+                      onOpen(k.flightId);
+                      // Close the native disclosure after picking.
+                      e.currentTarget.closest("details")?.removeAttribute("open");
+                    }}
+                  >
+                    {labelFor(k)}
+                  </AddCrewItem>
+                ))}
+              </AddCrewMenu>
+            </AddCrew>
           )}
-        </Bar>
-      )}
+          <MinButton
+            type="button"
+            aria-label={minimised ? "Show crew" : "Hide crew"}
+            aria-pressed={minimised}
+            onClick={onToggleMinimise}
+          >
+            {minimised ? <PanelBottomOpen size={15} aria-hidden="true" /> : <PanelBottomClose size={15} aria-hidden="true" />}
+          </MinButton>
+        </BarControls>
+      </Bar>
       {/* Faces stay mounted when minimised — collapsed via CSS, never unmounted. */}
-      <Faces $placement={effPlacement} $minimised={!inline && minimised} aria-hidden={!inline && minimised}>
-        {visible.map((k) => (
-          <CrewFace key={k.flightId} cam={k} onDismiss={() => dismiss(k.flightId)} />
+      <Faces $placement={placement} $minimised={minimised} aria-hidden={minimised}>
+        {open.map((k) => (
+          <CrewFace key={k.flightId} cam={k} onClose={() => onClose(k.flightId)} />
         ))}
       </Faces>
     </Root>
@@ -93,7 +110,7 @@ export function CrewBar({
 // A single crew face
 // ---------------------------------------------------------------------------
 
-function CrewFace({ cam, onDismiss }: { cam: CameraState; onDismiss: () => void }): React.JSX.Element {
+function CrewFace({ cam, onClose }: { cam: CameraState; onClose: () => void }): React.JSX.Element {
   const wrapRef = useRef<HTMLDivElement>(null);
   const destroyed = isCameraDestroyed(cam);
   const eva = cam.crewLocation === CrewLocation.Eva;
@@ -101,27 +118,22 @@ function CrewFace({ cam, onDismiss }: { cam: CameraState; onDismiss: () => void 
 
   // Fullscreen the FACE CONTAINER (the video goes fullscreen with it) — the
   // KerbalFaceFeed primitive doesn't expose its <video>, so element fullscreen
-  // on the wrapper is the composable path. Dismiss hides this face this visit.
+  // on the wrapper is the composable path. Close hides this face from the bar
+  // (persisted; reopen via the Add crew menu).
   const actions = useMemo<FeedAction[]>(
     () => [
       {
-        id: "fullscreen",
-        label: "Fullscreen",
-        icon: <Maximize2 size={13} strokeWidth={2} aria-hidden="true" />,
-        onClick: () => toggleFullscreen(wrapRef.current),
-      },
-      {
-        id: "dismiss",
-        label: "Dismiss",
+        id: "close",
+        label: "Close",
         icon: <X size={13} strokeWidth={2} aria-hidden="true" />,
-        onClick: onDismiss,
+        onClick: onClose,
       },
     ],
-    [onDismiss],
+    [onClose],
   );
 
   return (
-    <FaceWrap ref={wrapRef} data-testid="crew-face" data-flight-id={cam.flightId} data-destroyed={destroyed}>
+    <FaceWrap ref={wrapRef} data-testid="crew-face" data-flight-id={cam.flightId} data-destroyed={destroyed} onDoubleClick={() => toggleFullscreen(wrapRef.current)}>
       <KerbalFaceFeed flightId={cam.flightId} actions={actions} showStandby={!destroyed}>
         <Overlay>
           <Badge $eva={eva}>{eva ? "EVA" : "IVA"}</Badge>
@@ -155,25 +167,20 @@ function toggleFullscreen(el: HTMLElement | null): void {
 /** Fixed square edge for a crew face (px). */
 const FACE = 132;
 
-const Root = styled.div<{ $placement: CrewBarPlacement; $inline: boolean }>`
+const Root = styled.div<{ $placement: CrewBarPlacement }>`
   display: flex;
   flex-direction: column;
   min-height: 0;
   ${(p) =>
-    p.$inline
+    p.$placement === "column"
       ? `
-    /* Dissolved: sits in the content flow, full width, no dock chrome. */
-    padding: 0.75rem 1rem 0;
-  `
-      : p.$placement === "column"
-        ? `
     /* Side column: fixed-width vertical dock. */
     width: ${FACE + 32}px;
     flex: 0 0 auto;
     border-left: 1px solid var(--kc-border, rgba(255,255,255,0.1));
     background: var(--kc-surface, rgba(0,0,0,0.15));
   `
-        : `
+      : `
     /* Bottom dock (row / wrap): full-width horizontal strip. */
     flex: 0 0 auto;
     border-top: 1px solid var(--kc-border, rgba(255,255,255,0.1));
@@ -195,6 +202,75 @@ const BarTitle = styled.span`
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--kc-text-muted, rgba(255,255,255,0.6));
+`;
+
+const BarControls = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+`;
+
+const AddCrew = styled.details`
+  position: relative;
+`;
+
+const AddCrewSummary = styled.summary`
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.68rem;
+  border-radius: 3px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--kc-text-muted, rgba(255,255,255,0.6));
+
+  &::-webkit-details-marker {
+    display: none;
+  }
+  &:hover {
+    color: var(--kc-text, #fff);
+    background: rgba(255, 255, 255, 0.08);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--kc-accent, #6ab0ff);
+    outline-offset: 2px;
+  }
+`;
+
+const AddCrewMenu = styled.div`
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  margin-top: 4px;
+  min-width: 160px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  border-radius: 6px;
+  background: var(--kc-surface-raised, #222);
+  border: 1px solid var(--kc-border, rgba(255,255,255,0.12));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+`;
+
+const AddCrewItem = styled.button`
+  text-align: left;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.75rem;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--kc-text, #fff);
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--kc-accent, #6ab0ff);
+    outline-offset: -2px;
+  }
 `;
 
 const MinButton = styled.button`

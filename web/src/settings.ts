@@ -15,7 +15,10 @@ const KEY_DEBUG = "kerbcast:debug";
 const KEY_SHOW_STATIC = "kerbcast:showStatic";
 const KEY_SHOW_PERF_WARNINGS = "kerbcast:showPerfWarnings";
 const KEY_CREW_BAR_PLACEMENT = "kerbcast:crewBarPlacement";
-const KEY_CREW_BAR_DISSOLVE = "kerbcast:crewBarDissolve";
+// Kept for continuity though the semantics are now "merge into the camera list"
+// (kerbal cams become regular grid tiles) rather than the old inline-dissolve.
+const KEY_CREW_MERGE = "kerbcast:crewBarDissolve";
+const KEY_CREW_CLOSED = "kerbcast:crewClosed";
 
 export function loadTheme(): ThemePreference {
   const raw = localStorage.getItem(KEY_THEME);
@@ -84,14 +87,40 @@ export function saveCrewBarPlacement(placement: CrewBarPlacement): void {
 }
 
 /**
- * Dissolve preference. When true the crew bar is dissolved: kerbal face cams
- * render inline in the main content area instead of a docked bar. Defaults to
- * false (docked bar) when unset.
+ * Merge preference. When true, kerbal face cams are merged into the regular
+ * camera list: they become ordinary grid tiles (seedable / addable / in the
+ * camera dropdowns) and NO separate crew bar is shown. Defaults to false (crew
+ * shown only in the docked crew bar) when unset.
  */
-export function loadCrewBarDissolve(): boolean {
-  return localStorage.getItem(KEY_CREW_BAR_DISSOLVE) === "true";
+export function loadCrewMerge(): boolean {
+  return localStorage.getItem(KEY_CREW_MERGE) === "true";
 }
 
-export function saveCrewBarDissolve(dissolve: boolean): void {
-  localStorage.setItem(KEY_CREW_BAR_DISSOLVE, String(dissolve));
+export function saveCrewMerge(merge: boolean): void {
+  localStorage.setItem(KEY_CREW_MERGE, String(merge));
+}
+
+/**
+ * Closed crew wire-ids (the faces a user has closed out of the crew bar).
+ * Absent = none closed = all crew open. Crew wire-ids are name-stable, so a
+ * closed face stays closed across seat<->EVA and reload.
+ */
+export function loadClosedCrew(): number[] {
+  try {
+    const raw = localStorage.getItem(KEY_CREW_CLOSED);
+    if (raw === null) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is number => typeof v === "number");
+  } catch {
+    return [];
+  }
+}
+
+export function saveClosedCrew(flightIds: number[]): void {
+  try {
+    localStorage.setItem(KEY_CREW_CLOSED, JSON.stringify(flightIds));
+  } catch {
+    // ignore (private browsing / storage full)
+  }
 }
