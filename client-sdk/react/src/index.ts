@@ -40,3 +40,7 @@ export type {
   CameraStreamHook,
   FeedAction,
 } from "./CameraFeed";
+
+// KerbalFaceFeed — shared single-kerbal-face primitive
+export { KerbalFaceFeed } from "./KerbalFaceFeed";
+export type { KerbalFaceFeedProps, KerbalFeedState } from "./KerbalFaceFeed";
