@@ -138,6 +138,22 @@ jobs:
             -buildTarget Linux64 \
             -logFile -
 
+      # Camera-orientation proof: a four-corner marker frame blitted through
+      # each capture blit branch (plain / NightVision / filter-probe) must come
+      # back with every corner unmoved. Catches the NightVision d3d11 upside-
+      # down bug (GitHub #5) and exercises the HullcamFilterBlit probe. glcore
+      # here; the Windows job runs the d3d11 side. Same xvfb arrangement.
+      - name: Camera orientation proof (Linux bundle, glcore)
+        working-directory: ci/kerbcast-shaders
+        timeout-minutes: 10
+        run: |
+          xvfb-run -a "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcastCI.CameraOrientation.RenderAll \
+            -buildTarget Linux64 \
+            -logFile -
+
       - uses: actions/upload-artifact@v4
         with:
           name: kerbcast-shaders-unix
@@ -217,6 +233,27 @@ jobs:
             -buildTarget Win64 \
             -logFile unity-smoke.log || status=$?
           cat unity-smoke.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
+          exit "$status"
+
+      # d3d11 side of the camera-orientation proof (see the Linux step). This is
+      # where the NightVision branch is expected RED until the shader fix: its
+      # vert_img inverts on top-left-origin D3D11. batchmode without -nographics
+      # so a real device exists.
+      - name: Camera orientation proof (Windows bundle, d3d11)
+        working-directory: ci/kerbcast-shaders
+        timeout-minutes: 10
+        shell: bash
+        env:
+          KERBCAST_SMOKE_BUNDLE_DIR: Bundles-windows
+        run: |
+          status=0
+          "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcastCI.CameraOrientation.RenderAll \
+            -buildTarget Win64 \
+            -logFile unity-orient.log || status=$?
+          cat unity-orient.log 2>/dev/null || echo "::error::Unity wrote no log (exit $status): editor launch failed before logging"
           exit "$status"
 
       - uses: actions/upload-artifact@v4
