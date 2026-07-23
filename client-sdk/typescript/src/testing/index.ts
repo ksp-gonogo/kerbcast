@@ -130,6 +130,9 @@ export class MockSidecar {
   private _onTrackHandler:
     | ((track: MediaStreamTrack, idx: number, mid: string) => void)
     | undefined;
+  private _subscribeHandler:
+    | ((flightId: number, mid: string) => void)
+    | undefined;
   private _trackIdx = 0;
   /** Slot mids available for the dynamic-subscription model. Override with
    *  {@link withSlots} before connecting if a test needs a specific pool. */
@@ -303,6 +306,16 @@ export class MockSidecar {
   deliverTrack(mid: string, track: MediaStreamTrack): void {
     this._deliveredTracks.set(mid, track);
     this._onTrackHandler?.(track, this._trackIdx++, mid);
+  }
+
+  /**
+   * Register a handler fired each time a `subscribe` binds a camera to a slot,
+   * with `(flightId, mid)`. A browser harness uses it to deliver that camera's
+   * track to the mid it was actually bound to — so tracks follow the real
+   * subscription order, not the registration/array order. Set before connecting.
+   */
+  onSubscribe(handler: (flightId: number, mid: string) => void): void {
+    this._subscribeHandler = handler;
   }
 
   /** The slot mid currently carrying `flightId`, or undefined. */
@@ -544,6 +557,9 @@ export class MockSidecar {
             type: "slot-map",
             content: { mid: freeMid, flightId },
           });
+          // Let a harness deliver this camera's track to the slot it was just
+          // bound to (so tracks follow the actual subscription, not array order).
+          this._subscribeHandler?.(flightId, freeMid);
         }
         break;
       }

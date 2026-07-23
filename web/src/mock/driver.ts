@@ -200,32 +200,38 @@ export async function createMockClient(): Promise<KerbcastClient> {
   }
 
   /*
-   * Canvas tracks are built once per camera and reused across reconnects;
-   * the canvases keep animating regardless of connection state.
+   * Canvas tracks are built once per camera (keyed by flightId, drawing that
+   * camera's own name/hue) and reused across reconnects; the canvases keep
+   * animating regardless of connection state.
+   *
+   * Delivery follows the actual SUBSCRIPTION, not array order: the app decides
+   * which cameras to subscribe (crew bar + grid, in its own order), the mock
+   * binds each to a free slot, and onSubscribe fires (flightId, mid) so we
+   * deliver THAT camera's track to THAT slot. Delivering by array index instead
+   * crossed the feeds once the subscribed set stopped matching array order.
    */
   const tracks = new Map<number, MediaStreamTrack>();
-  const deliverTracks = () => {
-    let slotIdx = 0;
-    for (let i = 0; i < MOCK_CAMERAS.length; i++) {
-      const cam = MOCK_CAMERAS[i];
-      if ((cam.lifecycle ?? CameraLifecycle.Active) === CameraLifecycle.Destroyed) {
-        slotIdx++;
-        continue;
-      }
-      const mid = String(slotIdx);
-      let track = tracks.get(cam.flightId);
-      if (!track) {
-        // Kerbal face cams render SQUARE; part cams stay 16:9.
-        const square = cam.kind === CameraKind.Kerbal;
-        const w = square ? 360 : 640;
-        const h = 360;
-        track = buildCanvasTrack(cam.cameraName ?? "Camera", CAMERA_HUES[i] ?? 0, w, h);
-        tracks.set(cam.flightId, track);
-      }
-      sidecar.deliverTrack(mid, track);
-      slotIdx++;
-    }
+  const trackFor = (flightId: number): MediaStreamTrack | undefined => {
+    const existing = tracks.get(flightId);
+    if (existing) return existing;
+    const i = MOCK_CAMERAS.findIndex((c) => c.flightId === flightId);
+    if (i < 0) return undefined;
+    const cam = MOCK_CAMERAS[i];
+    // Destroyed cams have no live track (the UI shows SIGNAL LOST).
+    if ((cam.lifecycle ?? CameraLifecycle.Active) === CameraLifecycle.Destroyed) return undefined;
+    // Kerbal face cams render SQUARE; part cams stay 16:9.
+    const square = cam.kind === CameraKind.Kerbal;
+    const track = buildCanvasTrack(cam.cameraName ?? "Camera", CAMERA_HUES[i] ?? 0, square ? 360 : 640, 360);
+    tracks.set(flightId, track);
+    return track;
   };
+
+  // Registered before connect: fires for every subscribe (incl. re-subscribe
+  // after a reconnect), so a camera's track always lands on its bound slot.
+  sidecar.onSubscribe((flightId, mid) => {
+    const track = trackFor(flightId);
+    if (track) sidecar.deliverTrack(mid, track);
+  });
 
   const mockClient = new KerbcastClient(
     {
@@ -240,7 +246,8 @@ export async function createMockClient(): Promise<KerbcastClient> {
         setTimeout(() => {
           sidecar.open();
           sidecar.setConnectionState("connected");
-          deliverTracks();
+          // Tracks are delivered per-subscription via the onSubscribe handler
+          // above, so there's nothing to push eagerly here.
         }, 50);
         return answer;
       },
