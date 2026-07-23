@@ -335,7 +335,7 @@ impl KerbcastPeer {
     /// rendering on the next reaper tick instead of waiting for the consume
     /// loop's lazy dead-Weak prune (which a staggered camera can starve).
     pub async fn release_all(&self, registry: &Arc<CameraRegistry>) {
-        release_all_bound(registry, self.peer_id, &self.slots).await;
+        release_all_bound(registry, &self.slots).await;
     }
 
     /// Tracks of this peer's slots currently bound to `flight_id` (0 or 1
@@ -546,7 +546,10 @@ async fn handle_client_message(
                 peer_id,
                 "client requested graceful disconnect — releasing cameras"
             );
-            release_all_bound(&registry, peer_id, &slots).await;
+            release_all_bound(&registry, &slots).await;
+            // Peer-scoped display-size clear: sweeps EVERY camera this peer
+            // reported a size for, including any it never bound a slot to.
+            registry.forget_display_size_all(peer_id).await;
         }
     }
 }
@@ -647,6 +650,13 @@ async fn handle_unsubscribe(
     dc: &Arc<RTCDataChannel>,
     flight_id: u32,
 ) {
+    // Clear-on-departure FIRST, before the slot early-out: an explicit
+    // Unsubscribe(X) must forget this peer's reported display size for X even
+    // when X was never bound to a slot (a report is not binding-gated), so the
+    // MAX relaxes and can't pin high. Also covers the rebind-away path (a slot
+    // only rebinds after an unsubscribe).
+    registry.forget_display_size(flight_id, peer_id).await;
+
     let (track, mid) = {
         let mut guard = slots.lock().await;
         match guard.iter_mut().find(|s| s.bound == Some(flight_id)) {
@@ -654,14 +664,9 @@ async fn handle_unsubscribe(
                 slot.bound = None;
                 (slot.track.clone(), slot.mid.clone())
             }
-            None => return, // not bound to any slot — nothing to do
+            None => return, // not bound to any slot — nothing more to do
         }
     };
-
-    // Clear-on-departure: this peer no longer displays this camera (explicit
-    // unsubscribe, and the rebind-away path — a slot only rebinds after an
-    // unsubscribe), so forget its display size and let the MAX relax.
-    registry.forget_display_size(flight_id, peer_id).await;
 
     if let Some(cam) = registry.get(flight_id).await {
         let remaining = cam.remove_track(&track).await;
@@ -694,11 +699,12 @@ async fn handle_unsubscribe(
 /// is already gone). Decrements immediately — no dependence on the consume
 /// loop's lazy dead-Weak prune (which a staggered camera's reduced frame
 /// cadence can starve). Idempotent: a second call finds nothing bound.
-async fn release_all_bound(
-    registry: &Arc<CameraRegistry>,
-    peer_id: u32,
-    slots: &Arc<Mutex<Vec<Slot>>>,
-) {
+async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec<Slot>>>) {
+    // NOTE: display-size clear-on-departure is NOT done here — it is
+    // peer-scoped (forget_display_size_all), not binding-scoped, because a
+    // report can exist for a camera this peer never bound. Callers on the
+    // peer-death paths (graceful Disconnect, the reaper) invoke
+    // forget_display_size_all separately.
     let bound: Vec<(u32, Arc<TrackLocalStaticSample>)> = {
         let mut guard = slots.lock().await;
         let mut v = Vec::new();
@@ -710,10 +716,6 @@ async fn release_all_bound(
         v
     };
     for (flight_id, track) in bound {
-        // Clear-on-departure for every camera this peer was displaying (graceful
-        // Disconnect and, via release_all, the dead-peer reap). Idempotent with
-        // the reaper's belt-and-braces forget in the consume loop.
-        registry.forget_display_size(flight_id, peer_id).await;
         if let Some(cam) = registry.get(flight_id).await {
             let remaining = cam.remove_track(&track).await;
             if remaining == 0 {
