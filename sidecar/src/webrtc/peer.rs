@@ -52,10 +52,10 @@ use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorPayload, ErrorSource,
-    FlightIdPayload, HelloPayload, Layer, QualityPreset, SceneStateChangedPayload, ServerMessage,
-    SetDegradePayload, SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload,
-    SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload, SetZoomRatePayload,
-    SlotMapPayload,
+    FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
+    SceneStateChangedPayload, ServerMessage, SetDegradePayload, SetFovPayload, SetLayersPayload,
+    SetPanPayload, SetPanRatePayload, SetQualityPayload, SetRenderSizePayload,
+    SetThrottleMainScreenPayload, SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -335,7 +335,7 @@ impl KerbcastPeer {
     /// rendering on the next reaper tick instead of waiting for the consume
     /// loop's lazy dead-Weak prune (which a staggered camera can starve).
     pub async fn release_all(&self, registry: &Arc<CameraRegistry>) {
-        release_all_bound(registry, &self.slots).await;
+        release_all_bound(registry, self.peer_id, &self.slots).await;
     }
 
     /// Tracks of this peer's slots currently bound to `flight_id` (0 or 1
@@ -471,11 +471,19 @@ async fn handle_client_message(
         }) => {
             apply_render_size_change(&registry, &dc, flight_id, width, height).await;
         }
-        // TODO(S6-T2): record this per-consumer display size into the camera's
-        // MAX-across-consumers resolution tracker (and clear it on unsubscribe /
-        // peer reap). No-op until the tracker lands; parses today so the wire
-        // message is accepted rather than erroring.
-        ClientMessage::ReportDisplaySize(_payload) => {}
+        // A consumer reporting its own display px for one camera. Recorded
+        // keyed by peer_id into the per-camera MAX-across-consumers tracker;
+        // forgotten on unsubscribe / disconnect / peer reap (below + in the
+        // consume-loop reaper) so the max relaxes when it leaves.
+        ClientMessage::ReportDisplaySize(ReportDisplaySizePayload {
+            flight_id,
+            width,
+            height,
+        }) => {
+            registry
+                .record_display_size(flight_id, peer_id, width, height)
+                .await;
+        }
         ClientMessage::SetFov(SetFovPayload { flight_id, fov }) => {
             apply_fov_change(&registry, &dc, flight_id, fov).await;
         }
@@ -516,7 +524,7 @@ async fn handle_client_message(
             handle_subscribe(&registry, &slots, &dc, flight_id).await;
         }
         ClientMessage::Unsubscribe(FlightIdPayload { flight_id }) => {
-            handle_unsubscribe(&registry, &slots, &dc, flight_id).await;
+            handle_unsubscribe(&registry, peer_id, &slots, &dc, flight_id).await;
         }
         ClientMessage::Pong => {
             // No-op — the peer is alive by virtue of having sent this.
@@ -538,7 +546,7 @@ async fn handle_client_message(
                 peer_id,
                 "client requested graceful disconnect — releasing cameras"
             );
-            release_all_bound(&registry, &slots).await;
+            release_all_bound(&registry, peer_id, &slots).await;
         }
     }
 }
@@ -634,6 +642,7 @@ async fn handle_subscribe(
 /// subscribe); the camera sleeps once its last viewer leaves.
 async fn handle_unsubscribe(
     registry: &Arc<CameraRegistry>,
+    peer_id: u32,
     slots: &Arc<Mutex<Vec<Slot>>>,
     dc: &Arc<RTCDataChannel>,
     flight_id: u32,
@@ -648,6 +657,11 @@ async fn handle_unsubscribe(
             None => return, // not bound to any slot — nothing to do
         }
     };
+
+    // Clear-on-departure: this peer no longer displays this camera (explicit
+    // unsubscribe, and the rebind-away path — a slot only rebinds after an
+    // unsubscribe), so forget its display size and let the MAX relax.
+    registry.forget_display_size(flight_id, peer_id).await;
 
     if let Some(cam) = registry.get(flight_id).await {
         let remaining = cam.remove_track(&track).await;
@@ -680,7 +694,11 @@ async fn handle_unsubscribe(
 /// is already gone). Decrements immediately — no dependence on the consume
 /// loop's lazy dead-Weak prune (which a staggered camera's reduced frame
 /// cadence can starve). Idempotent: a second call finds nothing bound.
-async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec<Slot>>>) {
+async fn release_all_bound(
+    registry: &Arc<CameraRegistry>,
+    peer_id: u32,
+    slots: &Arc<Mutex<Vec<Slot>>>,
+) {
     let bound: Vec<(u32, Arc<TrackLocalStaticSample>)> = {
         let mut guard = slots.lock().await;
         let mut v = Vec::new();
@@ -692,6 +710,10 @@ async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec
         v
     };
     for (flight_id, track) in bound {
+        // Clear-on-departure for every camera this peer was displaying (graceful
+        // Disconnect and, via release_all, the dead-peer reap). Idempotent with
+        // the reaper's belt-and-braces forget in the consume loop.
+        registry.forget_display_size(flight_id, peer_id).await;
         if let Some(cam) = registry.get(flight_id).await {
             let remaining = cam.remove_track(&track).await;
             if remaining == 0 {
@@ -847,14 +869,13 @@ async fn apply_render_size_change(
     let w = make_even(width.min(cam.max_width));
     let h = make_even(height.min(cam.max_height));
 
-    let snapshot = {
-        let mut ctrl = cam.control.lock().await;
-        ctrl.width = Some(w);
-        ctrl.height = Some(h);
-        ctrl.clone()
-    };
-
-    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+    // SetRenderSize is now a CAP, not a direct set: it bounds the auto
+    // MAX-across-consumers resolution rather than clobbering it. The effective
+    // size flushed to the plugin is min(auto, this cap).
+    if let Err(e) = registry
+        .set_manual_render_size(flight_id, Some((w, h)))
+        .await
+    {
         warn!(flight_id, error = %e, "control file flush failed");
         send_server_message(
             dc,
@@ -871,7 +892,7 @@ async fn apply_render_size_change(
         flight_id,
         width = w,
         height = h,
-        "data-channel set-render-size applied"
+        "data-channel set-render-size applied (manual cap)"
     );
     push_camera_state(registry, dc, flight_id).await;
 }

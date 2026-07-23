@@ -405,9 +405,14 @@ async fn consume_loop(
             peer.release_all(&registry).await;
             // Deadman: a browser that dropped mid-hold must not leave a
             // camera drifting to its travel limit. Zero the persistent
-            // pan/zoom rates on every camera this peer was driving.
+            // pan/zoom rates on every camera this peer was driving. Also
+            // forget this peer's reported display size on each (belt to
+            // release_all's braces) so the auto-resolution MAX relaxes when a
+            // large-display consumer drops — the v1.6.3 clear-on-departure
+            // lesson: never rely on a single clear site for a per-consumer max.
             for flight_id in driven_flight_ids {
                 registry.zero_rates(flight_id).await;
+                registry.forget_display_size(flight_id, peer.peer_id).await;
             }
         }
 

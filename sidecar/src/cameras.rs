@@ -454,6 +454,20 @@ pub struct CameraState {
     /// dropped peers get GC'd from this list naturally — no manual unsub
     /// bookkeeping per peer needed.
     pub tracks: RwLock<Vec<Weak<TrackLocalStaticSample>>>,
+    /// Per-consumer reported display size in px, keyed by `peer_id` (stable for
+    /// the connection's lifetime, present at the report site AND every teardown
+    /// site). Auto-resolution takes the per-dimension MAX across live entries;
+    /// entries are FORGOTTEN on unsubscribe / disconnect / peer-reap so the max
+    /// relaxes when a large-display consumer leaves (the v1.6.3 clear-on-
+    /// departure lesson). Mirrors `bandwidth_estimates` (a per-consumer map that
+    /// reduces), NOT the `effective_degrade` scalar — display size is a genuine
+    /// per-consumer need, not a camera-global property.
+    pub display_sizes: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
+    /// Operator `SetRenderSize` CAP (even, clamped to the ring max), or `None`
+    /// = uncapped. The effective render size is min(auto MAX-across-consumers,
+    /// this cap): a manual size can only LOWER what auto would pick, never raise
+    /// it past what consumers actually need.
+    pub manual_render_cap: Mutex<Option<(u32, u32)>>,
 }
 
 impl CameraState {
@@ -550,6 +564,63 @@ impl CameraState {
         *cur = next;
         true
     }
+
+    /// Record a consumer's reported display size (px) for auto-resolution,
+    /// keyed by `peer_id`. Mirrors `record_bandwidth_estimate`.
+    pub async fn record_display_size(&self, peer_id: u32, width: u32, height: u32) {
+        self.display_sizes
+            .lock()
+            .await
+            .insert(peer_id, (width, height));
+    }
+
+    /// Forget a consumer's display size (on unsubscribe / disconnect / peer
+    /// reap) so the MAX relaxes. Mirrors `forget_estimate`. Idempotent — a
+    /// second call, or one for a peer that never reported, is a no-op.
+    pub async fn forget_display_size(&self, peer_id: u32) {
+        self.display_sizes.lock().await.remove(&peer_id);
+    }
+
+    /// Set (or clear, with `None`) the operator `SetRenderSize` cap.
+    pub async fn set_manual_render_cap(&self, cap: Option<(u32, u32)>) {
+        *self.manual_render_cap.lock().await = cap;
+    }
+
+    /// Effective render size = min(auto MAX-across-consumers, manual cap),
+    /// clamped to the ring's max dims and made even (H.264 chroma). `None` when
+    /// there is neither a consumer demand nor a manual cap — the plugin then
+    /// falls back to its settings.cfg default. This is what gets written into
+    /// `ControlState.width/height`; the plugin's adaptive-shed min() still rides
+    /// underneath.
+    pub async fn effective_render_size(&self) -> Option<(u32, u32)> {
+        let auto = {
+            let sizes = self.display_sizes.lock().await;
+            sizes
+                .values()
+                .copied()
+                .reduce(|(aw, ah), (w, h)| (aw.max(w), ah.max(h)))
+        };
+        let cap = *self.manual_render_cap.lock().await;
+        let combined = match (auto, cap) {
+            (Some((aw, ah)), Some((cw, ch))) => Some((aw.min(cw), ah.min(ch))),
+            (Some(a), None) => Some(a),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        combined.map(|(w, h)| {
+            (
+                even_clamp(w, self.max_width),
+                even_clamp(h, self.max_height),
+            )
+        })
+    }
+}
+
+/// Clamp a requested dimension to the ring's allocated max and force it even
+/// (H.264 chroma needs even dims; anything over the ring max would be rejected
+/// by the plugin's `MmapFrameRing.Produce`).
+fn even_clamp(v: u32, max: u32) -> u32 {
+    (v.min(max)) & !1
 }
 
 /// Registry of cameras. Owns the rescan logic that discovers new rings
@@ -999,6 +1070,8 @@ impl CameraRegistry {
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
                             tracks: RwLock::new(Vec::new()),
+                            display_sizes: Mutex::new(std::collections::HashMap::new()),
+                            manual_render_cap: Mutex::new(None),
                             control: Mutex::new(ControlState::default()),
                             control_block: std::sync::Mutex::new(None),
                         }),
@@ -1408,6 +1481,68 @@ impl CameraRegistry {
         Ok(())
     }
 
+    /// Recompute a camera's effective render size (auto MAX-across-consumers ∩
+    /// manual cap) and flush it into `ControlState.width/height` → the plugin.
+    /// Called after any display-size report, forget, or manual-cap change. The
+    /// plugin's adaptive-shed min() still rides underneath on the game side.
+    pub async fn flush_effective_render_size(&self, flight_id: u32) -> std::io::Result<()> {
+        let Some(cam) = self.get(flight_id).await else {
+            return Ok(()); // camera gone this tick — nothing to flush
+        };
+        let eff = cam.effective_render_size().await;
+        let snapshot = {
+            let mut ctrl = cam.control.lock().await;
+            let (w, h) = match eff {
+                Some((w, h)) => (Some(w), Some(h)),
+                None => (None, None),
+            };
+            ctrl.width = w;
+            ctrl.height = h;
+            ctrl.clone()
+        };
+        self.flush_control(flight_id, &snapshot).await?;
+        self.mark_camera_dirty(flight_id).await;
+        Ok(())
+    }
+
+    /// A consumer reported its display size for a camera: record it (keyed by
+    /// `peer_id`) and reflush the effective size. See `ReportDisplaySize`.
+    pub async fn record_display_size(&self, flight_id: u32, peer_id: u32, width: u32, height: u32) {
+        match self.get(flight_id).await {
+            Some(cam) => cam.record_display_size(peer_id, width, height).await,
+            None => return,
+        }
+        if let Err(e) = self.flush_effective_render_size(flight_id).await {
+            warn!(flight_id, error = %e, "display-size record flush failed");
+        }
+    }
+
+    /// A consumer went away (unsubscribe / disconnect / peer reap): forget its
+    /// display size and reflush so the MAX relaxes. Idempotent.
+    pub async fn forget_display_size(&self, flight_id: u32, peer_id: u32) {
+        match self.get(flight_id).await {
+            Some(cam) => cam.forget_display_size(peer_id).await,
+            None => return,
+        }
+        if let Err(e) = self.flush_effective_render_size(flight_id).await {
+            warn!(flight_id, error = %e, "display-size forget flush failed");
+        }
+    }
+
+    /// Operator `SetRenderSize`: set (or clear) the manual cap and reflush the
+    /// effective size (min(auto, cap)).
+    pub async fn set_manual_render_size(
+        &self,
+        flight_id: u32,
+        cap: Option<(u32, u32)>,
+    ) -> std::io::Result<()> {
+        match self.get(flight_id).await {
+            Some(cam) => cam.set_manual_render_cap(cap).await,
+            None => return Ok(()),
+        }
+        self.flush_effective_render_size(flight_id).await
+    }
+
     /// Flag a camera for a state broadcast on the consume loop's next tick.
     pub async fn mark_camera_dirty(&self, flight_id: u32) {
         self.dirty_cameras.lock().await.insert(flight_id);
@@ -1745,6 +1880,69 @@ mod tests {
             CameraLifecycle::Active,
             "unknown lifecycle in info.json should be treated as Active"
         );
+    }
+
+    /// Helper: attach one camera with a large max so display reports up to
+    /// 512 fit without the max-dim clamp, and hand back the live CameraState.
+    /// Keeps the TempDir alive for the caller's lifetime.
+    async fn attach_camera_for_tracker(flight_id: u32) -> (tempfile::TempDir, Arc<CameraState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 1024,
+            max_height: 1024,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        (dir, cam)
+    }
+
+    /// Auto-resolution aggregates each consumer's reported display size as the
+    /// per-dimension MAX across live consumers (meet-the-minimum-need).
+    #[tokio::test]
+    async fn display_size_tracker_takes_max_across_consumers() {
+        let (_dir, cam) = attach_camera_for_tracker(7_001).await;
+        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(2, 512, 512).await;
+        assert_eq!(cam.effective_render_size().await, Some((512, 512)));
+    }
+
+    /// THE clear-on-departure regression guard (the v1.6.3 leak was a missed
+    /// clear): forgetting the large consumer must RELAX the effective size back
+    /// down, not leave it pinned high.
+    #[tokio::test]
+    async fn display_size_relaxes_when_large_consumer_departs() {
+        let (_dir, cam) = attach_camera_for_tracker(7_002).await;
+        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(2, 512, 512).await;
+        assert_eq!(cam.effective_render_size().await, Some((512, 512)));
+
+        cam.forget_display_size(2).await;
+        assert_eq!(
+            cam.effective_render_size().await,
+            Some((40, 40)),
+            "effective size must relax after the large consumer departs (clear-on-departure)"
+        );
+
+        // Last consumer gone -> no auto demand at all.
+        cam.forget_display_size(1).await;
+        assert_eq!(cam.effective_render_size().await, None);
+    }
+
+    /// A manual SetRenderSize acts as a CAP: effective = min(auto_max, manual).
+    #[tokio::test]
+    async fn manual_render_cap_bounds_the_auto_max() {
+        let (_dir, cam) = attach_camera_for_tracker(7_003).await;
+        cam.record_display_size(1, 512, 512).await;
+        cam.set_manual_render_cap(Some((256, 256))).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 256)));
+
+        // Clearing the cap frees it back to the auto max.
+        cam.set_manual_render_cap(None).await;
+        assert_eq!(cam.effective_render_size().await, Some((512, 512)));
     }
 
     /// A kerbal-camera manifest (`kind:"kerbal"`, a persistent id, a crew
