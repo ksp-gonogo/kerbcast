@@ -22,7 +22,7 @@
  *  - Station (brokered) mode -- gonogo-only KerbcastDataSource.attachBroker.
  */
 
-import { KerbcastClient, QualityPreset } from "@ksp-gonogo/kerbcast";
+import { KerbcastClient, QualityPreset, TrackMode } from "@ksp-gonogo/kerbcast";
 import type { CameraLifecycle, ClientMessage } from "@ksp-gonogo/kerbcast";
 import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
@@ -108,6 +108,7 @@ function toInit(c: CameraStateLike): MockCameraInit {
     degradeLevel: c.degradeLevel as number | undefined,
     viewerQuality: c.viewerQuality as QualityPreset | undefined,
     qualityLimitedBy: c.qualityLimitedBy as string | undefined,
+    trackMode: c.trackMode as TrackMode | undefined,
   };
 }
 
@@ -154,6 +155,7 @@ function renderFeed(
     showDebugInfo?: boolean;
     renderSize?: "auto" | "none";
     enableQualityControl?: boolean;
+    enableTracking?: boolean;
     showStatic?: boolean;
     showStandbyIcon?: boolean;
     showActions?: boolean;
@@ -1714,5 +1716,133 @@ describe("CameraFeed - client prop override", () => {
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "Override Cam" })).toBeTruthy();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tracking (crosshair) — auto-track a moving vessel, server-authoritative
+// ---------------------------------------------------------------------------
+
+describe("CameraFeed - tracking (crosshair)", () => {
+  function panZoomCam(overrides: Record<string, unknown> = {}) {
+    return makeCamera({
+      flightId: 42,
+      cameraName: "Launchpad Cam",
+      supportsPan: true,
+      supportsZoom: true,
+      panPitchMin: -90,
+      panPitchMax: 90,
+      ...overrides,
+    });
+  }
+
+  it("shows the crosshair on a pan+zoom camera when enableTracking", async () => {
+    const { client } = await buildConnectedSource([panZoomCam()]);
+    const { queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    expect(queryByLabelText("Auto-track")).toBeTruthy();
+  });
+
+  it("hides the crosshair without enableTracking", async () => {
+    const { client } = await buildConnectedSource([panZoomCam()]);
+    const { queryByLabelText } = renderFeed(client, { flightId: 42 });
+    expect(queryByLabelText("Auto-track")).toBeNull();
+  });
+
+  it("hides the crosshair when the camera lacks pan or zoom", async () => {
+    const { client } = await buildConnectedSource([
+      makeCamera({ flightId: 42, supportsPan: true, supportsZoom: false }),
+    ]);
+    const { queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    expect(queryByLabelText("Auto-track")).toBeNull();
+  });
+
+  it("clicking a mode sends set-track-target with that mode", async () => {
+    const { client, sidecar } = await buildConnectedSource([panZoomCam()]);
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    fireEvent.click(getByLabelText("Auto-track"));
+    fireEvent.click(
+      await screen.findByRole("menuitemradio", { name: "Track active vessel" }),
+    );
+    expect(sidecar.lastCommand("set-track-target", 42)?.content.mode).toBe(
+      TrackMode.ActiveVessel,
+    );
+  });
+
+  it("highlight reflects the SERVER trackMode, never the click (not optimistic)", async () => {
+    const { client, sidecar } = await buildConnectedSource([panZoomCam()]);
+    // Suppress the echo so a click alone cannot flip the highlight; only a
+    // real server state change may.
+    const spy = vi.spyOn(client, "setTrackTarget").mockResolvedValue();
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    expect(getByLabelText("Auto-track").getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(getByLabelText("Auto-track"));
+    fireEvent.click(
+      await screen.findByRole("menuitemradio", { name: "Track target" }),
+    );
+    expect(spy).toHaveBeenCalledWith(42, TrackMode.Target);
+    // No echo yet -> highlight must stay off.
+    expect(getByLabelText("Auto-track").getAttribute("aria-pressed")).toBe("false");
+
+    // Server confirms -> highlight turns on.
+    await act(async () => {
+      sidecar.updateCamera(42, { trackMode: TrackMode.Target });
+    });
+    expect(getByLabelText("Auto-track").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("clicking the active mode deselects to none", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      panZoomCam({ trackMode: TrackMode.ActiveVessel }),
+    ]);
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    fireEvent.click(getByLabelText("Auto-track"));
+    fireEvent.click(
+      await screen.findByRole("menuitemradio", { name: "Track active vessel" }),
+    );
+    expect(sidecar.lastCommand("set-track-target", 42)?.content.mode).toBe(
+      TrackMode.None,
+    );
+  });
+
+  it("disables the manual pan + zoom controls while tracking", async () => {
+    const { client } = await buildConnectedSource([
+      panZoomCam({ trackMode: TrackMode.Target }),
+    ]);
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    expect((getByLabelText("Zoom in") as HTMLButtonElement).disabled).toBe(true);
+    expect((getByLabelText("Zoom out") as HTMLButtonElement).disabled).toBe(true);
+    expect((getByLabelText("Pan left") as HTMLButtonElement).disabled).toBe(true);
+    expect((getByLabelText("Pan right") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps manual pan + zoom enabled when not tracking", async () => {
+    const { client } = await buildConnectedSource([
+      panZoomCam({ trackMode: TrackMode.None }),
+    ]);
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+    });
+    expect((getByLabelText("Zoom in") as HTMLButtonElement).disabled).toBe(false);
+    expect((getByLabelText("Pan left") as HTMLButtonElement).disabled).toBe(false);
   });
 });

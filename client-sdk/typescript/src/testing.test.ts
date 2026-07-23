@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { CameraLifecycle, Layer } from "./__generated__/types";
+import { CameraLifecycle, Layer, TrackMode } from "./__generated__/types";
 import { KerbcastClient } from "./index";
 import { MockSidecar } from "./testing/index";
 
@@ -140,6 +140,27 @@ describe("MockSidecar", () => {
     // Advisory: reporting a display size must NOT be translated into an
     // operator set-render-size command (that path is the manual cap only).
     expect(sidecar.commands.some((c) => c.type === "set-render-size")).toBe(false);
+  });
+
+  it("set-track-target updates trackMode and echoes it to the client (server-authoritative)", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 7, supportsPan: true, supportsZoom: true });
+
+    const client = new KerbcastClient(
+      { host: "localhost", port: 8088 },
+      sidecar.createTransport(),
+    );
+    await client.connect([7]);
+    sidecar.open();
+
+    await client.setTrackTarget(7, TrackMode.Target);
+    expect(sidecar.lastCommand("set-track-target", 7)?.content.mode).toBe(TrackMode.Target);
+    // The mock echoes camera-state-changed so every client reflects the same
+    // server-held mode (never optimistic-local).
+    expect(client.cameras.find((c) => c.flightId === 7)?.trackMode).toBe(TrackMode.Target);
+
+    await client.setTrackTarget(7, TrackMode.None);
+    expect(client.cameras.find((c) => c.flightId === 7)?.trackMode).toBe(TrackMode.None);
   });
 
   it("updateCamera pushes state-change to the client", async () => {

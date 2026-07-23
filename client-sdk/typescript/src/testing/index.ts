@@ -1,5 +1,5 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraKind, CameraLifecycle, CrewLocation, ErrorSource, Layer, QualityPreset } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CrewLocation, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
 import type {
   InboundVideoStats,
   KerbcastConnectionState,
@@ -44,6 +44,8 @@ export interface MockCameraInit {
   degradeLevel?: number;
   viewerQuality?: QualityPreset;
   qualityLimitedBy?: string;
+  /** Server-authoritative auto-track mode. Defaults to `None` (untracked). */
+  trackMode?: TrackMode;
 }
 
 function buildCamera(init: MockCameraInit): CameraState {
@@ -79,6 +81,7 @@ function buildCamera(init: MockCameraInit): CameraState {
     degradeLevel: init.degradeLevel ?? 0,
     viewerQuality: init.viewerQuality,
     qualityLimitedBy: init.qualityLimitedBy,
+    trackMode: init.trackMode ?? TrackMode.None,
   };
 }
 
@@ -541,6 +544,18 @@ export class MockSidecar {
         };
         this._cameras.set(msg.content.flightId, updated);
         this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
+        break;
+      }
+      case "set-track-target": {
+        // Server-authoritative: hold the chosen mode and broadcast it back as
+        // camera-state-changed, mirroring the sidecar so every browser reflects
+        // the same trackMode (never optimistic-local).
+        const cam = this._cameras.get(msg.content.flightId);
+        if (cam) {
+          const updated: CameraState = { ...cam, trackMode: msg.content.mode };
+          this._cameras.set(msg.content.flightId, updated);
+          this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
+        }
         break;
       }
       case "subscribe": {

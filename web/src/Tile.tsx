@@ -199,6 +199,7 @@ export function Tile({
           enableFullscreen
           enablePictureInPicture
           enableQualityControl
+          enableTracking
           actions={actions}
           trailingActions={trailingActions}
         />

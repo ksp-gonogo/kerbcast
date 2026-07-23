@@ -1,5 +1,5 @@
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
-import { PanZoomController, QualityPreset } from "@ksp-gonogo/kerbcast";
+import { PanZoomController, QualityPreset, TrackMode } from "@ksp-gonogo/kerbcast";
 import {
   forwardRef,
   useCallback,
@@ -320,6 +320,16 @@ export interface CameraFeedProps {
    */
   enableQualityControl?: boolean;
   /**
+   * Show a built-in auto-track (crosshair) control, only on pan+zoom cameras.
+   * A tri-state toggle group (off / track active vessel / track target): the
+   * camera aims itself at the chosen moving vessel (and auto-zooms) with no kOS.
+   * State is SERVER-authoritative: the highlight reflects `CameraState.trackMode`
+   * published by the sidecar, never the local click, so two browsers agree.
+   * While tracking, the manual pan/zoom controls are disabled (the aim loop owns
+   * the gimbal + FoV). Default false.
+   */
+  enableTracking?: boolean;
+  /**
    * Consumer-injected action buttons, rendered left of the built-in
    * fullscreen/PiP controls in the top-right action bar.
    */
@@ -374,6 +384,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enableFullscreen = false,
       enablePictureInPicture = false,
       enableQualityControl = false,
+      enableTracking = false,
       actions,
       trailingActions,
       showActions = true,
@@ -557,6 +568,14 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const isDestroyed = camera ? isCameraDestroyed(camera) : false;
     const showPan = camera?.supportsPan && !isDestroyed;
     const showZoom = camera?.supportsZoom && !isDestroyed;
+
+    // Auto-track state is server-authoritative: driven purely by the published
+    // trackMode (absent -> none), never local click. While tracking, the aim
+    // loop owns the gimbal + FoV, so the manual pan/zoom controls are disabled
+    // (they jitter against the track and are no-ops in practice).
+    const trackMode = camera?.trackMode ?? TrackMode.None;
+    const tracking = trackMode !== TrackMode.None;
+    const manualDisabled = tracking;
     const supportsPitch =
       !!camera && camera.panPitchMax - camera.panPitchMin > 0;
 
@@ -761,6 +780,38 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       [client, flightId, closeQualityMenu],
     );
 
+    // -------------------------------------------------------------------------
+    // Auto-track control (opt-in, pan+zoom cameras only). A crosshair button +
+    // menu with the two modes. Sends the intent; the highlight follows the
+    // server-published trackMode (above), so two browsers agree.
+    // -------------------------------------------------------------------------
+    const trackingAvailable =
+      enableTracking &&
+      flightId !== null &&
+      camera !== null &&
+      camera.supportsPan === true &&
+      camera.supportsZoom === true &&
+      !isDestroyed;
+    const trackingMenuId = useId();
+    const trackingMenu = usePortalMenu({
+      maxWidth: QUALITY_MENU_MAX_WIDTH,
+      maxHeight: QUALITY_MENU_MAX_HEIGHT,
+      align: "end",
+    });
+    const closeTrackingMenu = trackingMenu.close;
+
+    const selectTrack = useCallback(
+      (mode: TrackMode) => {
+        if (flightId === null) return;
+        // Tri-state: clicking the already-active mode hands aiming back (none).
+        // Decision reads the server-confirmed trackMode, not a local toggle.
+        const next = trackMode === mode ? TrackMode.None : mode;
+        void client.setTrackTarget(flightId, next);
+        closeTrackingMenu();
+      },
+      [client, flightId, trackMode, closeTrackingMenu],
+    );
+
     const topOverlay = (
       <TopOverlay>
         <TitleRow>
@@ -842,7 +893,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     );
 
     const builtInActions =
-      flightId !== null && (pipAvailable || fullscreenAvailable || qualityAvailable);
+      flightId !== null &&
+      (pipAvailable || fullscreenAvailable || qualityAvailable || trackingAvailable);
     const hasActionBar =
       showActions &&
       (hasCameras ||
@@ -890,6 +942,28 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             >
               <QualityIcon />
               {qualityThrottled && <ThrottledDot aria-hidden="true" />}
+            </OverlayIconButton>
+          )}
+          {trackingAvailable && (
+            <OverlayIconButton
+              ref={trackingMenu.triggerRef}
+              type="button"
+              aria-label="Auto-track"
+              aria-haspopup="menu"
+              aria-expanded={trackingMenu.open}
+              aria-controls={trackingMenuId}
+              aria-pressed={tracking}
+              title={
+                tracking
+                  ? trackMode === TrackMode.Target
+                    ? "Auto-tracking target"
+                    : "Auto-tracking active vessel"
+                  : "Auto-track a vessel"
+              }
+              $active={tracking || trackingMenu.open}
+              onClick={trackingMenu.toggle}
+            >
+              <CrosshairIcon />
             </OverlayIconButton>
           )}
           {flightId !== null && pipAvailable && (
@@ -981,6 +1055,39 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 </QualityMenu>,
                 document.body,
               )}
+            {trackingAvailable &&
+              trackingMenu.open &&
+              trackingMenu.position &&
+              camera &&
+              createPortal(
+                <QualityMenu
+                  ref={trackingMenu.menuRef}
+                  id={trackingMenuId}
+                  role="menu"
+                  aria-label="Auto-track"
+                  style={trackingMenu.position}
+                >
+                  <CameraMenuItem
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={trackMode === TrackMode.ActiveVessel}
+                    $selected={trackMode === TrackMode.ActiveVessel}
+                    onClick={() => selectTrack(TrackMode.ActiveVessel)}
+                  >
+                    Track active vessel
+                  </CameraMenuItem>
+                  <CameraMenuItem
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={trackMode === TrackMode.Target}
+                    $selected={trackMode === TrackMode.Target}
+                    onClick={() => selectTrack(TrackMode.Target)}
+                  >
+                    Track target
+                  </CameraMenuItem>
+                </QualityMenu>,
+                document.body,
+              )}
             {outOfFlight ? (
               showStandbyIcon && (
                 <StandbyOverlay role="status" aria-label="Standby, no active flight">
@@ -1008,11 +1115,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
               </>
             )}
             {showZoom && (
-              <ZoomControlsWrap>
+              <ZoomControlsWrap $disabled={manualDisabled} aria-hidden={manualDisabled}>
                 <ZoomButton
                   type="button"
                   aria-label="Zoom in"
                   $pos="top"
+                  disabled={manualDisabled}
                   onPointerDown={() =>
                     controllerRef.current?.setZoomRate(1)
                   }
@@ -1032,6 +1140,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   max={camera.fovMax}
                   step={0.5}
                   value={sliderFov}
+                  disabled={manualDisabled}
                   onChange={(e) => {
                     const v = Number(e.target.value);
                     controllerRef.current?.fovSliderInput(v);
@@ -1050,6 +1159,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   type="button"
                   aria-label="Zoom out"
                   $pos="bottom"
+                  disabled={manualDisabled}
                   onPointerDown={() => controllerRef.current?.setZoomRate(-1)}
                   onPointerUp={() => controllerRef.current?.setZoomRate(0)}
                   onPointerLeave={() => controllerRef.current?.setZoomRate(0)}
@@ -1063,12 +1173,17 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
               </ZoomControlsWrap>
             )}
             {showPan && (
-              <PanControl role="group" aria-label="Pan camera">
+              <PanControl
+                role="group"
+                aria-label="Pan camera"
+                $disabled={manualDisabled}
+                aria-hidden={manualDisabled}
+              >
                 <PanArrow
                   type="button"
                   $dir="up"
                   aria-label="Pan up"
-                  disabled={!supportsPitch}
+                  disabled={manualDisabled || !supportsPitch}
                   onClick={() => controllerRef.current?.nudgePan(0, 1)}
                 >
                   &#9650;
@@ -1077,7 +1192,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   type="button"
                   $dir="down"
                   aria-label="Pan down"
-                  disabled={!supportsPitch}
+                  disabled={manualDisabled || !supportsPitch}
                   onClick={() => controllerRef.current?.nudgePan(0, -1)}
                 >
                   &#9660;
@@ -1086,6 +1201,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   type="button"
                   $dir="left"
                   aria-label="Pan left"
+                  disabled={manualDisabled}
                   onClick={() => controllerRef.current?.nudgePan(-1, 0)}
                 >
                   &#9664;
@@ -1094,6 +1210,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   type="button"
                   $dir="right"
                   aria-label="Pan right"
+                  disabled={manualDisabled}
                   onClick={() => controllerRef.current?.nudgePan(1, 0)}
                 >
                   &#9654;
@@ -1101,10 +1218,10 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 <PanBall
                   aria-hidden="true"
                   title="Drag to pan"
-                  onPointerDown={handleBallDown}
-                  onPointerMove={handleBallMove}
-                  onPointerUp={handleBallUp}
-                  onPointerCancel={handleBallUp}
+                  onPointerDown={manualDisabled ? undefined : handleBallDown}
+                  onPointerMove={manualDisabled ? undefined : handleBallMove}
+                  onPointerUp={manualDisabled ? undefined : handleBallUp}
+                  onPointerCancel={manualDisabled ? undefined : handleBallUp}
                   style={{
                     transform: `translate(${ballPos.x}px, ${ballPos.y}px)`,
                   }}
@@ -1197,6 +1314,16 @@ function QualityIcon() {
   );
 }
 
+/* Auto-track: a crosshair / reticle. */
+function CrosshairIcon() {
+  return (
+    <svg {...iconProps}>
+      <circle cx="8" cy="8" r="4.5" />
+      <path d="M8 1v2.5M8 12.5V15M1 8h2.5M12.5 8H15" />
+    </svg>
+  );
+}
+
 /* Stale badge: fading signal bars (tallest dimmed). */
 function StaleIcon() {
   return (
@@ -1228,7 +1355,7 @@ function PictureInPictureIcon() {
 // Styled components
 // ---------------------------------------------------------------------------
 
-const PanControl = styled.div`
+const PanControl = styled.div<{ $disabled?: boolean }>`
   position: absolute;
   bottom: 10px;
   right: 10px;
@@ -1237,6 +1364,9 @@ const PanControl = styled.div`
   opacity: 0;
   transition: opacity 0.15s;
   touch-action: none;
+
+  /* Greyed + inert while auto-tracking owns the gimbal. */
+  ${(p) => p.$disabled && "pointer-events: none; filter: grayscale(1) opacity(0.4);"}
 
   @media (prefers-reduced-motion: reduce) {
     transition: none;
@@ -1308,7 +1438,7 @@ const PanBall = styled.div`
   }
 `;
 
-const ZoomControlsWrap = styled.div`
+const ZoomControlsWrap = styled.div<{ $disabled?: boolean }>`
   position: absolute;
   bottom: 8px;
   left: 8px;
@@ -1320,6 +1450,9 @@ const ZoomControlsWrap = styled.div`
   border: 1px solid rgba(255, 255, 255, 0.5);
   opacity: 0;
   transition: opacity 0.15s;
+
+  /* Greyed + inert while auto-tracking owns the FoV. */
+  ${(p) => p.$disabled && "pointer-events: none; filter: grayscale(1) opacity(0.4);"}
 
   @media (prefers-reduced-motion: reduce) {
     transition: none;
@@ -1640,14 +1773,19 @@ const OverlayIconButton = styled.button<{ $active?: boolean }>`
   align-items: center;
   justify-content: center;
   padding: 0;
+  /* Active-toggle fill (quality / tracking / PiP / fullscreen / custom actions
+     all share this button). Its own token so a consumer can recolour just the
+     action-row highlight without touching the general accent; defaults to
+     --kerbcast-accent, so the sidecar web page (which maps its accent onto that)
+     is unchanged. */
   background: ${(p) =>
     p.$active
-      ? "var(--kerbcast-accent, #00ff88)"
+      ? "var(--kerbcast-action-active, var(--kerbcast-accent, #00ff88))"
       : "rgba(0, 0, 0, 0.5)"};
   border: 1px solid
     ${(p) =>
       p.$active
-        ? "var(--kerbcast-accent, #00ff88)"
+        ? "var(--kerbcast-action-active, var(--kerbcast-accent, #00ff88))"
         : "rgba(255, 255, 255, 0.3)"};
   border-radius: 3px;
   color: ${(p) => (p.$active ? "#000" : "#fff")};
@@ -1658,7 +1796,7 @@ const OverlayIconButton = styled.button<{ $active?: boolean }>`
     &:hover {
       background: ${(p) =>
         p.$active
-          ? "var(--kerbcast-accent, #00ff88)"
+          ? "var(--kerbcast-action-active, var(--kerbcast-accent, #00ff88))"
           : "rgba(0, 0, 0, 0.7)"};
       border-color: rgba(255, 255, 255, 0.6);
     }
