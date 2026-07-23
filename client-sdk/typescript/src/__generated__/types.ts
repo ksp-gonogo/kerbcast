@@ -394,8 +394,11 @@ export type ClientMessage =
 	 */
 	| { type: "set-layers", content: SetLayersPayload }
 	/**
-	 * Override the operator render size for one camera. Even pixels
-	 * only (H.264 chroma); server caps at the ring's allocated max.
+	 * Cap the auto-resolution for one camera. As of Stage 6 this is a
+	 * CEILING on the demand-driven size (effective = min(auto max-across-
+	 * consumers, this cap)), NOT an authoritative set: it cannot force a
+	 * camera larger than current consumers report, only smaller. Even
+	 * pixels only (H.264 chroma); server caps at the ring's allocated max.
 	 */
 	| { type: "set-render-size", content: SetRenderSizePayload }
 	/**
