@@ -1,5 +1,5 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraLifecycle, ErrorSource, Layer, QualityPreset } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CrewLocation, ErrorSource, Layer, QualityPreset } from "../__generated__/types";
 import type {
   InboundVideoStats,
   KerbcastConnectionState,
@@ -11,6 +11,13 @@ import type {
 export interface MockCameraInit {
   flightId: number;
   lifecycle?: CameraLifecycle;
+  /** Part vs kerbal face camera. Defaults to `part` when omitted, so existing
+   *  part-cam callers are unchanged. */
+  kind?: CameraKind;
+  /** Only meaningful for `kind: Kerbal`: seated IVA portrait vs EVA view. */
+  crewLocation?: CrewLocation;
+  /** Only meaningful for `kind: Kerbal`: informational raw persistentID. */
+  kerbalPersistentId?: number;
   partName?: string;
   partTitle?: string;
   cameraName?: string;
@@ -43,6 +50,9 @@ function buildCamera(init: MockCameraInit): CameraState {
   return {
     flightId: init.flightId,
     lifecycle: init.lifecycle ?? CameraLifecycle.Active,
+    kind: init.kind ?? CameraKind.Part,
+    crewLocation: init.crewLocation,
+    kerbalPersistentId: init.kerbalPersistentId,
     partName: init.partName ?? `part-${init.flightId}`,
     partTitle: init.partTitle ?? `Part ${init.flightId}`,
     cameraName: init.cameraName ?? `camera-${init.flightId}`,
