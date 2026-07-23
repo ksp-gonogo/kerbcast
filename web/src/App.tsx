@@ -17,6 +17,7 @@ import {
   loadClosedCrew,
   loadCrewBarPlacement,
   loadCrewMerge,
+  loadCrewSpotlight,
   loadDebug,
   loadShowPerfWarnings,
   loadShowStatic,
@@ -24,6 +25,7 @@ import {
   saveClosedCrew,
   saveCrewBarPlacement,
   saveCrewMerge,
+  saveCrewSpotlight,
   saveDebug,
   saveShowPerfWarnings,
   saveShowStatic,
@@ -97,6 +99,15 @@ export function App({ client }: AppProps): React.JSX.Element {
       if (isClosed) next.add(flightId);
       else next.delete(flightId);
       saveClosedCrew([...next]);
+      return next;
+    });
+  }, []);
+  // Spotlit crew face (single, persisted). Toggling the same id clears it.
+  const [crewSpotlight, setCrewSpotlight] = useState<number | null>(() => loadCrewSpotlight());
+  const toggleCrewSpotlight = useCallback((flightId: number) => {
+    setCrewSpotlight((cur) => {
+      const next = cur === flightId ? null : flightId;
+      saveCrewSpotlight(next);
       return next;
     });
   }, []);
@@ -185,6 +196,8 @@ export function App({ client }: AppProps): React.JSX.Element {
                 closed={closedCrew}
                 onClose={(flightId) => setCrewClosed(flightId, true)}
                 onOpen={(flightId) => setCrewClosed(flightId, false)}
+                spotlight={crewSpotlight}
+                onToggleSpotlight={toggleCrewSpotlight}
               />
             )}
           </DockLayout>

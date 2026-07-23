@@ -52,6 +52,8 @@ interface CrewProps {
   closed?: ReadonlySet<number>;
   onClose?: (id: number) => void;
   onOpen?: (id: number) => void;
+  spotlight?: number | null;
+  onToggleSpotlight?: (id: number) => void;
 }
 
 function renderCrewBar(client: KerbcastClient, props: CrewProps = {}) {
@@ -64,6 +66,8 @@ function renderCrewBar(client: KerbcastClient, props: CrewProps = {}) {
         closed={props.closed ?? new Set()}
         onClose={props.onClose ?? (() => {})}
         onOpen={props.onOpen ?? (() => {})}
+        spotlight={props.spotlight ?? null}
+        onToggleSpotlight={props.onToggleSpotlight ?? (() => {})}
       />
     </KerbcastProvider>,
   );
@@ -189,23 +193,48 @@ describe("CrewBar", () => {
     expect(screen.getByRole("button", { name: /^close$/i })).toBeTruthy();
   });
 
-  it("spotlight toggles on the SAME face node (no remount)", async () => {
+  it("clicking spotlight requests the toggle for that face's flightId", async () => {
     const { client } = await buildConnectedFixture([
       { flightId: 201, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Seat, cameraName: "Jebediah Kerman" },
     ]);
-    let container!: HTMLElement;
-    await act(async () => { ({ container } = renderCrewBar(client)); });
-
-    const before = container.querySelector('[data-flight-id="201"]');
-    expect(before?.getAttribute("data-spotlit")).toBe("false");
-
+    const onToggleSpotlight = vi.fn();
+    await act(async () => { renderCrewBar(client, { onToggleSpotlight }); });
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: /spotlight this feed/i })); });
+    expect(onToggleSpotlight).toHaveBeenCalledWith(201);
+  });
 
-    const after = container.querySelector('[data-flight-id="201"]');
-    expect(after).toBe(before); // identical DOM node — CSS reflow, not a remount
-    expect(after?.getAttribute("data-spotlit")).toBe("true");
-    // Toggle icon flips to the un-spotlight affordance.
-    expect(screen.getByRole("button", { name: /remove from spotlight/i })).toBeTruthy();
+  it("spotlighting floats the face to FIRST and flips it in place (same node, no remount)", async () => {
+    const { client } = await buildConnectedFixture([
+      { flightId: 201, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Seat, cameraName: "Jebediah Kerman" },
+      { flightId: 202, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Eva, cameraName: "Valentina Kerman" },
+    ]);
+
+    // Controlled: the App owns the spotlit id; drive it via the prop (rerender).
+    const props = (spotlight: number | null) => (
+      <KerbcastProvider client={client}>
+        <CrewBar placement="wrap" minimised={false} onToggleMinimise={() => {}}
+          closed={new Set()} onClose={() => {}} onOpen={() => {}}
+          spotlight={spotlight} onToggleSpotlight={() => {}} />
+      </KerbcastProvider>
+    );
+
+    let container!: HTMLElement;
+    let rerender!: (ui: React.ReactElement) => void;
+    await act(async () => { ({ container, rerender } = render(props(null))); });
+
+    const val0 = container.querySelector('[data-flight-id="202"]');
+    expect(val0?.getAttribute("data-spotlit")).toBe("false");
+    // Natural order: Jeb (201) first, Val (202) second.
+    let faces = [...container.querySelectorAll('[data-testid="crew-face"]')];
+    expect(faces[0].getAttribute("data-flight-id")).toBe("201");
+
+    // Spotlight Val: floats to FIRST, data-spotlit true, IDENTICAL DOM node.
+    await act(async () => { rerender(props(202)); });
+    const val1 = container.querySelector('[data-flight-id="202"]');
+    expect(val1).toBe(val0); // moved by keyed reconciliation, not remounted
+    expect(val1?.getAttribute("data-spotlit")).toBe("true");
+    faces = [...container.querySelectorAll('[data-testid="crew-face"]')];
+    expect(faces[0].getAttribute("data-flight-id")).toBe("202"); // floated first
   });
 
   it("never remounts a face across placement + minimise changes (same instance)", async () => {
@@ -223,6 +252,8 @@ describe("CrewBar", () => {
           closed={new Set()}
           onClose={() => {}}
           onOpen={() => {}}
+          spotlight={null}
+          onToggleSpotlight={() => {}}
         />
       </KerbcastProvider>
     );
@@ -280,5 +311,27 @@ describe("merge (crew in the regular grid)", () => {
     // reconnecting placeholder) — it flows through the same tile path as parts.
     expect(container.querySelector("video")).not.toBeNull();
     expect(screen.queryByText(/camera reconnecting/i)).toBeNull();
+  });
+
+  it("a merged kerbal tile is spotlightable via the part-grid path", async () => {
+    const { client } = await buildConnectedFixture([
+      { flightId: 201, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Seat, cameraName: "Jebediah Kerman" },
+    ]);
+    await act(async () => {
+      render(
+        <KerbcastProvider client={client}>
+          <Grid
+            mergeCrew={true}
+            tiles={[{ flightId: 201, spotlit: false, key: null }]}
+            onTilesChange={() => {}}
+            showDebugInfo={false}
+            showStatic={false}
+          />
+        </KerbcastProvider>,
+      );
+    });
+    // A merged kerbal is an ordinary tile, so it exposes the part-grid spotlight
+    // control (2x2 span handled by the existing Grid mechanism, no crew path).
+    expect(screen.getByRole("button", { name: /spotlight this feed/i })).toBeTruthy();
   });
 });
