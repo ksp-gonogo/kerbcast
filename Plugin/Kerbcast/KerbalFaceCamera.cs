@@ -104,6 +104,11 @@ namespace Kerbcast
             // (EnsureCapture) renders at the same _captureDim, so ring and
             // frame can never disagree regardless of quality tier.
             _ring = MmapFrameRing.Create(_ringPath, ringSlots, _captureDim, _captureDim);
+            // A kerbal discovered already on EVA (CrewProvider's EVA sweep) must
+            // stamp its FIRST manifest "eva", not the default "seat" — otherwise an
+            // EVA cam that is never subscribed reports "seat" in /cameras until the
+            // first subscribe re-resolves it.
+            if (vessel != null && vessel.isEVA) _crewLocation = "eva";
             WriteInfoManifest();
         }
 
