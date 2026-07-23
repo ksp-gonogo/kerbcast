@@ -17,6 +17,8 @@ namespace Kerbcast.Kos
         public float PanYawMin, PanYawMax, PanPitchMin, PanPitchMax;
         public float BoresightX, BoresightY, BoresightZ;
         public float PositionX, PositionY, PositionZ;
+        // Auto-track mode (0=none/1=active-vessel/2=target).
+        public int TrackMode;
         public object PartHandle;
     }
 }

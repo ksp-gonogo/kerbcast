@@ -52,6 +52,7 @@ if (block != null)
     // track_mode is an append: the v2 golden fixture predates it, so its
     // present bit is clear and the reader decodes it as null (not tracking).
     Check(s.TrackMode == null, "trackMode == null (fixture predates the append)");
+    Check(s.TrackSeq == 0u, "trackSeq == 0 (fixed field, fixture not tracking)");
     Check(s.Seq == 2L, "seqlock seq == 2 (exactly one published write)");
 
     // Change detection: re-reading the same (unchanged) block yields nothing.

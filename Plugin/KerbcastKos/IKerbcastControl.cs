@@ -14,5 +14,10 @@ namespace Kerbcast.Kos
         bool SetFov(uint flightId, float fov);
         bool SetPan(uint flightId, float yaw, float pitch);
         bool AimAt(uint flightId, double x, double y, double z);
+        /* Auto-track mode (0=none/1=active-vessel/2=target). Set is synchronous
+           + optimistic-local (only pan+zoom cameras honour it; returns false
+           otherwise); get returns the applied value now. */
+        bool SetTrackMode(uint flightId, int mode);
+        int GetTrackMode(uint flightId);
     }
 }

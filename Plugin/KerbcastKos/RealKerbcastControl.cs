@@ -31,6 +31,10 @@ namespace Kerbcast.Kos
         public bool AimAt(uint id, double x, double y, double z) =>
             Kerbcast.KerbcastControl.AimAt(id, new UnityEngine.Vector3((float)x, (float)y, (float)z));
 
+        public bool SetTrackMode(uint id, int mode) => Kerbcast.KerbcastControl.SetTrackMode(id, mode);
+
+        public int GetTrackMode(uint id) => Kerbcast.KerbcastControl.GetTrackMode(id);
+
         static KosCameraView ToKos(Kerbcast.KerbcastCameraView v) => new KosCameraView
         {
             FlightId = v.FlightId, PartFlightId = v.PartFlightId, CameraName = v.CameraName, PartName = v.PartName,
@@ -39,6 +43,7 @@ namespace Kerbcast.Kos
             PanYawMax = v.PanYawMax, PanPitchMin = v.PanPitchMin, PanPitchMax = v.PanPitchMax,
             BoresightX = v.BoresightX, BoresightY = v.BoresightY, BoresightZ = v.BoresightZ,
             PositionX = v.PositionX, PositionY = v.PositionY, PositionZ = v.PositionZ,
+            TrackMode = v.TrackMode,
             PartHandle = v.Part,
         };
     }

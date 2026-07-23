@@ -111,6 +111,41 @@ namespace Kerbcast.Kos
                whether the seam accepted it (false when the camera can't pan). */
             AddSuffix("LOOKAT", new OneArgsSuffix<BooleanValue, kOS.Suffixed.Vector>(
                 pos => control.AimAt(id, pos.X, pos.Y, pos.Z) ? BooleanValue.True : BooleanValue.False));
+
+            /* TRACK: high-level auto-track mode, "none" | "vessel" | "target".
+               SET is synchronous (applies at once, no round-trip) and only
+               honoured on a pan+zoom camera; GET returns the current mode. The
+               state is linked with the browser: a mode set here reflects in
+               every browser, and a browser-set mode reads back here. Distinct
+               from the low-level AIM/LOOKAT (a bespoke per-frame vector): if
+               both are set on one camera the mode wins frame-by-frame. */
+            AddSuffix("TRACK", new SetSuffix<StringValue>(
+                () => new StringValue(TrackModeToString(control.GetTrackMode(id))),
+                value => control.SetTrackMode(id, TrackModeFromString(value.ToString()))));
+        }
+
+        /* mode int (0/1/2) <-> kerboscript string. Unrecognised strings map to
+           none; "active"/"activevessel" are accepted aliases for "vessel". */
+        static string TrackModeToString(int mode)
+        {
+            switch (mode)
+            {
+                case 1: return "vessel";
+                case 2: return "target";
+                default: return "none";
+            }
+        }
+
+        static int TrackModeFromString(string s)
+        {
+            switch ((s ?? "").Trim().ToLowerInvariant())
+            {
+                case "vessel":
+                case "active":
+                case "activevessel": return 1;
+                case "target": return 2;
+                default: return 0;
+            }
         }
 
         /* Mirror kOS Widget: hand kerboscript a NoDelegate instead of a raw

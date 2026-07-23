@@ -119,6 +119,18 @@ struct PerCameraStatus {
     pan_yaw: f32,
     #[serde(default)]
     pan_pitch: f32,
+    /// The plugin's CURRENT applied auto-track mode (0=none/1=active-vessel/
+    /// 2=target), echoed up so the read path can reflect a kOS-set value. Read
+    /// only when `track_report_seq` advances (a kOS SetTrackMode). Int, not the
+    /// enum, because the plugin hand-writes this JSON.
+    #[serde(default)]
+    track_mode: u32,
+    /// Monotonic counter the plugin bumps ONLY on a kOS-facade SetTrackMode
+    /// (never when applying a control-block flush — the anti-loop guard). The
+    /// sidecar adopts the reported `track_mode` when this advances, exactly
+    /// once per kOS set.
+    #[serde(default)]
+    track_report_seq: u32,
 }
 
 /// Project the wire `SettingsStatePayload` out of an on-disk status snapshot.
@@ -239,11 +251,28 @@ pub struct ControlState {
     /// overrides a kOS aim on the same camera; `None` hands aiming back to kOS.
     #[serde(skip_serializing_if = "track_mode_is_none")]
     pub track_mode: TrackMode,
+    /// Monotonic counter bumped on every authoritative `track_mode` change (a
+    /// browser `SetTrackTarget` OR the sidecar adopting a kOS report). Flushed
+    /// to the control block; the plugin applies `track_mode` only when this
+    /// changes (edge-trigger), so the every-flush stale value can't revert a
+    /// kOS-set mode. Same pattern as `pan_seq`/`fov_seq`.
+    #[serde(default)]
+    pub track_seq: u32,
 }
 
 /// serde skip helper: keep the debug JSON clean for the common not-tracking case.
 fn track_mode_is_none(m: &TrackMode) -> bool {
     *m == TrackMode::None
+}
+
+/// Status-echo int (0=none/1=active-vessel/2=target) -> TrackMode. Anything
+/// unrecognised is treated as not-tracking. Mirrors the plugin's mapping.
+fn track_mode_from_u32(v: u32) -> TrackMode {
+    match v {
+        1 => TrackMode::ActiveVessel,
+        2 => TrackMode::Target,
+        _ => TrackMode::None,
+    }
 }
 
 /// Public shape returned by `GET /cameras` — what a browser sees before
@@ -462,6 +491,11 @@ pub struct CameraState {
     /// by `list()`/`protocol_state` without locking. `apply_track_target` is the
     /// single writer and sets both, so they can't drift.
     pub track_mode_bits: AtomicU32,
+    /// Last kOS-report seq the sidecar has consumed for this camera (from the
+    /// plugin's status echo). `poll_status` adopts the reported track_mode when
+    /// the incoming seq differs from this, then stores it — so a level-triggered
+    /// echo is adopted exactly once per kOS set (no re-adopt loop). Starts 0.
+    pub last_track_report_seq: AtomicU32,
     /// Last wall-clock instant we *encoded* (and emitted NALs to) a frame.
     /// The consume loop uses this to pace encodes against the configured
     /// `fps`, instead of running once per ring write at LateUpdate's
@@ -1115,6 +1149,7 @@ impl CameraRegistry {
                             bandwidth_estimates: Mutex::new(std::collections::HashMap::new()),
                             effective_degrade: AtomicU32::new(0),
                             track_mode_bits: AtomicU32::new(0),
+                            last_track_report_seq: AtomicU32::new(0),
                             last_encoded_at: Mutex::new(None),
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
@@ -1284,8 +1319,31 @@ impl CameraRegistry {
             delta.settings = Some(settings_from_status(&parsed));
         }
 
+        // kOS track-mode proposals echoed up the status channel: adopt a
+        // camera's reported track_mode when its track_report_seq advances
+        // (exactly once per kOS SetTrackMode). Collected here, applied after the
+        // guards drop — adopt re-locks the cameras map, so it can't run while
+        // this read guard is held. Independent of the render-state diff below (a
+        // kOS set need not move render state).
+        let mut adopts: Vec<(u32, TrackMode)> = Vec::new();
+
         // Per-camera diffs. Only flag cameras whose effective state moved.
         for cam_status in &parsed.cameras {
+            if let Some(cam) = cameras.get(&cam_status.flight_id) {
+                let reported_seq = cam_status.track_report_seq;
+                if reported_seq != 0
+                    && reported_seq != cam.last_track_report_seq.load(Ordering::Acquire)
+                {
+                    // Consume this report exactly once (a level-triggered echo
+                    // keeps reporting the same seq until the next kOS set).
+                    cam.last_track_report_seq
+                        .store(reported_seq, Ordering::Release);
+                    adopts.push((
+                        cam_status.flight_id,
+                        track_mode_from_u32(cam_status.track_mode),
+                    ));
+                }
+            }
             let prev = last.as_ref().and_then(|s| {
                 s.cameras
                     .iter()
@@ -1379,6 +1437,15 @@ impl CameraRegistry {
         }
 
         *last = Some(parsed);
+
+        // Drop the poll locks before adopting: adopt_track_report re-locks the
+        // cameras map + the camera's control mutex, which must not nest under
+        // the read guard held above.
+        drop(last);
+        drop(cameras);
+        for (flight_id, mode) in adopts {
+            self.adopt_track_report(flight_id, mode).await;
+        }
         delta
     }
 
@@ -1539,12 +1606,32 @@ impl CameraRegistry {
     /// camera; `None` stops tracking. A browser track overrides a kOS aim on the
     /// same camera. Errors only on an unknown camera.
     pub async fn apply_track_target(&self, flight_id: u32, mode: TrackMode) -> Result<(), String> {
-        let Some(cam) = self.get(flight_id).await else {
+        if self.get(flight_id).await.is_none() {
             return Err(format!("no camera with flight_id={flight_id}"));
+        }
+        self.set_track_mode_authoritative(flight_id, mode).await
+    }
+
+    /// The single authoritative track_mode write, serialized per camera by the
+    /// `cam.control` lock. Sets `ControlState.track_mode`, bumps `track_seq`
+    /// (so the plugin applies it on the edge and a later stale flush can't
+    /// revert it), mirrors the lock-free publish atom, flushes to the control
+    /// block, and marks the camera dirty (every browser reflects it). Called by
+    /// BOTH a browser `SetTrackTarget` and the sidecar adopting a kOS report; a
+    /// near-simultaneous pair is serialized here (last to take the lock wins the
+    /// mode, both sides converge to it). Errors only on a flush failure.
+    async fn set_track_mode_authoritative(
+        &self,
+        flight_id: u32,
+        mode: TrackMode,
+    ) -> Result<(), String> {
+        let Some(cam) = self.get(flight_id).await else {
+            return Ok(()); // camera gone this tick — nothing to write
         };
         let snapshot = {
             let mut ctrl = cam.control.lock().await;
             ctrl.track_mode = mode;
+            ctrl.track_seq = ctrl.track_seq.wrapping_add(1);
             ctrl.clone()
         };
         // Mirror to the lock-free publish source BEFORE the broadcast so
@@ -1556,6 +1643,18 @@ impl CameraRegistry {
         }
         self.mark_camera_dirty(flight_id).await;
         Ok(())
+    }
+
+    /// Adopt a kOS-originated track_mode PROPOSAL reported up the status channel.
+    /// Called from `poll_status` when a camera's `track_report_seq` advances.
+    /// Routes through the same authoritative write as a browser set, so the two
+    /// converge to whichever the sidecar serializes last. The per-camera
+    /// last-consumed report seq (checked in `poll_status`) makes this fire
+    /// exactly once per kOS set — no re-adopt loop.
+    pub async fn adopt_track_report(&self, flight_id: u32, mode: TrackMode) {
+        if let Err(e) = self.set_track_mode_authoritative(flight_id, mode).await {
+            warn!(flight_id, error = %e, "adopt kOS track report failed");
+        }
     }
 
     /// Recompute a camera's effective render size (auto MAX-across-consumers ∩
@@ -1917,6 +2016,92 @@ mod tests {
                 .expect("advanced UT emits settings")
                 .capture_ut,
             Some(1004.0)
+        );
+    }
+
+    /// The linked track_mode contract: a kOS proposal echoed up the status
+    /// channel is adopted into the authoritative ControlState (UP convergence);
+    /// the same report is consumed exactly once (no re-adopt loop); a browser
+    /// set supersedes and a STALE kOS echo can't revert it (no oscillation); a
+    /// genuinely NEW kOS report is adopted (last-setter wins the mode).
+    #[tokio::test]
+    async fn poll_status_adopts_kos_track_report_with_no_oscillation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 5_001;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let status_path = shm.join("global.status.json");
+        let cam = registry.get(flight_id).await.expect("attached");
+
+        let write = |track_mode: u32, seq: u32| {
+            std::fs::write(
+                &status_path,
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"throttleMainScreen":false,"cameras":[{{"flightId":{flight_id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"trackMode":{track_mode},"trackReportSeq":{seq}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        // No report yet (seq 0): not tracking.
+        write(0, 0);
+        registry.poll_status().await;
+        assert_eq!(cam.track_mode(), TrackMode::None);
+
+        // kOS reports active-vessel (seq 1): adopted, published, track_seq bumped.
+        write(1, 1);
+        registry.poll_status().await;
+        assert_eq!(
+            cam.track_mode(),
+            TrackMode::ActiveVessel,
+            "kOS report adopted"
+        );
+        let seq_after_adopt = cam.control.lock().await.track_seq;
+        assert!(
+            seq_after_adopt >= 1,
+            "adopt bumps track_seq (plugin edge-trigger)"
+        );
+
+        // Same report re-polled: consumed once, no re-adopt, no extra bump.
+        write(1, 1);
+        registry.poll_status().await;
+        assert_eq!(
+            cam.control.lock().await.track_seq,
+            seq_after_adopt,
+            "an already-consumed report must not re-adopt"
+        );
+
+        // Browser set: authoritative, supersedes.
+        registry
+            .apply_track_target(flight_id, TrackMode::Target)
+            .await
+            .unwrap();
+        assert_eq!(cam.track_mode(), TrackMode::Target);
+
+        // The plugin keeps echoing the STALE kOS report (seq 1) until its next
+        // kOS set; re-polling must NOT revert the browser's Target. No oscillation.
+        write(1, 1);
+        registry.poll_status().await;
+        assert_eq!(
+            cam.track_mode(),
+            TrackMode::Target,
+            "a stale kOS echo must not revert a browser set"
+        );
+
+        // A genuinely NEW kOS report (seq 2) IS adopted (last-setter wins).
+        write(1, 2);
+        registry.poll_status().await;
+        assert_eq!(
+            cam.track_mode(),
+            TrackMode::ActiveVessel,
+            "a new kOS report is adopted after the browser set"
         );
     }
 

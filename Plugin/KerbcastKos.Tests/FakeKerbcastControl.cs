@@ -16,6 +16,7 @@ namespace Kerbcast.Kos.Tests
         public (uint id, float fov)? LastSetFov;
         public (uint id, float yaw, float pitch)? LastSetPan;
         public (uint id, double x, double y, double z)? LastAim;
+        public (uint id, int mode)? LastSetTrackMode;
 
         public bool IsActive => true;
 
@@ -55,5 +56,17 @@ namespace Kerbcast.Kos.Tests
             LastAim = (flightId, x, y, z);
             return ViewOf(flightId) != null;
         }
+
+        public bool SetTrackMode(uint flightId, int mode)
+        {
+            LastSetTrackMode = (flightId, mode);
+            var v = ViewOf(flightId);
+            // Mirror the facade gate: only pan+zoom cameras honour a set.
+            if (v == null || !(v.SupportsPan && v.SupportsZoom)) return false;
+            v.TrackMode = mode;
+            return true;
+        }
+
+        public int GetTrackMode(uint flightId) => ViewOf(flightId)?.TrackMode ?? 0;
     }
 }

@@ -23,6 +23,8 @@ namespace Kerbcast
         // same frame kOS uses for TARGET:POSITION, so a script can do
         // (TARGET:POSITION - cam:POSITION) directly.
         public float PositionX, PositionY, PositionZ;
+        // Current auto-track mode (0=none/1=active-vessel/2=target).
+        public int TrackMode;
         public global::Part Part;
     }
 
@@ -76,6 +78,28 @@ namespace Kerbcast
             return true;
         }
 
+        /* Auto-track (issue #6) as a SYNCHRONOUS kOS function: set/get the
+           camera's track mode in-process, immediate, no sidecar round-trip.
+           Set is optimistic-local (the camera aims at once) and stages an
+           up-report the sidecar adopts as authoritative (so every browser
+           reflects it); get returns the applied value now. Only pan+zoom
+           cameras honour a set (mirrors the browser gate); a non-pan+zoom or
+           unknown camera returns none (0) from get and false from set.
+           mode: 0=none, 1=active-vessel, 2=target. */
+        public static bool SetTrackMode(uint flightId, int mode)
+        {
+            var c = Find(flightId);
+            if (c == null || !(c.SupportsPan && c.SupportsZoom)) return false;
+            c.RequestTrackMode(mode);
+            return true;
+        }
+
+        public static int GetTrackMode(uint flightId)
+        {
+            var c = Find(flightId);
+            return c != null ? c.GetTrackMode() : 0;
+        }
+
         static KerbcastCamera Find(uint flightId)
         {
             var cams = KerbcastCore.Instance?.Cameras;
@@ -106,6 +130,7 @@ namespace Kerbcast
                 PanPitchMin = c.PanPitchMin, PanPitchMax = c.PanPitchMax,
                 BoresightX = fwd.x, BoresightY = fwd.y, BoresightZ = fwd.z,
                 PositionX = pos.x, PositionY = pos.y, PositionZ = pos.z,
+                TrackMode = c.GetTrackMode(),
                 Part = part,
             };
         }

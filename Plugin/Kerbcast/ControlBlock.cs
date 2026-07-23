@@ -33,6 +33,10 @@
 //                                 2=target. Present-bit CLEAR = none/off; the
 //                                 sidecar always writes full state so absence
 //                                 means not-tracking, not leave-untouched.)
+//     [+60]    u32 track_seq     (FIXED field, always read — like pan_seq/
+//                                 fov_seq. Sidecar bumps it on any authoritative
+//                                 track_mode change; the plugin applies
+//                                 track_mode only on a change (edge-trigger).)
 //
 // track_mode (+56) is an APPEND with its own fields_present bit — NOT a
 // LAYOUT_VERSION bump. The bitmask is forward-compatible: an old reader ignores
@@ -83,6 +87,11 @@ namespace Kerbcast
         /// when the present bit is clear = not tracking. A browser track
         /// overrides a kOS aim on the same camera.</summary>
         public uint? TrackMode;
+        /// <summary>Monotonic counter the sidecar bumps on any authoritative
+        /// track_mode change. The plugin applies track_mode only when this
+        /// moves (edge-trigger), so a stale flush can't revert a kOS-set mode.
+        /// Always read (fixed field), like PanSeq/FovSeq.</summary>
+        public uint TrackSeq;
         /// <summary>The seqlock value this snapshot was read at (even).</summary>
         public long Seq;
     }
@@ -115,6 +124,11 @@ namespace Kerbcast
         private const int BFovSeq = HeaderSize + 48;
         private const int BViewerLevel = HeaderSize + 52;
         private const int BTrackMode = HeaderSize + 56;
+        // track_seq (+60): FIXED field (always read, like BPanSeq/BFovSeq). The
+        // sidecar bumps it on any authoritative track_mode change; we apply the
+        // control-block track_mode only when it moves (edge-trigger), so a stale
+        // flush can't revert a kOS-set mode. Append -> no LayoutVersion bump.
+        private const int BTrackSeq = HeaderSize + 60;
 
         // fields_present bits — one per Option/Vec field.
         public const uint FpLayers = 1u << 0;
@@ -237,6 +251,7 @@ namespace Kerbcast
                 FovSeq = _view.ReadUInt32(BFovSeq),
                 ViewerLevel = (present & FpViewerLevel) != 0 ? _view.ReadUInt32(BViewerLevel) : (uint?)null,
                 TrackMode = (present & FpTrackMode) != 0 ? _view.ReadUInt32(BTrackMode) : (uint?)null,
+                TrackSeq = _view.ReadUInt32(BTrackSeq),
                 Seq = seq,
             };
         }

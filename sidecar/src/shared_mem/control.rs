@@ -43,6 +43,12 @@
 //!                                unambiguously means not-tracking here, unlike
 //!                                the leave-untouched semantics of the fields
 //!                                above.)
+//!   +60  4   u32 track_seq      (FIXED field, always read — like pan_seq /
+//!                                fov_seq. Bumped by the sidecar on ANY
+//!                                authoritative track_mode change; the plugin
+//!                                applies track_mode only on a change, so the
+//!                                every-flush stale value can't revert a kOS-set
+//!                                mode. Append -> no version bump.)
 //! ```
 //!
 //! NOTE: this field is an APPEND with its own `fields_present` bit, NOT a layout
@@ -100,6 +106,13 @@ const B_PAN_SEQ: usize = 44;
 const B_FOV_SEQ: usize = 48;
 const B_VIEWER_LEVEL: usize = 52;
 const B_TRACK_MODE: usize = 56;
+// track_seq (+60): a monotonic counter the SIDECAR bumps on ANY authoritative
+// track_mode change (a browser SetTrackTarget OR adopting a kOS report). A FIXED
+// field, always written / always read — exactly like pan_seq / fov_seq, NOT
+// present-bit-gated. The plugin applies the control-block track_mode ONLY when
+// track_seq changes (edge-trigger), so the every-flush stale track_mode can't
+// revert a kOS-set mode. Appended within the reserved body -> no version bump.
+const B_TRACK_SEQ: usize = 60;
 
 // `fields_present` bits — one per Option/Vec field that can be "unset".
 pub const FP_LAYERS: u32 = 1 << 0;
@@ -256,6 +269,7 @@ impl ControlBlock {
         self.put_u32(B_FOV_SEQ, s.fov_seq);
         self.put_u32(B_VIEWER_LEVEL, s.viewer_level.unwrap_or(0));
         self.put_u32(B_TRACK_MODE, track_mode_to_u32(s.track_mode));
+        self.put_u32(B_TRACK_SEQ, s.track_seq);
     }
 }
 
@@ -281,6 +295,9 @@ pub struct ControlSnapshot {
     /// Auto-track mode (0=none/1=active-vessel/2=target). `None` when the
     /// present bit is clear = not tracking.
     pub track_mode: Option<u32>,
+    /// Monotonic counter the sidecar bumps on any authoritative track_mode
+    /// change; the plugin applies track_mode only on a change (edge-trigger).
+    pub track_seq: u32,
 }
 
 fn rd_u32(buf: &[u8], at: usize) -> u32 {
@@ -294,7 +311,7 @@ fn rd_f32(buf: &[u8], at: usize) -> f32 {
 /// magic+version. Returns `None` if the bytes don't carry our layout — the
 /// reader's "not ready / wrong build" gate.
 pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
-    if buf.len() < CONTROL_HEADER_SIZE + B_TRACK_MODE + 4 {
+    if buf.len() < CONTROL_HEADER_SIZE + B_TRACK_SEQ + 4 {
         return None;
     }
     if u64::from_le_bytes(buf[H_MAGIC..H_MAGIC + 8].try_into().unwrap()) != CONTROL_MAGIC {
@@ -335,6 +352,7 @@ pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
         fov_seq: rd_u32(buf, b + B_FOV_SEQ),
         viewer_level: opt_u32(FP_VIEWER_LEVEL, B_VIEWER_LEVEL),
         track_mode: opt_u32(FP_TRACK_MODE, B_TRACK_MODE),
+        track_seq: rd_u32(buf, b + B_TRACK_SEQ),
     })
 }
 
@@ -363,6 +381,9 @@ mod tests {
             // Left None so the golden fixture stays byte-identical (the append
             // is forward-compatible; track_mode has its own dedicated test).
             track_mode: TrackMode::None,
+            // Left 0 so +60 stays zero and the golden fixture stays
+            // byte-identical (track_seq has its own dedicated test below).
+            track_seq: 0,
         }
     }
 
@@ -451,6 +472,21 @@ mod tests {
             ..fixture_state()
         };
         assert_eq!(decode(&write_to_vec(&active)).unwrap().track_mode, Some(1));
+    }
+
+    #[test]
+    fn track_seq_roundtrips_as_a_fixed_field() {
+        // Default 0 (byte-compat with the golden fixture).
+        assert_eq!(
+            decode(&write_to_vec(&fixture_state())).unwrap().track_seq,
+            0
+        );
+        // A bumped value round-trips at +60, independent of the present bits.
+        let bumped = ControlState {
+            track_seq: 7,
+            ..fixture_state()
+        };
+        assert_eq!(decode(&write_to_vec(&bumped)).unwrap().track_seq, 7);
     }
 
     #[test]

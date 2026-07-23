@@ -1055,6 +1055,19 @@ namespace Kerbcast
            default) makes Refresh's track step a single bool check with no other
            effect, so the kOS aim path is untouched. */
         private int _trackMode = TrackAim.ModeNone;
+        /* Linked track_mode (sidecar-authoritative + eventual-consistency).
+           DOWN: the control block carries track_mode + a track_seq the sidecar
+           bumps on ANY authoritative change; we apply the control-block
+           track_mode ONLY when track_seq moves (edge-trigger), so the sidecar's
+           every-flush stale value can't revert a kOS-set mode. Init 0 = matches
+           a freshly-created block, so a never-tracked camera never applies.
+           UP: a kOS-facade SetTrackMode is optimistic-local (aims at once) and
+           bumps _trackReportSeq, which the status writer echoes; the sidecar
+           adopts it into its authoritative ControlState on the seq change. We
+           bump _trackReportSeq ONLY for a kOS set, NEVER when applying a
+           control-block flush — the anti-loop guard. */
+        private uint _lastTrackSeq;
+        private uint _trackReportSeq;
 
         /* Auto-zoom reference pair for TrackAim.FovForDistance: at
            AutoZoomReferenceDistanceM the framing FoV is AutoZoomReferenceFovDeg;
@@ -1064,10 +1077,31 @@ namespace Kerbcast
         private const float AutoZoomReferenceDistanceM = 1000f;
         private const float AutoZoomReferenceFovDeg = 20f;
 
-        /// <summary>Set the browser auto-track mode (0=none/1=active-vessel/
-        /// 2=target). Called from PollControlFile. Only acted on for a pan+zoom
-        /// camera; a browser track overrides a kOS aim on the same camera.</summary>
+        /// <summary>Apply the authoritative auto-track mode from the control
+        /// block (the DOWN path). Called by PollControlFile on a track_seq edge.
+        /// Does NOT bump the up-report seq (that is reserved for a kOS set — the
+        /// anti-loop guard). Only acted on for a pan+zoom camera.</summary>
         public void SetTrackMode(int mode) => _trackMode = mode;
+
+        /// <summary>Set the auto-track mode from kOS (the UP path). Synchronous
+        /// + optimistic-local: applies immediately (the camera aims at once) and
+        /// stages an up-report by bumping _trackReportSeq, which the sidecar
+        /// adopts as authoritative on its next status poll. GET reflects it at
+        /// once. Only acted on for a pan+zoom camera.</summary>
+        public void RequestTrackMode(int mode)
+        {
+            _trackMode = mode;
+            _trackReportSeq++;
+        }
+
+        /// <summary>Current applied auto-track mode (0=none/1=active-vessel/
+        /// 2=target). The synchronous kOS read.</summary>
+        public int GetTrackMode() => _trackMode;
+
+        /// <summary>Monotonic kOS-report seq, echoed in global.status.json so
+        /// the sidecar adopts a kOS-set mode exactly once (never bumped by a
+        /// control-block apply).</summary>
+        public uint TrackReportSeq => _trackReportSeq;
 
         /* Resolve the current track target's WORLD position from FlightGlobals
            only (no orbit math): the active vessel's CoM, or its target's
@@ -1322,11 +1356,21 @@ namespace Kerbcast
                     _zoomRate = Mathf.Clamp(snap.ZoomRate.Value, -1f, 1f);
                 }
 
-                // Auto-track mode (issue #6). The sidecar always writes full
-                // state, so an absent bit means "not tracking" (none), not
-                // "leave unchanged"; hence the ?? 0. Only acted on for a pan+zoom
-                // camera in Refresh; a browser track overrides a kOS aim.
-                SetTrackMode((int)(snap.TrackMode ?? 0u));
+                // Auto-track mode (linked, sidecar-authoritative). Apply the
+                // control-block track_mode ONLY when track_seq changes: the
+                // sidecar re-publishes the full state every flush, so applying
+                // every poll would let its stale track_mode overwrite a kOS-set
+                // mode each frame. The edge-trigger (mirroring _lastFovSeq) makes
+                // a stale flush idempotent while a genuine authoritative change
+                // (browser SetTrackTarget OR the sidecar adopting a kOS report)
+                // still lands. Absent bit => none (the sidecar writes full state,
+                // so absent means not-tracking). Uses SetTrackMode (the DOWN
+                // path) so it does NOT bump the up-report seq.
+                if (snap.TrackSeq != _lastTrackSeq)
+                {
+                    _lastTrackSeq = snap.TrackSeq;
+                    SetTrackMode((int)(snap.TrackMode ?? 0u));
+                }
 
                 if (SupportsPan)
                 {

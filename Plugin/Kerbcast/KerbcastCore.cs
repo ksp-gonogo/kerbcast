@@ -918,7 +918,14 @@ namespace Kerbcast
                     sb.Append($"      \"enableAtmosphericFx\": {(kc.EnableFx ? "true" : "false")},\n");
                     sb.Append($"      \"fov\": {kc.Fov.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     sb.Append($"      \"panYaw\": {kc.PanYaw.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
-                    sb.Append($"      \"panPitch\": {kc.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n");
+                    sb.Append($"      \"panPitch\": {kc.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    // Auto-track echo UP: the plugin's CURRENT applied mode + a
+                    // monotonic seq bumped ONLY on a kOS-facade set. The sidecar
+                    // adopts the mode into its authoritative ControlState when the
+                    // seq advances (linked track_mode: kOS proposes, sidecar
+                    // converges), never re-adopting a control-block-applied change.
+                    sb.Append($"      \"trackMode\": {kc.GetTrackMode()},\n");
+                    sb.Append($"      \"trackReportSeq\": {kc.TrackReportSeq}\n");
                     sb.Append(i == streaming.Count - 1 ? "    }\n" : "    },\n");
                 }
                 sb.Append("  ]");

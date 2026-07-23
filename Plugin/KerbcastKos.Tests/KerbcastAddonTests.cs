@@ -116,6 +116,45 @@ namespace Kerbcast.Kos.Tests
             Assert.Equal((1u, 12f, 5f), fake.LastSetPan);   // pitch carried from the live view
         }
 
+        [Fact]
+        public void Camera_track_set_routes_through_the_seam_on_pan_zoom()
+        {
+            var fake = new FakeKerbcastControl();
+            fake.Seed(new KosCameraView { FlightId = 1, SupportsPan = true, SupportsZoom = true });
+
+            var run = Run(fake, "SET ADDONS:KERBCAST:CAMERA(\"1\"):TRACK TO \"vessel\".");
+
+            foreach (var m in run.Log) _out.WriteLine("LOG: " + m);
+            Assert.Null(run.StepError);
+            Assert.Equal((1u, 1), fake.LastSetTrackMode);  // "vessel" -> 1
+            Assert.Equal(1, fake.ViewOf(1).TrackMode);     // read-back reflects the write
+        }
+
+        [Fact]
+        public void Camera_track_get_returns_the_mode_string()
+        {
+            var fake = new FakeKerbcastControl();
+            fake.Seed(new KosCameraView { FlightId = 1, SupportsPan = true, SupportsZoom = true, TrackMode = 2 });
+
+            var run = Run(fake, "PRINT ADDONS:KERBCAST:CAMERA(\"1\"):TRACK.");
+
+            _out.WriteLine("screen: [" + string.Join(" | ", run.Screen) + "]");
+            AssertPrinted(run.Screen, "target");           // 2 -> "target"
+        }
+
+        [Fact]
+        public void Camera_track_set_gated_off_a_non_pan_zoom_camera()
+        {
+            var fake = new FakeKerbcastControl();
+            // Pan-only (no zoom): tracking is not offered, so the set is a no-op.
+            fake.Seed(new KosCameraView { FlightId = 1, SupportsPan = true, SupportsZoom = false });
+
+            var run = Run(fake, "SET ADDONS:KERBCAST:CAMERA(\"1\"):TRACK TO \"vessel\".");
+
+            Assert.Null(run.StepError);
+            Assert.Equal(0, fake.ViewOf(1).TrackMode);     // gated: mode unchanged
+        }
+
         /* BORESIGHT/POSITION return a kOS Vector carrying the seeded components.
            Read the suffix directly (not via the CPU) so the assertion sees the
            real value; proves the Vector is constructed and populated correctly. */
