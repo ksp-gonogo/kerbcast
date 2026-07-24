@@ -223,7 +223,7 @@ function CameraSeeder({ mergeCrew, tilesSeeded, onSeed }: CameraSeederProps): nu
   // kerbal cams are seedable/addable grid tiles like part cams.
   const all = useKerbcastCameras();
   const cameras = useMemo(
-    () => (mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal)),
+    () => (mergeCrew ? all : all.filter((c) => c.kind === CameraKind.Part)),
     [all, mergeCrew],
   );
 
@@ -262,7 +262,7 @@ function CameraReconciler({ mergeCrew, tiles, onReconcile }: CameraReconcilerPro
   // identity doesn't re-run the effect every commit.
   const all = useKerbcastCameras();
   const cameras = useMemo(
-    () => (mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal)),
+    () => (mergeCrew ? all : all.filter((c) => c.kind === CameraKind.Part)),
     [all, mergeCrew],
   );
 

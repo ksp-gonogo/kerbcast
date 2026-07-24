@@ -134,7 +134,6 @@ export function Settings({
           >
             <option value="row">Bottom row</option>
             <option value="column">Side column</option>
-            <option value="wrap">Wrap</option>
           </NativeSelect>
         </FieldRow>
 

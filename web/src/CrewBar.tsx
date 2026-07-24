@@ -11,7 +11,7 @@
  * The open/closed set is owned + persisted by the App (like the tile grid), so
  * it survives reload; default (nothing stored) is all-open.
  *
- * Placement (row / column / wrap) and minimise are CSS-only reflows of the SAME
+ * Placement (row / column) and minimise are CSS-only reflows of the SAME
  * mounted feeds — switching either never remounts a KerbalFaceFeed.
  */
 
@@ -74,8 +74,10 @@ export function CrewBar({
         ]
       : openFaces;
 
+  const hasSpotlit = spotlight != null && open.some((k) => k.flightId === spotlight);
+
   return (
-    <Root $placement={placement} data-testid="crew-bar" data-placement={placement}>
+    <Root $placement={placement} $hasSpotlit={hasSpotlit} data-testid="crew-bar" data-placement={placement}>
       <Bar>
         <BarTitle>Crew</BarTitle>
         <BarControls>
@@ -113,12 +115,11 @@ export function CrewBar({
         </BarControls>
       </Bar>
       {/* Faces stay mounted when minimised — collapsed via CSS, never unmounted. */}
-      <Faces $placement={placement} $minimised={minimised} aria-hidden={minimised}>
+      <Faces $placement={placement} $spotlit={hasSpotlit} $minimised={minimised} aria-hidden={minimised}>
         {open.map((k) => (
           <CrewFace
             key={k.flightId}
             cam={k}
-            placement={placement}
             spotlit={spotlight === k.flightId}
             onToggleSpotlight={() => onToggleSpotlight(k.flightId)}
             onClose={() => {
@@ -140,13 +141,12 @@ export function CrewBar({
 
 interface CrewFaceProps {
   cam: CameraState;
-  placement: CrewBarPlacement;
   spotlit: boolean;
   onToggleSpotlight: () => void;
   onClose: () => void;
 }
 
-function CrewFace({ cam, placement, spotlit, onToggleSpotlight, onClose }: CrewFaceProps): React.JSX.Element {
+function CrewFace({ cam, spotlit, onToggleSpotlight, onClose }: CrewFaceProps): React.JSX.Element {
   const wrapRef = useRef<HTMLDivElement>(null);
   const destroyed = isCameraDestroyed(cam);
   const eva = cam.crewLocation === CrewLocation.Eva;
@@ -201,7 +201,6 @@ function CrewFace({ cam, placement, spotlit, onToggleSpotlight, onClose }: CrewF
     <FaceWrap
       ref={wrapRef}
       $spotlit={spotlit}
-      $placement={placement}
       data-testid="crew-face"
       data-flight-id={cam.flightId}
       data-destroyed={destroyed}
@@ -256,21 +255,22 @@ function togglePictureInPicture(wrap: HTMLElement | null): void {
 /** Fixed square edge for a crew face (px). */
 const FACE = 132;
 
-const Root = styled.div<{ $placement: CrewBarPlacement }>`
+const Root = styled.div<{ $placement: CrewBarPlacement; $hasSpotlit: boolean }>`
   display: flex;
   flex-direction: column;
   min-height: 0;
   ${(p) =>
     p.$placement === "column"
       ? `
-    /* Side column: fixed-width vertical dock. */
-    width: ${FACE + 32}px;
+    /* Side column: vertical dock. Widen to fit a spotlit 2x face so it stays
+       inside the sidebar (never renders off-screen); relaxes when none spotlit. */
+    width: ${(p.$hasSpotlit ? FACE * 2 : FACE) + 32}px;
     flex: 0 0 auto;
     border-left: 1px solid var(--kc-border, rgba(255,255,255,0.1));
     background: var(--kc-surface, rgba(0,0,0,0.15));
   `
       : `
-    /* Bottom dock (row / wrap): full-width horizontal strip. */
+    /* Bottom dock (row): full-width horizontal strip. */
     flex: 0 0 auto;
     border-top: 1px solid var(--kc-border, rgba(255,255,255,0.1));
     background: var(--kc-surface, rgba(0,0,0,0.15));
@@ -385,26 +385,28 @@ const MinButton = styled.button`
   }
 `;
 
-const Faces = styled.div<{ $placement: CrewBarPlacement; $minimised: boolean }>`
+const Faces = styled.div<{ $placement: CrewBarPlacement; $spotlit: boolean; $minimised: boolean }>`
   display: grid;
   gap: 0.6rem;
   padding: 0.6rem;
+  grid-auto-rows: ${FACE}px;
+  grid-auto-columns: ${FACE}px;
+  /* When a face is spotlit the dock is 2 tracks deep (the spotlit face spans a
+     real 2x2), so the 1x1 faces pack 2-up to fill the second track via dense
+     flow instead of sitting single-file beside a half-empty band. No spotlight:
+     a single track of squares. */
   ${(p) =>
-    p.$placement === "wrap"
-      ? /* 2D grid of square cells; the spotlit face spans 2x2 (a real grid
-           span) and dense flow packs the rest around it — the clean 2x2. */
-        `grid-template-columns: repeat(auto-fill, ${FACE}px);
-         grid-auto-rows: ${FACE}px;
-         grid-auto-flow: row dense;
-         justify-content: start; align-content: flex-start;
-         overflow-y: auto;`
-      : p.$placement === "column"
-        ? /* Single column that grows to fit the bigger square. */
-          `grid-auto-flow: row; grid-auto-rows: max-content;
-           justify-items: center; overflow-y: auto;`
-        : /* Single row (filmstrip) that grows taller to fit the bigger square. */
-          `grid-auto-flow: column; grid-auto-columns: max-content;
-           align-items: start; overflow-x: auto;`}
+    p.$placement === "column"
+      ? p.$spotlit
+        ? `grid-template-columns: repeat(2, ${FACE}px); grid-auto-flow: row dense;
+           justify-content: center; overflow-y: auto;`
+        : `grid-template-columns: ${FACE}px; grid-auto-flow: row;
+           justify-content: center; overflow-y: auto;`
+      : p.$spotlit
+        ? `grid-template-rows: repeat(2, ${FACE}px); grid-auto-flow: column dense;
+           align-content: start; overflow-x: auto;`
+        : `grid-template-rows: ${FACE}px; grid-auto-flow: column;
+           align-content: start; overflow-x: auto;`}
 
   /* Minimise collapses the strip without unmounting the feeds. visibility:hidden
      takes the faces (and their action buttons) out of the tab order + a11y tree,
@@ -420,23 +422,37 @@ const Faces = styled.div<{ $placement: CrewBarPlacement; $minimised: boolean }>`
   }
 `;
 
-const FaceWrap = styled.div<{ $placement: CrewBarPlacement; $spotlit: boolean }>`
+const FaceWrap = styled.div<{ $spotlit: boolean }>`
   position: relative;
-  /* Spotlight grows the face to a ~2x square on the SAME mounted feed (CSS
-     only, never a remount) and floats it to the front. In WRAP it spans a real
-     2x2 of the square grid (fills the spanned cells); in row/column it's an
-     explicit 2x square that grows the single track. Non-spotlit fills its 1x1
-     cell (wrap) or is a fixed square (row/column). */
-  ${(p) =>
-    p.$placement === "wrap"
-      ? p.$spotlit
-        ? `grid-column: span 2; grid-row: span 2; width: 100%; height: 100%;`
-        : `width: 100%; height: 100%;`
-      : `width: ${p.$spotlit ? FACE * 2 : FACE}px; height: ${p.$spotlit ? FACE * 2 : FACE}px;`}
+  /* Fills its grid cell (FACE square). Spotlight spans a real 2x2 of the
+     FACE-sized grid on the SAME mounted feed (CSS only, never a remount) and
+     floats to the front; the 1x1 faces dense-pack around it (2-up in the second
+     track). Stays square. */
+  width: 100%;
+  height: 100%;
+  ${(p) => (p.$spotlit ? "grid-column: span 2; grid-row: span 2;" : "")}
   transition: width 0.18s ease, height 0.18s ease;
 
   @media (prefers-reduced-motion: reduce) {
     transition: none;
+  }
+
+  /* Fullscreen: the face is SQUARE, so letterbox it (black bars) rather than
+     stretch to the viewport. Native fullscreen sizes this element to the screen;
+     center the inner square feed at min(100vw,100vh) so its aspect is preserved.
+     The primitive's video is object-fit:cover of a square frame, so a square
+     frame means no crop/stretch. */
+  &:fullscreen,
+  &:-webkit-full-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+  }
+  &:fullscreen [data-testid="kerbal-face-feed"],
+  &:-webkit-full-screen [data-testid="kerbal-face-feed"] {
+    width: min(100vw, 100vh);
+    height: min(100vw, 100vh);
   }
 
   /* Actions (top-right, from the primitive) hover-reveal: hidden until the face
