@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.7.0 - 2026-07-24
+
+Crew face cameras, auto-resolution, and camera targeting.
+
+### Added
+
+- `KerbalFaceFeed`: a single-kerbal face-camera primitive. Renders one crew
+  face in a square frame, keyed by `flightId`, and never remounts its `<video>`
+  on re-layout. Composable via `children` (name label, badge, custom overlays)
+  and an `actions` bar.
+- `useReportDisplaySize` hook plus the client-scoped display-size registry:
+  `createClientDisplaySizes`, `useKerbcastDisplaySizes`, and the
+  `KerbcastDisplaySizes` type. `KerbcastProvider` now accepts an optional
+  `displaySizes` override (mirrors `subscriptions`). Mounted feeds self-measure
+  and drive per-consumer auto-resolution; two views of the same camera from one
+  client collapse to a single MAX report.
+- `showActions?: boolean` (default true) on `CameraFeed` and `KerbalFaceFeed` to
+  suppress the hover action bar without affecting resolution reporting.
+- `reportSize?: boolean` (default true) on `KerbalFaceFeed` to opt a
+  fixed-resolution face out of auto-resolution.
+- `enableTracking?: boolean` (default false) on `CameraFeed`: a tri-state
+  auto-track control (off / active-vessel / target) on pan+zoom cameras,
+  highlighted from the server-published `CameraState.trackMode`.
+- `cameraFilter?: (camera) => boolean` on `CameraFeed` to narrow the selectable
+  set (picker menu, stepper, auto-latch). Omit to consider every camera.
+- `--kerbcast-action-active` theme token: the fill for every active action-row
+  toggle (tracking, quality, PiP, fullscreen, custom). Defaults to
+  `var(--kerbcast-accent, #00ff88)`, so one knob recolours them all.
+
+### Changed
+
+- `KerbalFaceFeed` `size` is now LAYOUT-ONLY. It sets the element's size but no
+  longer requests a stream resolution: the primitive always self-measures its
+  rendered box and reports that (auto-resolution), so resolution follows how
+  large the feed is actually shown.
+- `CameraFeed` with `renderSize="auto"` (the default) now reports its measured
+  display size for auto-resolution instead of writing a 16:9 operator render
+  size. `renderSize="none"` opts out.
+- `CameraFeed` auto-disables its manual pan/zoom controls while the camera's
+  published `trackMode` is not `none` (they no-op against a live track and the
+  rate/drag path otherwise jitters).
+
 ## 0.12.0 - 2026-06-07
 
 Initial release. Versioned in lockstep with `@jonpepler/kerbcast` and the

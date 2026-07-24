@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.7.0 - 2026-07-24
+
+Crew face cameras, auto-resolution, and camera targeting.
+
+### Added
+
+- `KerbcastClient.reportDisplaySize(flightId, width, height)`: report a
+  consumer's own displayed pixel size for a camera. The sidecar aggregates it
+  MAX-across-consumers to drive auto-resolution (distinct from `setRenderSize`,
+  which is the shared operator cap).
+- `KerbcastClient.setTrackTarget(flightId, mode)`: ask a pan+zoom camera to
+  auto-track a moving vessel, or stop.
+- `TrackMode` type (`"none" | "activeVessel" | "target"`).
+- `trackMode?: TrackMode` on `CameraState` (WS push) and `CameraInfo`
+  (`GET /cameras`), server-authoritative so every consumer reflects the same
+  tracking state.
+- `MockSidecar` accepts the new `report-display-size` and `set-track-target`
+  client messages (records them; `report-display-size` is advisory and does not
+  mutate render dims).
+- `MockCameraInit` gains `kind`, `crewLocation`, `kerbalPersistentId`, and
+  `trackMode` for building crew and tracking fixtures.
+
 ## 0.12.0 - 2026-06-07
 
 ### Added

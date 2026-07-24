@@ -41,6 +41,7 @@ Each camera has:
 | `:LOOKAT(vector)` | bool | Aim once at a point (same as `SET cam:AIM TO vector`), returning whether it was accepted. |
 | `:BORESIGHT` | vector | World-space unit forward of the stream (where it currently points). |
 | `:POSITION` | vector | Lens position in the same frame as `TARGET:POSITION`. |
+| `:TRACK` | string | Auto-track mode: `"none"`, `"vessel"` (the active vessel), or `"target"` (its target). `"active"` / `"activevessel"` alias `"vessel"`; anything unrecognised reads as `"none"`. Settable on pan+zoom cameras only (a no-op otherwise); the camera then auto-aims and auto-zooms to follow. Synchronous: the set applies at once. Linked with the browser: a mode set here shows in every viewer, and a viewer-set mode reads back here. |
 
 `:BORESIGHT` and `:POSITION` let a script steer the *vessel* to hold a target the
 mount alone can't reach: rotate the craft so `:BORESIGHT` lines up with
@@ -75,9 +76,18 @@ FOR c IN ADDONS:KERBCAST:CAMERAS {
 }
 ```
 
-The `:AIM` callback is the intended way to follow something: it is a
+The `:AIM` callback is the intended way to follow an ARBITRARY point: it is a
 recalculating source, so as the target and vessel move, the mount keeps
 pointing at it. `:LOOKAT(v)` is the one-shot equivalent for a fixed point.
+
+For the common case of following the active vessel or its target, `:TRACK` is
+higher level: `SET cam:TRACK TO "target".` and the camera auto-aims and
+auto-zooms to keep it framed, no per-tick callback and no `LOCK STEERING`
+caveat. `SET cam:TRACK TO "none".` stops it. Because the track mode is shared
+with the browser, a mode you set here also lights up in the web viewer (and a
+mode set there reads back through `:TRACK`). If both `:AIM`/`:LOOKAT` and
+`:TRACK` are set on one camera, the browser-linked `:TRACK` wins each frame it
+has a valid target.
 
 > **Run continuous `:AIM` tracking from a program, not the terminal.** A kOS
 > callback (`{ ... }`) lives only as long as the context that created it, and

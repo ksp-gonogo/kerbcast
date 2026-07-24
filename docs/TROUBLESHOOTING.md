@@ -107,6 +107,20 @@ where a camera is aimed, some scatters near that feed's edges can thin out.
 Scatters directly in shot render normally. This keeps the feeds smooth and
 leaves your own game view untouched.
 
+## No auto-track control on a camera
+
+Auto-track (aiming a camera at the active vessel or its target) is offered only
+on cameras that can BOTH pan and zoom, since a fixed lens cannot follow. A
+fixed camera shows no track control, and setting a track mode on one from kOS is
+a no-op. This is expected, not a fault.
+
+## A crew face shows up twice, or in the wrong place
+
+Crew face cameras live in the crew bar by default and are not part-camera grid
+tiles. If you'd rather see them as ordinary tiles in the main grid, turn on
+"Merge crew into the camera list" in Settings. With merge off they appear only
+in the crew bar; with merge on only in the grid.
+
 ## Still stuck?
 
 1. Turn on verbose logging: uncomment `DebugCameraLogging = true` in

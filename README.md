@@ -16,6 +16,9 @@ A from-scratch, high-performance oriented successor to OCISLY for streaming Kerb
 - Supports performance tweak options to keep fps reasonable through degrading resolution, framerate, and shedding render layers. By default, performance should feel vastly improved over the original OCISLY mod
 - Introduces optional shaders for wind and re-entry FX
 - Supports popular visual mods so their effects show on the camera feeds: Scatterer, EVE, TUFX, Deferred, Firefly, and Parallax
+- Streams each crew member's face as a live camera, seated in the cabin and out on EVA, shown together in a dedicated crew bar
+- Sizes each feed's stream quality to how large it is actually shown, so you are not paying for pixels you cannot see (auto-resolution)
+- Can point a pannable, zoomable camera at the active vessel or its target and have it follow automatically, aiming and zooming to keep it framed
 - HullcamVDS implementation enhancements:
   - Honours each camera's `cameraMode` so B&W / CRT / night-vision variants look like they do in the in-game Hullcam GUI
   - Introduces planned but never fully implemented panning options for turret cam and launch cam
@@ -57,7 +60,7 @@ This mod was built initally for getting best performance out of Steam Deck, and 
 
 ## kOS addon (optional)
 
-**KerbcastKos** lets a [kOS](https://github.com/KSP-KOS/KOS) script running on a vessel enumerate that vessel's kerbcast cameras and control them from kerboscript: set field of view, pan steerable mounts, and target-track a moving point (`SET cam:AIM TO { RETURN TARGET:POSITION. }.`). It ships as a separate optional download (`KerbcastKos-*.zip` on the [releases page](https://github.com/ksp-gonogo/kerbcast/releases)) and needs both kerbcast and kOS installed.
+**KerbcastKos** lets a [kOS](https://github.com/KSP-KOS/KOS) script running on a vessel enumerate that vessel's kerbcast cameras and control them from kerboscript: set field of view, pan steerable mounts, target-track a moving point (`SET cam:AIM TO { RETURN TARGET:POSITION. }.`), and auto-track the active vessel or its target on a pannable, zoomable camera (`SET cam:TRACK TO "target".`). Auto-track is shared with the browser: a mode set from kerboscript shows up in every viewer, and a viewer-set mode reads back in kerboscript. It ships as a separate optional download (`KerbcastKos-*.zip` on the [releases page](https://github.com/ksp-gonogo/kerbcast/releases)) and needs both kerbcast and kOS installed.
 
 Full API and examples: [GameData/KerbcastKos/README.md](GameData/KerbcastKos/README.md).
 

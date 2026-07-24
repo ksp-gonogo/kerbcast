@@ -73,7 +73,26 @@ An imperative `CameraFeedHandle` (via `ref`) exposes `stepCamera`,
 `setPanAxis`, `setZoomRate`, `nudgePan`, and `nudgeZoom` for wiring feeds
 to a gamepad or keyboard.
 
+`enableTracking` shows a tri-state auto-track control (off / active-vessel /
+target) on pan+zoom cameras, and `CameraFeed` disables its manual pan/zoom
+while a camera is tracking. `cameraFilter` narrows the selectable cameras
+(picker, stepper, auto-latch). `showActions={false}` hides the whole action
+bar without affecting resolution reporting.
+
+## `KerbalFaceFeed`
+
+A single-kerbal face-camera primitive: one crew face in a square frame, keyed
+by `flightId`, never remounting its `<video>` on re-layout. Compose a name
+label, badge, or overlay via `children`. `size` is LAYOUT-ONLY: the feed always
+self-measures its rendered box and reports that for auto-resolution, so stream
+quality follows how large it is shown (pass `reportSize={false}` to opt out).
+
 ## Hooks
+
+- `useReportDisplaySize(flightId, ref)`. Self-measure an element and drive the
+  client's per-consumer `reportDisplaySize` (auto-resolution). The feed
+  primitives use it internally; multiple views of one camera from a client
+  collapse to a single MAX report.
 
 - `useKerbcastCameras(): CameraState[]`. The live camera registry,
   re-rendering as cameras appear, change, or are destroyed.

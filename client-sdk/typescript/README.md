@@ -106,6 +106,22 @@ controls each part actually supports.
   skip, producing the macroblocking and stuttering aesthetic of
   in-game CommNet signal loss. Also a real CPU optimisation when
   every consumer wants degraded video.
+- `kind` (`"part"` | `"kerbal"`) and, for a kerbal face camera,
+  `crewLocation` (`"seat"` | `"eva"`). Distinguish crew face cameras
+  from part cameras.
+- `trackMode` (`"none"` | `"activeVessel"` | `"target"`). Server-authoritative
+  auto-track state on a pan+zoom camera, so every consumer reflects the same
+  tracking state.
+
+## Auto-resolution and targeting
+
+- `client.reportDisplaySize(flightId, width, height)`. Report a consumer's
+  displayed pixel size for a camera; the sidecar takes the MAX across consumers
+  to size the encode (distinct from `setRenderSize`, the shared operator cap).
+  The react feed primitives self-measure and call this for you.
+- `client.setTrackTarget(flightId, mode)`. Ask a pan+zoom camera to auto-track
+  the active vessel or its target (`TrackMode`), or `"none"` to stop. The
+  chosen mode is published back on `CameraState.trackMode`.
 
 ## Pan/zoom input helper
 
