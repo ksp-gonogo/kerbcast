@@ -122,7 +122,7 @@ describe("CrewBar", () => {
 
   it("reflows across placement modes without changing the roster", async () => {
     const { client } = await buildConnectedFixture(ROSTER);
-    for (const placement of ["row", "column", "wrap"] as CrewBarPlacement[]) {
+    for (const placement of ["row", "column"] as CrewBarPlacement[]) {
       let container!: HTMLElement;
       await act(async () => {
         ({ container } = renderCrewBar(client, { placement }));
@@ -212,7 +212,7 @@ describe("CrewBar", () => {
     // Controlled: the App owns the spotlit id; drive it via the prop (rerender).
     const props = (spotlight: number | null) => (
       <KerbcastProvider client={client}>
-        <CrewBar placement="wrap" minimised={false} onToggleMinimise={() => {}}
+        <CrewBar placement="column" minimised={false} onToggleMinimise={() => {}}
           closed={new Set()} onClose={() => {}} onOpen={() => {}}
           spotlight={spotlight} onToggleSpotlight={() => {}} />
       </KerbcastProvider>
@@ -267,7 +267,7 @@ describe("CrewBar", () => {
     expect(face0).not.toBeNull();
     expect(video0).not.toBeNull();
 
-    for (const [placement, minimised] of [["column", false], ["wrap", false], ["row", true], ["row", false]] as [CrewBarPlacement, boolean][]) {
+    for (const [placement, minimised] of [["column", false], ["row", true], ["column", true], ["row", false]] as [CrewBarPlacement, boolean][]) {
       await act(async () => { rerender(props(placement, minimised)); });
       // The face + its <video> are the IDENTICAL DOM nodes — a CSS reflow, never
       // a remount. (The merge toggle IS an expected remount, tracked separately.)

@@ -1350,3 +1350,28 @@ describe("App - out-of-flight standby", () => {
     ).toBeNull();
   });
 });
+
+describe("App - kerbal-only vessel does not double-feed (crew bar + grid)", () => {
+  it("merge OFF: a lone kerbal cam shows in the crew bar only, never as a grid tile", async () => {
+    const { client, openSidecar } = buildFixture([
+      makeCamera({
+        flightId: 900,
+        kind: CameraKind.Kerbal,
+        crewLocation: CrewLocation.Seat,
+        cameraName: "Jebediah Kerman",
+        partName: "",
+        partTitle: "",
+      }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("crew-face").length).toBe(1);
+    });
+    // The kerbal must NOT also be a grid tile: no remove-tile control exists
+    // (an empty grid has none), i.e. it is not gridded.
+    expect(screen.queryAllByRole("button", { name: /remove tile/i })).toHaveLength(0);
+  });
+});
+

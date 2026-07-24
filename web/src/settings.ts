@@ -6,9 +6,9 @@
 
 export type ThemePreference = "auto" | "light" | "dark";
 
-/** Where the crew bar docks: a horizontal filmstrip, a vertical column, or a
- *  reflowing wrap. Squares stay square in all three. */
-export type CrewBarPlacement = "row" | "column" | "wrap";
+/** Where the crew bar docks: a horizontal bottom filmstrip or a vertical side
+ *  column. Squares stay square in both. */
+export type CrewBarPlacement = "row" | "column";
 
 const KEY_THEME = "kerbcast:theme";
 const KEY_DEBUG = "kerbcast:debug";
@@ -79,7 +79,8 @@ export function saveShowPerfWarnings(enabled: boolean): void {
 /** Crew-bar placement. Defaults to a bottom row when unset. */
 export function loadCrewBarPlacement(): CrewBarPlacement {
   const raw = localStorage.getItem(KEY_CREW_BAR_PLACEMENT);
-  if (raw === "row" || raw === "column" || raw === "wrap") return raw;
+  // "wrap" was removed; a stored "wrap" (or anything unknown) falls back to row.
+  if (raw === "row" || raw === "column") return raw;
   return "row";
 }
 

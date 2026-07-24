@@ -39,7 +39,7 @@ export function Grid({ mergeCrew, tiles, onTilesChange, showDebugInfo, showStati
   // are regular grid cameras, indistinguishable from part cams. Part-camera grid
   // behaviour is unchanged either way.
   const all = useKerbcastCameras();
-  const cameras = mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal);
+  const cameras = mergeCrew ? all : all.filter((c) => c.kind === CameraKind.Part);
   const [showPerfNote, setShowPerfNote] = useState(false);
 
   const commit = (next: TileData[]) => {
