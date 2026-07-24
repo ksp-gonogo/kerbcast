@@ -270,7 +270,14 @@ namespace Kerbcast
         private void OnVesselChange(Vessel v)
         {
             Debug.Log($"[Kerbcast] vessel change: {(v != null ? v.vesselName : "<null>")}");
-            RebuildCameraList(v);
+            // Going EVA fires onVesselChange (control follows the kerbal onto the
+            // EVA vessel), but the ship stays loaded and in physics range — like a
+            // dock/stage change (onVesselWasModified, additive). Keep the ship's
+            // cameras through the EVA switch instead of the scope-and-drop a real
+            // craft switch does; a genuine out-of-range unload is still caught by
+            // onPartDestroyed + the LateUpdate !IsAlive sweep. See VesselChangePolicy.
+            bool goingEva = v != null && v.isEVA;
+            RebuildCameraList(v, VesselChangePolicy.DisposeMissingOnVesselChange(goingEva));
         }
 
         // GameEvents.onPartDestroyed fires when a Part's GameObject is

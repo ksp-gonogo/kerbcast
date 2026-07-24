@@ -134,6 +134,7 @@
     <Compile Remove="InFlightSignal.Tests/**/*.cs" />
     <Compile Remove="PanAim.Tests/**/*.cs" />
     <Compile Remove="CameraId.Tests/**/*.cs" />
+    <Compile Remove="VesselChangePolicy.Tests/**/*.cs" />
     <Compile Remove="AimSourceRegistry.Tests/**/*.cs" />
     <Compile Remove="TrackAim.Tests/**/*.cs" />
     <Compile Remove="KosSpike/**/*.cs" />

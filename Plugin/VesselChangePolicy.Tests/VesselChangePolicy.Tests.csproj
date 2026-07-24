@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Standalone contract test for VesselChangePolicy.cs. Compiles ONLY the
+       Unity-free lifecycle predicate (no KSP/Unity), mirroring CameraId.Tests.
+       Run: `dotnet run`. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Kerbcast/VesselChangePolicy.cs" />
+  </ItemGroup>
+</Project>
