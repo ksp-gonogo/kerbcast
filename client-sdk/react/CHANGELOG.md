@@ -10,12 +10,11 @@ Crew face cameras, auto-resolution, and camera targeting.
   face in a square frame, keyed by `flightId`, and never remounts its `<video>`
   on re-layout. Composable via `children` (name label, badge, custom overlays)
   and an `actions` bar.
-- `useReportDisplaySize` hook plus the client-scoped display-size registry:
-  `createClientDisplaySizes`, `useKerbcastDisplaySizes`, and the
-  `KerbcastDisplaySizes` type. `KerbcastProvider` now accepts an optional
-  `displaySizes` override (mirrors `subscriptions`). Mounted feeds self-measure
-  and drive per-consumer auto-resolution; two views of the same camera from one
-  client collapse to a single MAX report.
+- Low-level auto-resolution primitives, for CUSTOM feed surfaces only (not
+  needed for normal use, since the feed components self-measure):
+  `useReportDisplaySize`, `createClientDisplaySizes`, `useKerbcastDisplaySizes`,
+  the `KerbcastDisplaySizes` type, and a `displaySizes` override on
+  `KerbcastProvider`.
 - `showActions?: boolean` (default true) on `CameraFeed` and `KerbalFaceFeed` to
   suppress the hover action bar without affecting resolution reporting.
 - `reportSize?: boolean` (default true) on `KerbalFaceFeed` to opt a
