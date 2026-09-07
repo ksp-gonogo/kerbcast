@@ -49,6 +49,10 @@ on:
       - 'Plugin/Kerbcast/CaptureOrientation/**'
       - 'GameData/Kerbcast/HullcamShaders/**'
       - '.github/workflows/build-kerbcast-shaders.yml'
+      # The shared Unity install. This is the workflow that regression-tests
+      # it: fx-previews chains off a green run here, and the HullcamVDS bundle
+      # build uses the same action but only runs on demand.
+      - '.github/actions/setup-unity-linux/**'
   workflow_dispatch:
 
 permissions:

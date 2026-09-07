@@ -24,6 +24,10 @@ name: Build HullcamVDS shader bundle (Linux)
 # `branches` is load-bearing alongside `paths`: GitHub ignores path filters
 # for tag pushes, so without it every release tag ran this whole Unity job
 # with none of its inputs changed.
+#
+# The shared Unity install is not in `paths` on purpose. Every workflow using
+# it would otherwise fire at once and contend for the single Unity Personal
+# activation; build-kerbcast-shaders covers that action on every change.
 
 on:
   workflow_dispatch:

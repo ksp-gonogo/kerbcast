@@ -128,9 +128,16 @@ runs:
     # to run without it. The EDITOR comes from the direct download above, since
     # Hub's headless editor install is the broken part.
     #
-    # Pin pre-3.20: 3.20 relocated its binary to /usr/lib/unityhub while the
-    # tooling expects /opt/unityhub. An apt pin, not `apt-mark hold`, because
-    # hold makes the activation action's own apt-get install exit 100.
+    # Pin below 3.20: that release relocated Hub's binary to /usr/lib/unityhub
+    # while the tooling expects /opt/unityhub. An apt pin, not `apt-mark hold`,
+    # because hold makes the activation action's own apt-get install exit 100.
+    #
+    # Select by version comparison rather than by excluding known-bad strings.
+    # The original pattern excluded `3.20` literally, so when Unity shipped
+    # 3.21 it sailed through, installed outside /opt, and surfaced 20 minutes
+    # later as an opaque "Unity Hub is not installed" from the activation step.
+    # The install-location assertion below turns the next such drift into an
+    # immediate, named failure.
     - name: Install Unity Hub (licensing client only)
       shell: bash
       run: |
@@ -142,16 +149,21 @@ runs:
           | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
         sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
         sudo apt-get update -qq
-        VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
-        echo "pinning unityhub ${VER:-<latest>}"
-        if [ -n "$VER" ]; then
-          printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
-            | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
-          sudo apt-get install -y "unityhub=$VER"
-        else
-          sudo apt-get install -y unityhub
+        VER="$(apt-cache madison unityhub | awk '{print $3}' | sort -Vr \
+                 | awk -F. '($1 < 3) || ($1 == 3 && $2 < 20) { print; exit }')"
+        if [ -z "$VER" ]; then
+          echo "::error::no unityhub below 3.20 available; Unity may have dropped the old builds"
+          exit 1
         fi
-        if [ -x /opt/unityhub/unityhub ] && [ ! -e /usr/bin/unity-hub ]; then
+        echo "pinning unityhub $VER"
+        printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
+          | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
+        sudo apt-get install -y "unityhub=$VER"
+        if [ ! -x /opt/unityhub/unityhub ]; then
+          echo "::error::unityhub $VER installed outside /opt; the licensing client will not be found"
+          exit 1
+        fi
+        if [ ! -e /usr/bin/unity-hub ]; then
           sudo ln -sf /opt/unityhub/unityhub /usr/bin/unity-hub
         fi
         command -v unity-hub unityhub || true
