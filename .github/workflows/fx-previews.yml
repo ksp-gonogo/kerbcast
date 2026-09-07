@@ -49,34 +49,23 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Set up Unity Hub + Editor
-        uses: buildalon/unity-setup@v2
+      # Shares an editor cache with build-kerbcast-shaders, which is the
+      # workflow that triggers this one, so the install is normally a cache
+      # hit. Not buildalon/unity-setup: Hub's headless editor install is
+      # broken on the current runner image, and that is what had been failing
+      # every run of this workflow since 2026-07-23.
+      - name: Set up Unity (Linux)
+        uses: ./.github/actions/setup-unity-linux
         with:
           unity-version: ${{ env.UNITY_VERSION }}
-          version-file: 'None'
-          # Same module set as build-kerbcast-shaders.yml's build-unix job
-          # even though the previews only need the Linux editor: an identical
-          # install means cache-installation reuses the editor that workflow
-          # cached. (windows-mono left with the Linux d3d11 cross-compile;
-          # the Windows bundle now builds on a windows-2022 runner.)
-          build-targets: StandaloneLinux64
-          modules: mac-mono
-          cache-installation: true
-
-      - name: Activate Unity Personal license
-        uses: buildalon/activate-unity-license@v2
-        with:
-          license: 'Personal'
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
       # `-nographics` is intentionally OMITTED on the render step: the flag
       # disables Unity's graphics device entirely, which would make
       # Camera.Render() and RenderTexture readback no-ops. We wrap in
-      # `xvfb-run` so the runner has a (virtual) display for the GL context.
-      - name: Install xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-
+      # `xvfb-run` so the runner has a (virtual) display for the GL context;
+      # the setup action installs xvfb.
       - name: Render FX preview PNGs
         working-directory: ci/kerbcast-shaders
         # LLVMpipe fill cost scales with proxy triangle count (one strip per

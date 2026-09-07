@@ -17,13 +17,18 @@ name: Build HullcamVDS shader bundle (Linux)
 # later gets 2FA enabled, add UNITY_TOTP_KEY and pass via the action's
 # `totp` input.
 #
-# Trigger: manual via workflow_dispatch (and on push to this workflow
-# file or to ci/hullcam-shaders/) — keeps activation rate down on
+# Trigger: manual via workflow_dispatch, and on push to this workflow
+# file or to ci/hullcam-shaders/. That keeps activation rate down on
 # Unity's licensing servers while we iterate.
+#
+# `branches` is load-bearing alongside `paths`: GitHub ignores path filters
+# for tag pushes, so without it every release tag ran this whole Unity job
+# with none of its inputs changed.
 
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     paths:
       - '.github/workflows/build-hullcam-shaders.yml'
       - 'ci/hullcam-shaders/**'
@@ -77,25 +82,18 @@ jobs:
              hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
           ls -la hullcam/HullCameraAssets/Assets/Editor/
 
-      # Order matters: unity-setup installs Unity Hub + Editor first;
-      # activate-unity-license then uses Hub's Licensing Client to
-      # auth. Reversed order errors with "Unity Hub is not installed".
-      - name: Set up Unity Hub + Editor
-        uses: buildalon/unity-setup@v2
+      # Not buildalon/unity-setup: Hub's headless editor install is broken on
+      # the current runner image. The action downloads the editor straight
+      # from Unity's CDN and handles licensing; see it for the full story.
+      # It also sidesteps this workflow's old ProjectVersion.txt problem, since
+      # the cloned HullCameraAssets/ pins an ancient Unity version that the
+      # action's resolver choked on: the version comes from UNITY_VERSION only.
+      - name: Set up Unity (Linux)
+        # kerbcast is checked out under kerbcast/ here, not at the workspace
+        # root, so the local action path carries that prefix.
+        uses: ./kerbcast/.github/actions/setup-unity-linux
         with:
           unity-version: ${{ env.UNITY_VERSION }}
-          # Skip auto-detection of ProjectVersion.txt in the cloned
-          # HullCameraAssets/ — that file pins an ancient Unity version
-          # which the action's resolver chokes on. We control the
-          # version explicitly via unity-version above.
-          version-file: 'None'
-          build-targets: StandaloneLinux64
-          cache-installation: true
-
-      - name: Activate Unity Personal license
-        uses: buildalon/activate-unity-license@v2
-        with:
-          license: 'Personal'
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
