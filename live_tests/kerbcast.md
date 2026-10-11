@@ -103,7 +103,7 @@ Client → sidecar (`ClientMessage`):
 | `type` | content | notes |
 |---|---|---|
 | `hello` | – | first message; sidecar replies `hello` + `camera-snapshot` + `settings-state` |
-| `subscribe` / `unsubscribe` | `{ "flightId": n }` | dynamic slot binding; reply is `slot-map` |
+| `subscribe` / `unsubscribe` | `{ "flightId": n }` | dynamic slot binding; reply is `slot-map`, or an `error` carrying `flightId` and `code` when refused |
 | `set-layers` | `{ "flightId": n, "layers": ["NEAR","SCALED","GALAXY"] }` | server-wide |
 | `set-render-size` | `{ "flightId": n, … }` | even pixels only; capped at ring max |
 | `set-fov` | `{ "flightId": n, "fov": deg }` | ignored when `supportsZoom == false` |
@@ -120,8 +120,11 @@ Sidecar → client (`ServerMessage`): `hello` (version + encoder backend name),
 `camera-snapshot` (full `CameraState` array), `camera-state-changed`,
 `slot-map` (`mid` ↔ `flightId`/null), `adaptive-shed` (with human-readable
 `reason`), `settings-state`, `ping` (every 5 s; client must `pong` — no ping
-for 15 s means the client should tear down), `error` (echoes the offending
-payload).
+for 15 s means the client should tear down), `error` (`message` + `source`;
+refusals about one camera also carry `flightId` and a `code`: `no-free-slot`,
+`camera-not-found` or `camera-destroyed`). Cameras requested at `/offer` that
+could not be bound are reported with the same `error` shape right after
+`hello` and the initial `slot-map`s.
 
 ## What "healthy" looks like
 

@@ -54,8 +54,8 @@ use crate::cameras::CameraState as InternalCameraState;
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
-    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorPayload, ErrorSource,
-    FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
+    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorCode, ErrorPayload,
+    ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
     SceneStateChangedPayload, ServerMessage, SetBackgroundCaptureFpsPayload, SetDegradePayload,
     SetForceFullResolutionPayload, SetFovPayload, SetLayersPayload, SetPanPayload,
     SetPanRatePayload, SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload,
@@ -200,6 +200,9 @@ pub struct KerbcastPeer {
     /// flight_ids bound at connect time — echoed (in slot order) in the
     /// `/offer` answer so the browser maps its initial cameras to slots.
     pub subscribed: Vec<u32>,
+    /// Initial cameras that could not be bound, sent to the browser as typed
+    /// errors right after Hello.
+    pub refused: Arc<Vec<ErrorPayload>>,
     /// Set once the browser opens the control channel. Held for the
     /// peer's lifetime so server-initiated pushes (AdaptiveShed,
     /// vessel-change-driven camera-state-changed) can address this
@@ -305,21 +308,45 @@ impl KerbcastPeer {
         // the slot from that camera's encoder. set_subscribed(true) wakes the
         // plugin's per-camera render on its next ~1Hz control poll.
         let mut subscribed = Vec::new();
+        /* Refusals can't be sent yet: the control channel doesn't exist until
+        the browser opens it. They are held and sent after Hello, in the same
+        shape as a refused Subscribe. */
+        let mut refusals = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for &flight_id in initial {
+            // A repeated id is handled once: bound, or refused, a single time.
+            if !seen.insert(flight_id) {
+                continue;
+            }
             let cam = match registry.get(flight_id).await {
                 Some(c) => c,
                 None => {
                     warn!(flight_id, "initial camera not found, skipping");
+                    refusals.push(refusal(
+                        flight_id,
+                        ErrorCode::CameraNotFound,
+                        format!("no live camera with flight_id={flight_id}"),
+                    ));
                     continue;
                 }
             };
             if cam.destroyed.load(Ordering::Acquire) {
                 warn!(flight_id, "skipping destroyed initial camera");
+                refusals.push(refusal(
+                    flight_id,
+                    ErrorCode::CameraDestroyed,
+                    format!("no live camera with flight_id={flight_id}"),
+                ));
                 continue;
             }
             let Some(slot) = slots.iter_mut().find(|s| s.bound.is_none()) else {
                 warn!(flight_id, "no free slot for initial subscription");
-                break;
+                refusals.push(refusal(
+                    flight_id,
+                    ErrorCode::NoFreeSlot,
+                    NO_FREE_SLOT_MESSAGE.into(),
+                ));
+                continue;
             };
             cam.add_track(slot.track.clone()).await;
             registry.set_subscribed(flight_id, true).await;
@@ -346,10 +373,13 @@ impl KerbcastPeer {
         let registry_for_dc = registry.clone();
         let control_channel_for_handler = control_channel.clone();
         let slots_for_handler = slots.clone();
+        let refusals = Arc::new(refusals);
+        let refused = refusals.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let registry = registry_for_dc.clone();
             let control_channel = control_channel_for_handler.clone();
             let slots = slots_for_handler.clone();
+            let refusals = refusals.clone();
             Box::pin(async move {
                 if dc.label() != CONTROL_CHANNEL_LABEL {
                     info!(label = %dc.label(), "ignoring unexpected data channel");
@@ -362,9 +392,10 @@ impl KerbcastPeer {
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let registry = registry.clone();
                     let slots = slots.clone();
+                    let refusals = refusals.clone();
                     let dc = dc_for_msg.clone();
                     Box::pin(async move {
-                        handle_client_message(registry, peer_id, slots, dc, msg).await;
+                        handle_client_message(registry, peer_id, slots, refusals, dc, msg).await;
                     })
                 }));
             })
@@ -388,6 +419,7 @@ impl KerbcastPeer {
             peer_id,
             slots,
             subscribed,
+            refused,
             control_channel,
             connected,
             liveness,
@@ -583,6 +615,7 @@ async fn handle_client_message(
     registry: Arc<CameraRegistry>,
     peer_id: u32,
     slots: Arc<Mutex<Vec<Slot>>>,
+    refusals: Arc<Vec<ErrorPayload>>,
     dc: Arc<RTCDataChannel>,
     msg: DataChannelMessage,
 ) {
@@ -602,6 +635,7 @@ async fn handle_client_message(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("parse failed: {e}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -641,6 +675,10 @@ async fn handle_client_message(
             // initial cameras to slots by mid — uniform with dynamic
             // Subscribe, no reliance on the answer's camera order.
             send_initial_slot_maps(&slots, &dc).await;
+            // Initial cameras that could not be bound (see `KerbcastPeer::new`).
+            for payload in refusals.iter() {
+                send_server_message(&dc, &ServerMessage::Error(payload.clone())).await;
+            }
         }
         ClientMessage::SetLayers(SetLayersPayload { flight_id, layers }) => {
             apply_layer_change(&registry, &dc, flight_id, layers).await;
@@ -701,6 +739,7 @@ async fn handle_client_message(
                     &ServerMessage::Error(ErrorPayload {
                         message,
                         source: ErrorSource::Sidecar,
+                        ..Default::default()
                     }),
                 )
                 .await;
@@ -803,13 +842,19 @@ async fn handle_subscribe(
 ) {
     let cam = match registry.get(flight_id).await {
         Some(c) if !c.destroyed.load(Ordering::Acquire) => c,
-        _ => {
+        found => {
+            let code = if found.is_some() {
+                ErrorCode::CameraDestroyed
+            } else {
+                ErrorCode::CameraNotFound
+            };
             send_server_message(
                 dc,
-                &ServerMessage::Error(ErrorPayload {
-                    message: format!("no live camera with flight_id={flight_id}"),
-                    source: ErrorSource::Sidecar,
-                }),
+                &ServerMessage::Error(refusal(
+                    flight_id,
+                    code,
+                    format!("no live camera with flight_id={flight_id}"),
+                )),
             )
             .await;
             return;
@@ -830,10 +875,11 @@ async fn handle_subscribe(
             drop(guard);
             send_server_message(
                 dc,
-                &ServerMessage::Error(ErrorPayload {
-                    message: "no free slot — negotiate more video transceivers".into(),
-                    source: ErrorSource::Sidecar,
-                }),
+                &ServerMessage::Error(refusal(
+                    flight_id,
+                    ErrorCode::NoFreeSlot,
+                    NO_FREE_SLOT_MESSAGE.into(),
+                )),
             )
             .await;
             return;
@@ -1049,6 +1095,7 @@ async fn apply_layer_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1069,6 +1116,7 @@ async fn apply_layer_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1094,6 +1142,7 @@ async fn apply_render_size_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1119,6 +1168,7 @@ async fn apply_render_size_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1148,6 +1198,7 @@ async fn apply_fov_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1160,6 +1211,7 @@ async fn apply_fov_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("camera {flight_id} does not support zoom"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1187,6 +1239,7 @@ async fn apply_fov_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1212,6 +1265,7 @@ async fn apply_pan_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1227,6 +1281,7 @@ async fn apply_pan_change(
                      planned mod extension)"
                 ),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1252,6 +1307,7 @@ async fn apply_pan_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1286,6 +1342,7 @@ async fn apply_pan_rate_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1301,6 +1358,7 @@ async fn apply_pan_rate_change(
                      planned mod extension)"
                 ),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1323,6 +1381,7 @@ async fn apply_pan_rate_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1355,6 +1414,7 @@ async fn apply_zoom_rate_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1367,6 +1427,7 @@ async fn apply_zoom_rate_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("camera {flight_id} does not support zoom"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1387,6 +1448,7 @@ async fn apply_zoom_rate_change(
             &ServerMessage::Error(ErrorPayload {
                 message: format!("control file flush failed: {e}"),
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1420,6 +1482,7 @@ async fn apply_quality_change(
             &ServerMessage::Error(ErrorPayload {
                 message,
                 source: ErrorSource::Sidecar,
+                ..Default::default()
             }),
         )
         .await;
@@ -1444,6 +1507,7 @@ async fn apply_degrade_change(
                 &ServerMessage::Error(ErrorPayload {
                     message: format!("no camera with flight_id={flight_id}"),
                     source: ErrorSource::Sidecar,
+                    ..Default::default()
                 }),
             )
             .await;
@@ -1493,6 +1557,18 @@ async fn push_camera_state(
         &ServerMessage::CameraStateChanged(CameraStateChangedPayload { state }),
     )
     .await;
+}
+
+const NO_FREE_SLOT_MESSAGE: &str = "no free slot - negotiate more video transceivers";
+
+/// An error about one camera that a client can act on without parsing `message`.
+fn refusal(flight_id: u32, code: ErrorCode, message: String) -> ErrorPayload {
+    ErrorPayload {
+        message,
+        source: ErrorSource::Sidecar,
+        flight_id: Some(flight_id),
+        code: Some(code),
+    }
 }
 
 async fn send_server_message(dc: &Arc<RTCDataChannel>, msg: &ServerMessage) {
@@ -1734,6 +1810,39 @@ mod tests {
             "Unsubscribe must release this peer's force-full-resolution pin, \
              not just its display-size report -- otherwise the feed never \
              relaxes off the ring ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbindable_initial_cameras_are_refused_with_a_code() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        for id in [1, 2] {
+            MmapFrameRing::create(&dir.path().join(format!("{id}.ring")), cfg).expect("ring");
+        }
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+
+        // One slot, two live cameras and one unknown id, with repeats.
+        let peer = KerbcastPeer::new(registry, &[1, 2, 99, 1, 99], 1)
+            .await
+            .expect("peer");
+
+        assert_eq!(peer.subscribed, vec![1]);
+        let got: Vec<_> = peer.refused.iter().map(|e| (e.flight_id, e.code)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(2), Some(ErrorCode::NoFreeSlot)),
+                (Some(99), Some(ErrorCode::CameraNotFound)),
+            ],
+            "a full slot pool must not hide the cameras after the first refusal"
         );
     }
 

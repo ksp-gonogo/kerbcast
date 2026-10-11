@@ -265,9 +265,33 @@ export enum ErrorSource {
 	Client = "client",
 }
 
+/**
+ * Machine-readable reason for an `ErrorPayload`, so a client can react to a
+ * refusal without matching on the wording of `message`.
+ */
+export enum ErrorCode {
+	/** Every video slot is bound; the client negotiated too few transceivers. */
+	NoFreeSlot = "no-free-slot",
+	/**
+	 * No camera with the requested flight id is registered. For cameras
+	 * requested at connect time this is true as of the offer; the camera may
+	 * appear later, so a client can retry with `Subscribe`.
+	 */
+	CameraNotFound = "camera-not-found",
+	/** The named camera exists but its part is gone. */
+	CameraDestroyed = "camera-destroyed",
+}
+
 export interface ErrorPayload {
 	message: string;
 	source?: ErrorSource;
+	/** Camera the error is about, when it concerns one. */
+	flightId?: number;
+	/**
+	 * Reason code for refusals a client may want to act on. Absent for
+	 * errors that only carry a human-readable `message`.
+	 */
+	code?: ErrorCode;
 }
 
 export interface FlightIdPayload {

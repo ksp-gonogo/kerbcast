@@ -511,13 +511,36 @@ pub enum ErrorSource {
     Client,
 }
 
+/// Machine-readable reason for an `ErrorPayload`, so a client can react to a
+/// refusal without matching on the wording of `message`.
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ErrorCode {
+    /// Every video slot is bound; the client negotiated too few transceivers.
+    NoFreeSlot,
+    /// No camera with the requested flight id is registered. For cameras
+    /// requested at connect time this is true as of the offer; the camera may
+    /// appear later, so a client can retry with `Subscribe`.
+    CameraNotFound,
+    /// The named camera exists but its part is gone.
+    CameraDestroyed,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorPayload {
     pub message: String,
     #[serde(default)]
     pub source: ErrorSource,
+    /// Camera the error is about, when it concerns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_id: Option<u32>,
+    /// Reason code for refusals a client may want to act on. Absent for
+    /// errors that only carry a human-readable `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<ErrorCode>,
 }
 
 #[typeshare]
@@ -1143,6 +1166,35 @@ mod tests {
             serde_json::from_str::<ClientMessage>(&s).unwrap(),
             ClientMessage::Unsubscribe(FlightIdPayload { flight_id: 7 })
         ));
+    }
+
+    #[test]
+    fn error_carries_camera_and_reason_code() {
+        let refused = ServerMessage::Error(ErrorPayload {
+            message: "no free slot".into(),
+            flight_id: Some(42),
+            code: Some(ErrorCode::NoFreeSlot),
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&refused).unwrap();
+        assert!(s.contains("\"type\":\"error\""));
+        assert!(s.contains("\"flightId\":42"));
+        assert!(s.contains("\"code\":\"no-free-slot\""));
+    }
+
+    #[test]
+    fn plain_error_omits_camera_and_code() {
+        let plain = ServerMessage::Error(ErrorPayload {
+            message: "parse failed".into(),
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&plain).unwrap();
+        assert!(!s.contains("flightId"), "{s}");
+        assert!(!s.contains("code"), "{s}");
+        // A payload from an older sidecar still parses.
+        let old: ErrorPayload =
+            serde_json::from_str(r#"{"message":"m","source":"sidecar"}"#).unwrap();
+        assert_eq!((old.flight_id, old.code), (None, None));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraKind, CameraLifecycle, CrewLocation, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
 import type {
   DiscoveredCamera,
   InboundVideoStats,
@@ -646,7 +646,12 @@ export class MockSidecar {
         if (freeMid === undefined) {
           this._sendToClient({
             type: "error",
-            content: { message: "no free slot", source: ErrorSource.Sidecar },
+            content: {
+              message: "no free slot",
+              source: ErrorSource.Sidecar,
+              flightId,
+              code: ErrorCode.NoFreeSlot,
+            },
           });
         } else {
           this._slotBindings.set(freeMid, flightId);
