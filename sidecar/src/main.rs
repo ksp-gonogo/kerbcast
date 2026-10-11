@@ -7,6 +7,7 @@
 //! we don't poll the ring beyond the heartbeat interval. The plugin keeps
 //! writing frames into the ring; the sidecar just doesn't consume them.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -299,6 +300,9 @@ async fn consume_loop(
 ) -> Result<()> {
     let mut last_rescan = Instant::now() - rescan_interval; // rescan immediately
     let frame_duration = Duration::from_secs(1) / fps;
+    // Cameras currently skipped for lack of subscribers, so the skip is
+    // logged on the transition rather than on every tick.
+    let mut idle_cameras: HashSet<u32> = HashSet::new();
 
     loop {
         if last_rescan.elapsed() >= rescan_interval {
@@ -441,13 +445,26 @@ async fn consume_loop(
             if cam.destroyed.load(Ordering::Acquire) {
                 continue;
             }
-            if cam.subscribers.load(Ordering::Acquire) == 0 {
-                debug!(flight_id = cam.flight_id, "skipped: no subscribers");
+            let idle = cam.subscribers.load(Ordering::Acquire) == 0;
+            if idle_changed(&mut idle_cameras, cam.flight_id, idle) {
+                if idle {
+                    debug!(flight_id = cam.flight_id, "no subscribers, not encoding");
+                } else {
+                    debug!(flight_id = cam.flight_id, "subscriber present");
+                }
+            }
+            if idle {
                 continue;
             }
             any_active = true;
             encode_and_fan_out(cam, encoder_choice, fps, bitrate_bps, frame_duration).await;
         }
+
+        idle_cameras.retain(|id| {
+            cameras
+                .iter()
+                .any(|c| c.flight_id == *id && !c.destroyed.load(Ordering::Acquire))
+        });
 
         // After encode + GC of dead weak refs, any cam that just lost its
         // last subscriber needs `subscribed=false` flushed so the plugin sleeps
@@ -460,6 +477,16 @@ async fn consume_loop(
         } else {
             sleep(idle_interval).await;
         }
+    }
+}
+
+/// Record a camera's idle state and report whether it differs from the last
+/// tick, so a steady state is logged once instead of every tick.
+fn idle_changed(idle_cameras: &mut HashSet<u32>, flight_id: u32, idle: bool) -> bool {
+    if idle {
+        idle_cameras.insert(flight_id)
+    } else {
+        idle_cameras.remove(&flight_id)
     }
 }
 
@@ -970,6 +997,24 @@ async fn encode_and_fan_out(
 mod tests {
     use super::*;
     use kerbcast_sidecar::encoder::{Nvenc, Software};
+
+    #[test]
+    fn idle_state_is_reported_only_on_change() {
+        let mut idle = HashSet::new();
+        assert!(idle_changed(&mut idle, 7, true), "first idle tick logs");
+        assert!(!idle_changed(&mut idle, 7, true), "steady idle stays quiet");
+        assert!(!idle_changed(&mut idle, 7, true));
+        assert!(idle_changed(&mut idle, 7, false), "resuming logs once");
+        assert!(
+            !idle_changed(&mut idle, 7, false),
+            "steady active stays quiet"
+        );
+        assert!(idle_changed(&mut idle, 7, true), "going idle again logs");
+        assert!(
+            idle_changed(&mut idle, 8, true),
+            "cameras are tracked apart"
+        );
+    }
 
     #[test]
     fn bitrate_flag_absent_is_distinguishable_from_explicit() {
