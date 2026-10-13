@@ -42,7 +42,6 @@
        Mirrors Gonogo.Kos.Tests. NO UnityEngine reference: the whole driven
        path stays Unity-free. -->
   <PropertyGroup>
-    <KspGameData Condition="'$(KspGameData)' == ''">/Users/jon.pepler/personal/gonogo/local_docs/syncthing/kspdata/GameData</KspGameData>
     <KosSafeDll>$(KspGameData)/kOS/Plugins/kOS.Safe.dll</KosSafeDll>
     <KosDll>$(KspGameData)/kOS/Plugins/kOS.dll</KosDll>
     <KerbcastKosDll>$(MSBuildThisFileDirectory)../KerbcastKos/bin/$(Configuration)/Kerbcast.Kos.dll</KerbcastKosDll>

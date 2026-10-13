@@ -35,10 +35,7 @@ using Mono.Cecil.Cil;
 string dllPath =
     (args.Length > 0 ? args[0] : null)
     ?? Environment.GetEnvironmentVariable("KERBCAST_HULLCAM_DLL")
-    ?? Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        "personal", "gonogo", "local_docs", "syncthing", "kspdata",
-        "GameData", "HullCameraVDS", "Plugins", "HullcamVDSContinued.dll");
+    ?? string.Empty;
 
 Console.WriteLine($"HullcamVDSContinued.dll: {dllPath}");
 if (!File.Exists(dllPath))

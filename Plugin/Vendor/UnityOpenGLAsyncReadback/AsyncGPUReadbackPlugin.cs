@@ -173,7 +173,6 @@ namespace Yangrc.OpenGLAsyncReadback {
         /// GetData() is already a zero-copy view of Unity's internal buffer — the
         /// caller should use GetData() there. The pointer is valid only until the
         /// next readback Update; copy out of it immediately.
-        /// See local_docs/perf_profiles/readback_investigation.md change #1.
         /// </summary>
         public unsafe bool TryGetRawPtr(out void* ptr, out int length) {
             if (isPlugin) {

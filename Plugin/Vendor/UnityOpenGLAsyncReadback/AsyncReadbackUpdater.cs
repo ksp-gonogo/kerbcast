@@ -17,7 +17,7 @@ namespace Yangrc.OpenGLAsyncReadback {
         // pump on the next Flight scene) reliably sees null. Upstream never
         // nulled it, leaving a stale reference after the GameObject was
         // destroyed; the pump then failed to re-spawn and async readbacks wedged
-        // until a full restart. See local_docs/perf_profiles/session_20260606.md.
+        // until a full restart.
         private void OnDestroy() {
             if (instance == this) instance = null;
         }

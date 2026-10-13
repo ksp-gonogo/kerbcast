@@ -129,7 +129,7 @@ namespace Kerbcast
             // Stock-like fade-out: mirror AerodynamicsFX's FxScalar gate so
             // we fade out naturally at high altitude (heatFlux < 8e6 N/W
             // → FX off). Drives the 30 km ascent fade-out the user
-            // observes in stock. See local_docs/kerbcast/stock_plasma_research.md.
+            // observes in stock.
             float fxScalar = ComputeStockFxScalar(state.Vessel);
             intensity *= fxScalar;
 
@@ -205,7 +205,7 @@ namespace Kerbcast
         // we use it as an intensity multiplier so our effect fades to zero
         // when stock would. Drives the natural ~30 km ascent fade-out and
         // correct reentry fade-in. Numeric values from PhysicsGlobals /
-        // Physics.cfg; see local_docs/kerbcast/stock_plasma_research.md.
+        // Physics.cfg.
         private static float ComputeStockFxScalar(Vessel vessel)
         {
             if (vessel == null) return 0f;

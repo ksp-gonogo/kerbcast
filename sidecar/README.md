@@ -15,8 +15,6 @@ Encoder tiers:
 | `nvenc.rs` | Windows / NVIDIA | 2 | stub — returns Unavailable, selection falls through to software |
 | `software.rs` | all | fallback | OpenH264, bundled source build; also the init-failure fallback |
 
-See gonogo's `local_docs/ocisly_state_and_rebuild.md` for the original design (§2 architecture, §3 Hullcam filter fidelity, §4 perf budgets); the parent repo's `CLAUDE.md` for current layout and conventions.
-
 ## Build
 
 ```

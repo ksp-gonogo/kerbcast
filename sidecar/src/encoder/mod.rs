@@ -1,6 +1,5 @@
 //! Encoder backend trait + factory + stub implementations per OS tier.
 //!
-//! See the gonogo repo's `local_docs/ocisly_state_and_rebuild.md` §2.3.
 //! Tier-1 is libva (Steam Deck Linux). Tier-2 is VideoToolbox (macOS),
 //! NVENC (Windows/NVIDIA, stub) and Media Foundation (Windows, vendor-
 //! generic hardware MFTs). Software fallback (OpenH264 / x264) ships

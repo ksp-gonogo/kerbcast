@@ -14,14 +14,13 @@ suffix logic and a headless `PRINT ADDONS:KERBCAST:...` run are already covered 
   **restart KSP** (kOS addons load at startup):
 
   ```sh
-  M=~/personal/gonogo/local_docs/syncthing/kspdata
+  M=/path/to/ksp   # KSP install root containing KSP_Data/ and GameData/
   dotnet build Plugin/KerbcastKos/KerbcastKos.csproj -c Release \
     /p:KspManaged="$M/KSP_Data/Managed" /p:KspGameData="$M/GameData"
   mkdir -p "$M/GameData/KerbcastKos/Plugins"
   cp Plugin/KerbcastKos/bin/Release/Kerbcast.Kos.dll "$M/GameData/KerbcastKos/Plugins/"
   ```
-  (Syncthing carries it to the Deck; the plugin `Kerbcast.dll` it links must already be in
-  `GameData/Kerbcast/Plugins/`.)
+  (The plugin `Kerbcast.dll` it links must already be in `GameData/Kerbcast/Plugins/`.)
 
 - A vessel with **a `DC.TurretCam`** (steerable, yaw ±135) and at least one zoom-capable
   Hullcam, plus a **kOS CPU** aboard. Optionally a `hc.launchcam` to see pitch (TurretCam is

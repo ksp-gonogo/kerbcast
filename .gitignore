@@ -36,8 +36,12 @@ sidecar/target-linux/
 .DS_Store
 Thumbs.db
 
-# Claude Code
-.claude/
+# Claude Code and other agent config (private, never tracked)
+/.claude/
+/CLAUDE.md
+/AGENTS.md
+/GEMINI.md
+/.mcp.json
 # Browser-automation scratch output (Playwright MCP console/page dumps)
 .playwright-mcp/
 
