@@ -19,14 +19,25 @@ name: release
 #                             vertex shader blobs in v0.19.0 (E_INVALIDARG at
 #                             draw time, black NightVision streams); see
 #                             build-kerbcast-shaders.yml for the full story.
-#   bundle         (~11 min)  collects the per-rid sidecar artifacts and the
-#                             Windows shader bundle, builds the plugin DLL +
-#                             Linux/macOS shader bundles, assembles the
-#                             complete GameData/Kerbcast/ install tree, and creates
-#                             the GitHub Release. needs publish-sdk so a Release
-#                             never claims packages that failed to publish, and a
-#                             mis-cut tag fails in about a minute instead of after
-#                             the Unity builds.
+#   build-native-readback     builds libAsyncGPUReadbackPlugin.so (the Linux
+#                  (~1 min)   OpenGL readback library) from pinned upstream
+#                             source on ubuntu-22.04, checks it, and reads a
+#                             texture back through it on a real GL context.
+#   bundle         (~11 min)  collects the per-rid sidecar artifacts, the
+#                             Windows shader bundle and the readback library,
+#                             builds the plugin DLL + Linux/macOS shader bundles,
+#                             assembles the complete GameData/Kerbcast/ install
+#                             tree, refuses to continue if the release zip lacks
+#                             a valid readback library, and uploads the zips as
+#                             the kerbcast-release-bundle artifact.
+#   publish        (~1 min)   creates the GitHub Release from that artifact and
+#                             mirrors it to SpaceDock and the .ckan pins. needs
+#                             publish-sdk so a Release never claims packages that
+#                             failed to publish.
+#
+# Dry run: a manual dispatch defaults to dry_run=true, which skips publish-sdk
+# and publish at the job level, so no publishing step can run. Only the builds,
+# assemble and gate run, and the zips are downloadable from the run.
 #
 # "Re-run failed jobs" re-runs whichever half failed without repeating the
 # other.
@@ -60,11 +71,17 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, assemble and gate only; publish nothing"
+        type: boolean
+        default: true
 
 jobs:
   publish-sdk:
     name: publish SDK packages
+    if: github.event_name == 'push' || inputs.dry_run == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -481,12 +498,41 @@ jobs:
           path: ci/kerbcast-shaders/Bundles-windows/kerbcast-shaders
           if-no-files-found: error
 
-  bundle:
-    name: GameData bundle + GitHub Release
-    needs: [publish-sdk, build-sidecar, build-windows-shaders]
+  build-native-readback:
+    name: build native readback library
+    # glibc 2.35, the same floor as the Linux sidecar; check.sh enforces it.
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ make libgl1-mesa-dev libglu1-mesa-dev binutils \
+            xvfb xauth libgl1-mesa-dri libx11-dev
+
+      - name: Build and check libAsyncGPUReadbackPlugin.so
+        run: Plugin/Vendor/UnityOpenGLAsyncReadback/native/build.sh native-out
+
+      - name: Read a texture back through it on a GL core context
+        run: |
+          cc -O1 -o gl_readback_smoke \
+            Plugin/Vendor/UnityOpenGLAsyncReadback/native/gl_readback_smoke.c -lGL -lX11 -ldl
+          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a ./gl_readback_smoke \
+            "$PWD/native-out/libAsyncGPUReadbackPlugin.so"
+
+      - name: Upload readback library
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-readback-linux-x64
+          path: native-out/
+          if-no-files-found: error
+
+  bundle:
+    name: GameData bundle
+    needs: [build-sidecar, build-windows-shaders, build-native-readback]
+    runs-on: ubuntu-22.04
     env:
       UNITY_VERSION: 2019.4.40f1 (ffc62b691db5)
       HULLCAM_REPO: linuxgurugamer/HullcamVDSContinued
@@ -584,15 +630,27 @@ jobs:
           name: kerbcast-shaders-windows
           path: windows-shaders
 
+      - name: Download readback library
+        uses: actions/download-artifact@v8
+        with:
+          name: native-readback-linux-x64
+          path: native-readback
+
       - name: Assemble GameData/Kerbcast
         run: |
           set -euo pipefail
           mkdir -p \
-            GameData/Kerbcast/Plugins \
+            GameData/Kerbcast/Plugins/linux-x64 \
             GameData/Kerbcast/Sidecar \
             GameData/Kerbcast/HullcamShaders
 
           cp Plugin/obj/Release/Kerbcast.dll GameData/Kerbcast/Plugins/
+
+          # Linux OpenGL readback library. The plugin dlopens it from exactly
+          # this path (ReadbackGate.NativeLibraryPath) and refuses to start on
+          # Linux OpenGL without it.
+          cp native-readback/libAsyncGPUReadbackPlugin.so GameData/Kerbcast/Plugins/linux-x64/
+          chmod 644 GameData/Kerbcast/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so
 
           # Per-rid sidecar layout: Sidecar/<rid>/kerbcast-sidecar[.exe] (+ lib/
           # on Linux). Kept in lockstep with ResolveSidecarBinary's rid switch
@@ -650,7 +708,8 @@ jobs:
 
       - name: Create release zips
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          # A dry run on a branch has a ref name like fix/x; keep it a file name.
+          TAG="${GITHUB_REF_NAME//\//-}"
           # Core zip: only GameData/Kerbcast (not the whole GameData/, so the
           # addon tree doesn't leak into the core download).
           zip -r "kerbcast-${TAG}.zip" GameData/Kerbcast/
@@ -658,6 +717,54 @@ jobs:
           # Addon zip: only GameData/KerbcastKos.
           zip -r "KerbcastKos-${TAG}.zip" GameData/KerbcastKos/
           echo "KOS_RELEASE_ZIP=KerbcastKos-${TAG}.zip" >> $GITHUB_ENV
+
+      # Gate on what players actually receive: unzip the core zip into an
+      # empty directory and check the library there, not the staging tree.
+      - name: Verify the readback library ships in the release zip
+        run: Plugin/Vendor/UnityOpenGLAsyncReadback/native/check-zip.sh "${RELEASE_ZIP}" native-readback/build-info.txt
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: kerbcast-release-bundle
+          path: |
+            ${{ env.RELEASE_ZIP }}
+            ${{ env.KOS_RELEASE_ZIP }}
+            Plugin/obj/Release/Kerbcast.dll
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release + SpaceDock + .ckan pins
+    needs: [publish-sdk, bundle]
+    if: github.event_name == 'push' || inputs.dry_run == false
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download release bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: kerbcast-release-bundle
+          path: release-bundle
+
+      - name: Locate release assets
+        run: |
+          set -euo pipefail
+          # Same file-name form as the bundle job's "Create release zips".
+          TAG="${GITHUB_REF_NAME//\//-}"
+          for f in "kerbcast-${TAG}.zip" "KerbcastKos-${TAG}.zip" "Plugin/obj/Release/Kerbcast.dll"; do
+            test -f "release-bundle/$f" || { echo "::error::release bundle is missing $f"; exit 1; }
+          done
+          mv "release-bundle/kerbcast-${TAG}.zip" "release-bundle/KerbcastKos-${TAG}.zip" .
+          {
+            echo "RELEASE_ZIP=kerbcast-${TAG}.zip"
+            echo "KOS_RELEASE_ZIP=KerbcastKos-${TAG}.zip"
+            echo "PLUGIN_DLL=release-bundle/Plugin/obj/Release/Kerbcast.dll"
+          } >> "$GITHUB_ENV"
 
       # No GITHUB_REPO env: cliff.toml uses only local commit data, and
       # setting it makes git-cliff fetch remote metadata it never renders —
@@ -733,7 +840,7 @@ jobs:
           gh release create "${TAG}" \
             "${{ env.RELEASE_ZIP }}" \
             "${{ env.KOS_RELEASE_ZIP }}" \
-            Plugin/obj/Release/Kerbcast.dll \
+            "${PLUGIN_DLL}" \
             --title "kerbcast ${TAG}" \
             ${PRERELEASE_FLAG} \
             --notes-file release-notes.md
@@ -743,7 +850,7 @@ jobs:
       # SpaceDock has no API tokens; auth is cookie-based, so the credentials
       # live in repo secrets and the mod id in a repo variable. The step skips
       # cleanly until all three are configured. Runs on the tag, before the
-      # ckan re-pin switches the working tree to main, so the assembled zip and
+      # ckan re-pin switches the working tree to main, so the downloaded zip and
       # Kerbcast.version are still on disk.
       - name: Publish to SpaceDock
         # NOT for pre-releases: SpaceDock feeds the CKAN index, so mirroring an

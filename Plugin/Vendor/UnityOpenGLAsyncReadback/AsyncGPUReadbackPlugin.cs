@@ -55,7 +55,8 @@ namespace Yangrc.OpenGLAsyncReadback {
     public static class RuntimeInitializer {
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
         static void Initialize() {
-            if (SystemInfo.graphicsDeviceType == GraphicsDeviceType.OpenGLCore && AsyncReadbackUpdater.instance == null) {
+            // kerbcast: gated on the library actually being bound (not upstream).
+            if (NativeReadbackLibrary.IsLoaded && AsyncReadbackUpdater.instance == null) {
                 var go = new GameObject("__OpenGL Async Readback Updater__");
                 go.hideFlags = HideFlags.HideAndDontSave;
                 GameObject.DontDestroyOnLoad(go);
@@ -301,25 +302,40 @@ namespace Yangrc.OpenGLAsyncReadback {
             GL.IssuePluginEvent(GetUpdateRenderThreadFunctionPtr(), 0);
 		}
 
-		[DllImport ("AsyncGPUReadbackPlugin")]
-		private static extern bool CheckCompatible();
-        [DllImport("AsyncGPUReadbackPlugin")]
-        private static extern int RequestTextureMainThread(int texture, int miplevel);
-        [DllImport("AsyncGPUReadbackPlugin")]
-        private static extern int RequestComputeBufferMainThread(int bufferID, int bufferSize);
-        [DllImport ("AsyncGPUReadbackPlugin")]
-		private static extern IntPtr GetKickstartFunctionPtr();
-        [DllImport("AsyncGPUReadbackPlugin")]
-        private static extern IntPtr UpdateMainThread();
-        [DllImport("AsyncGPUReadbackPlugin")]
-        private static extern IntPtr GetUpdateRenderThreadFunctionPtr();
-        [DllImport ("AsyncGPUReadbackPlugin")]
-		private static extern unsafe void GetData(int event_id, ref void* buffer, ref int length);
-        [DllImport("AsyncGPUReadbackPlugin")]
-        private static extern bool TaskError(int event_id);
-        [DllImport("AsyncGPUReadbackPlugin")]
-        private static extern bool TaskExists(int event_id);
-        [DllImport ("AsyncGPUReadbackPlugin")]
-		private static extern bool TaskDone(int event_id);
+        /* kerbcast (not upstream): bound through NativeReadbackLibrary, which
+           dlopens the library from GameData by absolute path. DllImport would
+           search only Mono's and Unity's own folders, which never include
+           GameData. */
+        private static int RequestTextureMainThread(int texture, int miplevel) {
+            return NativeReadbackLibrary.RequestTextureMainThread(texture, miplevel);
+        }
+        private static int RequestComputeBufferMainThread(int bufferID, int bufferSize) {
+            return NativeReadbackLibrary.RequestComputeBufferMainThread(bufferID, bufferSize);
+        }
+        private static IntPtr GetKickstartFunctionPtr() {
+            return NativeReadbackLibrary.GetKickstartFunctionPtr();
+        }
+        private static void UpdateMainThread() {
+            NativeReadbackLibrary.UpdateMainThread();
+        }
+        private static IntPtr GetUpdateRenderThreadFunctionPtr() {
+            return NativeReadbackLibrary.GetUpdateRenderThreadFunctionPtr();
+        }
+        private static unsafe void GetData(int event_id, ref void* buffer, ref int length) {
+            IntPtr p = IntPtr.Zero;
+            UIntPtr len = UIntPtr.Zero;
+            NativeReadbackLibrary.GetData(event_id, ref p, ref len);
+            buffer = (void*)p;
+            length = (int)len.ToUInt64();
+        }
+        private static bool TaskError(int event_id) {
+            return NativeReadbackLibrary.TaskError(event_id);
+        }
+        private static bool TaskExists(int event_id) {
+            return NativeReadbackLibrary.TaskExists(event_id);
+        }
+        private static bool TaskDone(int event_id) {
+            return NativeReadbackLibrary.TaskDone(event_id);
+        }
 	}
 }

@@ -75,6 +75,8 @@ namespace Kerbcast
         // Sidecar reads, diffs, and pushes camera-state-changed +
         // adaptive-shed messages to all peers' control channels.
         private string _statusPath;
+        /* Set when ReadbackGate refused startup; nothing was initialised. */
+        private bool _disabled;
         private float _statusCooldown;
         private const float StatusWriteIntervalSeconds = 1.0f;
 
@@ -200,6 +202,15 @@ namespace Kerbcast
 
         private void Awake()
         {
+            /* Before anything else spins up: without a working GPU readback
+               every feed would stream an empty buffer, so start nothing. */
+            if (!ReadbackGate.EnsureReady())
+            {
+                _disabled = true;
+                enabled = false;
+                return;
+            }
+
             Instance = this;
             Debug.Log("[Kerbcast] KerbcastCore.Awake — initialising");
 
@@ -233,16 +244,14 @@ namespace Kerbcast
 
             try
             {
-                // yangrc's [RuntimeInitializeOnLoadMethod] hook never
-                // fires for mod DLLs (KSP loads them post-init), so the
-                // updater MonoBehaviour that pumps OpenGLAsyncReadbackRequest
-                // never auto-attaches. Spawn it ourselves on a dedicated
-                // DontDestroyOnLoad GameObject. OpenGLCore only, mirroring the
-                // vendor's own auto-spawn gate: on D3D11/Metal the wrapper
-                // uses Unity's native AsyncGPUReadback and the pump's Update
-                // P/Invokes a native lib we only ship for Linux, throwing
-                // DllNotFoundException every frame.
-                if (SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.OpenGLCore
+                /* yangrc's [RuntimeInitializeOnLoadMethod] hook never fires
+                   for mod DLLs (KSP loads them post-init), so the updater
+                   MonoBehaviour that pumps OpenGLAsyncReadbackRequest never
+                   auto-attaches. Spawn it ourselves on a DontDestroyOnLoad
+                   GameObject, only when ReadbackGate loaded the native library
+                   (Linux OpenGL). Elsewhere the wrapper uses Unity's own
+                   AsyncGPUReadback and the pump has nothing to drive. */
+                if (NativeReadbackLibrary.IsLoaded
                     && AsyncReadbackUpdater.instance == null)
                 {
                     _readbackUpdaterGo = new GameObject("Kerbcast_AsyncReadbackUpdater");
@@ -519,6 +528,22 @@ namespace Kerbcast
         // render pass — we own the render timing entirely.
         private void LateUpdate()
         {
+            /* The library loaded but its render-thread GL setup failed, so every
+               readback errors and feeds would stay empty. Shut down exactly as
+               if startup had been refused: OnDestroy disposes the cameras and
+               the pump, and destroying the host stops the sidecar. */
+            if (ReadbackGate.GlUnusable())
+            {
+                if (KerbcastSidecarHost.Instance != null)
+                    Destroy(KerbcastSidecarHost.Instance.gameObject);
+                /* Cleared now rather than in the deferred OnDestroy, so
+                   KerbcastControl reads as inactive from this frame on. */
+                if (Instance == this) Instance = null;
+                enabled = false;
+                Destroy(this);
+                return;
+            }
+
             UpdateFpsAverage();
 
             // Telemetry: sample the GC collection counters once per frame and
@@ -1349,6 +1374,7 @@ namespace Kerbcast
 
         private void OnDestroy()
         {
+            if (_disabled) return;
             if (Instance == this) Instance = null;
 
             // ALWAYS restore the main flight cameras on scene exit so a

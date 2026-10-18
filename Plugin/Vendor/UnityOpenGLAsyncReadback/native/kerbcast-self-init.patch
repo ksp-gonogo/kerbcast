@@ -1,0 +1,60 @@
+diff --git a/NativePlugin/src/AsyncGPUReadbackPlugin.cpp b/NativePlugin/src/AsyncGPUReadbackPlugin.cpp
+index 2b805e9..6d0341f 100644
+--- a/NativePlugin/src/AsyncGPUReadbackPlugin.cpp
++++ b/NativePlugin/src/AsyncGPUReadbackPlugin.cpp
+@@ -29,6 +29,33 @@ static std::mutex tasks_mutex;
+ int next_event_id = 1;
+ static bool inited = false;
+ 
++/* kerbcast (not upstream): Unity only calls UnityPluginLoad for plugins it
++   loads itself from its own Plugins folder. Kerbcast dlopens this library from
++   GameData, so GLEW is initialised here instead, lazily on the render thread
++   where the GL context is current. If the GL entry points still cannot be
++   resolved, every task fails with an error rather than calling a null pointer. */
++static int gl_state = 0; /* 0 untried, 1 ready, -1 unusable; render thread only */
++static bool EnsureGlReady() {
++	if (gl_state == 0) {
++		if (!inited) {
++			glewInit();
++		}
++		bool ok = glGenFramebuffers != nullptr && glFramebufferTexture != nullptr
++			&& glGenBuffers != nullptr && glBindBuffer != nullptr && glBufferData != nullptr
++			&& glCopyBufferSubData != nullptr && glFenceSync != nullptr
++			&& glGetSynciv != nullptr && glDeleteSync != nullptr
++			&& glMapBufferRange != nullptr && glUnmapBuffer != nullptr
++			&& glDeleteBuffers != nullptr && glDeleteFramebuffers != nullptr
++			&& glBindFramebuffer != nullptr;
++		gl_state = ok ? 1 : -1;
++	}
++	return gl_state == 1;
++}
++
++extern "C" int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API KerbcastGlState() {
++	return gl_state;
++}
++
+ extern "C" bool UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API CheckCompatible();
+ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType);
+ 
+@@ -371,6 +398,11 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API KickstartRequestInRen
+ 	// Get task back
+ 	std::lock_guard<std::mutex> guard(tasks_mutex);
+ 	std::shared_ptr<BaseTask> task = tasks[event_id];
++	if (!EnsureGlReady()) {
++		task->error = true;
++		task->done = true;
++		return;
++	}
+ 	task->StartRequest();
+ 	// Done init
+ 	task->initialized = true;
+@@ -385,6 +417,9 @@ extern "C" UnityRenderingEvent UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetKic
+  */
+ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UpdateRenderThread(int event_id) {
+ 	unused(event_id);
++	if (!EnsureGlReady()) {
++		return;
++	}
+ 	//Lock up.
+ 	std::lock_guard<std::mutex> guard(tasks_mutex);
+ 	for (auto ite = tasks.begin(); ite != tasks.end(); ite++) {
