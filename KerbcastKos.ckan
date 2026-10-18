@@ -4,7 +4,7 @@
     "name": "KerbcastKos",
     "abstract": "kerboscript (kOS) control of kerbcast cameras: enumerate cameras, set FOV, and pan or target-track steerable mounts from a vessel's own CPU.",
     "author": "Jon Pepler",
-    "version": "1.10.0",
+    "version": "1.10.1",
     "ksp_version_min": "1.12.0",
     "ksp_version_max": "1.12.99",
     "license": "GPL-3.0-only",
@@ -14,7 +14,7 @@
     "depends": [
         {
             "name": "Kerbcast",
-            "version": "1.10.0"
+            "version": "1.10.1"
         },
         {
             "name": "kOS"
@@ -27,12 +27,12 @@
         }
     ],
     "download": [
-        "https://github.com/ksp-gonogo/kerbcast/releases/download/v1.10.0/KerbcastKos-v1.10.0.zip"
+        "https://github.com/ksp-gonogo/kerbcast/releases/download/v1.10.1/KerbcastKos-v1.10.1.zip"
     ],
-    "download_size": 24246,
+    "download_size": 24241,
     "download_hash": {
-        "sha1": "E6BE5B418151B3AD0B39615D52ADC7F3E8977DB0",
-        "sha256": "6DFDAB5F54F1936FCE70052B70E22AD1A35C5E618CEF4CB1D089EE4C98762411"
+        "sha1": "E816A09B58122A7FAF66F31262F108114DCE4F17",
+        "sha256": "A24E31A876B794933906FDD2FEA3B7639CB8CF2A7DD4C4917350293C2308ECF4"
     },
     "download_content_type": "application/zip"
 }
