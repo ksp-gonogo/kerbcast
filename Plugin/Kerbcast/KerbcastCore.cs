@@ -18,7 +18,9 @@
 //               creates/destroys the matching ring files).
 //   - GameEvents.onPartDestroyed: write lifecycle:"destroyed" tombstone
 //               to the camera's info.json, close the ring, then leave
-//               info.json for the sidecar to clean up.
+//               info.json for the sidecar to clean up. Once
+//               onGameSceneLoadRequested has fired the scene is unloading,
+//               so part destructions become normal teardowns instead.
 //   - GameEvents.onVesselCrewWasModified: crew-scoped rescan (board /
 //               transfer / EVA / re-seat within the same vessel). Clean-
 //               removes vacated kerbal cams (Dispose, not a tombstone)
@@ -97,6 +99,8 @@ namespace Kerbcast
            Bumped on a UT discontinuity (scene load / quickload) so a consumer
            flushes and resyncs. See CaptureEpoch. */
         private readonly CaptureEpoch _captureEpoch = new CaptureEpoch();
+        // Tombstone-or-normal decision for cameras whose part goes away. See CameraTeardown.
+        private readonly CameraTeardown _teardown = new CameraTeardown();
         // Adaptive-shed decision state machine. The fps thresholds + hysteresis
         // and the anti-flap dwell/back-off all live in ShedController (which is
         // Unity-free and unit-tested). Each LateUpdate we hand it the rolling
@@ -268,6 +272,9 @@ namespace Kerbcast
             try
             {
                 Directory.CreateDirectory(RingDir);
+                int swept = CameraTeardown.SweepStaleCameraFiles(RingDir);
+                if (swept > 0)
+                    Debug.Log($"[Kerbcast] swept {swept} stale camera file(s) left by an earlier flight");
                 _statusPath = Path.Combine(RingDir, "global.status.json");
                 _controlPath = Path.Combine(RingDir, "global.control.json");
                 Debug.Log($"[Kerbcast] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
@@ -353,14 +360,22 @@ namespace Kerbcast
                 if (cam.OwnsPart(part))
                 {
                     if (affected == null) affected = cam.Vessel;
-                    Debug.Log($"[Kerbcast] part destroyed — disposing cam={cam.FlightId} ({part.name})");
+                    Debug.Log($"[Kerbcast] part destroyed — disposing cam={cam.FlightId} ({part.name}){(_teardown.WriteTombstone ? "" : " during scene unload, normal teardown")}");
                     _cameras.RemoveAt(i);
-                    cam.DisposeDestroyed();
+                    DisposeLost(cam);
                 }
             }
             // Rebuild FX draw lists on the surviving cams of the same vessel so
             // the destroyed part's renderers don't linger in their CommandBuffers.
             if (affected != null) MarkFxDirtyForVessel(affected);
+        }
+
+        /* A camera whose part went away: a tombstone (SIGNAL LOST) for a genuine
+           in-flight loss, a normal teardown once the scene is unloading. */
+        private void DisposeLost(ICamera cam)
+        {
+            if (_teardown.WriteTombstone) cam.DisposeDestroyed();
+            else cam.Dispose();
         }
 
         // Decoupling, staging, docking, fairing jettison etc. change a
@@ -411,8 +426,14 @@ namespace Kerbcast
 
         /* Scene load / quickload: universal time is about to jump, so mark a
            capture-clock discontinuity. The `scene`/`node` args are unused;
-           any fire of these events is a resync point. */
-        private void OnGameSceneLoadRequested(GameScenes scene) => _captureEpoch.Bump();
+           any fire of these events is a resync point. A scene load also means
+           the parts are about to be destroyed wholesale, which must not leave
+           destroyed tombstones behind. */
+        private void OnGameSceneLoadRequested(GameScenes scene)
+        {
+            _captureEpoch.Bump();
+            _teardown.OnSceneLoadRequested();
+        }
 
         private void OnGameStatePostLoad(ConfigNode node) => _captureEpoch.Bump();
 
@@ -647,7 +668,7 @@ namespace Kerbcast
                 {
                     Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null part/vessel — disposing (missed destruction event?)");
                     _cameras.RemoveAt(i);
-                    cam.DisposeDestroyed();
+                    DisposeLost(cam);
                 }
             }
 
