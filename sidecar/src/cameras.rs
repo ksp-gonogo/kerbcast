@@ -1342,13 +1342,14 @@ impl CameraRegistry {
             info!(flight_id = id, "camera ring removed (normal teardown)");
         }
 
-        /* Destroyed cameras stay listed so the UI can show SIGNAL LOST, but
-        only until the camera set next changes: any attach or normal teardown
-        means a vessel switch, scene change or relaunch, after which the
-        tombstones belong to a craft that is no longer in play. Without this
-        every relaunch that tombstoned its cameras left them in /cameras for
+        /* Destroyed cameras stay listed so the UI can show SIGNAL LOST until the
+        craft changes: a normal-teardown removal (a vessel switch or relaunch
+        tears its rings down) or global.inflight going false, which the consume
+        loop handles through prune_tombstones. An attach alone (staging,
+        docking, a crew or EVA rescan) is not a craft change and keeps them.
+        Without the prune every relaunch left its tombstones in /cameras for
         the rest of the session. */
-        if !attached.is_empty() || !removed.is_empty() {
+        if !removed.is_empty() {
             removed.extend(prune_acknowledged_tombstones(&mut cameras));
         }
         removed.sort_unstable();
@@ -3713,13 +3714,16 @@ mod tests {
         );
     }
 
-    /* The playtest leak: each relaunch tore the old pair down as tombstones
-    and attached a fresh pair, and the tombstones were kept forever. */
+    /* The playtest leak: each relaunch left the old craft's tombstones in the
+    list forever. A relaunch tears the surviving rings down normally (here a
+    probe camera) while the old pair sits as tombstones, and attaches a new
+    craft. */
     #[tokio::test]
-    async fn destroyed_tombstones_pruned_when_next_launch_attaches() {
+    async fn destroyed_tombstones_pruned_across_four_relaunches() {
         let rig = TombstoneRig::new();
         let mut live = vec![10u32, 11];
-        for id in &live {
+        let mut probe = 99u32;
+        for id in live.iter().chain([&probe]) {
             rig.spawn(*id);
         }
         rig.tick().await;
@@ -3728,8 +3732,10 @@ mod tests {
                 rig.destroy(*id);
             }
             rig.tick().await;
+            rig.teardown(probe);
             let next = vec![10 + launch * 2, 11 + launch * 2];
-            for id in &next {
+            probe = 99 + launch;
+            for id in next.iter().chain([&probe]) {
                 rig.spawn(*id);
             }
             let outcome = rig.tick().await;
@@ -3741,12 +3747,38 @@ mod tests {
             }
             live = next;
         }
+        let mut expected: Vec<_> = live
+            .iter()
+            .chain([&probe])
+            .map(|id| (*id, CameraLifecycle::Active))
+            .collect();
+        expected.sort_unstable_by_key(|(id, _)| *id);
         assert_eq!(
             rig.lifecycles().await,
-            live.iter()
-                .map(|id| (*id, CameraLifecycle::Active))
-                .collect::<Vec<_>>(),
+            expected,
             "only the current launch's cameras remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_only_rescan_keeps_acknowledged_tombstone() {
+        let rig = TombstoneRig::new();
+        rig.spawn(1);
+        rig.tick().await;
+        rig.destroy(1);
+        rig.tick().await;
+        // Staging or docking attaches a new camera without any teardown.
+        rig.spawn(2);
+        let outcome = rig.tick().await;
+        assert_eq!(outcome.attached, vec![2]);
+        assert!(outcome.removed.is_empty());
+        assert_eq!(
+            rig.lifecycles().await,
+            vec![
+                (1, CameraLifecycle::Destroyed),
+                (2, CameraLifecycle::Active)
+            ],
+            "an attach alone is not a craft change"
         );
     }
 

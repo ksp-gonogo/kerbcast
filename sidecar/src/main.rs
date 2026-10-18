@@ -336,7 +336,9 @@ async fn consume_loop(
             }
             // Scene state lives in a separate host-written file (outlives the
             // flight-only status writer). Broadcast only when the flag flips.
+            let mut left_flight = false;
             if let Some(in_flight) = registry.poll_in_flight().await {
+                left_flight = !in_flight;
                 let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
                 /* Leaving flight ends every tombstone's SIGNAL LOST window, even
                 when the departing craft had no live rings left to churn. */
@@ -356,6 +358,13 @@ async fn consume_loop(
                 broadcast_destroyed_cameras(&registry, &peers, &newly_destroyed).await;
                 for flight_id in newly_destroyed {
                     registry.acknowledge_destruction(flight_id).await;
+                }
+                /* A tombstone first seen in the tick that left flight was kept by
+                the prune above so its notification could go out; it is
+                acknowledged now, so drop it too. */
+                if left_flight && !registry.prune_tombstones().await.is_empty() {
+                    let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+                    resync_after_camera_churn(&registry, &snapshot, &[]).await;
                 }
             }
             last_rescan = Instant::now();
