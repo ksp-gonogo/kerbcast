@@ -913,8 +913,10 @@ namespace Kerbcast
                 }
                 var scaled = FindKspCameraByName("Camera ScaledSpace");
                 if (scaled != null) scaled.enabled = true;
+                else Debug.LogWarning("[Kerbcast] restore: 'Camera ScaledSpace' not found, left as is");
                 var galaxy = FindKspCameraByName("GalaxyCamera");
                 if (galaxy != null) galaxy.enabled = true;
+                else Debug.LogWarning("[Kerbcast] restore: 'GalaxyCamera' not found, left as is");
                 if (FXCamera.Instance != null)
                 {
                     var fxCam = FXCamera.Instance.GetComponent<Camera>();
@@ -924,6 +926,7 @@ namespace Kerbcast
                 _throttleEffective = false;
                 _fxCamSuppressed = false;
                 Debug.Log("[Kerbcast] main flight render restored (ThrottleMainScreen=false)");
+                LogAllCameras("throttle-restored");
             }
             catch (Exception ex)
             {
@@ -995,15 +998,19 @@ namespace Kerbcast
             return anyDisabled;
         }
 
-        // Camera.allCameras snapshots every active Camera, so this is
-        // cheap. KerbcastCamera.SetCameras() uses the same pattern via
-        // FindKspCamera; duplicated here because we run earlier than
-        // the per-camera setup and don't want the cross-class call.
+        /* Includes disabled cameras. Camera.allCameras lists only enabled
+           ones, so a lookup through it could never find the cameras the
+           throttle had switched off, and RestoreMainScreen left Camera
+           ScaledSpace and GalaxyCamera disabled for the rest of the KSP
+           session (both live in ScaledSpace's DontDestroyOnLoad tree, and
+           KSP never re-enables their Camera components). Every later
+           SetCameras then built scaled and galaxy clones from Unity
+           defaults. Only called on throttle toggles and rebuilds. */
         private static Camera FindKspCameraByName(string name)
         {
-            foreach (var c in Camera.allCameras)
+            foreach (var c in UnityEngine.Object.FindObjectsOfType<Camera>())
             {
-                if (c.name == name) return c;
+                if (c != null && c.name == name) return c;
             }
             return null;
         }

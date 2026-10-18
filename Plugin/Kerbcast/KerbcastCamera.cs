@@ -811,7 +811,7 @@ namespace Kerbcast
             // Near layer — close-up of parts + atmospheric effects.
             var nearGo = new GameObject($"Kerbcast_{FlightId}_Near");
             _nearCam = nearGo.AddComponent<Camera>();
-            var sourceNear = FindKspCamera("Camera 00");
+            var sourceNear = FindRequiredKspCamera("Camera 00");
             if (sourceNear != null) _nearCam.CopyFrom(sourceNear);
             _nearCam.name = $"Kerbcast_{FlightId}_Near";
             nearGo.transform.parent = nearParent;
@@ -860,7 +860,7 @@ namespace Kerbcast
             // Scaled layer — planet terrain + atmosphere at scaled-space scale.
             var scaledGo = new GameObject($"Kerbcast_{FlightId}_Scaled");
             _scaledCam = scaledGo.AddComponent<Camera>();
-            var sourceScaled = FindKspCamera("Camera ScaledSpace");
+            var sourceScaled = FindRequiredKspCamera("Camera ScaledSpace");
             if (sourceScaled != null)
             {
                 _scaledCam.CopyFrom(sourceScaled);
@@ -898,7 +898,7 @@ namespace Kerbcast
             // these when it succeeds.
             _galaxyCam.clearFlags = CameraClearFlags.SolidColor;
             _galaxyCam.backgroundColor = Color.black;
-            var sourceGalaxy = FindKspCamera("GalaxyCamera");
+            var sourceGalaxy = FindRequiredKspCamera("GalaxyCamera");
             if (sourceGalaxy != null)
             {
                 _galaxyCam.CopyFrom(sourceGalaxy);
@@ -1097,6 +1097,18 @@ namespace Kerbcast
         private static Camera FindKspCamera(string name)
         {
             return Camera.allCameras.FirstOrDefault(c => c.name == name);
+        }
+
+        /* Enabled cameras only, on purpose: KerbcastCore re-enables the
+           sources around every rebuild, so a miss means this layer is about
+           to be built from Unity defaults (wrong clear flags, cull mask and
+           clip range). */
+        private Camera FindRequiredKspCamera(string name)
+        {
+            var cam = FindKspCamera(name);
+            if (cam == null)
+                Debug.LogWarning($"[Kerbcast] cam={FlightId} source camera '{name}' not enabled: its layer falls back to Unity defaults");
+            return cam;
         }
 
         public CameraLayers Layers => _layers;
