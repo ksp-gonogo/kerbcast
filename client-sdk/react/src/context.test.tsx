@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
-import { createClientDisplaySizes } from "./context";
+import { createClientDisplaySizes, createClientSubscriptions } from "./context";
 
 /**
  * A client stub that only records reportDisplaySize calls. The registry is the
@@ -151,5 +151,61 @@ describe("createClientDisplaySizes", () => {
       openControl();
       expect(reports).toEqual([]);
     });
+  });
+});
+
+describe("createClientSubscriptions reconnect", () => {
+  function subsClient() {
+    const calls: string[] = [];
+    const handlers: Array<() => void> = [];
+    const client = {
+      on: (_event: string, h: () => void) => {
+        handlers.push(h);
+        return () => {};
+      },
+      subscribe: vi.fn(async (id: number) => {
+        calls.push(`subscribe:${id}`);
+      }),
+      unsubscribe: vi.fn(async (id: number) => {
+        calls.push(`unsubscribe:${id}`);
+      }),
+      reportDisplaySize: vi.fn(async (id: number) => {
+        calls.push(`size:${id}`);
+      }),
+    } as unknown as KerbcastClient;
+    return { client, calls, openControl: () => handlers.forEach((h) => h()) };
+  }
+
+  it("re-subscribes every held flightId when the control channel reopens", () => {
+    const { client, calls, openControl } = subsClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.acquire(1);
+    subs.acquire(2);
+    subs.acquire(3);
+    subs.release(3);
+    calls.length = 0;
+    openControl();
+    expect(calls).toEqual(["subscribe:1", "subscribe:2"]);
+  });
+
+  it("does not throw when a re-subscribe is rejected", async () => {
+    const { client, openControl } = subsClient();
+    (client.subscribe as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("pool full"));
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    expect(() => openControl()).not.toThrow();
+    await Promise.resolve();
+  });
+
+  it("re-subscribes before the display-size resend", () => {
+    const { client, calls, openControl } = subsClient();
+    const subs = createClientSubscriptions(client);
+    const sizes = createClientDisplaySizes(client);
+    subs.acquire(1);
+    sizes.report(1, "a", 640, 360);
+    calls.length = 0;
+    openControl();
+    expect(calls).toEqual(["subscribe:1", "size:1"]);
   });
 });
