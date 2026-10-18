@@ -338,6 +338,11 @@ async fn consume_loop(
             // flight-only status writer). Broadcast only when the flag flips.
             if let Some(in_flight) = registry.poll_in_flight().await {
                 let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+                /* Leaving flight ends every tombstone's SIGNAL LOST window, even
+                when the departing craft had no live rings left to churn. */
+                if !in_flight && !registry.prune_tombstones().await.is_empty() {
+                    resync_after_camera_churn(&registry, &snapshot, &[]).await;
+                }
                 let msg = ServerMessage::SceneStateChanged(SceneStateChangedPayload { in_flight });
                 broadcast(&snapshot, &msg).await;
             }

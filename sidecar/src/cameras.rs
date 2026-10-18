@@ -179,7 +179,8 @@ pub struct RescanOutcome {
     pub newly_destroyed: Vec<u32>,
     /// Flight ids whose rings were attached this pass.
     pub attached: Vec<u32>,
-    /// Flight ids dropped under normal teardown this pass.
+    /// Flight ids dropped this pass: normal teardowns plus destroyed
+    /// tombstones pruned because the camera set changed.
     pub removed: Vec<u32>,
 }
 
@@ -980,6 +981,25 @@ struct GlobalControlFile {
     seq: u64,
 }
 
+/* Remove destroyed entries whose destruction has been broadcast, returning
+their ids. A tombstone first seen this tick is kept so its SIGNAL LOST
+notification still goes out. */
+fn prune_acknowledged_tombstones(cameras: &mut HashMap<u32, Arc<CameraState>>) -> Vec<u32> {
+    let mut pruned = Vec::new();
+    cameras.retain(|id, cam| {
+        let stale = cam.destroyed.load(Ordering::Acquire)
+            && cam.destruction_broadcast_sent.load(Ordering::Acquire);
+        if stale {
+            pruned.push(*id);
+        }
+        !stale
+    });
+    for id in &pruned {
+        info!(flight_id = id, "destroyed camera tombstone pruned");
+    }
+    pruned
+}
+
 impl CameraRegistry {
     pub fn new(shm_dir: PathBuf) -> Self {
         Self {
@@ -1307,11 +1327,9 @@ impl CameraRegistry {
 
         // --- Step 3: drop cameras that have disappeared under normal
         // teardown (ring file gone AND not a pending destroyed camera).
-        // Destroyed cameras are retained so the UI can display SIGNAL LOST.
         let mut removed = Vec::new();
         cameras.retain(|id, cam| {
             if cam.destroyed.load(Ordering::Acquire) {
-                // Destroyed — keep in registry (visible in /cameras as destroyed).
                 return true;
             }
             let still = found.contains_key(id);
@@ -1323,6 +1341,17 @@ impl CameraRegistry {
         for id in &removed {
             info!(flight_id = id, "camera ring removed (normal teardown)");
         }
+
+        /* Destroyed cameras stay listed so the UI can show SIGNAL LOST, but
+        only until the camera set next changes: any attach or normal teardown
+        means a vessel switch, scene change or relaunch, after which the
+        tombstones belong to a craft that is no longer in play. Without this
+        every relaunch that tombstoned its cameras left them in /cameras for
+        the rest of the session. */
+        if !attached.is_empty() || !removed.is_empty() {
+            removed.extend(prune_acknowledged_tombstones(&mut cameras));
+        }
+        removed.sort_unstable();
 
         RescanOutcome {
             newly_destroyed,
@@ -1353,6 +1382,15 @@ impl CameraRegistry {
                 warn!(flight_id, error = %e, "failed to delete info.json tombstone");
             }
         }
+    }
+
+    /// Drop every destroyed camera whose destruction peers have already been
+    /// told about. Used on scene exit, where a departing craft whose cameras
+    /// were all destroyed produces no ring churn to trigger the rescan prune.
+    pub async fn prune_tombstones(&self) -> Vec<u32> {
+        let mut pruned = prune_acknowledged_tombstones(&mut *self.cameras.write().await);
+        pruned.sort_unstable();
+        pruned
     }
 
     pub async fn list(&self) -> Vec<CameraInfo> {
@@ -3570,5 +3608,177 @@ mod tests {
         assert_eq!(quality_limited_reason(1024, 768, Some(Half)), None);
         // Odd products floor to even, matching the plugin's MakeEven.
         assert_eq!(quality_limited_reason(1030, 772, Some(ThreeQuarter)), None);
+    }
+
+    /* Tombstone-pruning fixture: a part camera whose ring + manifest the test
+    drives directly, standing in for the plugin. */
+    struct TombstoneRig {
+        dir: tempfile::TempDir,
+        registry: CameraRegistry,
+    }
+
+    impl TombstoneRig {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let registry = CameraRegistry::new(dir.path().to_path_buf());
+            Self { dir, registry }
+        }
+
+        fn manifest(&self, id: u32, lifecycle: &str) {
+            let content = format!(
+                r#"{{"lifecycle":"{lifecycle}","flight_id":{id},"part_name":"hc.booster","part_title":"BoosterCam","camera_name":"BoosterCam","vessel_name":"LFV-2 Wave","supports_zoom":false,"fov":60.0,"fov_min":10.0,"fov_max":90.0,"supports_pan":false,"pan_yaw_min":0.0,"pan_yaw_max":0.0,"pan_pitch_min":0.0,"pan_pitch_max":0.0}}"#,
+            );
+            std::fs::write(self.dir.path().join(format!("{id}.info.json")), content).unwrap();
+        }
+
+        fn spawn(&self, id: u32) {
+            let cfg = MmapRingConfig {
+                slot_count: 4,
+                max_width: 64,
+                max_height: 64,
+            };
+            MmapFrameRing::create(&self.dir.path().join(format!("{id}.ring")), cfg)
+                .expect("create ring");
+            self.manifest(id, "active");
+        }
+
+        /* Plugin destruction path: tombstone first, then the ring goes. */
+        fn destroy(&self, id: u32) {
+            self.manifest(id, "destroyed");
+            std::fs::remove_file(self.dir.path().join(format!("{id}.ring"))).unwrap();
+        }
+
+        /* Plugin normal-teardown path: ring and manifest both deleted. */
+        fn teardown(&self, id: u32) {
+            let _ = std::fs::remove_file(self.dir.path().join(format!("{id}.ring")));
+            let _ = std::fs::remove_file(self.dir.path().join(format!("{id}.info.json")));
+        }
+
+        /* One consume-loop rescan tick, including the acknowledgement the
+        loop sends after broadcasting a destruction. */
+        async fn tick(&self) -> RescanOutcome {
+            let outcome = self.registry.rescan().await;
+            for id in &outcome.newly_destroyed {
+                self.registry.acknowledge_destruction(*id).await;
+            }
+            outcome
+        }
+
+        async fn lifecycles(&self) -> Vec<(u32, CameraLifecycle)> {
+            self.registry
+                .list()
+                .await
+                .into_iter()
+                .map(|c| (c.flight_id, c.lifecycle))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn destroyed_tombstone_survives_quiet_rescans() {
+        let rig = TombstoneRig::new();
+        rig.spawn(1);
+        rig.spawn(2);
+        rig.tick().await;
+        rig.destroy(1);
+        rig.tick().await;
+        for _ in 0..3 {
+            rig.tick().await;
+        }
+        assert_eq!(
+            rig.lifecycles().await,
+            vec![
+                (1, CameraLifecycle::Destroyed),
+                (2, CameraLifecycle::Active)
+            ],
+            "a destroyed camera keeps its SIGNAL LOST entry while nothing else changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroyed_tombstone_survives_churn_in_its_own_tick() {
+        let rig = TombstoneRig::new();
+        rig.spawn(1);
+        rig.spawn(2);
+        rig.tick().await;
+        // Same tick: camera 1 destroyed, camera 2 torn down normally.
+        rig.destroy(1);
+        rig.teardown(2);
+        let outcome = rig.tick().await;
+        assert_eq!(outcome.removed, vec![2]);
+        assert_eq!(
+            rig.lifecycles().await,
+            vec![(1, CameraLifecycle::Destroyed)],
+            "a tombstone first seen this tick must reach peers before any prune"
+        );
+    }
+
+    /* The playtest leak: each relaunch tore the old pair down as tombstones
+    and attached a fresh pair, and the tombstones were kept forever. */
+    #[tokio::test]
+    async fn destroyed_tombstones_pruned_when_next_launch_attaches() {
+        let rig = TombstoneRig::new();
+        let mut live = vec![10u32, 11];
+        for id in &live {
+            rig.spawn(*id);
+        }
+        rig.tick().await;
+        for launch in 1..=4u32 {
+            for id in &live {
+                rig.destroy(*id);
+            }
+            rig.tick().await;
+            let next = vec![10 + launch * 2, 11 + launch * 2];
+            for id in &next {
+                rig.spawn(*id);
+            }
+            let outcome = rig.tick().await;
+            for id in &live {
+                assert!(
+                    outcome.removed.contains(id),
+                    "pruned tombstone {id} must be reported so peers get a fresh snapshot"
+                );
+            }
+            live = next;
+        }
+        assert_eq!(
+            rig.lifecycles().await,
+            live.iter()
+                .map(|id| (*id, CameraLifecycle::Active))
+                .collect::<Vec<_>>(),
+            "only the current launch's cameras remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroyed_tombstone_pruned_on_vessel_change_teardown() {
+        let rig = TombstoneRig::new();
+        rig.spawn(1);
+        rig.spawn(2);
+        rig.tick().await;
+        rig.destroy(1);
+        rig.tick().await;
+        // Vessel switch to a craft with no cameras: camera 2 torn down normally.
+        rig.teardown(2);
+        let outcome = rig.tick().await;
+        assert_eq!(outcome.removed, vec![1, 2]);
+        assert!(rig.lifecycles().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_tombstones_drops_only_acknowledged_destroyed_entries() {
+        let rig = TombstoneRig::new();
+        rig.spawn(1);
+        rig.spawn(2);
+        rig.tick().await;
+        rig.destroy(1);
+        rig.tick().await;
+        assert_eq!(rig.registry.prune_tombstones().await, vec![1]);
+        assert_eq!(
+            rig.lifecycles().await,
+            vec![(2, CameraLifecycle::Active)],
+            "live cameras are untouched by a tombstone prune"
+        );
+        assert!(rig.registry.prune_tombstones().await.is_empty());
     }
 }
