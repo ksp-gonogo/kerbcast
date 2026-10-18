@@ -6,6 +6,14 @@ namespace Kerbcast
     /* Unity-free teardown decisions for KerbcastCore: whether a camera leaving
        the tracked set leaves a destroyed tombstone, and which ring-dir files
        belong to a camera rather than to the session. */
+    public enum CameraDisposal
+    {
+        /// <summary>Write the destroyed tombstone (SIGNAL LOST).</summary>
+        Destroyed,
+        /// <summary>Plain teardown, no tombstone.</summary>
+        Normal,
+    }
+
     public sealed class CameraTeardown
     {
         private bool _sceneUnloading;
@@ -25,6 +33,10 @@ namespace Kerbcast
         /// tombstone (a genuine in-flight loss); false once the scene is unloading.
         /// </summary>
         public bool WriteTombstone => !_sceneUnloading;
+
+        /// <summary>How KerbcastCore disposes a camera whose part was destroyed now.</summary>
+        public CameraDisposal LostCameraDisposal =>
+            WriteTombstone ? CameraDisposal.Destroyed : CameraDisposal.Normal;
 
         private static readonly string[] PerCameraSuffixes = { ".ring", ".info.json", ".control.bin" };
 
@@ -56,10 +68,11 @@ namespace Kerbcast
         /* Delete per-camera files left by an earlier flight scene (a crash, or
            tombstones the sidecar never acknowledged). Run at flight start
            before any camera exists, so nothing live can match. Returns the
-           number of files removed; a missing directory or a locked file is
-           skipped rather than thrown. */
-        public static int SweepStaleCameraFiles(string dir)
+           number of files removed; a missing directory is skipped, and a locked
+           file is counted in skipped rather than thrown. */
+        public static int SweepStaleCameraFiles(string dir, out int skipped)
         {
+            skipped = 0;
             if (!Directory.Exists(dir)) return 0;
             int removed = 0;
             foreach (var path in Directory.GetFiles(dir))
@@ -70,8 +83,8 @@ namespace Kerbcast
                     File.Delete(path);
                     removed++;
                 }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
+                catch (IOException) { skipped++; }
+                catch (UnauthorizedAccessException) { skipped++; }
             }
             return removed;
         }

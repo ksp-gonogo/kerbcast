@@ -1094,20 +1094,36 @@ namespace Kerbcast
             _fxHost?.OnVesselChanged(Mount.Vessel);
         }
 
-        private static Camera FindKspCamera(string name)
+        /* Every non-Kerbcast camera with this name, enabled or not. Camera.allCameras
+           lists only enabled ones, which hides the sources while the main-screen
+           throttle has them off. Our own Kerbcast_* clones are skipped. */
+        internal static List<Camera> FindKspCamerasByName(string name)
         {
-            return Camera.allCameras.FirstOrDefault(c => c.name == name);
+            var found = new List<Camera>();
+            foreach (var c in UnityEngine.Object.FindObjectsOfType<Camera>())
+            {
+                if (c == null || c.name != name) continue;
+                if (c.name.StartsWith("Kerbcast_", StringComparison.Ordinal)) continue;
+                found.Add(c);
+            }
+            return found;
         }
 
-        /* Enabled cameras only, on purpose: KerbcastCore re-enables the
-           sources around every rebuild, so a miss means this layer is about
-           to be built from Unity defaults (wrong clear flags, cull mask and
-           clip range). */
+        /* Prefers an enabled match when a mod's disabled same-named clone also
+           exists. CopyFrom reads settings regardless of enabled state. */
+        private static Camera FindKspCamera(string name)
+        {
+            var all = FindKspCamerasByName(name);
+            return all.FirstOrDefault(c => c.enabled) ?? all.FirstOrDefault();
+        }
+
+        /* A miss means this layer is about to be built from Unity defaults
+           (wrong clear flags, cull mask and clip range). */
         private Camera FindRequiredKspCamera(string name)
         {
             var cam = FindKspCamera(name);
             if (cam == null)
-                Debug.LogWarning($"[Kerbcast] cam={FlightId} source camera '{name}' not enabled: its layer falls back to Unity defaults");
+                Debug.LogWarning($"[Kerbcast] cam={FlightId} source camera '{name}' not found: its layer falls back to Unity defaults");
             return cam;
         }
 

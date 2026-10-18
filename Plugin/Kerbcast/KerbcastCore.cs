@@ -272,9 +272,9 @@ namespace Kerbcast
             try
             {
                 Directory.CreateDirectory(RingDir);
-                int swept = CameraTeardown.SweepStaleCameraFiles(RingDir);
-                if (swept > 0)
-                    Debug.Log($"[Kerbcast] swept {swept} stale camera file(s) left by an earlier flight");
+                int swept = CameraTeardown.SweepStaleCameraFiles(RingDir, out int skipped);
+                if (swept > 0 || skipped > 0)
+                    Debug.Log($"[Kerbcast] swept {swept} stale camera file(s) left by an earlier flight, skipped {skipped} in use");
                 _statusPath = Path.Combine(RingDir, "global.status.json");
                 _controlPath = Path.Combine(RingDir, "global.control.json");
                 Debug.Log($"[Kerbcast] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
@@ -360,7 +360,7 @@ namespace Kerbcast
                 if (cam.OwnsPart(part))
                 {
                     if (affected == null) affected = cam.Vessel;
-                    Debug.Log($"[Kerbcast] part destroyed — disposing cam={cam.FlightId} ({part.name}){(_teardown.WriteTombstone ? "" : " during scene unload, normal teardown")}");
+                    Debug.Log($"[Kerbcast] part destroyed — disposing cam={cam.FlightId} ({part.name}){(_teardown.LostCameraDisposal == CameraDisposal.Destroyed ? "" : " during scene unload, normal teardown")}");
                     _cameras.RemoveAt(i);
                     DisposeLost(cam);
                 }
@@ -374,7 +374,7 @@ namespace Kerbcast
            in-flight loss, a normal teardown once the scene is unloading. */
         private void DisposeLost(ICamera cam)
         {
-            if (_teardown.WriteTombstone) cam.DisposeDestroyed();
+            if (_teardown.LostCameraDisposal == CameraDisposal.Destroyed) cam.DisposeDestroyed();
             else cam.Dispose();
         }
 
@@ -885,10 +885,8 @@ namespace Kerbcast
                 {
                     FlightCamera.fetch.DisableCamera(disableAudioListener: false);
                 }
-                var scaled = FindKspCameraByName("Camera ScaledSpace");
-                if (scaled != null) scaled.enabled = false;
-                var galaxy = FindKspCameraByName("GalaxyCamera");
-                if (galaxy != null) galaxy.enabled = false;
+                SetKspCamerasEnabled("Camera ScaledSpace", false);
+                SetKspCamerasEnabled("GalaxyCamera", false);
                 // FXCamera is a separate singleton MonoBehaviour with its
                 // own Camera component (NOT in FlightCamera.cameras array)
                 // that renders aero/re-entry FX via a velocity-based shader.
@@ -932,12 +930,10 @@ namespace Kerbcast
                 {
                     FlightCamera.fetch.EnableCamera();
                 }
-                var scaled = FindKspCameraByName("Camera ScaledSpace");
-                if (scaled != null) scaled.enabled = true;
-                else Debug.LogWarning("[Kerbcast] restore: 'Camera ScaledSpace' not found, left as is");
-                var galaxy = FindKspCameraByName("GalaxyCamera");
-                if (galaxy != null) galaxy.enabled = true;
-                else Debug.LogWarning("[Kerbcast] restore: 'GalaxyCamera' not found, left as is");
+                if (!SetKspCamerasEnabled("Camera ScaledSpace", true))
+                    Debug.LogWarning("[Kerbcast] restore: 'Camera ScaledSpace' not found, left as is");
+                if (!SetKspCamerasEnabled("GalaxyCamera", true))
+                    Debug.LogWarning("[Kerbcast] restore: 'GalaxyCamera' not found, left as is");
                 if (FXCamera.Instance != null)
                 {
                     var fxCam = FXCamera.Instance.GetComponent<Camera>();
@@ -1026,14 +1022,13 @@ namespace Kerbcast
            session (both live in ScaledSpace's DontDestroyOnLoad tree, and
            KSP never re-enables their Camera components). Every later
            SetCameras then built scaled and galaxy clones from Unity
-           defaults. Only called on throttle toggles and rebuilds. */
-        private static Camera FindKspCameraByName(string name)
+           defaults. Acts on every match, so a mod's same-named clone cannot stand in for
+           the real camera. Only called on throttle toggles and rebuilds. */
+        private static bool SetKspCamerasEnabled(string name, bool enabled)
         {
-            foreach (var c in UnityEngine.Object.FindObjectsOfType<Camera>())
-            {
-                if (c != null && c.name == name) return c;
-            }
-            return null;
+            var matches = KerbcastCamera.FindKspCamerasByName(name);
+            foreach (var c in matches) c.enabled = enabled;
+            return matches.Count > 0;
         }
 
         // ~1 Hz status write. Each write carries the full per-camera

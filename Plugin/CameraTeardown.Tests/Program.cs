@@ -16,7 +16,9 @@ void Check(bool cond, string msg)
    and those are normal teardowns. */
 var gate = new CameraTeardown();
 Check(gate.WriteTombstone, "in-flight part destruction writes a tombstone");
+Check(gate.LostCameraDisposal == CameraDisposal.Destroyed, "before the scene-load gate a lost camera is disposed with a tombstone");
 gate.OnSceneLoadRequested();
+Check(gate.LostCameraDisposal == CameraDisposal.Normal, "once the scene-load gate is set a lost camera gets a normal dispose");
 Check(!gate.WriteTombstone, "part destruction during scene unload is a normal teardown");
 
 Check(CameraTeardown.IsPerCameraFile("780776309.ring"), "ring file is per-camera");
@@ -40,12 +42,13 @@ try
     string[] kept = { "global.inflight", "global.status.json", "global.control.json", "notes.txt" };
     foreach (var f in stale.Concat(kept)) File.WriteAllText(Path.Combine(dir, f), "x");
 
-    int swept = CameraTeardown.SweepStaleCameraFiles(dir);
+    int swept = CameraTeardown.SweepStaleCameraFiles(dir, out int skipped);
     Check(swept == stale.Length, $"sweep reports {stale.Length} files removed (got {swept})");
+    Check(skipped == 0, "nothing skipped when no file is locked");
     Check(stale.All(f => !File.Exists(Path.Combine(dir, f))), "every stale per-camera file is gone");
     Check(kept.All(f => File.Exists(Path.Combine(dir, f))), "global and unrelated files survive");
-    Check(CameraTeardown.SweepStaleCameraFiles(dir) == 0, "a second sweep finds nothing");
-    Check(CameraTeardown.SweepStaleCameraFiles(Path.Combine(dir, "missing")) == 0,
+    Check(CameraTeardown.SweepStaleCameraFiles(dir, out _) == 0, "a second sweep finds nothing");
+    Check(CameraTeardown.SweepStaleCameraFiles(Path.Combine(dir, "missing"), out _) == 0,
         "a missing directory sweeps nothing");
 }
 finally
