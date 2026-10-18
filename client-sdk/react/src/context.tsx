@@ -99,6 +99,17 @@ export function createClientDisplaySizes(
     client.reportDisplaySize(flightId, maxW, maxH).catch(() => {});
   }
 
+  /*
+   * The sidecar forgets a peer's display sizes when the peer leaves, so after
+   * a reconnect nothing it holds matches lastSent. Re-send the current MAX for
+   * every camera that still has reporters, once the new control channel is
+   * open and can take messages.
+   */
+  client.on("control-open", () => {
+    lastSent.clear();
+    for (const flightId of [...perCamera.keys()]) recompute(flightId);
+  });
+
   return {
     report(flightId: number, instanceId: string, width: number, height: number): void {
       let instances = perCamera.get(flightId);

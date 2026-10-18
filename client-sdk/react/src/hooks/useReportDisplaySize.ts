@@ -1,4 +1,4 @@
-import { useEffect, useId } from "react";
+import { useEffect, useId, useLayoutEffect, useState } from "react";
 import { useKerbcastDisplaySizes } from "../context";
 
 /*
@@ -35,7 +35,8 @@ export interface ReportDisplaySizeOptions {
  * Self-measure a feed element and drive the client's per-consumer
  * `reportDisplaySize` (via the context display-size registry, which collapses
  * multiple feeds of the same camera to one MAX report). Attach `ref` to the
- * element whose rendered pixel box is the display size. Reporting follows the
+ * element whose rendered pixel box is the display size; an element that
+ * appears or changes after mount is picked up on the host's next render. Reporting follows the
  * mount lifecycle: on unmount / `flightId` change / `enabled` flip it
  * deregisters, and the sidecar's clear-on-departure (unsubscribe) does the
  * server-side clear.
@@ -48,9 +49,19 @@ export function useReportDisplaySize(
   const displaySizes = useKerbcastDisplaySizes();
   const instanceId = useId();
 
+  /*
+   * Track the element behind the ref as state so an element that mounts or is
+   * swapped after the first render (conditional render, a feed that appears
+   * once a stream arrives) is observed. Checked after every commit of the
+   * host component; the state only changes when the element does.
+   */
+  const [el, setEl] = useState<Element | null>(null);
+  useLayoutEffect(() => {
+    if (ref.current !== el) setEl(ref.current);
+  });
+
   useEffect(() => {
     if (flightId === null || !enabled) return;
-    const el = ref.current;
     if (!el) return;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -87,5 +98,5 @@ export function useReportDisplaySize(
       if (timer !== null) clearTimeout(timer);
       displaySizes.clear(flightId, instanceId);
     };
-  }, [displaySizes, flightId, ref, enabled, square, instanceId]);
+  }, [displaySizes, flightId, el, enabled, square, instanceId]);
 }

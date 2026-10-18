@@ -274,6 +274,13 @@ export interface KerbcastClientEvents {
    * instead of per-camera SIGNAL LOST.
    */
   "scene-change": boolean | undefined;
+  /**
+   * Fired each time the control channel of a freshly (re)connected peer
+   * opens, i.e. the earliest moment it can carry messages. Consumers that
+   * hold per-peer state on the sidecar (display sizes, subscriptions) re-send
+   * it here, because the sidecar forgets a peer's state when it leaves.
+   */
+  "control-open": undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1037,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.control = peer.createDataChannel("kerbcast-control");
     this.control.onOpen(() => {
       void this._send({ type: "hello" });
+      this.emit("control-open", undefined);
     });
     this.control.onMessage((raw) => {
       this.handleServerMessage(raw);

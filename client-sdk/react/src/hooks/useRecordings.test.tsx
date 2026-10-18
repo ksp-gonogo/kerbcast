@@ -51,7 +51,7 @@ function fakeClient(): KerbcastClient {
   const controller = new RecordingController(new FakeRecordingClient(), {
     loadTrimmer: () => Promise.resolve(null),
   });
-  return { recording: controller } as unknown as KerbcastClient;
+  return { recording: controller, on: () => () => {} } as unknown as KerbcastClient;
 }
 
 let store: RecordingsStore | undefined;
