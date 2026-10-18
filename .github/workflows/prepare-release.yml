@@ -163,9 +163,11 @@ jobs:
       - name: Trigger release workflow
         # GITHUB_TOKEN pushes don't fire push-tag triggers in other workflows.
         # workflow_dispatch does fire, so dispatch release.yml on the new tag.
+        # A manual dispatch defaults to dry_run=true, so publishing is explicit.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run release.yml \
             --repo "${{ github.repository }}" \
-            --ref "${{ steps.version.outputs.tag }}"
+            --ref "${{ steps.version.outputs.tag }}" \
+            -f dry_run=false
