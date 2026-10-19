@@ -527,6 +527,92 @@ describe("KerbcastClient", () => {
     expect(result[0].supportsZoom).toBe(true);
   });
 
+  it("discover() surfaces per-camera rates and the held display size", async () => {
+    const { transport } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    const base = {
+      partName: "navCam1",
+      partTitle: "NavCam",
+      cameraName: "NavCam",
+      vesselName: "Test Vessel",
+      maxWidth: 1280,
+      maxHeight: 720,
+      supportsZoom: true,
+      fov: 60,
+      fovMin: 30,
+      fovMax: 100,
+      supportsPan: false,
+    };
+    const mockCameras = [
+      {
+        ...base,
+        flightId: 1,
+        targetCaptureFps: 30,
+        displayed: true,
+        captureFps: 29.5,
+        sentFps: 23,
+        keyframesSent: 12,
+        keyframeRequestsReceived: 4,
+        displaySize: { width: 640, height: 360, ageMs: 250 },
+      },
+      { ...base, flightId: 2, targetCaptureFps: 2, displayed: false, displaySize: null },
+      { ...base, flightId: 3 },
+    ];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ cameras: mockCameras }), { status: 200 }),
+    );
+
+    const [watched, background, old] = await client.discover();
+    expect(watched.targetCaptureFps).toBe(30);
+    expect(watched.displayed).toBe(true);
+    expect(watched.captureFps).toBe(29.5);
+    expect(watched.sentFps).toBe(23);
+    expect(watched.keyframesSent).toBe(12);
+    expect(watched.keyframeRequestsReceived).toBe(4);
+    expect(watched.displaySize).toEqual({ width: 640, height: 360, ageMs: 250 });
+    expect(background.targetCaptureFps).toBe(2);
+    expect(background.displaySize).toBeNull();
+    // An older sidecar sends none of the rate fields.
+    expect(old.targetCaptureFps).toBeUndefined();
+    expect(old.displaySize).toBeUndefined();
+  });
+
+  it("camera state from the snapshot carries the rate fields when the sidecar sends them", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+
+    await client.connect();
+    captured.dc?._open();
+    captured.dc?._msg(
+      JSON.stringify({
+        type: "camera-snapshot",
+        content: {
+          cameras: [
+            fakeCameraState(1, {
+              targetCaptureFps: 2,
+              displayed: false,
+              captureFps: 2,
+              sentFps: 2,
+              keyframesSent: 3,
+              keyframeRequestsReceived: 0,
+            }),
+            fakeCameraState(2),
+          ],
+        },
+      }),
+    );
+
+    const [withRates, legacy] = client.cameras;
+    expect(withRates.targetCaptureFps).toBe(2);
+    expect(withRates.displayed).toBe(false);
+    expect(withRates.sentFps).toBe(2);
+    expect(withRates.keyframesSent).toBe(3);
+    expect(withRates.displaySize).toBeUndefined();
+    expect(legacy.targetCaptureFps).toBeUndefined();
+    expect(legacy.captureFps).toBeUndefined();
+  });
+
   it("sidecar error message emits error event with correct payload including source", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);

@@ -1592,18 +1592,21 @@ fn make_even(v: u32) -> u32 {
     }
 }
 
-/// True if a batch of received RTCP contains a keyframe request — a Picture
-/// Loss Indication (PLI) or Full Intra Request (FIR). The browser sends these
+/// Number of keyframe requests in a batch of received RTCP: Picture Loss
+/// Indications (PLI) and Full Intra Requests (FIR). The browser sends these
 /// when it hits a loss it can't recover from retransmission; honoring one forces
 /// an IDR so the decoder unwedges in ~1 RTT instead of waiting for the next
 /// scheduled keyframe (a full GOP of static — the "feeds cut to static" bug).
-fn rtcp_requests_keyframe(packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>]) -> bool {
+fn rtcp_keyframe_request_count(packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>]) -> usize {
     use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
     use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-    packets.iter().any(|p| {
-        let any = p.as_any();
-        any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>()
-    })
+    packets
+        .iter()
+        .filter(|p| {
+            let any = p.as_any();
+            any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>()
+        })
+        .count()
 }
 
 /// Decide whether to honor a keyframe request for the camera currently bound to
@@ -1665,7 +1668,8 @@ async fn drain_rtcp_sink(
     while let Ok((packets, _)) = sender.read_rtcp().await {
         // REMB and other RTCP intentionally discarded — see fn doc. Only a
         // keyframe request is acted on.
-        if !rtcp_requests_keyframe(&packets) {
+        let requests = rtcp_keyframe_request_count(&packets);
+        if requests == 0 {
             continue;
         }
         let bound = {
@@ -1673,15 +1677,17 @@ async fn drain_rtcp_sink(
             guard.get(slot_idx).and_then(|s| s.bound)
         };
         let Some(flight_id) = bound else { continue };
+        let Some(cam) = registry.get(flight_id).await else {
+            continue;
+        };
+        cam.note_keyframe_requests(requests as u64);
         let now = Instant::now();
         if !should_force_keyframe(flight_id, last_forced, now, MIN_KEYFRAME_GAP) {
             continue;
         }
-        if let Some(cam) = registry.get(flight_id).await {
-            request_keyframe_for(&cam).await;
-            last_forced = Some((flight_id, now));
-            info!(flight_id, "keyframe forced by browser PLI/FIR");
-        }
+        request_keyframe_for(&cam).await;
+        last_forced = Some((flight_id, now));
+        info!(flight_id, "keyframe forced by browser PLI/FIR");
     }
     // read_rtcp errors when the sender closes (peer torn down) — the normal
     // exit. If it ever happens mid-connection this slot loses its NACK pump and
@@ -1918,7 +1924,7 @@ mod tests {
         use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
         let pkts: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
             vec![Box::new(PictureLossIndication::default())];
-        assert!(rtcp_requests_keyframe(&pkts));
+        assert!(rtcp_keyframe_request_count(&pkts) > 0);
     }
 
     /// A Full Intra Request is the other keyframe-request RTCP feedback; some
@@ -1928,7 +1934,7 @@ mod tests {
         use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
         let pkts: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
             vec![Box::new(FullIntraRequest::default())];
-        assert!(rtcp_requests_keyframe(&pkts));
+        assert!(rtcp_keyframe_request_count(&pkts) > 0);
     }
 
     /// Routine RTCP (receiver reports, NACKs) must NOT be mistaken for a
@@ -1939,7 +1945,24 @@ mod tests {
         use rtcp::receiver_report::ReceiverReport;
         let pkts: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
             vec![Box::new(ReceiverReport::default())];
-        assert!(!rtcp_requests_keyframe(&pkts));
+        assert_eq!(rtcp_keyframe_request_count(&pkts), 0);
+    }
+
+    /// Every PLI/FIR in a batch counts toward the camera's received-request
+    /// counter; routine RTCP does not.
+    #[test]
+    fn keyframe_requests_are_counted_per_packet() {
+        use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+        use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+        use rtcp::receiver_report::ReceiverReport;
+        let pkts: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> = vec![
+            Box::new(PictureLossIndication::default()),
+            Box::new(ReceiverReport::default()),
+            Box::new(FullIntraRequest::default()),
+            Box::new(PictureLossIndication::default()),
+        ];
+        assert_eq!(rtcp_keyframe_request_count(&pkts), 3);
+        assert_eq!(rtcp_keyframe_request_count(&pkts[1..2]), 0);
     }
 
     const GAP: Duration = Duration::from_millis(1000);
