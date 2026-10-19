@@ -26,8 +26,9 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CrewLocation,
-    Layer, QualityPreset, SettingsStatePayload, TrackMode,
+    DisplaySizeReport, Layer, QualityPreset, SettingsStatePayload, TrackMode,
 };
+use crate::rate::RateWindow;
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
 
 /// Filesystem identity for a `.ring` file: distinguishes "same path, same
@@ -97,6 +98,10 @@ struct GlobalStatusFile {
     /// so every camera keeps being asked for the primary rate as before.
     #[serde(default)]
     background_capture_fps: f32,
+    /// The plugin's primary capture rate (settings.cfg MaxCaptureFps). Absent in
+    /// older plugin writes, which pace at `DEFAULT_PRIMARY_CAPTURE_FPS`.
+    #[serde(default)]
+    max_capture_fps: Option<f32>,
     /// Mission-time capture clock (see `SettingsStatePayload`). All three
     /// absent in older plugin writes; `None` => no clock, surfaced as
     /// "unknown" to consumers.
@@ -337,6 +342,31 @@ pub struct CameraInfo {
     pub encoder_bitrate_bps: u32,
     pub target_bitrate_bps: u32,
     pub degrade_level: f32,
+    /// See the protocol `CameraState` for the meaning of these.
+    pub target_capture_fps: f32,
+    pub displayed: bool,
+    pub capture_fps: f32,
+    pub sent_fps: f32,
+    pub keyframes_sent: u64,
+    pub keyframe_requests_received: u64,
+    pub display_size: Option<DisplaySizeReport>,
+}
+
+/// Primary capture rate a plugin predating the `maxCaptureFps` status field
+/// paces at (its settings.cfg default).
+pub const DEFAULT_PRIMARY_CAPTURE_FPS: f32 = 30.0;
+
+/// Per-camera rate and stream counters, computed when `/cameras` is served or a
+/// camera state is built for peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CameraStats {
+    pub target_capture_fps: f32,
+    pub displayed: bool,
+    pub capture_fps: f32,
+    pub sent_fps: f32,
+    pub keyframes_sent: u64,
+    pub keyframe_requests_received: u64,
+    pub display_size: Option<DisplaySizeReport>,
 }
 
 /// Manifest the plugin writes alongside the ring file. Static for the
@@ -541,7 +571,7 @@ pub struct CameraState {
     /// departure lesson). Mirrors `bandwidth_estimates` (a per-consumer map that
     /// reduces), NOT the `effective_degrade` scalar — display size is a genuine
     /// per-consumer need, not a camera-global property.
-    pub display_sizes: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
+    pub display_sizes: Mutex<std::collections::HashMap<u32, (u32, u32, Instant)>>,
     /// Operator `SetRenderSize` CAP (even, clamped to the ring max), or `None`
     /// = uncapped. The effective render size is min(auto MAX-across-consumers,
     /// this cap): a manual size can only LOWER what auto would pick, never raise
@@ -554,6 +584,12 @@ pub struct CameraState {
     /// reap), not `effective_degrade` (a camera-global scalar): forcing is a
     /// genuine per-consumer demand, not a camera-wide property.
     pub forced_full_res: Mutex<std::collections::HashSet<u32>>,
+    /// Frames the plugin produced into the ring, counted from sequence advances.
+    pub capture_rate: RateWindow,
+    /// Encoded frames handed to at least one track.
+    pub sent_rate: RateWindow,
+    pub keyframes_sent: AtomicU64,
+    pub keyframe_requests_received: AtomicU64,
 }
 
 impl CameraState {
@@ -727,7 +763,7 @@ impl CameraState {
         if width < 2 || height < 2 {
             sizes.remove(&peer_id);
         } else {
-            sizes.insert(peer_id, (width, height));
+            sizes.insert(peer_id, (width, height, Instant::now()));
         }
     }
 
@@ -788,6 +824,80 @@ impl CameraState {
         Some(background_ceiling_fps)
     }
 
+    /// Count the frames between two ring reads as captured. A zero `prev` is the
+    /// first read since attach, which only sets the baseline: the ring may hold
+    /// frames produced long before anyone was reading.
+    pub fn note_ring_advance_at(&self, now: Instant, prev: u64, seq: u64) {
+        if prev != 0 && seq > prev {
+            self.capture_rate.record_at(now, seq - prev);
+        }
+    }
+
+    pub fn note_ring_advance(&self, prev: u64, seq: u64) {
+        self.note_ring_advance_at(Instant::now(), prev, seq);
+    }
+
+    pub fn note_frame_sent(&self) {
+        self.sent_rate.record(1);
+    }
+
+    pub fn note_keyframe_sent(&self) {
+        self.keyframes_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_keyframe_requests(&self, n: u64) {
+        self.keyframe_requests_received
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The per-dimension MAX display size held across consumers, aged from the
+    /// newest report that set either dimension of it.
+    pub async fn display_size_report_at(&self, now: Instant) -> Option<DisplaySizeReport> {
+        let sizes = self.display_sizes.lock().await;
+        let (width, height) = sizes
+            .values()
+            .map(|&(w, h, _)| (w, h))
+            .reduce(|(aw, ah), (w, h)| (aw.max(w), ah.max(h)))?;
+        let newest = sizes
+            .values()
+            .filter(|&&(w, h, _)| w == width || h == height)
+            .map(|&(_, _, at)| at)
+            .max()?;
+        let age_ms = now.saturating_duration_since(newest).as_millis();
+        Some(DisplaySizeReport {
+            width,
+            height,
+            age_ms: u32::try_from(age_ms).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// The rate the plugin is pacing this camera to, derived from the control
+    /// state it was last sent: 0 when not subscribed, otherwise the requested
+    /// background rate or the primary rate, clamped the way `CapturePacing`
+    /// clamps it (a request never exceeds the primary rate).
+    pub fn target_capture_fps(&self, ctrl: &ControlState, primary_fps: f32) -> f32 {
+        if !ctrl.subscribed || self.destroyed.load(Ordering::Acquire) {
+            return 0.0;
+        }
+        match ctrl.capture_fps {
+            Some(fps) => fps.clamp(0.0, primary_fps),
+            None => primary_fps,
+        }
+    }
+
+    pub async fn stats(&self, ctrl: &ControlState, primary_fps: f32) -> CameraStats {
+        let now = Instant::now();
+        CameraStats {
+            target_capture_fps: self.target_capture_fps(ctrl, primary_fps),
+            displayed: self.has_display_demand().await,
+            capture_fps: self.capture_rate.rate_at(now),
+            sent_fps: self.sent_rate.rate_at(now),
+            keyframes_sent: self.keyframes_sent.load(Ordering::Relaxed),
+            keyframe_requests_received: self.keyframe_requests_received.load(Ordering::Relaxed),
+            display_size: self.display_size_report_at(now).await,
+        }
+    }
+
     /// Effective render size = min(demand, manual cap), clamped to the ring's
     /// max dims and made even (H.264 chroma). Demand is normally the auto MAX-
     /// across-consumers display size; while ANY peer forces this camera (see
@@ -804,7 +914,7 @@ impl CameraState {
             let sizes = self.display_sizes.lock().await;
             sizes
                 .values()
-                .copied()
+                .map(|&(w, h, _)| (w, h))
                 .reduce(|(aw, ah), (w, h)| (aw.max(w), ah.max(h)))
         };
         let cap = *self.manual_render_cap.lock().await;
@@ -1314,6 +1424,10 @@ impl CameraRegistry {
                             display_sizes: Mutex::new(std::collections::HashMap::new()),
                             manual_render_cap: Mutex::new(None),
                             forced_full_res: Mutex::new(std::collections::HashSet::new()),
+                            capture_rate: RateWindow::new(),
+                            sent_rate: RateWindow::new(),
+                            keyframes_sent: AtomicU64::new(0),
+                            keyframe_requests_received: AtomicU64::new(0),
                             control: Mutex::new(ControlState::default()),
                             control_block: std::sync::Mutex::new(None),
                         }),
@@ -1395,10 +1509,13 @@ impl CameraRegistry {
     }
 
     pub async fn list(&self) -> Vec<CameraInfo> {
-        let cams = self.cameras.read().await;
-        let mut out: Vec<_> = cams
-            .values()
-            .map(|s| CameraInfo {
+        let cams = self.snapshot().await;
+        let primary_fps = self.primary_capture_fps().await;
+        let mut out = Vec::with_capacity(cams.len());
+        for s in &cams {
+            let ctrl = s.control.lock().await.clone();
+            let stats = s.stats(&ctrl, primary_fps).await;
+            out.push(CameraInfo {
                 flight_id: s.flight_id,
                 lifecycle: if s.destroyed.load(Ordering::Acquire) {
                     CameraLifecycle::Destroyed
@@ -1427,11 +1544,29 @@ impl CameraRegistry {
                 encoder_bitrate_bps: s.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: s.target_bitrate_bps.load(Ordering::Acquire),
                 degrade_level: s.current_degrade(),
-            })
-            .collect();
+                target_capture_fps: stats.target_capture_fps,
+                displayed: stats.displayed,
+                capture_fps: stats.capture_fps,
+                sent_fps: stats.sent_fps,
+                keyframes_sent: stats.keyframes_sent,
+                keyframe_requests_received: stats.keyframe_requests_received,
+                display_size: stats.display_size,
+            });
+        }
         // Stable ordering for tests + UX (a refresh shouldn't shuffle).
         out.sort_by_key(|c| c.flight_id);
         out
+    }
+
+    /// Primary capture rate the plugin reports pacing displayed cameras to.
+    pub async fn primary_capture_fps(&self) -> f32 {
+        self.last_status
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| s.max_capture_fps)
+            .filter(|f| *f > 0.0)
+            .unwrap_or(DEFAULT_PRIMARY_CAPTURE_FPS)
     }
 
     pub async fn get(&self, flight_id: u32) -> Option<Arc<CameraState>> {
@@ -1559,14 +1694,19 @@ impl CameraRegistry {
             let Some(cam) = cameras.get(&cam_status.flight_id) else {
                 continue;
             };
-            let (viewer_quality, background_capturing) = {
-                let ctrl = cam.control.lock().await;
+            let (viewer_quality, background_capturing, stats) = {
+                let ctrl = cam.control.lock().await.clone();
+                let primary_fps = parsed
+                    .max_capture_fps
+                    .filter(|f| *f > 0.0)
+                    .unwrap_or(DEFAULT_PRIMARY_CAPTURE_FPS);
                 (
                     ctrl.viewer_level.and_then(QualityPreset::from_viewer_level),
                     // "Humming" is simply "we asked this camera for a reduced
                     // rate" — the same fact the plugin was told, so the state we
                     // publish can't drift from the state we commanded.
                     ctrl.capture_fps.is_some(),
+                    cam.stats(&ctrl, primary_fps).await,
                 )
             };
             delta.changed_cameras.push(ProtocolCameraState {
@@ -1611,6 +1751,13 @@ impl CameraRegistry {
                     cam_status.render_width,
                     viewer_quality,
                 ),
+                target_capture_fps: stats.target_capture_fps,
+                displayed: stats.displayed,
+                capture_fps: stats.capture_fps,
+                sent_fps: stats.sent_fps,
+                keyframes_sent: stats.keyframes_sent,
+                keyframe_requests_received: stats.keyframe_requests_received,
+                display_size: stats.display_size,
             });
         }
 
@@ -2158,6 +2305,7 @@ impl CameraRegistry {
         let background_capturing = ctrl.capture_fps.is_some();
         let quality_limited_by =
             quality_limited_reason(operator_width, render_width, viewer_quality);
+        let stats = cam.stats(&ctrl, self.primary_capture_fps().await).await;
 
         Some(ProtocolCameraState {
             flight_id,
@@ -2197,6 +2345,13 @@ impl CameraRegistry {
             degrade_level: cam.current_degrade(),
             viewer_quality,
             quality_limited_by,
+            target_capture_fps: stats.target_capture_fps,
+            displayed: stats.displayed,
+            capture_fps: stats.capture_fps,
+            sent_fps: stats.sent_fps,
+            keyframes_sent: stats.keyframes_sent,
+            keyframe_requests_received: stats.keyframe_requests_received,
+            display_size: stats.display_size,
         })
     }
 }
@@ -3812,5 +3967,192 @@ mod tests {
             "live cameras are untouched by a tombstone prune"
         );
         assert!(rig.registry.prune_tombstones().await.is_empty());
+    }
+
+    fn write_rate_status(dir: &std::path::Path, extra: &str) {
+        let body = format!(
+            r#"{{"kspFps":60.0,"shedLevel":0{extra},"cameras":[{{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64}}]}}"#
+        );
+        std::fs::write(dir.join("global.status.json"), body).unwrap();
+    }
+
+    async fn info_for(registry: &CameraRegistry, flight_id: u32) -> CameraInfo {
+        registry
+            .list()
+            .await
+            .into_iter()
+            .find(|c| c.flight_id == flight_id)
+            .expect("camera listed")
+    }
+
+    /// The target rate mirrors what the plugin was told: 0 while nobody
+    /// subscribes, the plugin's primary rate while displayed, and the
+    /// background rate while subscribed but undisplayed.
+    #[tokio::test]
+    async fn target_capture_fps_follows_pacing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        write_rate_status(
+            dir.path(),
+            r#","maxCaptureFps":24.0,"backgroundCaptureFps":2.0"#,
+        );
+        registry.poll_status().await;
+
+        let info = info_for(&registry, 1).await;
+        assert_eq!(
+            info.target_capture_fps, 0.0,
+            "not subscribed, not capturing"
+        );
+        assert!(!info.displayed);
+
+        registry.set_subscribed(1, true).await;
+        registry.set_background_request(9, 2.0).await;
+        registry.reflush_all_capture_rates().await;
+        let info = info_for(&registry, 1).await;
+        assert_eq!(
+            info.target_capture_fps, 2.0,
+            "undisplayed -> background rate"
+        );
+        assert!(!info.displayed);
+
+        registry.record_display_size(1, 9, 640, 360).await;
+        let info = info_for(&registry, 1).await;
+        assert_eq!(info.target_capture_fps, 24.0, "displayed -> primary rate");
+        assert!(info.displayed);
+
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!(state.target_capture_fps, 24.0);
+        assert!(state.displayed);
+    }
+
+    /// A plugin that predates `maxCaptureFps` paces at its default 30fps.
+    #[tokio::test]
+    async fn target_capture_fps_defaults_for_older_plugins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        write_rate_status(dir.path(), "");
+        registry.poll_status().await;
+        registry.set_subscribed(1, true).await;
+        assert_eq!(info_for(&registry, 1).await.target_capture_fps, 30.0);
+    }
+
+    /// A forced feed counts as displayed even with no visible tile.
+    #[tokio::test]
+    async fn forced_feed_reports_displayed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        registry.set_forced_full_res(1, 3, true).await;
+        assert!(info_for(&registry, 1).await.displayed);
+    }
+
+    /// Ring sequence advances count as captured frames; the first observation
+    /// after attach is only a baseline, so a ring full of old frames cannot spike.
+    #[tokio::test]
+    async fn ring_sequence_advances_count_as_captured_frames() {
+        let (_dir, cam) = attach_camera_for_tracker(7_201).await;
+        let t0 = Instant::now();
+        cam.note_ring_advance_at(t0, 0, 500);
+        assert_eq!(cam.capture_rate.rate_at(t0), 0.0, "baseline only");
+        for i in 1..=60u64 {
+            cam.note_ring_advance_at(
+                t0 + std::time::Duration::from_millis(33 * i),
+                499 + i,
+                500 + i,
+            );
+        }
+        let r = cam
+            .capture_rate
+            .rate_at(t0 + std::time::Duration::from_millis(2000));
+        assert!((r - 30.0).abs() < 2.0, "got {r}");
+    }
+
+    #[tokio::test]
+    async fn list_reports_captured_and_sent_rates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        cam.capture_rate.record(10);
+        cam.sent_rate.record(5);
+        let info = info_for(&registry, 1).await;
+        assert!(info.capture_fps > 0.0);
+        assert!(info.sent_fps > 0.0);
+        assert!(info.capture_fps > info.sent_fps);
+    }
+
+    #[tokio::test]
+    async fn keyframe_counters_accumulate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        cam.note_keyframe_requests(2);
+        cam.note_keyframe_requests(1);
+        cam.note_keyframe_sent();
+        let info = info_for(&registry, 1).await;
+        assert_eq!(info.keyframe_requests_received, 3);
+        assert_eq!(info.keyframes_sent, 1);
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!(state.keyframe_requests_received, 3);
+        assert_eq!(state.keyframes_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn display_size_is_none_when_nothing_held() {
+        let (_dir, cam) = attach_camera_for_tracker(7_202).await;
+        assert!(cam.display_size_report_at(Instant::now()).await.is_none());
+        cam.record_display_size(1, 0, 0).await;
+        assert!(cam.display_size_report_at(Instant::now()).await.is_none());
+    }
+
+    /// The held size is the per-dimension max, aged from the newest report
+    /// that contributed to it (a smaller, fresher report does not reset it).
+    #[tokio::test]
+    async fn display_size_reports_max_and_contributing_age() {
+        use std::time::Duration;
+        let (_dir, cam) = attach_camera_for_tracker(7_203).await;
+        cam.record_display_size(1, 800, 450).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cam.record_display_size(2, 100, 100).await;
+        let now = Instant::now() + Duration::from_millis(200);
+        let ds = cam.display_size_report_at(now).await.expect("held");
+        assert_eq!((ds.width, ds.height), (800, 450));
+        assert!(
+            ds.age_ms >= 230,
+            "aged from the 800x450 report, got {}",
+            ds.age_ms
+        );
+        assert!(ds.age_ms < 1000, "got {}", ds.age_ms);
+
+        cam.record_display_size(1, 800, 450).await;
+        let ds = cam
+            .display_size_report_at(Instant::now())
+            .await
+            .expect("held");
+        assert!(
+            ds.age_ms < 30,
+            "re-report refreshes the age, got {}",
+            ds.age_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn camera_info_serialises_rate_fields_in_camel_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        let v = serde_json::to_value(info_for(&registry, 1).await).unwrap();
+        for key in [
+            "targetCaptureFps",
+            "displayed",
+            "captureFps",
+            "sentFps",
+            "keyframesSent",
+            "keyframeRequestsReceived",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key} in {v}");
+        }
+        assert!(v["displaySize"].is_null());
+
+        cam.record_display_size(4, 320, 180).await;
+        let v = serde_json::to_value(info_for(&registry, 1).await).unwrap();
+        assert_eq!(v["displaySize"]["width"], 320);
+        assert_eq!(v["displaySize"]["height"], 180);
+        assert!(v["displaySize"]["ageMs"].is_number());
     }
 }

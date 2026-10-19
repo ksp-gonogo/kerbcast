@@ -163,7 +163,7 @@ pub enum CrewLocation {
 /// fixed-FoV camera shouldn't get a zoom slider, a non-steerable one
 /// shouldn't get a pan stick.
 #[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraState {
     pub flight_id: u32,
@@ -268,6 +268,50 @@ pub struct CameraState {
     /// Absent/None = the request is fully honored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_limited_by: Option<String>,
+    /// Rate in fps Kerbcast is currently pacing this camera's capture to: the
+    /// plugin's primary rate (MaxCaptureFps) while displayed, the background
+    /// rate while subscribed but undisplayed, 0 when not capturing.
+    #[serde(default)]
+    pub target_capture_fps: f32,
+    /// Whether any consumer reports a non-zero display size for this camera,
+    /// or a consumer forces it (e.g. a full-resolution recording).
+    #[serde(default)]
+    pub displayed: bool,
+    /// Frames the plugin produced into this camera's ring per second, over
+    /// roughly the last two seconds, as observed by the sidecar's encode loop.
+    #[serde(default)]
+    pub capture_fps: f32,
+    /// Encoded frames handed to this camera's tracks per second, over the same
+    /// window. Below `capture_fps` when the encoder skips frames (encode pacing,
+    /// degrade); a viewer receiving less than this is losing frames in transit.
+    #[serde(default)]
+    pub sent_fps: f32,
+    /// Keyframes the encoder emitted for this camera (periodic or requested)
+    /// since its ring was attached.
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub keyframes_sent: u64,
+    /// PLI/FIR keyframe requests received from viewers for this camera, across
+    /// peers, since its ring was attached. Counted before the per-slot debounce,
+    /// so it can exceed the keyframes forced in response.
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub keyframe_requests_received: u64,
+    /// Largest display size currently held for this camera across consumers.
+    /// Absent when no consumer reports one (`GET /cameras` sends null instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_size: Option<DisplaySizeReport>,
+}
+
+/// The per-dimension MAX display size held for a camera across consumers.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplaySizeReport {
+    pub width: u32,
+    pub height: u32,
+    /// Milliseconds since the most recent report that contributed to the max.
+    pub age_ms: u32,
 }
 
 // Wrapper structs for the algebraic-enum content payloads. typeshare's
@@ -896,6 +940,7 @@ mod tests {
                 degrade_level: 0.0,
                 viewer_quality: Some(QualityPreset::Half),
                 quality_limited_by: Some("throttled".into()),
+                ..Default::default()
             }],
         });
         let s = serde_json::to_string(&snap).unwrap();
@@ -951,6 +996,7 @@ mod tests {
             degrade_level: 0.0,
             viewer_quality: None,
             quality_limited_by: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&state).unwrap();
         assert!(!s.contains("viewerQuality"), "got {s}");
@@ -961,6 +1007,64 @@ mod tests {
         let back: CameraState = serde_json::from_str(&old).unwrap();
         assert_eq!(back.viewer_quality, None);
         assert_eq!(back.quality_limited_by, None);
+    }
+
+    #[test]
+    fn camera_state_rate_fields_use_camel_case_keys() {
+        let state = CameraState {
+            flight_id: 1,
+            target_capture_fps: 30.0,
+            displayed: true,
+            capture_fps: 29.5,
+            sent_fps: 28.0,
+            keyframes_sent: 4,
+            keyframe_requests_received: 2,
+            display_size: Some(DisplaySizeReport {
+                width: 640,
+                height: 360,
+                age_ms: 120,
+            }),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&state).unwrap();
+        assert_eq!(v["targetCaptureFps"], 30.0);
+        assert_eq!(v["displayed"], true);
+        assert_eq!(v["captureFps"], 29.5);
+        assert_eq!(v["sentFps"], 28.0);
+        assert_eq!(v["keyframesSent"], 4);
+        assert_eq!(v["keyframeRequestsReceived"], 2);
+        assert_eq!(v["displaySize"]["width"], 640);
+        assert_eq!(v["displaySize"]["height"], 360);
+        assert_eq!(v["displaySize"]["ageMs"], 120);
+
+        let none = serde_json::to_value(CameraState::default()).unwrap();
+        assert!(
+            none.get("displaySize").is_none(),
+            "nothing held -> omitted, matching the optional TS binding"
+        );
+    }
+
+    /// A payload from a sidecar predating the rate fields still parses.
+    #[test]
+    fn camera_state_without_rate_fields_parses() {
+        let mut v = serde_json::to_value(CameraState::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for key in [
+            "targetCaptureFps",
+            "displayed",
+            "captureFps",
+            "sentFps",
+            "keyframesSent",
+            "keyframeRequestsReceived",
+            "displaySize",
+        ] {
+            obj.remove(key);
+        }
+        let back: CameraState = serde_json::from_value(v).unwrap();
+        assert_eq!(back.target_capture_fps, 0.0);
+        assert!(!back.displayed);
+        assert_eq!(back.keyframes_sent, 0);
+        assert!(back.display_size.is_none());
     }
 
     #[test]
@@ -1400,6 +1504,7 @@ mod tests {
             degrade_level: 0.0,
             viewer_quality: None,
             quality_limited_by: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&state).unwrap();
         assert!(s.contains("\"kind\":\"kerbal\""));

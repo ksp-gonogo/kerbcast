@@ -2,6 +2,7 @@ import type {
   AdaptiveShedPayload,
   CameraState,
   ClientMessage,
+  DisplaySizeReport,
   ErrorPayload,
   Layer,
   QualityPreset,
@@ -247,6 +248,26 @@ export interface DiscoveredCamera {
   targetBitrateBps: number;
   /** Effective degrade level (max across active subscribers). 0.0 to 1.0. */
   degradeLevel: number;
+  /*
+   * Live rate fields, absent from sidecars that predate them. Poll
+   * discover() for current values; the data-channel CameraState carries the
+   * same fields as of its last push.
+   */
+  /** Rate Kerbcast paces this camera's capture to: the primary rate while
+   *  displayed, the background rate while undisplayed, 0 when not capturing. */
+  targetCaptureFps?: number;
+  /** Any consumer reports a non-zero display size, or the feed is forced. */
+  displayed?: boolean;
+  /** Frames the plugin produced per second over roughly the last 2 s. */
+  captureFps?: number;
+  /** Encoded frames handed to this camera's tracks per second, same window. */
+  sentFps?: number;
+  /** Keyframes the encoder emitted since the camera's stream started. */
+  keyframesSent?: number;
+  /** PLI/FIR keyframe requests received across peers since the stream started. */
+  keyframeRequestsReceived?: number;
+  /** Largest display size held across consumers; null when none is held. */
+  displaySize?: DisplaySizeReport | null;
 }
 
 /** Event payloads emitted by a {@link KerbcastClient}. */

@@ -6,6 +6,7 @@ pub mod cameras;
 pub mod encoder;
 pub mod heartbeat;
 pub mod protocol;
+pub mod rate;
 pub mod shared_mem;
 pub mod signalling;
 pub mod webrtc;

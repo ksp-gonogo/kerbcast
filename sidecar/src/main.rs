@@ -605,6 +605,8 @@ async fn broadcast_destroyed_cameras(
             degrade_level: 0.0,
             viewer_quality: None,
             quality_limited_by: None,
+            // Nothing is captured or sent for a destroyed camera.
+            ..Default::default()
         };
         let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
         broadcast(&snapshot, &msg).await;
@@ -725,6 +727,7 @@ async fn encode_and_fan_out(
         "new frame accepted for encode"
     );
     cam.last_sequence.store(frame.sequence, Ordering::Release);
+    cam.note_ring_advance(last, frame.sequence);
 
     // Apply SetDegrade. Two cheap levers:
     //
@@ -874,6 +877,9 @@ async fn encode_and_fan_out(
     }) {
         Ok(n) => {
             cam.encode_failure_streak.store(0, Ordering::Release);
+            if n.iter().any(|nal| nal.is_keyframe()) {
+                cam.note_keyframe_sent();
+            }
             /* A promotion is complete once a keyframe actually goes out — that
             is the moment the feed becomes renderable, so it's what flips the
             published state from Ramping to Full. Keyed on a real IDR in the
@@ -992,6 +998,7 @@ async fn encode_and_fan_out(
             "encoded a frame but sent it to NOBODY (no live tracks)"
         );
     } else {
+        cam.note_frame_sent();
         debug!(
             flight_id = cam.flight_id,
             sent,

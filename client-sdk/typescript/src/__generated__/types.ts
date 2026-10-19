@@ -111,6 +111,14 @@ export enum QualityPreset {
 	Quarter = "quarter",
 }
 
+/** The per-dimension MAX display size held for a camera across consumers. */
+export interface DisplaySizeReport {
+	width: number;
+	height: number;
+	/** Milliseconds since the most recent report that contributed to the max. */
+	ageMs: number;
+}
+
 /**
  * Per-camera snapshot pushed by the sidecar on every state change
  * (operator API call, adaptive shed, vessel change). Same shape served
@@ -250,6 +258,44 @@ export interface CameraState {
 	 * Absent/None = the request is fully honored.
 	 */
 	qualityLimitedBy?: string;
+	/**
+	 * Rate in fps Kerbcast is currently pacing this camera's capture to: the
+	 * plugin's primary rate (MaxCaptureFps) while displayed, the background
+	 * rate while subscribed but undisplayed, 0 when not capturing.
+	 */
+	targetCaptureFps?: number;
+	/**
+	 * Whether any consumer reports a non-zero display size for this camera,
+	 * or a consumer forces it (e.g. a full-resolution recording).
+	 */
+	displayed?: boolean;
+	/**
+	 * Frames the plugin produced into this camera's ring per second, over
+	 * roughly the last two seconds, as observed by the sidecar's encode loop.
+	 */
+	captureFps?: number;
+	/**
+	 * Encoded frames handed to this camera's tracks per second, over the same
+	 * window. Below `capture_fps` when the encoder skips frames (encode pacing,
+	 * degrade); a viewer receiving less than this is losing frames in transit.
+	 */
+	sentFps?: number;
+	/**
+	 * Keyframes the encoder emitted for this camera (periodic or requested)
+	 * since its ring was attached.
+	 */
+	keyframesSent?: number;
+	/**
+	 * PLI/FIR keyframe requests received from viewers for this camera, across
+	 * peers, since its ring was attached. Counted before the per-slot debounce,
+	 * so it can exceed the keyframes forced in response.
+	 */
+	keyframeRequestsReceived?: number;
+	/**
+	 * Largest display size currently held for this camera across consumers.
+	 * Absent when no consumer reports one (`GET /cameras` sends null instead).
+	 */
+	displaySize?: DisplaySizeReport;
 }
 
 export interface CameraSnapshotPayload {

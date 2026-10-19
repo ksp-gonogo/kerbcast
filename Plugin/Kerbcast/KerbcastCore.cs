@@ -1066,6 +1066,8 @@ namespace Kerbcast
                    knows which cameras nobody is displaying. 0 = background capture off, which
                    is the default and makes this whole path inert. */
                 sb.Append($"  \"backgroundCaptureFps\": {_effectiveBackgroundCeiling.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)},\n");
+                // Primary pacing rate, so the sidecar can report each camera's target rate.
+                sb.Append($"  \"maxCaptureFps\": {_settings.MaxCaptureFps.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 /* Mission-time capture clock: KSP universal time (seconds) and
                    the current time-warp multiplier at write time, plus the
                    discontinuity epoch. Round-trip ("R") + InvariantCulture so
