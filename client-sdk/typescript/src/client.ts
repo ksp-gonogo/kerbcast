@@ -11,9 +11,27 @@ import type {
   TrackMode,
 } from "./__generated__/types";
 import { CameraLifecycle, ErrorSource } from "./__generated__/types";
-import { type NoisePipeline, tryCreateNoisePipeline } from "./noise";
+import {
+  type DisplayedFrameUt,
+  type FrameUt,
+  FrameStampStore,
+  STAMP_TO_DISPLAY_MAX_MS,
+  type VideoWithFrameCallback,
+  extrapolateCaptureUt,
+  monotonicNowMs,
+} from "./frameUt";
+import {
+  type DisplayedFrameMetadata,
+  type DisplayedSourceFrame,
+  type NoisePipeline,
+  tryCreateNoisePipeline,
+} from "./noise";
 import { RecordingController, type RecordingControllerOptions } from "./recording";
 
+/** Cadence of estimated frames from a watcher on a browser without `requestVideoFrameCallback`. */
+const ESTIMATED_FRAME_INTERVAL_MS = 100;
+/* How long after an element's last exactly identified frame that frame still bounds an unidentified one. */
+const LAST_EXACT_MAX_AGE_MS = 1000;
 /** Intensity the static runs at when a camera has no live source (signal lost). */
 const SOURCELESS_INTENSITY = 1.0;
 /** Floor applied to the degrade-driven intensity of a live feed. */
@@ -148,6 +166,17 @@ export interface KerbcastClientConfig {
    * this via `cam.configure({ noise: ... })`. Noise is enabled by default.
    */
   noise?: Partial<NoiseConfig>;
+  /**
+   * Keep cameras whose noise is disabled on the frame-locked canvas path,
+   * with no static, instead of exposing the raw track. On Chrome this lets
+   * `watchDisplayedFrames` identify every displayed frame exactly even where
+   * the browser's frame callbacks carry no `rtpTimestamp`. Where the browser
+   * has MediaStreamTrackProcessor and MediaStreamTrackGenerator, frames are
+   * forwarded untouched with no canvas work; elsewhere it costs one canvas
+   * composite per frame. Cameras with noise enabled are always frame-locked.
+   * Default false.
+   */
+  frameLock?: boolean;
   /**
    * ICE gathering timeout in milliseconds. Passed to the default
    * {@link BrowserKerbcastTransport}; ignored when a custom transport is
@@ -542,6 +571,8 @@ class CameraHandle
   private _keyframeRetry: ReturnType<typeof setInterval> | null = null;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
   private _showStatic = true;
+  /** True while the pipeline runs as a static-free frame-lock passthrough (noise off, `frameLock` on). */
+  private _clear = false;
   private readonly client: KerbcastClient;
 
   constructor(flightId: number, client: KerbcastClient) {
@@ -579,7 +610,7 @@ class CameraHandle
 
   setShowStatic(enabled: boolean): void {
     this._showStatic = enabled;
-    this._noisePipeline?.setShowStatic(enabled);
+    if (!this._clear) this._noisePipeline?.setShowStatic(enabled);
   }
 
   /**
@@ -601,7 +632,7 @@ class CameraHandle
 
     // Live feed: degrade drives intensity. Don't touch a sourceless pipeline,
     // which is pinned at full static.
-    if (!this._sourceless) {
+    if (!this._sourceless && !this._clear) {
       this._noisePipeline?.setIntensity(this._liveIntensity());
     }
 
@@ -633,26 +664,29 @@ class CameraHandle
     this._sourceless = raw === null;
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
+    this._clear = !noiseEnabled && this.client._frameLock();
 
-    if (noiseEnabled) {
+    if (noiseEnabled || this._clear) {
       // Sourceless feeds show static in flight, but go blank (black, no
       // noise) out of flight so a whole-scene unload is calm.
-      const showStatic = raw ? this._showStatic : this._sourcelessShowStatic();
+      const showStatic = this._clear ? false : raw ? this._showStatic : this._sourcelessShowStatic();
+      const intensity = this._clear ? 0 : raw ? this._liveIntensity() : SOURCELESS_INTENSITY;
       // Reuse an existing pipeline; otherwise try to create one.
       if (!this._noisePipeline) {
-        const initial = raw ? this._liveIntensity() : SOURCELESS_INTENSITY;
-        this._noisePipeline = tryCreateNoisePipeline(raw, initial, {
+        this._noisePipeline = tryCreateNoisePipeline(raw, intensity, {
           showStatic,
+          passthrough: this._clear,
           onStallChange: (stalled) => this._setStalled(stalled),
         });
       } else {
+        this._noisePipeline.setPassthrough(this._clear);
         this._noisePipeline.setSource(raw);
         this._noisePipeline.setShowStatic(showStatic);
       }
 
       const pipeline = this._noisePipeline;
       if (pipeline) {
-        pipeline.setIntensity(raw ? this._liveIntensity() : SOURCELESS_INTENSITY);
+        pipeline.setIntensity(intensity);
         this._setOutput(pipeline.processedStream);
         return;
       }
@@ -682,7 +716,7 @@ class CameraHandle
    * existing sourceless pipeline so it switches between static and blank.
    */
   _refreshSceneState(): void {
-    if (this._sourceless) {
+    if (this._sourceless && !this._clear) {
       this._noisePipeline?.setShowStatic(this._sourcelessShowStatic());
     }
   }
@@ -723,6 +757,20 @@ class CameraHandle
 
   private _liveIntensity(): number {
     return Math.max(LIVE_INTENSITY_FLOOR, this._state?.degradeLevel ?? 0);
+  }
+
+  /**
+   * Internal: the source frame shown by a frame `video` presented with
+   * `metadata`, when `video` is playing the noise pipeline's output, else
+   * null.
+   */
+  _displayedSourceFrame(
+    video: HTMLVideoElement,
+    metadata: DisplayedFrameMetadata,
+  ): DisplayedSourceFrame | null {
+    const pipeline = this._noisePipeline;
+    if (!pipeline || video.srcObject !== pipeline.processedStream) return null;
+    return pipeline.displayedFrame(metadata);
   }
 
   /**
@@ -882,6 +930,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _captureUt: number | null = null;
   private _captureEpoch = 0;
   private _warpRate = 1;
+  /** When `_captureUt` arrived, on the monotonic clock, for extrapolation. */
+  private _captureUtAt = 0;
+  /** Per-frame capture stamps from `frame-stamp`, for exact frame UT lookup. */
+  private readonly frameStamps = new FrameStampStore();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
   /** Client-side recording controller, lazily built on first `recording` access. */
@@ -942,6 +994,140 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       captureUt: this._captureUt,
       epoch: this._captureEpoch,
       warpRate: this._warpRate,
+    };
+  }
+
+  /**
+   * Mission time of one frame of `flightId`'s video. With the frame's RTP
+   * timestamp (from `requestVideoFrameCallback` metadata `rtpTimestamp`, or a
+   * `VideoFrame`'s metadata) and a matching stamp from the sidecar, the
+   * result is the exact UT the frame was rendered at, `source: "exact"`.
+   * Otherwise it falls back to the capture clock extrapolated to `atMs`
+   * (default now, `performance.now()` clock), `source: "estimated"`. `null`
+   * only when there is no stamp and no clock either.
+   */
+  frameUt(flightId: number, rtpTimestamp?: number | null, atMs?: number): FrameUt | null {
+    if (rtpTimestamp != null) {
+      const stamp = this.frameStamps.lookup(flightId, rtpTimestamp);
+      if (stamp) return { ut: stamp.ut, epoch: stamp.epoch, source: "exact" };
+    }
+    if (this._captureUt === null) return null;
+    return {
+      ut: extrapolateCaptureUt(
+        this._captureUt,
+        this._warpRate,
+        this._captureUtAt,
+        atMs ?? monotonicNowMs(),
+      ),
+      epoch: this._captureEpoch,
+      source: "estimated",
+    };
+  }
+
+  /**
+   * Report the mission time of every frame `video` presents while it shows
+   * `flightId`'s feed. `video` may play the camera handle's `mediaStream`
+   * with or without the noise pipeline: through the pipeline, the frame is
+   * the source frame composited into the presented output frame.
+   *
+   * `source: "exact"` only when the presented frame itself identifies its
+   * source frame: the RTP timestamp in the element's own frame metadata, or
+   * the pipeline's output frame identified by `mediaTime` (Chrome). Anything
+   * else is `"estimated"` and lags the picture rather than leading it: an
+   * older frame's stamp, in order of preference the oldest pipeline
+   * composite that could be on screen, the element's last exactly identified
+   * frame (within the last second), or the newest stamp that arrived more
+   * than {@link STAMP_TO_DISPLAY_MAX_MS} before the frame was shown. Only
+   * with no stamp at all does it fall back to the capture clock, which
+   * leads.
+   * Without `requestVideoFrameCallback` estimated frames arrive every 100 ms
+   * instead. Frames with neither a stamp nor a clock are skipped. Returns a
+   * function that stops watching.
+   */
+  watchDisplayedFrames(
+    flightId: number,
+    video: HTMLVideoElement,
+    onFrame: (frame: DisplayedFrameUt) => void,
+  ): () => void {
+    const v = video as VideoWithFrameCallback;
+    /*
+     * The last frame of this element identified exactly. Frames are presented
+     * in order, so when a later frame can't be identified, this one is a
+     * bound that never leads the picture.
+     */
+    let lastExact: (DisplayedFrameUt & { mediaTime: number | undefined }) | null = null;
+    const estimate = (presentedAt: number) => {
+      if (lastExact && presentedAt - lastExact.presentedAt <= LAST_EXACT_MAX_AGE_MS) {
+        onFrame({
+          ut: lastExact.ut,
+          epoch: lastExact.epoch,
+          source: "estimated",
+          flightId,
+          rtpTimestamp: lastExact.rtpTimestamp,
+          presentedAt,
+        });
+        return;
+      }
+      const older = this.frameStamps.newestArrivedBy(
+        flightId,
+        presentedAt - STAMP_TO_DISPLAY_MAX_MS,
+      );
+      if (older) {
+        onFrame({ ...older, source: "estimated", flightId, presentedAt });
+        return;
+      }
+      const clock = this.frameUt(flightId, null, presentedAt);
+      if (clock) onFrame({ ...clock, flightId, rtpTimestamp: null, presentedAt });
+    };
+    const report = (
+      rtpTimestamp: number | null,
+      exact: boolean,
+      presentedAt: number,
+      mediaTime?: number,
+    ) => {
+      const stamp = rtpTimestamp === null ? null : this.frameStamps.lookup(flightId, rtpTimestamp);
+      /* An identification that runs backwards against the last exact frame is not trusted. */
+      const ordered =
+        mediaTime === undefined ||
+        lastExact?.mediaTime === undefined ||
+        mediaTime >= lastExact.mediaTime;
+      if (!stamp || !ordered) {
+        estimate(presentedAt);
+        return;
+      }
+      const frame: DisplayedFrameUt = {
+        ...stamp,
+        source: exact ? "exact" : "estimated",
+        flightId,
+        rtpTimestamp,
+        presentedAt,
+      };
+      if (exact) lastExact = { ...frame, mediaTime };
+      onFrame(frame);
+    };
+    if (typeof v.requestVideoFrameCallback !== "function") {
+      const timer = setInterval(() => estimate(monotonicNowMs()), ESTIMATED_FRAME_INTERVAL_MS);
+      return () => clearInterval(timer);
+    }
+    let stopped = false;
+    let id: number | null = null;
+    const arm = () => {
+      id = v.requestVideoFrameCallback!((now, metadata) => {
+        if (stopped) return;
+        const presentedAt = metadata?.expectedDisplayTime ?? now;
+        if (typeof metadata?.rtpTimestamp === "number") {
+          report(metadata.rtpTimestamp, true, presentedAt);
+        } else {
+          const shown = this.handles.get(flightId)?._displayedSourceFrame(video, metadata ?? {});
+          report(shown?.rtpTimestamp ?? null, shown?.exact ?? false, presentedAt, metadata?.mediaTime);
+        }
+        arm();
+      });
+    };
+    arm();
+    return () => {
+      stopped = true;
+      if (id !== null) v.cancelVideoFrameCallback?.(id);
     };
   }
 
@@ -1030,6 +1216,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.trackByMid.clear();
     this.flightByMid.clear();
     this.flightByTrackId.clear();
+    /* RTP timestamps restart from a fresh random base on every peer. */
+    this.frameStamps.clear();
 
     const peer = this.transport.createPeer(
       this.cfg.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
@@ -1196,12 +1384,27 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * Choose the craft a command camera watches, by `Vessel.persistentId` from
+   * `CameraState.commandCentre.targets` (any entry, whatever its eligibility),
+   * or 0 to return to the game's default. The new target shows up in
+   * `commandCentre.targetPersistentId` once the game applies it.
+   */
+  async setCommandTarget(flightId: number, persistentId: number): Promise<void> {
+    await this._send({ type: "set-command-target", content: { flightId, persistentId } });
+  }
+
+  /**
    * Internal — resolves the effective noise enabled state for a camera,
    * merging the per-camera override (if any) with the client-level default.
    */
   _resolveNoise(override: Partial<NoiseConfig> | null): boolean {
     if (override?.enabled !== undefined) return override.enabled;
     return this.cfg.noise?.enabled !== false; // default: enabled
+  }
+
+  /** Internal: whether noise-disabled cameras stay on the frame-locked path. */
+  _frameLock(): boolean {
+    return this.cfg.frameLock === true;
   }
 
   /**
@@ -1348,11 +1551,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
          * value updates it); warpRate falls back to 1 when absent.
          */
         this._captureUt = msg.content.captureUt ?? null;
+        this._captureUtAt = monotonicNowMs();
         if (msg.content.captureEpoch != null) {
           this._captureEpoch = msg.content.captureEpoch;
         }
         this._warpRate = msg.content.timeWarpRate ?? 1;
         this.emit("settings-change", msg.content);
+        break;
+      case "frame-stamp":
+        this.frameStamps.record(msg.content);
         break;
       case "scene-state-changed":
         this._inFlight = msg.content.inFlight;

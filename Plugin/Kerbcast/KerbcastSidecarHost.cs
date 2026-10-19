@@ -191,12 +191,13 @@ namespace Kerbcast
 
         /* Report whether KSP is in a flight scene so the sidecar can tell
            browsers to show the out-of-flight standby instead of a wall of
-           SIGNAL LOST. Warn once, not per second, if the write fails. */
+           SIGNAL LOST. The Space Center counts while its command camera runs.
+           Warn once, not per second, if the write fails. */
         private void WriteInFlight()
         {
             try
             {
-                InFlightSignal.Write(_inFlightPath, HighLogic.LoadedSceneIsFlight);
+                InFlightSignal.Write(_inFlightPath, HighLogic.LoadedSceneIsFlight || KerbcastCore.SpaceCenterFeedsLive);
             }
             catch (Exception ex)
             {

@@ -1,4 +1,4 @@
-import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
+import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
 import { CameraKind, CameraLifecycle, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
 import type {
   DiscoveredCamera,
@@ -19,6 +19,10 @@ export interface MockCameraInit {
   crewLocation?: CrewLocation;
   /** Only meaningful for `kind: Kerbal`: informational raw persistentID. */
   kerbalPersistentId?: number;
+  /** Only meaningful for `kind: Command`: where the station stands. */
+  commandCentre?: CommandCentreInfo;
+  /** Only meaningful for `kind: Command`: aim and visibility for the brackets. */
+  commandTrack?: CommandTrackState;
   partName?: string;
   partTitle?: string;
   cameraName?: string;
@@ -66,6 +70,8 @@ function buildCamera(init: MockCameraInit): CameraState {
     kind: init.kind ?? CameraKind.Part,
     crewLocation: init.crewLocation,
     kerbalPersistentId: init.kerbalPersistentId,
+    commandCentre: init.commandCentre,
+    commandTrack: init.commandTrack,
     partName: init.partName ?? `part-${init.flightId}`,
     partTitle: init.partTitle ?? `Part ${init.flightId}`,
     cameraName: init.cameraName ?? `camera-${init.flightId}`,
@@ -368,6 +374,11 @@ export class MockSidecar {
     this._sendToClient({ type: "settings-state", content: payload });
   }
 
+  /** Push a `frame-stamp` to the client: the capture UT of one frame, keyed by RTP timestamp. */
+  fireFrameStamp(payload: FrameStampPayload): void {
+    this._sendToClient({ type: "frame-stamp", content: payload });
+  }
+
   /** Push a `scene-state-changed` event to the client (flight scene or not). */
   fireSceneState(inFlight: boolean): void {
     this._sendToClient({ type: "scene-state-changed", content: { inFlight } });
@@ -635,6 +646,19 @@ export class MockSidecar {
         const cam = this._cameras.get(msg.content.flightId);
         if (cam) {
           const updated: CameraState = { ...cam, trackMode: msg.content.mode };
+          this._cameras.set(msg.content.flightId, updated);
+          this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
+        }
+        break;
+      }
+      case "set-command-target": {
+        // The game applies the choice and reports it on its next status write.
+        const cam = this._cameras.get(msg.content.flightId);
+        if (cam?.commandCentre) {
+          const updated: CameraState = {
+            ...cam,
+            commandCentre: { ...cam.commandCentre, targetPersistentId: msg.content.persistentId },
+          };
           this._cameras.set(msg.content.flightId, updated);
           this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
         }

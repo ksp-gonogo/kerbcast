@@ -214,7 +214,7 @@ export function Tile({
           recordFullResolution={recordFullResolution}
           showStandbyIcon={false}
           onSelectCamera={onSelectCamera}
-          cameraFilter={mergeCrew ? undefined : (c) => c.kind === CameraKind.Part}
+          cameraFilter={mergeCrew ? undefined : (c) => c.kind !== CameraKind.Kerbal}
           onDisplayedCameraChange={setDisplayedFlightId}
           enableFullscreen
           enablePictureInPicture

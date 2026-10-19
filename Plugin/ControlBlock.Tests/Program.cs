@@ -56,6 +56,8 @@ if (block != null)
     // capture_fps is a later append on the same terms: the fixture predates it,
     // so the bit is clear and null means "capture at the primary rate".
     Check(s.CaptureFps == null, "captureFps == null (fixture predates the append)");
+    Check(s.CommandTarget == null, "commandTarget == null (fixture predates the append)");
+    Check(s.CommandTargetSeq == 0u, "commandTargetSeq == 0 (fixed field, no choice yet)");
     Check(s.Seq == 2L, "seqlock seq == 2 (exactly one published write)");
 
     // Change detection: re-reading the same (unchanged) block yields nothing.

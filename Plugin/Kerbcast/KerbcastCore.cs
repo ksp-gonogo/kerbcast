@@ -1,4 +1,5 @@
-// KSPAddon entry point. Hooks into the Flight scene, scans the active
+// KSPAddon entry point. Hooks into the Flight scene (and the Space Center,
+// for the command camera alone), scans the active
 // vessel for Hullcam VDS parts, and pumps an AsyncGPUReadback per camera
 // each LateUpdate. Each KerbcastCamera owns its own MmapFrameRing keyed
 // by KSP's stable Part.flightID; the Rust sidecar discovers rings by
@@ -46,7 +47,9 @@ using Debug = UnityEngine.Debug;
 
 namespace Kerbcast
 {
-    [KSPAddon(KSPAddon.Startup.Flight, once: false)]
+    /* Flight runs everything. The Space Center runs only the command camera,
+       and only when EnableCommandCamera is on; otherwise it starts nothing. */
+    [KSPAddon(KSPAddon.Startup.FlightAndKSC, once: false)]
     public sealed class KerbcastCore : MonoBehaviour
     {
         private const int RingSlots = 4;
@@ -57,8 +60,17 @@ namespace Kerbcast
            kOS add-on) resolves cameras through this. */
         public static KerbcastCore Instance { get; private set; }
 
+        /* Live at the Space Center: feeds are up outside flight, which the
+           sidecar host reports as in-flight so clients do not show standby. */
+        internal static bool SpaceCenterFeedsLive => Instance != null && Instance._atSpaceCenter;
+        private bool _atSpaceCenter;
+
         // Read-only view of the tracked cameras for the KerbcastControl facade.
         internal System.Collections.Generic.IReadOnlyList<ICamera> Cameras => _cameras;
+
+        /* gonogo's authority over the command feeds; one per scene, so a scene
+           change ends any registration. */
+        internal CommandAuthority CommandAuthority { get; } = new CommandAuthority();
 
         /* ~0.5s at 60fps: long enough that a transient scene-change hiccup
            doesn't evict a healthy camera, short enough to stop a genuinely
@@ -99,6 +111,8 @@ namespace Kerbcast
            Bumped on a UT discontinuity (scene load / quickload) so a consumer
            flushes and resyncs. See CaptureEpoch. */
         private readonly CaptureEpoch _captureEpoch = new CaptureEpoch();
+        // Read by CaptureCore so every ring frame carries the epoch its UT belongs to.
+        internal uint CaptureEpochValue => _captureEpoch.Value;
         // Tombstone-or-normal decision for cameras whose part goes away. See CameraTeardown.
         private readonly CameraTeardown _teardown = new CameraTeardown();
         // Adaptive-shed decision state machine. The fps thresholds + hysteresis
@@ -206,6 +220,18 @@ namespace Kerbcast
 
         private void Awake()
         {
+            _atSpaceCenter = HighLogic.LoadedScene == GameScenes.SPACECENTER;
+            if (_atSpaceCenter)
+            {
+                _settings = KerbcastSettings.Load();
+                if (!_settings.EnableCommandCamera)
+                {
+                    _disabled = true;
+                    enabled = false;
+                    return;
+                }
+            }
+
             /* Before anything else spins up: without a working GPU readback
                every feed would stream an empty buffer, so start nothing. */
             if (!ReadbackGate.EnsureReady())
@@ -216,15 +242,26 @@ namespace Kerbcast
             }
 
             Instance = this;
-            Debug.Log("[Kerbcast] KerbcastCore.Awake — initialising");
+            Debug.Log($"[Kerbcast] KerbcastCore.Awake: initialising (scene={HighLogic.LoadedScene})");
 
-            _settings = KerbcastSettings.Load();
-            _crewProvider = new CrewProvider(RingDir, RingSlots, _settings.Width, _settings.Height);
-            _providers = new List<ICameraSourceProvider>
+            if (_settings == null) _settings = KerbcastSettings.Load();
+            _providers = new List<ICameraSourceProvider>();
+            if (_atSpaceCenter)
             {
-                new HullcamProvider(_settings, RingDir, RingSlots),
-                _crewProvider,
-            };
+                _providers.Add(new CommandCameraProvider(_settings, RingDir, RingSlots, spaceCenter: true, CommandAuthority));
+                Debug.Log("[Kerbcast][CMDCAM] scene start: Space Center, command camera only");
+            }
+            else
+            {
+                _crewProvider = new CrewProvider(RingDir, RingSlots, _settings.Width, _settings.Height);
+                _providers.Add(new HullcamProvider(_settings, RingDir, RingSlots));
+                _providers.Add(_crewProvider);
+                if (_settings.EnableCommandCamera)
+                {
+                    _providers.Add(new CommandCameraProvider(_settings, RingDir, RingSlots, spaceCenter: false, CommandAuthority));
+                    Debug.Log("[Kerbcast][CMDCAM] scene start: flight, command camera follows the active craft");
+                }
+            }
             _staggerController = BuildStaggerController(_settings);
             /* Only built when the operator permits background capture at all:
                with the ceiling at 0 nothing can ever background capture, so there is nothing to
@@ -303,8 +340,9 @@ namespace Kerbcast
                build's throttle left the DontDestroyOnLoad scaled and galaxy
                cameras off. Re-enable them before the first SetCameras, as the
                earlier restore-at-rebuild did, so no clone is built from a
-               camera KSP or a mod has switched off. */
-            if (AreAnySourceCamerasDisabled())
+               camera KSP or a mod has switched off. Skipped at the Space Center,
+               whose scene decides for itself which of these cameras run. */
+            if (!_atSpaceCenter && AreAnySourceCamerasDisabled())
             {
                 Debug.Log("[Kerbcast] source cameras already disabled at Awake: re-enabling before SetCameras");
                 EnableSourceCameras();
@@ -431,6 +469,7 @@ namespace Kerbcast
         {
             _captureEpoch.Bump();
             _teardown.OnSceneLoadRequested();
+            CommandAuthority.Reset();
             /* Restore now, before the scene tears down. Camera ScaledSpace and
                GalaxyCamera survive into the next scene, so a throttle left on
                them would keep the next scene's main view in an 8x8 corner. */
@@ -479,14 +518,17 @@ namespace Kerbcast
                 for (int i = _cameras.Count - 1; i >= 0; i--)
                 {
                     var cam = _cameras[i];
-                    bool keep = cam is KerbalFaceCamera && cam.IsAlive;
+                    /* A command camera follows whichever craft is
+                       active, so a pilot switch keeps it like a live kerbal. */
+                    bool keep = (cam is KerbalFaceCamera || IsCommandCamera(cam)) && cam.IsAlive;
                     if (keep) continue;
                     cam.Dispose();
                     _cameras.RemoveAt(i);
                 }
             }
 
-            if (vessel == null) return;
+            /* The Space Center has no active vessel; its command camera needs none. */
+            if (vessel == null && !_atSpaceCenter) return;
 
             /* While the main-screen throttle is active, the KSP source cameras
                carry its cull mask of 0 and 8x8 pixel viewport, and
@@ -536,6 +578,46 @@ namespace Kerbcast
             }
         }
 
+        private static bool IsCommandCamera(ICamera cam) => cam is KerbcastCamera kc && kc.Rig != null;
+
+        /* Every frame, paused or not, so a command feed's state transitions and
+           the authority timeout are caught close to when they happen even while
+           nobody is watching it (a rendered feed solves on every frame anyway). */
+        private void PollCommandRigs()
+        {
+            for (int i = 0; i < _cameras.Count; i++)
+            {
+                if (!(_cameras[i] is KerbcastCamera kc) || !(kc.Rig is CommandCameraRig gr)) continue;
+                try { gr.Poll(); }
+                catch (Exception ex)
+                {
+                    if (Time.unscaledTime < _commandPollWarnAt) continue;
+                    _commandPollWarnAt = Time.unscaledTime + 10f;
+                    Debug.LogWarning($"[Kerbcast][CMDCAM] cam={kc.FlightId} poll threw: {ex}");
+                }
+            }
+        }
+
+        private float _commandPollWarnAt = float.MinValue;
+
+        /* On the first scene of a process the launch site's coordinates arrive
+           after startup, so the command camera waits for them (additively, like
+           a docking rebuild) instead of standing at (0,0). */
+        private void RetryPendingCommandCamera()
+        {
+            if (_providers == null) return;
+            var vessel = FlightGlobals.ActiveVessel;
+            if (vessel == null && !_atSpaceCenter) return;
+            for (int i = 0; i < _providers.Count; i++)
+            {
+                if (_providers[i] is CommandCameraProvider gp && gp.RetryDue)
+                {
+                    RebuildCameraList(vessel, disposeMissing: false);
+                    return;
+                }
+            }
+        }
+
         // LateUpdate drives explicit camera.Render() calls via each
         // KerbcastCamera.Refresh(). Our offscreen cameras are permanently
         // disabled (enabled=false) so they never fire during Unity's normal
@@ -559,6 +641,8 @@ namespace Kerbcast
             }
 
             UpdateFpsAverage();
+            RetryPendingCommandCamera();
+            PollCommandRigs();
 
             // Telemetry: sample the GC collection counters once per frame and
             // fold this frame's wall-clock duration into the interval stats, so
@@ -827,6 +911,8 @@ namespace Kerbcast
         // sometimes weird across mod combinations).
         private bool ReadThrottleDesired()
         {
+            /* The throttle blanks the flight view; the Space Center view stays. */
+            if (_atSpaceCenter) return false;
             try
             {
                 var game = HighLogic.CurrentGame;
@@ -1097,6 +1183,8 @@ namespace Kerbcast
                 sb.Append($"  \"captureUt\": {Planetarium.GetUniversalTime().ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 sb.Append($"  \"captureEpoch\": {_captureEpoch.Value},\n");
                 sb.Append($"  \"timeWarpRate\": {TimeWarp.CurrentRate.ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\n");
+                /* Wall clock at the UT sample, so the sidecar on this machine can age captureUt to the moment it sends. */
+                sb.Append($"  \"captureWallMs\": {(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 // Stagger telemetry — watch the budget regulator converge + tune
                 // MaxKerbcastFrameBudgetMs / MinKspFps. staggerBudget: cameras
                 // permitted to capture this tick. kerbcastFrameMs: EMA of kerbcast's
@@ -1131,6 +1219,7 @@ namespace Kerbcast
                     // seq advances (linked track_mode: kOS proposes, sidecar
                     // converges), never re-adopting a control-block-applied change.
                     sb.Append($"      \"trackMode\": {kc.GetTrackMode()},\n");
+                    if (kc.Rig is CommandCameraRig gr) AppendCommandFields(sb, gr);
                     sb.Append($"      \"trackReportSeq\": {kc.TrackReportSeq}\n");
                     sb.Append(i == streaming.Count - 1 ? "    }\n" : "    },\n");
                 }
@@ -1169,6 +1258,116 @@ namespace Kerbcast
             {
                 Debug.LogWarning($"[Kerbcast] status file write failed: {ex.Message}");
             }
+        }
+
+        /* Command camera geometry. Polled here so it stays current while nobody
+           is watching the feed. */
+        private static void AppendCommandFields(System.Text.StringBuilder sb, CommandCameraRig gr)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            gr.Poll();
+            sb.Append($"      \"occluded\": {(gr.Occluded ? "true" : "false")},\n");
+            sb.Append($"      \"blocker\": \"{JsonEsc(gr.Blocker)}\",\n");
+            sb.Append($"      \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
+            sb.Append($"      \"elevationDeg\": {(gr.HasFix ? gr.ElevationDeg.ToString("F3", ci) : "null")},\n");
+            sb.Append($"      \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
+            sb.Append($"      \"targetPersistentId\": {gr.TargetPersistentId},\n");
+            sb.Append($"      \"targetName\": \"{JsonEsc(gr.TargetName)}\",\n");
+            AppendCommandCentre(sb, gr);
+            AppendCommandTrack(sb, gr);
+        }
+
+        /* Target, range, Tracking Station level and the craft the camera could
+           watch. Ranges go out to 3 significant figures so the sidecar only
+           re-broadcasts when one moves visibly. */
+        private static void AppendCommandCentre(System.Text.StringBuilder sb, CommandCameraRig gr)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            double ut = Planetarium.GetUniversalTime();
+            List<CommandTargetView> targets;
+            try { targets = CommandCameraTargets.List(gr.Site, ut); }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] target list failed: {ex.Message}");
+                targets = new List<CommandTargetView>();
+            }
+            uint pid = gr.TargetPersistentId;
+            double range = double.NaN;
+            foreach (var t in targets)
+                if (t.PersistentId == pid) { range = t.RangeM; break; }
+            if (double.IsNaN(range) && pid != 0) range = CommandCameraTargets.RangeTo(gr.Site, pid, ut);
+            string Range(double m) => double.IsNaN(m) || double.IsInfinity(m)
+                ? "null"
+                : CommandCameraTargets.RoundRange(m).ToString("R", ci);
+
+            sb.Append("      \"commandCentre\": {\n");
+            sb.Append($"        \"targetPersistentId\": {pid},\n");
+            sb.Append($"        \"rangeM\": {Range(range)},\n");
+            sb.Append($"        \"trackingLevel\": {CommandCameraTargets.TrackingLevel()},\n");
+            sb.Append("        \"targets\": [");
+            for (int i = 0; i < targets.Count; i++)
+            {
+                var t = targets[i];
+                sb.Append(i == 0 ? "\n" : ",\n");
+                sb.Append($"          {{ \"persistentId\": {t.PersistentId}, \"vesselName\": \"{JsonEsc(t.VesselName)}\", "
+                    + $"\"vesselType\": \"{JsonEsc(t.VesselType)}\", \"rangeM\": {Range(t.RangeM)}, "
+                    + $"\"eligibility\": \"{JsonEsc(t.Eligibility)}\", \"eligibilityText\": \"{JsonEsc(t.EligibilityText)}\" }}");
+            }
+            sb.Append(targets.Count > 0 ? "\n        ]\n" : "]\n");
+            sb.Append("      },\n");
+        }
+
+        /* The bracket contract: camera-axis state at the aimed point, the
+           registered authority, any blank, and the recent discrete transitions
+           with the exact UT of each. */
+        private static void AppendCommandTrack(System.Text.StringBuilder sb, CommandCameraRig gr)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            sb.Append("      \"commandTrack\": {\n");
+            sb.Append($"        \"ut\": {gr.TrackUt.ToString("R", ci)},\n");
+            sb.Append($"        \"hasFix\": {(gr.HasFix ? "true" : "false")},\n");
+            sb.Append($"        \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
+            sb.Append($"        \"occluded\": {(gr.Occluded ? "true" : "false")},\n");
+            sb.Append($"        \"occluder\": \"{JsonEsc(gr.Blocker)}\",\n");
+            sb.Append($"        \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
+            sb.Append($"        \"bracketHalfPx\": {(gr.HasFix ? gr.BracketHalfPx.ToString("0.###", ci) : "null")},\n");
+            sb.Append($"        \"frameHeightPx\": {gr.FrameHeightPx},\n");
+            sb.Append($"        \"framingFits\": {(gr.FramingFits ? "true" : "false")},\n");
+            var offset = gr.TrueOffsetPx;
+            sb.Append($"        \"trueOffsetPx\": {(offset.HasValue ? offset.Value.ToString("0.###", ci) : "null")},\n");
+            sb.Append(gr.AuthorityOwner == null
+                ? "        \"authority\": null,\n"
+                : $"        \"authority\": {{ \"owner\": \"{JsonEsc(gr.AuthorityOwner)}\" }},\n");
+            sb.Append($"        \"blank\": {JsonStringOrNull(gr.Blank)},\n");
+            sb.Append("        \"events\": [");
+            var events = gr.TrackEvents();
+            for (int i = 0; i < events.Count; i++)
+            {
+                var e = events[i];
+                sb.Append(i == 0 ? "\n" : ",\n");
+                sb.Append($"          {{ \"ut\": {e.Ut.ToString("R", ci)}, \"occluded\": {(e.Occluded ? "true" : "false")}, "
+                    + $"\"occluder\": \"{JsonEsc(e.Occluder)}\", \"sunlit\": {(e.Sunlit ? "true" : "false")}, "
+                    + $"\"blank\": {JsonStringOrNull(e.Blank)}"
+                    + (e.Predicted ? ", \"predicted\": true }" : " }"));
+            }
+            sb.Append(events.Count > 0 ? "\n        ]\n" : "]\n");
+            sb.Append("      },\n");
+        }
+
+        private static string JsonStringOrNull(string s) => s == null ? "null" : $"\"{JsonEsc(s)}\"";
+
+        private static string JsonEsc(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var sb = new System.Text.StringBuilder(s.Length + 8);
+            foreach (var c in s)
+            {
+                if (c == '"') sb.Append("\\\"");
+                else if (c == '\\') sb.Append("\\\\");
+                else if (c < 0x20) sb.Append($"\\u{(int)c:X4}");
+                else sb.Append(c);
+            }
+            return sb.ToString();
         }
 
         /*

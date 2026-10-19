@@ -2,11 +2,13 @@
 //! sidecar uses: build a peer, add one H.264 video track, exchange SDP,
 //! push encoded NAL samples.
 //!
-//! The transport is RFC 6184 H.264-over-RTP. webrtc-rs handles the
-//! packetisation internally when we use `TrackLocalStaticSample` with
-//! `MIME_TYPE_H264`; we just hand it a buffer of Annex-B NAL units plus a
-//! presentation duration and the crate fragments / aggregates as needed.
+//! The transport is RFC 6184 H.264-over-RTP. `VideoTrack` packetises each
+//! buffer of Annex-B NAL units with webrtc-rs's own H.264 payloader, keeping
+//! hold of the RTP timestamp so every frame's capture UT can be published
+//! under it.
 
+pub mod outbox;
 pub mod peer;
+pub mod video_track;
 
 pub use peer::{resync_after_camera_churn, KerbcastPeer};

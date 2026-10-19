@@ -46,8 +46,10 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
+
+use super::outbox::{ControlChannel, Outbox};
+use super::video_track::VideoTrack;
 
 use crate::cameras::CameraState as InternalCameraState;
 
@@ -56,10 +58,10 @@ use crate::encoder::selected_backend_name;
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorCode, ErrorPayload,
     ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
-    SceneStateChangedPayload, ServerMessage, SetBackgroundCaptureFpsPayload, SetDegradePayload,
-    SetForceFullResolutionPayload, SetFovPayload, SetLayersPayload, SetPanPayload,
-    SetPanRatePayload, SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload,
-    SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
+    SceneStateChangedPayload, ServerMessage, SetBackgroundCaptureFpsPayload,
+    SetCommandTargetPayload, SetDegradePayload, SetForceFullResolutionPayload, SetFovPayload,
+    SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload, SetRenderSizePayload,
+    SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -69,7 +71,7 @@ const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
 /// feeds it (`None` = idle/silent) and `mid` is the transceiver mid the
 /// browser keys its `SlotMap` routing on (filled once the answer is set).
 struct Slot {
-    track: Arc<TrackLocalStaticSample>,
+    track: Arc<VideoTrack>,
     mid: Option<String>,
     bound: Option<u32>,
 }
@@ -203,11 +205,9 @@ pub struct KerbcastPeer {
     /// Initial cameras that could not be bound, sent to the browser as typed
     /// errors right after Hello.
     pub refused: Arc<Vec<ErrorPayload>>,
-    /// Set once the browser opens the control channel. Held for the
-    /// peer's lifetime so server-initiated pushes (AdaptiveShed,
-    /// vessel-change-driven camera-state-changed) can address this
-    /// peer directly without re-discovering the channel each time.
-    control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    /// Every control-channel send for this peer goes through here, so none
+    /// of them ever waits on the data channel.
+    outbox: Outbox,
     connected: Arc<Notify>,
     /// Connection liveness, fed by the RTCPeerConnection state callback. The
     /// daemon polls `is_alive()` each consume tick and reaps what it reports
@@ -268,10 +268,12 @@ impl KerbcastPeer {
         // senders are held here and the per-slot drain tasks are spawned once
         // the slot pool is shared (below), so each drain can resolve the camera
         // bound to its slot when it honors a PLI.
+        let control_channel: ControlChannel = Arc::new(Mutex::new(None));
+        let outbox = Outbox::spawn(control_channel.clone());
         let mut slots: Vec<Slot> = Vec::with_capacity(slot_count);
         let mut senders: Vec<Arc<RTCRtpSender>> = Vec::with_capacity(slot_count);
         for i in 0..slot_count {
-            let track = Arc::new(TrackLocalStaticSample::new(
+            let track = Arc::new(VideoTrack::new(
                 /* Declare the fmtp explicitly. With only a mime type here, codec
                 matching falls back to a mime-only fuzzy search across every
                 H.264 payload type the browser offered — including
@@ -291,9 +293,10 @@ impl KerbcastPeer {
                 },
                 format!("video-slot{i}"),
                 format!("kerbcast-slot{i}"),
+                Some(outbox.clone()),
             ));
             let rtp_sender = pc
-                .add_track(track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+                .add_track(track.rtp_track() as Arc<dyn TrackLocal + Send + Sync>)
                 .await?;
             senders.push(rtp_sender);
             slots.push(Slot {
@@ -368,18 +371,18 @@ impl KerbcastPeer {
             });
         }
 
-        let control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(Mutex::new(None));
-
         let registry_for_dc = registry.clone();
         let control_channel_for_handler = control_channel.clone();
         let slots_for_handler = slots.clone();
         let refusals = Arc::new(refusals);
         let refused = refusals.clone();
+        let outbox_for_handler = outbox.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let registry = registry_for_dc.clone();
             let control_channel = control_channel_for_handler.clone();
             let slots = slots_for_handler.clone();
             let refusals = refusals.clone();
+            let outbox = outbox_for_handler.clone();
             Box::pin(async move {
                 if dc.label() != CONTROL_CHANNEL_LABEL {
                     info!(label = %dc.label(), "ignoring unexpected data channel");
@@ -388,14 +391,14 @@ impl KerbcastPeer {
                 info!(label = %dc.label(), "control channel opened");
                 *control_channel.lock().await = Some(dc.clone());
 
-                let dc_for_msg = dc.clone();
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let registry = registry.clone();
                     let slots = slots.clone();
                     let refusals = refusals.clone();
-                    let dc = dc_for_msg.clone();
+                    let outbox = outbox.clone();
                     Box::pin(async move {
-                        handle_client_message(registry, peer_id, slots, refusals, dc, msg).await;
+                        handle_client_message(registry, peer_id, slots, refusals, outbox, msg)
+                            .await;
                     })
                 }));
             })
@@ -420,7 +423,7 @@ impl KerbcastPeer {
             slots,
             subscribed,
             refused,
-            control_channel,
+            outbox,
             connected,
             liveness,
         })
@@ -516,7 +519,7 @@ impl KerbcastPeer {
     /// connected at all. A transient `Disconnected` stays alive, so a network
     /// blip no longer tears the viewer's feed down.
     pub fn is_alive(&self) -> bool {
-        self.liveness.is_alive(Instant::now())
+        !self.outbox.is_dead() && self.liveness.is_alive(Instant::now())
     }
 
     /// Mark the peer terminal without waiting for a deadline. Used by the
@@ -557,7 +560,7 @@ impl KerbcastPeer {
     /// disappears and reappears across a KSP scene change: the slot stays
     /// bound through the gap, but the re-attached ring gets a brand-new
     /// `CameraState` that doesn't know about this track yet.
-    pub async fn tracks_bound_to(&self, flight_id: u32) -> Vec<Arc<TrackLocalStaticSample>> {
+    pub async fn tracks_bound_to(&self, flight_id: u32) -> Vec<Arc<VideoTrack>> {
         self.slots
             .lock()
             .await
@@ -572,23 +575,17 @@ impl KerbcastPeer {
     /// snapshot, used when registry membership churns mid-connection so a
     /// browser's camera list drains and repopulates across scene changes.
     pub async fn push_camera_snapshot(&self, registry: &Arc<CameraRegistry>) {
-        let dc = match self.control_channel.lock().await.as_ref() {
-            Some(d) => d.clone(),
-            None => return,
-        };
-        send_camera_snapshot(registry, &dc).await;
+        send_camera_snapshot(registry, &self.outbox).await;
     }
 
-    /// Server-initiated push to the browser. No-op if the control
-    /// channel hasn't been opened yet (we drop the message rather than
-    /// queue — pushes from the consume loop are state snapshots, so a
-    /// later snapshot supersedes a dropped one).
-    pub async fn push_message(&self, msg: &ServerMessage) {
-        let dc = match self.control_channel.lock().await.as_ref() {
-            Some(d) => d.clone(),
-            None => return,
-        };
-        send_server_message(&dc, msg).await;
+    /**
+     * Server-initiated push to the browser. Never waits on the data channel.
+     * Dropped until the browser opens the control channel (its Hello is
+     * answered with a full snapshot); after that, a message this peer cannot
+     * take marks it dead for the reaper instead of being lost.
+     */
+    pub fn push_message(&self, msg: &ServerMessage) {
+        self.outbox.send(msg);
     }
 
     /// Block until the peer reaches the Connected state. Used by tests.
@@ -604,6 +601,7 @@ impl KerbcastPeer {
     /// called when reaping a dropped peer, or cameras keep rendering for a
     /// viewer that's already gone.
     pub async fn close(&self) -> Result<()> {
+        self.outbox.shutdown();
         self.pc.close().await?;
         Ok(())
     }
@@ -616,7 +614,7 @@ async fn handle_client_message(
     peer_id: u32,
     slots: Arc<Mutex<Vec<Slot>>>,
     refusals: Arc<Vec<ErrorPayload>>,
-    dc: Arc<RTCDataChannel>,
+    dc: Outbox,
     msg: DataChannelMessage,
 ) {
     let text = match std::str::from_utf8(&msg.data) {
@@ -637,8 +635,7 @@ async fn handle_client_message(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -652,24 +649,21 @@ async fn handle_client_message(
                     sidecar_version: crate::VERSION.to_owned(),
                     encoder_backend: selected_backend_name().to_owned(),
                 }),
-            )
-            .await;
+            );
             send_camera_snapshot(&registry, &dc).await;
             /* Prime the client with current global settings (throttle + the
              * mission-time capture clock, if the plugin has reported one). */
             send_server_message(
                 &dc,
                 &ServerMessage::SettingsState(registry.last_settings().await),
-            )
-            .await;
+            );
             /* Prime scene state so a peer connecting out of flight shows the
              * standby immediately, not a stale live layout. */
             if let Some(in_flight) = registry.read_in_flight().await {
                 send_server_message(
                     &dc,
                     &ServerMessage::SceneStateChanged(SceneStateChangedPayload { in_flight }),
-                )
-                .await;
+                );
             }
             // Announce the initial slot bindings so the client maps its
             // initial cameras to slots by mid — uniform with dynamic
@@ -677,7 +671,7 @@ async fn handle_client_message(
             send_initial_slot_maps(&slots, &dc).await;
             // Initial cameras that could not be bound (see `KerbcastPeer::new`).
             for payload in refusals.iter() {
-                send_server_message(&dc, &ServerMessage::Error(payload.clone())).await;
+                send_server_message(&dc, &ServerMessage::Error(payload.clone()));
             }
         }
         ClientMessage::SetLayers(SetLayersPayload { flight_id, layers }) => {
@@ -741,8 +735,29 @@ async fn handle_client_message(
                         source: ErrorSource::Sidecar,
                         ..Default::default()
                     }),
-                )
-                .await;
+                );
+            }
+        }
+        ClientMessage::SetCommandTarget(SetCommandTargetPayload {
+            flight_id,
+            persistent_id,
+        }) => {
+            /* The plugin applies the choice on its next control read; its
+            status write then reports the new target to every consumer. */
+            if let Err(message) = registry
+                .apply_command_target(flight_id, persistent_id)
+                .await
+            {
+                send_server_message(
+                    &dc,
+                    &ServerMessage::Error(ErrorPayload {
+                        message,
+                        source: ErrorSource::Sidecar,
+                        ..Default::default()
+                    }),
+                );
+            } else {
+                info!(flight_id, persistent_id, "command target set");
             }
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {
@@ -837,7 +852,7 @@ async fn request_keyframe_for(cam: &Arc<InternalCameraState>) {
 async fn handle_subscribe(
     registry: &Arc<CameraRegistry>,
     slots: &Arc<Mutex<Vec<Slot>>>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
 ) {
     let cam = match registry.get(flight_id).await {
@@ -855,8 +870,7 @@ async fn handle_subscribe(
                     code,
                     format!("no live camera with flight_id={flight_id}"),
                 )),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -880,8 +894,7 @@ async fn handle_subscribe(
                     ErrorCode::NoFreeSlot,
                     NO_FREE_SLOT_MESSAGE.into(),
                 )),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -905,8 +918,7 @@ async fn handle_subscribe(
                     mid,
                     flight_id: Some(flight_id),
                 }),
-            )
-            .await;
+            );
         }
         None => warn!(
             flight_id,
@@ -921,7 +933,7 @@ async fn handle_unsubscribe(
     registry: &Arc<CameraRegistry>,
     peer_id: u32,
     slots: &Arc<Mutex<Vec<Slot>>>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
 ) {
     // Clear-on-departure FIRST, before the slot early-out: an explicit
@@ -966,8 +978,7 @@ async fn handle_unsubscribe(
                 mid,
                 flight_id: None,
             }),
-        )
-        .await;
+        );
     }
 }
 
@@ -986,7 +997,7 @@ async fn release_all_bound(registry: &Arc<CameraRegistry>, slots: &Arc<Mutex<Vec
     // report can exist for a camera this peer never bound. Callers on the
     // peer-death paths (graceful Disconnect, the reaper) invoke
     // forget_display_size_all separately.
-    let bound: Vec<(u32, Arc<TrackLocalStaticSample>)> = {
+    let bound: Vec<(u32, Arc<VideoTrack>)> = {
         let mut guard = slots.lock().await;
         let mut v = Vec::new();
         for slot in guard.iter_mut() {
@@ -1058,7 +1069,7 @@ pub async fn resync_after_camera_churn(
 /// the client maps its initial cameras to slots by mid (the same mechanism
 /// dynamic Subscribe uses). Idle slots and slots without a negotiated mid are
 /// skipped.
-async fn send_initial_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Arc<RTCDataChannel>) {
+async fn send_initial_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Outbox) {
     let bindings: Vec<(String, u32)> = {
         let guard = slots.lock().await;
         guard
@@ -1076,14 +1087,13 @@ async fn send_initial_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Arc<RTCDataC
                 mid,
                 flight_id: Some(flight_id),
             }),
-        )
-        .await;
+        );
     }
 }
 
 async fn apply_layer_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
     layers: Vec<Layer>,
 ) {
@@ -1097,8 +1107,7 @@ async fn apply_layer_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1118,8 +1127,7 @@ async fn apply_layer_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
 
@@ -1129,7 +1137,7 @@ async fn apply_layer_change(
 
 async fn apply_render_size_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
     width: u32,
     height: u32,
@@ -1144,8 +1152,7 @@ async fn apply_render_size_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1170,8 +1177,7 @@ async fn apply_render_size_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
 
@@ -1184,12 +1190,7 @@ async fn apply_render_size_change(
     push_camera_state(registry, dc, flight_id).await;
 }
 
-async fn apply_fov_change(
-    registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
-    flight_id: u32,
-    fov: f32,
-) {
+async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id: u32, fov: f32) {
     let cam = match registry.get(flight_id).await {
         Some(c) => c,
         None => {
@@ -1200,8 +1201,7 @@ async fn apply_fov_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1213,8 +1213,7 @@ async fn apply_fov_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
     // Clamp to the part's declared FoV range so the plugin doesn't get
@@ -1241,8 +1240,7 @@ async fn apply_fov_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
 
@@ -1252,7 +1250,7 @@ async fn apply_fov_change(
 
 async fn apply_pan_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
     yaw: f32,
     pitch: f32,
@@ -1267,8 +1265,7 @@ async fn apply_pan_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1283,8 +1280,7 @@ async fn apply_pan_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
     let yaw_clamped = yaw.clamp(cam.pan_yaw_min, cam.pan_yaw_max);
@@ -1309,8 +1305,7 @@ async fn apply_pan_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
 
@@ -1329,7 +1324,7 @@ async fn apply_pan_change(
 /// `pan_yaw_rate`/`pan_pitch_rate` carry the last command.
 async fn apply_pan_rate_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
     yaw_rate: f32,
     pitch_rate: f32,
@@ -1344,8 +1339,7 @@ async fn apply_pan_rate_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1360,8 +1354,7 @@ async fn apply_pan_rate_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
     let yaw_clamped = yaw_rate.clamp(-1.0, 1.0);
@@ -1383,8 +1376,7 @@ async fn apply_pan_rate_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
 
@@ -1402,7 +1394,7 @@ async fn apply_pan_rate_change(
 /// per frame, rather than an absolute FoV. Holds until superseded.
 async fn apply_zoom_rate_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
     rate: f32,
 ) {
@@ -1416,8 +1408,7 @@ async fn apply_zoom_rate_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1429,8 +1420,7 @@ async fn apply_zoom_rate_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
     let clamped = rate.clamp(-1.0, 1.0);
@@ -1450,8 +1440,7 @@ async fn apply_zoom_rate_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
 
@@ -1472,7 +1461,7 @@ async fn apply_zoom_rate_change(
 /// wins, all UIs converge).
 async fn apply_quality_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     flight_id: u32,
     preset: Option<QualityPreset>,
 ) {
@@ -1484,8 +1473,7 @@ async fn apply_quality_change(
                 source: ErrorSource::Sidecar,
                 ..Default::default()
             }),
-        )
-        .await;
+        );
         return;
     }
     info!(flight_id, ?preset, "data-channel set-quality applied");
@@ -1494,7 +1482,7 @@ async fn apply_quality_change(
 
 async fn apply_degrade_change(
     registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
+    dc: &Outbox,
     peer_id: u32,
     flight_id: u32,
     level: f32,
@@ -1509,8 +1497,7 @@ async fn apply_degrade_change(
                     source: ErrorSource::Sidecar,
                     ..Default::default()
                 }),
-            )
-            .await;
+            );
             return;
         }
     };
@@ -1525,7 +1512,7 @@ async fn apply_degrade_change(
     push_camera_state(registry, dc, flight_id).await;
 }
 
-async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataChannel>) {
+async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Outbox) {
     // Per-camera state via the registry's shared snapshot builder: the
     // last plugin-reported effective state when one exists, optimistic
     // operator-equals-effective defaults before the first status write.
@@ -1540,23 +1527,17 @@ async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Arc<RTCDataCh
     send_server_message(
         dc,
         &ServerMessage::CameraSnapshot(CameraSnapshotPayload { cameras }),
-    )
-    .await;
+    );
 }
 
-async fn push_camera_state(
-    registry: &Arc<CameraRegistry>,
-    dc: &Arc<RTCDataChannel>,
-    flight_id: u32,
-) {
+async fn push_camera_state(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id: u32) {
     let Some(state) = registry.protocol_state(flight_id).await else {
         return;
     };
     send_server_message(
         dc,
         &ServerMessage::CameraStateChanged(CameraStateChangedPayload { state }),
-    )
-    .await;
+    );
 }
 
 const NO_FREE_SLOT_MESSAGE: &str = "no free slot - negotiate more video transceivers";
@@ -1571,17 +1552,8 @@ fn refusal(flight_id: u32, code: ErrorCode, message: String) -> ErrorPayload {
     }
 }
 
-async fn send_server_message(dc: &Arc<RTCDataChannel>, msg: &ServerMessage) {
-    let body = match serde_json::to_string(msg) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "control channel: serialise failed");
-            return;
-        }
-    };
-    if let Err(e) = dc.send_text(body).await {
-        warn!(error = %e, "control channel: send failed");
-    }
+fn send_server_message(dc: &Outbox, msg: &ServerMessage) {
+    dc.send(msg);
 }
 
 fn make_even(v: u32) -> u32 {
@@ -1728,6 +1700,7 @@ mod tests {
     #[tokio::test]
     async fn close_releases_track_arc() {
         let pc = build_pc().await;
+        use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_owned(),
@@ -1802,11 +1775,7 @@ mod tests {
         );
 
         let slots: Arc<Mutex<Vec<Slot>>> = Arc::new(Mutex::new(Vec::new()));
-        let pc = build_pc().await;
-        let dc = pc
-            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
-            .await
-            .expect("data channel");
+        let dc = Outbox::spawn(Arc::new(Mutex::new(None)));
 
         handle_unsubscribe(&registry, peer_id, &slots, &dc, 9001).await;
 

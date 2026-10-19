@@ -53,10 +53,10 @@ export function Grid({
 }: GridProps): React.JSX.Element {
   // Merge OFF: kerbal face cams live in the crew bar, so the grid's seeding /
   // add-all / missing-count / reconcile never pull one in. Merge ON: kerbal cams
-  // are regular grid cameras, indistinguishable from part cams. Part-camera grid
-  // behaviour is unchanged either way.
+  // are regular grid cameras, indistinguishable from part cams. Every other kind
+  // (part, command) is a grid camera either way.
   const all = useKerbcastCameras();
-  const cameras = mergeCrew ? all : all.filter((c) => c.kind === CameraKind.Part);
+  const cameras = mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal);
   const [showPerfNote, setShowPerfNote] = useState(false);
 
   const commit = (next: TileData[]) => {

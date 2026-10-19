@@ -22,11 +22,16 @@ export enum CameraLifecycle {
 
 /**
  * Distinguishes an existing Hullcam part camera (`Part`) from a
- * per-kerbal face camera (`Kerbal`).
+ * per-kerbal face camera (`Kerbal`) and a fixed command
+ * camera watching a craft from a CommNet station (`Command`).
+ * 
+ * Consumers must treat a value they do not recognise as "some other kind of
+ * camera" rather than failing: new kinds are added without a protocol bump.
  */
 export enum CameraKind {
 	Part = "part",
 	Kerbal = "kerbal",
+	Command = "command",
 }
 
 /**
@@ -67,6 +72,143 @@ export enum CaptureState {
 export enum CrewLocation {
 	Seat = "seat",
 	Eva = "eva",
+}
+
+/**
+ * Whether a command camera's tracking network could watch a craft. Only
+ * `NotTrackable` applies outside career (or with the tracking rules off).
+ */
+export enum CommandTargetEligibility {
+	Ok = "ok",
+	/** Beyond the Tracking Station's range at its current level. */
+	TooFar = "tooFar",
+	/** An unowned object, and the current level tracks none. */
+	LevelTooLow = "levelTooLow",
+	/** An unowned object the player has found but not tracked. */
+	NotTrackable = "notTrackable",
+}
+
+/** One craft a command camera could watch. */
+export interface CommandTarget {
+	persistentId: number;
+	vesselName: string;
+	/** KSP's `VesselType` name, e.g. `"Ship"`, `"Probe"`, `"Debris"`. */
+	vesselType: string;
+	/**
+	 * Station to craft in metres, to 3 significant figures. `None` without a
+	 * position for it.
+	 */
+	rangeM?: number;
+	eligibility: CommandTargetEligibility;
+	/** Short display text for `eligibility`. */
+	eligibilityText: string;
+}
+
+/**
+ * Where a command camera stands, what it watches and what it could watch.
+ * Present only when `CameraState.kind == Command`.
+ */
+export interface CommandCentreInfo {
+	/** gonogo's command-centre id for this station, `ground:<nodeName>`. */
+	stationId: string;
+	/** The CommNet home's `nodeName` (KSC's is `"KSC"`). */
+	nodeName: string;
+	/**
+	 * The station's name as the player reads it in game, or `node_name` when
+	 * it has none.
+	 */
+	displayName: string;
+	/** Body the station sits on. */
+	body: string;
+	latitude: number;
+	longitude: number;
+	/**
+	 * Lens altitude above sea level in metres: the station's own altitude
+	 * plus the plugin's configured offset.
+	 */
+	altitude: number;
+	/** `Vessel.persistentId` of the craft the camera watches; 0 for none. */
+	targetPersistentId: number;
+	/**
+	 * Station to that craft in metres, to 3 significant figures. `None`
+	 * without a position for it.
+	 */
+	rangeM?: number;
+	/**
+	 * The Tracking Station's level, 1-based (stock 1..=3). The highest level
+	 * outside career.
+	 */
+	trackingLevel: number;
+	/**
+	 * Every craft the camera could watch, eligible first, then nearest
+	 * first. Any of them can be chosen with `SetCommandTarget`; eligibility
+	 * only reports what the tracking network would allow.
+	 */
+	targets: CommandTarget[];
+}
+
+/** The registered command authority. */
+export interface CommandAuthorityState {
+	owner: string;
+}
+
+/**
+ * A full snapshot of a command track's discrete fields at the exact UT they
+ * changed, so a delayed client can show the state that held at its own
+ * displayed UT.
+ */
+export interface CommandTrackEvent {
+	ut: number;
+	occluded: boolean;
+	occluder: string;
+	sunlit: boolean;
+	blank?: string;
+	/**
+	 * True for a transition the plugin expects ahead of `ut` on the current
+	 * trajectory. Each write replaces the predictions; recorded events never
+	 * carry it.
+	 */
+	predicted?: boolean;
+}
+
+/**
+ * What a command camera is aimed at and how well it can see
+ * it. The aim point always sits at frame centre; clients draw the target
+ * brackets from this. Present only on command cameras.
+ */
+export interface CommandTrackState {
+	/** UT this state was evaluated at. */
+	ut: number;
+	hasFix: boolean;
+	/** Range to the aimed point in metres. `None` without a fix. */
+	rangeM?: number;
+	occluded: boolean;
+	/** Name of the occluding body when `occluded`, otherwise empty. */
+	occluder: string;
+	sunlit: boolean;
+	/**
+	 * Bracket half-extent in capture-frame pixels (craft extent plus the
+	 * authority's framing margin), relative to `frame_height_px`. `None` without a fix.
+	 */
+	bracketHalfPx?: number;
+	frameHeightPx: number;
+	/**
+	 * False when the craft plus the framing margin would not fit even at
+	 * the widest FoV.
+	 */
+	framingFits: boolean;
+	/**
+	 * The true craft's offset from frame centre in capture-frame pixels.
+	 * Non-zero only when an authority aims away from the craft. `None`
+	 * without a true fix.
+	 */
+	trueOffsetPx?: number;
+	/** The registered authority. `None` when standalone. */
+	authority?: CommandAuthorityState;
+	/** Why the feed is blanked; the game sends black frames while set. */
+	blank?: string;
+	/** Recent discrete transitions, oldest first. */
+	events: CommandTrackEvent[];
 }
 
 /**
@@ -160,6 +302,17 @@ export interface CameraState {
 	 * part cameras.
 	 */
 	crewLocation?: CrewLocation;
+	/**
+	 * Station identity for a command camera. `None` for
+	 * every other kind.
+	 */
+	commandCentre?: CommandCentreInfo;
+	/**
+	 * Aim and visibility of a command camera, from the
+	 * plugin's last status write. `None` for every other kind, and before
+	 * the plugin has reported one.
+	 */
+	commandTrack?: CommandTrackState;
 	/**
 	 * Server-authoritative auto-track state for a pan+zoom camera (the
 	 * operator's persistent intent). `None` (the default) = not tracking.
@@ -344,6 +497,29 @@ export interface FlightIdPayload {
 	flightId: number;
 }
 
+/**
+ * Mission-time stamp of one video frame, sent on the control channel just
+ * before the frame's RTP packets. A browser matches it to a presented frame
+ * by `rtp_timestamp` (`requestVideoFrameCallback` metadata `rtpTimestamp`),
+ * which gives the exact UT that frame was rendered at.
+ */
+export interface FrameStampPayload {
+	/** Camera the frame came from. */
+	flightId: number;
+	/**
+	 * RTP timestamp (90 kHz clock) the frame's packets carry on this peer's
+	 * track for that camera.
+	 */
+	rtpTimestamp: number;
+	/** KSP universal time (seconds) the frame was rendered at. */
+	captureUt: number;
+	/**
+	 * Capture epoch (see `SettingsStatePayload::capture_epoch`) `capture_ut`
+	 * belongs to.
+	 */
+	captureEpoch: number;
+}
+
 export interface HelloPayload {
 	sidecarVersion: string;
 	encoderBackend: string;
@@ -384,6 +560,18 @@ export interface SetBackgroundCaptureFpsPayload {
 	 * Clamped to the operator ceiling; 0 means no background capture.
 	 */
 	fps: number;
+}
+
+/**
+ * Choose the craft a command camera watches: a `Vessel.persistentId` from
+ * `CommandCentreInfo.targets` (any of them, whatever its eligibility), or 0
+ * to return to the plugin's default (the active craft in flight). Under a
+ * command authority the authority still aims the camera; the target only
+ * decides which craft is drawn as the true craft.
+ */
+export interface SetCommandTargetPayload {
+	flightId: number;
+	persistentId: number;
 }
 
 export interface SetDegradePayload {
@@ -574,6 +762,12 @@ export type ClientMessage =
 	 * same camera; send `mode: none` to hand aiming back to kOS.
 	 */
 	| { type: "set-track-target", content: SetTrackTargetPayload }
+	/**
+	 * Choose the craft a command camera watches. Server-wide: every consumer
+	 * sees the new target in `CommandCentreInfo.target_persistent_id` once the
+	 * plugin applies it.
+	 */
+	| { type: "set-command-target", content: SetCommandTargetPayload }
 	/**
 	 * A consumer reporting its OWN current display size in px; the sidecar
 	 * aggregates MAX-across-consumers to drive auto-resolution
@@ -766,5 +960,10 @@ export type ServerMessage =
 	 * Whether KSP is in a flight scene. Primed after `Hello` and
 	 * re-broadcast when the polled in-flight flag changes.
 	 */
-	| { type: "scene-state-changed", content: SceneStateChangedPayload };
+	| { type: "scene-state-changed", content: SceneStateChangedPayload }
+	/**
+	 * Capture UT of one frame about to go out on a video track, keyed by
+	 * its RTP timestamp. One per frame per track.
+	 */
+	| { type: "frame-stamp", content: FrameStampPayload };
 

@@ -7,7 +7,7 @@
 //
 //   header (4096 bytes, page-aligned):
 //     [0..8]   u64 magic = 0x4B45524243414D31 ("KERBCAM1") little-endian
-//     [8..12]  u32 version = 1
+//     [8..12]  u32 version = 2
 //     [12..16] u32 slot_count
 //     [16..20] u32 max_width
 //     [20..24] u32 max_height
@@ -20,10 +20,12 @@
 //     [+0..4]   u32 width
 //     [+4..8]   u32 height
 //     [+8..12]  u32 stride_bytes
-//     [+12..16] padding
+//     [+12..16] u32 capture_epoch (UT discontinuity counter at render)
 //     [+16..24] f64 capture_ts_ms
 //     [+24..32] u64 sequence (matches header.sequence when written)
-//     [+32..]   RGBA8 pixels, max_width * max_height * 4 bytes
+//     [+32..40] f64 capture_ut (KSP universal time at render; NaN = unknown)
+//     [+40..64] padding
+//     [+64..]   RGBA8 pixels, max_width * max_height * 4 bytes
 //
 // Sync protocol (writer side):
 //   1. Bump `header.sequence` atomically (Interlocked.Increment).
@@ -47,7 +49,7 @@ namespace Kerbcast
     {
         /* "KERBCAM1" legacy ring magic; value pinned for plugin wire-format compat, not renamed. */
         public const ulong Magic = 0x4B45_5242_4341_4D31UL;
-        public const uint LayoutVersion = 1;
+        public const uint LayoutVersion = 2;
         public const int HeaderSize = 4096;
 
         private const int HeaderOffMagic = 0;
@@ -61,9 +63,11 @@ namespace Kerbcast
         private const int SlotOffWidth = 0;
         private const int SlotOffHeight = 4;
         private const int SlotOffStride = 8;
+        private const int SlotOffCaptureEpoch = 12;
         private const int SlotOffCaptureTs = 16;
         private const int SlotOffSequence = 24;
-        private const int SlotOffPixels = 32;
+        private const int SlotOffCaptureUt = 32;
+        private const int SlotOffPixels = 64;
 
         private readonly int _slotCount;
         private readonly int _maxWidth;
@@ -162,12 +166,14 @@ namespace Kerbcast
         /// Write one frame into the next slot. <paramref name="rgba"/> length
         /// must equal width * height * 4. Returns the monotonic sequence
         /// number assigned to this frame; consumers detect dropped frames by
-        /// sequence-number gaps.
+        /// sequence-number gaps. <paramref name="captureUt"/> is the KSP
+        /// universal time the frame was rendered at (NaN when unknown) and
+        /// <paramref name="captureEpoch"/> the UT discontinuity epoch then.
         /// </summary>
-        public ulong Produce(int width, int height, double captureTsMs, byte[] rgba, int rgbaOffset, int rgbaLength)
+        public ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, byte[] rgba, int rgbaOffset, int rgbaLength)
         {
             ValidateFrame(width, height, rgbaLength);
-            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs);
+            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch);
             _view.WriteArray(slotStart + SlotOffPixels, rgba, rgbaOffset, rgbaLength);
             PublishSlot(slot, slotStart, newSeq);
             return (ulong)newSeq;
@@ -181,10 +187,10 @@ namespace Kerbcast
         /// Byte-for-byte identical to the <c>byte[]</c> overload — see
         /// MmapFrameRing.Tests.
         /// </summary>
-        public unsafe ulong Produce(int width, int height, double captureTsMs, byte* src, int length)
+        public unsafe ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, byte* src, int length)
         {
             ValidateFrame(width, height, length);
-            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs);
+            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch);
             Buffer.MemoryCopy(src, _basePtr + slotStart + SlotOffPixels, length, length);
             PublishSlot(slot, slotStart, newSeq);
             return (ulong)newSeq;
@@ -207,7 +213,7 @@ namespace Kerbcast
         // Steps 1-2 of the seqlock write plus the slot header. The pixel copy
         // (step 3) is the caller's job — the only part that differs between the
         // byte[] and unmanaged-pointer overloads. PublishSlot does steps 4-5.
-        private (int slot, int slotStart, long seq) BeginSlot(int width, int height, double captureTsMs)
+        private (int slot, int slotStart, long seq) BeginSlot(int width, int height, double captureTsMs, double captureUt, uint captureEpoch)
         {
             // Interlocked.Increment on Int64 is an atomic add + load — same
             // semantics as Rust's AtomicU64.fetch_add(1, Release) cross-process.
@@ -219,7 +225,9 @@ namespace Kerbcast
             _view.Write(slotStart + SlotOffWidth, (uint)width);
             _view.Write(slotStart + SlotOffHeight, (uint)height);
             _view.Write(slotStart + SlotOffStride, (uint)(width * 4));
+            _view.Write(slotStart + SlotOffCaptureEpoch, captureEpoch);
             _view.Write(slotStart + SlotOffCaptureTs, captureTsMs);
+            _view.Write(slotStart + SlotOffCaptureUt, captureUt);
             return ((int)nextSlot, slotStart, newSeq);
         }
 

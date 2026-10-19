@@ -7,15 +7,31 @@
  * Creates a KerbcastClient backed by MockSidecar. Registers 4 plausible
  * cameras and delivers animated canvas captureStream tracks to each slot.
  *
- * One camera starts destroyed to demonstrate SIGNAL LOST.
+ * One camera starts destroyed to demonstrate SIGNAL LOST. A command
+ * camera cycles through the target-bracket states.
  * /profile fetch is intercepted to return plausible stagger numbers.
  */
 
-import { CameraKind, CameraLifecycle, CrewLocation, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import {
+  CameraKind,
+  CameraLifecycle,
+  CommandTargetEligibility,
+  CrewLocation,
+  KerbcastClient,
+} from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { loadLocalMediabunnyTrimmer } from "../mediabunnyAsset";
 import { stateFollowingDecodedSizeProbe } from "./decodedSizeProbe";
+import {
+  MOCK_COMMAND_FRAME_HEIGHT,
+  MOCK_COMMAND_SCENARIO_COUNT,
+  mockCommandTrack,
+} from "./commandScenarios";
+
+const COMMAND_FLIGHT_ID = 301;
+const COMMAND_SCENARIO_MS = 4000;
+const MOCK_START_UT = 637_599_000;
 
 const MOCK_CAMERAS: MockCameraInit[] = [
   {
@@ -93,6 +109,68 @@ const MOCK_CAMERAS: MockCameraInit[] = [
     operatorWidth: 0,
     operatorHeight: 0,
     encoderBitrateBps: 0,
+  },
+  {
+    flightId: COMMAND_FLIGHT_ID,
+    kind: CameraKind.Command,
+    cameraName: "KSC tracking",
+    vesselName: "KSC",
+    partName: "kerbcast.commandCamera",
+    partTitle: "Command camera",
+    lifecycle: CameraLifecycle.Active,
+    supportsZoom: false,
+    supportsPan: false,
+    renderWidth: 1024,
+    renderHeight: MOCK_COMMAND_FRAME_HEIGHT,
+    operatorWidth: 1024,
+    operatorHeight: MOCK_COMMAND_FRAME_HEIGHT,
+    encoderBitrateBps: 1_000_000,
+    commandCentre: {
+      stationId: "ground:KSC",
+      nodeName: "KSC",
+      displayName: "Kerbal Space Center",
+      body: "Kerbin",
+      latitude: -0.13,
+      longitude: -74.6,
+      altitude: 95.5,
+      targetPersistentId: 1001,
+      rangeM: 11_500_000,
+      trackingLevel: 2,
+      targets: [
+        {
+          persistentId: 1001,
+          vesselName: "Kerbal X",
+          vesselType: "Ship",
+          rangeM: 11_500_000,
+          eligibility: CommandTargetEligibility.Ok,
+          eligibilityText: "Trackable",
+        },
+        {
+          persistentId: 1002,
+          vesselName: "Comms Relay",
+          vesselType: "Relay",
+          rangeM: 2_870_000,
+          eligibility: CommandTargetEligibility.Ok,
+          eligibilityText: "Trackable",
+        },
+        {
+          persistentId: 1003,
+          vesselName: "Duna Probe",
+          vesselType: "Probe",
+          rangeM: 19_300_000_000,
+          eligibility: CommandTargetEligibility.TooFar,
+          eligibilityText: "Out of tracking range",
+        },
+        {
+          persistentId: 1004,
+          vesselName: "Ast. HSJ-227",
+          vesselType: "SpaceObject",
+          eligibility: CommandTargetEligibility.NotTrackable,
+          eligibilityText: "Not tracked",
+        },
+      ],
+    },
+    commandTrack: mockCommandTrack(0, MOCK_START_UT, MOCK_START_UT),
   },
   // Kerbal face cameras (square, no pan/zoom). Kerbal wire-ids are name-hashed
   // with the top bit set on the plugin side; the exact values are arbitrary in
@@ -191,8 +269,8 @@ const MOCK_CAMERAS: MockCameraInit[] = [
   },
 ];
 
-/** HSL hue for each camera's test pattern (part cams then kerbal faces). */
-const CAMERA_HUES = [210, 30, 140, 0, 265, 320, 95, 45, 175];
+/** HSL hue for each camera's test pattern (part cams, command, then kerbal faces). */
+const CAMERA_HUES = [210, 30, 140, 0, 200, 265, 320, 95, 45, 175];
 
 /**
  * Create a KerbcastClient backed by a MockSidecar.
@@ -239,7 +317,14 @@ export async function createMockClient(): Promise<KerbcastClient> {
     if ((cam.lifecycle ?? CameraLifecycle.Active) === CameraLifecycle.Destroyed) return undefined;
     // Kerbal face cams render SQUARE; part cams stay 16:9.
     const square = cam.kind === CameraKind.Kerbal;
-    const track = buildCanvasTrack(cam.cameraName ?? "Camera", CAMERA_HUES[i] ?? 0, square ? 360 : 640, 360);
+    const command = cam.kind === CameraKind.Command;
+    const track = buildCanvasTrack(
+      cam.cameraName ?? "Camera",
+      CAMERA_HUES[i] ?? 0,
+      square ? 360 : 640,
+      360,
+      command,
+    );
     tracks.set(flightId, track);
     return track;
   };
@@ -326,6 +411,32 @@ export async function createMockClient(): Promise<KerbcastClient> {
     });
   }, 3000);
 
+  /*
+   * Mission clock at 1Hz plus the command camera's bracket scenarios, so the
+   * readout ages tick and every bracket state comes round.
+   */
+  let ut = MOCK_START_UT;
+  let scenario = 0;
+  let switchedAtUt = MOCK_START_UT;
+  let sinceSwitchMs = 0;
+  setInterval(() => {
+    ut += 1;
+    sinceSwitchMs += 1000;
+    if (sinceSwitchMs >= COMMAND_SCENARIO_MS) {
+      sinceSwitchMs = 0;
+      scenario = (scenario + 1) % MOCK_COMMAND_SCENARIO_COUNT;
+      switchedAtUt = ut;
+    }
+    sidecar.fireSettingsState({
+      throttleMainScreen: sidecar.throttleMainScreen,
+      captureUt: ut,
+      timeWarpRate: 1,
+    });
+    sidecar.updateCamera(COMMAND_FLIGHT_ID, {
+      commandTrack: mockCommandTrack(scenario, ut, switchedAtUt),
+    });
+  }, 1000);
+
   // Periodic pings (keeps the watchdog alive in mock mode)
   setInterval(() => {
     sidecar.firePing();
@@ -338,7 +449,13 @@ export async function createMockClient(): Promise<KerbcastClient> {
 // Animated canvas track
 // ---------------------------------------------------------------------------
 
-function buildCanvasTrack(label: string, hue: number, width = 640, height = 360): MediaStreamTrack {
+function buildCanvasTrack(
+  label: string,
+  hue: number,
+  width = 640,
+  height = 360,
+  centreMarker = false,
+): MediaStreamTrack {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -364,7 +481,11 @@ function buildCanvasTrack(label: string, hue: number, width = 640, height = 360)
     ctx.font = "bold 24px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(label, width / 2, height / 2);
+    // A command camera holds its target at frame centre; keep the label clear of it.
+    ctx.fillText(label, width / 2, centreMarker ? height * 0.8 : height / 2);
+    if (centreMarker) {
+      ctx.fillRect(width / 2 - 2, height / 2 - 2, 4, 4);
+    }
   }, 1000 / 24);
 
   // captureStream is stubbed by installDomStubs in test environments

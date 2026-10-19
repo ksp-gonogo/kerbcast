@@ -54,6 +54,9 @@ namespace Kerbcast
         private UniversalAsyncGPUReadbackRequest _pendingRequest;
         private bool _readbackInFlight;
         private double _pendingCaptureTsMs;
+        // Mission time and UT epoch at render, carried with the readback so each ring frame names the UT it shows.
+        private double _pendingCaptureUt;
+        private uint _pendingCaptureEpoch;
 
         // Shared telemetry sink (owned by the camera) plus the failure-streak
         // callbacks: the camera keeps _consecutiveErrors and LogRateLimited, we
@@ -160,6 +163,8 @@ namespace Kerbcast
             // dimensions.
             _targets.CapturePending();
             _pendingCaptureTsMs = captureTsMs;
+            _pendingCaptureUt = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
+            _pendingCaptureEpoch = KerbcastCore.Instance != null ? KerbcastCore.Instance.CaptureEpochValue : 0;
             long reqStart = _telemetry ? Stopwatch.GetTimestamp() : 0;
             _pendingRequest = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
             if (_telemetry)
@@ -230,7 +235,7 @@ namespace Kerbcast
                     src = (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
                     length = data.Length;
                 }
-                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, src, length);
+                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, _pendingCaptureUt, _pendingCaptureEpoch, src, length);
                 _resetErrorStreak();
             }
             catch (Exception ex)

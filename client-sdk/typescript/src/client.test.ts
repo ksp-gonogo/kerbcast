@@ -461,6 +461,25 @@ describe("KerbcastClient", () => {
     ]);
   });
 
+  it("setCommandTarget sends a set-command-target command", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+
+    await client.connect();
+    captured.dc?._open();
+    captured.dc!.sent.length = 0;
+
+    await client.setCommandTarget(2147483905, 4000000001);
+
+    expect(captured.dc?.sent).toEqual([
+      JSON.stringify({
+        type: "set-command-target",
+        content: { flightId: 2147483905, persistentId: 4000000001 },
+      }),
+    ]);
+  });
+
   it("disconnect tears down peer + emits null MediaStream events", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);
@@ -875,6 +894,51 @@ describe("KerbcastClient", () => {
       expect(streams[streams.length - 1]).toBeNull();
     });
 
+    it("frameLock keeps a noise-disabled camera on the pipeline with no static", async () => {
+      const fakeProcessed = new MediaStream();
+      const mockCaptureStream = vi.fn().mockReturnValue(fakeProcessed);
+      const fakeCtx = {
+        drawImage: vi.fn(),
+        fillRect: vi.fn(),
+        createImageData: vi.fn().mockReturnValue({ data: new Uint8ClampedArray(4) }),
+        putImageData: vi.fn(),
+      };
+      const origGetContext = HTMLCanvasElement.prototype.getContext;
+      // @ts-expect-error -- jsdom augmentation
+      HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(fakeCtx);
+      // @ts-expect-error -- jsdom augmentation
+      HTMLCanvasElement.prototype.captureStream = mockCaptureStream;
+      let draw: FrameRequestCallback | null = null;
+      const rafSpy = vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((cb) => {
+        draw = cb;
+        return 0;
+      });
+
+      try {
+        const { transport, captured } = makeFakeTransport();
+        const client = new KerbcastClient(
+          { host: "h", port: 1, noise: { enabled: false }, frameLock: true },
+          transport,
+        );
+        vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([3]));
+
+        await client.connect([3]);
+        captured.onTrack?.({} as MediaStreamTrack, 0);
+        const cam = client.camera(3);
+        expect(cam.mediaStream).toBe(fakeProcessed);
+
+        /* showStatic can't bring static back, and the waiting frame is plain black. */
+        cam.setShowStatic(true);
+        (draw as FrameRequestCallback | null)?.(0);
+        expect(fakeCtx.putImageData).not.toHaveBeenCalled();
+      } finally {
+        HTMLCanvasElement.prototype.getContext = origGetContext;
+        // @ts-expect-error -- cleanup
+        delete HTMLCanvasElement.prototype.captureStream;
+        rafSpy.mockRestore();
+      }
+    });
+
     it("noise pipeline is used when captureStream is available", async () => {
       const fakeProcessed = new MediaStream();
       const mockCaptureStream = vi.fn().mockReturnValue(fakeProcessed);
@@ -899,7 +963,8 @@ describe("KerbcastClient", () => {
         captured.onTrack?.({} as MediaStreamTrack, 0);
 
         expect(client.camera(3).mediaStream).toBe(fakeProcessed);
-        expect(mockCaptureStream).toHaveBeenCalledWith(30);
+        /* Frames are captured on demand, one per emitted composite. */
+        expect(mockCaptureStream).toHaveBeenCalledWith(0);
       } finally {
         HTMLCanvasElement.prototype.getContext = origGetContext;
         // @ts-expect-error — cleanup
@@ -958,6 +1023,7 @@ describe("KerbcastClient", () => {
           setIntensity,
           setSource,
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1006,6 +1072,7 @@ describe("KerbcastClient", () => {
           setIntensity,
           setSource,
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1050,6 +1117,7 @@ describe("KerbcastClient", () => {
           setIntensity: vi.fn(),
           setSource,
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1169,6 +1237,7 @@ describe("KerbcastClient", () => {
           setIntensity: vi.fn(),
           setSource: vi.fn(),
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy,
         });
       try {
@@ -1856,5 +1925,175 @@ describe("KerbcastClient.inboundVideoStats", () => {
     expect(events).toHaveLength(2);
     expect(events[1].throttleMainScreen).toBe(true);
     expect(client.throttleMainScreen).toBe(true);
+  });
+});
+
+describe("KerbcastClient frame UT", () => {
+  async function connected() {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+    return { sidecar, client };
+  }
+
+  /** A video element whose frame callbacks the test fires by hand. */
+  function fakeVideo() {
+    const callbacks = new Map<number, (now: number, meta: object) => void>();
+    let next = 1;
+    const video = {
+      requestVideoFrameCallback: (cb: (now: number, meta: object) => void) => {
+        callbacks.set(next, cb);
+        return next++;
+      },
+      cancelVideoFrameCallback: (id: number) => callbacks.delete(id),
+    } as unknown as HTMLVideoElement;
+    const present = (meta: object, now = 0) => {
+      const pending = [...callbacks.values()];
+      callbacks.clear();
+      for (const cb of pending) cb(now, meta);
+    };
+    return { video, present, armed: () => callbacks.size };
+  }
+
+  it("is null with neither a stamp nor a clock", async () => {
+    const { client } = await connected();
+    expect(client.frameUt(7, 1234)).toBeNull();
+  });
+
+  it("is exact for a stamped RTP timestamp and estimated otherwise", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500, captureEpoch: 2 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 90_000, captureUt: 498.25, captureEpoch: 2 });
+
+    expect(client.frameUt(7, 90_000)).toEqual({ ut: 498.25, epoch: 2, source: "exact" });
+    expect(client.frameUt(7, 93_000)?.source).toBe("estimated");
+    expect(client.frameUt(8, 90_000)?.source).toBe("estimated");
+    expect(client.frameUt(7)?.source).toBe("estimated");
+  });
+
+  it("forgets stamps on reconnect, since RTP timestamps restart per peer", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 1, captureUt: 10, captureEpoch: 0 });
+    expect(client.frameUt(7, 1)?.source).toBe("exact");
+    await client.connect();
+    expect(client.frameUt(7, 1)).toBeNull();
+  });
+
+  it("watchDisplayedFrames reports each presented frame with its source", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    const { video, present, armed } = fakeVideo();
+    const frames: unknown[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    present({ rtpTimestamp: 3000, expectedDisplayTime: 42 });
+    present({ rtpTimestamp: 6000, expectedDisplayTime: 75 });
+    expect(frames).toEqual([
+      { ut: 499.5, epoch: 0, source: "exact", flightId: 7, rtpTimestamp: 3000, presentedAt: 42 },
+      /* Unstamped: bounded by the last exactly identified frame. */
+      { ut: 499.5, epoch: 0, source: "estimated", flightId: 7, rtpTimestamp: 3000, presentedAt: 75 },
+    ]);
+
+    stop();
+    expect(armed()).toBe(0);
+  });
+
+  it("watchDisplayedFrames resolves noise-pipeline frames and keeps inexact ones estimated", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    const handle = client.camera(7) as unknown as {
+      _displayedSourceFrame(m: object): { rtpTimestamp: number | null; exact: boolean } | null;
+    };
+    const resolve = vi.spyOn(handle, "_displayedSourceFrame");
+    const { video, present } = fakeVideo();
+    const frames: unknown[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    resolve.mockReturnValueOnce({ rtpTimestamp: 3000, exact: true });
+    present({ mediaTime: 1.5, expectedDisplayTime: 42 });
+    resolve.mockReturnValueOnce({ rtpTimestamp: 3000, exact: false });
+    present({ presentationTime: 70, expectedDisplayTime: 75 });
+    expect(resolve).toHaveBeenNthCalledWith(1, video, { mediaTime: 1.5, expectedDisplayTime: 42 });
+    expect(frames).toEqual([
+      { ut: 499.5, epoch: 0, source: "exact", flightId: 7, rtpTimestamp: 3000, presentedAt: 42 },
+      { ut: 499.5, epoch: 0, source: "estimated", flightId: 7, rtpTimestamp: 3000, presentedAt: 75 },
+    ]);
+    stop();
+  });
+
+  it("watchDisplayedFrames estimates unidentified frames from a stamp old enough to be on screen", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    const now = vi.spyOn(performance, "now");
+    now.mockReturnValue(1000);
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    now.mockReturnValue(1100);
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 6000, captureUt: 499.6, captureEpoch: 0 });
+    now.mockRestore();
+    const { video, present } = fakeVideo();
+    const frames: { ut: number; source: string; rtpTimestamp: number | null }[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    /* No rtpTimestamp in the metadata and no pipeline: never exact, never newer than the screen. */
+    present({ expectedDisplayTime: 1200 });
+    present({ expectedDisplayTime: 1260 });
+    /* A presented rtp the sidecar never stamped is estimated the same way. */
+    present({ rtpTimestamp: 9000, expectedDisplayTime: 1300 });
+    expect(frames.map((f) => [f.ut, f.source, f.rtpTimestamp])).toEqual([
+      [499.5, "estimated", 3000],
+      [499.6, "estimated", 6000],
+      [499.6, "estimated", 6000],
+    ]);
+    stop();
+  });
+
+  it("watchDisplayedFrames distrusts a pipeline identification that runs backwards", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 6000, captureUt: 499.6, captureEpoch: 0 });
+    const handle = client.camera(7) as unknown as {
+      _displayedSourceFrame(v: unknown, m: object): { rtpTimestamp: number | null; exact: boolean } | null;
+    };
+    const resolve = vi.spyOn(handle, "_displayedSourceFrame");
+    const { video, present } = fakeVideo();
+    const frames: { ut: number; source: string }[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    resolve.mockReturnValueOnce({ rtpTimestamp: 6000, exact: true });
+    present({ mediaTime: 2, expectedDisplayTime: 100 });
+    resolve.mockReturnValueOnce({ rtpTimestamp: 3000, exact: true });
+    present({ mediaTime: 1.9, expectedDisplayTime: 133 });
+    resolve.mockReturnValueOnce(null);
+    present({ mediaTime: 2.1, expectedDisplayTime: 166 });
+    expect(frames.map((f) => [f.ut, f.source])).toEqual([
+      [499.6, "exact"],
+      [499.6, "estimated"],
+      [499.6, "estimated"],
+    ]);
+    stop();
+  });
+
+  it("watchDisplayedFrames falls back to timed estimates without frame callbacks", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sidecar, client } = await connected();
+      sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+      const frames: { source: string; rtpTimestamp: number | null }[] = [];
+      const stop = client.watchDisplayedFrames(7, {} as HTMLVideoElement, (f) => frames.push(f));
+      vi.advanceTimersByTime(250);
+      stop();
+      vi.advanceTimersByTime(500);
+      expect(frames).toHaveLength(2);
+      expect(frames.every((f) => f.source === "estimated" && f.rtpTimestamp === null)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -121,6 +121,58 @@ namespace Kerbcast
         // MinKspFps.
         public float BackgroundCaptureFps { get; private set; } = 2f;
 
+        /* Command camera: a feed from the home CommNet station
+           (KSC) that follows the active craft with a telescope-narrow zoom.
+           Experimental, off by default. */
+        public bool EnableCommandCamera { get; private set; } = false;
+        /* Share of the frame height the craft is zoomed to fill. */
+        public double CommandCameraFrameFraction { get; private set; } = 0.3;
+        /* Zoom limits, vertical field of view in degrees. Below the floor the
+           craft simply gets smaller with range. */
+        public double CommandCameraFovMin { get; private set; } = 0.02;
+        /* The lens a lower Tracking Station level gets in career with the
+           tracking rules on, and the lens beside the launch site always gets
+           level 1's. CommandCameraFovMin is the top level's. */
+        public double CommandCameraFovMinLevel1 { get; private set; } = 1.0;
+        public double CommandCameraFovMinLevel2 { get; private set; } = 0.1;
+        public double CommandCameraFovMax { get; private set; } = 30.0;
+        /* Where the lens stands: "launchsite" (beside the pad or runway the
+           active craft launched from) or "ksc" (the home CommNet station). */
+        public string CommandCameraAnchor { get; private set; } = "launchsite";
+        /* Launch-site anchor: metres from the site's spawn point, the compass
+           bearing from the site to the lens (180 = due south, side-on to an
+           eastward launch) and the lens height above the ground. */
+        public double CommandCameraPadDistance { get; private set; } = 500.0;
+        public double CommandCameraPadBearing { get; private set; } = 180.0;
+        public double CommandCameraPadHeight { get; private set; } = 5.0;
+        /* KSC anchor: metres above the station's own altitude the lens sits, to
+           clear the tracking-station dish and nearby buildings. */
+        public double CommandCameraAltitudeOffset { get; private set; } = 30.0;
+        /* Space Center only: the craft the command camera watches first, by
+           vessel name. Empty picks the most recently launched craft that is not
+           debris. SetCommandTarget changes it at runtime. */
+        public string CommandCameraTargetName { get; private set; } = "";
+        /* With CommandCameraAnchor=vessel, the exact name of the vessel the camera rides. */
+        public string CommandCameraVantageName { get; private set; } = "";
+        /* A point of light in the scene at an unloaded target's position, lit
+           only while the target is in sunlight. */
+        public bool CommandCameraTargetMarker { get; private set; } = false;
+        /* The unloaded target drawn from its saved parts' models instead of a
+           point. Wins over CommandCameraTargetMarker. */
+        public bool CommandCameraTargetModel { get; private set; } = false;
+        /* Debug: burns the UT each command camera frame was rendered at into the frame,
+           so a recording can be mapped frame by frame to game time. A row of
+           52 square blocks, 8x8 px each, runs along the bottom edge from the
+           bottom-left corner (x 0..415, the bottom 8 rows), drawn after every
+           layer so nothing in the scene covers it. Each block is solid white
+           (1) or solid black (0). Blocks 0-3 are the start pattern 1,0,1,0;
+           blocks 4-51 are round(UT * 1000), UT in milliseconds as an unsigned
+           48-bit integer, most significant bit first. Decode by thresholding
+           each block's centre pixel at mid grey. Blank (black) frames carry
+           no stripe. Sizes are in capture pixels: a stream delivered at a
+           smaller size scales the blocks by delivered width / capture width. */
+        public bool CommandCameraDebugUtStripe { get; private set; } = false;
+
         // Stagger budget CEILING: the most main-thread time (ms/frame) kerbcast
         // will spend on its own render + readback. When it would exceed this,
         // kerbcast captures FEWER cameras per frame (each updates less often, but
@@ -452,6 +504,31 @@ namespace Kerbcast
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyFloat(node, "MaxCaptureFps", v => settings.MaxCaptureFps = v);
             ApplyFloat(node, "BackgroundCaptureFps", v => settings.BackgroundCaptureFps = v);
+            ApplyBool(node, "EnableCommandCamera", v => settings.EnableCommandCamera = v);
+            ApplyFloat(node, "CommandCameraFrameFraction", v =>
+            {
+                if (v > 0f && v <= 1f) settings.CommandCameraFrameFraction = v;
+                else Debug.LogWarning($"[Kerbcast] settings.cfg: CommandCameraFrameFraction={v} must be in (0, 1]; ignoring");
+            });
+            ApplyFloat(node, "CommandCameraFovMin", v => settings.CommandCameraFovMin = Mathf.Max(0.001f, v));
+            ApplyFloat(node, "CommandCameraFovMinLevel1", v => settings.CommandCameraFovMinLevel1 = Mathf.Max(0.001f, v));
+            ApplyFloat(node, "CommandCameraFovMinLevel2", v => settings.CommandCameraFovMinLevel2 = Mathf.Max(0.001f, v));
+            ApplyFloat(node, "CommandCameraFovMax", v => settings.CommandCameraFovMax = Mathf.Min(120f, v));
+            ApplyString(node, "CommandCameraAnchor", v =>
+            {
+                var a = v.Trim().ToLowerInvariant();
+                if (a == "launchsite" || a == "ksc" || a == "vessel") settings.CommandCameraAnchor = a;
+                else Debug.LogWarning($"[Kerbcast] settings.cfg: CommandCameraAnchor={v} must be launchsite, ksc or vessel; ignoring");
+            });
+            ApplyFloat(node, "CommandCameraPadDistance", v => settings.CommandCameraPadDistance = Mathf.Max(0f, v));
+            ApplyFloat(node, "CommandCameraPadBearing", v => settings.CommandCameraPadBearing = v);
+            ApplyFloat(node, "CommandCameraPadHeight", v => settings.CommandCameraPadHeight = v);
+            ApplyFloat(node, "CommandCameraAltitudeOffset", v => settings.CommandCameraAltitudeOffset = v);
+            ApplyString(node, "CommandCameraTargetName", v => settings.CommandCameraTargetName = v.Trim());
+            ApplyString(node, "CommandCameraVantageName", v => settings.CommandCameraVantageName = v.Trim());
+            ApplyBool(node, "CommandCameraTargetMarker", v => settings.CommandCameraTargetMarker = v);
+            ApplyBool(node, "CommandCameraTargetModel", v => settings.CommandCameraTargetModel = v);
+            ApplyBool(node, "CommandCameraDebugUtStripe", v => settings.CommandCameraDebugUtStripe = v);
             ApplyFloat(node, "MaxKerbcastFrameBudgetMs", v => settings.MaxKerbcastFrameBudgetMs = v);
             ApplyFloat(node, "MinKspFps", v => settings.MinKspFps = v);
             ApplyBool(node, "EnableAtmosphericFx", v => settings.EnableAtmosphericFx = v);

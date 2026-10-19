@@ -21,7 +21,6 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
-use webrtc::media::Sample;
 
 use kerbcast_sidecar::cameras::{CameraRegistry, CameraState};
 use kerbcast_sidecar::encoder::{
@@ -198,7 +197,7 @@ async fn main() -> Result<()> {
             let snapshot: Vec<Arc<KerbcastPeer>> = ping_peers.read().await.clone();
             for peer in &snapshot {
                 if peer.is_alive() {
-                    peer.push_message(&ServerMessage::Ping).await;
+                    peer.push_message(&ServerMessage::Ping);
                 }
             }
         }
@@ -512,7 +511,7 @@ async fn broadcast(peers: &[Arc<KerbcastPeer>], msg: &ServerMessage) {
         return;
     }
     for peer in peers {
-        peer.push_message(msg).await;
+        peer.push_message(msg);
     }
 }
 
@@ -577,6 +576,7 @@ async fn broadcast_destroyed_cameras(
             capture_state: CaptureState::Off,
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
+            command_centre: cam.command_centre.clone(),
             crew_location: cam.crew_location(),
             track_mode: cam.track_mode(),
             part_name: cam.part_name.clone(),
@@ -961,11 +961,6 @@ async fn encode_and_fan_out(
     for nal in &nals {
         combined.extend_from_slice(&nal.0);
     }
-    let sample = Sample {
-        data: combined.into(),
-        duration: actual_duration,
-        ..Default::default()
-    };
 
     // Fan-out + GC dead weak refs in one pass. Pruned weaks mean a peer
     // dropped without telling us — decrement the camera's subscriber
@@ -977,8 +972,11 @@ async fn encode_and_fan_out(
     let mut sent = 0usize;
     for weak in prev {
         if let Some(track) = weak.upgrade() {
-            if let Err(e) = track.write_sample(&sample).await {
-                warn!(flight_id = cam.flight_id, error = %e, "write_sample failed");
+            if let Err(e) = track
+                .write_frame(&combined, actual_duration, cam.flight_id, frame.capture)
+                .await
+            {
+                warn!(flight_id = cam.flight_id, error = %e, "write_frame failed");
             } else {
                 sent += 1;
             }
@@ -1003,7 +1001,7 @@ async fn encode_and_fan_out(
             flight_id = cam.flight_id,
             sent,
             pruned,
-            bytes = sample.data.len(),
+            bytes = combined.len(),
             "sample fanned out"
         );
     }

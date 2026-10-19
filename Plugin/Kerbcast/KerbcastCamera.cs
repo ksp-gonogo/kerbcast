@@ -39,9 +39,126 @@ using UnityEngine;
 
 namespace Kerbcast
 {
+    /* Drives a KerbcastCamera whose mount is not a part (the command camera):
+       places, zooms and clips the layer stack each rendered tick, and may draw
+       an extra local layer between the far and near passes. */
+    internal enum RigFrame
+    {
+        /* Nothing to look at this tick: keep the last frame. */
+        Skip,
+        Render,
+        /* Deliver a black frame instead of the scene. */
+        Blank,
+    }
+
+    internal interface ICameraRig
+    {
+        /* Called right before the layers render. */
+        RigFrame PrepareRender(KerbcastCamera cam);
+        void RenderBetweenFarAndNear(KerbcastCamera cam);
+        /* After every layer has drawn, before the frame is captured. */
+        void AfterLayersRender(KerbcastCamera cam);
+        /* Around each scaled-layer render, for per-camera shader inputs. */
+        void BeforeScaledRender(KerbcastCamera cam);
+        void AfterScaledRender(KerbcastCamera cam);
+        /* The frame centre after galaxy and scaled rendered, when asked for. */
+        void OnScaledProbe(KerbcastCamera cam, Color centre);
+        void Dispose();
+    }
+
     internal sealed class KerbcastCamera : ICamera
     {
         public uint FlightId { get; }
+
+        /* Null for part cameras. Set once, right after construction. */
+        internal ICameraRig Rig { get; set; }
+        /* Set by the rig when the far layer must not draw this tick (the craft
+           is hidden behind a body). */
+        internal bool RigSkipFar { get; set; }
+        internal Camera NearLayer => _nearCam;
+        internal Camera FarLayer => _farCam;
+        internal Camera ScaledLayer => _scaledCam;
+        /* Set by the rig to read the frame centre right after the next scaled
+           render (galaxy plus scaled only), reported back through OnScaledProbe. */
+        internal bool RigScaledProbe { get; set; }
+
+        /* A scaled-body renderer left exactly as ScaledSpaceFader set it, the
+           way the main camera sees it: a command camera's own body while its
+           terrain is drawn locally. */
+        internal Renderer RigStockFaderRenderer { get; set; }
+
+        /* Re-renders galaxy and scaled and reads the centre, so a rig can
+           compare backdrop variants inside OnScaledProbe. */
+        internal Color RenderBackdropForProbe()
+        {
+            if (_galaxyCam != null) _galaxyCam.Render();
+            if (_scaledCam != null) RenderScaledWithRig();
+            return SampleCaptureCentre();
+        }
+
+        private void RenderScaledWithRig()
+        {
+            if (Rig == null)
+            {
+                _scaledCam.Render();
+                return;
+            }
+            Rig.BeforeScaledRender(this);
+            try { _scaledCam.Render(); }
+            finally { Rig.AfterScaledRender(this); }
+        }
+
+        /* A blanked feed streams black, never the scene and never a frozen
+           frame. The plain blit keeps any filter or test pattern off it. */
+        private void PublishBlack()
+        {
+            if (_telemetry) _phaseTimings.BeginFrame();
+            try
+            {
+                var prev = RenderTexture.active;
+                RenderTexture.active = _capture.CaptureRt;
+                GL.Clear(true, true, Color.black);
+                RenderTexture.active = prev;
+                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit);
+            }
+            catch (Exception ex)
+            {
+                _capture.AbortInFlight();
+                LogRateLimited($"blank frame threw: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private static readonly Action<RenderTexture, RenderTexture> s_plainBlit = (src, dst) => Graphics.Blit(src, dst);
+
+        /* One pixel from the composite so far. Stalls on the GPU: diagnostics only. */
+        private Color SampleCaptureCentre()
+        {
+            var prev = RenderTexture.active;
+            RenderTexture.active = _capture.CaptureRt;
+            var sample = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+            sample.ReadPixels(new Rect(_capture.CaptureRt.width / 2, _capture.CaptureRt.height / 2, 1, 1), 0, 0);
+            sample.Apply();
+            var px = sample.GetPixel(0, 0);
+            UnityEngine.Object.Destroy(sample);
+            RenderTexture.active = prev;
+            return px;
+        }
+
+        /* Rig-owned zoom: bypasses SupportsZoom and the operator slew, which
+           belong to part cameras. */
+        internal void SetRigFov(float fov)
+        {
+            Fov = _fovTarget = fov;
+            if (_nearCam != null) _nearCam.fieldOfView = fov;
+            if (_scaledCam != null) _scaledCam.fieldOfView = fov;
+            if (_galaxyCam != null) _galaxyCam.fieldOfView = fov;
+            if (_farCam != null) _farCam.fieldOfView = fov;
+        }
+
+        /* Manifest "kind" plus any kind-specific fields, already JSON-encoded
+           ("  \"key\": value" lines, comma-separated, no trailing comma). */
+        private readonly string _manifestKind;
+        private readonly string _manifestExtraFields;
         /* Placement + identity + optional zoom/pan capabilities, decoupled from
            MuMechModuleHullCamera. Every former Hullcam read now goes through this. */
         public ICameraMountSource Mount { get; }
@@ -320,9 +437,13 @@ namespace Kerbcast
             int renderHeight,
             CameraLayers initialLayers,
             bool enableAtmosphericFx,
-            AtmoFxLayers fxLayers)
+            AtmoFxLayers fxLayers,
+            string manifestKind = "part",
+            string manifestExtraFields = null)
         {
             Mount = mount;
+            _manifestKind = manifestKind;
+            _manifestExtraFields = manifestExtraFields;
             // Pan is delivered through the mount as the IPanCapability contract;
             // core steers purely through the interface, never a concrete type.
             _pan = mount.Pan;
@@ -1273,6 +1394,8 @@ namespace Kerbcast
            control-block flush — the anti-loop guard. */
         private uint _lastTrackSeq;
         private uint _trackReportSeq;
+        /* Same edge-trigger for a command camera's target choice. */
+        private uint _lastCommandTargetSeq;
 
         /* Last successfully-aimed track pose, recorded whenever the tracked target
            resolves. On target LOSS (destroyed / unresolvable) while still tracking,
@@ -1603,6 +1726,13 @@ namespace Kerbcast
                     _lastTrackSeq = snap.TrackSeq;
                     SetTrackMode((int)(snap.TrackMode ?? 0u));
                 }
+                if (snap.CommandTargetSeq != _lastCommandTargetSeq)
+                {
+                    _lastCommandTargetSeq = snap.CommandTargetSeq;
+                    if (snap.CommandTarget.HasValue && Rig is CommandCameraRig
+                        && !KerbcastControl.SetCommandTarget(FlightId, snap.CommandTarget.Value))
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] cam={FlightId} target {snap.CommandTarget.Value} from a client refused: no such craft");
+                }
 
                 if (SupportsPan)
                 {
@@ -1671,7 +1801,7 @@ namespace Kerbcast
             {
                 var json = "{\n"
                     + $"  \"lifecycle\": \"{lifecycle}\",\n"
-                    + $"  \"kind\": \"part\",\n"
+                    + $"  \"kind\": \"{_manifestKind}\",\n"
                     + $"  \"flight_id\": {FlightId},\n"
                     + $"  \"part_name\": \"{EscapeJson(_cachedPartName)}\",\n"
                     + $"  \"part_title\": \"{EscapeJson(_cachedPartTitle)}\",\n"
@@ -1685,8 +1815,9 @@ namespace Kerbcast
                     + $"  \"pan_yaw_min\": {PanYawMin.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n"
                     + $"  \"pan_yaw_max\": {PanYawMax.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n"
                     + $"  \"pan_pitch_min\": {PanPitchMin.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n"
-                    + $"  \"pan_pitch_max\": {PanPitchMax.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n"
-                    + "}\n";
+                    + $"  \"pan_pitch_max\": {PanPitchMax.ToString(System.Globalization.CultureInfo.InvariantCulture)}"
+                    + (string.IsNullOrEmpty(_manifestExtraFields) ? "" : ",\n" + _manifestExtraFields)
+                    + "\n}\n";
                 File.WriteAllText(_infoPath, json);
             }
             catch (Exception ex)
@@ -1889,6 +2020,27 @@ namespace Kerbcast
             // frame; only the render + readback issue below is paced.
             if (!mayIssueReadback) return;
 
+            /* A rig places, zooms and clips the layers just before they render,
+               so floating-origin and frame shifts since last tick are picked up. */
+            if (Rig != null)
+            {
+                try
+                {
+                    var frame = Rig.PrepareRender(this);
+                    if (frame == RigFrame.Skip) return;
+                    if (frame == RigFrame.Blank)
+                    {
+                        PublishBlack();
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogRateLimited($"rig prepare threw: {ex.GetType().Name}: {ex.Message}");
+                    return;
+                }
+            }
+
             // Zero this frame's per-phase Last values before recording, so a
             // phase shed this tick reads 0 rather than its last-rendered figure
             // (otherwise the across-camera Last sum overstates cost under
@@ -1950,6 +2102,7 @@ namespace Kerbcast
                     {
                         var r = bodyRenderers[bi];
                         if (r == null) continue; // body renderer torn down since cache
+                        if (r == RigStockFaderRenderer) continue;
                         bool wasEnabled = r.enabled;
                         // Guard the read: some scaled-body materials (e.g. the
                         // sun, mod-added bodies) lack _FadeAltitude. GetFloat on
@@ -1977,7 +2130,7 @@ namespace Kerbcast
                                 $"scaledSunLight={(ssl == null ? "null" : $"enabled={ssl.enabled} intensity={ssl.intensity} color={ssl.color} cullingMask={ssl.cullingMask}")}");
                         }
                         _integrationHost?.PerFrame(_scaledCam, CameraLayers.Scaled, BuildIntegrationFrameState(CameraLayers.Scaled));
-                        _scaledCam.Render();
+                        RenderScaledWithRig();
                         if (_firstRender)
                         {
                             _firstRender = false;
@@ -1986,15 +2139,13 @@ namespace Kerbcast
                         if (_firstPixelCheck)
                         {
                             _firstPixelCheck = false;
-                            var prev = RenderTexture.active;
-                            RenderTexture.active = _capture.CaptureRt;
-                            var sample = new Texture2D(1, 1, TextureFormat.RGBA32, false);
-                            sample.ReadPixels(new Rect(_capture.CaptureRt.width / 2, _capture.CaptureRt.height / 2, 1, 1), 0, 0);
-                            sample.Apply();
-                            var px = sample.GetPixel(0, 0);
-                            UnityEngine.Object.Destroy(sample);
-                            RenderTexture.active = prev;
+                            var px = SampleCaptureCentre();
                             Debug.Log($"[Kerbcast] cam={FlightId} scaled center pixel: r={px.r:F3} g={px.g:F3} b={px.b:F3} a={px.a:F3}");
+                        }
+                        if (RigScaledProbe)
+                        {
+                            RigScaledProbe = false;
+                            Rig?.OnScaledProbe(this, SampleCaptureCentre());
                         }
                     }
                     finally
@@ -2018,7 +2169,7 @@ namespace Kerbcast
                     _phaseTimings.Record(RenderPhase.Scaled,
                         (System.Diagnostics.Stopwatch.GetTimestamp() - scaledStart) * _msPerTick);
 
-                if (_farCam != null && (_layers & CameraLayers.Far) != 0)
+                if (_farCam != null && (_layers & CameraLayers.Far) != 0 && !RigSkipFar)
                 {
                     long farStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     _integrationHost?.PerFrame(_farCam, CameraLayers.Far, BuildIntegrationFrameState(CameraLayers.Far));
@@ -2027,6 +2178,8 @@ namespace Kerbcast
                         _phaseTimings.Record(RenderPhase.Far,
                             (System.Diagnostics.Stopwatch.GetTimestamp() - farStart) * _msPerTick);
                 }
+
+                Rig?.RenderBetweenFarAndNear(this);
 
                 if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
                 {
@@ -2043,6 +2196,8 @@ namespace Kerbcast
                         _phaseTimings.Record(RenderPhase.Near,
                             (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
                 }
+
+                Rig?.AfterLayersRender(this);
 
                 // Composite done: re-attach Scatterer's sun-light shadow buffers
                 // so the main flight render this frame gets correct shadows. The
@@ -2133,6 +2288,8 @@ namespace Kerbcast
             _filterBlit.DestroyMaterial();
             // Tear down FX effects (detach their CBs, release materials) before
             // destroying the camera they're attached to.
+            Rig?.Dispose();
+            Rig = null;
             _fxHost?.Dispose();
             _fxHost = null;
             // Detach visual-mod integrations before destroying the cameras: this

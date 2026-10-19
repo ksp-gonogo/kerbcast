@@ -141,6 +141,7 @@
     <Compile Remove="CameraTeardown.Tests/**/*.cs" />
     <Compile Remove="AimSourceRegistry.Tests/**/*.cs" />
     <Compile Remove="TrackAim.Tests/**/*.cs" />
+    <Compile Remove="CommandCameraMath.Tests/**/*.cs" />
     <Compile Remove="NativeReadback.Tests/**/*.cs" />
     <Compile Remove="KosSpike/**/*.cs" />
     <Compile Remove="KerbcastKos/**/*.cs" />

@@ -45,9 +45,28 @@ namespace Kerbcast
             return (NameHash(kerbalName) & PartMask) | KerbalTag;
         }
 
+        /* Wire id for a command camera. Shares the bit-31 space
+           with kerbal ids rather than carving out a new tag, because every 31-bit
+           value is already reachable by both existing namespaces: a third tag
+           would mean re-hashing kerbal ids and breaking stored ones. The "ground:"
+           prefix keys the hash on gonogo's centre id format, so the station
+           and a kerbal can only meet on a 1-in-2^31 hash collision, which the
+           provider logs. The manifest's kind, not the id, says which it is. */
+        public static uint CommandCameraWireId(string stationNodeName)
+        {
+            return (NameHash(CommandCentreId(stationNodeName)) & PartMask) | KerbalTag;
+        }
+
+        /* gonogo's command-centre id for a CommNet home: "ground:<nodeName>". */
+        public static string CommandCentreId(string stationNodeName)
+        {
+            return "ground:" + (stationNodeName ?? string.Empty);
+        }
+
         /* True when a wire-id is in the KERBAL namespace (bit 31 set), i.e. a
            kerbal camera rather than a part camera. Lets Unity-free code tell the
-           two id spaces apart without duplicating the tag constant. */
+           two id spaces apart without duplicating the tag constant. Command
+           camera ids also set bit 31, so this reads "not a part camera". */
         public static bool IsKerbalId(uint flightId)
         {
             return (flightId & KerbalTag) != 0;
