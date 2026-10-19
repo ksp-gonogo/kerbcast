@@ -137,6 +137,7 @@
     <Compile Remove="CameraId.Tests/**/*.cs" />
     <Compile Remove="EvaPovDedupe.Tests/**/*.cs" />
     <Compile Remove="VesselChangePolicy.Tests/**/*.cs" />
+    <Compile Remove="MainScreenThrottlePolicy.Tests/**/*.cs" />
     <Compile Remove="CameraTeardown.Tests/**/*.cs" />
     <Compile Remove="AimSourceRegistry.Tests/**/*.cs" />
     <Compile Remove="TrackAim.Tests/**/*.cs" />

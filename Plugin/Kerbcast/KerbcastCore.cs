@@ -297,20 +297,18 @@ namespace Kerbcast
             GameEvents.onGameSceneLoadRequested.Add(OnGameSceneLoadRequested);
             GameEvents.onGameStatePostLoad.Add(OnGameStatePostLoad);
 
-            // Defensive: at Awake time the scene's source cameras (Camera 00,
-            // ScaledSpace, GalaxyCamera, FXCamera) may already be disabled —
-            // e.g. loading a save that was last in IVA, or a save where the
-            // previous session's throttle state was preserved by KSP. Sync
-            // our _mainCamerasDisabled flag from reality so the first
-            // RebuildCameraList correctly does the restore-rebuild-reapply
-            // dance and SetCameras sees enabled sources. Without this, the
-            // first per-camera SetCameras call would CopyFrom(null) and
-            // inherit Unity's default cullingMask (~0 — including the IVA
-            // layer 16), producing the "pod interior leak" symptom on the
-            // streams.
-            _mainCamerasDisabled = AreAnySourceCamerasDisabled();
-            if (_mainCamerasDisabled)
-                Debug.Log("[Kerbcast] source cameras already disabled at Awake — RebuildCameraList will restore before SetCameras");
+            /* Defensive: at Awake the scene's source cameras (Camera 00,
+               ScaledSpace, GalaxyCamera, FXCamera) may already be disabled, for
+               example after loading a save last left in IVA, or after an older
+               build's throttle left the DontDestroyOnLoad scaled and galaxy
+               cameras off. Re-enable them before the first SetCameras, as the
+               earlier restore-at-rebuild did, so no clone is built from a
+               camera KSP or a mod has switched off. */
+            if (AreAnySourceCamerasDisabled())
+            {
+                Debug.Log("[Kerbcast] source cameras already disabled at Awake: re-enabling before SetCameras");
+                EnableSourceCameras();
+            }
 
             RebuildCameraList(FlightGlobals.ActiveVessel);
 
@@ -433,9 +431,9 @@ namespace Kerbcast
         {
             _captureEpoch.Bump();
             _teardown.OnSceneLoadRequested();
-            /* Restore now, while the scaled-space cameras are still findable. By
-               OnDestroy their GameObjects are inactive, FindObjectsOfType skips
-               them, and they would stay disabled into the next scene. */
+            /* Restore now, before the scene tears down. Camera ScaledSpace and
+               GalaxyCamera survive into the next scene, so a throttle left on
+               them would keep the next scene's main view in an 8x8 corner. */
             RestoreMainScreen();
         }
 
@@ -490,30 +488,21 @@ namespace Kerbcast
 
             if (vessel == null) return;
 
-            // If main-screen throttling is currently active, the KSP source
-            // cameras (Camera 00, Camera ScaledSpace, GalaxyCamera) are
-            // disabled. KerbcastCamera.SetCameras() locates them via
-            // Camera.allCameras which only enumerates ENABLED cameras —
-            // so SetCameras() would skip CopyFrom and our per-camera
-            // Unity Camera components would inherit Unity's defaults
-            // (cullingMask = ~0, no source-transform parenting). That
-            // produces the "command pod interior + black sky" symptom
-            // operators have seen on flight-scene reload / quickload,
-            // when onVesselChange fires AFTER Awake's initial
-            // ApplyMainScreenThrottle and re-runs SetCameras against the
-            // now-disabled sources.
-            //
-            // Temporarily restore the source cameras so SetCameras sees
-            // a fully-initialised render stack, then re-apply the
-            // throttle once the rebuild is complete. The restore/apply
-            // pair captures whatever state KSP currently considers
-            // canonical (e.g. cullingMask updates from other mods,
-            // post-IVA-exit state), not whatever stale snapshot we last
-            // disabled from.
-            bool wasThrottled = _mainCamerasDisabled;
+            /* While the main-screen throttle is active, the KSP source cameras
+               carry its cull mask of 0 and 8x8 pixel viewport, and
+               KerbcastCamera.SetCameras copies every setting from them with
+               CopyFrom. A rebuild against throttled sources would build clones
+               that cull everything into a corner of the frame.
+
+               Temporarily restore the source cameras so SetCameras sees the
+               real render stack, then re-apply the throttle once the rebuild
+               is complete. The restore/apply pair captures whatever state KSP
+               currently considers canonical (e.g. cullingMask updates from
+               other mods, post-IVA-exit state). */
+            bool wasThrottled = _mainScreenThrottled;
             if (wasThrottled)
             {
-                Debug.Log("[Kerbcast] rebuild: temporarily restoring main screen so SetCameras sees enabled source cameras");
+                Debug.Log("[Kerbcast] rebuild: temporarily restoring main screen so SetCameras copies unthrottled source cameras");
                 RestoreMainScreen();
             }
 
@@ -658,6 +647,10 @@ namespace Kerbcast
             // null Instance), suppress it now.
             if (_throttleEffective && !_fxCamSuppressed)
                 TrySuppressFxCamera();
+
+            // Undo any KSP or mod write to the throttled cameras before this frame's main render.
+            if (_mainScreenThrottled)
+                _mainThrottle.Enforce();
 
             // Defensive: scan for cameras whose Hullcam part has gone null
             // (e.g. a destruction event we missed, or a KSP internal teardown
@@ -818,7 +811,8 @@ namespace Kerbcast
 
         private bool _throttleDesired;
         private bool _throttleEffective;
-        private bool _mainCamerasDisabled;
+        private bool _mainScreenThrottled;
+        private readonly MainScreenThrottle _mainThrottle = new MainScreenThrottle();
         // Tracks whether we have successfully disabled FXCamera's camera
         // component as part of a throttle. ApplyMainScreenThrottle sets this
         // only when FXCamera.Instance is available at call time; LateUpdate
@@ -849,21 +843,6 @@ namespace Kerbcast
             return KerbcastSettings.SeedThrottleMainScreen;
         }
 
-        // Hotkey toggles BOTH the live state AND the per-save value
-        // (so the change persists if the operator saves now). Lets the
-        // hotkey behave intuitively — "press it, it stays toggled
-        // until I press it again or change the Difficulty Setting".
-        // KSP ships FlightCamera.EnableCamera() / DisableCamera() as
-        // its first-class on/off for the layered main view; calling
-        // DisableCamera here is the same code path KSP itself uses on
-        // scene transitions, so we're not fighting the engine. We
-        // additionally disable Camera ScaledSpace + GalaxyCamera so
-        // no layer of the main composite renders. The ScaledCamera
-        // and GalaxyCamera MonoBehaviours keep running their
-        // transform-tracking LateUpdate logic independently of the
-        // Camera component's enabled flag, so our per-Hullcam cameras
-        // (which are parented to those transforms) still get correct
-        // positions every frame.
         private void TrySuppressFxCamera()
         {
             if (FXCamera.Instance == null) return;
@@ -880,20 +859,25 @@ namespace Kerbcast
             Debug.Log("[Kerbcast] FXCamera suppressed (late-init, throttle already active)");
         }
 
+        /* Stops KSP's own view costing render time while leaving its cameras
+           enabled. Scatterer and EVE update the sky, haze, cloud and sunlight
+           state the clones render with from callbacks on those cameras
+           (Scatterer's SkyNode.OnPreRender on Camera ScaledSpace, among others),
+           and a disabled camera fires none of them. Scatterer also finds its
+           cameras through Camera.allCameras when it initialises a scene, which
+           skips disabled ones. So the cameras keep rendering, into an 8x8 pixel
+           viewport, and the local ones cull everything. See MainScreenThrottle
+           and MainScreenThrottlePolicy. */
         private void ApplyMainScreenThrottle()
         {
-            if (_mainCamerasDisabled) { _throttleEffective = true; return; }
+            if (_mainScreenThrottled) { _throttleEffective = true; return; }
             /* The scene is unloading and the restore already ran; the per-frame
-               reconcile must not switch the cameras off again on the way out. */
+               reconcile must not throttle the cameras again on the way out. */
             if (_teardown.SceneUnloading) return;
             try
             {
-                if (FlightCamera.fetch != null)
-                {
-                    FlightCamera.fetch.DisableCamera(disableAudioListener: false);
-                }
-                SetKspCamerasEnabled("Camera ScaledSpace", false);
-                SetKspCamerasEnabled("GalaxyCamera", false);
+                var detail = new System.Text.StringBuilder();
+                _mainThrottle.Apply(ThrottleTargets(), detail);
                 // FXCamera is a separate singleton MonoBehaviour with its
                 // own Camera component (NOT in FlightCamera.cameras array)
                 // that renders aero/re-entry FX via a velocity-based shader.
@@ -917,9 +901,9 @@ namespace Kerbcast
                 // If FXCamera.Instance was null here, _fxCamSuppressed stays
                 // false. LateUpdate will retry every frame via
                 // TrySuppressFxCamera() until it succeeds.
-                _mainCamerasDisabled = true;
+                _mainScreenThrottled = true;
                 _throttleEffective = true;
-                Debug.Log("[Kerbcast] main flight render disabled (ThrottleMainScreen=true)");
+                Debug.Log($"[Kerbcast] main flight render throttled, KSP cameras kept enabled (ThrottleMainScreen=true):{detail}");
                 LogAllCameras("throttle-applied");
             }
             catch (Exception ex)
@@ -928,33 +912,76 @@ namespace Kerbcast
             }
         }
 
+        /* FlightCamera.cameras holds Camera 00 and Camera 01 (on D3D11 KSP
+           deactivates Camera 01's GameObject and Camera 00 covers the whole
+           range). Name lookup is the fallback for a scene without one. */
+        private static IEnumerable<KeyValuePair<Camera, ThrottledCameraRole>> ThrottleTargets()
+        {
+            var local = FlightCamera.fetch != null ? FlightCamera.fetch.cameras : null;
+            if (local != null)
+            {
+                foreach (var c in local)
+                    yield return new KeyValuePair<Camera, ThrottledCameraRole>(c, ThrottledCameraRole.Local);
+            }
+            else
+            {
+                foreach (var c in KerbcastCamera.FindKspCamerasByName("Camera 00"))
+                    yield return new KeyValuePair<Camera, ThrottledCameraRole>(c, ThrottledCameraRole.Local);
+                foreach (var c in KerbcastCamera.FindKspCamerasByName("Camera 01"))
+                    yield return new KeyValuePair<Camera, ThrottledCameraRole>(c, ThrottledCameraRole.Local);
+            }
+            foreach (var c in KerbcastCamera.FindKspCamerasByName("Camera ScaledSpace"))
+                yield return new KeyValuePair<Camera, ThrottledCameraRole>(c, ThrottledCameraRole.Scaled);
+            foreach (var c in KerbcastCamera.FindKspCamerasByName("GalaxyCamera"))
+                yield return new KeyValuePair<Camera, ThrottledCameraRole>(c, ThrottledCameraRole.Scaled);
+        }
+
         private void RestoreMainScreen()
         {
-            if (!_mainCamerasDisabled) { _throttleEffective = false; return; }
+            if (!_mainScreenThrottled) { _throttleEffective = false; return; }
             try
             {
-                if (FlightCamera.fetch != null)
-                {
-                    FlightCamera.fetch.EnableCamera();
-                }
-                if (!SetKspCamerasEnabled("Camera ScaledSpace", true))
-                    Debug.LogWarning("[Kerbcast] restore: 'Camera ScaledSpace' not found, left as is");
-                if (!SetKspCamerasEnabled("GalaxyCamera", true))
-                    Debug.LogWarning("[Kerbcast] restore: 'GalaxyCamera' not found, left as is");
+                var detail = new System.Text.StringBuilder();
+                int restored = _mainThrottle.Restore(detail);
                 if (FXCamera.Instance != null)
                 {
                     var fxCam = FXCamera.Instance.GetComponent<Camera>();
                     if (fxCam != null) fxCam.enabled = true;
                 }
-                _mainCamerasDisabled = false;
+                _mainScreenThrottled = false;
                 _throttleEffective = false;
                 _fxCamSuppressed = false;
-                Debug.Log("[Kerbcast] main flight render restored (ThrottleMainScreen=false)");
+                Debug.Log($"[Kerbcast] main flight render restored, {restored} camera(s) (ThrottleMainScreen=false):{detail}");
                 LogAllCameras("throttle-restored");
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[Kerbcast] RestoreMainScreen failed: {ex}");
+            }
+        }
+
+        /* Re-enables every source camera KSP or a mod left switched off. Only
+           the Awake recovery uses it; the throttle never disables them. */
+        private static void EnableSourceCameras()
+        {
+            try
+            {
+                if (FlightCamera.fetch != null)
+                    FlightCamera.fetch.EnableCamera();
+                if (!SetKspCamerasEnabled("Camera ScaledSpace", true))
+                    Debug.LogWarning("[Kerbcast] re-enable: 'Camera ScaledSpace' not found, left as is");
+                if (!SetKspCamerasEnabled("GalaxyCamera", true))
+                    Debug.LogWarning("[Kerbcast] re-enable: 'GalaxyCamera' not found, left as is");
+                if (FXCamera.Instance != null)
+                {
+                    var fxCam = FXCamera.Instance.GetComponent<Camera>();
+                    if (fxCam != null) fxCam.enabled = true;
+                }
+                LogAllCameras("source-cameras-reenabled");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Kerbcast] EnableSourceCameras failed: {ex}");
             }
         }
 
@@ -985,9 +1012,8 @@ namespace Kerbcast
         // Probe whether ANY of the four main source cameras KSP uses for
         // its in-flight composite (Camera 00, Camera ScaledSpace,
         // GalaxyCamera, FXCamera) are currently disabled. Returns true
-        // even if only one is. Used at Awake to sync our
-        // _mainCamerasDisabled flag from reality before the first
-        // RebuildCameraList — needed for load-from-IVA-save / similar
+        // even if only one is. Used at Awake to re-enable them before the
+        // first RebuildCameraList, needed for load-from-IVA-save / similar
         // paths where KSP brings the scene up with some cams off.
         //
         // Uses Object.FindObjectsOfType<Camera> rather than
@@ -1022,15 +1048,11 @@ namespace Kerbcast
             return anyDisabled;
         }
 
-        /* Includes disabled cameras. Camera.allCameras lists only enabled
-           ones, so a lookup through it could never find the cameras the
-           throttle had switched off, and RestoreMainScreen left Camera
-           ScaledSpace and GalaxyCamera disabled for the rest of the KSP
-           session (both live in ScaledSpace's DontDestroyOnLoad tree, and
-           KSP never re-enables their Camera components). Every later
-           SetCameras then built scaled and galaxy clones from Unity
-           defaults. Acts on every match, so a mod's same-named clone cannot stand in for
-           the real camera. Only called on throttle toggles and rebuilds. */
+        /* Includes disabled cameras, which Camera.allCameras skips: Camera
+           ScaledSpace and GalaxyCamera live in ScaledSpace's DontDestroyOnLoad
+           tree and KSP never re-enables their Camera components itself. Acts
+           on every match, so a mod's same-named clone cannot stand in for the
+           real camera. */
         private static bool SetKspCamerasEnabled(string name, bool enabled)
         {
             var matches = KerbcastCamera.FindKspCamerasByName(name);

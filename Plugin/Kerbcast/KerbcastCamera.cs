@@ -1095,8 +1095,8 @@ namespace Kerbcast
         }
 
         /* Every non-Kerbcast camera with this name, enabled or not. Camera.allCameras
-           lists only enabled ones, which hides the sources while the main-screen
-           throttle has them off. Our own Kerbcast_* clones are skipped. */
+           lists only enabled ones, which hides a source KSP has switched off (IVA,
+           for one). Our own Kerbcast_* clones are skipped. */
         internal static List<Camera> FindKspCamerasByName(string name)
         {
             var found = new List<Camera>();
