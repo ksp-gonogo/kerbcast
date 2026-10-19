@@ -22,11 +22,16 @@ export enum CameraLifecycle {
 
 /**
  * Distinguishes an existing Hullcam part camera (`Part`) from a
- * per-kerbal face camera (`Kerbal`).
+ * per-kerbal face camera (`Kerbal`) and a fixed ground tracking-station
+ * camera watching the active craft (`GroundStation`).
+ * 
+ * Consumers must treat a value they do not recognise as "some other kind of
+ * camera" rather than failing: new kinds are added without a protocol bump.
  */
 export enum CameraKind {
 	Part = "part",
 	Kerbal = "kerbal",
+	GroundStation = "groundStation",
 }
 
 /**
@@ -67,6 +72,28 @@ export enum CaptureState {
 export enum CrewLocation {
 	Seat = "seat",
 	Eva = "eva",
+}
+
+/**
+ * Where a ground tracking-station camera stands. Present only when
+ * `CameraState.kind == GroundStation`.
+ */
+export interface GroundStationInfo {
+	/** gonogo's command-centre id for this station, `ground:<nodeName>`. */
+	stationId: string;
+	/** The CommNet home's `nodeName` (KSC's is `"KSC"`). */
+	nodeName: string;
+	/** The station's name as the player reads it in game. */
+	name: string;
+	/** Body the station sits on. */
+	body: string;
+	latitude: number;
+	longitude: number;
+	/**
+	 * Lens altitude above sea level in metres: the station's own altitude
+	 * plus the plugin's configured offset.
+	 */
+	altitude: number;
 }
 
 /**
@@ -160,6 +187,11 @@ export interface CameraState {
 	 * part cameras.
 	 */
 	crewLocation?: CrewLocation;
+	/**
+	 * Station identity for a ground tracking-station camera. `None` for
+	 * every other kind.
+	 */
+	groundStation?: GroundStationInfo;
 	/**
 	 * Server-authoritative auto-track state for a pan+zoom camera (the
 	 * operator's persistent intent). `None` (the default) = not tracking.

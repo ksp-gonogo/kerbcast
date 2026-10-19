@@ -26,7 +26,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CrewLocation,
-    DisplaySizeReport, Layer, QualityPreset, SettingsStatePayload, TrackMode,
+    DisplaySizeReport, GroundStationInfo, Layer, QualityPreset, SettingsStatePayload, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
@@ -321,6 +321,10 @@ pub struct CameraInfo {
     /// Which source a kerbal camera is currently rendering. `None` for
     /// part cameras.
     pub crew_location: Option<CrewLocation>,
+    /// Station identity for a ground tracking-station camera; omitted for
+    /// every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_station: Option<GroundStationInfo>,
     /// Server-authoritative auto-track mode for a pan+zoom camera. `None` =
     /// not tracking. Every browser reflects this.
     pub track_mode: TrackMode,
@@ -422,6 +426,21 @@ struct InfoManifest {
     /// `"seat"` or `"eva"`. `None` for part cameras.
     #[serde(default)]
     crew_location: Option<String>,
+    /// Ground station identity, present only on `"ground_station"` manifests.
+    #[serde(default)]
+    station_id: Option<String>,
+    #[serde(default)]
+    station_node_name: Option<String>,
+    #[serde(default)]
+    station_name: Option<String>,
+    #[serde(default)]
+    station_body: Option<String>,
+    #[serde(default)]
+    station_latitude: Option<f64>,
+    #[serde(default)]
+    station_longitude: Option<f64>,
+    #[serde(default)]
+    station_altitude: Option<f64>,
 }
 
 pub struct CameraState {
@@ -450,6 +469,9 @@ pub struct CameraState {
     /// (a fresh attach is never triggered by the switch). Read via
     /// `crew_location()`.
     crew_location: std::sync::Mutex<Option<CrewLocation>>,
+    /// Station identity for a ground tracking-station camera. Static for the
+    /// camera's life (the station does not move).
+    pub ground_station: Option<GroundStationInfo>,
     pub part_name: String,
     pub part_title: String,
     pub camera_name: String,
@@ -1386,6 +1408,7 @@ impl CameraRegistry {
                             max_height: ring_dims.max_height,
                             kind: camera_kind_from_manifest(&manifest.kind),
                             kerbal_persistent_id: manifest.kerbal_persistent_id,
+                            ground_station: ground_station_from_manifest(&manifest),
                             crew_location: std::sync::Mutex::new(crew_location_from_manifest(
                                 manifest.crew_location.as_deref(),
                             )),
@@ -1524,6 +1547,7 @@ impl CameraRegistry {
                 },
                 kind: s.kind,
                 kerbal_persistent_id: s.kerbal_persistent_id,
+                ground_station: s.ground_station.clone(),
                 crew_location: s.crew_location(),
                 track_mode: s.track_mode(),
                 max_width: s.max_width,
@@ -1718,6 +1742,7 @@ impl CameraRegistry {
                 },
                 kind: cam.kind,
                 kerbal_persistent_id: cam.kerbal_persistent_id,
+                ground_station: cam.ground_station.clone(),
                 capture_state: cam.capture_state_with(background_capturing),
                 crew_location: cam.crew_location(),
                 track_mode: cam.track_mode(),
@@ -2316,6 +2341,7 @@ impl CameraRegistry {
             },
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
+            ground_station: cam.ground_station.clone(),
             capture_state: cam.capture_state_with(background_capturing),
             crew_location: cam.crew_location(),
             track_mode: cam.track_mode(),
@@ -2402,6 +2428,13 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
         pan_pitch_max: 0.0,
         kind: String::new(),
         kerbal_persistent_id: None,
+        station_id: None,
+        station_node_name: None,
+        station_name: None,
+        station_body: None,
+        station_latitude: None,
+        station_longitude: None,
+        station_altitude: None,
         crew_location: None,
     };
     let bytes = match tokio::fs::read(&path).await {
@@ -2426,8 +2459,27 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
 fn camera_kind_from_manifest(kind: &str) -> CameraKind {
     match kind {
         "kerbal" => CameraKind::Kerbal,
+        "ground_station" => CameraKind::GroundStation,
         _ => CameraKind::Part,
     }
+}
+
+/// Station identity from a `"ground_station"` manifest. `None` for any other
+/// kind, or when the plugin wrote no station id.
+fn ground_station_from_manifest(m: &InfoManifest) -> Option<GroundStationInfo> {
+    if camera_kind_from_manifest(&m.kind) != CameraKind::GroundStation {
+        return None;
+    }
+    let station_id = m.station_id.clone()?;
+    Some(GroundStationInfo {
+        station_id,
+        node_name: m.station_node_name.clone().unwrap_or_default(),
+        name: m.station_name.clone().unwrap_or_default(),
+        body: m.station_body.clone().unwrap_or_default(),
+        latitude: m.station_latitude.unwrap_or_default(),
+        longitude: m.station_longitude.unwrap_or_default(),
+        altitude: m.station_altitude.unwrap_or_default(),
+    })
 }
 
 /// Manifest `crew_location` string -> protocol enum. Absent/unrecognised
@@ -3148,6 +3200,83 @@ mod tests {
         assert_eq!(info.kind, CameraKind::Kerbal);
         assert_eq!(info.kerbal_persistent_id, Some(42));
         assert_eq!(info.crew_location, Some(CrewLocation::Seat));
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(
+            json.get("groundStation").is_none(),
+            "non-ground cameras omit groundStation so existing payloads are unchanged"
+        );
+    }
+
+    /// A ground tracking-station manifest threads its kind and station
+    /// identity through `rescan` into `/cameras`, and the camera carries the
+    /// same per-camera stats fields as any other kind (it rides the normal
+    /// ring/registry path).
+    #[tokio::test]
+    async fn rescan_populates_ground_station_camera_from_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 0x8123_4567;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
+
+        let content = format!(
+            r#"{{"lifecycle":"active","kind":"ground_station","flight_id":{flight_id},"part_name":"kerbcast.groundStation","part_title":"Ground tracking station","camera_name":"KSC tracking","vessel_name":"KSC","supports_zoom":false,"fov":30,"fov_min":30,"fov_max":30,"supports_pan":false,"pan_yaw_min":0,"pan_yaw_max":0,"pan_pitch_min":0,"pan_pitch_max":0,"station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center","station_body":"Kerbin","station_latitude":-0.13,"station_longitude":-74.6,"station_altitude":95.5}}"#,
+        );
+        tokio::fs::write(shm.join(format!("{flight_id}.info.json")), content)
+            .await
+            .unwrap();
+
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        assert_eq!(cam.kind, CameraKind::GroundStation);
+        let station = cam.ground_station.clone().expect("station identity");
+        assert_eq!(station.station_id, "ground:KSC");
+        assert_eq!(station.node_name, "KSC");
+        assert_eq!(station.body, "Kerbin");
+        assert!((station.altitude - 95.5).abs() < 1e-9);
+
+        let info = registry
+            .list()
+            .await
+            .into_iter()
+            .find(|c| c.flight_id == flight_id)
+            .expect("camera in list");
+        assert_eq!(info.kind, CameraKind::GroundStation);
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["kind"], "groundStation");
+        assert_eq!(json["groundStation"]["stationId"], "ground:KSC");
+        assert_eq!(json["groundStation"]["name"], "Kerbal Space Center");
+        for key in [
+            "targetCaptureFps",
+            "displayed",
+            "captureFps",
+            "sentFps",
+            "keyframesSent",
+            "keyframeRequestsReceived",
+        ] {
+            assert!(json.get(key).is_some(), "ground camera reports {key}");
+        }
+    }
+
+    /// Station fields on a manifest of another kind are ignored.
+    #[test]
+    fn ground_station_identity_only_for_ground_kind() {
+        let m: InfoManifest =
+            serde_json::from_str(r#"{"flight_id":1,"kind":"part","station_id":"ground:KSC"}"#)
+                .unwrap();
+        assert!(ground_station_from_manifest(&m).is_none());
+        let g: InfoManifest =
+            serde_json::from_str(r#"{"flight_id":1,"kind":"ground_station"}"#).unwrap();
+        assert!(
+            ground_station_from_manifest(&g).is_none(),
+            "no station id, no identity"
+        );
     }
 
     /// A kerbal camera's `crew_location` updates LIVE when the plugin

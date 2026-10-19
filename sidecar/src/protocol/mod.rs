@@ -133,7 +133,11 @@ pub enum CaptureState {
 }
 
 /// Distinguishes an existing Hullcam part camera (`Part`) from a
-/// per-kerbal face camera (`Kerbal`).
+/// per-kerbal face camera (`Kerbal`) and a fixed ground tracking-station
+/// camera watching the active craft (`GroundStation`).
+///
+/// Consumers must treat a value they do not recognise as "some other kind of
+/// camera" rather than failing: new kinds are added without a protocol bump.
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +145,28 @@ pub enum CameraKind {
     #[default]
     Part,
     Kerbal,
+    GroundStation,
+}
+
+/// Where a ground tracking-station camera stands. Present only when
+/// `CameraState.kind == GroundStation`.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundStationInfo {
+    /// gonogo's command-centre id for this station, `ground:<nodeName>`.
+    pub station_id: String,
+    /// The CommNet home's `nodeName` (KSC's is `"KSC"`).
+    pub node_name: String,
+    /// The station's name as the player reads it in game.
+    pub name: String,
+    /// Body the station sits on.
+    pub body: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Lens altitude above sea level in metres: the station's own altitude
+    /// plus the plugin's configured offset.
+    pub altitude: f64,
 }
 
 /// Which source a kerbal camera is currently rendering: a seated IVA
@@ -191,6 +217,10 @@ pub struct CameraState {
     /// part cameras.
     #[serde(default)]
     pub crew_location: Option<CrewLocation>,
+    /// Station identity for a ground tracking-station camera. `None` for
+    /// every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ground_station: Option<GroundStationInfo>,
     /// Server-authoritative auto-track state for a pan+zoom camera (the
     /// operator's persistent intent). `None` (the default) = not tracking.
     /// Every browser reflects this; a browser track overrides a kOS aim on the
@@ -912,6 +942,7 @@ mod tests {
                 kind: CameraKind::Part,
                 capture_state: CaptureState::Full,
                 kerbal_persistent_id: None,
+                ground_station: None,
                 crew_location: None,
                 track_mode: TrackMode::None,
                 part_name: "navCam1".into(),
@@ -968,6 +999,7 @@ mod tests {
             kind: CameraKind::Part,
             capture_state: CaptureState::Full,
             kerbal_persistent_id: None,
+            ground_station: None,
             crew_location: None,
             track_mode: TrackMode::None,
             part_name: String::new(),
@@ -1476,6 +1508,7 @@ mod tests {
             kind: CameraKind::Kerbal,
             capture_state: CaptureState::Full,
             kerbal_persistent_id: Some(123456),
+            ground_station: None,
             crew_location: Some(CrewLocation::Eva),
             track_mode: TrackMode::None,
             part_name: String::new(),
