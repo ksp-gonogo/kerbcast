@@ -214,6 +214,23 @@ describe("KerbcastClient", () => {
     expect(captured.dc?.sent).toContain(JSON.stringify({ type: "hello" }));
   });
 
+  it("emits `control-open` once per control channel open, after hello is sent", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => fakeAnswer());
+    const sentAtOpen: string[][] = [];
+    client.on("control-open", () => sentAtOpen.push([...(captured.dc?.sent ?? [])]));
+
+    await client.connect();
+    expect(sentAtOpen).toHaveLength(0);
+    captured.dc?._open();
+    expect(sentAtOpen).toEqual([[JSON.stringify({ type: "hello" })]]);
+
+    await client.connect();
+    captured.dc?._open();
+    expect(sentAtOpen).toHaveLength(2);
+  });
+
   it("populates the camera registry from a snapshot push", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);

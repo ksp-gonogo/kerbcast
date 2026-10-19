@@ -31,7 +31,7 @@ function recordingRegistry() {
   return { displaySizes, reports, clears };
 }
 
-const fakeClient = {} as unknown as KerbcastClient;
+const fakeClient = { on: () => () => {} } as unknown as KerbcastClient;
 
 function fireResize(width: number, height: number) {
   act(() => {
@@ -54,6 +54,12 @@ function Harness({
   const ref = useRef<HTMLDivElement>(null);
   useReportDisplaySize(flightId, ref, { square, enabled });
   return <div ref={ref} data-testid="feed" />;
+}
+
+function LateHarness({ show }: { show: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useReportDisplaySize(7, ref);
+  return show ? <div ref={ref} data-testid="late" /> : null;
 }
 
 beforeEach(() => {
@@ -162,5 +168,19 @@ describe("useReportDisplaySize", () => {
     );
     expect(resizeCallback).toBeUndefined();
     expect(reports).toEqual([]);
+  });
+
+  it("observes an element that appears after mount", () => {
+    const { displaySizes, reports } = recordingRegistry();
+    const view = (show: boolean) => (
+      <KerbcastProvider client={fakeClient} displaySizes={displaySizes}>
+        <LateHarness show={show} />
+      </KerbcastProvider>
+    );
+    const { rerender } = render(view(false));
+    expect(resizeCallback).toBeUndefined();
+    rerender(view(true));
+    fireResize(40, 30);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 32 }]);
   });
 });

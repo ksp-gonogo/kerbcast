@@ -26,6 +26,19 @@ export function createClientSubscriptions(
   client: KerbcastClient,
 ): KerbcastSubscriptions {
   const refcounts = new Map<number, number>();
+  /*
+   * A reconnect clears every slot binding on the client and the sidecar starts
+   * the new peer empty, so re-subscribe each camera still held. Listeners fire
+   * in registration order and the provider builds this before the display-size
+   * registry, so subscriptions go out first. The sidecar treats a repeat
+   * subscribe for a bound camera as a re-announce, and a rejection (for
+   * example a full slot pool) is swallowed like every other subscribe here.
+   */
+  client.on("control-open", () => {
+    for (const flightId of refcounts.keys()) {
+      client.subscribe(flightId).catch(() => {});
+    }
+  });
   return {
     acquire(flightId: number): void {
       const count = (refcounts.get(flightId) ?? 0) + 1;
@@ -98,6 +111,17 @@ export function createClientDisplaySizes(
     lastSent.set(flightId, { w: maxW, h: maxH });
     client.reportDisplaySize(flightId, maxW, maxH).catch(() => {});
   }
+
+  /*
+   * The sidecar forgets a peer's display sizes when the peer leaves, so after
+   * a reconnect nothing it holds matches lastSent. Re-send the current MAX for
+   * every camera that still has reporters, once the new control channel is
+   * open and can take messages.
+   */
+  client.on("control-open", () => {
+    lastSent.clear();
+    for (const flightId of [...perCamera.keys()]) recompute(flightId);
+  });
 
   return {
     report(flightId: number, instanceId: string, width: number, height: number): void {
