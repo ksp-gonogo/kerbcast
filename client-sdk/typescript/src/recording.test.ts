@@ -169,6 +169,35 @@ class FakeCamera implements RecordingClientCamera {
   emitState(state: CameraState): void {
     this.state = state;
     for (const l of [...this.listeners]) l(state);
+    if (this.decodedFollowsState) this.setDecoded(state.renderWidth, state.renderHeight);
+  }
+
+  /**
+   * When true (the default), every emitted state also lands as the decoded
+   * frame size at once, as if the decoder kept pace with the sidecar. A test
+   * modelling the real lag between the two sets this false and drives
+   * {@link setDecoded} itself.
+   */
+  decodedFollowsState = true;
+  decoded: { width: number; height: number } | null = null;
+  private readonly decodedListeners = new Set<(width: number, height: number) => void>();
+
+  /** Test hook: the decoder delivers a frame of this size. */
+  setDecoded(width: number, height: number): void {
+    this.decoded = { width, height };
+    for (const l of [...this.decodedListeners]) l(width, height);
+  }
+
+  /** Fake {@link DecodedSizeProbe} body: reports the current size at once, then each change. */
+  probe(onSize: (width: number, height: number) => void): () => void {
+    this.decodedListeners.add(onSize);
+    if (this.decoded) onSize(this.decoded.width, this.decoded.height);
+    return () => this.decodedListeners.delete(onSize);
+  }
+
+  /** Live decoded-size probe count, to assert a wait releases its probe. */
+  get probeCount(): number {
+    return this.decodedListeners.size;
   }
 
   /** Live "change" subscription count, to assert a wait releases its listener. */
@@ -444,7 +473,10 @@ describe("RecordingController force-full-resolution", () => {
         return new Blob([new Uint8Array(16)], { type: mimeType });
       },
     };
-    ctrl = new RecordingController(client, { loadTrimmer: () => Promise.resolve(fakeTrimmer) });
+    ctrl = new RecordingController(client, {
+      loadTrimmer: () => Promise.resolve(fakeTrimmer),
+      probeDecodedSize: (flightId, _stream, onSize) => client.camera(flightId).probe(onSize),
+    });
   });
 
   describe("single (arm-and-wait)", () => {
@@ -651,96 +683,396 @@ describe("RecordingController force-full-resolution", () => {
     });
   });
 
-  describe("grouped (record immediately)", () => {
-    it("starts every member's recorder immediately, without arming", () => {
-      const cam1 = client.camera(1);
-      const cam2 = client.camera(2);
+  describe("grouped (arm every member, start together)", () => {
+    const fullState = (flightId: number): CameraState =>
+      makeCameraState({
+        flightId,
+        renderWidth: 1920,
+        renderHeight: 1080,
+        operatorWidth: 1920,
+        operatorHeight: 1080,
+      });
+    const tileState = (flightId: number): CameraState =>
+      makeCameraState({
+        flightId,
+        renderWidth: 720,
+        renderHeight: 400,
+        operatorWidth: 720,
+        operatorHeight: 400,
+      });
+    const armingOf = (id: string): boolean | undefined =>
+      ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming;
 
+    let startSpy: ReturnType<typeof vi.spyOn>;
+    let cam1: FakeCamera;
+    let cam2: FakeCamera;
+
+    beforeEach(() => {
+      startSpy = vi.spyOn(StubMediaRecorder.prototype, "start");
+      /* maxRenderSize must be set BEFORE starting the group: watchResolutionReady
+         reads it synchronously at watch-start, so setting it afterwards would
+         silently exercise the (weaker) unknown-ceiling fallback instead. */
+      cam1 = client.camera(1);
+      cam2 = client.camera(2);
+      cam1.maxRenderSize = { width: 1920, height: 1080 };
+      cam2.maxRenderSize = { width: 1920, height: 1080 };
+      cam1.emitState(tileState(1));
+      cam2.emitState(tileState(2));
+    });
+
+    afterEach(() => {
+      startSpy.mockRestore();
+      vi.useRealTimers();
+    });
+
+    it("sends force for every member and arms them all without starting any recorder", () => {
       const { recordingIds } = ctrl.startGroupedRecording([1, 2], {
         forceFullResolution: true,
       });
 
       expect(cam1.forceCalls).toEqual([true]);
       expect(cam2.forceCalls).toEqual([true]);
-      const active = ctrl.getSnapshot().active;
-      expect(active).toHaveLength(2);
-      expect(active.every((a) => a.arming === false)).toBe(true);
-      expect(recordingIds).toHaveLength(2);
+      expect(recordingIds.map(armingOf)).toEqual([true, true]);
+      expect(startSpy).not.toHaveBeenCalled();
     });
 
-    it("captures each member's resolution-ready UT and folds it into the common trim window", async () => {
+    it("starts every recorder together only once the last member reaches full resolution", async () => {
       client.captureUt = 500;
-      /* maxRenderSize must be set BEFORE starting the group: watchResolutionReady
-         reads it synchronously at watch-start, so setting it afterwards would
-         silently exercise the (weaker) unknown-ceiling fallback instead of the
-         known-ceiling path this test is meant to cover. */
-      const cam1 = client.camera(1);
-      const cam2 = client.camera(2);
-      cam1.maxRenderSize = { width: 1920, height: 1080 };
-      cam2.maxRenderSize = { width: 1920, height: 1080 };
+      const { recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+
+      client.tick(502);
+      cam1.emitState(fullState(1));
+      await flush();
+      /* One member ready is not enough: nobody starts yet. */
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(recordingIds.map(armingOf)).toEqual([true, true]);
+
+      client.tick(506);
+      cam2.emitState(fullState(2));
+      await flush();
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(recordingIds.map(armingOf)).toEqual([false, false]);
+      /* One shared clock base: both clips open at the same instant. */
+      const [a, b] = recordingIds.map(
+        (id) => ctrl.getSnapshot().active.find((x) => x.recordingId === id)!,
+      );
+      expect(a.startedAt).toBe(b.startedAt);
+      /* The per-member watches were released once the group started. */
+      expect(cam1.changeListenerCount).toBe(0);
+      expect(cam2.changeListenerCount).toBe(0);
+    });
+
+    it("opens every clip at the start UT, so the common window starts there with no lead-in to cut", async () => {
+      client.captureUt = 500;
       const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2], {
         forceFullResolution: true,
       });
-      const [id1, id2] = recordingIds;
-
-      /* Feed 1 reaches full resolution quickly. */
-      client.tick(502);
-      cam1.emitState(
-        makeCameraState({
-          flightId: 1,
-          renderWidth: 1920,
-          renderHeight: 1080,
-          operatorWidth: 1920,
-          operatorHeight: 1080,
-        }),
-      );
-      await flush();
-
-      /* Feed 2 reaches full resolution later; this later UT should win the fold. */
-      client.tick(506);
-      cam2.emitState(
-        makeCameraState({
-          flightId: 2,
-          renderWidth: 1920,
-          renderHeight: 1080,
-          operatorWidth: 1920,
-          operatorHeight: 1080,
-        }),
-      );
+      client.tick(503);
+      cam1.emitState(fullState(1));
+      cam2.emitState(fullState(2));
       await flush();
 
       client.captureUt = 510;
       const handle = await ctrl.stopGroupedRecording(groupId);
 
-      expect(handle.commonUtWindow).toEqual([500, 510]);
+      for (const rec of handle.recordings) {
+        expect(rec.utStart).toBe(503);
+        expect(rec.byteSize).toBeGreaterThan(0);
+      }
+      expect(handle.commonUtWindow).toEqual([503, 510]);
       expect(trimCalls).toHaveLength(2);
-
-      /* recordings/trimCalls preserve the [id1, id2] order Promise.all was
-         given, regardless of which member's trim settles first. */
-      const rec1 = handle.recordings.find((r) => r.recordingId === id1)!;
-      const rec2 = handle.recordings.find((r) => r.recordingId === id2)!;
-      const [call1, call2] = trimCalls;
-      /* The window start used is the LATEST resolution-ready UT (506), not
-         the raw common window start (500), for both clips alike (one common
-         window, UT-synced). */
-      expect(call1.startMs).toBe(utToRecordingTimeMs(rec1.utSamples, 506));
-      expect(call2.startMs).toBe(utToRecordingTimeMs(rec2.utSamples, 506));
-      /* Confirms the fold actually moved the start later than the untouched
-         common window would have. */
-      expect(call1.startMs).toBeGreaterThan(utToRecordingTimeMs(rec1.utSamples, 500)!);
+      const rec1 = handle.recordings.find((r) => r.recordingId === recordingIds[0])!;
+      expect(trimCalls[0].startMs).toBe(utToRecordingTimeMs(rec1.utSamples, 503));
+      expect(trimCalls[0].startMs).toBe(0);
     });
 
-    it("leaves the lead-in untrimmed when no member ever reaches full resolution", async () => {
+    it("starts every member anyway once the shared ARM_TIMEOUT_MS passes", async () => {
+      vi.useFakeTimers();
+      const { recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+      cam1.emitState(fullState(1));
+      await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS - 1);
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(recordingIds.map(armingOf)).toEqual([true, true]);
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(recordingIds.map(armingOf)).toEqual([false, false]);
+      /* The straggler's watch was cancelled, not leaked. */
+      expect(cam2.changeListenerCount).toBe(0);
+    });
+
+    it("starts promptly when every member is already at its ceiling", async () => {
+      cam1.emitState(fullState(1));
+      cam2.emitState(fullState(2));
+      const { recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+      await flush();
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(recordingIds.map(armingOf)).toEqual([false, false]);
+    });
+
+    it("discarding the slow member mid-arm releases its force and lets the rest start", async () => {
+      const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+      cam1.emitState(fullState(1));
+      await flush();
+      expect(startSpy).not.toHaveBeenCalled();
+
+      ctrl.discardRecording(recordingIds[1]);
+
+      expect(cam2.forceCalls).toEqual([true, false]);
+      expect(cam2.changeListenerCount).toBe(0);
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(armingOf(recordingIds[0])).toBe(false);
+
+      const handle = await ctrl.stopGroupedRecording(groupId);
+      expect(handle.recordings.map((r) => r.recordingId)).toEqual([recordingIds[0]]);
+      expect(handle.recordings[0].byteSize).toBeGreaterThan(0);
+    });
+
+    it("discarding the whole group mid-arm releases every force and never starts a recorder", async () => {
+      const { groupId } = ctrl.startGroupedRecording([1, 2], { forceFullResolution: true });
+      cam1.emitState(fullState(1));
+      await flush();
+
+      ctrl.discardGroupedRecording(groupId);
+
+      expect(cam1.forceCalls).toEqual([true, false]);
+      expect(cam2.forceCalls).toEqual([true, false]);
+      expect(cam2.changeListenerCount).toBe(0);
+      expect(ctrl.getSnapshot().active).toHaveLength(0);
+
+      cam2.emitState(fullState(2));
+      await flush();
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it("stopping the group mid-arm settles empty clips, releases force, and never starts later", async () => {
+      vi.useFakeTimers();
       client.captureUt = 100;
       const { groupId } = ctrl.startGroupedRecording([1, 2], { forceFullResolution: true });
-      client.captureUt = 105;
+
+      client.captureUt = 101;
       const handle = await ctrl.stopGroupedRecording(groupId);
 
-      expect(handle.commonUtWindow).toEqual([100, 105]);
-      expect(trimCalls).toHaveLength(2);
-      for (const call of trimCalls) {
-        expect(call.startMs).toBe(utToRecordingTimeMs(handle.recordings[0].utSamples, 100));
+      expect(handle.recordings).toHaveLength(2);
+      for (const rec of handle.recordings) expect(rec.byteSize).toBe(0);
+      expect(cam1.forceCalls).toEqual([true, false]);
+      expect(cam2.forceCalls).toEqual([true, false]);
+      /* Empty clips have nothing to cut. */
+      expect(trimCalls).toHaveLength(0);
+      expect(ctrl.getSnapshot().active).toHaveLength(0);
+
+      /* Neither a late bump nor the old timeout resurrects anything. */
+      cam1.emitState(fullState(1));
+      cam2.emitState(fullState(2));
+      await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS);
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it("stopping one member mid-arm lets the rest start without it", async () => {
+      const { recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+      cam1.emitState(fullState(1));
+      await flush();
+
+      const stopped = await ctrl.stopRecording(recordingIds[1]);
+
+      expect(stopped.byteSize).toBe(0);
+      expect(cam2.forceCalls).toEqual([true, false]);
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(armingOf(recordingIds[0])).toBe(false);
+    });
+
+    it("leaves a group without full resolution exactly as before: no force, no arming, recorders start at once", () => {
+      const { recordingIds } = ctrl.startGroupedRecording([1, 2]);
+
+      expect(cam1.forceCalls).toEqual([]);
+      expect(cam2.forceCalls).toEqual([]);
+      expect(recordingIds.map(armingOf)).toEqual([false, false]);
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(cam1.changeListenerCount).toBe(0);
+    });
+  });
+
+  describe("decoded-frame gate", () => {
+    const sized = (flightId: number, width: number, height: number): CameraState =>
+      makeCameraState({
+        flightId,
+        renderWidth: width,
+        renderHeight: height,
+        operatorWidth: width,
+        operatorHeight: height,
+      });
+    const armingOf = (id: string): boolean | undefined =>
+      ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming;
+
+    let infoSpy: ReturnType<typeof vi.spyOn>;
+
+    /* The real lag: the state reports the new size before the decoder
+       delivers it, so each camera here starts at the tile size with the
+       decoder decoupled from the state. */
+    const laggingCamera = (flightId: number): FakeCamera => {
+      const cam = client.camera(flightId);
+      cam.maxRenderSize = { width: 1024, height: 576 };
+      cam.decodedFollowsState = false;
+      cam.emitState(sized(flightId, 752, 416));
+      cam.setDecoded(752, 416);
+      return cam;
+    };
+
+    beforeEach(() => {
+      infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      infoSpy.mockRestore();
+      vi.useRealTimers();
+    });
+
+    it("keeps a single recording armed while the state reports full size but decoded frames are still tile-size", async () => {
+      const cam = laggingCamera(42);
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+
+      cam.emitState(sized(42, 1024, 576));
+      await flush();
+      expect(armingOf(id)).toBe(true);
+
+      cam.setDecoded(1024, 576);
+      await flush();
+      expect(armingOf(id)).toBe(false);
+      expect(cam.probeCount).toBe(0);
+      expect(infoSpy).toHaveBeenCalledWith(
+        `kerbcast: recording ${id} started after arming (full resolution); decoded size 42=1024x576`,
+      );
+    });
+
+    it("accepts a decoded size a few pixels under the ceiling (encoder rounding)", async () => {
+      const cam = laggingCamera(42);
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+
+      cam.setDecoded(1024, 570);
+      await flush();
+      expect(armingOf(id)).toBe(false);
+    });
+
+    it("starts on ARM_TIMEOUT_MS when decoded frames never reach full size, logging the timeout and releasing the probe", async () => {
+      vi.useFakeTimers();
+      const cam = laggingCamera(42);
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      cam.emitState(sized(42, 1024, 576));
+
+      await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS - 1);
+      expect(armingOf(id)).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(armingOf(id)).toBe(false);
+      expect(cam.probeCount).toBe(0);
+      expect(infoSpy).toHaveBeenCalledWith(
+        `kerbcast: recording ${id} started after arming (arm timeout); decoded size 42=752x416`,
+      );
+    });
+
+    it("releases the probe when a recording is discarded while waiting on decoded frames", async () => {
+      const cam = laggingCamera(42);
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      expect(cam.probeCount).toBe(1);
+
+      ctrl.discardRecording(id);
+      expect(cam.probeCount).toBe(0);
+
+      cam.setDecoded(1024, 576);
+      await flush();
+      expect(ctrl.getSnapshot().active).toHaveLength(0);
+    });
+
+    it("releases the probe when a recording is stopped while waiting on decoded frames", async () => {
+      const cam = laggingCamera(42);
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+
+      const handle = await ctrl.stopRecording(id);
+
+      expect(handle.byteSize).toBe(0);
+      expect(cam.probeCount).toBe(0);
+    });
+
+    it("starts no probe and falls back to the state check when the ceiling is unknown", async () => {
+      const cam = laggingCamera(42);
+      cam.maxRenderSize = null;
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      expect(cam.probeCount).toBe(0);
+
+      cam.emitState(sized(42, 1024, 576));
+      await flush();
+      expect(armingOf(id)).toBe(false);
+    });
+
+    it("starts a group only once every member's decoded frames reach full size, whatever the state says", async () => {
+      const startSpy = vi.spyOn(StubMediaRecorder.prototype, "start");
+      try {
+        const cam1 = laggingCamera(1);
+        const cam2 = laggingCamera(2);
+        const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2], {
+          forceFullResolution: true,
+        });
+
+        cam1.emitState(sized(1, 1024, 576));
+        cam2.emitState(sized(2, 1024, 576));
+        cam1.setDecoded(1024, 576);
+        await flush();
+        expect(startSpy).not.toHaveBeenCalled();
+        expect(recordingIds.map(armingOf)).toEqual([true, true]);
+
+        cam2.setDecoded(1024, 576);
+        await flush();
+        expect(startSpy).toHaveBeenCalledTimes(2);
+        expect(cam1.probeCount).toBe(0);
+        expect(cam2.probeCount).toBe(0);
+        expect(infoSpy).toHaveBeenCalledWith(
+          `kerbcast: grouped recording ${groupId} started 2 member(s) after arming (all at full resolution); decoded sizes 1=1024x576 2=1024x576`,
+        );
+      } finally {
+        startSpy.mockRestore();
       }
+    });
+
+    it("logs the timeout and each member's last decoded size when a group times out", async () => {
+      vi.useFakeTimers();
+      const cam1 = laggingCamera(1);
+      const cam2 = laggingCamera(2);
+      const { groupId } = ctrl.startGroupedRecording([1, 2], { forceFullResolution: true });
+      cam1.setDecoded(1024, 576);
+
+      await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS);
+
+      expect(cam2.probeCount).toBe(0);
+      expect(infoSpy).toHaveBeenCalledWith(
+        `kerbcast: grouped recording ${groupId} started 2 member(s) after arming (arm timeout); decoded sizes 1=1024x576 2=752x416`,
+      );
+    });
+
+    it("releases every member's probe when a group is stopped or discarded mid-arm", async () => {
+      const cam1 = laggingCamera(1);
+      const cam2 = laggingCamera(2);
+      const first = ctrl.startGroupedRecording([1, 2], { forceFullResolution: true });
+      expect(cam1.probeCount + cam2.probeCount).toBe(2);
+      await ctrl.stopGroupedRecording(first.groupId);
+      expect(cam1.probeCount + cam2.probeCount).toBe(0);
+
+      const second = ctrl.startGroupedRecording([1, 2], { forceFullResolution: true });
+      expect(cam1.probeCount + cam2.probeCount).toBe(2);
+      ctrl.discardGroupedRecording(second.groupId);
+      expect(cam1.probeCount + cam2.probeCount).toBe(0);
     });
   });
 

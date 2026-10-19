@@ -6,7 +6,10 @@
  * the mock's `set-force-full-resolution` handling actually satisfies the
  * SDK's arm-and-wait / grouped-trim logic end to end: a forced single feed
  * really arms then records (not stuck arming forever) and a forced group
- * really trims its lead-in to the resolution-ready point.
+ * really arms every member, then starts them together once all are ready.
+ * jsdom has no decoder, so the decoded-size gate follows the mock's camera
+ * state here (stateFollowingDecodedSizeProbe); the gap between the two is
+ * covered in the SDK's own recording tests.
  *
  * Client-level, not App/component-level: `client.recording` is driven
  * directly. The web app's own option-wiring (Settings toggle governs the
@@ -21,6 +24,7 @@ import type { GroupTrimmer } from "@ksp-gonogo/kerbcast";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "./connectionManager";
+import { stateFollowingDecodedSizeProbe } from "./mock/decodedSizeProbe";
 
 function fakeVideoTrack(): MediaStreamTrack {
   return { kind: "video" } as MediaStreamTrack;
@@ -55,8 +59,13 @@ async function connectedClientWithTracks(
     return Promise.reject(new Error(`unexpected fetch: ${url}`));
   });
 
-  const client = new KerbcastClient(
-    { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), recording: { loadTrimmer } },
+  const client: KerbcastClient = new KerbcastClient(
+    {
+      host: "h",
+      port: 1,
+      negotiate: (o) => sidecar.negotiate(o),
+      recording: { loadTrimmer, probeDecodedSize: stateFollowingDecodedSizeProbe(() => client) },
+    },
     sidecar.createTransport(),
   );
   await client.discover();
@@ -130,21 +139,23 @@ describe("force-full-resolution through the mock: single feed", () => {
 });
 
 describe("force-full-resolution through the mock: grouped", () => {
-  it("records every member immediately (no arming) and trims the lead-in to the resolution-ready point", async () => {
-    vi.useFakeTimers();
-    const sidecar = new MockSidecar({ forceBumpDelayMs: 200 });
+  async function forcedGroupClient(forceBumpDelayMs: number): Promise<{
+    sidecar: MockSidecar;
+    client: KerbcastClient;
+    trimCalls: { startMs: number; endMs: number }[];
+  }> {
+    const sidecar = new MockSidecar({ forceBumpDelayMs });
     for (const flightId of [1, 2]) {
       sidecar.addCamera({
         flightId,
-        renderWidth: 640,
-        renderHeight: 360,
-        operatorWidth: 640,
-        operatorHeight: 360,
-        maxWidth: 1920,
-        maxHeight: 1080,
+        renderWidth: 720,
+        renderHeight: 400,
+        operatorWidth: 720,
+        operatorHeight: 400,
+        maxWidth: 1024,
+        maxHeight: 576,
       });
     }
-
     const trimCalls: { startMs: number; endMs: number }[] = [];
     const fakeTrimmer: GroupTrimmer = {
       trim: async (blob, _mimeType, startMs, endMs) => {
@@ -155,87 +166,63 @@ describe("force-full-resolution through the mock: grouped", () => {
     const client = await connectedClientWithTracks(sidecar, [1, 2], () =>
       Promise.resolve(fakeTrimmer),
     );
+    return { sidecar, client, trimCalls };
+  }
+
+  const armingOf = (client: KerbcastClient, ids: string[]): (boolean | undefined)[] =>
+    ids.map((id) => client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming);
+
+  it("arms every member, then starts them together once the mock lands both bumps", async () => {
+    vi.useFakeTimers();
+    const { sidecar, client, trimCalls } = await forcedGroupClient(200);
 
     sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
-
     const { groupId, recordingIds } = client.recording.startGroupedRecording([1, 2], {
       forceFullResolution: true,
     });
 
-    // Grouped members record immediately: no arming, ever.
-    const active = client.recording.getSnapshot().active;
-    expect(active.every((a) => a.arming === false)).toBe(true);
     expect(sidecar.lastCommand("set-force-full-resolution", 1)?.content.force).toBe(true);
     expect(sidecar.lastCommand("set-force-full-resolution", 2)?.content.force).toBe(true);
+    expect(armingOf(client, recordingIds)).toEqual([true, true]);
 
-    // Some recording-time passes (a distinct utSamples point), then UT
-    // advances while the feeds are still catching up to full resolution.
+    /* UT moves on while the feeds are still at tile size: none of this
+       lead-in may reach a clip. */
     await vi.advanceTimersByTimeAsync(100);
     sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 506 });
+    expect(armingOf(client, recordingIds)).toEqual([true, true]);
 
-    // The remaining half of the bump delay elapses: both cameras' bumps land,
-    // each firing camera-state-changed, which resolves each member's
-    // resolution-ready wait at the CURRENT captureUt (still 506).
     await vi.advanceTimersByTimeAsync(100);
+    expect(armingOf(client, recordingIds)).toEqual([false, false]);
 
+    await vi.advanceTimersByTimeAsync(100);
     sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 510 });
     const handle = await client.recording.stopGroupedRecording(groupId);
 
-    expect(handle.commonUtWindow).toEqual([500, 510]);
+    /* Both clips open at the UT the recorders started on, after the bump. */
+    expect(handle.recordings.map((r) => r.utStart)).toEqual([506, 506]);
+    expect(handle.commonUtWindow).toEqual([506, 510]);
     expect(trimCalls).toHaveLength(2);
-
-    const rec1 = handle.recordings.find((r) => r.recordingId === recordingIds[0])!;
-    const expectedStartMs = utToRecordingTimeMs(rec1.utSamples, 506);
-    expect(trimCalls[0].startMs).toBe(expectedStartMs);
-    // Confirms the fold actually moved the start later than the raw common
-    // window (500) would have, i.e. the low-res lead-in is really cut.
-    expect(trimCalls[0].startMs).toBeGreaterThan(utToRecordingTimeMs(rec1.utSamples, 500)!);
+    for (const call of trimCalls) expect(call.startMs).toBe(0);
+    expect(sidecar.lastCommand("set-force-full-resolution", 1)?.content.force).toBe(false);
+    expect(sidecar.lastCommand("set-force-full-resolution", 2)?.content.force).toBe(false);
   });
 
-  it("leaves the lead-in untrimmed when no member ever reaches full resolution", async () => {
-    // Real timers: a gap exists (the mock *could* bump these), but the test
-    // never waits out the delay, modelling a feed that's out of flight or
-    // wedged and never actually lands the bump (the design's documented
-    // "never reaches full" edge case, bounded rather than hanging forever).
-    const sidecar = new MockSidecar({ forceBumpDelayMs: 200 });
-    sidecar.addCamera({
-      flightId: 1,
-      operatorWidth: 640,
-      operatorHeight: 360,
-      maxWidth: 1920,
-      maxHeight: 1080,
-    });
-    sidecar.addCamera({
-      flightId: 2,
-      operatorWidth: 640,
-      operatorHeight: 360,
-      maxWidth: 1920,
-      maxHeight: 1080,
-    });
+  it("starts every member after ARM_TIMEOUT_MS when the bumps never land", async () => {
+    vi.useFakeTimers();
+    /* A bump far beyond the arm bound models a feed out of flight or wedged. */
+    const { client } = await forcedGroupClient(60_000);
 
-    const trimCalls: { startMs: number; endMs: number }[] = [];
-    const fakeTrimmer: GroupTrimmer = {
-      trim: async (blob, _mimeType, startMs, endMs) => {
-        trimCalls.push({ startMs, endMs });
-        return blob;
-      },
-    };
-    const client = await connectedClientWithTracks(sidecar, [1, 2], () =>
-      Promise.resolve(fakeTrimmer),
-    );
-
-    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 100 });
-    const { groupId } = client.recording.startGroupedRecording([1, 2], {
+    const { groupId, recordingIds } = client.recording.startGroupedRecording([1, 2], {
       forceFullResolution: true,
     });
-    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 105 });
-    const handle = await client.recording.stopGroupedRecording(groupId);
+    await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS - 100);
+    expect(armingOf(client, recordingIds)).toEqual([true, true]);
 
-    expect(handle.commonUtWindow).toEqual([100, 105]);
-    expect(trimCalls).toHaveLength(2);
-    for (const call of trimCalls) {
-      expect(call.startMs).toBe(utToRecordingTimeMs(handle.recordings[0].utSamples, 100));
-    }
+    await vi.advanceTimersByTimeAsync(100);
+    expect(armingOf(client, recordingIds)).toEqual([false, false]);
+
+    const handle = await client.recording.stopGroupedRecording(groupId);
+    for (const rec of handle.recordings) expect(rec.byteSize).toBeGreaterThan(0);
   });
 });
 
@@ -279,8 +266,13 @@ describe("force-full-resolution through the real production connect flow (Connec
       return Promise.reject(new Error(`unexpected fetch: ${url}`));
     });
 
-    const client = new KerbcastClient(
-      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+    const client: KerbcastClient = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: (o) => sidecar.negotiate(o),
+        recording: { probeDecodedSize: stateFollowingDecodedSizeProbe(() => client) },
+      },
       sidecar.createTransport(),
     );
 

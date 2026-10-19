@@ -19,6 +19,7 @@ interface FakeActive {
   flightId: number;
   startedAt: number;
   groupId?: string;
+  arming?: boolean;
 }
 
 const startGroupSpy = vi.fn<(flightIds: number[], opts?: { forceFullResolution?: boolean }) => string>();
@@ -55,6 +56,8 @@ vi.mock("@ksp-gonogo/kerbcast-react", async (importOriginal) => {
             flightId,
             startedAt: nowMs(),
             groupId,
+            /* Mirrors the real controller: a full-resolution group arms first. */
+            arming: opts?.forceFullResolution === true,
           })),
         );
         return groupId;
@@ -324,13 +327,14 @@ describe("RecGroupBar - full resolution checkbox", () => {
 });
 
 describe("RecGroupBar - recording", () => {
-  function startThenRecord(onStopped: () => void = () => {}) {
+  function startThenRecord(onStopped: () => void = () => {}, fullResolution = false) {
     let r: ReturnType<typeof render>;
     r = render(
       <RecGroupBar
         active={true}
         selectedFlightIds={new Set([1, 2])}
         groupId={null}
+        defaultFullResolution={fullResolution}
         onCancel={() => {}}
         onStarted={() => {}}
         onStopped={onStopped}
@@ -357,6 +361,26 @@ describe("RecGroupBar - recording", () => {
   it("shows a 'recording N feeds' indicator reflecting the store's active members", () => {
     startThenRecord();
     expect(screen.getByText(/recording 2 feeds/i)).toBeTruthy();
+  });
+
+  it("shows an arming indicator instead of the timer while a full-resolution group arms", () => {
+    startThenRecord(() => {}, true);
+    expect(screen.getByText(/arming 2 feeds for full resolution/i)).toBeTruthy();
+    expect(screen.queryByText(/recording 2 feeds/i)).toBeNull();
+    expect(screen.queryByText(/0:00/)).toBeNull();
+  });
+
+  it("can stop a full-resolution group while it is still arming", async () => {
+    const onStopped = vi.fn();
+    startThenRecord(onStopped, true);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /stop grouped recording/i }));
+      await Promise.resolve();
+    });
+
+    expect(stopGroupSpy).toHaveBeenCalledWith("grp-1");
+    expect(onStopped).toHaveBeenCalledTimes(1);
   });
 
   it("ticks an elapsed timer while recording", async () => {

@@ -15,6 +15,7 @@ import { CameraKind, CameraLifecycle, CrewLocation, KerbcastClient } from "@ksp-
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { loadLocalMediabunnyTrimmer } from "../mediabunnyAsset";
+import { stateFollowingDecodedSizeProbe } from "./decodedSizeProbe";
 
 const MOCK_CAMERAS: MockCameraInit[] = [
   {
@@ -250,11 +251,14 @@ export async function createMockClient(): Promise<KerbcastClient> {
     if (track) sidecar.deliverTrack(mid, track);
   });
 
-  const mockClient = new KerbcastClient(
+  const mockClient: KerbcastClient = new KerbcastClient(
     {
       host: "mock",
       port: 0,
-      recording: { loadTrimmer: loadLocalMediabunnyTrimmer },
+      recording: {
+        loadTrimmer: loadLocalMediabunnyTrimmer,
+        probeDecodedSize: stateFollowingDecodedSizeProbe(() => mockClient),
+      },
       negotiate: async (offer) => {
         const answer = await sidecar.negotiate(offer);
         /*

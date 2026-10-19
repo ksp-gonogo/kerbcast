@@ -185,6 +185,19 @@ export function tryCreateNoisePipeline(
   const draw = () => {
     if (destroyed) return;
     const now = performance.now();
+    /*
+     * Follow mid-stream size changes. loadedmetadata fires once per source,
+     * so without this the canvas (and the processed stream every consumer
+     * displays and records) stays at the first decoded size forever, even
+     * after the sidecar raises the render size.
+     */
+    if (
+      video.srcObject &&
+      video.videoWidth > 0 &&
+      (video.videoWidth !== canvas.width || video.videoHeight !== canvas.height)
+    ) {
+      onMeta();
+    }
     const cw = canvas.width;
     const ch = canvas.height;
     const nw = noiseCanvas.width;

@@ -65,21 +65,23 @@ export interface StartRecordingOptions {
   /**
    * Force this feed to the operator's full render size for the duration of
    * the recording (overrides the display-size demand only; still yields to
-   * the adaptive framerate shed). Off by default. A single recording arms
-   * and waits (bounded) for the bump before the clip starts, so it opens on
-   * full-res frames; a grouped recording starts immediately and the lead-in
-   * is cut via the existing UT-window trim instead. Released automatically
-   * on stop, discard, or auto-stop.
+   * the adaptive framerate shed). Off by default. The recording arms and
+   * waits (bounded) until the browser is decoding full-size frames before
+   * the clip starts: MediaRecorder fixes the clip's frame size when it
+   * starts, so a later bump would never reach the file. A grouped recording
+   * arms every member and starts all their recorders together once every
+   * feed is ready (or the shared bound passes). Released automatically on
+   * stop, discard, or auto-stop.
    */
   forceFullResolution?: boolean;
 }
 
 /**
- * Bound on the single-recording arm-and-wait: how long
- * {@link RecordingController.startRecording} waits for a forced feed to
- * reach full resolution before starting the recorder anyway. Never hangs a
- * start indefinitely (feed out of flight, wedged, or the sidecar/plugin
- * round trip taking longer than expected).
+ * Bound on the arm-and-wait: how long a forced recording waits for its feed
+ * (or, for a group, every member's feed) to reach full resolution before
+ * starting the recorder anyway. Never hangs a start indefinitely (feed out
+ * of flight, wedged, or the sidecar/plugin round trip taking longer than
+ * expected).
  */
 export const ARM_TIMEOUT_MS = 3000;
 
@@ -148,11 +150,11 @@ export interface ActiveRecordingInfo {
   startedAt: number;
   groupId?: string;
   /**
-   * True while a single forced recording is armed (force sent, waiting for
-   * the feed to reach full resolution) but the recorder has not started
-   * yet. Always false for a non-forced recording and for grouped members
-   * (which record immediately). A UI shows a distinct "arming" state while
-   * this is true.
+   * True while a forced recording is armed (force sent, waiting for the
+   * feed to reach full resolution) but the recorder has not started yet.
+   * Forced grouped members stay arming until every member is ready, then
+   * flip together. Always false for a non-forced recording. A UI shows a
+   * distinct "arming" state while this is true.
    */
   arming: boolean;
 }
@@ -299,6 +301,95 @@ export interface GroupTrimmer {
 /** Loads a {@link GroupTrimmer}, or resolves null when trimming is unavailable. */
 export type TrimmerLoader = () => Promise<GroupTrimmer | null>;
 
+/**
+ * Watches the decoded frame size of a feed's live stream, calling `onSize`
+ * whenever it is known or changes (repeats are fine). Returns a stop function
+ * that releases everything the probe holds. The arm-and-wait gates a forced
+ * recording on this, not on the reported camera state: the state flips to
+ * the full size before the decoder delivers full-size frames, and
+ * MediaRecorder locks the clip to whatever size it sees first.
+ */
+export type DecodedSizeProbe = (
+  flightId: number,
+  stream: MediaStream,
+  onSize: (width: number, height: number) => void,
+) => () => void;
+
+/* Structural view of requestVideoFrameCallback, which not every DOM lib
+   version types. */
+interface FrameCallbackVideo {
+  requestVideoFrameCallback?(
+    cb: (now: number, meta: { width?: number; height?: number }) => void,
+  ): number;
+  cancelVideoFrameCallback?(id: number): void;
+}
+
+/**
+ * Default {@link DecodedSizeProbe}: plays the stream into an off-DOM muted
+ * `<video>` and reads the decoded size from each frame
+ * (requestVideoFrameCallback where available) and from `resize` /
+ * `loadedmetadata`. `track.getSettings()` is not used because Chromium often
+ * reports stale or missing dimensions for remote WebRTC tracks. Outside a
+ * browser it never reports, so a forced recording falls back to the arm
+ * timeout.
+ */
+export const videoElementDecodedSizeProbe: DecodedSizeProbe = (_flightId, stream, onSize) => {
+  if (typeof document === "undefined") return () => {};
+  const video = document.createElement("video");
+  const vfc = video as unknown as FrameCallbackVideo;
+  video.muted = true;
+  video.playsInline = true;
+  let stopped = false;
+  let frameId: number | undefined;
+
+  const report = (): void => {
+    if (!stopped && video.videoWidth > 0 && video.videoHeight > 0) {
+      onSize(video.videoWidth, video.videoHeight);
+    }
+  };
+  const onFrame = (_now: number, meta: { width?: number; height?: number }): void => {
+    if (stopped) return;
+    if (meta?.width && meta.height) onSize(meta.width, meta.height);
+    else report();
+    frameId = vfc.requestVideoFrameCallback?.(onFrame);
+  };
+
+  video.addEventListener("resize", report);
+  video.addEventListener("loadedmetadata", report);
+  video.srcObject = stream;
+  if (typeof vfc.requestVideoFrameCallback === "function") {
+    frameId = vfc.requestVideoFrameCallback(onFrame);
+  }
+  try {
+    const played = video.play() as Promise<void> | undefined;
+    played?.catch(() => {});
+  } catch {
+    /* play() unsupported or refused: resize/loadedmetadata may still report */
+  }
+  report();
+
+  return () => {
+    stopped = true;
+    video.removeEventListener("resize", report);
+    video.removeEventListener("loadedmetadata", report);
+    if (frameId != null) vfc.cancelVideoFrameCallback?.(frameId);
+    try {
+      video.pause();
+    } catch {
+      /* nothing to pause */
+    }
+    video.srcObject = null;
+  };
+};
+
+/**
+ * How far below the ceiling a decoded frame may be and still count as full
+ * size. Encoders round frame dimensions to even or macroblock multiples, so
+ * an exact match is not guaranteed; the tile sizes the gate rejects are far
+ * further off than this.
+ */
+const DECODED_SIZE_TOLERANCE_PX = 16;
+
 /** Options for {@link RecordingController}. */
 export interface RecordingControllerOptions {
   /**
@@ -307,6 +398,12 @@ export interface RecordingControllerOptions {
    * `import("mediabunny")` keyframe remux.
    */
   loadTrimmer?: TrimmerLoader;
+  /**
+   * Override how a forced recording observes its feed's decoded frame size
+   * (tests inject a fake; a harness without real decoding can follow the
+   * camera state instead). Defaults to {@link videoElementDecodedSizeProbe}.
+   */
+  probeDecodedSize?: DecodedSizeProbe;
 }
 
 /**
@@ -414,28 +511,35 @@ interface ActiveRecording {
    */
   discarded?: boolean;
   /**
-   * True while a single forced recording is armed (force sent, recorder not
-   * started yet). Never set for grouped members, which record immediately.
+   * True while a forced recording is armed (force sent, recorder not started
+   * yet). A grouped member stays armed until its whole group starts.
    */
   arming?: boolean;
   /** True once this recording has acquired the per-feed force ref-count. */
   forced?: boolean;
   /**
-   * Grouped path only: recording-time (ms since `startedAt`) at which this
-   * feed was observed at full resolution. Undefined until reached (or
-   * always, if it never is before stop).
-   */
-  resolutionReadyAt?: number;
-  /** Grouped path only: `client.clock.captureUt` at the same moment. */
-  resolutionReadyUt?: number;
-  /**
-   * Cancels a pending arm-wait (single) or ready-watch (grouped)
-   * subscription. Set while a {@link RecordingController.watchResolutionReady}
+   * Cancels a pending arm-wait subscription (single, or one member of a
+   * group). Set while a {@link RecordingController.watchResolutionReady}
    * wait is outstanding; cleared once it settles or is cancelled. Always
    * cancelled on stop/discard so a torn-down recording never leaks a
-   * "change" listener or starts its recorder late.
+   * "change" listener or decoded-size probe, or starts its recorder late.
    */
   cancelResolutionWatch?: () => void;
+  /** The last decoded frame size the arm-wait saw, for the start log line. */
+  lastDecodedSize?: () => { width: number; height: number } | null;
+}
+
+/** Arm state for a forced grouped recording whose recorders have not started yet. */
+interface GroupArm {
+  /** Members whose feed has been observed at full resolution. */
+  ready: Set<string>;
+  /** The shared {@link ARM_TIMEOUT_MS} bound; starts every member when it fires. */
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** `WxH` for a log line, or `unknown` when no decoded frame was seen. */
+function formatSize(size: { width: number; height: number } | null): string {
+  return size ? `${size.width}x${size.height}` : "unknown";
 }
 
 let idCounter = 0;
@@ -464,6 +568,7 @@ export class RecordingController {
   /** Per-group trimmer load kicked off at group-start, awaited at stop. */
   private readonly groupTrimmers = new Map<string, Promise<GroupTrimmer | null>>();
   private readonly loadTrimmer: TrimmerLoader;
+  private readonly probeDecodedSize: DecodedSizeProbe;
   /** recordingIds in a grouped set, so they stay out of the standalone `recordings` list. */
   private readonly groupMemberIds = new Set<string>();
   /** recordingId -> groupId, so discarding one member can pull it out of its group's array. */
@@ -483,6 +588,8 @@ export class RecordingController {
    * one; see {@link acquireForce}.
    */
   private readonly forceSendState = new Map<number, "pending" | "sent">();
+  /** groupId -> arm state, present only while a forced group is still arming. */
+  private readonly groupArms = new Map<string, GroupArm>();
   private readonly listeners = new Set<() => void>();
   private snapshot: RecordingsSnapshot = { recordings: [], groups: [], active: [] };
   /** While true, {@link rebuild} is a no-op; used to batch startGroupedRecording's
@@ -492,6 +599,7 @@ export class RecordingController {
   constructor(client: RecordingClient, options?: RecordingControllerOptions) {
     this.client = client;
     this.loadTrimmer = options?.loadTrimmer ?? loadMediabunnyTrimmer;
+    this.probeDecodedSize = options?.probeDecodedSize ?? videoElementDecodedSizeProbe;
   }
 
   /** Subscribe to snapshot changes. Returns an unsubscribe function. */
@@ -591,43 +699,27 @@ export class RecordingController {
   }
 
   /**
-   * Whether `state` shows a feed actually rendering at its full target size,
-   * as opposed to merely having caught up to whatever small size it already
-   * had. Two ways to know the target:
-   *
-   * - `target` known (from `maxRenderSize`): ready once the operator size
-   *   has reached it and the rendered size has caught up to the operator
-   *   size. Resolves promptly even when the feed was already at its ceiling
-   *   before the force was sent (nothing ever "increases").
-   * - `target` unknown: falls back to requiring the operator size to have
-   *   increased past `baseline` (the first REAL state observed at or after
-   *   watch-start; see {@link watchResolutionReady}) and the rendered size
-   *   to have caught up. `baseline` is `null` until that first real state
-   *   arrives, and a `null` baseline is never ready: a placeholder `{0,0}`
-   *   would let any positive operator size look like an increase, so no
-   *   verdict is possible until a genuine baseline exists. This is a
-   *   strictly weaker guarantee than the known-target path: a feed already
-   *   at its true ceiling when forced will not be recognised as ready until
-   *   something else changes its operator size, or the wait simply times
-   *   out, but it still refuses to treat the pre-force snapshot itself as
-   *   ready.
-   *
-   * Either way, a state whose rendered size has not yet caught up to its own
-   * operator size (adaptive shed still catching up) is never ready.
+   * Fallback readiness for a feed whose ceiling is unknown to the client (no
+   * `maxRenderSize`), judged from the reported camera state alone. Ready once
+   * the operator size has increased past `baseline` (the first REAL state
+   * observed at or after watch-start; see {@link watchResolutionReady}) and
+   * the rendered size has caught up to it. `baseline` is `null` until that
+   * first real state arrives, and a `null` baseline is never ready: a
+   * placeholder `{0,0}` would let any positive operator size look like an
+   * increase. A feed already at its true ceiling when forced is not
+   * recognised until something else changes its operator size, so the wait
+   * usually times out instead, but the pre-force snapshot itself is never
+   * treated as ready. A state whose rendered size has not yet caught up to
+   * its own operator size (adaptive shed still catching up) is never ready.
    */
-  private isAtFullResolution(
+  private stateIncreasedPastBaseline(
     state: CameraState | null,
-    target: { width: number; height: number } | null,
     baseline: { width: number; height: number } | null,
   ): boolean {
-    if (!state) return false;
+    if (!state || !baseline) return false;
     if (state.renderWidth !== state.operatorWidth || state.renderHeight !== state.operatorHeight) {
       return false;
     }
-    if (target) {
-      return state.operatorWidth >= target.width && state.operatorHeight >= target.height;
-    }
-    if (!baseline) return false;
     return state.operatorWidth > baseline.width && state.operatorHeight > baseline.height;
   }
 
@@ -647,57 +739,95 @@ export class RecordingController {
   }
 
   /**
-   * Waits for a forced feed to actually render at full resolution.
+   * Waits for a forced feed to actually deliver full-resolution frames.
+   *
+   * With the ceiling known (`maxRenderSize`), the gate is the decoded frame
+   * size from {@link probeDecodedSize} reaching it (within
+   * {@link DECODED_SIZE_TOLERANCE_PX}). The camera state is deliberately not
+   * trusted here: it reports the new size before the decoder delivers
+   * full-size frames, and a recorder started in that gap locks the clip to
+   * the old size. A feed already at its ceiling resolves on the probe's
+   * first report. With the ceiling unknown, falls back to the state-only
+   * check ({@link stateIncreasedPastBaseline}).
+   *
    * `timeoutMs` omitted means no bound: the wait only ends when the feed
    * becomes ready or the caller cancels it (the grouped path, bounded by the
-   * recording's own lifetime instead; see {@link startRecording}).
-   * Resolves `true` once ready, `false` on timeout. Returns a `cancel` next
-   * to the promise so a caller can abandon the wait (stop/discard) without
-   * leaking the underlying "change" subscription or timer; cancelling never
-   * settles the promise.
+   * group's one shared timer instead; see {@link armGroup}). Resolves `true`
+   * once ready, `false` on timeout. `cancel` abandons the wait (stop/discard)
+   * without settling the promise; every exit path releases the "change"
+   * subscription, the probe, and the timer. `lastDecoded` reports the most
+   * recent decoded size seen, for logging.
    */
   private watchResolutionReady(
     flightId: number,
     timeoutMs?: number,
-  ): { ready: Promise<boolean>; cancel: () => void } {
+  ): {
+    ready: Promise<boolean>;
+    cancel: () => void;
+    lastDecoded: () => { width: number; height: number } | null;
+  } {
     const cam = this.client.camera(flightId);
     const target = cam.maxRenderSize;
-    /* Known-ceiling path never consults baseline; unknown-ceiling path
-       starts with no baseline until a real state seeds one, so a null
-       cam.state at watch-start (e.g. no discover() yet, since state and
-       the track are independent transports with no ordering guarantee)
-       can never masquerade as a {0,0} baseline. */
+    /* Unknown-ceiling path starts with no baseline until a real state seeds
+       one, so a null cam.state at watch-start (e.g. no discover() yet, since
+       state and the track are independent transports with no ordering
+       guarantee) can never masquerade as a {0,0} baseline. */
     let baseline = target ? null : this.seedResolutionBaseline(cam.state);
+    let decoded: { width: number; height: number } | null = null;
 
     let settled = false;
     let unsubscribe: () => void = () => {};
+    let stopProbe: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const release = (): void => {
+      settled = true;
+      if (timer != null) clearTimeout(timer);
+      unsubscribe();
+      stopProbe?.();
+      stopProbe = null;
+    };
 
     const ready = new Promise<boolean>((resolve) => {
       const finish = (reached: boolean): void => {
         if (settled) return;
-        settled = true;
-        if (timer != null) clearTimeout(timer);
-        unsubscribe();
+        release();
         resolve(reached);
       };
 
-      if (this.isAtFullResolution(cam.state, target, baseline)) {
-        finish(true);
-        return;
-      }
-
-      unsubscribe = cam.on("change", (state) => {
-        if (!target && !baseline) {
-          /* This is the first real state we've ever seen: it becomes the
-             baseline, but a state can't ready itself against its own
-             just-established baseline, so wait for the NEXT state. */
-          baseline = this.seedResolutionBaseline(state);
+      if (target) {
+        const stream = cam.mediaStream;
+        if (stream) {
+          const stop = this.probeDecodedSize(flightId, stream, (width, height) => {
+            decoded = { width, height };
+            if (
+              width >= target.width - DECODED_SIZE_TOLERANCE_PX &&
+              height >= target.height - DECODED_SIZE_TOLERANCE_PX
+            ) {
+              finish(true);
+            }
+          });
+          /* The probe may report (and finish the wait) before returning. */
+          if (settled) stop();
+          else stopProbe = stop;
+        }
+      } else {
+        if (this.stateIncreasedPastBaseline(cam.state, baseline)) {
+          finish(true);
           return;
         }
-        if (this.isAtFullResolution(state, target, baseline)) finish(true);
-      });
-      if (timeoutMs != null) {
+        unsubscribe = cam.on("change", (state) => {
+          if (!baseline) {
+            /* This is the first real state we've ever seen: it becomes the
+               baseline, but a state can't ready itself against its own
+               just-established baseline, so wait for the NEXT state. */
+            baseline = this.seedResolutionBaseline(state);
+            return;
+          }
+          if (this.stateIncreasedPastBaseline(state, baseline)) finish(true);
+        });
+      }
+      if (!settled && timeoutMs != null) {
         timer = setTimeout(() => finish(false), timeoutMs);
       }
     });
@@ -706,10 +836,9 @@ export class RecordingController {
       ready,
       cancel: (): void => {
         if (settled) return;
-        settled = true;
-        if (timer != null) clearTimeout(timer);
-        unsubscribe();
+        release();
       },
+      lastDecoded: () => decoded,
     };
   }
 
@@ -718,14 +847,12 @@ export class RecordingController {
    * synchronously. Throws if the feed has no live track or is already
    * recording.
    *
-   * `inGroup` is internal (set by {@link startGroupedRecording}) and governs
-   * how `opts.forceFullResolution` behaves: a single recording (`inGroup`
-   * false) arms and waits, bounded by {@link ARM_TIMEOUT_MS}, for the feed to
-   * reach full resolution before the recorder actually starts, so the clip
-   * opens on full-res frames. A grouped member starts immediately and
-   * instead records the moment it reaches full resolution
-   * (`resolutionReadyAt`/`resolutionReadyUt`) so {@link stopGroupedRecording}
-   * can fold it into the common trim window.
+   * With `opts.forceFullResolution`, the recording arms and waits, bounded by
+   * {@link ARM_TIMEOUT_MS}, for the feed to reach full resolution before the
+   * recorder actually starts, so the clip opens on full-res frames.
+   * `inGroup` is internal (set by {@link startGroupedRecording}): a forced
+   * grouped member arms the same way but leaves the wait to the group, which
+   * starts every member's recorder together (see {@link armGroup}).
    */
   startRecording(flightId: number, opts?: StartRecordingOptions, inGroup = false): string {
     if (this.byFlight.has(flightId)) {
@@ -786,18 +913,27 @@ export class RecordingController {
       }, opts.maxDurationMs);
     }
 
-    if (forceRequested && !inGroup) {
+    if (forceRequested && inGroup) {
+      /* Grouped path: arm only. startGroupedRecording owns the wait and
+         starts every member's recorder in one go. */
+      rec.arming = true;
+    } else if (forceRequested) {
       /* Single path: arm-and-wait. Show "arming" immediately; the recorder
          itself doesn't start until the feed reaches full resolution (or the
          bounded wait gives up), so the clip never opens on low-res frames. */
       rec.arming = true;
       const watch = this.watchResolutionReady(flightId, ARM_TIMEOUT_MS);
       rec.cancelResolutionWatch = watch.cancel;
-      void watch.ready.then(() => {
+      void watch.ready.then((reached) => {
         rec.cancelResolutionWatch = undefined;
         /* Discarded while arming: the recorder was never started and this
            id is gone from `active`, so there is nothing left to do. */
         if (!this.active.has(recordingId)) return;
+        console.info(
+          `kerbcast: recording ${recordingId} started after arming (${
+            reached ? "full resolution" : "arm timeout"
+          }); decoded size ${flightId}=${formatSize(watch.lastDecoded())}`,
+        );
         rec.arming = false;
         /* The real recording starts now: reset the clock base so the
            elapsed timer and utSamples track begin at actual record start,
@@ -811,29 +947,105 @@ export class RecordingController {
       });
     } else {
       recorder.start();
-      if (forceRequested) {
-        /* Grouped path: record immediately. Watch for the moment this feed
-           actually reaches full resolution so stopGroupedRecording can fold
-           it into the common trim window and cut the low-res lead-in. No
-           bound here: the wait is naturally bounded by the recording's own
-           lifetime (cancelled on stop/discard); a feed that never reaches
-           full resolution simply keeps its lead-in untrimmed. */
-        const watch = this.watchResolutionReady(flightId);
-        rec.cancelResolutionWatch = watch.cancel;
-        void watch.ready.then((reached) => {
-          rec.cancelResolutionWatch = undefined;
-          if (!reached) return;
-          if (!this.active.has(recordingId)) return;
-          if (rec.resolutionReadyAt == null) {
-            rec.resolutionReadyAt = now() - rec.startedAt;
-            rec.resolutionReadyUt = this.client.clock.captureUt ?? undefined;
-          }
-        });
-      }
     }
 
     this.rebuild();
     return recordingId;
+  }
+
+  /**
+   * Arms a forced group: watches every member's feed and starts all their
+   * recorders together once each has reached full resolution, or once the
+   * one shared {@link ARM_TIMEOUT_MS} bound passes, whichever comes first.
+   * Members stopped or discarded mid-arm drop out of the wait, so a slow
+   * feed that gets cancelled no longer holds the rest back.
+   */
+  private armGroup(groupId: string, ids: string[]): void {
+    const arm: GroupArm = {
+      ready: new Set(),
+      timer: setTimeout(() => this.startArmedGroup(groupId), ARM_TIMEOUT_MS),
+    };
+    this.groupArms.set(groupId, arm);
+    for (const id of ids) {
+      const rec = this.active.get(id);
+      if (!rec) continue;
+      const watch = this.watchResolutionReady(rec.flightId);
+      rec.cancelResolutionWatch = watch.cancel;
+      rec.lastDecodedSize = watch.lastDecoded;
+      void watch.ready.then(() => {
+        rec.cancelResolutionWatch = undefined;
+        arm.ready.add(id);
+        this.checkGroupArm(groupId);
+      });
+    }
+  }
+
+  /** Members of a group still armed and waiting to start (not stopped or discarded). */
+  private armingMembers(groupId: string): ActiveRecording[] {
+    const ids = this.groups.get(groupId) ?? [];
+    const members: ActiveRecording[] = [];
+    for (const id of ids) {
+      const rec = this.active.get(id);
+      if (rec && rec.arming && !rec.stopPromise) members.push(rec);
+    }
+    return members;
+  }
+
+  /** Starts an arming group once every member still waiting is ready. */
+  private checkGroupArm(groupId: string): void {
+    const arm = this.groupArms.get(groupId);
+    if (!arm) return;
+    if (this.armingMembers(groupId).every((rec) => arm.ready.has(rec.recordingId))) {
+      this.startArmedGroup(groupId);
+    }
+  }
+
+  /**
+   * Ends a group's arm and starts every still-armed member's recorder in the
+   * same tick, on one shared clock base (`startedAt`, `utStart`), so the
+   * clips open together. Cancels any outstanding per-member watches (the
+   * timeout path).
+   */
+  private startArmedGroup(groupId: string): void {
+    const arm = this.groupArms.get(groupId);
+    if (!arm) return;
+    this.groupArms.delete(groupId);
+    clearTimeout(arm.timer);
+    const members = this.armingMembers(groupId);
+    if (members.length === 0) return;
+    const startedAt = now();
+    const utStart = this.client.clock.captureUt ?? undefined;
+    for (const rec of members) {
+      rec.cancelResolutionWatch?.();
+      rec.cancelResolutionWatch = undefined;
+      rec.arming = false;
+      rec.startedAt = startedAt;
+      rec.utStart = utStart;
+      rec.utSamples = [{ t: 0, ut: utStart }];
+      rec.latestUt = utStart;
+      rec.recorder.start();
+    }
+    const reason = members.every((rec) => arm.ready.has(rec.recordingId))
+      ? "all at full resolution"
+      : "arm timeout";
+    const sizes = members.map(
+      (rec) => `${rec.flightId}=${formatSize(rec.lastDecodedSize?.() ?? null)}`,
+    );
+    console.info(
+      `kerbcast: grouped recording ${groupId} started ${members.length} member(s) after arming (${reason}); decoded sizes ${sizes.join(" ")}`,
+    );
+    this.rebuild();
+  }
+
+  /**
+   * Abandons a group's arm without starting anything: the caller is tearing
+   * the whole group down (stop or discard), so no member should start mid-way.
+   */
+  private cancelGroupArm(groupId: string): void {
+    const arm = this.groupArms.get(groupId);
+    if (!arm) return;
+    this.groupArms.delete(groupId);
+    clearTimeout(arm.timer);
   }
 
   /**
@@ -880,6 +1092,10 @@ export class RecordingController {
       this.active.delete(recordingId);
       this.byFlight.delete(rec.flightId);
       this.rebuild();
+      /* An arming group member stopped on its own: the rest of its group
+         may now be ready to start without it. */
+      const groupId = this.memberOfGroup.get(recordingId);
+      if (groupId != null) this.checkGroupArm(groupId);
       return rec.stopPromise;
     }
 
@@ -989,6 +1205,9 @@ export class RecordingController {
     }
 
     if (changed) this.rebuild();
+    /* Discarding a slow member of an arming group must not keep the others
+       waiting on it. */
+    if (groupId != null) this.checkGroupArm(groupId);
   }
 
   // -------------------------------------------------------------------------
@@ -997,12 +1216,15 @@ export class RecordingController {
 
   /**
    * Start recording several feeds as one synchronised moment. All recorders
-   * open in a single tick to minimise skew. Returns the groupId plus the real
-   * per-feed recordingIds (so a caller can cancel one member individually via
-   * `stopRecording`/`discardRecording`, the same ids that end up on each
-   * clip's `RecordingHandle`). If any feed can't start (no track / already
-   * recording), the ones already started are discarded and the error
-   * rethrows.
+   * open in a single tick to minimise skew. With `opts.forceFullResolution`,
+   * every member arms first and that single tick comes later, once all feeds
+   * have reached full resolution or {@link ARM_TIMEOUT_MS} passes (see
+   * {@link armGroup}); the members report `arming` until then. Returns the
+   * groupId plus the real per-feed recordingIds (so a caller can cancel one
+   * member individually via `stopRecording`/`discardRecording`, the same ids
+   * that end up on each clip's `RecordingHandle`). If any feed can't start
+   * (no track / already recording), the ones already started are discarded
+   * and the error rethrows.
    */
   startGroupedRecording(
     flightIds: number[],
@@ -1044,6 +1266,7 @@ export class RecordingController {
           }
         })(),
       );
+      if (opts?.forceFullResolution === true) this.armGroup(groupId, started);
       return { groupId, recordingIds: [...started] };
     } finally {
       this.suppressRebuild = false;
@@ -1075,32 +1298,13 @@ export class RecordingController {
       );
     }
 
-    /* Capture each forced member's resolution-ready UT before stopRecording
-       tears down its ActiveRecording bookkeeping below. */
-    const resolutionReadyUts: number[] = [];
-    for (const id of ids) {
-      const ut = this.active.get(id)?.resolutionReadyUt;
-      if (ut != null) resolutionReadyUts.push(ut);
-    }
+    /* A group stopped while still arming never starts its recorders: each
+       still-armed member settles below as an empty clip, the same as a
+       single recording stopped mid-arm. */
+    this.cancelGroupArm(groupId);
 
     const recordings = await Promise.all(ids.map((id) => this.stopRecording(id)));
     const window = commonUtWindow(recordings);
-
-    /* Fold the low-res lead-in cut into the same common-window trim: extend
-       the window's start to the latest point any forced member actually
-       reached full resolution, so every clip stays cut to one shared window
-       (UT-synced) rather than each clip getting its own start. A member that
-       never reached full resolution before stop simply doesn't contribute
-       (its own lead-in stays untrimmed, per the documented edge case). This
-       only widens the physical trim cut: `commonUtWindow` on the returned
-       handle keeps reporting the clips' own raw UT intersection, unchanged,
-       since that's metadata about what the clips cover independent of
-       whether (or how) they got physically cut. */
-    let trimWindow = window;
-    if (trimWindow && resolutionReadyUts.length > 0) {
-      const windowStart = Math.max(trimWindow[0], ...resolutionReadyUts);
-      trimWindow = [windowStart, trimWindow[1]];
-    }
 
     /* Physically remux-trim each clip to the common window so the grouped
        output is pre-aligned by default. The UT metadata (utSamples +
@@ -1108,11 +1312,11 @@ export class RecordingController {
        clips to telemetry. Trimming never fails the recording: any clip that
        can't be cut cleanly degrades to metadata-only. */
     let finalRecordings = recordings;
-    if (trimWindow) {
+    if (window) {
       const trimmer = await (this.groupTrimmers.get(groupId) ?? Promise.resolve(null));
       if (trimmer) {
         finalRecordings = await Promise.all(
-          recordings.map((rec) => this.maybeTrim(rec, trimWindow, trimmer)),
+          recordings.map((rec) => this.maybeTrim(rec, window, trimmer)),
         );
       }
     }
@@ -1143,6 +1347,8 @@ export class RecordingController {
     /* MediaRecorder webm output isn't remuxed to mp4 here; degrade to
        metadata-only for those clips (mp4 is the default container). */
     if (!/mp4/i.test(rec.mimeType)) return rec;
+    /* A member stopped while still arming has no media to cut. */
+    if (rec.byteSize === 0) return rec;
     const startMs = utToRecordingTimeMs(rec.utSamples, window[0]);
     const endMs = utToRecordingTimeMs(rec.utSamples, window[1]);
     if (startMs == null || endMs == null || endMs <= startMs) return rec;
@@ -1173,6 +1379,9 @@ export class RecordingController {
        stop the same group at once). */
     let changed = false;
     const active = this.groups.get(groupId);
+    /* Before the member discards below, so a still-arming group can't start
+       its remaining members partway through being torn down. */
+    this.cancelGroupArm(groupId);
     if (active) {
       /* discardRecording now splices ids out of this very array as it goes
          (fix for cancelling one grouped member); iterate a copy so removals

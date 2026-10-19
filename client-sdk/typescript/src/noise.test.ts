@@ -338,3 +338,43 @@ describe("noise pipeline stall presentation", () => {
     }
   });
 });
+
+describe("noise pipeline sizing", () => {
+  it("resizes the output canvas when the source's decoded size changes mid-stream", () => {
+    const env = installStallEnv();
+    let vw = 784;
+    let vh = 448;
+    const proto = HTMLVideoElement.prototype;
+    const origW = Object.getOwnPropertyDescriptor(proto, "videoWidth");
+    const origH = Object.getOwnPropertyDescriptor(proto, "videoHeight");
+    Object.defineProperty(proto, "videoWidth", { configurable: true, get: () => vw });
+    Object.defineProperty(proto, "videoHeight", { configurable: true, get: () => vh });
+    let output: HTMLCanvasElement | null = null;
+    // @ts-expect-error -- jsdom augmentation
+    HTMLCanvasElement.prototype.captureStream = vi.fn(function (this: HTMLCanvasElement) {
+      output = this;
+      return {} as MediaStream;
+    });
+    try {
+      const pipeline = tryCreateNoisePipeline(fakeStream(), 0.05);
+      expect(pipeline).not.toBeNull();
+
+      env.setNow(1000);
+      env.fireFrame();
+      env.draw();
+      expect([output!.width, output!.height]).toEqual([784, 448]);
+
+      // The sidecar raises the render size; no second loadedmetadata fires.
+      vw = 1024;
+      vh = 576;
+      env.setNow(1033);
+      env.fireFrame();
+      env.draw();
+      expect([output!.width, output!.height]).toEqual([1024, 576]);
+    } finally {
+      if (origW) Object.defineProperty(proto, "videoWidth", origW);
+      if (origH) Object.defineProperty(proto, "videoHeight", origH);
+      env.restore();
+    }
+  });
+});

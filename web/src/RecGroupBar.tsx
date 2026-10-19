@@ -65,12 +65,21 @@ export function RecGroupBar({
 
   if (groupId !== null) {
     const elapsedMs = startedAt !== null ? nowMs() - startedAt : 0;
+    const feeds = `${members.length} feed${members.length === 1 ? "" : "s"}`;
+    /* A full-resolution group arms every member before any recorder starts;
+       they flip out of arming together, so one member is enough to tell. */
+    const arming = members.some((m) => m.arming);
     return (
       <Bar role="status" aria-label="Grouped recording in progress">
-        <Dot aria-hidden="true" />
+        <Dot aria-hidden="true" $arming={arming} />
         <Label>
-          Recording {members.length} feed{members.length === 1 ? "" : "s"} &middot;{" "}
-          {formatElapsed(elapsedMs)}
+          {arming ? (
+            <>Arming {feeds} for full resolution&hellip;</>
+          ) : (
+            <>
+              Recording {feeds} &middot; {formatElapsed(elapsedMs)}
+            </>
+          )}
         </Label>
         <Spacer />
         <BarButton
@@ -151,11 +160,12 @@ const Bar = styled.div`
   flex-shrink: 0;
 `;
 
-const Dot = styled.span`
+const Dot = styled.span<{ $arming?: boolean }>`
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--kerbcast-rec-active, #ff3b30);
+  background: ${(p) =>
+    p.$arming ? "var(--kerbcast-arming-active, #d9a441)" : "var(--kerbcast-rec-active, #ff3b30)"};
   flex-shrink: 0;
   animation: kc-rec-pulse 1.4s ease-in-out infinite;
 
