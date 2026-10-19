@@ -433,6 +433,10 @@ namespace Kerbcast
         {
             _captureEpoch.Bump();
             _teardown.OnSceneLoadRequested();
+            /* Restore now, while the scaled-space cameras are still findable. By
+               OnDestroy their GameObjects are inactive, FindObjectsOfType skips
+               them, and they would stay disabled into the next scene. */
+            RestoreMainScreen();
         }
 
         private void OnGameStatePostLoad(ConfigNode node) => _captureEpoch.Bump();
@@ -879,16 +883,17 @@ namespace Kerbcast
         private void ApplyMainScreenThrottle()
         {
             if (_mainCamerasDisabled) { _throttleEffective = true; return; }
+            /* The scene is unloading and the restore already ran; the per-frame
+               reconcile must not switch the cameras off again on the way out. */
+            if (_teardown.SceneUnloading) return;
             try
             {
                 if (FlightCamera.fetch != null)
                 {
                     FlightCamera.fetch.DisableCamera(disableAudioListener: false);
                 }
-                var scaled = FindKspCameraByName("Camera ScaledSpace");
-                if (scaled != null) scaled.enabled = false;
-                var galaxy = FindKspCameraByName("GalaxyCamera");
-                if (galaxy != null) galaxy.enabled = false;
+                SetKspCamerasEnabled("Camera ScaledSpace", false);
+                SetKspCamerasEnabled("GalaxyCamera", false);
                 // FXCamera is a separate singleton MonoBehaviour with its
                 // own Camera component (NOT in FlightCamera.cameras array)
                 // that renders aero/re-entry FX via a velocity-based shader.
@@ -932,10 +937,10 @@ namespace Kerbcast
                 {
                     FlightCamera.fetch.EnableCamera();
                 }
-                var scaled = FindKspCameraByName("Camera ScaledSpace");
-                if (scaled != null) scaled.enabled = true;
-                var galaxy = FindKspCameraByName("GalaxyCamera");
-                if (galaxy != null) galaxy.enabled = true;
+                if (!SetKspCamerasEnabled("Camera ScaledSpace", true))
+                    Debug.LogWarning("[Kerbcast] restore: 'Camera ScaledSpace' not found, left as is");
+                if (!SetKspCamerasEnabled("GalaxyCamera", true))
+                    Debug.LogWarning("[Kerbcast] restore: 'GalaxyCamera' not found, left as is");
                 if (FXCamera.Instance != null)
                 {
                     var fxCam = FXCamera.Instance.GetComponent<Camera>();
@@ -945,6 +950,7 @@ namespace Kerbcast
                 _throttleEffective = false;
                 _fxCamSuppressed = false;
                 Debug.Log("[Kerbcast] main flight render restored (ThrottleMainScreen=false)");
+                LogAllCameras("throttle-restored");
             }
             catch (Exception ex)
             {
@@ -1016,17 +1022,20 @@ namespace Kerbcast
             return anyDisabled;
         }
 
-        // Camera.allCameras snapshots every active Camera, so this is
-        // cheap. KerbcastCamera.SetCameras() uses the same pattern via
-        // FindKspCamera; duplicated here because we run earlier than
-        // the per-camera setup and don't want the cross-class call.
-        private static Camera FindKspCameraByName(string name)
+        /* Includes disabled cameras. Camera.allCameras lists only enabled
+           ones, so a lookup through it could never find the cameras the
+           throttle had switched off, and RestoreMainScreen left Camera
+           ScaledSpace and GalaxyCamera disabled for the rest of the KSP
+           session (both live in ScaledSpace's DontDestroyOnLoad tree, and
+           KSP never re-enables their Camera components). Every later
+           SetCameras then built scaled and galaxy clones from Unity
+           defaults. Acts on every match, so a mod's same-named clone cannot stand in for
+           the real camera. Only called on throttle toggles and rebuilds. */
+        private static bool SetKspCamerasEnabled(string name, bool enabled)
         {
-            foreach (var c in Camera.allCameras)
-            {
-                if (c.name == name) return c;
-            }
-            return null;
+            var matches = KerbcastCamera.FindKspCamerasByName(name);
+            foreach (var c in matches) c.enabled = enabled;
+            return matches.Count > 0;
         }
 
         // ~1 Hz status write. Each write carries the full per-camera
