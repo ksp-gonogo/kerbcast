@@ -48,7 +48,8 @@ namespace Kerbcast
             for (int i = 0; i < cams.Count; i++)
             {
                 // Kerbal cameras aren't exposed to kOS this stage.
-                if (cams[i] is KerbcastCamera c && c.Vessel == vessel)
+                // Nor are ground station cameras, whose Vessel is just the tracked craft.
+                if (cams[i] is KerbcastCamera c && c.Rig == null && c.Vessel == vessel)
                     result.Add(ToView(c));
             }
             return result;

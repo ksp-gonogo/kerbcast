@@ -39,9 +39,44 @@ using UnityEngine;
 
 namespace Kerbcast
 {
+    /* Drives a KerbcastCamera whose mount is not a part (the ground station):
+       places, zooms and clips the layer stack each rendered tick, and may draw
+       an extra local layer between the far and near passes. */
+    internal interface ICameraRig
+    {
+        /* Called right before the layers render. False skips this tick's frame. */
+        bool PrepareRender(KerbcastCamera cam);
+        void RenderBetweenFarAndNear(KerbcastCamera cam);
+        void Dispose();
+    }
+
     internal sealed class KerbcastCamera : ICamera
     {
         public uint FlightId { get; }
+
+        /* Null for part cameras. Set once, right after construction. */
+        internal ICameraRig Rig { get; set; }
+        /* Set by the rig when the far layer must not draw this tick (the craft
+           is hidden behind a body). */
+        internal bool RigSkipFar { get; set; }
+        internal Camera NearLayer => _nearCam;
+        internal Camera FarLayer => _farCam;
+
+        /* Rig-owned zoom: bypasses SupportsZoom and the operator slew, which
+           belong to part cameras. */
+        internal void SetRigFov(float fov)
+        {
+            Fov = _fovTarget = fov;
+            if (_nearCam != null) _nearCam.fieldOfView = fov;
+            if (_scaledCam != null) _scaledCam.fieldOfView = fov;
+            if (_galaxyCam != null) _galaxyCam.fieldOfView = fov;
+            if (_farCam != null) _farCam.fieldOfView = fov;
+        }
+
+        /* Manifest "kind" plus any kind-specific fields, already JSON-encoded
+           ("  \"key\": value" lines, comma-separated, no trailing comma). */
+        private readonly string _manifestKind;
+        private readonly string _manifestExtraFields;
         /* Placement + identity + optional zoom/pan capabilities, decoupled from
            MuMechModuleHullCamera. Every former Hullcam read now goes through this. */
         public ICameraMountSource Mount { get; }
@@ -320,9 +355,13 @@ namespace Kerbcast
             int renderHeight,
             CameraLayers initialLayers,
             bool enableAtmosphericFx,
-            AtmoFxLayers fxLayers)
+            AtmoFxLayers fxLayers,
+            string manifestKind = "part",
+            string manifestExtraFields = null)
         {
             Mount = mount;
+            _manifestKind = manifestKind;
+            _manifestExtraFields = manifestExtraFields;
             // Pan is delivered through the mount as the IPanCapability contract;
             // core steers purely through the interface, never a concrete type.
             _pan = mount.Pan;
@@ -1671,7 +1710,7 @@ namespace Kerbcast
             {
                 var json = "{\n"
                     + $"  \"lifecycle\": \"{lifecycle}\",\n"
-                    + $"  \"kind\": \"part\",\n"
+                    + $"  \"kind\": \"{_manifestKind}\",\n"
                     + $"  \"flight_id\": {FlightId},\n"
                     + $"  \"part_name\": \"{EscapeJson(_cachedPartName)}\",\n"
                     + $"  \"part_title\": \"{EscapeJson(_cachedPartTitle)}\",\n"
@@ -1685,8 +1724,9 @@ namespace Kerbcast
                     + $"  \"pan_yaw_min\": {PanYawMin.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n"
                     + $"  \"pan_yaw_max\": {PanYawMax.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n"
                     + $"  \"pan_pitch_min\": {PanPitchMin.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n"
-                    + $"  \"pan_pitch_max\": {PanPitchMax.ToString(System.Globalization.CultureInfo.InvariantCulture)}\n"
-                    + "}\n";
+                    + $"  \"pan_pitch_max\": {PanPitchMax.ToString(System.Globalization.CultureInfo.InvariantCulture)}"
+                    + (string.IsNullOrEmpty(_manifestExtraFields) ? "" : ",\n" + _manifestExtraFields)
+                    + "\n}\n";
                 File.WriteAllText(_infoPath, json);
             }
             catch (Exception ex)
@@ -1889,6 +1929,22 @@ namespace Kerbcast
             // frame; only the render + readback issue below is paced.
             if (!mayIssueReadback) return;
 
+            /* A rig places, zooms and clips the layers just before they render,
+               so floating-origin and frame shifts since last tick are picked up.
+               False means nothing to look at this tick: keep the last frame. */
+            if (Rig != null)
+            {
+                try
+                {
+                    if (!Rig.PrepareRender(this)) return;
+                }
+                catch (Exception ex)
+                {
+                    LogRateLimited($"rig prepare threw: {ex.GetType().Name}: {ex.Message}");
+                    return;
+                }
+            }
+
             // Zero this frame's per-phase Last values before recording, so a
             // phase shed this tick reads 0 rather than its last-rendered figure
             // (otherwise the across-camera Last sum overstates cost under
@@ -2018,7 +2074,7 @@ namespace Kerbcast
                     _phaseTimings.Record(RenderPhase.Scaled,
                         (System.Diagnostics.Stopwatch.GetTimestamp() - scaledStart) * _msPerTick);
 
-                if (_farCam != null && (_layers & CameraLayers.Far) != 0)
+                if (_farCam != null && (_layers & CameraLayers.Far) != 0 && !RigSkipFar)
                 {
                     long farStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     _integrationHost?.PerFrame(_farCam, CameraLayers.Far, BuildIntegrationFrameState(CameraLayers.Far));
@@ -2027,6 +2083,8 @@ namespace Kerbcast
                         _phaseTimings.Record(RenderPhase.Far,
                             (System.Diagnostics.Stopwatch.GetTimestamp() - farStart) * _msPerTick);
                 }
+
+                Rig?.RenderBetweenFarAndNear(this);
 
                 if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
                 {
@@ -2133,6 +2191,8 @@ namespace Kerbcast
             _filterBlit.DestroyMaterial();
             // Tear down FX effects (detach their CBs, release materials) before
             // destroying the camera they're attached to.
+            Rig?.Dispose();
+            Rig = null;
             _fxHost?.Dispose();
             _fxHost = null;
             // Detach visual-mod integrations before destroying the cameras: this

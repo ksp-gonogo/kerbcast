@@ -60,5 +60,15 @@ Check(CameraId.IsKerbalId(CameraId.KerbalWireId("Jebediah Kerman")), "IsKerbalId
 Check(!CameraId.IsKerbalId(CameraId.Synthetic(100u, 0, "")), "IsKerbalId false for a part id");
 Check(!CameraId.IsKerbalId(CameraId.Synthetic(0xFFFFFFFFu, 2, "cam")), "IsKerbalId false for a masked part id");
 
+// Ground station ids: stable, outside the part space, distinct from the
+// kerbal id of the same string.
+uint ksc = CameraId.GroundStationWireId("KSC");
+Check(ksc == CameraId.GroundStationWireId("KSC"), "ground id stable");
+Check((ksc & TopBit) != 0, "ground id top-bit set (never a part id)");
+Check(ksc != CameraId.KerbalWireId("KSC"), "ground id differs from a kerbal named the same");
+Check(ksc != CameraId.GroundStationWireId("Harvester Massif"), "different stations differ");
+Check(CameraId.GroundCentreId("KSC") == "ground:KSC", "centre id matches gonogo's ground:<name>");
+Check(CameraId.GroundCentreId(null) == "ground:", "centre id tolerates a null name");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

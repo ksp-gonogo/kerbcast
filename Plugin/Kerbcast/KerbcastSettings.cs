@@ -121,6 +121,20 @@ namespace Kerbcast
         // MinKspFps.
         public float BackgroundCaptureFps { get; private set; } = 2f;
 
+        /* Ground tracking-station camera: a feed from the home CommNet station
+           (KSC) that follows the active craft with a telescope-narrow zoom.
+           Experimental, off by default. */
+        public bool EnableGroundStationCamera { get; private set; } = false;
+        /* Share of the frame height the craft is zoomed to fill. */
+        public double GroundStationFrameFraction { get; private set; } = 0.3;
+        /* Zoom limits, vertical field of view in degrees. Below the floor the
+           craft simply gets smaller with range. */
+        public double GroundStationFovMin { get; private set; } = 0.02;
+        public double GroundStationFovMax { get; private set; } = 30.0;
+        /* Metres above the station's own altitude the lens sits, to clear the
+           tracking-station dish and nearby buildings. */
+        public double GroundStationAltitudeOffset { get; private set; } = 30.0;
+
         // Stagger budget CEILING: the most main-thread time (ms/frame) kerbcast
         // will spend on its own render + readback. When it would exceed this,
         // kerbcast captures FEWER cameras per frame (each updates less often, but
@@ -452,6 +466,15 @@ namespace Kerbcast
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyFloat(node, "MaxCaptureFps", v => settings.MaxCaptureFps = v);
             ApplyFloat(node, "BackgroundCaptureFps", v => settings.BackgroundCaptureFps = v);
+            ApplyBool(node, "EnableGroundStationCamera", v => settings.EnableGroundStationCamera = v);
+            ApplyFloat(node, "GroundStationFrameFraction", v =>
+            {
+                if (v > 0f && v <= 1f) settings.GroundStationFrameFraction = v;
+                else Debug.LogWarning($"[Kerbcast] settings.cfg: GroundStationFrameFraction={v} must be in (0, 1]; ignoring");
+            });
+            ApplyFloat(node, "GroundStationFovMin", v => settings.GroundStationFovMin = Mathf.Max(0.001f, v));
+            ApplyFloat(node, "GroundStationFovMax", v => settings.GroundStationFovMax = Mathf.Min(120f, v));
+            ApplyFloat(node, "GroundStationAltitudeOffset", v => settings.GroundStationAltitudeOffset = v);
             ApplyFloat(node, "MaxKerbcastFrameBudgetMs", v => settings.MaxKerbcastFrameBudgetMs = v);
             ApplyFloat(node, "MinKspFps", v => settings.MinKspFps = v);
             ApplyBool(node, "EnableAtmosphericFx", v => settings.EnableAtmosphericFx = v);

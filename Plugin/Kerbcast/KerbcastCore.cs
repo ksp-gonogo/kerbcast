@@ -225,6 +225,11 @@ namespace Kerbcast
                 new HullcamProvider(_settings, RingDir, RingSlots),
                 _crewProvider,
             };
+            if (_settings.EnableGroundStationCamera)
+            {
+                _providers.Add(new GroundStationProvider(_settings, RingDir, RingSlots));
+                Debug.Log("[Kerbcast] ground tracking-station camera enabled (EnableGroundStationCamera=true)");
+            }
             _staggerController = BuildStaggerController(_settings);
             /* Only built when the operator permits background capture at all:
                with the ceiling at 0 nothing can ever background capture, so there is nothing to
@@ -481,7 +486,9 @@ namespace Kerbcast
                 for (int i = _cameras.Count - 1; i >= 0; i--)
                 {
                     var cam = _cameras[i];
-                    bool keep = cam is KerbalFaceCamera && cam.IsAlive;
+                    /* A ground station camera follows whichever craft is
+                       active, so a pilot switch keeps it like a live kerbal. */
+                    bool keep = (cam is KerbalFaceCamera || IsGroundCamera(cam)) && cam.IsAlive;
                     if (keep) continue;
                     cam.Dispose();
                     _cameras.RemoveAt(i);
@@ -546,6 +553,8 @@ namespace Kerbcast
                 ApplyMainScreenThrottle();
             }
         }
+
+        private static bool IsGroundCamera(ICamera cam) => cam is KerbcastCamera kc && kc.Rig != null;
 
         // LateUpdate drives explicit camera.Render() calls via each
         // KerbcastCamera.Refresh(). Our offscreen cameras are permanently
