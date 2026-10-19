@@ -131,8 +131,17 @@ namespace Kerbcast
            craft simply gets smaller with range. */
         public double GroundStationFovMin { get; private set; } = 0.02;
         public double GroundStationFovMax { get; private set; } = 30.0;
-        /* Metres above the station's own altitude the lens sits, to clear the
-           tracking-station dish and nearby buildings. */
+        /* Where the lens stands: "launchsite" (beside the pad or runway the
+           active craft launched from) or "ksc" (the home CommNet station). */
+        public string GroundStationAnchor { get; private set; } = "launchsite";
+        /* Launch-site anchor: metres from the site's spawn point, the compass
+           bearing from the site to the lens (180 = due south, side-on to an
+           eastward launch) and the lens height above the ground. */
+        public double GroundStationPadDistance { get; private set; } = 500.0;
+        public double GroundStationPadBearing { get; private set; } = 180.0;
+        public double GroundStationPadHeight { get; private set; } = 5.0;
+        /* KSC anchor: metres above the station's own altitude the lens sits, to
+           clear the tracking-station dish and nearby buildings. */
         public double GroundStationAltitudeOffset { get; private set; } = 30.0;
 
         // Stagger budget CEILING: the most main-thread time (ms/frame) kerbcast
@@ -474,6 +483,15 @@ namespace Kerbcast
             });
             ApplyFloat(node, "GroundStationFovMin", v => settings.GroundStationFovMin = Mathf.Max(0.001f, v));
             ApplyFloat(node, "GroundStationFovMax", v => settings.GroundStationFovMax = Mathf.Min(120f, v));
+            ApplyString(node, "GroundStationAnchor", v =>
+            {
+                var a = v.Trim().ToLowerInvariant();
+                if (a == "launchsite" || a == "ksc") settings.GroundStationAnchor = a;
+                else Debug.LogWarning($"[Kerbcast] settings.cfg: GroundStationAnchor={v} must be launchsite or ksc; ignoring");
+            });
+            ApplyFloat(node, "GroundStationPadDistance", v => settings.GroundStationPadDistance = Mathf.Max(0f, v));
+            ApplyFloat(node, "GroundStationPadBearing", v => settings.GroundStationPadBearing = v);
+            ApplyFloat(node, "GroundStationPadHeight", v => settings.GroundStationPadHeight = v);
             ApplyFloat(node, "GroundStationAltitudeOffset", v => settings.GroundStationAltitudeOffset = v);
             ApplyFloat(node, "MaxKerbcastFrameBudgetMs", v => settings.MaxKerbcastFrameBudgetMs = v);
             ApplyFloat(node, "MinKspFps", v => settings.MinKspFps = v);

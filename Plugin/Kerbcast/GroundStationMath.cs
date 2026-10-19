@@ -92,6 +92,21 @@ namespace Kerbcast
             return new DVec3(zup.X, zup.Z, zup.Y) + bodyCentre;
         }
 
+        /* The point `distance` metres from lat/lon along the great circle that
+           leaves it on `bearingDeg` (0 = north, 90 = east), on a sphere of
+           `radius`. Used to stand the lens off from a launch site. */
+        public static void Destination(double latDeg, double lonDeg, double bearingDeg, double distance,
+            double radius, out double outLatDeg, out double outLonDeg)
+        {
+            double lat = latDeg * Deg2Rad, lon = lonDeg * Deg2Rad, brg = bearingDeg * Deg2Rad;
+            double d = distance / radius;
+            double lat2 = Math.Asin(Math.Sin(lat) * Math.Cos(d) + Math.Cos(lat) * Math.Sin(d) * Math.Cos(brg));
+            double lon2 = lon + Math.Atan2(Math.Sin(brg) * Math.Sin(d) * Math.Cos(lat),
+                Math.Cos(d) - Math.Sin(lat) * Math.Sin(lat2));
+            outLatDeg = lat2 * Rad2Deg;
+            outLonDeg = (lon2 * Rad2Deg + 540.0) % 360.0 - 180.0;
+        }
+
         /* Forward and up for a camera at `from` looking at `to`, with up as close
            to `upHint` (the station's local vertical) as the view allows, so the
            horizon stays level. When the craft is straight overhead the hint is

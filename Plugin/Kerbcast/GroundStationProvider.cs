@@ -6,8 +6,9 @@ using Debug = UnityEngine.Debug;
 
 namespace Kerbcast
 {
-    /* One ground tracking-station camera at the home CommNet station (KSC),
-       watching whichever craft is active. Not tied to any vessel: it returns
+    /* One ground camera beside the active craft's launch site (or at the home
+       CommNet station, per GroundStationAnchor), watching whichever craft is
+       active. Not tied to any vessel: it returns
        the same camera whatever vessel is scanned, and KerbcastCore keeps it
        across vessel switches. Only registered when EnableGroundStationCamera
        is on. The site is resolved once per flight scene. */
@@ -31,15 +32,28 @@ namespace Kerbcast
             var result = new List<ICamera>();
             if (_site == null)
             {
-                _site = GroundStationSite.ResolveHome(_settings.GroundStationAltitudeOffset);
+                if (_settings.GroundStationAnchor == "launchsite")
+                {
+                    _site = GroundStationSite.ResolveLaunchSite(FlightGlobals.ActiveVessel ?? vessel,
+                        _settings.GroundStationPadDistance, _settings.GroundStationPadBearing,
+                        _settings.GroundStationPadHeight);
+                    if (_site != null)
+                        Debug.Log($"[Kerbcast][GROUNDCAM] launch site resolved: {_site} distance={_settings.GroundStationPadDistance:F0} bearing={_settings.GroundStationPadBearing:F0} height={_settings.GroundStationPadHeight:F1}");
+                    else
+                        Debug.LogWarning("[Kerbcast][GROUNDCAM] no launch site found; using the home station");
+                }
                 if (_site == null)
                 {
-                    if (!_resolveFailedLogged)
-                        Debug.LogWarning("[Kerbcast][GROUNDCAM] no home station or home body found; ground camera not created");
-                    _resolveFailedLogged = true;
-                    return result;
+                    _site = GroundStationSite.ResolveHome(_settings.GroundStationAltitudeOffset);
+                    if (_site == null)
+                    {
+                        if (!_resolveFailedLogged)
+                            Debug.LogWarning("[Kerbcast][GROUNDCAM] no home station or home body found; ground camera not created");
+                        _resolveFailedLogged = true;
+                        return result;
+                    }
+                    Debug.Log($"[Kerbcast][GROUNDCAM] home station resolved: {_site}");
                 }
-                Debug.Log($"[Kerbcast][GROUNDCAM] home station resolved: {_site}");
             }
 
             uint flightId = CameraId.GroundStationWireId(_site.NodeName);

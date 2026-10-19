@@ -132,5 +132,22 @@ Check(Near(singleDeep.NearFar, 2e6 + 80, 1), "single stack: far plane follows pa
 var singleHidden = GroundStationMath.PlanClips(2e6, 15, true, false, false, nN, fF, 0, 0);
 Check(Near(singleHidden.NearFar, 2e6 - 80, 1), "single stack occluded: stops short of the craft");
 
+// Launch-site stand-off: 500 m on a Kerbin-sized sphere from the KSC pad.
+const double kerbinR = 600000;
+GroundStationMath.Destination(-0.0972, -74.5577, 180, 500, kerbinR, out double sLat, out double sLon);
+Check(Near(sLon, -74.5577, 1e-9) && Near((-0.0972 - sLat) * Math.PI / 180 * kerbinR, 500, 1e-6),
+    "due south: same longitude, 500 m of latitude");
+GroundStationMath.Destination(0, -74.5577, 90, 500, kerbinR, out double eLat, out double eLon);
+Check(Near(eLat, 0, 1e-12) && Near((eLon + 74.5577) * Math.PI / 180 * kerbinR, 500, 1e-6),
+    "due east on the equator: 500 m of longitude");
+GroundStationMath.Destination(-0.0972, -74.5577, 37, 500, kerbinR, out double aLat, out double aLon);
+var padPos = GroundStationMath.SurfacePosition(new DVec3(0, 0, 0), new DVec3(1, 0, 0), new DVec3(0, 1, 0), new DVec3(0, 0, 1),
+    kerbinR, -0.0972, -74.5577, 0);
+var lensPos = GroundStationMath.SurfacePosition(new DVec3(0, 0, 0), new DVec3(1, 0, 0), new DVec3(0, 1, 0), new DVec3(0, 0, 1),
+    kerbinR, aLat, aLon, 0);
+Check(Near((lensPos - padPos).Magnitude, 500, 0.01), "any bearing: the lens stands 500 m from the pad");
+GroundStationMath.Destination(10, 179.9999, 90, 500, kerbinR, out _, out double wrapLon);
+Check(wrapLon > -180 && wrapLon < -179.9, "longitude wraps across the antimeridian");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

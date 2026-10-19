@@ -18,8 +18,8 @@ namespace Kerbcast
         /* Altitude of the lens: the station's own altitude plus the configured offset. */
         public double Altitude { get; private set; }
         public bool IsHome { get; private set; }
-        /* How the site was found, for the log: commnet-fields, commnet-transform,
-           spacecenter or fallback. */
+        /* How the site was found, for the log: launchsite, commnet-fields,
+           commnet-transform, spacecenter or fallback. */
         public string Source { get; private set; }
 
         /* Stock keeps a home's body and coordinates protected, so they are read
@@ -79,6 +79,60 @@ namespace Kerbcast
             return OnTerrain("KSC", "KSC", homeBody, FallbackLatitude, FallbackLongitude, altitudeOffset, "fallback");
         }
 
+        /* A lens standing `distance` metres from a launch site on `bearingDeg`,
+           `height` metres above the ground there. The site is the one the craft
+           launched from (stock pad and runway, Making History and Kerbal
+           Konstructs sites), else the stock launch pad. Null when no site is
+           known, so the caller can fall back to the home station. */
+        public static GroundStationSite ResolveLaunchSite(Vessel vessel, double distance, double bearingDeg, double height)
+        {
+            var setup = PSystemSetup.Instance;
+            if (setup == null) return null;
+
+            string launchedFrom = vessel != null ? vessel.launchedFrom : null;
+            foreach (var name in new[] { launchedFrom, "LaunchPad" })
+            {
+                if (string.IsNullOrEmpty(name)) continue;
+                try
+                {
+                    if (!SpawnPointOf(setup, name, out var body, out double lat, out double lon)) continue;
+                    GroundStationMath.Destination(lat, lon, bearingDeg, distance, body.Radius,
+                        out double lensLat, out double lensLon);
+                    var site = OnTerrain(name, setup.GetLaunchSiteDisplayName(name), body,
+                        lensLat, lensLon, height, "launchsite");
+                    site.IsHome = false;
+                    return site;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Kerbcast][GROUNDCAM] launch site '{name}' not usable: {ex.Message}");
+                }
+            }
+            return null;
+        }
+
+        private static bool SpawnPointOf(PSystemSetup setup, string name,
+            out CelestialBody body, out double lat, out double lon)
+        {
+            body = null; lat = lon = 0;
+            double alt;
+            var facility = setup.GetSpaceCenterFacility(name);
+            if (facility != null && facility.spawnPoints != null && facility.spawnPoints.Length > 0)
+            {
+                facility.spawnPoints[0].GetSpawnPointLatLonAlt(out lat, out lon, out alt);
+                body = facility.hostBody;
+            }
+            else
+            {
+                var site = setup.GetLaunchSite(name);
+                if (site == null || site.spawnPoints == null || site.spawnPoints.Length == 0) return false;
+                site.spawnPoints[0].GetSpawnPointLatLonAlt(out lat, out lon, out alt);
+                body = site.Body;
+            }
+            if (body == null) body = FlightGlobals.GetHomeBody();
+            return body != null && !double.IsNaN(lat) && !double.IsNaN(lon);
+        }
+
         private static GroundStationSite FromHome(CommNetHome home, double altitudeOffset)
         {
             var body = Read<CelestialBody>(BodyField, home)
@@ -129,6 +183,8 @@ namespace Kerbcast
             double ground = 0;
             try { ground = body.TerrainAltitude(lat, lon); }
             catch (Exception) { /* no PQS: sea level */ }
+            /* Over water the lens floats on the sea, not on the seabed. */
+            if (body.ocean && ground < 0) ground = 0;
             return new GroundStationSite
             {
                 NodeName = node, DisplayName = display, Body = body,
