@@ -28,6 +28,9 @@ namespace Kerbcast
             _sceneUnloading = true;
         }
 
+        /// <summary>True from the scene-load request until this flight scene is gone.</summary>
+        public bool SceneUnloading => _sceneUnloading;
+
         /// <summary>
         /// True when a camera disposed now should write a <c>lifecycle: "destroyed"</c>
         /// tombstone (a genuine in-flight loss); false once the scene is unloading.

@@ -433,6 +433,10 @@ namespace Kerbcast
         {
             _captureEpoch.Bump();
             _teardown.OnSceneLoadRequested();
+            /* Restore now, while the scaled-space cameras are still findable. By
+               OnDestroy their GameObjects are inactive, FindObjectsOfType skips
+               them, and they would stay disabled into the next scene. */
+            RestoreMainScreen();
         }
 
         private void OnGameStatePostLoad(ConfigNode node) => _captureEpoch.Bump();
@@ -879,6 +883,9 @@ namespace Kerbcast
         private void ApplyMainScreenThrottle()
         {
             if (_mainCamerasDisabled) { _throttleEffective = true; return; }
+            /* The scene is unloading and the restore already ran; the per-frame
+               reconcile must not switch the cameras off again on the way out. */
+            if (_teardown.SceneUnloading) return;
             try
             {
                 if (FlightCamera.fetch != null)
