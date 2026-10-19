@@ -41,7 +41,7 @@ namespace Kerbcast
         private const double FallbackLongitude = -74.567;
 
         /* The home station (normally KSC). Tries, in order: the CommNetHome
-           flagged isKSC (or the first home) with stock's own lat/lon/alt, which
+           PickHome chooses with stock's own lat/lon/alt, which
            are only filled while CommNet is enabled for the save; the same home's
            node transform converted through its body; the SpaceCenter object;
            and finally fixed coordinates near the pad on the home body. */
@@ -50,12 +50,7 @@ namespace Kerbcast
             CommNetHome home = null;
             try
             {
-                foreach (var h in UnityEngine.Object.FindObjectsOfType<CommNetHome>())
-                {
-                    if (h == null) continue;
-                    if (h.isKSC) { home = h; break; }
-                    if (home == null) home = h;
-                }
+                home = PickHome(UnityEngine.Object.FindObjectsOfType<CommNetHome>());
             }
             catch (Exception ex)
             {
@@ -77,6 +72,40 @@ namespace Kerbcast
                 return OnTerrain("KSC", "KSC", homeBody, sc.Latitude, sc.Longitude, altitudeOffset, "spacecenter");
             }
             return OnTerrain("KSC", "KSC", homeBody, FallbackLatitude, FallbackLongitude, altitudeOffset, "fallback");
+        }
+
+        /* RealAntennas and similar mods flag many ground stations isKSC, so the
+           flag alone picks whichever comes first. Among flagged homes (or all,
+           if none is flagged) take the one nearest the SpaceCenter object, then
+           one named KSC, then the first. */
+        private static CommNetHome PickHome(CommNetHome[] homes)
+        {
+            var candidates = new System.Collections.Generic.List<CommNetHome>();
+            foreach (var h in homes)
+                if (h != null && h.isKSC) candidates.Add(h);
+            if (candidates.Count == 0)
+                foreach (var h in homes)
+                    if (h != null) candidates.Add(h);
+            if (candidates.Count <= 1) return candidates.Count == 1 ? candidates[0] : null;
+
+            var sc = SpaceCenter.Instance;
+            if (sc != null)
+            {
+                CommNetHome nearest = null;
+                float best = float.MaxValue;
+                foreach (var h in candidates)
+                {
+                    var t = h.nodeTransform != null ? h.nodeTransform : h.transform;
+                    if (t == null) continue;
+                    float d = (t.position - sc.transform.position).sqrMagnitude;
+                    if (d < best) { best = d; nearest = h; }
+                }
+                if (nearest != null) return nearest;
+            }
+            foreach (var h in candidates)
+                if (h.nodeName == "KSC" || (h.nodeName ?? "").IndexOf("Kerbal Space Center", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return h;
+            return candidates[0];
         }
 
         /* A lens standing `distance` metres from a launch site on `bearingDeg`,

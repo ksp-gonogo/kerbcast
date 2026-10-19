@@ -337,6 +337,8 @@ namespace Kerbcast
             _originShifts++;
             var fo = FloatingOrigin.fetch;
             if (fo != null && fo.continuous) return; // continuous mode: counted in the status line only
+            /* KSP fires zero-offset shifts constantly; only a real move is worth a line. */
+            if (offset.magnitude < 0.05) return;
             if (_originShiftLogsThisSecond >= MaxOriginShiftLogsPerSecond) return;
             _originShiftLogsThisSecond++;
             Debug.Log($"{Tag} cam={_flightId} UT={F(Planetarium.GetUniversalTime())} d={_lastDistance:F0} "
