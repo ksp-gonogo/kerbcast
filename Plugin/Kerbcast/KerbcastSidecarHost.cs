@@ -44,6 +44,10 @@ namespace Kerbcast
         public static KerbcastSidecarHost Instance { get; private set; }
 
         private KerbcastSettings _settings;
+
+        /* The settings the running sidecar was launched with; process-level
+           values like the bind address only change on the next KSP start. */
+        internal KerbcastSettings LaunchSettings => _settings;
         private string _ringDir;
         private string _heartbeatPath;
         private float _heartbeatCooldown;

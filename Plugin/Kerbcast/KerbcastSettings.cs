@@ -271,7 +271,7 @@ namespace Kerbcast
 
         // True if the bind address only accepts connections from this machine,
         // so exposing the feeds to the LAN warrants a warning when it isn't.
-        private static bool IsLoopback(string addr)
+        internal static bool IsLoopback(string addr)
         {
             if (string.IsNullOrEmpty(addr)) return true;
             addr = addr.Trim();

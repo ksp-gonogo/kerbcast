@@ -40,6 +40,21 @@ namespace Kerbcast
            state where every feed goes black while the mod still looks healthy. */
         public static bool SidecarAlive => KerbcastSidecarHost.Instance?.SidecarRunning ?? false;
 
+        /* Host the feeds and the signalling endpoint listen on: what the
+           running sidecar was launched with, or what settings.cfg configures
+           before the first flight starts it. */
+        public static string BindAddress => BindSettings.BindAddress;
+
+        public static int Port => BindSettings.Port;
+
+        /* True when only this computer can reach the feeds. */
+        public static bool BindIsLoopback => KerbcastSettings.IsLoopback(BindSettings.BindAddress);
+
+        private static KerbcastSettings _configured;
+
+        private static KerbcastSettings BindSettings =>
+            KerbcastSidecarHost.Instance?.LaunchSettings ?? (_configured ?? (_configured = KerbcastSettings.Load()));
+
         public static IReadOnlyList<KerbcastCameraView> CamerasFor(global::Vessel vessel)
         {
             var result = new List<KerbcastCameraView>();
