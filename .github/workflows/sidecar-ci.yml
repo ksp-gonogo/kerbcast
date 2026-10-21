@@ -28,7 +28,13 @@ on:
     paths:
       - 'sidecar/**'
       - '.github/workflows/sidecar-ci.yml'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version the sidecar reports (dev builds, e.g. 1.11.0-dev.ab12cd3). Empty keeps Cargo.toml'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -43,6 +49,10 @@ jobs:
     # keeps every bundled .so's glibc requirement at ≤ 2.35, safely below the
     # pressure-vessel floor.
     runs-on: ubuntu-22.04
+    # Empty on push and pull_request, which leaves VERSION at Cargo.toml's
+    # (see sidecar/src/lib.rs). scripts/dev-build.sh sets it on dispatch.
+    env:
+      KERBCAST_VERSION_OVERRIDE: ${{ inputs.version }}
     defaults:
       run:
         working-directory: sidecar
@@ -183,6 +193,7 @@ jobs:
           runner=${{ runner.os }} ${{ runner.arch }} (${{ runner.name }})
           ci_run=${{ github.run_id }}
           git_sha=${{ github.sha }}
+          version_override=${KERBCAST_VERSION_OVERRIDE}
           build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           EOF
 
