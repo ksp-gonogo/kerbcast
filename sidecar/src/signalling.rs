@@ -57,7 +57,8 @@ pub struct AppState {
 pub struct OfferRequest {
     pub sdp: String,
     /// flight IDs the browser wants tracks for. With no `slots` field, empty
-    /// = subscribe to every currently-known camera (the dev test page). With
+    /// = subscribe to the currently-known cameras, as many as the offer has
+    /// video sections for. With
     /// `slots` set (the dynamic model) these are the *initial* subscription
     /// bound to the first slots; empty then means "no initial subscription".
     #[serde(default)]
@@ -244,12 +245,16 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
     // to all. With an explicit `slots` (the dynamic model), an empty `cameras`
     // means "no initial subscription".
     let requested: Vec<u32> = if req.slots.is_none() && req.cameras.is_empty() {
+        /* Only as many cameras as the offer has video sections to carry them.
+        The SDK's legacy connect() offers one, so binding every camera left the
+        rest on slots no m-line matches: rendering, with every frame dropped. */
         state
             .registry
             .list()
             .await
             .iter()
             .map(|c| c.flight_id)
+            .take(offered_video_sections(&req.sdp))
             .collect()
     } else {
         req.cameras
@@ -293,6 +298,11 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
         sdp: answer_sdp,
         cameras: subscribed,
     })
+}
+
+/// The number of video m-lines in an SDP offer.
+fn offered_video_sections(sdp: &str) -> usize {
+    sdp.lines().filter(|l| l.starts_with("m=video")).count()
 }
 
 #[cfg(test)]
@@ -408,6 +418,53 @@ mod tests {
             "a peer whose exchange failed must be reapable at once, not after \
              the negotiation deadline"
         );
+    }
+
+    /// A legacy offer with no camera list binds only as many cameras as it has
+    /// video sections, so no camera is bound to a slot no m-line matches.
+    #[tokio::test]
+    async fn a_subscribe_all_offer_binds_only_what_it_can_carry() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        for id in [1, 2, 3] {
+            MmapFrameRing::create(&dir.path().join(format!("{id}.ring")), cfg).expect("ring");
+        }
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let state = AppState {
+            registry,
+            ..empty_state()
+        };
+
+        let req = OfferRequest {
+            sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+                .to_owned(),
+            cameras: Vec::new(),
+            slots: None,
+        };
+        let _ = handle_offer(state.clone(), req).await;
+
+        let peers = state.peers.read().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].subscribed.len(),
+            1,
+            "one video section, one camera"
+        );
+    }
+
+    #[test]
+    fn counts_video_sections_only() {
+        let sdp =
+            "v=0\r\nm=video 9 X 96\r\nm=audio 9 X 0\r\nm=video 9 X 96\r\nm=application 9 X y\r\n";
+        assert_eq!(offered_video_sections(sdp), 2);
+        assert_eq!(offered_video_sections("not an sdp"), 0);
     }
 
     /// The orphan the reaper could never collect: axum drops the handler future
