@@ -126,13 +126,15 @@ namespace Kerbcast
         /* Takes the lock on every command feed's aim in this scene for `owner`
            (gonogo). While it is held, SetCommandAim accepts only calls that pass
            `owner`; everyone else is refused, browser clients included. Aims
-           already set stay until the owner changes them. The lock fails closed:
-           if `owner` makes no call (this, SetCommandAim with its owner, or
-           SetCommandBlank) for 5 s of REAL time, every command feed blanks
-           "gonogo not responding". Real time keeps counting while the game is
-           paused or warping, so keep calling as a heartbeat then too. The lock
-           lasts until ClearCommandAuthority or a scene change, so take it again
-           on each scene load. Calling again with the same owner is a
+           already set stay until the owner changes them. The lock holds until
+           ClearCommandAuthority or a scene change, and never times out: take
+           it again on each scene load. It fails closed: if `owner` makes no
+           call (this, SetCommandAim with its owner, or SetCommandBlank) for 5 s
+           of REAL time, every command feed blanks "gonogo not responding", but
+           the lock stays held and everyone else stays refused, so a stalled
+           holder that delays commands can not be bypassed. Real time keeps
+           counting while the game is paused or warping, so keep calling as a
+           heartbeat then too. Calling again with the same owner is a
            heartbeat; a different owner is refused (false). False also when
            Kerbcast is not running in this scene. */
         public static bool SetCommandAuthority(string owner)
@@ -206,9 +208,10 @@ namespace Kerbcast
            is not built yet. While a lock is held (SetCommandAuthority) only
            calls passing its owner are accepted, and each is a heartbeat even
            when it returns false. False when the lock refuses the call, the
-           feed is not a command feed, a craft it names does not exist, its
-           body is unknown, or a number is not finite or out of range (a
-           negative framing margin, an elevation outside -90..90). */
+           feed is not a command feed, a craft it names does not exist (one
+           docked into another no longer does), its body is unknown, or a
+           number is not finite or out of range (a negative framing margin, an
+           elevation outside -90..90). */
         public static bool SetCommandAim(uint flightId, CommandAim aim, string owner = null)
         {
             var core = KerbcastCore.Instance;
@@ -235,11 +238,13 @@ namespace Kerbcast
         /* Creates a command camera standing at `vantage` for the rest of this
            scene (flight or Space Center), and returns the flightId its feed
            will have, or 0 when Kerbcast is not running here, the vantage is
-           malformed, a surface vantage names an unknown body, or `aim` is
-           unusable (as for SetCommandAim). The feed appears once the vantage
-           resolves, normally on the next frame; a launch site, station or
-           craft that is not placed within 30 s drops the camera instead of
-           standing it anywhere else. `name` replaces the default feed name
+           malformed, a surface vantage names an unknown body, a vessel vantage
+           names a craft that no longer exists, or `aim` is unusable (as for
+           SetCommandAim). The feed appears once the vantage resolves, normally
+           on the next frame; a launch site, station or craft that is not
+           placed within 30 s drops the camera instead of standing it anywhere
+           else. A vessel vantage rides the combined craft after a dock or claw
+           grab; if its craft is destroyed or recovered the camera is removed. `name` replaces the default feed name
            ("Launchpad camera", "<site> camera", "<station> tracking",
            "<craft> camera" or "<body> surface camera"). It points by `aim`,
            or at the default craft (the active one in flight) when null. While
@@ -309,16 +314,6 @@ namespace Kerbcast
             return null;
         }
 
-        static bool VesselExists(uint persistentId)
-        {
-            if (FlightGlobals.FindVessel(persistentId, out Vessel v) && v != null) return true;
-            var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
-            if (protos == null) return false;
-            for (int i = 0; i < protos.Count; i++)
-                if (protos[i] != null && protos[i].persistentId == persistentId) return true;
-            return false;
-        }
-
         /* Checks an aim's numbers, craft and body, building the conic for an Orbit aim. */
         static bool TryResolveAim(uint flightId, CommandAim aim, out Orbit orbit)
         {
@@ -326,7 +321,7 @@ namespace Kerbcast
             if (!Finite(aim.FramingMarginM) || aim.FramingMarginM < 0) return false;
             uint subject = aim.SubjectPersistentId;
             if (aim.Kind == CommandAimKind.Vessel && subject == 0) return false;
-            if (subject != 0 && !VesselExists(subject)) return false;
+            if (subject != 0 && !CommandCameraTargets.Exists(subject)) return false;
             switch (aim.Kind)
             {
                 case CommandAimKind.Vessel:

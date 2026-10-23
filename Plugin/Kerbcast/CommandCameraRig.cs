@@ -164,6 +164,20 @@ namespace Kerbcast
 
         /* Where the camera points; null for its default craft. */
         public CommandAim Aim => _aim;
+        internal Orbit AimOrbit => _aimOrbit;
+
+        /* The craft this lens rides no longer exists (crashed, recovered, or
+           gone some way other than a merge, which the lens follows). */
+        public bool VantageLost => _mount.Site.VantageGone;
+
+        /* A merge (dock or claw grab) moves both ends: the watched craft and
+           the craft the lens rides each follow into the survivor. */
+        private void OnMerged(uint oldPid, uint newPid)
+        {
+            _target.Merged(oldPid, newPid);
+            if (_mount.Site.FollowMerge(oldPid, newPid))
+                Debug.Log($"{Tag} cam={_flightId} vantage merged: persistentId={oldPid} -> {newPid} ('{_mount.Site.Vantage.vesselName}')");
+        }
 
         /* Points the camera by `aim` (null for the default craft) from the
            next solve, with `orbit` built for an Orbit aim. The aim's subject,
@@ -264,7 +278,7 @@ namespace Kerbcast
             }
 
             GameEvents.onFloatingOriginShift.Add(OnOriginShift);
-            GameEvents.onVesselPersistentIdChanged.Add(_target.Merged);
+            GameEvents.onVesselPersistentIdChanged.Add(OnMerged);
             Debug.Log($"{Tag} cam={_flightId} rig up: station {mount.Site} "
                 + $"near=[{_nearNativeNear:F2},{_nearNativeFar:F0}] "
                 + (_hasFar ? $"far=[{_farNativeNear:F0},{_farNativeFar:F0}] mid layer ready" : "no far layer (single local camera)")
@@ -308,7 +322,7 @@ namespace Kerbcast
             bool ok = SolveGeometry(ut, out station, out aim, out localUp, out north, out occluder);
             if (!ok) HasFix = false;
             FramingFits = !ok || CommandCameraMath.FramingFits(_craftRadius + FramingMargin, RangeM, _fovMax);
-            Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank);
+            Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost);
             UpdateBracket(now);
             NoteGovernance(ut, governed);
             _events.Record(new CommandTrackEvent(ut, Occluded, Blocker, Sunlit, Blank));
@@ -327,7 +341,7 @@ namespace Kerbcast
             var site = _mount.Site;
             Vector3d vantage = default;
             string vantageSource = null;
-            if (site.Vantage != null && !site.TryVantagePosition(ut, out vantage, out vantageSource))
+            if (site.HasVantage && !site.TryVantagePosition(ut, out vantage, out vantageSource))
                 return false;
             var body = site.Body;
             if (body == null) return false;
@@ -604,7 +618,7 @@ namespace Kerbcast
             station = aim = default;
             var site = _mount.Site;
             var v = site.Vantage;
-            if (v != null)
+            if (site.HasVantage)
             {
                 if (!site.TryVantagePosition(ut, out var vantage, out _)) return false;
                 if (v.LandedOrSplashed) station = BodyMotion.OnSurface(v.mainBody, vantage);
@@ -625,7 +639,7 @@ namespace Kerbcast
                 case CommandAimKind.Direction:
                 {
                     /* Held still against the ground, as near as the forecast needs. */
-                    var body = site.Vantage != null ? site.Vantage.mainBody : site.Body;
+                    var body = site.HasVantage ? (site.Vantage != null ? site.Vantage.mainBody : null) : site.Body;
                     if (body == null) return false;
                     aim = BodyMotion.OnSurface(body, new Vector3d(_lastAimPoint.X, _lastAimPoint.Y, _lastAimPoint.Z));
                     return true;
@@ -1315,7 +1329,7 @@ namespace Kerbcast
         public void Dispose()
         {
             GameEvents.onFloatingOriginShift.Remove(OnOriginShift);
-            GameEvents.onVesselPersistentIdChanged.Remove(_target.Merged);
+            GameEvents.onVesselPersistentIdChanged.Remove(OnMerged);
             _marker?.Dispose();
             _marker = null;
             _utStripe?.Dispose();

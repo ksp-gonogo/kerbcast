@@ -25,6 +25,12 @@ namespace Kerbcast
         public string Source { get; private set; }
         /* Set when the camera rides a vessel instead of standing on a body. */
         public Vessel Vantage { get; private set; }
+        /* The ridden craft's persistentId; 0 for a lens on a body. Kept apart
+           from Vantage, which reads as null once the craft is destroyed. */
+        public uint VantagePersistentId { get; private set; }
+        public bool HasVantage => VantagePersistentId != 0;
+        /* The ridden craft no longer exists, so the lens has no position. */
+        public bool VantageGone => HasVantage && (Vantage == null || Vantage.state == Vessel.State.DEAD);
         /* Set for a lens at an arbitrary surface point, not a station or a launch site. */
         public bool IsSurfacePoint { get; private set; }
 
@@ -330,7 +336,22 @@ namespace Kerbcast
             Body = v.mainBody,
             Source = "vessel",
             Vantage = v,
+            VantagePersistentId = v.persistentId,
         };
+
+        /* Rides the survivor when KSP merges the ridden craft into another (a
+           dock or a claw grab). NodeName keeps the original craft's id, so the
+           feed keeps its flightId. True when the vantage moved. */
+        public bool FollowMerge(uint oldPid, uint newPid)
+        {
+            uint next = CommandCameraMath.MergedPersistentId(VantagePersistentId, oldPid, newPid);
+            if (next == VantagePersistentId) return false;
+            if (!FlightGlobals.FindVessel(next, out Vessel survivor) || survivor == null) return false;
+            Vantage = survivor;
+            VantagePersistentId = next;
+            if (survivor.mainBody != null) Body = survivor.mainBody;
+            return true;
+        }
 
         /* A vessel as the vantage, found by exact name. Null when no such vessel exists. */
         public static CommandCameraSite ResolveVessel(string name)
@@ -393,8 +414,8 @@ namespace Kerbcast
             catch (Exception) { return null; }
         }
 
-        public override string ToString() => Vantage != null
-            ? $"node={NodeName} name='{DisplayName}' body={Body?.bodyName} vessel loaded={Vantage.loaded} source={Source}"
+        public override string ToString() => HasVantage
+            ? $"node={NodeName} name='{DisplayName}' body={Body?.bodyName} vessel={VantagePersistentId} loaded={(Vantage != null && Vantage.loaded)} source={Source}"
             : $"node={NodeName} name='{DisplayName}' body={Body?.bodyName} lat={Latitude:F5} lon={Longitude:F5} alt={Altitude:F1} home={IsHome} source={Source}";
     }
 }

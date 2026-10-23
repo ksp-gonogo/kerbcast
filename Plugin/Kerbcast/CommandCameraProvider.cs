@@ -60,8 +60,9 @@ namespace Kerbcast
 
         /* Queues a camera at `vantage`, built on the next enumeration once its
            site resolves. Returns the flightId it will have, or 0 with `error`
-           set when the vantage is malformed or names an unknown body. `taken`
-           is every flightId in use, so the new one collides with none. */
+           set when the vantage is malformed or names an unknown body or a
+           craft that no longer exists. `taken` is every flightId in use, so
+           the new one collides with none. */
         public uint Create(CommandVantage vantage, string name, CommandAim aim, Orbit aimOrbit, string token,
             IReadOnlyCollection<uint> taken, out string error)
         {
@@ -70,6 +71,11 @@ namespace Kerbcast
             if (vantage.Kind == CommandVantageKind.Surface && FlightGlobals.GetBodyByName(vantage.Body) == null)
             {
                 error = $"no body named '{vantage.Body}'";
+                return 0;
+            }
+            if (vantage.Kind == CommandVantageKind.Vessel && !CommandCameraTargets.Exists(vantage.PersistentId))
+            {
+                error = $"no craft with persistentId={vantage.PersistentId}";
                 return 0;
             }
             uint flightId;
@@ -100,6 +106,16 @@ namespace Kerbcast
         }
 
         public bool IsCreated(uint flightId) => _feeds.Any(f => f.Created && f.FlightId == flightId);
+
+        /* The default camera lost the craft it rode: its site is resolved
+           afresh from settings on the next enumeration, so it lands on the
+           home station unless a craft with the configured name still exists,
+           and `aim` carries over. The caller disposes the built camera. */
+        public void ReresolveDefault(CommandAim aim, Orbit aimOrbit)
+        {
+            var feed = _feeds.FirstOrDefault(f => !f.Created);
+            feed?.Reresolve(aim, aimOrbit);
+        }
 
         /* A created camera that is not built yet. */
         public bool IsPending(uint flightId) => _feeds.Any(f => f.Created && f.FlightId == flightId && !f.Built);
@@ -190,6 +206,23 @@ namespace Kerbcast
                 uint subject = aim?.SubjectPersistentId ?? 0;
                 if (_target != null && subject != _target.ChosenPersistentId) _target.Choose(subject);
             }
+
+            public void Reresolve(CommandAim aim, Orbit orbit)
+            {
+                _site = null;
+                Built = false;
+                _siteAttempts = 0;
+                _resolveFailedLogged = false;
+                _cameraWaitStart = -1f;
+                _vantageLost = true;
+                SetAim(aim, orbit);
+                RetryPending = true;
+                _nextSiteAttemptAt = Time.realtimeSinceStartup;
+            }
+
+            /* Mid-scene, a missing vantage craft will not turn up later the
+               way one still loading at scene start does, so there is no wait. */
+            private bool _vantageLost;
 
             private void Retry(float now)
             {
@@ -305,7 +338,7 @@ namespace Kerbcast
                         if (_site.Vantage.loaded)
                             Debug.LogWarning("[Kerbcast][CMDCAM] vantage vessel is loaded, so the camera sits inside its parts; keep it unloaded (over 2.5 km from the active vessel)");
                     }
-                    else if (now - _siteFirstAttemptAt < SiteRetrySeconds)
+                    else if (!_vantageLost && now - _siteFirstAttemptAt < SiteRetrySeconds)
                     {
                         if (_siteAttempts == 1)
                             Debug.LogWarning($"[Kerbcast][CMDCAM] vantage vessel '{S.CommandCameraVantageName}' not found; retrying every {SiteRetryInterval:F0}s for up to {SiteRetrySeconds:F0}s");
@@ -315,7 +348,8 @@ namespace Kerbcast
                     else
                     {
                         RetryPending = false;
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] vantage vessel '{S.CommandCameraVantageName}' still not found; using the home station");
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] vantage vessel '{S.CommandCameraVantageName}' "
+                            + (_vantageLost ? "gone" : "still not found") + "; using the home station");
                     }
                 }
                 if (_site == null)
@@ -415,7 +449,7 @@ namespace Kerbcast
                     RetryPending = false;
                     Debug.Log($"[Kerbcast][CMDCAM] {Label} site resolved: {_site}"
                         + (_siteAttempts > 1 ? $" after {_siteAttempts} attempts ({now - _siteFirstAttemptAt:F1}s)" : ""));
-                    if (_site.Vantage != null && _site.Vantage.loaded)
+                    if (_site.HasVantage && _site.Vantage.loaded)
                         Debug.LogWarning($"[Kerbcast][CMDCAM] {Label}: vantage vessel is loaded, so the camera sits inside its parts; keep it unloaded (over 2.5 km from the active vessel)");
                     return true;
                 }
@@ -446,7 +480,7 @@ namespace Kerbcast
             double top = _settings.CommandCameraFovMin;
             double middle = Math.Max(_settings.CommandCameraFovMinLevel2, top);
             double lowest = Math.Max(_settings.CommandCameraFovMinLevel1, middle);
-            if (site.Vantage != null || site.IsSurfacePoint) return () => top;
+            if (site.HasVantage || site.IsSurfacePoint) return () => top;
             if (site.IsLaunchSite) return () => lowest;
             return () => CommandCameraTargets.Gated()
                 ? CommandCameraMath.LensFovMin(CommandCameraTargets.NormLevel(), lowest, middle, top)

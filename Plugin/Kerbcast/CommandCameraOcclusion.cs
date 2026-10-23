@@ -69,8 +69,8 @@ namespace Kerbcast
         public void UseSite(CommandCameraSite site)
         {
             var body = site.Body;
-            _vantageBody = site.Vantage != null ? body : null;
-            _maskWanted = site.Vantage == null && body != null && body.pqsController != null;
+            _vantageBody = site.HasVantage ? body : null;
+            _maskWanted = !site.HasVantage && body != null && body.pqsController != null;
             if (!_maskWanted) return;
             if (_mask == null || body != _maskBody || site.Latitude != _maskLat || site.Longitude != _maskLon
                 || site.Altitude != _maskAlt)

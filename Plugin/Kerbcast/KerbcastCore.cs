@@ -717,6 +717,38 @@ namespace Kerbcast
 
         private float _commandPollWarnAt = float.MinValue;
 
+        /*
+         * A command camera whose vantage craft is destroyed (crashed,
+         * recovered; a dock is followed instead) has no position. A created
+         * camera is removed, as if its creator destroyed it. The default
+         * camera is rebuilt where settings resolve now, the home station
+         * unless a craft with the configured name exists. Until then the feed
+         * streams black, never a guessed position.
+         */
+        private void DropLostVantages()
+        {
+            if (_commandProvider == null) return;
+            List<KerbcastCamera> lost = null;
+            foreach (var cam in _cameras)
+                if (cam is KerbcastCamera kc && kc.Rig is CommandCameraRig gr && gr.VantageLost)
+                    (lost ?? (lost = new List<KerbcastCamera>())).Add(kc);
+            if (lost == null) return;
+            foreach (var kc in lost)
+            {
+                var gr = (CommandCameraRig)kc.Rig;
+                if (_commandProvider.IsCreated(kc.FlightId))
+                {
+                    Debug.LogWarning($"[Kerbcast][CMDCAM] cam={kc.FlightId} vantage craft persistentId={gr.Site.VantagePersistentId} is gone; command camera removed");
+                    DestroyCommandCamera(kc.FlightId);
+                    continue;
+                }
+                Debug.LogWarning($"[Kerbcast][CMDCAM] cam={kc.FlightId} vantage craft persistentId={gr.Site.VantagePersistentId} is gone; command camera moves to where settings resolve now");
+                _commandProvider.ReresolveDefault(gr.Aim, gr.AimOrbit);
+                _cameras.Remove(kc);
+                kc.Dispose();
+            }
+        }
+
         /* On the first scene of a process the launch site's coordinates arrive
            after startup, so the command camera waits for them (additively, like
            a docking rebuild) instead of standing at (0,0). A camera created at
@@ -753,6 +785,7 @@ namespace Kerbcast
 
             UpdateFpsAverage();
             MaybeApplyCommandRequests();
+            DropLostVantages();
             RetryPendingCommandCamera();
             PollCommandRigs();
 

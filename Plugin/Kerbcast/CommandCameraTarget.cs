@@ -207,7 +207,7 @@ namespace Kerbcast
                 {
                     foreach (var pv in protos)
                     {
-                        if (pv == null || !Eligible(pv.vesselType)) continue;
+                        if (!CommandCameraTargets.RecordCounts(pv) || !Eligible(pv.vesselType)) continue;
                         Consider(pv.vesselName, pv.launchTime, named, ref nameFound, ref bestLaunch,
                             () => { bestProto = pv; bestLive = null; });
                     }
@@ -255,7 +255,7 @@ namespace Kerbcast
                 var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
                 if (protos != null)
                     foreach (var pv in protos)
-                        if (pv != null && pv.persistentId == _wantedPid) { proto = pv; break; }
+                        if (CommandCameraTargets.RecordCounts(pv) && pv.persistentId == _wantedPid) { proto = pv; break; }
             }
             if (live == null && proto == null)
             {

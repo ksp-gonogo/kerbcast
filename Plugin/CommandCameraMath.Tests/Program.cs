@@ -200,6 +200,26 @@ Check(CommandCameraMath.BlankReason(true, true, "Custom") == CommandCameraMath.B
     "blank: a silent authority beats everything");
 Check(CommandCameraMath.BlankReason(true, false, "Custom") == "Custom", "blank: the holder's reason shows");
 Check(CommandCameraMath.BlankReason(true, false, "") == null, "blank: a held lock with no reason shows the feed");
+Check(CommandCameraMath.BlankReason(false, false, null, vantageGone: true) == CommandCameraMath.BlankVantageGone,
+    "blank: a lens whose vantage craft is gone blanks without a lock");
+Check(CommandCameraMath.BlankReason(true, true, "Custom", vantageGone: true) == CommandCameraMath.BlankVantageGone,
+    "blank: a gone vantage beats a silent holder");
+
+// Merges: dock or claw grab folds oldPid into newPid; KSP announces it twice.
+Check(CommandCameraMath.MergedPersistentId(11, 11, 22) == 22, "merge: an absorbed craft is followed into the survivor");
+Check(CommandCameraMath.MergedPersistentId(22, 11, 22) == 22, "merge: the repeat announcement is a no-op");
+Check(CommandCameraMath.MergedPersistentId(33, 11, 22) == 33, "merge: an uninvolved craft is untouched");
+Check(CommandCameraMath.MergedPersistentId(22, 22, 11) == 11 && CommandCameraMath.MergedPersistentId(22, 11, 22) == 22,
+    "merge: the survivor watched from the start stays");
+Check(CommandCameraMath.MergedPersistentId(0, 0, 22) == 0, "merge: nothing watched follows nothing");
+Check(CommandCameraMath.MergedPersistentId(11, 11, 0) == 11, "merge: no survivor id keeps the craft");
+
+// Saved records: the save's list is a snapshot, so it outlives docked, crashed and recovered craft.
+Check(!CommandCameraMath.SavedRecordCounts(true, true, true), "record: a merged-away craft's record is not a craft in flight");
+Check(!CommandCameraMath.SavedRecordCounts(true, false, false), "record: in flight live vessels are the whole list");
+Check(!CommandCameraMath.SavedRecordCounts(false, true, true), "record: a record whose Vessel was destroyed never counts");
+Check(CommandCameraMath.SavedRecordCounts(false, false, false), "record: an unbuilt record counts where vessels are not built");
+Check(CommandCameraMath.SavedRecordCounts(false, true, false), "record: a record with a live Vessel counts");
 
 {
     /* Direction: up +Y, north +Z, east +X, with skewed inputs squared up. */

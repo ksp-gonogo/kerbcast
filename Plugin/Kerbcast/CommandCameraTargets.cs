@@ -93,7 +93,7 @@ namespace Kerbcast
             {
                 foreach (var v in vessels)
                 {
-                    if (v == null || v == site.Vantage || !Listed(v.vesselType)) continue;
+                    if (v == null || v.persistentId == site.VantagePersistentId || !Listed(v.vesselType)) continue;
                     var level = v.DiscoveryInfo != null ? v.DiscoveryInfo.Level : DiscoveryLevels.Owned;
                     if (!seen.Add(v.persistentId)) continue;
                     double range = hasStation && TryPosition(v, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
@@ -106,8 +106,8 @@ namespace Kerbcast
             {
                 foreach (var pv in protos)
                 {
-                    if (pv == null || !Listed(pv.vesselType) || seen.Contains(pv.persistentId)) continue;
-                    if (site.Vantage != null && pv.persistentId == site.Vantage.persistentId) continue;
+                    if (!RecordCounts(pv) || !Listed(pv.vesselType) || seen.Contains(pv.persistentId)) continue;
+                    if (pv.persistentId == site.VantagePersistentId) continue;
                     seen.Add(pv.persistentId);
                     double range = hasStation && TryPosition(pv, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
                     Add(result, pv.persistentId, Localised(pv.vesselName), pv.vesselType, ProtoLevel(pv), range,
@@ -136,9 +136,34 @@ namespace Kerbcast
             var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
             if (protos != null)
                 foreach (var pv in protos)
-                    if (pv != null && pv.persistentId == persistentId)
+                    if (RecordCounts(pv) && pv.persistentId == persistentId)
                         return TryPosition(pv, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
             return double.NaN;
+        }
+
+        /* Whether a craft with this persistentId exists now, live or, in a
+           scene that has not built it, as a saved record. */
+        public static bool Exists(uint persistentId)
+        {
+            if (persistentId == 0) return false;
+            if (FlightGlobals.FindVessel(persistentId, out Vessel v) && v != null && v.state != Vessel.State.DEAD) return true;
+            var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
+            if (protos == null) return false;
+            for (int i = 0; i < protos.Count; i++)
+                if (RecordCounts(protos[i]) && protos[i].persistentId == persistentId) return true;
+            return false;
+        }
+
+        /* Whether a saved record still names a real craft (see
+           CommandCameraMath.SavedRecordCounts). A Vessel built from the record
+           and since destroyed reads as Unity-null while still referenced. */
+        public static bool RecordCounts(ProtoVessel pv)
+        {
+            if (pv == null) return false;
+            var vessels = FlightGlobals.Vessels;
+            bool authoritative = HighLogic.LoadedSceneIsFlight && vessels != null && vessels.Count > 0;
+            bool built = !ReferenceEquals(pv.vesselRef, null);
+            return CommandCameraMath.SavedRecordCounts(authoritative, built, built && pv.vesselRef == null);
         }
 
         private static void Add(List<CommandTargetView> into, uint pid, string name, VesselType type,
@@ -167,7 +192,7 @@ namespace Kerbcast
         private static bool TryStation(CommandCameraSite site, double ut, out Vector3d world)
         {
             world = default;
-            if (site.Vantage != null) return site.TryVantagePosition(ut, out world, out _);
+            if (site.HasVantage) return site.TryVantagePosition(ut, out world, out _);
             if (site.Body == null) return false;
             world = site.Body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
             return true;

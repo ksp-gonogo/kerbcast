@@ -153,7 +153,10 @@ The vantage is one of:
 - `surface`: at any `latitude` and `longitude` on a `body`, `height` metres
   above the ground there (above the sea over water; default 5 m)
 - `vessel`: riding the craft with that `persistentId`. Keep that craft
-  beyond physics range of the active one, or the lens sits inside its parts
+  beyond physics range of the active one, or the lens sits inside its parts.
+  If the craft docks into another (or is grabbed by a claw), the camera rides
+  the combined craft. If the craft is destroyed or recovered, the camera is
+  removed and its feed ends
 
 `createCommandCamera` resolves with the new camera's `CameraState` once the
 game has built it and reported what it is watching, normally within a
@@ -300,6 +303,12 @@ taken comes back as an `error` event with code `ErrorCode.CommandLocked`.
 lock is released every command camera returns to its default; aims set
 before or during the lock are not restored.
 
+The lock holds until its holder releases it (or the scene changes); it never
+times out. A holder that stops calling for 5 s blanks every command feed
+("gonogo not responding") but keeps the lock, so aims from anyone else are
+still refused. This is deliberate: a holder that delays commands (gonogo
+applies signal delay) can not be bypassed while it is unresponsive.
+
 ### In game (C#)
 
 Another KSP mod can do the same through `Kerbcast.KerbcastControl`, with
@@ -351,16 +360,21 @@ KerbcastControl.ClearCommandAuthority("gonogo");
   `SetCommandAim` works on it before then too. Under a held lock the aim is
   not applied
 - `SetCommandAim(flightId, aim, owner = null)` returns false when the lock
-  refuses it, the feed is not a command feed, or the aim is unusable
-- The lock fails closed: a holder that makes no call (`SetCommandAuthority`,
-  `SetCommandAim` with its owner, `SetCommandBlank`) for 5 s of real time
-  blanks every command feed "gonogo not responding", and
-  `SetCommandBlank(flightId, reason)` blanks one feed
+  refuses it, the feed is not a command feed, or the aim is unusable (a
+  craft that no longer exists, such as one docked into another, is
+  unusable)
+- The lock holds until `ClearCommandAuthority` or a scene change, and fails
+  closed: a holder that makes no call (`SetCommandAuthority`, `SetCommandAim`
+  with its owner, `SetCommandBlank`) for 5 s of real time blanks every
+  command feed "gonogo not responding" and keeps the lock, so everyone else
+  stays refused. `SetCommandBlank(flightId, reason)` blanks one feed
 - `DestroyCommandCamera(flightId)` returns false for the settings camera or
   an unknown id
 - `CommandFeeds()` lists every built command camera, with its `Aim`,
   `SubjectPersistentId`, and `Created` set on the ones made at runtime;
-  `CommandTargets(flightId)` lists the craft it could follow
+  `CommandTargets(flightId)` lists the craft it could follow (a craft docked
+  into another drops out; the combined craft keeps the survivor's
+  `persistentId`)
 
 ## Pan/zoom input helper
 

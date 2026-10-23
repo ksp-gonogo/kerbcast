@@ -288,11 +288,15 @@ namespace Kerbcast
         }
 
         public const string BlankNotResponding = "gonogo not responding";
+        public const string BlankVantageGone = "vantage craft gone";
 
-        /* Why a command feed is blanked, or null to show it. Only a held lock
-           blanks: a silent holder beats everything, then the holder's own blank. */
-        public static string BlankReason(bool governed, bool timedOut, string explicitBlank)
+        /* Why a command feed is blanked, or null to show it. A lens whose
+           vantage craft no longer exists has no position, so that blanks with
+           or without a lock. Otherwise only a held lock blanks: a silent holder
+           beats everything, then the holder's own blank. */
+        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone = false)
         {
+            if (vantageGone) return BlankVantageGone;
             if (!governed) return null;
             if (timedOut) return BlankNotResponding;
             if (!string.IsNullOrEmpty(explicitBlank)) return explicitBlank;
@@ -331,6 +335,24 @@ namespace Kerbcast
             double f = t <= 0.5 ? t * 2.0 : (t - 0.5) * 2.0;
             return from * Math.Pow(to / from, f);
         }
+
+        /* The craft to follow after KSP merges craft `oldPid` into `newPid` (a
+           dock or a claw grab): the survivor when `watched` was absorbed, else
+           `watched` unchanged. KSP announces each merge twice, so a repeat is a
+           no-op. */
+        public static uint MergedPersistentId(uint watched, uint oldPid, uint newPid) =>
+            watched != 0 && watched == oldPid && newPid != 0 ? newPid : watched;
+
+        /*
+         * Whether a craft's saved record still stands for a real craft. Where
+         * live Vessel objects are authoritative (flight, once they are built),
+         * a record never adds a craft: the save's list is a snapshot from the
+         * last save, so it still holds craft since docked into another, crashed
+         * or recovered. Elsewhere a record counts unless the Vessel built from
+         * it has been destroyed.
+         */
+        public static bool SavedRecordCounts(bool liveVesselsAuthoritative, bool vesselBuilt, bool vesselDestroyed) =>
+            !liveVesselsAuthoritative && !(vesselBuilt && vesselDestroyed);
 
         public const string EligibleOk = "ok";
         public const string EligibleTooFar = "tooFar";
