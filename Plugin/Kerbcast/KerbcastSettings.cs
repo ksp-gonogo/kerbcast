@@ -121,10 +121,9 @@ namespace Kerbcast
         // MinKspFps.
         public float BackgroundCaptureFps { get; private set; } = 2f;
 
-        /* Command camera: a feed from the home CommNet station
-           (KSC) that follows the active craft with a telescope-narrow zoom.
-           Experimental, off by default. */
-        public bool EnableCommandCamera { get; private set; } = false;
+        /* Command camera: a ground feed, beside the launch site by default,
+           that follows the active craft with a telescope-narrow zoom. */
+        public bool EnableCommandCamera { get; private set; } = true;
         /* Share of the frame height the craft is zoomed to fill. */
         public double CommandCameraFrameFraction { get; private set; } = 0.3;
         /* Zoom limits, vertical field of view in degrees. Below the floor the
@@ -156,7 +155,7 @@ namespace Kerbcast
         public string CommandCameraVantageName { get; private set; } = "";
         /* A point of light in the scene at an unloaded target's position, lit
            only while the target is in sunlight. */
-        public bool CommandCameraTargetMarker { get; private set; } = false;
+        public bool CommandCameraTargetMarker { get; private set; } = true;
         /* The unloaded target drawn from its saved parts' models instead of a
            point. Wins over CommandCameraTargetMarker. */
         public bool CommandCameraTargetModel { get; private set; } = false;
