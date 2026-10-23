@@ -59,6 +59,10 @@ client.on("adaptive-shed", (event) => {
 client.disconnect();
 ```
 
+Commands can be sent as soon as `connect` resolves. Any sent before the
+control channel has opened wait for it, and reject if it has not opened
+within 10 s or the client disconnects first.
+
 ### Pre-handshake discovery
 
 ```ts
@@ -152,7 +156,11 @@ The vantage is one of:
   beyond physics range of the active one, or the lens sits inside its parts
 
 `createCommandCamera` resolves with the new camera's `CameraState` once the
-game has built it, normally within a second. The request carries a token
+game has built it and reported what it is watching, normally within a
+second or two, so `commandCentre.targetPersistentId` and
+`commandCentre.targets` are already filled in. If that report has not come
+5 s after the camera appeared, it resolves with the state as it stands. The
+request carries a token
 (random unless you pass `token`) that the camera reports back as
 `commandCentre.token`; that is how the promise finds it, and how any other
 code can. A vantage the game can not find (an unknown body, site, station
@@ -171,13 +179,6 @@ import { CommandVantageKind, KerbcastClient } from "@ksp-gonogo/kerbcast";
 
 const client = new KerbcastClient({ host: "192.168.1.74", port: 8088 });
 await client.connect([], { slots: 2 });
-// Commands need the control channel, which opens just after connect resolves.
-await new Promise<void>((resolve) => {
-  const off = client.on("control-open", () => {
-    off();
-    resolve();
-  });
-});
 
 // 500 m south of the active craft's launch site, 5 m up.
 const pad = await client.createCommandCamera(

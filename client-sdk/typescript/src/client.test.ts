@@ -11,6 +11,8 @@ import {
 } from "./__generated__/types";
 import {
   BrowserKerbcastTransport,
+  COMMAND_CAMERA_STATE_WAIT_MS,
+  CONTROL_OPEN_TIMEOUT_MS,
   type KerbcastConnectionState,
   type KerbcastDataChannel,
   type KerbcastPeer,
@@ -232,6 +234,67 @@ describe("KerbcastClient", () => {
     await client.connect();
     captured.dc?._open();
     expect(sentAtOpen).toHaveLength(2);
+  });
+
+  describe("commands sent before the control channel opens", () => {
+    it("wait for it and go out after hello, in send order", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+
+      const fov = client.camera(7).setFov(40);
+      const sub = client.subscribe(7);
+      await Promise.resolve();
+      expect(captured.dc?.sent).toEqual([]);
+
+      captured.dc?._open();
+      await expect(Promise.all([fov, sub])).resolves.toBeDefined();
+      expect(captured.dc?.sent.map((m) => JSON.parse(m).type)).toEqual([
+        "hello",
+        "set-fov",
+        "subscribe",
+      ]);
+    });
+
+    it("reject when the channel does not open in time", async () => {
+      vi.useFakeTimers();
+      try {
+        const { transport } = makeFakeTransport();
+        const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+        vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+        await client.connect();
+        const outcome = client.subscribe(7).then(
+          () => "sent",
+          (e: Error) => e.message,
+        );
+        await vi.advanceTimersByTimeAsync(CONTROL_OPEN_TIMEOUT_MS + 1);
+        expect(await outcome).toMatch(/did not open within/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reject when the client disconnects first", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      const pending = client.subscribe(7);
+      client.disconnect();
+      await expect(pending).rejects.toThrow(/disconnected before the control channel opened/);
+      expect(captured.dc?.sent).toEqual([]);
+    });
+
+    it("reject when the channel closes before opening", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      const pending = client.subscribe(7);
+      captured.dc?._close();
+      await expect(pending).rejects.toThrow(/closed before it opened/);
+    });
   });
 
   it("populates the camera registry from a snapshot push", async () => {
@@ -484,7 +547,8 @@ describe("KerbcastClient", () => {
   });
 
   describe("command cameras", () => {
-    function commandCamera(flightId: number, token?: string) {
+    /* `reported` adds the game's first status report: a target, a target list and commandTrack. */
+    function commandCamera(flightId: number, token?: string, reported = true) {
       return {
         flightId,
         kind: CameraKind.Command,
@@ -520,12 +584,38 @@ describe("KerbcastClient", () => {
           latitude: 0,
           longitude: 0,
           altitude: 0,
-          targetPersistentId: 0,
+          targetPersistentId: reported ? 42 : 0,
           trackingLevel: 1,
-          targets: [],
+          targets: reported
+            ? [
+                {
+                  persistentId: 42,
+                  vesselName: "Kerbal X",
+                  vesselType: "Ship",
+                  rangeM: 519,
+                  eligibility: "ok",
+                  eligibilityText: "Trackable",
+                },
+              ]
+            : [],
           created: token !== undefined,
           ...(token !== undefined ? { token } : {}),
         },
+        ...(reported
+          ? {
+              commandTrack: {
+                ut: 1,
+                hasFix: true,
+                rangeM: 519,
+                occluded: false,
+                occluder: "",
+                sunlit: true,
+                frameHeightPx: 768,
+                framingFits: true,
+                events: [],
+              },
+            }
+          : {}),
       };
     }
 
@@ -608,6 +698,74 @@ describe("KerbcastClient", () => {
         );
         await vi.advanceTimersByTimeAsync(1001);
         expect(await outcome).toMatch(/did not appear within 1000 ms/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("createCommandCamera works straight after connect resolves", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.LaunchSite },
+        { token: "early" },
+      );
+      captured.dc?._open();
+      await Promise.resolve();
+      expect(captured.dc?.sent.map((m) => JSON.parse(m).type)).toEqual([
+        "hello",
+        "create-command-camera",
+      ]);
+      captured.dc?._msg(
+        JSON.stringify({
+          type: "camera-snapshot",
+          content: { cameras: [commandCamera(9, "early")] },
+        }),
+      );
+      expect((await created).flightId).toBe(9);
+    });
+
+    it("createCommandCamera resolves only once the camera's target is reported", async () => {
+      const { client, snapshot } = await connected();
+      let resolved = false;
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.LaunchSite },
+        { token: "tok-2" },
+      );
+      void created.then(() => {
+        resolved = true;
+      });
+
+      snapshot([commandCamera(300, "tok-2", false)]);
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      snapshot([commandCamera(300, "tok-2")]);
+      const cam = await created;
+      expect(cam.commandCentre?.targetPersistentId).toBe(42);
+      expect(cam.commandCentre?.targets.map((t) => t.persistentId)).toEqual([42]);
+    });
+
+    it("createCommandCamera resolves with what is known when no report comes", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client, snapshot } = await connected();
+        const created = client.createCommandCamera(
+          { kind: CommandVantageKind.LaunchSite },
+          { token: "bare", timeoutMs: 1000 },
+        );
+        const outcome = created.then(
+          (c) => c,
+          (e: Error) => e.message,
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        snapshot([commandCamera(300, "bare", false)]);
+        await vi.advanceTimersByTimeAsync(COMMAND_CAMERA_STATE_WAIT_MS + 1);
+        const cam = await outcome;
+        expect(typeof cam).not.toBe("string");
+        expect((cam as { flightId: number }).flightId).toBe(300);
       } finally {
         vi.useRealTimers();
       }

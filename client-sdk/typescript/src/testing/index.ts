@@ -819,6 +819,16 @@ export class MockSidecar {
         created: true,
         token: req.token,
       },
+      commandTrack: {
+        ut: 0,
+        hasFix: false,
+        occluded: false,
+        occluder: "",
+        sunlit: true,
+        frameHeightPx: 720,
+        framingFits: true,
+        events: [],
+      },
     });
     this._cameras.set(flightId, cam);
     this._maxRenderSizes.set(flightId, { maxWidth: 1280, maxHeight: 720 });

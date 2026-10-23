@@ -301,8 +301,27 @@ export interface DiscoveredCamera {
   displaySize?: DisplaySizeReport | null;
 }
 
+/**
+ * How long a command sent between `connect` resolving and the control channel
+ * opening waits for the channel before it rejects.
+ */
+export const CONTROL_OPEN_TIMEOUT_MS = 10_000;
+
+interface PendingSend {
+  payload: string;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 /** How long {@link KerbcastClient.createCommandCamera} waits for the camera by default. */
 export const COMMAND_CAMERA_CREATE_TIMEOUT_MS = 35_000;
+
+/**
+ * How long {@link KerbcastClient.createCommandCamera} waits, once the camera
+ * has appeared, for the game's first report of its target and target list.
+ */
+export const COMMAND_CAMERA_STATE_WAIT_MS = 5_000;
 
 /** Options for {@link KerbcastClient.createCommandCamera}. */
 export interface CreateCommandCameraOptions {
@@ -929,6 +948,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private readonly transport: KerbcastTransport;
   private peer: KerbcastPeer | null = null;
   private control: KerbcastDataChannel | null = null;
+  /** Whether {@link control} has opened and not closed since. */
+  private controlOpen = false;
+  /** Commands sent after `connect` but before the control channel opened, in send order. */
+  private pendingSends: PendingSend[] = [];
   private _state: KerbcastConnectionState = "disconnected";
   private _cameras: CameraState[] = [];
   private readonly handles = new Map<number, CameraHandle>();
@@ -1229,8 +1252,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    *
    * Two modes:
    * - **Legacy** (no `opts.slots`): one transceiver per requested camera;
-   *   an empty array subscribes to every currently-known camera. Tracks
-   *   route by m-line index. Unchanged behaviour.
+   *   an empty array offers one transceiver, which carries the first
+   *   currently-known camera. Tracks route by m-line index.
    * - **Dynamic** (`opts.slots` set): negotiates a pool of `opts.slots`
    *   recv-only video slots. `requestedCameras` are the *initial*
    *   subscription bound to the first slots; spare slots are filled at
@@ -1276,17 +1299,37 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       }
     });
 
-    this.control = peer.createDataChannel("kerbcast-control");
-    this.control.onOpen(() => {
+    const control = peer.createDataChannel("kerbcast-control");
+    this.control = control;
+    control.onOpen(() => {
+      if (this.control !== control) return;
+      this.controlOpen = true;
       void this._send({ type: "hello" });
+      /* Queued commands follow hello, in order, ahead of control-open listeners. */
+      const pending = this.pendingSends;
+      this.pendingSends = [];
+      for (const p of pending) {
+        clearTimeout(p.timer);
+        try {
+          control.send(p.payload);
+          p.resolve();
+        } catch (err) {
+          p.reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
       this.emit("control-open", undefined);
     });
-    this.control.onMessage((raw) => {
+    control.onMessage((raw) => {
       this.handleServerMessage(raw);
     });
-    this.control.onClose(() => {
-      // Channel closure usually follows peer disconnect; the peer
-      // state-change handler covers the tear-down. Nothing to do here.
+    control.onClose(() => {
+      /*
+       * Channel closure usually follows peer disconnect; the peer
+       * state-change handler covers the tear-down.
+       */
+      if (this.control !== control) return;
+      this.controlOpen = false;
+      this.rejectPendingSends("[kerbcast] control channel closed before it opened");
     });
 
     await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
@@ -1335,6 +1378,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.peer?.close();
     this.peer = null;
     this.control = null;
+    this.controlOpen = false;
+    this.rejectPendingSends("[kerbcast] client disconnected before the control channel opened");
     this.tearDownStreams();
     this.setState("disconnected");
   }
@@ -1429,7 +1474,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /**
    * Create a command camera standing at `vantage` for the rest of the
    * current game scene (flight or Space Center), and resolve with its state
-   * once it appears in {@link cameras}. Every consumer sees it. It watches
+   * once it appears in {@link cameras} and the game has reported its target
+   * and target list (`commandCentre.targetPersistentId`, `.targets`). Every
+   * consumer sees it. It watches
    * the active craft unless `targetPersistentId` or `lookAt` says otherwise,
    * and takes {@link setCommandTarget}, {@link setCommandLookAt} and
    * {@link destroyCommandCamera} like any command camera.
@@ -1452,7 +1499,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           c.commandCentre?.token === token &&
           c.lifecycle !== CameraLifecycle.Destroyed,
       );
+    /*
+     * The camera is announced before the game's first status report for it,
+     * so its first state has no target or target list yet. That report always
+     * carries commandTrack, so wait for it; a camera whose report never comes
+     * still resolves after COMMAND_CAMERA_STATE_WAIT_MS with what is known.
+     */
     const appeared = new Promise<CameraState>((resolve, reject) => {
+      let latest: CameraState | undefined;
+      let stateTimer: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
         off();
         reject(
@@ -1461,12 +1516,24 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           ),
         );
       }, timeoutMs);
+      const finish = (cam: CameraState) => {
+        clearTimeout(timer);
+        clearTimeout(stateTimer);
+        off();
+        resolve(cam);
+      };
       const off = this.on("cameras-change", (cams) => {
         const cam = find(cams);
         if (!cam) return;
-        clearTimeout(timer);
-        off();
-        resolve(cam);
+        if (cam.commandTrack != null) {
+          finish(cam);
+          return;
+        }
+        if (latest === undefined) {
+          clearTimeout(timer);
+          stateTimer = setTimeout(() => finish(latest ?? cam), COMMAND_CAMERA_STATE_WAIT_MS);
+        }
+        latest = cam;
       });
     });
     try {
@@ -1526,16 +1593,48 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Internal — sends a typed `ClientMessage` over the control
-   * channel. Drops silently if the channel hasn't opened yet (and
-   * logs to console). Public on the camera handle, but consumers
+   * Internal: sends a typed `ClientMessage` over the control channel. Throws
+   * when there is no connection. Between `connect` resolving and the channel
+   * opening, the message waits and goes out as soon as it opens; it rejects
+   * if the channel has not opened within {@link CONTROL_OPEN_TIMEOUT_MS}, or
+   * the client disconnects first. Public on the camera handle, but consumers
    * shouldn't need to call this directly.
    */
   async _send(msg: ClientMessage): Promise<void> {
-    if (!this.control) {
+    const control = this.control;
+    if (!control) {
       throw new Error("[kerbcast] control channel not open");
     }
-    this.control.send(JSON.stringify(msg));
+    const payload = JSON.stringify(msg);
+    if (this.controlOpen) {
+      control.send(payload);
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const entry: PendingSend = {
+        payload,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.pendingSends = this.pendingSends.filter((p) => p !== entry);
+          reject(
+            new Error(
+              `[kerbcast] control channel did not open within ${CONTROL_OPEN_TIMEOUT_MS} ms`,
+            ),
+          );
+        }, CONTROL_OPEN_TIMEOUT_MS),
+      };
+      this.pendingSends.push(entry);
+    });
+  }
+
+  private rejectPendingSends(message: string): void {
+    const pending = this.pendingSends;
+    this.pendingSends = [];
+    for (const p of pending) {
+      clearTimeout(p.timer);
+      p.reject(new Error(message));
+    }
   }
 
   // -- private --
