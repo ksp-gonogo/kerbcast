@@ -287,19 +287,32 @@ namespace Kerbcast
             return Math.Asin(radius / distance) <= fovMaxDeg * 0.5 * Deg2Rad;
         }
 
-        public const string BlankWaiting = "Waiting for gonogo";
         public const string BlankNotResponding = "gonogo not responding";
 
-        /* Why a command feed is blanked, or null to show it. Standalone feeds are
-           never blanked. Under an authority the feed fails closed: a silent
-           authority beats everything, and its own blank beats a missing aim. */
-        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool aimResolved)
+        /* Why a command feed is blanked, or null to show it. Only a held lock
+           blanks: a silent holder beats everything, then the holder's own blank. */
+        public static string BlankReason(bool governed, bool timedOut, string explicitBlank)
         {
             if (!governed) return null;
             if (timedOut) return BlankNotResponding;
             if (!string.IsNullOrEmpty(explicitBlank)) return explicitBlank;
-            if (!aimResolved) return BlankWaiting;
             return null;
+        }
+
+        /*
+         * Unit vector `azimuthDeg` clockwise from north and `elevationDeg` above
+         * the horizon, at a point whose up is `up`. `north` and `east` only need
+         * to point roughly that way along the ground; they are squared up to
+         * `up` here.
+         */
+        public static DVec3 DirectionVector(DVec3 up, DVec3 north, DVec3 east, double azimuthDeg, double elevationDeg)
+        {
+            var u = up.Normalized;
+            var n = (north - u * DVec3.Dot(north, u)).Normalized;
+            var e = east - u * DVec3.Dot(east, u);
+            e = (e - n * DVec3.Dot(e, n)).Normalized;
+            double az = azimuthDeg * Math.PI / 180.0, el = elevationDeg * Math.PI / 180.0;
+            return (n * (Math.Cos(el) * Math.Cos(az)) + e * (Math.Cos(el) * Math.Sin(az)) + u * Math.Sin(el)).Normalized;
         }
 
         /* Tightest zoom (vertical field of view, degrees) of the Tracking

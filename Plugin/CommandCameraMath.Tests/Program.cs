@@ -195,12 +195,24 @@ Check(!CommandCameraMath.FramingFits(10, 5, 30), "fit: lens inside the sphere ne
 Check(CommandCameraMath.FramingFits(0, 5, 30), "fit: no radius always fits");
 
 // Blank reasons: fail closed, in precedence order.
-Check(CommandCameraMath.BlankReason(false, true, "x", false) == null, "blank: standalone never blanks");
-Check(CommandCameraMath.BlankReason(true, true, "Custom", true) == CommandCameraMath.BlankNotResponding,
+Check(CommandCameraMath.BlankReason(false, true, "x") == null, "blank: standalone never blanks");
+Check(CommandCameraMath.BlankReason(true, true, "Custom") == CommandCameraMath.BlankNotResponding,
     "blank: a silent authority beats everything");
-Check(CommandCameraMath.BlankReason(true, false, "Custom", false) == "Custom", "blank: explicit reason beats a missing aim");
-Check(CommandCameraMath.BlankReason(true, false, null, false) == CommandCameraMath.BlankWaiting, "blank: no aim waits");
-Check(CommandCameraMath.BlankReason(true, false, "", true) == null, "blank: an aimed feed with no reason shows");
+Check(CommandCameraMath.BlankReason(true, false, "Custom") == "Custom", "blank: the holder's reason shows");
+Check(CommandCameraMath.BlankReason(true, false, "") == null, "blank: a held lock with no reason shows the feed");
+
+{
+    /* Direction: up +Y, north +Z, east +X, with skewed inputs squared up. */
+    var dirUp = new DVec3(0, 1, 0);
+    var dirNorth = new DVec3(0, 0.3, 1);
+    var dirEast = new DVec3(1, -0.2, 0.1);
+    Check(VNear(CommandCameraMath.DirectionVector(dirUp, dirNorth, dirEast, 0, 0), new DVec3(0, 0, 1), 1e-9), "direction: az 0 el 0 is north");
+    Check(VNear(CommandCameraMath.DirectionVector(dirUp, dirNorth, dirEast, 90, 0), new DVec3(1, 0, 0), 1e-9), "direction: az 90 is east");
+    Check(VNear(CommandCameraMath.DirectionVector(dirUp, dirNorth, dirEast, 270, 0), new DVec3(-1, 0, 0), 1e-9), "direction: az 270 is west");
+    Check(VNear(CommandCameraMath.DirectionVector(dirUp, dirNorth, dirEast, 123, 90), dirUp, 1e-9), "direction: el 90 is straight up");
+    var d = CommandCameraMath.DirectionVector(dirUp, dirNorth, dirEast, 180, 30);
+    Check(Math.Abs(d.Y - 0.5) < 1e-9 && d.Z < 0 && Math.Abs(d.X) < 1e-9, "direction: az 180 el 30 is south and 30 deg up");
+}
 
 // Tracking Station level: normalised level to 1-based.
 Check(CommandCameraMath.TrackingLevel(0.0, 2) == 1, "level: 0 of stock is level 1");

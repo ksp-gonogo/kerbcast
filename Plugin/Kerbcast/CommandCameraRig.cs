@@ -34,6 +34,8 @@ namespace Kerbcast
         private const double SubpixelBelowPx = 6.0;
         private const double SubpixelFloorPx = 0.02;
         private const int MaxOriginShiftLogsPerSecond = 4;
+        /* How far out a Direction aim's point sits when there is no subject range to use. */
+        private const double DirectionDefaultRangeM = 10000.0;
 
         private const float PollStaleSeconds = 0.1f;
         private const int EventCapacity = 32;
@@ -126,8 +128,8 @@ namespace Kerbcast
         public string Blocker { get; private set; } = "";
         public double RangeM { get; private set; }
         public double ElevationDeg { get; private set; }
-        public uint TargetPersistentId => _target.PersistentId;
-        public string TargetName => _target.Name ?? "";
+        public uint SubjectPersistentId => _target.PersistentId;
+        public string SubjectName => _target.Name ?? "";
         /* Nothing between the target and the Sun but empty space. */
         public bool Sunlit { get; private set; }
         private bool _sunlitLogged;
@@ -160,21 +162,25 @@ namespace Kerbcast
         public string StationDisplayName =>
             string.IsNullOrEmpty(_mount.Site.DisplayName) ? _mount.Site.NodeName : _mount.Site.DisplayName;
 
-        /* The craft this camera watches from now on (0 = the default). Under an
-           authority the aim stays the authority's; this only picks the true
-           craft. Takes effect on the next solve. */
-        public void SetTarget(uint persistentId) => _target.Choose(persistentId);
+        /* Where the camera points; null for its default craft. */
+        public CommandAim Aim => _aim;
 
-        /* Without an authority, the camera points at `aim` instead of its craft,
-           which is still drawn wherever it truly is; null returns to the craft.
-           An authority's aim wins while one is registered. */
-        public void SetLookAt(CommandAim aim, Orbit orbit, double framingMarginM)
+        /* Points the camera by `aim` (null for the default craft) from the
+           next solve, with `orbit` built for an Orbit aim. The aim's subject,
+           or the default craft without one, becomes the true craft drawn and
+           bracketed wherever it really is. */
+        public void SetAim(CommandAim aim, Orbit orbit)
         {
-            _lookAt = aim == null ? null : new CommandFeedOrders { Aim = aim, AimOrbit = orbit, FramingMarginM = framingMarginM };
-            Debug.Log($"{Tag} cam={_flightId} look-at {(aim == null ? "cleared, back to the craft" : $"{aim} margin={framingMarginM:F0}m")}");
+            _aim = aim;
+            _aimOrbit = orbit;
+            uint subject = aim?.SubjectPersistentId ?? 0;
+            if (subject != _target.ChosenPersistentId) _target.Choose(subject);
+            Debug.Log($"{Tag} cam={_flightId} aim {(aim == null ? "default (the default craft)" : aim.ToString())}");
         }
 
-        private CommandFeedOrders _lookAt;
+        private CommandAim _aim;
+        private Orbit _aimOrbit;
+        private DVec3 _lastAimPoint;
 
         /* The lens limit can change mid-scene (a Tracking Station upgrade), so
            it is re-read once a second. */
@@ -191,7 +197,7 @@ namespace Kerbcast
             }
             return _fovMin;
         }
-        private double FramingMargin => (CurrentOrders ?? _lookAt)?.FramingMarginM ?? 0.0;
+        private double FramingMargin => _aim?.FramingMarginM ?? 0.0;
         private bool _blankLogged;
         private string _loggedBlank;
         private string _loggedAim;
@@ -299,20 +305,20 @@ namespace Kerbcast
             bool timedOut = governed && _authority.TimedOut(Time.realtimeSinceStartup);
             var orders = governed ? _authority.Orders(_flightId) : null;
 
-            bool ok = SolveGeometry(ut, governed, orders, out station, out aim, out localUp, out north, out occluder);
+            bool ok = SolveGeometry(ut, out station, out aim, out localUp, out north, out occluder);
             if (!ok) HasFix = false;
             FramingFits = !ok || CommandCameraMath.FramingFits(_craftRadius + FramingMargin, RangeM, _fovMax);
-            Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, ok);
+            Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank);
             UpdateBracket(now);
-            NoteGovernance(ut, governed, orders);
+            NoteGovernance(ut, governed);
             _events.Record(new CommandTrackEvent(ut, Occluded, Blocker, Sunlit, Blank));
             return ok;
         }
 
         /* Station, aim point and true craft positions, and the camera-axis
-           readings at the aim point. Standalone the aim point is the true craft,
-           or the look-at point when one is set. */
-        private bool SolveGeometry(double ut, bool governed, CommandFeedOrders orders,
+           readings at the aim point: the true craft for the default or a
+           Vessel aim, otherwise the point the aim resolves to. */
+        private bool SolveGeometry(double ut,
             out DVec3 station, out DVec3 aim, out DVec3 localUp, out DVec3 north, out string occluder)
         {
             station = aim = localUp = north = default;
@@ -326,21 +332,6 @@ namespace Kerbcast
             var body = site.Body;
             if (body == null) return false;
 
-            _trueOk = _target.TryLocate(ut, out _truePos, out _trueBody);
-            CelestialBody aimBody;
-            var aimOrders = governed ? orders : _lookAt;
-            bool aimed = governed || _lookAt != null;
-            if (!aimed)
-            {
-                if (!_trueOk) return false;
-                aim = _truePos;
-                aimBody = _trueBody;
-            }
-            else if (aimOrders == null || aimOrders.Aim == null || !ResolveAim(aimOrders, ut, out aim, out aimBody))
-            {
-                return false;
-            }
-
             var frame = body.BodyFrame;
             var bodyPos = ToD(body.position);
             station = vantageSource != null
@@ -353,6 +344,26 @@ namespace Kerbcast
             localUp = (station - bodyPos).Normalized;
             var z = ToD(frame.Z);
             north = new DVec3(z.X, z.Z, z.Y);
+
+            _trueOk = _target.TryLocate(ut, out _truePos, out _trueBody);
+            CelestialBody aimBody;
+            bool aimed = _aim != null && _aim.Kind != CommandAimKind.Vessel;
+            if (!aimed)
+            {
+                if (!_trueOk) return false;
+                aim = _truePos;
+                aimBody = _trueBody;
+            }
+            else if (_aim.Kind == CommandAimKind.Direction)
+            {
+                aim = DirectionPoint(body, station, localUp);
+                aimBody = body;
+            }
+            else if (!ResolveAim(_aim, _aimOrbit, ut, out aim, out aimBody))
+            {
+                return false;
+            }
+            _lastAimPoint = aim;
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
@@ -390,41 +401,39 @@ namespace Kerbcast
             return true;
         }
 
-        /* The authority's or the look-at's aim point in world space, on the
+        /*
+         * A Direction aim's point: along the held direction at the subject's
+         * range, so the view is zoomed for the subject as it passes through.
+         * North and east come from stepping the station's own latitude and
+         * longitude, which holds for any body and any vantage.
+         */
+        private DVec3 DirectionPoint(CelestialBody body, DVec3 station, DVec3 localUp)
+        {
+            var st = new Vector3d(station.X, station.Y, station.Z);
+            double lat = body.GetLatitude(st), lon = body.GetLongitude(st), alt = body.GetAltitude(st);
+            const double Step = 0.01;
+            double northSign = lat > 89.0 ? -1.0 : 1.0;
+            var p0 = ToD(body.GetWorldSurfacePosition(lat, lon, alt));
+            var towardNorth = (ToD(body.GetWorldSurfacePosition(lat + northSign * Step, lon, alt)) - p0) * northSign;
+            var towardEast = ToD(body.GetWorldSurfacePosition(lat, lon + Step, alt)) - p0;
+            var dir = CommandCameraMath.DirectionVector(localUp, towardNorth, towardEast, _aim.Azimuth, _aim.Elevation);
+            double range = _trueOk ? (_truePos - station).Magnitude : DirectionDefaultRangeM;
+            if (!(range > 1.0)) range = DirectionDefaultRangeM;
+            return station + dir * range;
+        }
+
+        /* An Orbit, Surface or PositionAt aim's point in world space, on the
            same UT (and so the same physics tick) as the station and the
            scaled bodies. */
-        private bool ResolveAim(CommandFeedOrders orders, double ut, out DVec3 world, out CelestialBody body)
+        private static bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, out DVec3 world, out CelestialBody body)
         {
             world = default;
             body = null;
-            var aim = orders.Aim;
             switch (aim.Kind)
             {
-                case CommandAimKind.Vessel:
-                {
-                    if (_trueOk && aim.PersistentId == _target.PersistentId)
-                    {
-                        world = _truePos;
-                        body = _trueBody;
-                        return body != null;
-                    }
-                    if (!FlightGlobals.FindVessel(aim.PersistentId, out Vessel v) || v == null || v.mainBody == null)
-                        return false;
-                    body = v.mainBody;
-                    if (v.loaded)
-                        world = ToD(v.packed ? v.GetWorldPos3D() : v.CoMD);
-                    else if (v.situation == Vessel.Situations.LANDED || v.situation == Vessel.Situations.SPLASHED
-                        || v.situation == Vessel.Situations.PRELAUNCH)
-                        world = ToD(body.GetWorldSurfacePosition(v.latitude, v.longitude, v.altitude));
-                    else if (v.orbit != null)
-                        world = ToD(v.orbit.getPositionAtUT(ut));
-                    else
-                        return false;
-                    return true;
-                }
                 case CommandAimKind.Orbit:
                 {
-                    var orbit = orders.AimOrbit;
+                    var orbit = aimOrbit;
                     if (orbit == null || orbit.referenceBody == null) return false;
                     body = orbit.referenceBody;
                     world = ToD(orbit.getPositionAtUT(ut));
@@ -477,7 +486,7 @@ namespace Kerbcast
             return rt != null ? rt.height : _cam.RenderHeight;
         }
 
-        private void NoteGovernance(double ut, bool governed, CommandFeedOrders orders)
+        private void NoteGovernance(double ut, bool governed)
         {
             string at = $"{Tag} cam={_flightId} UT={F(ut)} d={_lastDistance:F0}";
             if (!_blankLogged || Blank != _loggedBlank)
@@ -487,12 +496,10 @@ namespace Kerbcast
                 _blankLogged = true;
                 _loggedBlank = Blank;
             }
-            string aim = governed ? (orders?.Aim != null ? orders.Aim.ToString() : "none") : null;
+            string aim = (_aim != null ? _aim.ToString() : "default") + (governed ? $" lock={_authority.Owner}" : "");
             if (aim != _loggedAim)
             {
-                Debug.Log(governed
-                    ? $"{at} event=aim owner={_authority.Owner} aim={aim} margin={FramingMargin:F0}m"
-                    : $"{at} event=aim-standalone (true target, no authority)");
+                Debug.Log($"{at} event=aim aim={aim}");
                 _loggedAim = aim;
             }
         }
@@ -611,30 +618,21 @@ namespace Kerbcast
                 station = BodyMotion.OnSurface(body, body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude));
             }
 
-            bool governed = _authority != null && _authority.Registered;
-            var orders = governed ? _authority.Orders(_flightId) : _lookAt;
-            if (!governed && orders == null) return TargetMotion(ut, out aim);
-            var a = orders?.Aim;
-            if (a == null) return false;
+            var a = _aim;
+            if (a == null || a.Kind == CommandAimKind.Vessel) return TargetMotion(ut, out aim);
             switch (a.Kind)
             {
-                case CommandAimKind.Vessel:
+                case CommandAimKind.Direction:
                 {
-                    if (a.PersistentId == _target.PersistentId) return TargetMotion(ut, out aim);
-                    if (!FlightGlobals.FindVessel(a.PersistentId, out Vessel av) || av == null || av.mainBody == null)
-                        return false;
-                    if (av.situation == Vessel.Situations.LANDED || av.situation == Vessel.Situations.SPLASHED
-                        || av.situation == Vessel.Situations.PRELAUNCH)
-                        aim = BodyMotion.OnSurface(av.mainBody,
-                            av.loaded ? (av.packed ? av.GetWorldPos3D() : av.CoMD)
-                                : av.mainBody.GetWorldSurfacePosition(av.latitude, av.longitude, av.altitude));
-                    else if (av.orbit != null) aim = BodyMotion.OnOrbit(av.orbit);
-                    else return false;
+                    /* Held still against the ground, as near as the forecast needs. */
+                    var body = site.Vantage != null ? site.Vantage.mainBody : site.Body;
+                    if (body == null) return false;
+                    aim = BodyMotion.OnSurface(body, new Vector3d(_lastAimPoint.X, _lastAimPoint.Y, _lastAimPoint.Z));
                     return true;
                 }
                 case CommandAimKind.Orbit:
                 {
-                    var orbit = orders.AimOrbit;
+                    var orbit = _aimOrbit;
                     if (orbit == null || orbit.referenceBody == null) return false;
                     aim = BodyMotion.OnOrbit(orbit);
                     return true;

@@ -1,6 +1,6 @@
 //! Global requests a client makes of the plugin that are not about one
-//! existing camera's control block: creating and destroying command cameras,
-//! and pointing one at a look-at point. The sidecar validates each, then
+//! existing camera's control block: creating, destroying and aiming command
+//! cameras. The sidecar validates each, then
 //! appends it to `global.commands.json`, which the plugin re-reads a few
 //! times a second.
 //!
@@ -16,8 +16,8 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-    CommandLookAt, CommandLookAtKind, CommandVantage, CommandVantageKind,
-    CreateCommandCameraPayload, DestroyCommandCameraPayload, SetCommandLookAtPayload,
+    CommandAim, CommandAimKind, CommandVantage, CommandVantageKind, CreateCommandCameraPayload,
+    DestroyCommandCameraPayload, SetCommandAimPayload,
 };
 
 pub const COMMANDS_FILE: &str = "global.commands.json";
@@ -45,7 +45,7 @@ pub struct CommandRequest {
 pub enum CommandOp {
     Create(CreateCommandCameraPayload),
     Destroy(DestroyCommandCameraPayload),
-    LookAt(SetCommandLookAtPayload),
+    Aim(SetCommandAimPayload),
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -155,25 +155,70 @@ pub fn validate_vantage(v: &CommandVantage) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_look_at(l: &CommandLookAt) -> Result<(), String> {
-    if !l.framing_margin_m.is_none_or(|m| finite(m) && m >= 0.0) {
+/// Mirrors the plugin's aim checks: shape and finite numbers. Whether the
+/// named body or craft exists is checked in game.
+pub fn validate_aim(a: &CommandAim) -> Result<(), String> {
+    let opt_finite = |x: Option<f64>| x.is_none_or(finite);
+    let all_finite = |xs: &[Option<f64>]| xs.iter().all(|x| x.is_some_and(finite));
+    let vec3 = |v: &Option<Vec<f64>>| {
+        v.as_ref()
+            .is_some_and(|v| v.len() == 3 && v.iter().all(|x| finite(*x)))
+    };
+    if !a.framing_margin_m.is_none_or(|m| finite(m) && m >= 0.0) {
         return Err("framingMarginM must be a finite number, 0 or more".into());
     }
-    match l.kind {
-        CommandLookAtKind::Vessel => {
-            if l.persistent_id.unwrap_or(0) == 0 {
-                return Err("a vessel look-at needs `persistentId`".into());
+    match a.kind {
+        CommandAimKind::Vessel => {
+            if a.persistent_id.unwrap_or(0) == 0 {
+                return Err("a vessel aim needs `persistentId`".into());
             }
         }
-        CommandLookAtKind::Surface => {
-            if !non_empty(&l.body) {
-                return Err("a surface look-at needs `body`".into());
+        CommandAimKind::Orbit => {
+            if !non_empty(&a.body) {
+                return Err("an orbit aim needs `body`".into());
             }
-            if !latitude_ok(l.latitude) {
-                return Err("a surface look-at needs `latitude` within -90..90".into());
+            if !all_finite(&[
+                a.inclination,
+                a.eccentricity,
+                a.semi_major_axis,
+                a.lan,
+                a.argument_of_periapsis,
+                a.mean_anomaly_at_epoch,
+                a.epoch,
+            ]) {
+                return Err("an orbit aim needs finite `inclination`, `eccentricity`, \
+                     `semiMajorAxis`, `lan`, `argumentOfPeriapsis`, `meanAnomalyAtEpoch` and `epoch`"
+                    .into());
             }
-            if !l.longitude.is_some_and(finite) || !l.altitude.is_none_or(finite) {
-                return Err("a surface look-at needs a finite `longitude` and `altitude`".into());
+        }
+        CommandAimKind::Surface => {
+            if !non_empty(&a.body) {
+                return Err("a surface aim needs `body`".into());
+            }
+            if !latitude_ok(a.latitude) {
+                return Err("a surface aim needs `latitude` within -90..90".into());
+            }
+            if !a.longitude.is_some_and(finite) || !opt_finite(a.altitude) {
+                return Err("a surface aim needs a finite `longitude` and `altitude`".into());
+            }
+        }
+        CommandAimKind::PositionAt => {
+            if !non_empty(&a.body) {
+                return Err("a positionAt aim needs `body`".into());
+            }
+            if !a.ut.is_some_and(finite) || !vec3(&a.position) || !vec3(&a.velocity) {
+                return Err(
+                    "a positionAt aim needs a finite `ut` and `position` and `velocity` of 3 finite numbers"
+                        .into(),
+                );
+            }
+        }
+        CommandAimKind::Direction => {
+            if !a.azimuth.is_some_and(finite) || !latitude_ok(a.elevation) {
+                return Err(
+                    "a direction aim needs a finite `azimuth` and `elevation` within -90..90"
+                        .into(),
+                );
             }
         }
     }
@@ -192,8 +237,8 @@ pub fn validate_create(p: &CreateCommandCameraPayload) -> Result<(), String> {
         return Err(format!("name must be at most {MAX_NAME_LEN} characters"));
     }
     validate_vantage(&p.vantage)?;
-    if let Some(l) = &p.look_at {
-        validate_look_at(l)?;
+    if let Some(a) = &p.aim {
+        validate_aim(a)?;
     }
     Ok(())
 }
@@ -237,8 +282,32 @@ mod tests {
             token: token.into(),
             name: None,
             vantage,
-            target_persistent_id: None,
-            look_at: None,
+            aim: None,
+        }
+    }
+
+    fn aim(kind: CommandAimKind) -> CommandAim {
+        CommandAim {
+            kind,
+            persistent_id: None,
+            body: None,
+            inclination: None,
+            eccentricity: None,
+            semi_major_axis: None,
+            lan: None,
+            argument_of_periapsis: None,
+            mean_anomaly_at_epoch: None,
+            epoch: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
+            ut: None,
+            position: None,
+            velocity: None,
+            azimuth: None,
+            elevation: None,
+            subject_persistent_id: None,
+            framing_margin_m: None,
         }
     }
 
@@ -274,23 +343,85 @@ mod tests {
         assert!(validate_create(&create("", launch_site())).is_err());
         assert!(validate_create(&create(&"x".repeat(129), launch_site())).is_err());
         let mut p = create("t", launch_site());
-        p.look_at = Some(CommandLookAt {
-            kind: CommandLookAtKind::Surface,
-            persistent_id: None,
+        p.aim = Some(CommandAim {
             body: Some("Kerbin".into()),
             latitude: Some(-0.1),
-            longitude: None,
             altitude: Some(70.0),
-            framing_margin_m: None,
+            ..aim(CommandAimKind::Surface)
         });
         assert!(
             validate_create(&p).is_err(),
-            "surface look-at needs a longitude"
+            "surface aim needs a longitude"
         );
-        p.look_at.as_mut().unwrap().longitude = Some(-74.5);
+        p.aim.as_mut().unwrap().longitude = Some(-74.5);
         assert!(validate_create(&p).is_ok());
-        p.look_at.as_mut().unwrap().framing_margin_m = Some(-5.0);
+        p.aim.as_mut().unwrap().framing_margin_m = Some(-5.0);
         assert!(validate_create(&p).is_err());
+    }
+
+    #[test]
+    fn aim_validation() {
+        assert!(validate_aim(&aim(CommandAimKind::Vessel)).is_err());
+        assert!(validate_aim(&CommandAim {
+            persistent_id: Some(7),
+            ..aim(CommandAimKind::Vessel)
+        })
+        .is_ok());
+
+        let direction = CommandAim {
+            azimuth: Some(270.0),
+            elevation: Some(45.0),
+            ..aim(CommandAimKind::Direction)
+        };
+        assert!(validate_aim(&direction).is_ok());
+        assert!(validate_aim(&CommandAim {
+            elevation: Some(91.0),
+            ..direction.clone()
+        })
+        .is_err());
+        assert!(validate_aim(&CommandAim {
+            azimuth: None,
+            ..direction
+        })
+        .is_err());
+
+        let position = CommandAim {
+            body: Some("Kerbin".into()),
+            ut: Some(10.0),
+            position: Some(vec![1.0, 2.0, 3.0]),
+            velocity: Some(vec![0.0, 0.0, 0.0]),
+            subject_persistent_id: Some(9),
+            ..aim(CommandAimKind::PositionAt)
+        };
+        assert!(validate_aim(&position).is_ok());
+        assert!(validate_aim(&CommandAim {
+            velocity: Some(vec![0.0, 0.0]),
+            ..position.clone()
+        })
+        .is_err());
+        assert!(validate_aim(&CommandAim {
+            position: Some(vec![1.0, f64::NAN, 3.0]),
+            ..position
+        })
+        .is_err());
+
+        let orbit = CommandAim {
+            body: Some("Kerbin".into()),
+            inclination: Some(0.0),
+            eccentricity: Some(0.01),
+            semi_major_axis: Some(700_000.0),
+            lan: Some(0.0),
+            argument_of_periapsis: Some(0.0),
+            mean_anomaly_at_epoch: Some(0.0),
+            epoch: Some(0.0),
+            ..aim(CommandAimKind::Orbit)
+        };
+        assert!(validate_aim(&orbit).is_ok());
+        assert!(validate_aim(&CommandAim {
+            epoch: None,
+            ..orbit
+        })
+        .is_err());
     }
 
     #[test]
@@ -301,9 +432,9 @@ mod tests {
         q.push(CommandOp::Destroy(DestroyCommandCameraPayload {
             flight_id: 2147483905,
         }));
-        q.push(CommandOp::LookAt(SetCommandLookAtPayload {
+        q.push(CommandOp::Aim(SetCommandAimPayload {
             flight_id: 2147483905,
-            look_at: None,
+            aim: None,
         }));
         let json: serde_json::Value = serde_json::from_str(&q.to_json().unwrap()).unwrap();
         let reqs = json["requests"].as_array().unwrap();
@@ -318,8 +449,8 @@ mod tests {
         );
         assert_eq!(reqs[1]["op"], "destroy");
         assert_eq!(reqs[1]["flightId"], 2147483905u32);
-        assert_eq!(reqs[2]["op"], "lookAt");
-        assert!(reqs[2]["lookAt"].is_null());
+        assert_eq!(reqs[2]["op"], "aim");
+        assert!(reqs[2]["aim"].is_null());
     }
 
     #[test]

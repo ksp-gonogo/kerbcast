@@ -133,7 +133,7 @@ const MOCK_CAMERAS: MockCameraInit[] = [
       latitude: -0.13,
       longitude: -74.6,
       altitude: 95.5,
-      targetPersistentId: 1001,
+      subjectPersistentId: 1001,
       rangeM: 11_500_000,
       trackingLevel: 2,
       targets: [

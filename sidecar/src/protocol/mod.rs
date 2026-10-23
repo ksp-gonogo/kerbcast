@@ -168,9 +168,16 @@ pub struct CommandCentreInfo {
     /// Lens altitude above sea level in metres: the station's own altitude
     /// plus the plugin's configured offset.
     pub altitude: f64,
-    /// `Vessel.persistentId` of the craft the camera watches; 0 for none.
-    pub target_persistent_id: u32,
-    /// Station to that craft in metres, to 3 significant figures. `None`
+    /// How the camera aims, as set by `SetCommandAim`. `None` for its
+    /// default: the active craft in flight, the configured craft at the Space
+    /// Center.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim_kind: Option<CommandAimKind>,
+    /// `Vessel.persistentId` of the camera's subject, the craft it draws,
+    /// brackets and reads out; 0 for none. A `vessel` aim's craft, an `orbit`
+    /// or `positionAt` aim's subject, otherwise the default craft.
+    pub subject_persistent_id: u32,
+    /// Station to the subject in metres, to 3 significant figures. `None`
     /// without a position for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_m: Option<f64>,
@@ -178,7 +185,7 @@ pub struct CommandCentreInfo {
     /// outside career.
     pub tracking_level: u32,
     /// Every craft the camera could watch, eligible first, then nearest
-    /// first. Any of them can be chosen with `SetCommandTarget`; eligibility
+    /// first. Any of them can be aimed at with a `vessel` aim; eligibility
     /// only reports what the tracking network would allow.
     pub targets: Vec<CommandTarget>,
     /// True for a camera made at runtime (`CreateCommandCamera`, or the
@@ -250,31 +257,58 @@ pub struct CommandVantage {
     pub persistent_id: Option<u32>,
 }
 
-/// What a command camera looks at instead of its craft.
+/// How a command camera aims.
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum CommandLookAtKind {
-    /// A craft other than the camera's own target.
+pub enum CommandAimKind {
+    /// Follows a craft, which is the subject.
     Vessel,
-    /// A fixed point on a body, carried round by its rotation.
+    /// Follows a conic the game propagates.
+    Orbit,
+    /// Holds a point on a body, carried round by its rotation.
     Surface,
+    /// Follows a position the caller propagated, extrapolated linearly.
+    PositionAt,
+    /// Holds a direction from the camera's local horizon.
+    Direction,
 }
 
-/// A point a command camera looks at instead of its craft. The craft is
-/// still drawn wherever it truly is. Ignored while a command authority is
-/// registered in game (the authority aims every command camera then).
+/// Where a command camera points. `kind` says which fields apply. With no
+/// subject (`surface`, `direction`, or `orbit` and `positionAt` without
+/// `subjectPersistentId`), the camera's default craft stays the subject.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommandLookAt {
-    pub kind: CommandLookAtKind,
+pub struct CommandAim {
+    pub kind: CommandAimKind,
     /// `vessel`: the craft's `Vessel.persistentId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_id: Option<u32>,
-    /// `surface`: the body's name.
+    /// `orbit`, `surface` and `positionAt`: the reference body's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// `orbit`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclination: Option<f64>,
+    /// `orbit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eccentricity: Option<f64>,
+    /// `orbit`: metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semi_major_axis: Option<f64>,
+    /// `orbit`: longitude of the ascending node, degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan: Option<f64>,
+    /// `orbit`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_of_periapsis: Option<f64>,
+    /// `orbit`: radians.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_anomaly_at_epoch: Option<f64>,
+    /// `orbit`: UT the mean anomaly is given at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<f64>,
     /// `surface`: degrees, -90..=90.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latitude: Option<f64>,
@@ -284,8 +318,27 @@ pub struct CommandLookAt {
     /// `surface`: metres above sea level. Default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub altitude: Option<f64>,
-    /// Metres of view kept around the point, as the framing margin. Default 0
-    /// (framed as tightly as the craft would be).
+    /// `positionAt`: UT of the sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ut: Option<f64>,
+    /// `positionAt`: `[x, y, z]` metres from the body centre at `ut`, in its
+    /// non-rotating frame (the frame of `Orbit.getRelativePositionAtUT`, z up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Vec<f64>>,
+    /// `positionAt`: `[x, y, z]` metres per second in the same frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<Vec<f64>>,
+    /// `direction`: compass bearing in degrees from north, clockwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azimuth: Option<f64>,
+    /// `direction`: degrees above the horizon, -90..=90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elevation: Option<f64>,
+    /// `orbit` and `positionAt`: the craft the path belongs to, drawn and
+    /// bracketed as the subject. Absent: the default craft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_persistent_id: Option<u32>,
+    /// Metres of view kept around the subject's own size when framing. Default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing_margin_m: Option<f64>,
 }
@@ -671,19 +724,6 @@ pub struct SetTrackTargetPayload {
     pub mode: TrackMode,
 }
 
-/// Choose the craft a command camera watches: a `Vessel.persistentId` from
-/// `CommandCentreInfo.targets` (any of them, whatever its eligibility), or 0
-/// to return to the plugin's default (the active craft in flight). Under a
-/// command authority the authority still aims the camera; the target only
-/// decides which craft is drawn as the true craft.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetCommandTargetPayload {
-    pub flight_id: u32,
-    pub persistent_id: u32,
-}
-
 /// Create a command camera for the rest of the current scene. Server-wide:
 /// the camera appears in every consumer's camera list (kind `command`) with
 /// `commandCentre.token` set to `token` once the game has built it,
@@ -702,13 +742,10 @@ pub struct CreateCommandCameraPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub vantage: CommandVantage,
-    /// The craft to watch (`Vessel.persistentId`); absent for the default
-    /// (the active craft in flight).
+    /// Where it points; absent for the default (the active craft in
+    /// flight). Not applied while a command authority holds the lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_persistent_id: Option<u32>,
-    /// A point to look at instead of the craft.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub look_at: Option<CommandLookAt>,
+    pub aim: Option<CommandAim>,
 }
 
 /// Destroy a command camera made by `CreateCommandCamera` (or created in
@@ -720,15 +757,16 @@ pub struct DestroyCommandCameraPayload {
     pub flight_id: u32,
 }
 
-/// Point a command camera at `look_at` instead of its craft, or back at the
-/// craft with `look_at` absent or null.
+/// Point a command camera at `aim`, or back at its default with `aim` absent
+/// or null. Refused with `ErrorCode::CommandLocked` while a command authority
+/// holds the lock.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetCommandLookAtPayload {
+pub struct SetCommandAimPayload {
     pub flight_id: u32,
     #[serde(default)]
-    pub look_at: Option<CommandLookAt>,
+    pub aim: Option<CommandAim>,
 }
 
 /// A consumer reporting its OWN current display size in px for one camera.
@@ -908,6 +946,8 @@ pub enum ErrorCode {
     CameraNotFound,
     /// The named camera exists but its part is gone.
     CameraDestroyed,
+    /// A command authority in game holds the command cameras' aim lock.
+    CommandLocked,
 }
 
 #[typeshare]
@@ -1009,18 +1049,13 @@ pub enum ClientMessage {
     /// consistent across browsers. A browser track OVERRIDES a kOS aim on the
     /// same camera; send `mode: none` to hand aiming back to kOS.
     SetTrackTarget(SetTrackTargetPayload),
-    /// Choose the craft a command camera watches. Server-wide: every consumer
-    /// sees the new target in `CommandCentreInfo.target_persistent_id` once the
-    /// plugin applies it.
-    SetCommandTarget(SetCommandTargetPayload),
     /// Create a command camera at a vantage for the rest of the scene.
     /// Server-wide; find the new camera by its `commandCentre.token`.
     CreateCommandCamera(CreateCommandCameraPayload),
     /// Destroy a created command camera. Server-wide.
     DestroyCommandCamera(DestroyCommandCameraPayload),
-    /// Point a command camera at a craft or a surface point instead of its
-    /// target, or back at the target. Server-wide.
-    SetCommandLookAt(SetCommandLookAtPayload),
+    /// Point a command camera, or return it to its default. Server-wide.
+    SetCommandAim(SetCommandAimPayload),
     /// A consumer reporting its OWN current display size in px; the sidecar
     /// aggregates MAX-across-consumers to drive auto-resolution
     /// (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
@@ -1233,22 +1268,44 @@ mod tests {
     }
 
     #[test]
-    fn set_command_target_matches_the_wire() {
-        let wire = r#"{"type":"set-command-target","content":{"flightId":2147483905,"persistentId":4000000001}}"#;
+    fn set_command_aim_matches_the_wire() {
+        let wire = r#"{"type":"set-command-aim","content":{"flightId":2147483905,"aim":{"kind":"vessel","persistentId":4000000001,"framingMarginM":20.0}}}"#;
         let msg: ClientMessage = serde_json::from_str(wire).unwrap();
         match &msg {
-            ClientMessage::SetCommandTarget(p) => {
+            ClientMessage::SetCommandAim(p) => {
                 assert_eq!(p.flight_id, 2_147_483_905);
-                assert_eq!(p.persistent_id, 4_000_000_001);
+                let aim = p.aim.as_ref().unwrap();
+                assert_eq!(aim.kind, CommandAimKind::Vessel);
+                assert_eq!(aim.persistent_id, Some(4_000_000_001));
+                assert_eq!(aim.framing_margin_m, Some(20.0));
             }
             _ => panic!("wrong variant"),
         }
         assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+
+        let direction = r#"{"type":"set-command-aim","content":{"flightId":5,"aim":{"kind":"direction","azimuth":90.0,"elevation":30.0}}}"#;
+        let msg: ClientMessage = serde_json::from_str(direction).unwrap();
+        assert_eq!(serde_json::to_string(&msg).unwrap(), direction);
+
+        let position = r#"{"type":"set-command-aim","content":{"flightId":5,"aim":{"kind":"positionAt","body":"Kerbin","ut":100.0,"position":[1.0,2.0,3.0],"velocity":[0.0,0.0,1.0],"subjectPersistentId":9}}}"#;
+        let msg: ClientMessage = serde_json::from_str(position).unwrap();
+        assert_eq!(serde_json::to_string(&msg).unwrap(), position);
+
+        /* Returning to the default: absent and null both parse to none. */
+        for clear in [
+            r#"{"type":"set-command-aim","content":{"flightId":5}}"#,
+            r#"{"type":"set-command-aim","content":{"flightId":5,"aim":null}}"#,
+        ] {
+            match serde_json::from_str::<ClientMessage>(clear).unwrap() {
+                ClientMessage::SetCommandAim(p) => assert!(p.aim.is_none()),
+                _ => panic!("wrong variant"),
+            }
+        }
     }
 
     #[test]
     fn command_camera_requests_match_the_wire() {
-        let create = r#"{"type":"create-command-camera","content":{"token":"t1","name":"Hill","vantage":{"kind":"surface","height":3.0,"body":"Kerbin","latitude":-0.05,"longitude":-74.7},"lookAt":{"kind":"surface","body":"Kerbin","latitude":-0.0972,"longitude":-74.5577,"altitude":70.0}}}"#;
+        let create = r#"{"type":"create-command-camera","content":{"token":"t1","name":"Hill","vantage":{"kind":"surface","height":3.0,"body":"Kerbin","latitude":-0.05,"longitude":-74.7},"aim":{"kind":"surface","body":"Kerbin","latitude":-0.0972,"longitude":-74.5577,"altitude":70.0}}}"#;
         let msg: ClientMessage = serde_json::from_str(create).unwrap();
         match &msg {
             ClientMessage::CreateCommandCamera(p) => {
@@ -1256,8 +1313,7 @@ mod tests {
                 assert_eq!(p.vantage.kind, CommandVantageKind::Surface);
                 assert_eq!(p.vantage.latitude, Some(-0.05));
                 assert!(p.vantage.site.is_none());
-                assert!(p.target_persistent_id.is_none());
-                assert_eq!(p.look_at.as_ref().unwrap().kind, CommandLookAtKind::Surface);
+                assert_eq!(p.aim.as_ref().unwrap().kind, CommandAimKind::Surface);
             }
             _ => panic!("wrong variant"),
         }
@@ -1278,24 +1334,13 @@ mod tests {
         let destroy = r#"{"type":"destroy-command-camera","content":{"flightId":2147483905}}"#;
         let msg: ClientMessage = serde_json::from_str(destroy).unwrap();
         assert_eq!(serde_json::to_string(&msg).unwrap(), destroy);
-
-        /* Clearing a look-at: absent and null both parse to none. */
-        for clear in [
-            r#"{"type":"set-command-look-at","content":{"flightId":5}}"#,
-            r#"{"type":"set-command-look-at","content":{"flightId":5,"lookAt":null}}"#,
-        ] {
-            match serde_json::from_str::<ClientMessage>(clear).unwrap() {
-                ClientMessage::SetCommandLookAt(p) => assert!(p.look_at.is_none()),
-                _ => panic!("wrong variant"),
-            }
-        }
     }
 
     /// An older sidecar's commandCentre has no `created`; it reads as false.
     #[test]
     fn command_centre_created_defaults_false() {
         let c: CommandCentreInfo = serde_json::from_str(
-            r#"{"stationId":"ground:KSC","nodeName":"KSC","displayName":"KSC","body":"Kerbin","latitude":0.0,"longitude":0.0,"altitude":0.0,"targetPersistentId":0,"trackingLevel":1,"targets":[]}"#,
+            r#"{"stationId":"ground:KSC","nodeName":"KSC","displayName":"KSC","body":"Kerbin","latitude":0.0,"longitude":0.0,"altitude":0.0,"subjectPersistentId":0,"trackingLevel":1,"targets":[]}"#,
         )
         .unwrap();
         assert!(!c.created);

@@ -16,8 +16,8 @@ namespace Kerbcast
        craft is active; at the Space Center it watches the craft
        CommandCameraTargetName picks. A created camera stands at its own
        CommandVantage and watches the same default craft until told otherwise.
-       KerbcastControl.SetCommandTarget (or a client) can choose another for
-       any of them.
+       KerbcastControl.SetCommandAim (or a client) points any of them
+       elsewhere.
 
        None is tied to a vessel: each is returned whatever vessel is scanned,
        and KerbcastCore keeps them across vessel switches. Each site is
@@ -62,7 +62,7 @@ namespace Kerbcast
            site resolves. Returns the flightId it will have, or 0 with `error`
            set when the vantage is malformed or names an unknown body. `taken`
            is every flightId in use, so the new one collides with none. */
-        public uint Create(CommandVantage vantage, string name, uint targetPersistentId, string token,
+        public uint Create(CommandVantage vantage, string name, CommandAim aim, Orbit aimOrbit, string token,
             IReadOnlyCollection<uint> taken, out string error)
         {
             error = vantage == null ? "no vantage" : vantage.Invalid();
@@ -80,7 +80,7 @@ namespace Kerbcast
             while (taken.Contains(flightId) || _feeds.Any(f => f.FlightId == flightId));
 
             var feed = new Feed(this, vantage, name, token, flightId);
-            if (targetPersistentId != 0) feed.SetTarget(targetPersistentId);
+            if (aim != null) feed.SetAim(aim, aimOrbit);
             _feeds.Add(feed);
             Debug.Log($"[Kerbcast][CMDCAM] command camera cam={flightId} requested at {vantage}"
                 + (string.IsNullOrEmpty(name) ? "" : $" name='{name}'")
@@ -108,22 +108,19 @@ namespace Kerbcast
         public bool HasToken(string token) =>
             !string.IsNullOrEmpty(token) && _feeds.Any(f => f.Token == token);
 
-        /* Choices made before a created camera is built, applied when it is. */
-        public bool SetPendingTarget(uint flightId, uint persistentId)
+        /* Drops every aim waiting for a created camera to be built. */
+        public void ClearPendingAims()
         {
-            var feed = _feeds.FirstOrDefault(f => f.Created && f.FlightId == flightId && !f.Built);
-            if (feed == null) return false;
-            feed.SetTarget(persistentId);
-            return true;
+            foreach (var f in _feeds)
+                if (!f.Built) f.SetAim(null, null);
         }
 
-        public bool SetPendingLookAt(uint flightId, CommandAim aim, Orbit orbit, double framingMarginM)
+        /* An aim set before a created camera is built, applied when it is. */
+        public bool SetPendingAim(uint flightId, CommandAim aim, Orbit orbit)
         {
             var feed = _feeds.FirstOrDefault(f => f.Created && f.FlightId == flightId && !f.Built);
             if (feed == null) return false;
-            feed.LookAt = aim;
-            feed.LookAtOrbit = orbit;
-            feed.LookAtMarginM = framingMarginM;
+            feed.SetAim(aim, orbit);
             return true;
         }
 
@@ -153,10 +150,8 @@ namespace Kerbcast
             /* A created camera whose site never resolved; removed after this enumeration. */
             public bool Dropped { get; private set; }
 
-            public CommandAim LookAt;
-            public Orbit LookAtOrbit;
-            public double LookAtMarginM;
-            private uint _pendingTarget;
+            private CommandAim _pendingAim;
+            private Orbit _pendingOrbit;
 
             private CommandCameraTarget _target;
             private CommandCameraSite _site;
@@ -186,10 +181,14 @@ namespace Kerbcast
                 }
             }
 
-            public void SetTarget(uint persistentId)
+            /* The subject is chosen at once, so a launch site vantage resolves
+               against the craft the camera will watch. */
+            public void SetAim(CommandAim aim, Orbit orbit)
             {
-                _pendingTarget = persistentId;
-                _target?.Choose(persistentId);
+                _pendingAim = aim;
+                _pendingOrbit = orbit;
+                uint subject = aim?.SubjectPersistentId ?? 0;
+                if (_target != null && subject != _target.ChosenPersistentId) _target.Choose(subject);
             }
 
             private void Retry(float now)
@@ -208,7 +207,8 @@ namespace Kerbcast
                     _target = named
                         ? CommandCameraTarget.Chosen(S.CommandCameraTargetName)
                         : CommandCameraTarget.ActiveVessel();
-                    if (_pendingTarget != 0) _target.Choose(_pendingTarget);
+                    uint subject = _pendingAim?.SubjectPersistentId ?? 0;
+                    if (subject != 0) _target.Choose(subject);
                 }
                 if (_site == null && !(Created ? ResolveCreated(vessel) : ResolveDefault(vessel))) return;
 
@@ -269,7 +269,7 @@ namespace Kerbcast
                             S.CommandCameraTargetModel,
                             S.CommandCameraDebugUtStripe);
                         cam.Rig = rig;
-                        if (LookAt != null) rig.SetLookAt(LookAt, LookAtOrbit, LookAtMarginM);
+                        if (_pendingAim != null) rig.SetAim(_pendingAim, _pendingOrbit);
                     }
                     catch
                     {

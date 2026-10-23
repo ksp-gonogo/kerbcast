@@ -37,10 +37,6 @@
 //                                 fov_seq. Sidecar bumps it on any authoritative
 //                                 track_mode change; the plugin applies
 //                                 track_mode only on a change (edge-trigger).)
-//     [+64]    f32 capture_fps
-//     [+68]    u32 command_target     (a command camera's chosen craft,
-//                                      Vessel.persistentId; 0 = the default)
-//     [+72]    u32 command_target_seq (FIXED field; applied on a change only)
 //
 // track_mode (+56) is an APPEND with its own fields_present bit — NOT a
 // LAYOUT_VERSION bump. The bitmask is forward-compatible: an old reader ignores
@@ -102,12 +98,6 @@ namespace Kerbcast
         /// subscribed but is paced far below the primary rate because nothing
         /// is displaying it at size.</summary>
         public float? CaptureFps;
-        /// <summary>A command camera's chosen craft (Vessel.persistentId, 0 =
-        /// back to the default). Null when the present bit is clear.</summary>
-        public uint? CommandTarget;
-        /// <summary>Bumped by the sidecar on every target choice; applied on a
-        /// change only, so a stale flush cannot undo SetCommandTarget.</summary>
-        public uint CommandTargetSeq;
         /// <summary>The seqlock value this snapshot was read at (even).</summary>
         public long Seq;
     }
@@ -149,9 +139,6 @@ namespace Kerbcast
         // old reader ignores the bit and never touches +64, so the golden
         // fixture stays byte-identical and a predating background capture sidecar interoperates.
         private const int BCaptureFps = HeaderSize + 64;
-        // Appends too: an old reader never touches +68/+72.
-        private const int BCommandTarget = HeaderSize + 68;
-        private const int BCommandTargetSeq = HeaderSize + 72;
 
         // fields_present bits — one per Option/Vec field.
         public const uint FpLayers = 1u << 0;
@@ -166,7 +153,6 @@ namespace Kerbcast
         public const uint FpViewerLevel = 1u << 9;
         public const uint FpTrackMode = 1u << 10;
         public const uint FpCaptureFps = 1u << 11;
-        public const uint FpCommandTarget = 1u << 12;
 
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewAccessor _view;
@@ -278,8 +264,6 @@ namespace Kerbcast
                 TrackMode = (present & FpTrackMode) != 0 ? _view.ReadUInt32(BTrackMode) : (uint?)null,
                 CaptureFps = (present & FpCaptureFps) != 0 ? _view.ReadSingle(BCaptureFps) : (float?)null,
                 TrackSeq = _view.ReadUInt32(BTrackSeq),
-                CommandTarget = (present & FpCommandTarget) != 0 ? _view.ReadUInt32(BCommandTarget) : (uint?)null,
-                CommandTargetSeq = _view.ReadUInt32(BCommandTargetSeq),
                 Seq = seq,
             };
         }

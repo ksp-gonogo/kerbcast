@@ -667,33 +667,31 @@ namespace Kerbcast
                         Debug.Log($"[Kerbcast][CMDCAM] client request {r.Id}: token {r.Token} already used this scene; ignored");
                         return;
                     }
-                    string why = r.LookAt?.Invalid();
+                    string why = r.Aim?.Invalid();
                     if (why != null)
                     {
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: look-at refused: {why}");
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: aim refused: {why}");
                         return;
                     }
-                    uint id = KerbcastControl.Create(r.Vantage, r.Name, r.TargetPersistentId, r.Token, out string error);
+                    var aim = r.Aim != null ? KerbcastControl.AimOf(r.Aim) : null;
+                    uint id = KerbcastControl.Create(r.Vantage, r.Name, aim, r.Token, out string error);
                     if (id == 0)
-                    {
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: command camera refused: {error}");
-                        return;
-                    }
-                    if (r.LookAt != null && !KerbcastControl.SetCommandLookAt(id, KerbcastControl.AimOf(r.LookAt), r.LookAt.FramingMarginM))
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: look-at for cam={id} refused");
                     return;
                 }
                 case CommandRequestOp.Destroy:
                     if (!KerbcastControl.DestroyCommandCamera(r.FlightId))
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is not a created command camera; nothing destroyed");
                     return;
-                case CommandRequestOp.LookAt:
+                case CommandRequestOp.Aim:
                 {
-                    string why = r.LookAt?.Invalid();
-                    bool ok = why == null && KerbcastControl.SetCommandLookAt(r.FlightId,
-                        r.LookAt != null ? KerbcastControl.AimOf(r.LookAt) : null, r.LookAt?.FramingMarginM ?? 0);
+                    string why = r.Aim?.Invalid();
+                    string owner = KerbcastControl.CommandAuthorityOwner;
+                    if (why == null && owner != null) why = $"{owner} holds the command lock";
+                    bool ok = why == null && KerbcastControl.SetCommandAim(r.FlightId,
+                        r.Aim != null ? KerbcastControl.AimOf(r.Aim) : null);
                     if (!ok)
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: look-at for cam={r.FlightId} refused{(why != null ? ": " + why : "")}");
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: aim for cam={r.FlightId} refused{(why != null ? ": " + why : "")}");
                     return;
                 }
             }
@@ -1385,14 +1383,27 @@ namespace Kerbcast
             sb.Append($"      \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
             sb.Append($"      \"elevationDeg\": {(gr.HasFix ? gr.ElevationDeg.ToString("F3", ci) : "null")},\n");
             sb.Append($"      \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
-            sb.Append($"      \"targetPersistentId\": {gr.TargetPersistentId},\n");
-            sb.Append($"      \"targetName\": \"{JsonEsc(gr.TargetName)}\",\n");
+            sb.Append($"      \"subjectPersistentId\": {gr.SubjectPersistentId},\n");
+            sb.Append($"      \"subjectName\": \"{JsonEsc(gr.SubjectName)}\",\n");
             AppendCommandCentre(sb, gr);
             AppendCommandTrack(sb, gr);
         }
 
-        /* Target, range, Tracking Station level and the craft the camera could
-           watch. Ranges go out to 3 significant figures so the sidecar only
+        /* The wire's CommandAimKind tag. */
+        private static string AimKindTag(CommandAimKind kind)
+        {
+            switch (kind)
+            {
+                case CommandAimKind.Vessel: return "vessel";
+                case CommandAimKind.Orbit: return "orbit";
+                case CommandAimKind.Surface: return "surface";
+                case CommandAimKind.PositionAt: return "positionAt";
+                default: return "direction";
+            }
+        }
+
+        /* Aim kind, subject, range, Tracking Station level and the craft the
+           camera could watch. Ranges go out to 3 significant figures so the sidecar only
            re-broadcasts when one moves visibly. */
         private static void AppendCommandCentre(System.Text.StringBuilder sb, CommandCameraRig gr)
         {
@@ -1405,7 +1416,7 @@ namespace Kerbcast
                 Debug.LogWarning($"[Kerbcast][CMDCAM] target list failed: {ex.Message}");
                 targets = new List<CommandTargetView>();
             }
-            uint pid = gr.TargetPersistentId;
+            uint pid = gr.SubjectPersistentId;
             double range = double.NaN;
             foreach (var t in targets)
                 if (t.PersistentId == pid) { range = t.RangeM; break; }
@@ -1415,7 +1426,8 @@ namespace Kerbcast
                 : CommandCameraTargets.RoundRange(m).ToString("R", ci);
 
             sb.Append("      \"commandCentre\": {\n");
-            sb.Append($"        \"targetPersistentId\": {pid},\n");
+            if (gr.Aim != null) sb.Append($"        \"aimKind\": \"{AimKindTag(gr.Aim.Kind)}\",\n");
+            sb.Append($"        \"subjectPersistentId\": {pid},\n");
             sb.Append($"        \"rangeM\": {Range(range)},\n");
             sb.Append($"        \"trackingLevel\": {CommandCameraTargets.TrackingLevel()},\n");
             sb.Append("        \"targets\": [");

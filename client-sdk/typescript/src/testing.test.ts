@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CameraLifecycle,
-  CommandLookAtKind,
+  CommandAimKind,
   CommandVantageKind,
   Layer,
   TrackMode,
 } from "./__generated__/types";
-import { KerbcastClient } from "./index";
+import { CommandLockedError, KerbcastClient } from "./index";
 import { MockSidecar } from "./testing/index";
 
 beforeEach(() => {
@@ -50,17 +50,44 @@ describe("MockSidecar", () => {
       { kind: CommandVantageKind.Surface, body: "Kerbin", latitude: -0.05, longitude: -74.7 },
       {
         name: "Hill",
-        lookAt: { kind: CommandLookAtKind.Vessel, persistentId: 9 },
+        aim: { kind: CommandAimKind.Vessel, persistentId: 9 },
       },
     );
     expect(hill.cameraName).toBe("Hill");
     expect(hill.flightId).not.toBe(pad.flightId);
     expect(sidecar.lastCommand("create-command-camera")).toMatchObject({
-      content: { name: "Hill", lookAt: { kind: "vessel", persistentId: 9 } },
+      content: { name: "Hill", aim: { kind: "vessel", persistentId: 9 } },
     });
 
     await client.destroyCommandCamera(pad.flightId);
     expect(client.cameras.map((c) => c.flightId)).toEqual([hill.flightId]);
+  });
+
+  it("models command camera aims and the authority lock", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.setDefaultCommandSubject(5);
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+
+    const pad = await client.createCommandCamera({ kind: CommandVantageKind.LaunchSite });
+    expect(pad.commandCentre?.aimKind).toBeUndefined();
+    expect(pad.commandCentre?.subjectPersistentId).toBe(5);
+    const centre = () => client.cameras.find((c) => c.flightId === pad.flightId)?.commandCentre;
+
+    await client.setCommandAim(pad.flightId, { kind: CommandAimKind.Vessel, persistentId: 9 });
+    expect(centre()?.aimKind).toBe(CommandAimKind.Vessel);
+    expect(centre()?.subjectPersistentId).toBe(9);
+    await client.setCommandAim(pad.flightId, { kind: CommandAimKind.Direction, azimuth: 0, elevation: 45 });
+    expect(centre()?.aimKind).toBe(CommandAimKind.Direction);
+    expect(centre()?.subjectPersistentId).toBe(5);
+
+    sidecar.setCommandAuthority("gonogo");
+    await expect(client.setCommandAim(pad.flightId, null)).rejects.toBeInstanceOf(CommandLockedError);
+
+    sidecar.setCommandAuthority(null);
+    expect(centre()?.aimKind).toBeUndefined();
+    await client.setCommandAim(pad.flightId, null);
   });
 
   it("client sends hello on open()", async () => {

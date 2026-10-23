@@ -53,12 +53,6 @@
 //!                                capture at the primary rate, which is what a
 //!                                sidecar predating background capture writes. A low value is a
 //!                                background background capture. Append -> no version bump.)
-//!   +68  4   u32 command_target (a command camera's chosen craft, a
-//!                                Vessel.persistentId; 0 = back to the default.
-//!                                Present-bit gated. Append -> no version bump.)
-//!   +72  4   u32 command_target_seq (FIXED field, bumped on every target
-//!                                choice; the plugin applies command_target
-//!                                only when it moves, like track_seq.)
 //! ```
 //!
 //! NOTE: this field is an APPEND with its own `fields_present` bit, NOT a layout
@@ -130,11 +124,6 @@ const B_TRACK_SEQ: usize = 60;
 // nothing is displaying it at size. Appended within the reserved body, so the
 // golden fixture stays byte-identical and old/new builds interoperate.
 const B_CAPTURE_FPS: usize = 64;
-/* command_target (+68) and command_target_seq (+72): a command camera's chosen
-craft and an edge-trigger counter, so a stale flush cannot undo a target the
-plugin set itself (SetCommandTarget). Appended, so the fixture is unchanged. */
-const B_COMMAND_TARGET: usize = 68;
-const B_COMMAND_TARGET_SEQ: usize = 72;
 
 // `fields_present` bits — one per Option/Vec field that can be "unset".
 pub const FP_LAYERS: u32 = 1 << 0;
@@ -149,7 +138,6 @@ pub const FP_ZOOM_RATE: u32 = 1 << 8;
 pub const FP_VIEWER_LEVEL: u32 = 1 << 9;
 pub const FP_TRACK_MODE: u32 = 1 << 10;
 pub const FP_CAPTURE_FPS: u32 = 1 << 11;
-pub const FP_COMMAND_TARGET: u32 = 1 << 12;
 
 /// Auto-track mode → the u32 the plugin decodes (0=none, 1=active-vessel,
 /// 2=target). Keep in lockstep with ControlBlock.cs's SetTrackMode mapping.
@@ -274,9 +262,6 @@ impl ControlBlock {
         if s.track_mode != TrackMode::None {
             present |= FP_TRACK_MODE;
         }
-        if s.command_target.is_some() {
-            present |= FP_COMMAND_TARGET;
-        }
 
         self.put_u32(B_FIELDS_PRESENT, present);
         // subscribed (u8) + 3 pad bytes.
@@ -301,8 +286,6 @@ impl ControlBlock {
         self.put_u32(B_TRACK_MODE, track_mode_to_u32(s.track_mode));
         self.put_u32(B_TRACK_SEQ, s.track_seq);
         self.put_f32(B_CAPTURE_FPS, s.capture_fps.unwrap_or(0.0));
-        self.put_u32(B_COMMAND_TARGET, s.command_target.unwrap_or(0));
-        self.put_u32(B_COMMAND_TARGET_SEQ, s.command_target_seq);
     }
 }
 
@@ -334,10 +317,6 @@ pub struct ControlSnapshot {
     /// Requested capture rate in fps. `None` when the present bit is clear =
     /// capture at the primary rate.
     pub capture_fps: Option<f32>,
-    /// A command camera's chosen craft. `None` when the present bit is clear.
-    pub command_target: Option<u32>,
-    /// Bumped on every target choice; the plugin applies on a change.
-    pub command_target_seq: u32,
 }
 
 fn rd_u32(buf: &[u8], at: usize) -> u32 {
@@ -351,7 +330,7 @@ fn rd_f32(buf: &[u8], at: usize) -> f32 {
 /// magic+version. Returns `None` if the bytes don't carry our layout — the
 /// reader's "not ready / wrong build" gate.
 pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
-    if buf.len() < CONTROL_HEADER_SIZE + B_COMMAND_TARGET_SEQ + 4 {
+    if buf.len() < CONTROL_HEADER_SIZE + B_CAPTURE_FPS + 4 {
         return None;
     }
     if u64::from_le_bytes(buf[H_MAGIC..H_MAGIC + 8].try_into().unwrap()) != CONTROL_MAGIC {
@@ -394,8 +373,6 @@ pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
         track_mode: opt_u32(FP_TRACK_MODE, B_TRACK_MODE),
         track_seq: rd_u32(buf, b + B_TRACK_SEQ),
         capture_fps: opt_f32(FP_CAPTURE_FPS, B_CAPTURE_FPS),
-        command_target: opt_u32(FP_COMMAND_TARGET, B_COMMAND_TARGET),
-        command_target_seq: rd_u32(buf, b + B_COMMAND_TARGET_SEQ),
     })
 }
 
@@ -430,9 +407,6 @@ mod tests {
             // Left None for the same reason: bit clear, +64 zero, fixture
             // unchanged. Its own round-trip test covers the set case.
             capture_fps: None,
-            // Left unset so +68 and +72 stay zero and the fixture is unchanged.
-            command_target: None,
-            command_target_seq: 0,
         }
     }
 
@@ -563,35 +537,6 @@ mod tests {
             ..fixture_state()
         };
         assert_eq!(decode(&write_to_vec(&bumped)).unwrap().track_seq, 7);
-    }
-
-    #[test]
-    fn command_target_roundtrips_with_its_seq() {
-        let snap = decode(&write_to_vec(&fixture_state())).expect("decodes");
-        assert_eq!(snap.command_target, None);
-        assert_eq!(snap.fields_present & FP_COMMAND_TARGET, 0);
-        assert_eq!(snap.command_target_seq, 0);
-
-        let chosen = ControlState {
-            command_target: Some(0xDEAD_BEEF),
-            command_target_seq: 3,
-            ..fixture_state()
-        };
-        let snap = decode(&write_to_vec(&chosen)).expect("decodes");
-        assert_eq!(snap.command_target, Some(0xDEAD_BEEF));
-        assert_ne!(snap.fields_present & FP_COMMAND_TARGET, 0);
-        assert_eq!(snap.command_target_seq, 3);
-
-        // Zero (back to the default) is present, not absent.
-        let reset = ControlState {
-            command_target: Some(0),
-            command_target_seq: 4,
-            ..fixture_state()
-        };
-        assert_eq!(
-            decode(&write_to_vec(&reset)).unwrap().command_target,
-            Some(0)
-        );
     }
 
     #[test]

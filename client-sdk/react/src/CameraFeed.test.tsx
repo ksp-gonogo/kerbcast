@@ -2515,7 +2515,7 @@ describe("CameraFeed - command camera target brackets", () => {
     latitude: -0.1,
     longitude: -74.6,
     altitude: 95,
-    targetPersistentId: 0,
+    subjectPersistentId: 0,
     trackingLevel: 3,
     targets: [],
   };
@@ -2635,7 +2635,7 @@ describe("CameraFeed - command camera target brackets", () => {
   describe("target picker", () => {
     const TARGETS: CommandCentreInfo = {
       ...STATION,
-      targetPersistentId: 11,
+      subjectPersistentId: 11,
       rangeM: 12_300,
       trackingLevel: 1,
       targets: [
@@ -2731,20 +2731,33 @@ describe("CameraFeed - command camera target brackets", () => {
       await act(async () => {
         fireEvent.click(screen.getByRole("menuitemradio", { name: /Relay 1/ }));
       });
-      expect(sidecar.lastCommand("set-command-target", 301)?.content).toEqual({
+      expect(sidecar.lastCommand("set-command-aim", 301)?.content).toEqual({
         flightId: 301,
-        persistentId: 22,
+        aim: { kind: "vessel", persistentId: 22 },
       });
       expect(
         screen.getByRole("button", { name: "Choose target" }).getAttribute("title"),
       ).toBe("Watching Relay 1");
     });
 
-    it("is hidden with no targets or with manual controls disabled", async () => {
+    it("is hidden with no targets, with manual controls disabled or under the lock", async () => {
       const { client } = await buildConnectedSource([targetCamera()]);
       const view = renderFeed(client, { flightId: 301, disableManualControls: true });
       expect(screen.queryByRole("button", { name: "Choose target" })).toBeNull();
       view.unmount();
+
+      const locked = await buildConnectedSource([
+        makeCamera({
+          flightId: 301,
+          kind: CameraKind.Command,
+          cameraName: "KSC tracking",
+          commandCentre: TARGETS,
+          commandTrack: commandTrack({ authority: { owner: "gonogo" } }),
+        }),
+      ]);
+      const lockedView = renderFeed(locked.client, { flightId: 301 });
+      expect(screen.queryByRole("button", { name: "Choose target" })).toBeNull();
+      lockedView.unmount();
 
       const empty = await buildConnectedSource([commandCamera()]);
       renderFeed(empty.client, { flightId: 301 });

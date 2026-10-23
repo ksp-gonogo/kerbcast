@@ -23,13 +23,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::commands::{validate_create, validate_look_at, CommandOp, CommandQueue, COMMANDS_FILE};
+use crate::commands::{validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE};
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
-    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState,
+    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAimKind,
     CommandCentreInfo, CommandTarget, CommandTrackState, CreateCommandCameraPayload, CrewLocation,
-    DestroyCommandCameraPayload, DisplaySizeReport, Layer, QualityPreset, SetCommandLookAtPayload,
-    SettingsStatePayload, TrackMode,
+    DestroyCommandCameraPayload, DisplaySizeReport, ErrorCode, Layer, QualityPreset,
+    SetCommandAimPayload, SettingsStatePayload, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
@@ -176,8 +176,10 @@ struct PerCameraStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommandCentreStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aim_kind: Option<CommandAimKind>,
     #[serde(default)]
-    target_persistent_id: u32,
+    subject_persistent_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     range_m: Option<f64>,
     #[serde(default)]
@@ -381,14 +383,6 @@ pub struct ControlState {
     /// without paying full capture cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_fps: Option<f32>,
-    /// A command camera's chosen craft (`Vessel.persistentId`, 0 = back to the
-    /// default). `None` until a client picks one. Flushed to the control block.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command_target: Option<u32>,
-    /// Bumped on every target choice; the plugin applies `command_target` only
-    /// when this changes, so a stale flush cannot undo an in-game choice.
-    #[serde(default)]
-    pub command_target_seq: u32,
 }
 
 /// serde skip helper: keep the debug JSON clean for the common not-tracking case.
@@ -2065,25 +2059,47 @@ impl CameraRegistry {
         .map_err(|e| format!("command request write failed: {e}"))
     }
 
-    /// Queue a look-at change for a command camera. Errors on an unknown or
-    /// non-command camera or a malformed look-at.
-    pub async fn request_command_look_at(
+    /// Queue an aim change for a command camera. Errors on an unknown or
+    /// non-command camera, a malformed aim, or while the plugin reports a
+    /// command authority holding the lock (with `ErrorCode::CommandLocked`).
+    pub async fn request_command_aim(
         &self,
-        payload: SetCommandLookAtPayload,
-    ) -> Result<u64, String> {
+        payload: SetCommandAimPayload,
+    ) -> Result<u64, (String, Option<ErrorCode>)> {
         let flight_id = payload.flight_id;
         let Some(cam) = self.get(flight_id).await else {
-            return Err(format!("no camera with flight_id={flight_id}"));
+            return Err((format!("no camera with flight_id={flight_id}"), None));
         };
         if cam.kind != CameraKind::Command {
-            return Err(format!("camera {flight_id} is not a command camera"));
+            return Err((format!("camera {flight_id} is not a command camera"), None));
         }
-        if let Some(l) = &payload.look_at {
-            validate_look_at(l)?;
+        if let Some(a) = &payload.aim {
+            validate_aim(a).map_err(|e| (e, None))?;
         }
-        self.append_command(CommandOp::LookAt(payload))
+        if let Some(owner) = self.command_lock_owner(flight_id).await {
+            return Err((
+                format!("{owner} holds the command camera lock; aim refused"),
+                Some(ErrorCode::CommandLocked),
+            ));
+        }
+        self.append_command(CommandOp::Aim(payload))
             .await
-            .map_err(|e| format!("command request write failed: {e}"))
+            .map_err(|e| (format!("command request write failed: {e}"), None))
+    }
+
+    /// The command authority the plugin last reported for this camera, if any.
+    async fn command_lock_owner(&self, flight_id: u32) -> Option<String> {
+        let status = self.last_status.lock().await;
+        status
+            .as_ref()?
+            .cameras
+            .iter()
+            .find(|c| c.flight_id == flight_id)?
+            .command_track
+            .as_ref()?
+            .authority
+            .as_ref()
+            .map(|a| a.owner.clone())
     }
 
     /// Update the `subscribed` flag in the cam's ControlState and flush
@@ -2187,35 +2203,6 @@ impl CameraRegistry {
             return Err(format!("no camera with flight_id={flight_id}"));
         }
         self.set_track_mode_authoritative(flight_id, mode).await
-    }
-
-    /// Choose the craft a command camera watches (`Vessel.persistentId`, 0 =
-    /// back to the plugin's default). Stores it, bumps `command_target_seq` so
-    /// the plugin applies it on the edge, and flushes. No broadcast here: the
-    /// plugin's next status write reports the new target. Errors on an unknown
-    /// camera or one that is not a command camera.
-    pub async fn apply_command_target(
-        &self,
-        flight_id: u32,
-        persistent_id: u32,
-    ) -> Result<(), String> {
-        let Some(cam) = self.get(flight_id).await else {
-            return Err(format!("no camera with flight_id={flight_id}"));
-        };
-        if cam.kind != CameraKind::Command {
-            return Err(format!("camera {flight_id} is not a command camera"));
-        }
-        let snapshot = {
-            let mut ctrl = cam.control.lock().await;
-            ctrl.command_target = Some(persistent_id);
-            ctrl.command_target_seq = ctrl.command_target_seq.wrapping_add(1);
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
-            warn!(flight_id, error = %e, "command target flush failed");
-            return Err(format!("control flush failed: {e}"));
-        }
-        Ok(())
     }
 
     /// The single authoritative track_mode write, serialized per camera by the
@@ -2730,7 +2717,8 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         latitude: m.station_latitude.unwrap_or_default(),
         longitude: m.station_longitude.unwrap_or_default(),
         altitude: m.station_altitude.unwrap_or_default(),
-        target_persistent_id: 0,
+        aim_kind: None,
+        subject_persistent_id: 0,
         range_m: None,
         tracking_level: 0,
         targets: Vec::new(),
@@ -2747,7 +2735,8 @@ fn command_centre_with(
 ) -> Option<CommandCentreInfo> {
     let mut out = info.clone()?;
     if let Some(s) = status {
-        out.target_persistent_id = s.target_persistent_id;
+        out.aim_kind = s.aim_kind;
+        out.subject_persistent_id = s.subject_persistent_id;
         out.range_m = s.range_m;
         out.tracking_level = s.tracking_level;
         out.targets = s.targets.clone();
@@ -3690,7 +3679,8 @@ mod tests {
         assert_eq!(json["kind"], "command");
         assert_eq!(json["commandCentre"]["stationId"], "ground:KSC");
         assert_eq!(json["commandCentre"]["displayName"], "Kerbal Space Center");
-        assert_eq!(json["commandCentre"]["targetPersistentId"], 0);
+        assert_eq!(json["commandCentre"]["subjectPersistentId"], 0);
+        assert!(json["commandCentre"].get("aimKind").is_none());
         assert_eq!(json["commandCentre"]["targets"], serde_json::json!([]));
         for key in [
             "targetCaptureFps",
@@ -3702,24 +3692,6 @@ mod tests {
         ] {
             assert!(json.get(key).is_some(), "command camera reports {key}");
         }
-
-        // A target choice lands in the control state with an edge-trigger bump.
-        registry
-            .apply_command_target(flight_id, 42)
-            .await
-            .expect("command camera takes a target");
-        {
-            let ctrl = cam.control.lock().await;
-            assert_eq!(ctrl.command_target, Some(42));
-            assert_eq!(ctrl.command_target_seq, 1);
-        }
-        registry.apply_command_target(flight_id, 42).await.unwrap();
-        assert_eq!(
-            cam.control.lock().await.command_target_seq,
-            2,
-            "re-choosing the same craft still bumps, so it re-applies"
-        );
-        assert!(registry.apply_command_target(1, 42).await.is_err());
     }
 
     /// A created command camera carries its creator's token, can be
@@ -3776,12 +3748,12 @@ mod tests {
             .await
             .expect("created camera can be destroyed");
         let look = registry
-            .request_command_look_at(SetCommandLookAtPayload {
+            .request_command_aim(SetCommandAimPayload {
                 flight_id: settings_id,
-                look_at: None,
+                aim: None,
             })
             .await
-            .expect("any command camera takes a look-at");
+            .expect("any command camera takes an aim");
         assert_eq!(look, first + 1, "ids only grow");
 
         let file: crate::commands::CommandFile =
@@ -3805,6 +3777,55 @@ mod tests {
         assert_eq!(next, look + 1);
     }
 
+    /// While the plugin reports a command authority, browser aims are refused
+    /// with a code and never reach the request file.
+    #[tokio::test]
+    async fn aims_are_refused_while_the_lock_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let id: u32 = 0x8000_0303;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+        tokio::fs::write(
+            shm.join(format!("{id}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","station_id":"ground:LaunchPad","station_node_name":"LaunchPad"}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let write = |track: &str| {
+            std::fs::write(
+                shm.join("global.status.json"),
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandTrack":{track}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let aim = || SetCommandAimPayload {
+            flight_id: id,
+            aim: None,
+        };
+
+        write(COMMAND_TRACK_JSON);
+        registry.poll_status().await;
+        let (message, code) = registry.request_command_aim(aim()).await.unwrap_err();
+        assert_eq!(code, Some(ErrorCode::CommandLocked));
+        assert!(message.contains("gonogo"), "{message}");
+        assert!(!shm.join(COMMANDS_FILE).exists());
+
+        write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"gonogo"},"#, ""));
+        registry.poll_status().await;
+        assert!(registry.request_command_aim(aim()).await.is_ok());
+    }
+
     /// A station with no display name reads as its node name.
     #[test]
     fn command_centre_display_name_falls_back_to_node_name() {
@@ -3818,7 +3839,7 @@ mod tests {
         );
     }
 
-    const COMMAND_CENTRE_JSON: &str = r#"{"targetPersistentId":42,"rangeM":12300.0,"trackingLevel":2,"targets":[{"persistentId":42,"vesselName":"Kerbal X","vesselType":"Ship","rangeM":12300.0,"eligibility":"ok","eligibilityText":"Trackable"},{"persistentId":7,"vesselName":"Ast. HSJ-227","vesselType":"SpaceObject","eligibility":"levelTooLow","eligibilityText":"Upgrade the Tracking Station"}]}"#;
+    const COMMAND_CENTRE_JSON: &str = r#"{"aimKind":"vessel","subjectPersistentId":42,"rangeM":12300.0,"trackingLevel":2,"targets":[{"persistentId":42,"vesselName":"Kerbal X","vesselType":"Ship","rangeM":12300.0,"eligibility":"ok","eligibilityText":"Trackable"},{"persistentId":7,"vesselName":"Ast. HSJ-227","vesselType":"SpaceObject","eligibility":"levelTooLow","eligibilityText":"Upgrade the Tracking Station"}]}"#;
 
     #[test]
     fn command_centre_status_parses_and_merges_over_the_manifest() {
@@ -3841,7 +3862,8 @@ mod tests {
         let merged =
             command_centre_with(&command_centre_from_manifest(&m), Some(&status)).expect("merged");
         assert_eq!(merged.station_id, "ground:KSC");
-        assert_eq!(merged.target_persistent_id, 42);
+        assert_eq!(merged.subject_persistent_id, 42);
+        assert_eq!(merged.aim_kind, Some(CommandAimKind::Vessel));
         assert_eq!(merged.range_m, Some(12300.0));
         assert_eq!(merged.tracking_level, 2);
         assert_eq!(merged.targets, status.targets);

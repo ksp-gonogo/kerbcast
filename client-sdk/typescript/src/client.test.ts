@@ -2,8 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CameraKind,
   CameraLifecycle,
-  CommandLookAtKind,
+  CommandAimKind,
   CommandVantageKind,
+  ErrorCode,
   ErrorSource,
   Layer,
   QualityPreset,
@@ -12,6 +13,7 @@ import {
 import {
   BrowserKerbcastTransport,
   COMMAND_CAMERA_STATE_WAIT_MS,
+  CommandLockedError,
   CONTROL_OPEN_TIMEOUT_MS,
   type KerbcastConnectionState,
   type KerbcastDataChannel,
@@ -527,25 +529,6 @@ describe("KerbcastClient", () => {
     ]);
   });
 
-  it("setCommandTarget sends a set-command-target command", async () => {
-    const { transport, captured } = makeFakeTransport();
-    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
-
-    await client.connect();
-    captured.dc?._open();
-    captured.dc!.sent.length = 0;
-
-    await client.setCommandTarget(2147483905, 4000000001);
-
-    expect(captured.dc?.sent).toEqual([
-      JSON.stringify({
-        type: "set-command-target",
-        content: { flightId: 2147483905, persistentId: 4000000001 },
-      }),
-    ]);
-  });
-
   describe("command cameras", () => {
     /* `reported` adds the game's first status report: a target, a target list and commandTrack. */
     function commandCamera(flightId: number, token?: string, reported = true) {
@@ -584,7 +567,7 @@ describe("KerbcastClient", () => {
           latitude: 0,
           longitude: 0,
           altitude: 0,
-          targetPersistentId: reported ? 42 : 0,
+          subjectPersistentId: reported ? 42 : 0,
           trackingLevel: 1,
           targets: reported
             ? [
@@ -659,8 +642,8 @@ describe("KerbcastClient", () => {
 
     it("createCommandCamera generates a token when none is given and passes target and look-at", async () => {
       const { client, captured, snapshot } = await connected();
-      const lookAt = {
-        kind: CommandLookAtKind.Surface,
+      const aim = {
+        kind: CommandAimKind.Surface,
         body: "Kerbin",
         latitude: -0.0972,
         longitude: -74.5577,
@@ -669,15 +652,14 @@ describe("KerbcastClient", () => {
       };
       const created = client.createCommandCamera(
         { kind: CommandVantageKind.Surface, body: "Kerbin", latitude: -0.05, longitude: -74.7 },
-        { targetPersistentId: 77, lookAt },
+        { aim },
       );
       await Promise.resolve();
       const sent = JSON.parse(captured.dc!.sent[0]);
       expect(sent.type).toBe("create-command-camera");
       expect(typeof sent.content.token).toBe("string");
       expect(sent.content.token.length).toBeGreaterThan(0);
-      expect(sent.content.targetPersistentId).toBe(77);
-      expect(sent.content.lookAt).toEqual(lookAt);
+      expect(sent.content.aim).toEqual(aim);
       expect("name" in sent.content).toBe(false);
 
       snapshot([commandCamera(5, sent.content.token)]);
@@ -744,7 +726,7 @@ describe("KerbcastClient", () => {
 
       snapshot([commandCamera(300, "tok-2")]);
       const cam = await created;
-      expect(cam.commandCentre?.targetPersistentId).toBe(42);
+      expect(cam.commandCentre?.subjectPersistentId).toBe(42);
       expect(cam.commandCentre?.targets.map((t) => t.persistentId)).toEqual([42]);
     });
 
@@ -778,21 +760,56 @@ describe("KerbcastClient", () => {
       ).rejects.toThrow(/control channel not open/);
     });
 
-    it("destroyCommandCamera and setCommandLookAt send their commands", async () => {
+    it("destroyCommandCamera and setCommandAim send their commands", async () => {
       const { client, captured } = await connected();
       await client.destroyCommandCamera(2147483905);
-      await client.setCommandLookAt(2147483905, {
-        kind: CommandLookAtKind.Vessel,
+      await client.setCommandAim(2147483905, {
+        kind: CommandAimKind.Vessel,
         persistentId: 4000000001,
       });
-      await client.setCommandLookAt(2147483905, null);
+      await client.setCommandAim(2147483905, {
+        kind: CommandAimKind.Direction,
+        azimuth: 90,
+        elevation: 30,
+        framingMarginM: 50,
+      });
+      await client.setCommandAim(2147483905, null);
       expect(captured.dc?.sent).toEqual([
         JSON.stringify({ type: "destroy-command-camera", content: { flightId: 2147483905 } }),
         JSON.stringify({
-          type: "set-command-look-at",
-          content: { flightId: 2147483905, lookAt: { kind: "vessel", persistentId: 4000000001 } },
+          type: "set-command-aim",
+          content: { flightId: 2147483905, aim: { kind: "vessel", persistentId: 4000000001 } },
         }),
-        JSON.stringify({ type: "set-command-look-at", content: { flightId: 2147483905 } }),
+        JSON.stringify({
+          type: "set-command-aim",
+          content: {
+            flightId: 2147483905,
+            aim: { kind: "direction", azimuth: 90, elevation: 30, framingMarginM: 50 },
+          },
+        }),
+        JSON.stringify({ type: "set-command-aim", content: { flightId: 2147483905 } }),
+      ]);
+    });
+
+    it("setCommandAim rejects while a command authority holds the lock", async () => {
+      const { client, captured, snapshot } = await connected();
+      const locked = {
+        ...commandCamera(300),
+        commandTrack: { ...commandCamera(300).commandTrack, authority: { owner: "gonogo" } },
+      };
+      snapshot([locked]);
+      const err = await client
+        .setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 7 })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CommandLockedError);
+      expect((err as CommandLockedError).owner).toBe("gonogo");
+      expect((err as CommandLockedError).code).toBe(ErrorCode.CommandLocked);
+      expect(captured.dc?.sent).toEqual([]);
+
+      snapshot([commandCamera(300)]);
+      await client.setCommandAim(300, null);
+      expect(captured.dc?.sent).toEqual([
+        JSON.stringify({ type: "set-command-aim", content: { flightId: 300 } }),
       ]);
     });
   });

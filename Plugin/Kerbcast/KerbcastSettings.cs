@@ -149,7 +149,7 @@ namespace Kerbcast
         public double CommandCameraAltitudeOffset { get; private set; } = 30.0;
         /* Space Center only: the craft the command camera watches first, by
            vessel name. Empty picks the most recently launched craft that is not
-           debris. SetCommandTarget changes it at runtime. */
+           debris. A Vessel aim (SetCommandAim) points elsewhere at runtime. */
         public string CommandCameraTargetName { get; private set; } = "";
         /* With CommandCameraAnchor=vessel, the exact name of the vessel the camera rides. */
         public string CommandCameraVantageName { get; private set; } = "";

@@ -59,10 +59,10 @@ use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, DestroyCommandCameraPayload,
     ErrorCode, ErrorPayload, ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset,
     ReportDisplaySizePayload, SceneStateChangedPayload, ServerMessage,
-    SetBackgroundCaptureFpsPayload, SetCommandTargetPayload, SetDegradePayload,
-    SetForceFullResolutionPayload, SetFovPayload, SetLayersPayload, SetPanPayload,
-    SetPanRatePayload, SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload,
-    SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
+    SetBackgroundCaptureFpsPayload, SetDegradePayload, SetForceFullResolutionPayload,
+    SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload,
+    SetRenderSizePayload, SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload,
+    SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -750,28 +750,6 @@ async fn handle_client_message(
                 );
             }
         }
-        ClientMessage::SetCommandTarget(SetCommandTargetPayload {
-            flight_id,
-            persistent_id,
-        }) => {
-            /* The plugin applies the choice on its next control read; its
-            status write then reports the new target to every consumer. */
-            if let Err(message) = registry
-                .apply_command_target(flight_id, persistent_id)
-                .await
-            {
-                send_server_message(
-                    &dc,
-                    &ServerMessage::Error(ErrorPayload {
-                        message,
-                        source: ErrorSource::Sidecar,
-                        ..Default::default()
-                    }),
-                );
-            } else {
-                info!(flight_id, persistent_id, "command target set");
-            }
-        }
         ClientMessage::CreateCommandCamera(payload) => {
             /* The plugin builds it on its next read of global.commands.json;
             the client finds it in the camera list by its token. */
@@ -790,11 +768,19 @@ async fn handle_client_message(
                 Err(message) => send_error(&dc, message),
             }
         }
-        ClientMessage::SetCommandLookAt(payload) => {
+        ClientMessage::SetCommandAim(payload) => {
             let flight_id = payload.flight_id;
-            match registry.request_command_look_at(payload).await {
-                Ok(id) => info!(request = id, flight_id, "command look-at requested"),
-                Err(message) => send_error(&dc, message),
+            match registry.request_command_aim(payload).await {
+                Ok(id) => info!(request = id, flight_id, "command aim requested"),
+                Err((message, code)) => send_server_message(
+                    &dc,
+                    &ServerMessage::Error(ErrorPayload {
+                        message,
+                        source: ErrorSource::Sidecar,
+                        flight_id: Some(flight_id),
+                        code,
+                    }),
+                ),
             }
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {

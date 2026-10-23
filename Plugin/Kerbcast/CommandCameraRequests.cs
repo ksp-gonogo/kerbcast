@@ -9,37 +9,62 @@ namespace Kerbcast
     {
         Create,
         Destroy,
-        LookAt,
+        Aim,
     }
 
-    /* A point for a command camera to look at instead of its craft, as a
-       client sent it. Kind is "vessel" or "surface"; altitude is metres above
-       sea level, as CommandAim.Surface takes it. */
-    internal sealed class CommandLookAtSpec
+    /* A command camera aim as a client sent it, before KerbcastControl.AimOf
+       turns it into a CommandAim. Kind is the wire's CommandAimKind tag;
+       absent numbers are NaN so validation can tell them from zero. */
+    internal sealed class CommandAimSpec
     {
         public string Kind = "";
         public uint PersistentId;
         public string Body = "";
-        public double Latitude, Longitude, Altitude;
+        public double Inclination = double.NaN, Eccentricity = double.NaN, SemiMajorAxis = double.NaN,
+            Lan = double.NaN, ArgumentOfPeriapsis = double.NaN, MeanAnomalyAtEpoch = double.NaN, Epoch = double.NaN;
+        public double Latitude = double.NaN, Longitude = double.NaN, Altitude;
+        public double Ut = double.NaN;
+        public double[] Position, Velocity;
+        public double Azimuth = double.NaN, Elevation = double.NaN;
+        public uint SubjectPersistentId;
         public double FramingMarginM;
 
         public string Invalid()
         {
             if (!Finite(FramingMarginM) || FramingMarginM < 0) return "framingMarginM must be a finite number, 0 or more";
-            if (Kind == "vessel") return PersistentId == 0 ? "a vessel look-at needs a persistentId" : null;
-            if (Kind != "surface") return $"unknown look-at kind '{Kind}'";
-            if (Body.Length == 0) return "a surface look-at needs a body name";
-            if (!Finite(Latitude) || Latitude < -90 || Latitude > 90) return "latitude must be within -90..90";
-            if (!Finite(Longitude) || !Finite(Altitude)) return "longitude and altitude must be finite";
-            return null;
+            switch (Kind)
+            {
+                case "vessel":
+                    return PersistentId == 0 ? "a vessel aim needs a persistentId" : null;
+                case "orbit":
+                    if (Body.Length == 0) return "an orbit aim needs a body name";
+                    return Finite(Inclination) && Finite(Eccentricity) && Finite(SemiMajorAxis) && Finite(Lan)
+                        && Finite(ArgumentOfPeriapsis) && Finite(MeanAnomalyAtEpoch) && Finite(Epoch)
+                        ? null : "an orbit aim needs every element, finite";
+                case "surface":
+                    if (Body.Length == 0) return "a surface aim needs a body name";
+                    if (!Finite(Latitude) || Latitude < -90 || Latitude > 90) return "latitude must be within -90..90";
+                    return Finite(Longitude) && Finite(Altitude) ? null : "longitude and altitude must be finite";
+                case "positionAt":
+                    if (Body.Length == 0) return "a positionAt aim needs a body name";
+                    return Finite(Ut) && Vec3(Position) && Vec3(Velocity)
+                        ? null : "a positionAt aim needs a finite ut, position and velocity";
+                case "direction":
+                    if (!Finite(Azimuth)) return "a direction aim needs a finite azimuth";
+                    return Finite(Elevation) && Elevation >= -90 && Elevation <= 90
+                        ? null : "elevation must be within -90..90";
+            }
+            return $"unknown aim kind '{Kind}'";
         }
 
         private static bool Finite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
+
+        private static bool Vec3(double[] v) => v != null && v.Length == 3 && Finite(v[0]) && Finite(v[1]) && Finite(v[2]);
     }
 
     /* One entry of global.commands.json, which the sidecar appends to for
        every create-command-camera, destroy-command-camera and
-       set-command-look-at a client sends. */
+       set-command-aim a client sends. */
     internal sealed class CommandCameraRequest
     {
         public ulong Id;
@@ -48,10 +73,9 @@ namespace Kerbcast
         public string Token = "";
         public string Name = "";
         public CommandVantage Vantage;
-        public uint TargetPersistentId;
-        /* Create and LookAt; null on LookAt clears it. */
-        public CommandLookAtSpec LookAt;
-        /* Destroy and LookAt. */
+        /* Create and Aim; null on Aim returns the camera to its default. */
+        public CommandAimSpec Aim;
+        /* Destroy and Aim. */
         public uint FlightId;
 
         /* The requests in `json`, malformed entries skipped with a reason in
@@ -92,19 +116,18 @@ namespace Kerbcast
                     req.Op = CommandRequestOp.Create;
                     req.Token = Str(o, "token");
                     req.Name = Str(o, "name");
-                    req.TargetPersistentId = U32(o, "targetPersistentId");
                     req.Vantage = VantageFrom(Obj(o, "vantage"), out why);
                     if (req.Vantage == null) { why = $"request {req.Id}: {why}"; return null; }
-                    req.LookAt = LookAtFrom(Obj(o, "lookAt"));
+                    req.Aim = AimFrom(Obj(o, "aim"));
                     return req;
                 case "destroy":
                     req.Op = CommandRequestOp.Destroy;
                     req.FlightId = U32(o, "flightId");
                     return req;
-                case "lookAt":
-                    req.Op = CommandRequestOp.LookAt;
+                case "aim":
+                    req.Op = CommandRequestOp.Aim;
                     req.FlightId = U32(o, "flightId");
-                    req.LookAt = LookAtFrom(Obj(o, "lookAt"));
+                    req.Aim = AimFrom(Obj(o, "aim"));
                     return req;
             }
             why = $"request {req.Id}: unknown op '{op}'";
@@ -134,19 +157,45 @@ namespace Kerbcast
             return null;
         }
 
-        private static CommandLookAtSpec LookAtFrom(Dictionary<string, object> l)
+        private static CommandAimSpec AimFrom(Dictionary<string, object> a)
         {
-            if (l == null) return null;
-            return new CommandLookAtSpec
+            if (a == null) return null;
+            return new CommandAimSpec
             {
-                Kind = Str(l, "kind"),
-                PersistentId = U32(l, "persistentId"),
-                Body = Str(l, "body"),
-                Latitude = Num(l, "latitude", double.NaN),
-                Longitude = Num(l, "longitude", double.NaN),
-                Altitude = Num(l, "altitude", 0),
-                FramingMarginM = Num(l, "framingMarginM", 0),
+                Kind = Str(a, "kind"),
+                PersistentId = U32(a, "persistentId"),
+                Body = Str(a, "body"),
+                Inclination = Num(a, "inclination", double.NaN),
+                Eccentricity = Num(a, "eccentricity", double.NaN),
+                SemiMajorAxis = Num(a, "semiMajorAxis", double.NaN),
+                Lan = Num(a, "lan", double.NaN),
+                ArgumentOfPeriapsis = Num(a, "argumentOfPeriapsis", double.NaN),
+                MeanAnomalyAtEpoch = Num(a, "meanAnomalyAtEpoch", double.NaN),
+                Epoch = Num(a, "epoch", double.NaN),
+                Latitude = Num(a, "latitude", double.NaN),
+                Longitude = Num(a, "longitude", double.NaN),
+                Altitude = Num(a, "altitude", 0),
+                Ut = Num(a, "ut", double.NaN),
+                Position = Vec(a, "position"),
+                Velocity = Vec(a, "velocity"),
+                Azimuth = Num(a, "azimuth", double.NaN),
+                Elevation = Num(a, "elevation", double.NaN),
+                SubjectPersistentId = U32(a, "subjectPersistentId"),
+                FramingMarginM = Num(a, "framingMarginM", 0),
             };
+        }
+
+        /* A numeric array; null when absent or holding anything else. */
+        private static double[] Vec(Dictionary<string, object> o, string key)
+        {
+            if (!o.TryGetValue(key, out var v) || !(v is List<object> list)) return null;
+            var result = new double[list.Count];
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (!(list[i] is double d)) return null;
+                result[i] = d;
+            }
+            return result;
         }
 
         private static Dictionary<string, object> Obj(Dictionary<string, object> o, string key) =>

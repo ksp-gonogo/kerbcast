@@ -56,10 +56,10 @@ Check(CameraId.IsKerbalId(c1), "created id is outside the part namespace");
 
 // Request file parsing.
 const string file = @"{""requests"":[
-  {""id"":3,""op"":""create"",""token"":""t-1"",""name"":""Pad"",""vantage"":{""kind"":""launchSite"",""site"":""LaunchPad"",""distance"":300,""bearing"":90,""height"":10},""targetPersistentId"":77,""lookAt"":null},
-  {""id"":4,""op"":""create"",""token"":""t-2"",""vantage"":{""kind"":""surface"",""body"":""Kerbin"",""latitude"":-0.05,""longitude"":-74.7,""height"":2},""lookAt"":{""kind"":""surface"",""body"":""Kerbin"",""latitude"":-0.0972,""longitude"":-74.5577,""altitude"":70,""framingMarginM"":40}},
+  {""id"":3,""op"":""create"",""token"":""t-1"",""name"":""Pad"",""vantage"":{""kind"":""launchSite"",""site"":""LaunchPad"",""distance"":300,""bearing"":90,""height"":10},""aim"":{""kind"":""vessel"",""persistentId"":77}},
+  {""id"":4,""op"":""create"",""token"":""t-2"",""vantage"":{""kind"":""surface"",""body"":""Kerbin"",""latitude"":-0.05,""longitude"":-74.7,""height"":2},""aim"":{""kind"":""surface"",""body"":""Kerbin"",""latitude"":-0.0972,""longitude"":-74.5577,""altitude"":70,""framingMarginM"":40}},
   {""id"":5,""op"":""destroy"",""flightId"":2147483905},
-  {""id"":6,""op"":""lookAt"",""flightId"":2147483905,""lookAt"":null},
+  {""id"":6,""op"":""aim"",""flightId"":2147483905,""aim"":null},
   {""id"":7,""op"":""create"",""token"":""t-3"",""vantage"":{""kind"":""station"",""station"":""KSC""}},
   {""id"":8,""op"":""create"",""token"":""t-4"",""vantage"":{""kind"":""vessel"",""persistentId"":4000000001}},
   {""id"":9,""op"":""explode""},
@@ -73,15 +73,15 @@ var r3 = reqs[0];
 Check(r3.Id == 3 && r3.Op == CommandRequestOp.Create && r3.Token == "t-1" && r3.Name == "Pad", "create header fields");
 Check(r3.Vantage.Kind == CommandVantageKind.LaunchSite && r3.Vantage.Name == "LaunchPad"
     && r3.Vantage.Distance == 300 && r3.Vantage.Bearing == 90 && r3.Vantage.Height == 10, "launch site vantage fields");
-Check(r3.TargetPersistentId == 77 && r3.LookAt == null, "target and absent look-at");
+Check(r3.Aim != null && r3.Aim.Kind == "vessel" && r3.Aim.PersistentId == 77 && r3.Aim.Invalid() == null, "vessel aim");
 var r4 = reqs[1];
 Check(r4.Vantage.Kind == CommandVantageKind.Surface && r4.Vantage.Body == "Kerbin" && r4.Vantage.Height == 2,
     "surface vantage fields");
-Check(r4.LookAt != null && r4.LookAt.Kind == "surface" && r4.LookAt.Altitude == 70 && r4.LookAt.FramingMarginM == 40,
-    "surface look-at fields");
-Check(r4.LookAt.Invalid() == null, "surface look-at is valid");
+Check(r4.Aim != null && r4.Aim.Kind == "surface" && r4.Aim.Altitude == 70 && r4.Aim.FramingMarginM == 40,
+    "surface aim fields");
+Check(r4.Aim.Invalid() == null, "surface aim is valid");
 Check(reqs[2].Op == CommandRequestOp.Destroy && reqs[2].FlightId == 2147483905u, "destroy carries a full 32-bit flightId");
-Check(reqs[3].Op == CommandRequestOp.LookAt && reqs[3].LookAt == null, "look-at null clears");
+Check(reqs[3].Op == CommandRequestOp.Aim && reqs[3].Aim == null, "aim null returns to the default");
 Check(reqs[4].Vantage.Kind == CommandVantageKind.Station && reqs[4].Vantage.Height == 30, "station height defaults when absent");
 Check(reqs[5].Vantage.PersistentId == 4000000001u, "vessel vantage persistentId above 2^31");
 
@@ -90,12 +90,27 @@ Check(CommandCameraRequest.ParseFile("{}", null).Count == 0, "file without reque
 Check(CommandCameraRequest.ParseFile(@"{""requests"":[{""id"":1,""op"":""create"",""vantage"":{""kind"":""moon""}}]}", null).Count == 0,
     "unknown vantage kind skipped");
 
-// Look-at validation.
-Check(new CommandLookAtSpec { Kind = "vessel", PersistentId = 0 }.Invalid() != null, "vessel look-at needs an id");
-Check(new CommandLookAtSpec { Kind = "vessel", PersistentId = 9 }.Invalid() == null, "vessel look-at with an id is valid");
-Check(new CommandLookAtSpec { Kind = "surface", Body = "Mun", Latitude = 0, Longitude = 0, FramingMarginM = -1 }.Invalid() != null,
+// Aim parsing and validation.
+CommandAimSpec AimOf(string json) =>
+    CommandCameraRequest.ParseFile(@"{""requests"":[{""id"":1,""op"":""aim"",""flightId"":5,""aim"":" + json + "}]}", null)[0].Aim;
+Check(new CommandAimSpec { Kind = "vessel", PersistentId = 0 }.Invalid() != null, "vessel aim needs an id");
+Check(new CommandAimSpec { Kind = "vessel", PersistentId = 9 }.Invalid() == null, "vessel aim with an id is valid");
+Check(new CommandAimSpec { Kind = "surface", Body = "Mun", Latitude = 0, Longitude = 0, FramingMarginM = -1 }.Invalid() != null,
     "negative framing margin refused");
-Check(new CommandLookAtSpec { Kind = "orbit" }.Invalid() != null, "unknown look-at kind refused");
+Check(new CommandAimSpec { Kind = "moon" }.Invalid() != null, "unknown aim kind refused");
+var dir = AimOf(@"{""kind"":""direction"",""azimuth"":90,""elevation"":30,""framingMarginM"":5}");
+Check(dir.Kind == "direction" && dir.Azimuth == 90 && dir.Elevation == 30 && dir.FramingMarginM == 5 && dir.Invalid() == null,
+    "direction aim fields");
+Check(AimOf(@"{""kind"":""direction"",""azimuth"":90}").Invalid() != null, "direction needs an elevation");
+Check(AimOf(@"{""kind"":""direction"",""azimuth"":90,""elevation"":95}").Invalid() != null, "elevation above 90 refused");
+var pos = AimOf(@"{""kind"":""positionAt"",""body"":""Kerbin"",""ut"":100,""position"":[1,2,3],""velocity"":[0,0,1],""subjectPersistentId"":4000000001}");
+Check(pos.Position[2] == 3 && pos.Velocity[2] == 1 && pos.SubjectPersistentId == 4000000001u && pos.Invalid() == null,
+    "positionAt aim fields and subject");
+Check(AimOf(@"{""kind"":""positionAt"",""body"":""Kerbin"",""ut"":100,""position"":[1,2],""velocity"":[0,0,1]}").Invalid() != null,
+    "positionAt needs three position components");
+var orbit = AimOf(@"{""kind"":""orbit"",""body"":""Kerbin"",""inclination"":0,""eccentricity"":0.01,""semiMajorAxis"":700000,""lan"":0,""argumentOfPeriapsis"":0,""meanAnomalyAtEpoch"":0,""epoch"":0}");
+Check(orbit.Invalid() == null && orbit.SubjectPersistentId == 0, "orbit aim without a subject is valid");
+Check(AimOf(@"{""kind"":""orbit"",""body"":""Kerbin"",""inclination"":0}").Invalid() != null, "orbit needs every element");
 
 // Ledger: each id once, in order; replays and stale files apply nothing.
 var ledger = new CommandRequestLedger();

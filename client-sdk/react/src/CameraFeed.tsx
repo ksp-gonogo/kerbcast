@@ -1,6 +1,7 @@
 import type { CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import {
   CameraKind,
+  CommandAimKind,
   CommandTargetEligibility,
   PanZoomController,
   QualityPreset,
@@ -830,12 +831,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // -------------------------------------------------------------------------
     // Command camera target picker. Lists every craft the game offers; the
     // ineligible ones stay visible but disabled with the game's reason, and
-    // the current target follows the published targetPersistentId.
+    // the current target follows the published subjectPersistentId. Picking
+    // one aims the camera at it. Hidden while a command authority holds the
+    // aim lock, since only it can aim then.
     // -------------------------------------------------------------------------
     const commandTargets = commandCamera?.commandCentre?.targets ?? [];
-    const commandTargetId = commandCamera?.commandCentre?.targetPersistentId ?? 0;
+    const commandTargetId = commandCamera?.commandCentre?.subjectPersistentId ?? 0;
+    const commandLocked = commandCamera?.commandTrack?.authority != null;
     const commandTargetAvailable =
-      isCommandFeed && !disableManualControls && commandTargets.length > 0;
+      isCommandFeed && !disableManualControls && !commandLocked && commandTargets.length > 0;
     const commandTargetMenuId = useId();
     const commandTargetMenu = usePortalMenu({
       maxWidth: MENU_MAX_WIDTH,
@@ -846,7 +850,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const selectCommandTarget = useCallback(
       (persistentId: number) => {
         if (flightId === null) return;
-        void client.setCommandTarget(flightId, persistentId);
+        client
+          .setCommandAim(flightId, { kind: CommandAimKind.Vessel, persistentId })
+          .catch(() => {});
         closeCommandTargetMenu();
       },
       [client, flightId, closeCommandTargetMenu],

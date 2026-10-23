@@ -26,6 +26,8 @@ namespace Kerbcast
         private bool _onSurface;
 
         public uint PersistentId { get; private set; }
+        /* The craft last chosen by Choose (or followed through a merge); 0 for the default. */
+        public uint ChosenPersistentId => _wantedPid;
         public string Name { get; private set; } = "";
         public string Situation { get; private set; } = "";
         public string LaunchedFrom { get; private set; } = "";

@@ -157,20 +157,51 @@ The vantage is one of:
 
 `createCommandCamera` resolves with the new camera's `CameraState` once the
 game has built it and reported what it is watching, normally within a
-second or two, so `commandCentre.targetPersistentId` and
+second or two, so `commandCentre.subjectPersistentId` and
 `commandCentre.targets` are already filled in. If that report has not come
 5 s after the camera appeared, it resolves with the state as it stands. The
-request carries a token
-(random unless you pass `token`) that the camera reports back as
-`commandCentre.token`; that is how the promise finds it, and how any other
-code can. A vantage the game can not find (an unknown body, site, station
-or craft) builds nothing, and the promise rejects after `timeoutMs`
-(default 35 s, since the game waits up to 30 s for a site to be placed).
+request carries a token (random unless you pass `token`) that the camera
+reports back as `commandCentre.token`; that is how the promise finds it,
+and how any other code can. A vantage the game can not find (an unknown
+body, site, station or craft) builds nothing, and the promise rejects after
+`timeoutMs` (default 35 s, since the game waits up to 30 s for a site to be
+placed).
 
 Lens reach depends on the vantage: a launch site camera has the tracking
 camera's lens at every Tracking Station level, a station's lens follows the
 Tracking Station's level in career, and surface and vessel vantages zoom
 fully.
+
+### Aiming
+
+`client.setCommandAim(flightId, aim)` points any command camera, and `null`
+returns it to its default: the active craft in flight, the configured craft
+at the Space Center. `createCommandCamera` takes the same `aim` as an option.
+The aim is one of:
+
+- `vessel`: follows the craft with that `persistentId` (any entry of
+  `commandCentre.targets`, whatever its eligibility)
+- `orbit`: follows a conic (`body`, `inclination`, `eccentricity`,
+  `semiMajorAxis`, `lan`, `argumentOfPeriapsis` in degrees and metres,
+  `meanAnomalyAtEpoch` in radians, `epoch`)
+- `positionAt`: follows a position you propagate yourself: `position` and
+  `velocity` as `[x, y, z]` relative to `body` in its non-rotating frame at
+  `ut`, carried on linearly
+- `surface`: holds a point on a `body` (`latitude`, `longitude`, `altitude`
+  in metres above sea level), turning with the planet
+- `direction`: holds a direction from the camera's local horizon,
+  `azimuth` degrees clockwise from north and `elevation` degrees above the
+  horizon
+
+The subject is the craft the camera draws (where it truly is, so an aim off
+the craft shows it off centre), brackets, sizes its zoom by and reads out. A
+`vessel` aim's craft is its subject; `orbit` and `positionAt` take an
+optional `subjectPersistentId`; otherwise the default craft stays the
+subject. A `direction` aim zooms for the subject's range, so the subject is
+framed as it passes through. Every kind takes `framingMarginM`, metres of
+view kept around the subject's own size. `commandCentre.aimKind` (absent for
+the default) and `commandCentre.subjectPersistentId` report what the game
+applied.
 
 ### A launchpad camera
 
@@ -201,13 +232,13 @@ bearing: 90, height: 20 }` stands one 800 m east of the runway, 20 m up.
 
 ### Between two vantages
 
-A camera can watch a point instead of its craft. Here one stands on a rise
-west of the KSC and watches the launch pad, then a particular craft, then
-whichever craft is active. The coordinates are illustrative.
+Here a camera stands on a rise west of the KSC and watches the launch pad,
+then a particular craft, then the sky above the pad, then whichever craft
+is active. The coordinates are illustrative.
 
 ```ts
 import {
-  CommandLookAtKind,
+  CommandAimKind,
   CommandVantageKind,
   type KerbcastClient,
 } from "@ksp-gonogo/kerbcast";
@@ -224,10 +255,10 @@ const hill = await client.createCommandCamera(
   },
   {
     name: "West ridge",
-    // Look at the pad: altitude is metres above sea level, and the margin
-    // keeps 60 m of view around the point.
-    lookAt: {
-      kind: CommandLookAtKind.Surface,
+    // The pad: altitude is metres above sea level, and the margin keeps
+    // 60 m of view around the subject.
+    aim: {
+      kind: CommandAimKind.Surface,
       body: "Kerbin",
       latitude: -0.0972,
       longitude: -74.5577,
@@ -237,26 +268,37 @@ const hill = await client.createCommandCamera(
   },
 );
 
-// Now follow a particular craft, by Vessel.persistentId.
-await client.setCommandLookAt(hill.flightId, {
-  kind: CommandLookAtKind.Vessel,
+// Follow a particular craft, by Vessel.persistentId.
+await client.setCommandAim(hill.flightId, {
+  kind: CommandAimKind.Vessel,
   persistentId: 4000000001,
 });
 
-// Back to its own target (the active craft), and pick another target.
-await client.setCommandLookAt(hill.flightId, null);
-await client.setCommandTarget(hill.flightId, 4000000001);
+// Hold still, looking east and 30 degrees up, for a launch to climb into.
+await client.setCommandAim(hill.flightId, {
+  kind: CommandAimKind.Direction,
+  azimuth: 90,
+  elevation: 30,
+});
+
+// Back to the default: the active craft.
+await client.setCommandAim(hill.flightId, null);
 ```
 
 A station watching a craft is the same with
-`{ kind: CommandVantageKind.Station, station: "KSC" }` and
-`targetPersistentId` at creation (or `setCommandTarget` later). The craft
-is always drawn where it truly is, so a look-at point that is not the
-craft shows it off centre, or not at all.
+`{ kind: CommandVantageKind.Station, station: "KSC" }` and a `vessel` aim.
 
-A command authority registered in game (`KerbcastControl.SetCommandAuthority`)
-aims every command camera itself while it holds the registration; look-at
-points apply again once it clears.
+### The command lock
+
+A mod in game can take a lock on every command camera's aim
+(`KerbcastControl.SetCommandAuthority(owner)`). While it holds the lock only
+its own aims are accepted: `setCommandAim` rejects with a
+`CommandLockedError` (its `owner` names the holder) whenever the camera's
+`commandTrack.authority` reports one, and a call that races the lock being
+taken comes back as an `error` event with code `ErrorCode.CommandLocked`.
+`createCommandCamera` still creates the camera, at its default aim. When the
+lock is released every command camera returns to its default; aims set
+before or during the lock are not restored.
 
 ### In game (C#)
 
@@ -270,13 +312,28 @@ using Kerbcast;
 uint pad = KerbcastControl.CreateCommandCamera(CommandVantage.LaunchSite());
 
 uint ridge = KerbcastControl.CreateCommandCamera(
-    CommandVantage.Surface("Kerbin", -0.08, -74.75, height: 10), "West ridge");
-KerbcastControl.SetCommandLookAt(ridge, CommandAim.Surface("Kerbin", -0.0972, -74.5577, 70),
-    framingMarginM: 60);
-KerbcastControl.SetCommandLookAt(ridge, null);
-KerbcastControl.SetCommandTarget(ridge, vessel.persistentId);
+    CommandVantage.Surface("Kerbin", -0.08, -74.75, height: 10), "West ridge",
+    CommandAim.Surface("Kerbin", -0.0972, -74.5577, 70, framingMarginM: 60));
+KerbcastControl.SetCommandAim(ridge, CommandAim.Vessel(vessel.persistentId));
+KerbcastControl.SetCommandAim(ridge, CommandAim.Direction(azimuth: 90, elevation: 30));
+KerbcastControl.SetCommandAim(ridge, null); // back to the default
 
 KerbcastControl.DestroyCommandCamera(ridge);
+```
+
+Holding the lock:
+
+```csharp
+// Re-take it on every scene load; a different owner is refused.
+KerbcastControl.SetCommandAuthority("gonogo");
+
+// Only calls passing the owner are accepted now, and each is a heartbeat.
+KerbcastControl.SetCommandAim(pad, CommandAim.PositionAt("Kerbin", ut, pos, vel,
+    subject: craft.persistentId, framingMarginM: uncertaintyM), "gonogo");
+KerbcastControl.SetCommandAim(pad, CommandAim.Vessel(other)); // false: locked
+
+// Every command camera returns to its default.
+KerbcastControl.ClearCommandAuthority("gonogo");
 ```
 
 - `CommandVantage.LaunchSite(site, distance, bearing, height)`,
@@ -284,16 +341,26 @@ KerbcastControl.DestroyCommandCamera(ridge);
   `CommandVantage.Surface(body, latitude, longitude, height)` and
   `CommandVantage.Vessel(persistentId)` mirror the vantage kinds above, with
   the same defaults
-- `CreateCommandCamera(vantage, name = null, targetPersistentId = 0)`
-  returns the flightId at once; the feed appears when the vantage resolves.
-  `SetCommandTarget`, `SetCommandLookAt` and `SetCommandAim` work on it
-  before then too
-- `SetCommandLookAt(flightId, aim, framingMarginM = 0)` takes any
-  `CommandAim`, including `Orbit` and `PositionAt`
+- `CommandAim.Vessel(persistentId, framingMarginM = 0)`,
+  `Orbit(body, inc, e, sma, lan, argPe, meanAnomalyAtEpoch, epoch, subject = 0, framingMarginM = 0)`,
+  `PositionAt(body, ut, pos, vel, subject = 0, framingMarginM = 0)`,
+  `Surface(body, lat, lon, alt, framingMarginM = 0)` and
+  `Direction(azimuth, elevation, framingMarginM = 0)` mirror the aim kinds
+- `CreateCommandCamera(vantage, name = null, aim = null)` returns the
+  flightId at once; the feed appears when the vantage resolves, and
+  `SetCommandAim` works on it before then too. Under a held lock the aim is
+  not applied
+- `SetCommandAim(flightId, aim, owner = null)` returns false when the lock
+  refuses it, the feed is not a command feed, or the aim is unusable
+- The lock fails closed: a holder that makes no call (`SetCommandAuthority`,
+  `SetCommandAim` with its owner, `SetCommandBlank`) for 5 s of real time
+  blanks every command feed "gonogo not responding", and
+  `SetCommandBlank(flightId, reason)` blanks one feed
 - `DestroyCommandCamera(flightId)` returns false for the settings camera or
   an unknown id
-- `CommandFeeds()` lists every built command camera, with `Created` set on
-  the ones made at runtime
+- `CommandFeeds()` lists every built command camera, with its `Aim`,
+  `SubjectPersistentId`, and `Created` set on the ones made at runtime;
+  `CommandTargets(flightId)` lists the craft it could follow
 
 ## Pan/zoom input helper
 

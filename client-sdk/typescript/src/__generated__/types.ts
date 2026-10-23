@@ -74,6 +74,20 @@ export enum CrewLocation {
 	Eva = "eva",
 }
 
+/** How a command camera aims. */
+export enum CommandAimKind {
+	/** Follows a craft, which is the subject. */
+	Vessel = "vessel",
+	/** Follows a conic the game propagates. */
+	Orbit = "orbit",
+	/** Holds a point on a body, carried round by its rotation. */
+	Surface = "surface",
+	/** Follows a position the caller propagated, extrapolated linearly. */
+	PositionAt = "positionAt",
+	/** Holds a direction from the camera's local horizon. */
+	Direction = "direction",
+}
+
 /**
  * Whether a command camera's tracking network could watch a craft. Only
  * `NotTrackable` applies outside career (or with the tracking rules off).
@@ -127,10 +141,20 @@ export interface CommandCentreInfo {
 	 * plus the plugin's configured offset.
 	 */
 	altitude: number;
-	/** `Vessel.persistentId` of the craft the camera watches; 0 for none. */
-	targetPersistentId: number;
 	/**
-	 * Station to that craft in metres, to 3 significant figures. `None`
+	 * How the camera aims, as set by `SetCommandAim`. `None` for its
+	 * default: the active craft in flight, the configured craft at the Space
+	 * Center.
+	 */
+	aimKind?: CommandAimKind;
+	/**
+	 * `Vessel.persistentId` of the camera's subject, the craft it draws,
+	 * brackets and reads out; 0 for none. A `vessel` aim's craft, an `orbit`
+	 * or `positionAt` aim's subject, otherwise the default craft.
+	 */
+	subjectPersistentId: number;
+	/**
+	 * Station to the subject in metres, to 3 significant figures. `None`
 	 * without a position for it.
 	 */
 	rangeM?: number;
@@ -141,7 +165,7 @@ export interface CommandCentreInfo {
 	trackingLevel: number;
 	/**
 	 * Every craft the camera could watch, eligible first, then nearest
-	 * first. Any of them can be chosen with `SetCommandTarget`; eligibility
+	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
 	 * only reports what the tracking network would allow.
 	 */
 	targets: CommandTarget[];
@@ -472,35 +496,56 @@ export interface CameraStateChangedPayload {
 	state: CameraState;
 }
 
-/** What a command camera looks at instead of its craft. */
-export enum CommandLookAtKind {
-	/** A craft other than the camera's own target. */
-	Vessel = "vessel",
-	/** A fixed point on a body, carried round by its rotation. */
-	Surface = "surface",
-}
-
 /**
- * A point a command camera looks at instead of its craft. The craft is
- * still drawn wherever it truly is. Ignored while a command authority is
- * registered in game (the authority aims every command camera then).
+ * Where a command camera points. `kind` says which fields apply. With no
+ * subject (`surface`, `direction`, or `orbit` and `positionAt` without
+ * `subjectPersistentId`), the camera's default craft stays the subject.
  */
-export interface CommandLookAt {
-	kind: CommandLookAtKind;
+export interface CommandAim {
+	kind: CommandAimKind;
 	/** `vessel`: the craft's `Vessel.persistentId`. */
 	persistentId?: number;
-	/** `surface`: the body's name. */
+	/** `orbit`, `surface` and `positionAt`: the reference body's name. */
 	body?: string;
+	/** `orbit`: degrees. */
+	inclination?: number;
+	/** `orbit`. */
+	eccentricity?: number;
+	/** `orbit`: metres. */
+	semiMajorAxis?: number;
+	/** `orbit`: longitude of the ascending node, degrees. */
+	lan?: number;
+	/** `orbit`: degrees. */
+	argumentOfPeriapsis?: number;
+	/** `orbit`: radians. */
+	meanAnomalyAtEpoch?: number;
+	/** `orbit`: UT the mean anomaly is given at. */
+	epoch?: number;
 	/** `surface`: degrees, -90..=90. */
 	latitude?: number;
 	/** `surface`: degrees. */
 	longitude?: number;
 	/** `surface`: metres above sea level. Default 0. */
 	altitude?: number;
+	/** `positionAt`: UT of the sample. */
+	ut?: number;
 	/**
-	 * Metres of view kept around the point, as the framing margin. Default 0
-	 * (framed as tightly as the craft would be).
+	 * `positionAt`: `[x, y, z]` metres from the body centre at `ut`, in its
+	 * non-rotating frame (the frame of `Orbit.getRelativePositionAtUT`, z up).
 	 */
+	position?: number[];
+	/** `positionAt`: `[x, y, z]` metres per second in the same frame. */
+	velocity?: number[];
+	/** `direction`: compass bearing in degrees from north, clockwise. */
+	azimuth?: number;
+	/** `direction`: degrees above the horizon, -90..=90. */
+	elevation?: number;
+	/**
+	 * `orbit` and `positionAt`: the craft the path belongs to, drawn and
+	 * bracketed as the subject. Absent: the default craft.
+	 */
+	subjectPersistentId?: number;
+	/** Metres of view kept around the subject's own size when framing. Default 0. */
 	framingMarginM?: number;
 }
 
@@ -572,12 +617,10 @@ export interface CreateCommandCameraPayload {
 	name?: string;
 	vantage: CommandVantage;
 	/**
-	 * The craft to watch (`Vessel.persistentId`); absent for the default
-	 * (the active craft in flight).
+	 * Where it points; absent for the default (the active craft in
+	 * flight). Not applied while a command authority holds the lock.
 	 */
-	targetPersistentId?: number;
-	/** A point to look at instead of the craft. */
-	lookAt?: CommandLookAt;
+	aim?: CommandAim;
 }
 
 /**
@@ -608,6 +651,8 @@ export enum ErrorCode {
 	CameraNotFound = "camera-not-found",
 	/** The named camera exists but its part is gone. */
 	CameraDestroyed = "camera-destroyed",
+	/** A command authority in game holds the command cameras' aim lock. */
+	CommandLocked = "command-locked",
 }
 
 export interface ErrorPayload {
@@ -692,24 +737,13 @@ export interface SetBackgroundCaptureFpsPayload {
 }
 
 /**
- * Point a command camera at `look_at` instead of its craft, or back at the
- * craft with `look_at` absent or null.
+ * Point a command camera at `aim`, or back at its default with `aim` absent
+ * or null. Refused with `ErrorCode::CommandLocked` while a command authority
+ * holds the lock.
  */
-export interface SetCommandLookAtPayload {
+export interface SetCommandAimPayload {
 	flightId: number;
-	lookAt?: CommandLookAt;
-}
-
-/**
- * Choose the craft a command camera watches: a `Vessel.persistentId` from
- * `CommandCentreInfo.targets` (any of them, whatever its eligibility), or 0
- * to return to the plugin's default (the active craft in flight). Under a
- * command authority the authority still aims the camera; the target only
- * decides which craft is drawn as the true craft.
- */
-export interface SetCommandTargetPayload {
-	flightId: number;
-	persistentId: number;
+	aim?: CommandAim;
 }
 
 export interface SetDegradePayload {
@@ -901,23 +935,14 @@ export type ClientMessage =
 	 */
 	| { type: "set-track-target", content: SetTrackTargetPayload }
 	/**
-	 * Choose the craft a command camera watches. Server-wide: every consumer
-	 * sees the new target in `CommandCentreInfo.target_persistent_id` once the
-	 * plugin applies it.
-	 */
-	| { type: "set-command-target", content: SetCommandTargetPayload }
-	/**
 	 * Create a command camera at a vantage for the rest of the scene.
 	 * Server-wide; find the new camera by its `commandCentre.token`.
 	 */
 	| { type: "create-command-camera", content: CreateCommandCameraPayload }
 	/** Destroy a created command camera. Server-wide. */
 	| { type: "destroy-command-camera", content: DestroyCommandCameraPayload }
-	/**
-	 * Point a command camera at a craft or a surface point instead of its
-	 * target, or back at the target. Server-wide.
-	 */
-	| { type: "set-command-look-at", content: SetCommandLookAtPayload }
+	/** Point a command camera, or return it to its default. Server-wide. */
+	| { type: "set-command-aim", content: SetCommandAimPayload }
 	/**
 	 * A consumer reporting its OWN current display size in px; the sidecar
 	 * aggregates MAX-across-consumers to drive auto-resolution

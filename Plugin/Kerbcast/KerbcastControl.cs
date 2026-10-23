@@ -123,28 +123,37 @@ namespace Kerbcast
             return c != null ? c.GetTrackMode() : 0;
         }
 
-        /* Registers `owner` (gonogo) as the authority over every command feed in
-           this scene. From then on each command feed points where the authority
-           says and fails closed: no aim yet blanks it "Waiting for gonogo", and
-           if no setter (this, SetCommandAim, SetCommandFraming, SetCommandBlank)
-           has been called for 5 s of REAL time every command feed blanks "gonogo
-           not responding". Real time keeps counting while the game is paused or
-           warping, so the authority must keep calling a setter as a heartbeat
-           then too. Registration lasts until ClearCommandAuthority or a scene
-           change, so re-register on each scene load. Calling again with the
-           same owner is a heartbeat; a different owner is refused (false).
-           False also when Kerbcast is not running in this scene. */
+        /* Takes the lock on every command feed's aim in this scene for `owner`
+           (gonogo). While it is held, SetCommandAim accepts only calls that pass
+           `owner`; everyone else is refused, browser clients included. Aims
+           already set stay until the owner changes them. The lock fails closed:
+           if `owner` makes no call (this, SetCommandAim with its owner, or
+           SetCommandBlank) for 5 s of REAL time, every command feed blanks
+           "gonogo not responding". Real time keeps counting while the game is
+           paused or warping, so keep calling as a heartbeat then too. The lock
+           lasts until ClearCommandAuthority or a scene change, so take it again
+           on each scene load. Calling again with the same owner is a
+           heartbeat; a different owner is refused (false). False also when
+           Kerbcast is not running in this scene. */
         public static bool SetCommandAuthority(string owner)
         {
             var auth = KerbcastCore.Instance?.CommandAuthority;
             return auth != null && auth.Register(owner, Time.realtimeSinceStartup);
         }
 
-        /* Ends `owner`'s registration; command feeds return to the perfect
-           standalone camera. Ignored for any other owner. */
+        /* Releases `owner`'s lock. Every command feed returns to its default
+           aim: no aim set before or during the lock is restored. Ignored for
+           any other owner. */
         public static void ClearCommandAuthority(string owner)
         {
-            KerbcastCore.Instance?.CommandAuthority?.Clear(owner);
+            var core = KerbcastCore.Instance;
+            var auth = core?.CommandAuthority;
+            if (auth == null || !auth.Registered || !string.Equals(auth.Owner, owner, System.StringComparison.Ordinal)) return;
+            auth.Clear(owner);
+            var cams = core.Cameras;
+            for (int i = 0; i < cams.Count; i++)
+                if (cams[i] is KerbcastCamera c && c.Rig is CommandCameraRig gr && gr.Aim != null) gr.SetAim(null, null);
+            core.CommandProvider?.ClearPendingAims();
         }
 
         /* The command feeds in this scene, empty when there are none. */
@@ -165,8 +174,9 @@ namespace Kerbcast
                         StationNodeName = gr.StationNodeName,
                         StationId = CameraId.CommandCentreId(gr.StationNodeName),
                         DisplayName = gr.StationDisplayName,
-                        TargetPersistentId = gr.TargetPersistentId,
-                        RangeM = CommandCameraTargets.RangeTo(gr.Site, gr.TargetPersistentId, ut),
+                        Aim = gr.Aim,
+                        SubjectPersistentId = gr.SubjectPersistentId,
+                        RangeM = CommandCameraTargets.RangeTo(gr.Site, gr.SubjectPersistentId, ut),
                         TrackingLevel = level,
                         FramingFits = gr.FramingFits,
                         Created = KerbcastCore.Instance.CommandProvider?.IsCreated(c.FlightId) ?? false,
@@ -179,7 +189,7 @@ namespace Kerbcast
         /* Every craft command feed `flightId` could watch, eligible first, then
            nearest first; empty when it is not a command feed. Eligibility only
            reports the tracking network's rules (career, with the tracking rules
-           difficulty setting on); SetCommandTarget accepts any of them. */
+           difficulty setting on); a Vessel aim accepts any of them. */
         public static IReadOnlyList<CommandTargetView> CommandTargets(uint flightId)
         {
             var c = Find(flightId);
@@ -187,45 +197,63 @@ namespace Kerbcast
             return CommandCameraTargets.List(gr.Site, Planetarium.GetUniversalTime());
         }
 
-        /* The craft command feed `flightId` watches, by Vessel.persistentId, or 0
-           to return to the default (the active craft in flight, the configured
-           CommandCameraTargetName at the Space Center). Any craft is accepted,
-           eligible or not. Under an authority SetCommandAim still points the
-           camera; the target only decides which craft is the true craft. False
-           when the feed is not a command feed or no craft has that id. */
-        public static bool SetCommandTarget(uint flightId, uint persistentId)
+        /* Points command feed `flightId` by `aim`, or returns it to its default
+           with null (the active craft in flight, the configured
+           CommandCameraTargetName at the Space Center). The aim's subject is
+           drawn wherever it truly is, so an aim off the craft shows it off
+           centre; every camera-axis reading (occlusion, sunlight, range,
+           bracket) is taken at the aimed point. Works on a created camera that
+           is not built yet. While a lock is held (SetCommandAuthority) only
+           calls passing its owner are accepted, and each is a heartbeat even
+           when it returns false. False when the lock refuses the call, the
+           feed is not a command feed, a craft it names does not exist, its
+           body is unknown, or a number is not finite or out of range (a
+           negative framing margin, an elevation outside -90..90). */
+        public static bool SetCommandAim(uint flightId, CommandAim aim, string owner = null)
         {
-            var c = Find(flightId);
-            var gr = c?.Rig as CommandCameraRig;
-            var provider = KerbcastCore.Instance?.CommandProvider;
-            bool pending = gr == null && provider != null && provider.IsPending(flightId);
-            if (gr == null && !pending) return false;
-            if (persistentId != 0 && !VesselExists(persistentId)) return false;
-            if (gr != null) gr.SetTarget(persistentId);
-            else provider.SetPendingTarget(flightId, persistentId);
+            var core = KerbcastCore.Instance;
+            if (core == null) return false;
+            var auth = core.CommandAuthority;
+            if (auth != null && auth.Registered)
+            {
+                if (!string.Equals(owner, auth.Owner, System.StringComparison.Ordinal)) return false;
+                auth.Heartbeat(Time.realtimeSinceStartup);
+            }
+            var gr = Find(flightId)?.Rig as CommandCameraRig;
+            var provider = core.CommandProvider;
+            if (gr == null && (provider == null || !provider.IsPending(flightId))) return false;
+            Orbit orbit = null;
+            if (aim != null && !TryResolveAim(flightId, aim, out orbit)) return false;
+            if (gr != null) gr.SetAim(aim, orbit);
+            else provider.SetPendingAim(flightId, aim, orbit);
             return true;
         }
+
+        /* The holder of the command lock, or null when nobody holds it. */
+        internal static string CommandAuthorityOwner => KerbcastCore.Instance?.CommandAuthority?.Owner;
 
         /* Creates a command camera standing at `vantage` for the rest of this
            scene (flight or Space Center), and returns the flightId its feed
            will have, or 0 when Kerbcast is not running here, the vantage is
-           malformed, or a surface vantage names an unknown body. The feed
-           appears once the vantage resolves, normally on the next frame; a
-           launch site, station or craft that is not placed within 30 s drops
-           the camera instead of standing it anywhere else. `name` replaces the
-           default feed name ("Launchpad camera", "<site> camera",
-           "<station> tracking", "<craft> camera" or "<body> surface camera").
-           It watches the default craft (the active one in flight) until
-           `targetPersistentId` or SetCommandTarget picks another; every
-           command setter works on it, including before it is built. */
-        public static uint CreateCommandCamera(CommandVantage vantage, string name = null, uint targetPersistentId = 0)
+           malformed, a surface vantage names an unknown body, or `aim` is
+           unusable (as for SetCommandAim). The feed appears once the vantage
+           resolves, normally on the next frame; a launch site, station or
+           craft that is not placed within 30 s drops the camera instead of
+           standing it anywhere else. `name` replaces the default feed name
+           ("Launchpad camera", "<site> camera", "<station> tracking",
+           "<craft> camera" or "<body> surface camera"). It points by `aim`,
+           or at the default craft (the active one in flight) when null. While
+           a lock is held the aim is not applied and the camera starts at its
+           default; the holder aims it with SetCommandAim, which works before
+           it is built. */
+        public static uint CreateCommandCamera(CommandVantage vantage, string name = null, CommandAim aim = null)
         {
-            uint id = Create(vantage, name, targetPersistentId, null, out string error);
+            uint id = Create(vantage, name, aim, null, out string error);
             if (id == 0) Debug.LogWarning($"[Kerbcast][CMDCAM] command camera at {vantage?.ToString() ?? "null"} refused: {error}");
             return id;
         }
 
-        internal static uint Create(CommandVantage vantage, string name, uint targetPersistentId, string token, out string error)
+        internal static uint Create(CommandVantage vantage, string name, CommandAim aim, string token, out string error)
         {
             var core = KerbcastCore.Instance;
             var provider = core?.CommandProvider;
@@ -234,12 +262,20 @@ namespace Kerbcast
                 error = "Kerbcast is not running in this scene";
                 return 0;
             }
-            if (targetPersistentId != 0 && !VesselExists(targetPersistentId))
+            Orbit orbit = null;
+            if (aim != null && !TryResolveAim(0, aim, out orbit))
             {
-                error = $"no craft with persistentId={targetPersistentId}";
+                error = $"aim {aim} is unusable";
                 return 0;
             }
-            return provider.Create(vantage, name, targetPersistentId, token, core.CameraFlightIds(), out error);
+            var auth = core.CommandAuthority;
+            if (aim != null && auth != null && auth.Registered)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] {auth.Owner} holds the command lock; new camera starts at its default, not {aim}");
+                aim = null;
+                orbit = null;
+            }
+            return provider.Create(vantage, name, aim, orbit, token, core.CameraFlightIds(), out error);
         }
 
         /* Removes a command camera CreateCommandCamera (or a client) made,
@@ -250,30 +286,28 @@ namespace Kerbcast
             return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
         }
 
-        /* Points command feed `flightId` at `aim` instead of its craft while no
-           authority is registered; the craft is still drawn wherever it truly
-           is. `framingMarginM` widens the framing around the point the way
-           SetCommandFraming does. Null clears it, back to the craft. Under an
-           authority SetCommandAim decides instead, and this resumes when the
-           authority clears. False when the feed is not a command feed, the
-           margin is negative or not finite, or the aim is unusable (as for
-           SetCommandAim). */
-        public static bool SetCommandLookAt(uint flightId, CommandAim aim, double framingMarginM = 0)
+        /* A client's aim as a CommandAim; call only once spec.Invalid() is null. */
+        internal static CommandAim AimOf(CommandAimSpec spec)
         {
-            if (!Finite(framingMarginM) || framingMarginM < 0) return false;
-            var gr = Find(flightId)?.Rig as CommandCameraRig;
-            var provider = KerbcastCore.Instance?.CommandProvider;
-            if (gr == null && (provider == null || !provider.IsPending(flightId))) return false;
-            Orbit orbit = null;
-            if (aim != null && !TryResolveAim(flightId, aim, out orbit)) return false;
-            if (gr != null) gr.SetLookAt(aim, orbit, framingMarginM);
-            else provider.SetPendingLookAt(flightId, aim, orbit, framingMarginM);
-            return true;
+            switch (spec.Kind)
+            {
+                case "vessel":
+                    return CommandAim.Vessel(spec.PersistentId, spec.FramingMarginM);
+                case "orbit":
+                    return CommandAim.Orbit(spec.Body, spec.Inclination, spec.Eccentricity, spec.SemiMajorAxis, spec.Lan,
+                        spec.ArgumentOfPeriapsis, spec.MeanAnomalyAtEpoch, spec.Epoch, spec.SubjectPersistentId, spec.FramingMarginM);
+                case "surface":
+                    return CommandAim.Surface(spec.Body, spec.Latitude, spec.Longitude, spec.Altitude, spec.FramingMarginM);
+                case "positionAt":
+                    return CommandAim.PositionAt(spec.Body, spec.Ut,
+                        new Vector3d(spec.Position[0], spec.Position[1], spec.Position[2]),
+                        new Vector3d(spec.Velocity[0], spec.Velocity[1], spec.Velocity[2]),
+                        spec.SubjectPersistentId, spec.FramingMarginM);
+                case "direction":
+                    return CommandAim.Direction(spec.Azimuth, spec.Elevation, spec.FramingMarginM);
+            }
+            return null;
         }
-
-        internal static CommandAim AimOf(CommandLookAtSpec spec) => spec.Kind == "vessel"
-            ? CommandAim.Vessel(spec.PersistentId)
-            : CommandAim.Surface(spec.Body, spec.Latitude, spec.Longitude, spec.Altitude);
 
         static bool VesselExists(uint persistentId)
         {
@@ -285,32 +319,27 @@ namespace Kerbcast
             return false;
         }
 
-        /* Points a command feed at `aim`. Under an authority every camera-axis reading (occlusion,
-           sunlight, range, bracket size) is taken at the aim point, while the
-           real craft is still drawn where it truly is, so a wrong aim shows as
-           a craft off centre. False when no authority is registered, the feed
-           is not a command feed, the aim is null, or its body is unknown. A
-           call is a heartbeat even when it returns false for a bad aim. */
-        public static bool SetCommandAim(uint flightId, CommandAim aim)
-        {
-            var auth = Governing(flightId);
-            if (auth == null || aim == null) return false;
-            if (!TryResolveAim(flightId, aim, out Orbit orbit)) return false;
-            var orders = auth.OrdersFor(flightId);
-            orders.Aim = aim;
-            orders.AimOrbit = orbit;
-            return true;
-        }
-
-        /* Checks an aim's numbers and body, building the conic for an Orbit aim. */
+        /* Checks an aim's numbers, craft and body, building the conic for an Orbit aim. */
         static bool TryResolveAim(uint flightId, CommandAim aim, out Orbit orbit)
         {
             orbit = null;
-            if (aim.Kind == CommandAimKind.PositionAt && !(Finite(aim.Ut) && Finite(aim.BodyRelativePosition)
-                && Finite(aim.BodyRelativeVelocity))) return false;
-            if (aim.Kind == CommandAimKind.Surface && !(Finite(aim.Latitude) && Finite(aim.Longitude) && Finite(aim.Altitude)))
-                return false;
-            if (aim.Kind == CommandAimKind.Vessel) return true;
+            if (!Finite(aim.FramingMarginM) || aim.FramingMarginM < 0) return false;
+            uint subject = aim.SubjectPersistentId;
+            if (aim.Kind == CommandAimKind.Vessel && subject == 0) return false;
+            if (subject != 0 && !VesselExists(subject)) return false;
+            switch (aim.Kind)
+            {
+                case CommandAimKind.Vessel:
+                    return true;
+                case CommandAimKind.Direction:
+                    return Finite(aim.Azimuth) && Finite(aim.Elevation) && aim.Elevation >= -90 && aim.Elevation <= 90;
+                case CommandAimKind.PositionAt:
+                    if (!(Finite(aim.Ut) && Finite(aim.BodyRelativePosition) && Finite(aim.BodyRelativeVelocity))) return false;
+                    break;
+                case CommandAimKind.Surface:
+                    if (!(Finite(aim.Latitude) && Finite(aim.Longitude) && Finite(aim.Altitude))) return false;
+                    break;
+            }
             var body = FlightGlobals.GetBodyByName(aim.Body);
             if (body == null) return false;
             if (aim.Kind != CommandAimKind.Orbit) return true;
@@ -327,24 +356,10 @@ namespace Kerbcast
             }
         }
 
-        /* Widens a command feed's framing by `marginM` metres around the aim
-           point, added to the craft's own radius for the field of view and for
-           the bracket. FramingFits on CommandFeeds reports whether the result
-           still fits the widest view. Until the first call the margin is 0.
-           Like every setter it is a heartbeat. False when no authority is
-           registered, the feed is not a command feed, or `marginM` is negative
-           or not finite. */
-        public static bool SetCommandFraming(uint flightId, double marginM)
-        {
-            var auth = Governing(flightId);
-            if (auth == null || !Finite(marginM) || marginM < 0) return false;
-            auth.OrdersFor(flightId).FramingMarginM = marginM;
-            return true;
-        }
-
         /* Blanks a command feed with `reason` shown on it; null or empty clears.
-           A blanked feed streams black frames, never the scene. False when no
-           authority is registered or the feed is not a command feed. */
+           A blanked feed streams black frames, never the scene. Like the
+           owner's other calls it is a heartbeat. False when no lock is held or
+           the feed is not a command feed. */
         public static bool SetCommandBlank(uint flightId, string reason)
         {
             var auth = Governing(flightId);

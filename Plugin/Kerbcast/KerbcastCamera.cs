@@ -1394,8 +1394,6 @@ namespace Kerbcast
            control-block flush — the anti-loop guard. */
         private uint _lastTrackSeq;
         private uint _trackReportSeq;
-        /* Same edge-trigger for a command camera's target choice. */
-        private uint _lastCommandTargetSeq;
 
         /* Last successfully-aimed track pose, recorded whenever the tracked target
            resolves. On target LOSS (destroyed / unresolvable) while still tracking,
@@ -1725,13 +1723,6 @@ namespace Kerbcast
                 {
                     _lastTrackSeq = snap.TrackSeq;
                     SetTrackMode((int)(snap.TrackMode ?? 0u));
-                }
-                if (snap.CommandTargetSeq != _lastCommandTargetSeq)
-                {
-                    _lastCommandTargetSeq = snap.CommandTargetSeq;
-                    if (snap.CommandTarget.HasValue && Rig is CommandCameraRig
-                        && !KerbcastControl.SetCommandTarget(FlightId, snap.CommandTarget.Value))
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] cam={FlightId} target {snap.CommandTarget.Value} from a client refused: no such craft");
                 }
 
                 if (SupportsPan)
