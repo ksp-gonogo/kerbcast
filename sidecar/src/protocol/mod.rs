@@ -548,6 +548,15 @@ pub struct CameraState {
     /// reduce below.
     pub operator_width: u32,
     pub operator_height: u32,
+    /// Configured capture size: the most this camera renders at (settings.cfg
+    /// `MaxQuality` or `Width`/`Height`, or a kerbal face camera's square
+    /// ring). Its aspect is the feed's shape: auto-resolution picks a size at
+    /// this aspect and never follows the viewer's box. Absent from a sidecar
+    /// that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u32>,
     /// Whether the part's Hullcam module supports runtime FoV changes
     /// (i.e. it's a `MuMechModuleHullCameraZoom`, not the fixed base
     /// `MuMechModuleHullCamera`). 19 of 21 stock parts do.
@@ -1487,6 +1496,8 @@ mod tests {
                 render_height: 384,
                 operator_width: 768,
                 operator_height: 768,
+                max_width: None,
+                max_height: None,
                 supports_zoom: true,
                 fov: 60.0,
                 fov_min: 30.0,
@@ -1545,6 +1556,8 @@ mod tests {
             render_height: 0,
             operator_width: 0,
             operator_height: 0,
+            max_width: None,
+            max_height: None,
             supports_zoom: false,
             fov: 0.0,
             fov_min: 0.0,
@@ -2029,6 +2042,8 @@ mod tests {
         assert_eq!(back.kind, CameraKind::Part);
         assert_eq!(back.kerbal_persistent_id, None);
         assert_eq!(back.crew_location, None);
+        assert_eq!(back.max_width, None);
+        assert_eq!(back.max_height, None);
     }
 
     /// A kerbal face camera round-trips its `kind`, `kerbalPersistentId`
@@ -2055,6 +2070,8 @@ mod tests {
             render_height: 0,
             operator_width: 0,
             operator_height: 0,
+            max_width: None,
+            max_height: None,
             supports_zoom: false,
             fov: 0.0,
             fov_min: 0.0,

@@ -89,15 +89,18 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    // 40x30 -> width ceiled to a 16-multiple (48), height at the box's 4:3 (36), reported without advancing timers.
+    // 40x30 -> width ceiled to a 16-multiple (48), height at 16:9 rounded to even (28), reported without advancing timers.
     fireResize(40, 30);
-    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 36 }]);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 28 }]);
   });
 
-  it("keeps the box's aspect so the frame fills it", () => {
-    expect(displayReportSize(441, 246)).toEqual({ width: 448, height: 250 });
-    expect(displayReportSize(372, 208)).toEqual({ width: 384, height: 214 });
+  it("asks for the 16:9 picture that fits the box, never the box's shape", () => {
     expect(displayReportSize(1024, 576)).toEqual({ width: 1024, height: 576 });
+    expect(displayReportSize(441, 246)).toEqual({ width: 448, height: 252 });
+    // A narrow, tall tile is limited by its width.
+    expect(displayReportSize(170, 400)).toEqual({ width: 176, height: 100 });
+    // A wide, short one by its height: the letterboxed picture is ~356x200.
+    expect(displayReportSize(800, 200)).toEqual({ width: 368, height: 208 });
   });
 
   it("reports a square (min edge) when square is set", () => {
@@ -119,12 +122,12 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    fireResize(48, 48); // prompt first -> 48x48
+    fireResize(48, 48); // prompt first -> 48x28
     fireResize(200, 200); // debounced, not yet applied
     expect(reports).toHaveLength(1);
     act(() => vi.advanceTimersByTime(200));
-    // 200 -> 208; the debounced resize now lands.
-    expect(reports.at(-1)).toMatchObject({ w: 208, h: 208 });
+    // 200 -> 208 wide at 16:9; the debounced resize now lands.
+    expect(reports.at(-1)).toMatchObject({ w: 208, h: 118 });
   });
 
   it("does not re-report a sub-bucket change", () => {
@@ -134,8 +137,8 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    fireResize(40, 40); // -> 48x48
-    fireResize(44, 44); // still ceils to 48x48 -> no new report
+    fireResize(40, 40); // -> 48x28
+    fireResize(44, 44); // still ceils to 48x28 -> no new report
     act(() => vi.advanceTimersByTime(200));
     expect(reports).toHaveLength(1);
   });
@@ -187,6 +190,6 @@ describe("useReportDisplaySize", () => {
     expect(resizeCallback).toBeUndefined();
     rerender(view(true));
     fireResize(40, 30);
-    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 36 }]);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 28 }]);
   });
 });

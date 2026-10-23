@@ -1920,6 +1920,8 @@ impl CameraRegistry {
                 render_height: cam_status.render_height,
                 operator_width: cam_status.operator_width,
                 operator_height: cam_status.operator_height,
+                max_width: Some(cam.max_width),
+                max_height: Some(cam.max_height),
                 supports_zoom: cam.supports_zoom,
                 fov: cam_status.fov,
                 fov_min: cam.fov_min,
@@ -2647,6 +2649,8 @@ impl CameraRegistry {
             render_height,
             operator_width,
             operator_height,
+            max_width: Some(cam.max_width),
+            max_height: Some(cam.max_height),
             supports_zoom: cam.supports_zoom,
             fov,
             fov_min: cam.fov_min,
@@ -4626,6 +4630,17 @@ mod tests {
         let ctrl = cam.control.lock().await;
         assert!(ctrl.subscribed, "quality apply must not clobber subscribed");
         assert_eq!(ctrl.fov, Some(42.0), "quality apply must not clobber fov");
+    }
+
+    /// The configured capture size rides every camera state, so a viewer can
+    /// keep the feed at its shape without a discovery call.
+    #[tokio::test]
+    async fn protocol_state_carries_configured_capture_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!(state.max_width, Some(cam.max_width));
+        assert_eq!(state.max_height, Some(cam.max_height));
     }
 
     /// Once the plugin reports effective dims below the viewer's target,

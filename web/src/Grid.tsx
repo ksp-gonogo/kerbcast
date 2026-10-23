@@ -113,6 +113,17 @@ export function Grid({
     setShowPerfNote(false);
   };
 
+  /*
+   * Part and command cameras share the configured capture size, so its shape
+   * is the page's tile shape. Unknown (an older sidecar, no cameras yet): 16:9.
+   */
+  const shapeSource = all.find(
+    (c) => c.kind !== CameraKind.Kerbal && (c.maxWidth ?? 0) > 0 && (c.maxHeight ?? 0) > 0,
+  );
+  const shapeW = shapeSource?.maxWidth ?? 16;
+  const shapeH = shapeSource?.maxHeight ?? 9;
+  const feedAspect = shapeW / shapeH;
+
   const isEmpty = tiles.length === 0;
   const spotlightActive = tiles.some((t) => t.spotlit);
 
@@ -132,7 +143,7 @@ export function Grid({
 
   /*
    * Flat grid: size the FEEDS to fill the viewport. Pick the column/row split
-   * that makes the feeds the largest 16:9 they can be for the measured area
+   * that makes the feeds the largest they can be at the feed shape for the measured area
    * (minus a slim strip reserved for the add bar), hand them an explicit width
    * via --tile-w, and center the block. The add control is a slim full-width
    * bar rather than a feed-sized cell, so it doesn't shrink the feeds or leave
@@ -140,16 +151,20 @@ export function Grid({
    */
   const ADD_BAR_H = 52;
   const flatFill = !spotlightActive && !isEmpty && size.w > 0 && size.h > 0;
-  let rootStyle: React.CSSProperties | undefined;
+  let rootStyle: React.CSSProperties = {
+    ["--kc-feed-w" as string]: shapeW,
+    ["--kc-feed-h" as string]: shapeH,
+  };
   if (flatFill) {
     // contentRect already excludes Root's padding, so size is the usable area.
     const availW = size.w;
     const availH = size.h - (ADD_BAR_H + GAP);
-    const { cols, rows } = bestGrid(tiles.length, availW, availH);
+    const { cols, rows } = bestGrid(tiles.length, availW, availH, feedAspect);
     const cellW = (availW - GAP * (cols - 1)) / cols;
     const cellH = (availH - GAP * (rows - 1)) / rows;
-    const tileW = Math.max(0, Math.min(cellW, (cellH * 16) / 9));
+    const tileW = Math.max(0, Math.min(cellW, cellH * feedAspect));
     rootStyle = {
+      ...rootStyle,
       gridTemplateColumns: `repeat(${cols}, auto)`,
       justifyContent: "center",
       alignContent: "center",

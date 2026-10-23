@@ -13,9 +13,11 @@ import { cameraKey } from "./tiles";
 
 /**
  * How the tile is sized by its container:
- *  - "grid": fills its grid column at 16:9 (the default flat grid).
+ *  - "grid": fills its grid column at the feed shape (the configured capture
+ *    aspect the Grid publishes, 16:9 by default).
  *  - "cell": fills whatever grid cell it's placed in (spotlight mode). The
- *    feed letterboxes inside via object-fit, so the cell need not be 16:9.
+ *    feed centres its picture at the camera's shape, so the cell need not
+ *    match it.
  */
 export type TileVariant = "grid" | "cell";
 
@@ -288,7 +290,7 @@ export function Tile({
 interface AddTileProps {
   onClick: () => void;
   isEmpty?: boolean;
-  /** Spotlight mode: render as a small 1x1 grid cell rather than a 16:9 tile. */
+  /** Spotlight mode: render as a small 1x1 grid cell rather than a feed-shaped tile. */
   compact?: boolean;
   /** Flat fill mode: a slim full-width bar below the feeds. */
   bar?: boolean;
@@ -415,11 +417,12 @@ const TileRoot = styled.div<TileRootProps>`
     width: var(--tile-w, 100%);
     max-width: 100%;
     max-height: 100%;
-    aspect-ratio: 16 / 9;
+    aspect-ratio: var(--kc-feed-w, 16) / var(--kc-feed-h, 9);
   `
       : `
-    /* Fill the grid cell; the feed letterboxes inside (object-fit: contain),
-       so a non-16:9 cell just adds bars rather than stretching the video. */
+    /* Fill the grid cell; the feed centres its picture at the camera's shape,
+       so a cell of another shape leaves room around it rather than stretching
+       the video. */
     width: 100%;
     height: 100%;
     min-height: 0;
@@ -692,14 +695,14 @@ const AddRoot = styled.button<AddRootProps>`
   background: none;
   border: 1.5px dashed var(--kc-border);
   border-radius: var(--kc-tile-radius);
-  aspect-ratio: 16 / 9;
+  aspect-ratio: var(--kc-feed-w, 16) / var(--kc-feed-h, 9);
   cursor: pointer;
   color: var(--kc-text-muted);
   font-family: inherit;
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 
   ${(p) => p.$isEmpty && `
-    /* When it's the only element, don't force 16:9; be more of a CTA bar */
+    /* When it's the only element, don't force the feed shape; be more of a CTA bar */
     aspect-ratio: unset;
     min-height: 80px;
     max-height: 100px;

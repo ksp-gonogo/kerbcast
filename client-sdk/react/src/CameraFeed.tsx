@@ -38,7 +38,7 @@ import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
 import { useRecordings } from "./hooks/useRecordings";
-import { useReportDisplaySize } from "./hooks/useReportDisplaySize";
+import { DEFAULT_FEED_ASPECT, useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
@@ -740,10 +740,36 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // -------------------------------------------------------------------------
     // Display-size reporting (auto-resolution). The feed self-measures its
     // rendered box and reports it per-consumer; the sidecar maxes across
-    // consumers. Reports the real w x h (part cams are not square). Disabled by
-    // `renderSize="none"`. See useReportDisplaySize for debounce / bucketing.
+    // consumers. Auto picks the resolution, never the shape: the request and
+    // the feed's own box keep the camera's configured capture aspect (16:9
+    // when unknown). Disabled by `renderSize="none"`. The video and the
+    // sidecar's render size let it ignore a resize that only follows the
+    // stream. See useReportDisplaySize for debounce / bucketing / the guard.
     // -------------------------------------------------------------------------
-    useReportDisplaySize(flightId, wrapRef, { enabled: renderSize === "auto" });
+    const baseW = camera?.maxWidth ?? 0;
+    const baseH = camera?.maxHeight ?? 0;
+    const hasBase = baseW > 0 && baseH > 0;
+    const feedAspect = hasBase ? baseW / baseH : DEFAULT_FEED_ASPECT;
+    const feedShape = useMemo(
+      () =>
+        ({
+          "--kc-feed-w": hasBase ? baseW : 16,
+          "--kc-feed-h": hasBase ? baseH : 9,
+        }) as React.CSSProperties,
+      [hasBase, baseW, baseH],
+    );
+    const renderedW = camera?.renderWidth ?? 0;
+    const renderedH = camera?.renderHeight ?? 0;
+    const renderedSize = useMemo(
+      () => ({ width: renderedW, height: renderedH }),
+      [renderedW, renderedH],
+    );
+    useReportDisplaySize(flightId, wrapRef, {
+      enabled: renderSize === "auto",
+      aspect: feedAspect,
+      videoRef,
+      streamSize: renderedSize,
+    });
 
     // -------------------------------------------------------------------------
     // UI state
@@ -1232,307 +1258,309 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     ) : null;
 
     return (
-      <Stage ref={wrapRef} $pinned={chromePinned}>
-        {flightId === null ? (
-          <>
-            <Empty>{emptyMessage}</Empty>
-            {topOverlay}
-            {actionBar}
-          </>
-        ) : (
-          <>
-            <StyledVideo
-              ref={attachVideo}
-              autoPlay
-              playsInline
-              muted
-              controls={false}
-              onClick={() => setChromePinned((v) => !v)}
-            />
-            {topOverlay}
-            {actionBar}
-            {qualityAvailable &&
-              qualityMenu.open &&
-              qualityMenu.position &&
-              camera &&
-              createPortal(
-                <QualityMenu
-                  ref={qualityMenu.menuRef}
-                  id={qualityMenuId}
-                  role="menu"
-                  aria-label="Quality"
-                  style={qualityMenu.position}
-                >
-                  <CameraMenuItem
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={camera.viewerQuality == null}
-                    $selected={camera.viewerQuality == null}
-                    onClick={() => selectQuality(null)}
+      <FeedBox style={feedShape}>
+        <Stage ref={wrapRef} $pinned={chromePinned}>
+          {flightId === null ? (
+            <>
+              <Empty>{emptyMessage}</Empty>
+              {topOverlay}
+              {actionBar}
+            </>
+          ) : (
+            <>
+              <StyledVideo
+                ref={attachVideo}
+                autoPlay
+                playsInline
+                muted
+                controls={false}
+                onClick={() => setChromePinned((v) => !v)}
+              />
+              {topOverlay}
+              {actionBar}
+              {qualityAvailable &&
+                qualityMenu.open &&
+                qualityMenu.position &&
+                camera &&
+                createPortal(
+                  <QualityMenu
+                    ref={qualityMenu.menuRef}
+                    id={qualityMenuId}
+                    role="menu"
+                    aria-label="Quality"
+                    style={qualityMenu.position}
                   >
-                    Auto
-                  </CameraMenuItem>
-                  {QUALITY_PRESETS.map(({ preset, label, scale }) => (
                     <CameraMenuItem
-                      key={preset}
                       type="button"
                       role="menuitemradio"
-                      aria-checked={camera.viewerQuality === preset}
-                      $selected={camera.viewerQuality === preset}
-                      onClick={() => selectQuality(preset)}
+                      aria-checked={camera.viewerQuality == null}
+                      $selected={camera.viewerQuality == null}
+                      onClick={() => selectQuality(null)}
                     >
-                      {label} ({presetDim(camera.operatorWidth, scale)}×
-                      {presetDim(camera.operatorHeight, scale)})
+                      Auto
                     </CameraMenuItem>
-                  ))}
-                  <QualityMeta role="status">
-                    now {camera.renderWidth}×{camera.renderHeight}
-                    {qualityThrottled ? " · throttled" : ""}
-                  </QualityMeta>
-                </QualityMenu>,
-                document.body,
-              )}
-            {trackingAvailable &&
-              trackingMenu.open &&
-              trackingMenu.position &&
-              camera &&
-              createPortal(
-                <QualityMenu
-                  ref={trackingMenu.menuRef}
-                  id={trackingMenuId}
-                  role="menu"
-                  aria-label="Auto-track"
-                  style={trackingMenu.position}
-                >
-                  <CameraMenuItem
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={trackMode === TrackMode.ActiveVessel}
-                    $selected={trackMode === TrackMode.ActiveVessel}
-                    onClick={() => selectTrack(TrackMode.ActiveVessel)}
-                  >
-                    Track active vessel
-                  </CameraMenuItem>
-                  <CameraMenuItem
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={trackMode === TrackMode.Target}
-                    $selected={trackMode === TrackMode.Target}
-                    onClick={() => selectTrack(TrackMode.Target)}
-                  >
-                    Track target
-                  </CameraMenuItem>
-                </QualityMenu>,
-                document.body,
-              )}
-            {commandTargetAvailable &&
-              commandTargetMenu.open &&
-              commandTargetMenu.position &&
-              createPortal(
-                <CameraMenu
-                  ref={commandTargetMenu.menuRef}
-                  id={commandTargetMenuId}
-                  role="menu"
-                  aria-label="Target"
-                  style={commandTargetMenu.position}
-                >
-                  {commandTargets.map((t) => {
-                    const eligible = t.eligibility === CommandTargetEligibility.Ok;
-                    const current = t.persistentId === commandTargetId;
-                    return (
+                    {QUALITY_PRESETS.map(({ preset, label, scale }) => (
                       <CameraMenuItem
-                        key={t.persistentId}
+                        key={preset}
                         type="button"
                         role="menuitemradio"
-                        aria-checked={current}
-                        $selected={current}
-                        disabled={!eligible}
-                        title={eligible ? undefined : t.eligibilityText}
-                        onClick={() => selectCommandTarget(t.persistentId)}
+                        aria-checked={camera.viewerQuality === preset}
+                        $selected={camera.viewerQuality === preset}
+                        onClick={() => selectQuality(preset)}
                       >
-                        {t.vesselName}
-                        {t.rangeM != null ? ` · ${formatCommandRange(t.rangeM)}` : ""}
-                        {eligible ? "" : ` · ${t.eligibilityText}`}
+                        {label} ({presetDim(camera.operatorWidth, scale)}×
+                        {presetDim(camera.operatorHeight, scale)})
                       </CameraMenuItem>
-                    );
-                  })}
-                </CameraMenu>,
-                document.body,
+                    ))}
+                    <QualityMeta role="status">
+                      now {camera.renderWidth}×{camera.renderHeight}
+                      {qualityThrottled ? " · throttled" : ""}
+                    </QualityMeta>
+                  </QualityMenu>,
+                  document.body,
+                )}
+              {trackingAvailable &&
+                trackingMenu.open &&
+                trackingMenu.position &&
+                camera &&
+                createPortal(
+                  <QualityMenu
+                    ref={trackingMenu.menuRef}
+                    id={trackingMenuId}
+                    role="menu"
+                    aria-label="Auto-track"
+                    style={trackingMenu.position}
+                  >
+                    <CameraMenuItem
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={trackMode === TrackMode.ActiveVessel}
+                      $selected={trackMode === TrackMode.ActiveVessel}
+                      onClick={() => selectTrack(TrackMode.ActiveVessel)}
+                    >
+                      Track active vessel
+                    </CameraMenuItem>
+                    <CameraMenuItem
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={trackMode === TrackMode.Target}
+                      $selected={trackMode === TrackMode.Target}
+                      onClick={() => selectTrack(TrackMode.Target)}
+                    >
+                      Track target
+                    </CameraMenuItem>
+                  </QualityMenu>,
+                  document.body,
+                )}
+              {commandTargetAvailable &&
+                commandTargetMenu.open &&
+                commandTargetMenu.position &&
+                createPortal(
+                  <CameraMenu
+                    ref={commandTargetMenu.menuRef}
+                    id={commandTargetMenuId}
+                    role="menu"
+                    aria-label="Target"
+                    style={commandTargetMenu.position}
+                  >
+                    {commandTargets.map((t) => {
+                      const eligible = t.eligibility === CommandTargetEligibility.Ok;
+                      const current = t.persistentId === commandTargetId;
+                      return (
+                        <CameraMenuItem
+                          key={t.persistentId}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={current}
+                          $selected={current}
+                          disabled={!eligible}
+                          title={eligible ? undefined : t.eligibilityText}
+                          onClick={() => selectCommandTarget(t.persistentId)}
+                        >
+                          {t.vesselName}
+                          {t.rangeM != null ? ` · ${formatCommandRange(t.rangeM)}` : ""}
+                          {eligible ? "" : ` · ${t.eligibilityText}`}
+                        </CameraMenuItem>
+                      );
+                    })}
+                  </CameraMenu>,
+                  document.body,
+                )}
+              {commandState &&
+                !outOfFlight &&
+                (
+                  <>
+                    {commandState.blank && <CommandBlank reason={commandState.blank} />}
+                    {targetBracketsAvailable && bracketsOn && (
+                      <CommandBrackets
+                        state={commandState}
+                        displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
+                        utSource={commandDisplayUt?.source ?? null}
+                        video={videoEl}
+                        fallbackSize={
+                          camera ? { width: camera.renderWidth, height: camera.renderHeight } : null
+                        }
+                        overlay={targetBracketOverlay}
+                      />
+                    )}
+                  </>
+                )}
+              {outOfFlight ? (
+                showStandbyIcon && (
+                  <StandbyOverlay role="status" aria-label="Standby, no active flight">
+                    <StandbyIconWrap>
+                      <StandbyIcon size={40} />
+                    </StandbyIconWrap>
+                  </StandbyOverlay>
+                )
+              ) : (
+                isDestroyed && (
+                  <SignalLostOverlay role="status" aria-label="Signal lost">
+                    <SignalLostText $animated={effectiveShowStatic}>
+                      SIGNAL LOST
+                    </SignalLostText>
+                  </SignalLostOverlay>
+                )
               )}
-            {commandState &&
-              !outOfFlight &&
-              (
+              {!outOfFlight && !effectiveShowStatic && isStale && !isDestroyed && (
                 <>
-                  {commandState.blank && <CommandBlank reason={commandState.blank} />}
-                  {targetBracketsAvailable && bracketsOn && (
-                    <CommandBrackets
-                      state={commandState}
-                      displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
-                      utSource={commandDisplayUt?.source ?? null}
-                      video={videoEl}
-                      fallbackSize={
-                        camera ? { width: camera.renderWidth, height: camera.renderHeight } : null
-                      }
-                      overlay={targetBracketOverlay}
-                    />
-                  )}
+                  <StaleScrim aria-hidden="true" />
+                  <StaleBadge role="status" aria-label="Feed stale">
+                    <StaleIcon />
+                    Stale
+                  </StaleBadge>
                 </>
               )}
-            {outOfFlight ? (
-              showStandbyIcon && (
-                <StandbyOverlay role="status" aria-label="Standby, no active flight">
-                  <StandbyIconWrap>
-                    <StandbyIcon size={40} />
-                  </StandbyIconWrap>
-                </StandbyOverlay>
-              )
-            ) : (
-              isDestroyed && (
-                <SignalLostOverlay role="status" aria-label="Signal lost">
-                  <SignalLostText $animated={effectiveShowStatic}>
-                    SIGNAL LOST
-                  </SignalLostText>
-                </SignalLostOverlay>
-              )
-            )}
-            {!outOfFlight && !effectiveShowStatic && isStale && !isDestroyed && (
-              <>
-                <StaleScrim aria-hidden="true" />
-                <StaleBadge role="status" aria-label="Feed stale">
-                  <StaleIcon />
-                  Stale
-                </StaleBadge>
-              </>
-            )}
-            {recordingActive && armingActive && (
-              <ArmingBadge role="status" aria-label="Arming">
-                <ArmingDot aria-hidden="true" />
-                ARMING
-              </ArmingBadge>
-            )}
-            {recordingActive && !armingActive && (
-              <RecBadge role="status" aria-label="Recording">
-                <RecDot aria-hidden="true" />
-                REC {formatElapsed(recordingElapsedMs)}
-              </RecBadge>
-            )}
-            {showZoom && (
-              <ZoomControlsWrap $disabled={manualDisabled} aria-hidden={manualDisabled}>
-                <ZoomButton
-                  type="button"
-                  aria-label="Zoom in"
-                  $pos="top"
-                  disabled={manualDisabled}
-                  onPointerDown={() =>
-                    controllerRef.current?.setZoomRate(1)
-                  }
-                  onPointerUp={() => controllerRef.current?.setZoomRate(0)}
-                  onPointerLeave={() => controllerRef.current?.setZoomRate(0)}
-                  onPointerCancel={() => controllerRef.current?.setZoomRate(0)}
-                  onClick={(e) => {
-                    if (e.detail === 0) controllerRef.current?.nudgeZoom(-1);
-                  }}
+              {recordingActive && armingActive && (
+                <ArmingBadge role="status" aria-label="Arming">
+                  <ArmingDot aria-hidden="true" />
+                  ARMING
+                </ArmingBadge>
+              )}
+              {recordingActive && !armingActive && (
+                <RecBadge role="status" aria-label="Recording">
+                  <RecDot aria-hidden="true" />
+                  REC {formatElapsed(recordingElapsedMs)}
+                </RecBadge>
+              )}
+              {showZoom && (
+                <ZoomControlsWrap $disabled={manualDisabled} aria-hidden={manualDisabled}>
+                  <ZoomButton
+                    type="button"
+                    aria-label="Zoom in"
+                    $pos="top"
+                    disabled={manualDisabled}
+                    onPointerDown={() =>
+                      controllerRef.current?.setZoomRate(1)
+                    }
+                    onPointerUp={() => controllerRef.current?.setZoomRate(0)}
+                    onPointerLeave={() => controllerRef.current?.setZoomRate(0)}
+                    onPointerCancel={() => controllerRef.current?.setZoomRate(0)}
+                    onClick={(e) => {
+                      if (e.detail === 0) controllerRef.current?.nudgeZoom(-1);
+                    }}
+                  >
+                    +
+                  </ZoomButton>
+                  <FovSlider
+                    type="range"
+                    aria-label="Zoom"
+                    min={camera.fovMin}
+                    max={camera.fovMax}
+                    step={0.5}
+                    value={sliderFov}
+                    disabled={manualDisabled}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      controllerRef.current?.fovSliderInput(v);
+                    }}
+                    onPointerDown={() => {
+                      controllerRef.current?.setFovSliderDragging(true);
+                    }}
+                    onPointerUp={() => {
+                      controllerRef.current?.setFovSliderDragging(false);
+                    }}
+                    onPointerCancel={() => {
+                      controllerRef.current?.setFovSliderDragging(false);
+                    }}
+                  />
+                  <ZoomButton
+                    type="button"
+                    aria-label="Zoom out"
+                    $pos="bottom"
+                    disabled={manualDisabled}
+                    onPointerDown={() => controllerRef.current?.setZoomRate(-1)}
+                    onPointerUp={() => controllerRef.current?.setZoomRate(0)}
+                    onPointerLeave={() => controllerRef.current?.setZoomRate(0)}
+                    onPointerCancel={() => controllerRef.current?.setZoomRate(0)}
+                    onClick={(e) => {
+                      if (e.detail === 0) controllerRef.current?.nudgeZoom(1);
+                    }}
+                  >
+                    &#8722;
+                  </ZoomButton>
+                </ZoomControlsWrap>
+              )}
+              {showPan && (
+                <PanControl
+                  role="group"
+                  aria-label="Pan camera"
+                  $disabled={manualDisabled}
+                  aria-hidden={manualDisabled}
                 >
-                  +
-                </ZoomButton>
-                <FovSlider
-                  type="range"
-                  aria-label="Zoom"
-                  min={camera.fovMin}
-                  max={camera.fovMax}
-                  step={0.5}
-                  value={sliderFov}
-                  disabled={manualDisabled}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    controllerRef.current?.fovSliderInput(v);
-                  }}
-                  onPointerDown={() => {
-                    controllerRef.current?.setFovSliderDragging(true);
-                  }}
-                  onPointerUp={() => {
-                    controllerRef.current?.setFovSliderDragging(false);
-                  }}
-                  onPointerCancel={() => {
-                    controllerRef.current?.setFovSliderDragging(false);
-                  }}
-                />
-                <ZoomButton
-                  type="button"
-                  aria-label="Zoom out"
-                  $pos="bottom"
-                  disabled={manualDisabled}
-                  onPointerDown={() => controllerRef.current?.setZoomRate(-1)}
-                  onPointerUp={() => controllerRef.current?.setZoomRate(0)}
-                  onPointerLeave={() => controllerRef.current?.setZoomRate(0)}
-                  onPointerCancel={() => controllerRef.current?.setZoomRate(0)}
-                  onClick={(e) => {
-                    if (e.detail === 0) controllerRef.current?.nudgeZoom(1);
-                  }}
-                >
-                  &#8722;
-                </ZoomButton>
-              </ZoomControlsWrap>
-            )}
-            {showPan && (
-              <PanControl
-                role="group"
-                aria-label="Pan camera"
-                $disabled={manualDisabled}
-                aria-hidden={manualDisabled}
-              >
-                <PanArrow
-                  type="button"
-                  $dir="up"
-                  aria-label="Pan up"
-                  disabled={manualDisabled || !supportsPitch}
-                  onClick={() => controllerRef.current?.nudgePan(0, 1)}
-                >
-                  &#9650;
-                </PanArrow>
-                <PanArrow
-                  type="button"
-                  $dir="down"
-                  aria-label="Pan down"
-                  disabled={manualDisabled || !supportsPitch}
-                  onClick={() => controllerRef.current?.nudgePan(0, -1)}
-                >
-                  &#9660;
-                </PanArrow>
-                <PanArrow
-                  type="button"
-                  $dir="left"
-                  aria-label="Pan left"
-                  disabled={manualDisabled}
-                  onClick={() => controllerRef.current?.nudgePan(-1, 0)}
-                >
-                  &#9664;
-                </PanArrow>
-                <PanArrow
-                  type="button"
-                  $dir="right"
-                  aria-label="Pan right"
-                  disabled={manualDisabled}
-                  onClick={() => controllerRef.current?.nudgePan(1, 0)}
-                >
-                  &#9654;
-                </PanArrow>
-                <PanBall
-                  aria-hidden="true"
-                  title="Drag to pan"
-                  onPointerDown={manualDisabled ? undefined : handleBallDown}
-                  onPointerMove={manualDisabled ? undefined : handleBallMove}
-                  onPointerUp={manualDisabled ? undefined : handleBallUp}
-                  onPointerCancel={manualDisabled ? undefined : handleBallUp}
-                  style={{
-                    transform: `translate(${ballPos.x}px, ${ballPos.y}px)`,
-                  }}
-                />
-              </PanControl>
-            )}
-          </>
-        )}
-      </Stage>
+                  <PanArrow
+                    type="button"
+                    $dir="up"
+                    aria-label="Pan up"
+                    disabled={manualDisabled || !supportsPitch}
+                    onClick={() => controllerRef.current?.nudgePan(0, 1)}
+                  >
+                    &#9650;
+                  </PanArrow>
+                  <PanArrow
+                    type="button"
+                    $dir="down"
+                    aria-label="Pan down"
+                    disabled={manualDisabled || !supportsPitch}
+                    onClick={() => controllerRef.current?.nudgePan(0, -1)}
+                  >
+                    &#9660;
+                  </PanArrow>
+                  <PanArrow
+                    type="button"
+                    $dir="left"
+                    aria-label="Pan left"
+                    disabled={manualDisabled}
+                    onClick={() => controllerRef.current?.nudgePan(-1, 0)}
+                  >
+                    &#9664;
+                  </PanArrow>
+                  <PanArrow
+                    type="button"
+                    $dir="right"
+                    aria-label="Pan right"
+                    disabled={manualDisabled}
+                    onClick={() => controllerRef.current?.nudgePan(1, 0)}
+                  >
+                    &#9654;
+                  </PanArrow>
+                  <PanBall
+                    aria-hidden="true"
+                    title="Drag to pan"
+                    onPointerDown={manualDisabled ? undefined : handleBallDown}
+                    onPointerMove={manualDisabled ? undefined : handleBallMove}
+                    onPointerUp={manualDisabled ? undefined : handleBallUp}
+                    onPointerCancel={manualDisabled ? undefined : handleBallUp}
+                    style={{
+                      transform: `translate(${ballPos.x}px, ${ballPos.y}px)`,
+                    }}
+                  />
+                </PanControl>
+              )}
+            </>
+          )}
+        </Stage>
+      </FeedBox>
     );
   },
 );
@@ -2147,7 +2175,27 @@ const Panel = styled.div`
   overflow: hidden;
 `;
 
+/*
+ * Fills the host and centres the Stage at the camera's configured aspect
+ * (--kc-feed-w / --kc-feed-h), so the picture fills the Stage and the host's
+ * spare room sits outside it.
+ */
+const FeedBox = styled.div`
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  container-type: size;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+`;
+
 const Stage = styled(Panel)<{ $pinned: boolean }>`
+  width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
+  height: auto;
+  aspect-ratio: var(--kc-feed-w) / var(--kc-feed-h);
+  flex: none;
   padding: 0;
   gap: 0;
   position: relative;
