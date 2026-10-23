@@ -23,11 +23,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
+use crate::commands::{validate_create, validate_look_at, CommandOp, CommandQueue, COMMANDS_FILE};
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState,
-    CommandCentreInfo, CommandTarget, CommandTrackState, CrewLocation, DisplaySizeReport, Layer,
-    QualityPreset, SettingsStatePayload, TrackMode,
+    CommandCentreInfo, CommandTarget, CommandTrackState, CreateCommandCameraPayload, CrewLocation,
+    DestroyCommandCameraPayload, DisplaySizeReport, Layer, QualityPreset, SetCommandLookAtPayload,
+    SettingsStatePayload, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
@@ -534,6 +536,12 @@ struct InfoManifest {
     /// Command camera station identity, present only on `"command"` manifests.
     #[serde(default)]
     station_id: Option<String>,
+    /// Set on a command camera created at runtime.
+    #[serde(default)]
+    command_created: Option<bool>,
+    /// The creating client's token, on a camera a client created.
+    #[serde(default)]
+    command_token: Option<String>,
     #[serde(default)]
     station_node_name: Option<String>,
     #[serde(default)]
@@ -1118,6 +1126,9 @@ pub struct CameraRegistry {
      * Subsequent writes bump atomically so concurrent peer handlers compose.
      */
     global_control_seq: AtomicU64,
+    /// The sidecar's copy of `global.commands.json`. Held across the whole
+    /// append and file write, so two requests can never land out of order.
+    command_queue: Mutex<CommandQueue>,
     /// Cameras whose sidecar-side state (e.g. viewer quality preset)
     /// changed and needs a `camera-state-changed` broadcast to EVERY
     /// connected peer. The plugin-status diff in `poll_status` can't see
@@ -1249,6 +1260,7 @@ impl CameraRegistry {
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
+            command_queue: Mutex::new(CommandQueue::default()),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1999,6 +2011,81 @@ impl CameraRegistry {
         Ok(())
     }
 
+    /// Append a request to `global.commands.json` under the next id and
+    /// return the id. The plugin applies each id once.
+    async fn append_command(&self, op: CommandOp) -> std::io::Result<u64> {
+        let path = self.shm_dir.join(COMMANDS_FILE);
+        let mut queue = self.command_queue.lock().await;
+        if !queue.is_seeded() {
+            let on_disk = tokio::fs::read(&path).await.ok();
+            queue.seed(on_disk.as_deref());
+        }
+        let id = queue.push(op);
+        let json = queue
+            .to_json()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, json.as_bytes()).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(id)
+    }
+
+    /// Queue a command camera for the plugin to create. Errors on a malformed
+    /// request or a failed write; whether the vantage exists is the game's
+    /// call, and a refused one simply never appears.
+    pub async fn request_create_command_camera(
+        &self,
+        payload: CreateCommandCameraPayload,
+    ) -> Result<u64, String> {
+        validate_create(&payload)?;
+        self.append_command(CommandOp::Create(payload))
+            .await
+            .map_err(|e| format!("command request write failed: {e}"))
+    }
+
+    /// Queue the destruction of a created command camera. Errors on an
+    /// unknown camera, one that is not a command camera, or the settings
+    /// camera.
+    pub async fn request_destroy_command_camera(&self, flight_id: u32) -> Result<u64, String> {
+        let Some(cam) = self.get(flight_id).await else {
+            return Err(format!("no camera with flight_id={flight_id}"));
+        };
+        if cam.kind != CameraKind::Command {
+            return Err(format!("camera {flight_id} is not a command camera"));
+        }
+        if !cam.command_centre.as_ref().is_some_and(|c| c.created) {
+            return Err(format!(
+                "camera {flight_id} is the game's own command camera and can not be destroyed"
+            ));
+        }
+        self.append_command(CommandOp::Destroy(DestroyCommandCameraPayload {
+            flight_id,
+        }))
+        .await
+        .map_err(|e| format!("command request write failed: {e}"))
+    }
+
+    /// Queue a look-at change for a command camera. Errors on an unknown or
+    /// non-command camera or a malformed look-at.
+    pub async fn request_command_look_at(
+        &self,
+        payload: SetCommandLookAtPayload,
+    ) -> Result<u64, String> {
+        let flight_id = payload.flight_id;
+        let Some(cam) = self.get(flight_id).await else {
+            return Err(format!("no camera with flight_id={flight_id}"));
+        };
+        if cam.kind != CameraKind::Command {
+            return Err(format!("camera {flight_id} is not a command camera"));
+        }
+        if let Some(l) = &payload.look_at {
+            validate_look_at(l)?;
+        }
+        self.append_command(CommandOp::LookAt(payload))
+            .await
+            .map_err(|e| format!("command request write failed: {e}"))
+    }
+
     /// Update the `subscribed` flag in the cam's ControlState and flush
     /// the whole struct to `<flight_id>.control.json`. Called from the
     /// peer subscribe path (true on add_track) and the consume loop's
@@ -2585,6 +2672,8 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
         kind: String::new(),
         kerbal_persistent_id: None,
         station_id: None,
+        command_created: None,
+        command_token: None,
         station_node_name: None,
         station_name: None,
         station_body: None,
@@ -2645,6 +2734,8 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         range_m: None,
         tracking_level: 0,
         targets: Vec::new(),
+        created: m.command_created.unwrap_or(false),
+        token: m.command_token.clone().filter(|t| !t.is_empty()),
     })
 }
 
@@ -3629,6 +3720,89 @@ mod tests {
             "re-choosing the same craft still bumps, so it re-applies"
         );
         assert!(registry.apply_command_target(1, 42).await.is_err());
+    }
+
+    /// A created command camera carries its creator's token, can be
+    /// destroyed and aimed through `global.commands.json`; the settings
+    /// camera can only be aimed.
+    #[tokio::test]
+    async fn created_command_cameras_and_the_request_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let created_id: u32 = 0x8000_0101;
+        let settings_id: u32 = 0x8000_0202;
+        for (id, extra) in [
+            (
+                created_id,
+                r#","command_created":true,"command_token":"tok-7""#,
+            ),
+            (settings_id, ""),
+        ] {
+            MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+            let content = format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","station_id":"ground:LaunchPad","station_node_name":"LaunchPad","station_name":"Launch Pad"{extra}}}"#
+            );
+            tokio::fs::write(shm.join(format!("{id}.info.json")), content)
+                .await
+                .unwrap();
+        }
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+
+        let list = registry.list().await;
+        let json = |id: u32| {
+            serde_json::to_value(list.iter().find(|c| c.flight_id == id).unwrap()).unwrap()
+        };
+        assert_eq!(json(created_id)["commandCentre"]["created"], true);
+        assert_eq!(json(created_id)["commandCentre"]["token"], "tok-7");
+        assert_eq!(json(settings_id)["commandCentre"]["created"], false);
+        assert!(json(settings_id)["commandCentre"].get("token").is_none());
+
+        assert!(registry
+            .request_destroy_command_camera(settings_id)
+            .await
+            .is_err());
+        assert!(registry
+            .request_destroy_command_camera(12345)
+            .await
+            .is_err());
+        let first = registry
+            .request_destroy_command_camera(created_id)
+            .await
+            .expect("created camera can be destroyed");
+        let look = registry
+            .request_command_look_at(SetCommandLookAtPayload {
+                flight_id: settings_id,
+                look_at: None,
+            })
+            .await
+            .expect("any command camera takes a look-at");
+        assert_eq!(look, first + 1, "ids only grow");
+
+        let file: crate::commands::CommandFile =
+            serde_json::from_slice(&tokio::fs::read(shm.join(COMMANDS_FILE)).await.unwrap())
+                .unwrap();
+        assert_eq!(file.requests.len(), 2);
+        assert_eq!(
+            file.requests[0].op,
+            CommandOp::Destroy(DestroyCommandCameraPayload {
+                flight_id: created_id
+            })
+        );
+
+        /* A second registry (a restarted sidecar) carries the ids on. */
+        let restarted = CameraRegistry::new(shm.to_path_buf());
+        restarted.rescan().await;
+        let next = restarted
+            .request_destroy_command_camera(created_id)
+            .await
+            .unwrap();
+        assert_eq!(next, look + 1);
     }
 
     /// A station with no display name reads as its node name.

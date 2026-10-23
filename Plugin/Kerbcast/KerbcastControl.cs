@@ -169,6 +169,7 @@ namespace Kerbcast
                         RangeM = CommandCameraTargets.RangeTo(gr.Site, gr.TargetPersistentId, ut),
                         TrackingLevel = level,
                         FramingFits = gr.FramingFits,
+                        Created = KerbcastCore.Instance.CommandProvider?.IsCreated(c.FlightId) ?? false,
                     });
                 }
             }
@@ -195,11 +196,84 @@ namespace Kerbcast
         public static bool SetCommandTarget(uint flightId, uint persistentId)
         {
             var c = Find(flightId);
-            if (c == null || !(c.Rig is CommandCameraRig gr)) return false;
+            var gr = c?.Rig as CommandCameraRig;
+            var provider = KerbcastCore.Instance?.CommandProvider;
+            bool pending = gr == null && provider != null && provider.IsPending(flightId);
+            if (gr == null && !pending) return false;
             if (persistentId != 0 && !VesselExists(persistentId)) return false;
-            gr.SetTarget(persistentId);
+            if (gr != null) gr.SetTarget(persistentId);
+            else provider.SetPendingTarget(flightId, persistentId);
             return true;
         }
+
+        /* Creates a command camera standing at `vantage` for the rest of this
+           scene (flight or Space Center), and returns the flightId its feed
+           will have, or 0 when Kerbcast is not running here, the vantage is
+           malformed, or a surface vantage names an unknown body. The feed
+           appears once the vantage resolves, normally on the next frame; a
+           launch site, station or craft that is not placed within 30 s drops
+           the camera instead of standing it anywhere else. `name` replaces the
+           default feed name ("Launchpad camera", "<site> camera",
+           "<station> tracking", "<craft> camera" or "<body> surface camera").
+           It watches the default craft (the active one in flight) until
+           `targetPersistentId` or SetCommandTarget picks another; every
+           command setter works on it, including before it is built. */
+        public static uint CreateCommandCamera(CommandVantage vantage, string name = null, uint targetPersistentId = 0)
+        {
+            uint id = Create(vantage, name, targetPersistentId, null, out string error);
+            if (id == 0) Debug.LogWarning($"[Kerbcast][CMDCAM] command camera at {vantage?.ToString() ?? "null"} refused: {error}");
+            return id;
+        }
+
+        internal static uint Create(CommandVantage vantage, string name, uint targetPersistentId, string token, out string error)
+        {
+            var core = KerbcastCore.Instance;
+            var provider = core?.CommandProvider;
+            if (provider == null)
+            {
+                error = "Kerbcast is not running in this scene";
+                return 0;
+            }
+            if (targetPersistentId != 0 && !VesselExists(targetPersistentId))
+            {
+                error = $"no craft with persistentId={targetPersistentId}";
+                return 0;
+            }
+            return provider.Create(vantage, name, targetPersistentId, token, core.CameraFlightIds(), out error);
+        }
+
+        /* Removes a command camera CreateCommandCamera (or a client) made,
+           built or not; its feed ends. False for the settings-driven camera or
+           an unknown id, so a repeated call is harmless. */
+        public static bool DestroyCommandCamera(uint flightId)
+        {
+            return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
+        }
+
+        /* Points command feed `flightId` at `aim` instead of its craft while no
+           authority is registered; the craft is still drawn wherever it truly
+           is. `framingMarginM` widens the framing around the point the way
+           SetCommandFraming does. Null clears it, back to the craft. Under an
+           authority SetCommandAim decides instead, and this resumes when the
+           authority clears. False when the feed is not a command feed, the
+           margin is negative or not finite, or the aim is unusable (as for
+           SetCommandAim). */
+        public static bool SetCommandLookAt(uint flightId, CommandAim aim, double framingMarginM = 0)
+        {
+            if (!Finite(framingMarginM) || framingMarginM < 0) return false;
+            var gr = Find(flightId)?.Rig as CommandCameraRig;
+            var provider = KerbcastCore.Instance?.CommandProvider;
+            if (gr == null && (provider == null || !provider.IsPending(flightId))) return false;
+            Orbit orbit = null;
+            if (aim != null && !TryResolveAim(flightId, aim, out orbit)) return false;
+            if (gr != null) gr.SetLookAt(aim, orbit, framingMarginM);
+            else provider.SetPendingLookAt(flightId, aim, orbit, framingMarginM);
+            return true;
+        }
+
+        internal static CommandAim AimOf(CommandLookAtSpec spec) => spec.Kind == "vessel"
+            ? CommandAim.Vessel(spec.PersistentId)
+            : CommandAim.Surface(spec.Body, spec.Latitude, spec.Longitude, spec.Altitude);
 
         static bool VesselExists(uint persistentId)
         {
@@ -221,31 +295,36 @@ namespace Kerbcast
         {
             var auth = Governing(flightId);
             if (auth == null || aim == null) return false;
-            if (aim.Kind == CommandAimKind.PositionAt && !(Finite(aim.Ut) && Finite(aim.BodyRelativePosition)
-                && Finite(aim.BodyRelativeVelocity))) return false;
-            Orbit orbit = null;
-            if (aim.Kind != CommandAimKind.Vessel)
-            {
-                var body = FlightGlobals.GetBodyByName(aim.Body);
-                if (body == null) return false;
-                if (aim.Kind == CommandAimKind.Orbit)
-                {
-                    try
-                    {
-                        orbit = new Orbit(aim.Inclination, aim.Eccentricity, aim.SemiMajorAxis, aim.Lan,
-                            aim.ArgumentOfPeriapsis, aim.MeanAnomalyAtEpoch, aim.Epoch, body);
-                    }
-                    catch (System.Exception ex)
-                    {
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] cam={flightId} aim {aim} rejected: {ex.Message}");
-                        return false;
-                    }
-                }
-            }
+            if (!TryResolveAim(flightId, aim, out Orbit orbit)) return false;
             var orders = auth.OrdersFor(flightId);
             orders.Aim = aim;
             orders.AimOrbit = orbit;
             return true;
+        }
+
+        /* Checks an aim's numbers and body, building the conic for an Orbit aim. */
+        static bool TryResolveAim(uint flightId, CommandAim aim, out Orbit orbit)
+        {
+            orbit = null;
+            if (aim.Kind == CommandAimKind.PositionAt && !(Finite(aim.Ut) && Finite(aim.BodyRelativePosition)
+                && Finite(aim.BodyRelativeVelocity))) return false;
+            if (aim.Kind == CommandAimKind.Surface && !(Finite(aim.Latitude) && Finite(aim.Longitude) && Finite(aim.Altitude)))
+                return false;
+            if (aim.Kind == CommandAimKind.Vessel) return true;
+            var body = FlightGlobals.GetBodyByName(aim.Body);
+            if (body == null) return false;
+            if (aim.Kind != CommandAimKind.Orbit) return true;
+            try
+            {
+                orbit = new Orbit(aim.Inclination, aim.Eccentricity, aim.SemiMajorAxis, aim.Lan,
+                    aim.ArgumentOfPeriapsis, aim.MeanAnomalyAtEpoch, aim.Epoch, body);
+                return true;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] cam={flightId} aim {aim} rejected: {ex.Message}");
+                return false;
+            }
         }
 
         /* Widens a command feed's framing by `marginM` metres around the aim
@@ -284,7 +363,8 @@ namespace Kerbcast
             if (auth == null || !auth.Registered) return null;
             auth.Heartbeat(Time.realtimeSinceStartup);
             var c = Find(flightId);
-            return c != null && c.Rig is CommandCameraRig ? auth : null;
+            if (c != null && c.Rig is CommandCameraRig) return auth;
+            return KerbcastCore.Instance.CommandProvider?.IsPending(flightId) == true ? auth : null;
         }
 
         static KerbcastCamera Find(uint flightId)

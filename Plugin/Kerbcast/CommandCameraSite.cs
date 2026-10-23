@@ -25,6 +25,8 @@ namespace Kerbcast
         public string Source { get; private set; }
         /* Set when the camera rides a vessel instead of standing on a body. */
         public Vessel Vantage { get; private set; }
+        /* Set for a lens at an arbitrary surface point, not a station or a launch site. */
+        public bool IsSurfacePoint { get; private set; }
 
         /* Stock keeps a home's body and coordinates protected, so they are read
            by reflection, the same route gonogo's CommNetHomeAccess takes. The
@@ -119,7 +121,7 @@ namespace Kerbcast
            set (with a reason) when a site exists but its coordinates are not
            filled in yet, which is worth retrying rather than falling back. */
         public static CommandCameraSite ResolveLaunchSite(string launchedFrom, double distance, double bearingDeg, double height,
-            out string pending)
+            out string pending, bool fallbackToPad = true)
         {
             pending = null;
             var setup = PSystemSetup.Instance;
@@ -129,7 +131,7 @@ namespace Kerbcast
                 return null;
             }
 
-            foreach (var name in new[] { launchedFrom, "LaunchPad" })
+            foreach (var name in fallbackToPad ? new[] { launchedFrom, "LaunchPad" } : new[] { launchedFrom })
             {
                 if (string.IsNullOrEmpty(name)) continue;
                 try
@@ -283,6 +285,53 @@ namespace Kerbcast
             };
         }
 
+        /* The CommNet home whose nodeName is `nodeName`, with the lens `height`
+           metres above it. Null when there is no such home or it can not be
+           placed yet. */
+        public static CommandCameraSite ResolveStation(string nodeName, double height)
+        {
+            CommNetHome[] homes;
+            try { homes = UnityEngine.Object.FindObjectsOfType<CommNetHome>(); }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] CommNetHome scan failed: {ex.Message}");
+                return null;
+            }
+            foreach (var h in homes)
+                if (h != null && string.Equals(h.nodeName, nodeName, StringComparison.Ordinal))
+                    return FromHome(h, height);
+            return null;
+        }
+
+        /* A lens `height` metres above the ground (or the sea) at a point on `body`. */
+        public static CommandCameraSite ResolveSurface(CelestialBody body, double lat, double lon, double height)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string node = string.Format(inv, "surface:{0}:{1:F5}:{2:F5}", body.bodyName, lat, lon);
+            var site = OnTerrain(node, body.bodyName, body, lat, lon, height, "surface");
+            site.IsHome = false;
+            site.IsSurfacePoint = true;
+            return site;
+        }
+
+        /* A vessel as the vantage, by persistentId. Null when no such vessel exists. */
+        public static CommandCameraSite ResolveVessel(uint persistentId)
+        {
+            if (persistentId == 0 || FlightGlobals.Vessels == null) return null;
+            foreach (var v in FlightGlobals.Vessels)
+                if (v != null && v.persistentId == persistentId) return FromVessel(v);
+            return null;
+        }
+
+        private static CommandCameraSite FromVessel(Vessel v) => new CommandCameraSite
+        {
+            NodeName = "vessel:" + v.persistentId,
+            DisplayName = v.vesselName,
+            Body = v.mainBody,
+            Source = "vessel",
+            Vantage = v,
+        };
+
         /* A vessel as the vantage, found by exact name. Null when no such vessel exists. */
         public static CommandCameraSite ResolveVessel(string name)
         {
@@ -290,14 +339,7 @@ namespace Kerbcast
             foreach (var v in FlightGlobals.Vessels)
             {
                 if (v == null || v.vesselName != name) continue;
-                return new CommandCameraSite
-                {
-                    NodeName = "vessel:" + v.persistentId,
-                    DisplayName = v.vesselName,
-                    Body = v.mainBody,
-                    Source = "vessel",
-                    Vantage = v,
-                };
+                return FromVessel(v);
             }
             return null;
         }

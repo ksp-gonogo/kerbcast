@@ -7,6 +7,8 @@ export * from "./__generated__/types";
 export {
   KerbcastClient,
   BrowserKerbcastTransport,
+  COMMAND_CAMERA_CREATE_TIMEOUT_MS,
+  type CreateCommandCameraOptions,
   type BrowserKerbcastTransportOptions,
   type InboundVideoStats,
   type KerbcastCameraHandle,

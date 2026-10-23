@@ -11,12 +11,15 @@ namespace Kerbcast
     {
         private readonly GameObject _anchor;
         private readonly float _defaultFov;
+        private readonly string _name;
 
         public CommandCameraSite Site { get; }
 
-        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov)
+        /* `name` replaces the feed name the site would give it. */
+        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, string name = null)
         {
             Site = site;
+            _name = name;
             _defaultFov = defaultFov;
             _anchor = new GameObject($"Kerbcast_{flightId}_CommandAnchor");
         }
@@ -42,7 +45,8 @@ namespace Kerbcast
 
         public string PartName => "kerbcast.commandCamera";
         public string PartTitle => "Command camera";
-        public string CameraName => !Site.IsLaunchSite ? $"{Site.DisplayName} tracking"
+        public string CameraName => !string.IsNullOrEmpty(_name) ? _name
+            : !Site.IsLaunchSite ? $"{Site.DisplayName} tracking"
             : Site.NodeName == "LaunchPad" ? "Launchpad camera"
             : $"{Site.DisplayName} camera";
         /* A command camera has no owning craft; the station's name is the stable

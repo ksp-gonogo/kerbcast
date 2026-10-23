@@ -165,6 +165,17 @@ namespace Kerbcast
            craft. Takes effect on the next solve. */
         public void SetTarget(uint persistentId) => _target.Choose(persistentId);
 
+        /* Without an authority, the camera points at `aim` instead of its craft,
+           which is still drawn wherever it truly is; null returns to the craft.
+           An authority's aim wins while one is registered. */
+        public void SetLookAt(CommandAim aim, Orbit orbit, double framingMarginM)
+        {
+            _lookAt = aim == null ? null : new CommandFeedOrders { Aim = aim, AimOrbit = orbit, FramingMarginM = framingMarginM };
+            Debug.Log($"{Tag} cam={_flightId} look-at {(aim == null ? "cleared, back to the craft" : $"{aim} margin={framingMarginM:F0}m")}");
+        }
+
+        private CommandFeedOrders _lookAt;
+
         /* The lens limit can change mid-scene (a Tracking Station upgrade), so
            it is re-read once a second. */
         private double FovMinNow()
@@ -180,7 +191,7 @@ namespace Kerbcast
             }
             return _fovMin;
         }
-        private double FramingMargin => CurrentOrders?.FramingMarginM ?? 0.0;
+        private double FramingMargin => (CurrentOrders ?? _lookAt)?.FramingMarginM ?? 0.0;
         private bool _blankLogged;
         private string _loggedBlank;
         private string _loggedAim;
@@ -299,7 +310,8 @@ namespace Kerbcast
         }
 
         /* Station, aim point and true craft positions, and the camera-axis
-           readings at the aim point. Standalone the aim point is the true craft. */
+           readings at the aim point. Standalone the aim point is the true craft,
+           or the look-at point when one is set. */
         private bool SolveGeometry(double ut, bool governed, CommandFeedOrders orders,
             out DVec3 station, out DVec3 aim, out DVec3 localUp, out DVec3 north, out string occluder)
         {
@@ -316,13 +328,15 @@ namespace Kerbcast
 
             _trueOk = _target.TryLocate(ut, out _truePos, out _trueBody);
             CelestialBody aimBody;
-            if (!governed)
+            var aimOrders = governed ? orders : _lookAt;
+            bool aimed = governed || _lookAt != null;
+            if (!aimed)
             {
                 if (!_trueOk) return false;
                 aim = _truePos;
                 aimBody = _trueBody;
             }
-            else if (orders == null || orders.Aim == null || !ResolveAim(orders, ut, out aim, out aimBody))
+            else if (aimOrders == null || aimOrders.Aim == null || !ResolveAim(aimOrders, ut, out aim, out aimBody))
             {
                 return false;
             }
@@ -355,7 +369,7 @@ namespace Kerbcast
             _trueOffsetRad = _trueOk ? CommandCameraMath.AngleBetween(aim - station, _truePos - station) : 0.0;
             if (_trueOk)
             {
-                if (!governed || (aim - _truePos).Magnitude < 1e-3)
+                if (!aimed || (aim - _truePos).Magnitude < 1e-3)
                 {
                     _trueDistance = distance;
                     _trueOccluded = Occluded;
@@ -376,8 +390,9 @@ namespace Kerbcast
             return true;
         }
 
-        /* The authority's aim point in world space, on the same UT (and so the
-           same physics tick) as the station and the scaled bodies. */
+        /* The authority's or the look-at's aim point in world space, on the
+           same UT (and so the same physics tick) as the station and the
+           scaled bodies. */
         private bool ResolveAim(CommandFeedOrders orders, double ut, out DVec3 world, out CelestialBody body)
         {
             world = default;
@@ -597,8 +612,8 @@ namespace Kerbcast
             }
 
             bool governed = _authority != null && _authority.Registered;
-            if (!governed) return TargetMotion(ut, out aim);
-            var orders = _authority.Orders(_flightId);
+            var orders = governed ? _authority.Orders(_flightId) : _lookAt;
+            if (!governed && orders == null) return TargetMotion(ut, out aim);
             var a = orders?.Aim;
             if (a == null) return false;
             switch (a.Kind)

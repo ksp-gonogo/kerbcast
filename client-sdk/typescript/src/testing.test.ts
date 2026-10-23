@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CameraLifecycle, Layer, TrackMode } from "./__generated__/types";
+import {
+  CameraLifecycle,
+  CommandLookAtKind,
+  CommandVantageKind,
+  Layer,
+  TrackMode,
+} from "./__generated__/types";
 import { KerbcastClient } from "./index";
 import { MockSidecar } from "./testing/index";
 
@@ -28,6 +34,33 @@ describe("MockSidecar", () => {
     expect(client.cameras).toHaveLength(1);
     expect(client.cameras[0].flightId).toBe(42);
     expect(cameraEvents).toHaveLength(1);
+  });
+
+  it("models command camera create and destroy", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+
+    const pad = await client.createCommandCamera({ kind: CommandVantageKind.LaunchSite });
+    expect(pad.cameraName).toBe("Launchpad camera");
+    expect(pad.commandCentre?.created).toBe(true);
+
+    const hill = await client.createCommandCamera(
+      { kind: CommandVantageKind.Surface, body: "Kerbin", latitude: -0.05, longitude: -74.7 },
+      {
+        name: "Hill",
+        lookAt: { kind: CommandLookAtKind.Vessel, persistentId: 9 },
+      },
+    );
+    expect(hill.cameraName).toBe("Hill");
+    expect(hill.flightId).not.toBe(pad.flightId);
+    expect(sidecar.lastCommand("create-command-camera")).toMatchObject({
+      content: { name: "Hill", lookAt: { kind: "vessel", persistentId: 9 } },
+    });
+
+    await client.destroyCommandCamera(pad.flightId);
+    expect(client.cameras.map((c) => c.flightId)).toEqual([hill.flightId]);
   });
 
   it("client sends hello on open()", async () => {

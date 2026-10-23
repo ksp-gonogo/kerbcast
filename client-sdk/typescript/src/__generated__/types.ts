@@ -145,6 +145,19 @@ export interface CommandCentreInfo {
 	 * only reports what the tracking network would allow.
 	 */
 	targets: CommandTarget[];
+	/**
+	 * True for a camera made at runtime (`CreateCommandCamera`, or the
+	 * plugin's `KerbcastControl.CreateCommandCamera`), false for the one
+	 * from the game's settings. Only created cameras can be destroyed.
+	 * Older sidecars omit it.
+	 */
+	created?: boolean;
+	/**
+	 * The `token` of the `CreateCommandCamera` request that made this
+	 * camera, so its creator can find it in the camera list. `None` for the
+	 * settings camera and for cameras created in game.
+	 */
+	token?: string;
 }
 
 /** The registered command authority. */
@@ -459,6 +472,122 @@ export interface CameraStateChangedPayload {
 	state: CameraState;
 }
 
+/** What a command camera looks at instead of its craft. */
+export enum CommandLookAtKind {
+	/** A craft other than the camera's own target. */
+	Vessel = "vessel",
+	/** A fixed point on a body, carried round by its rotation. */
+	Surface = "surface",
+}
+
+/**
+ * A point a command camera looks at instead of its craft. The craft is
+ * still drawn wherever it truly is. Ignored while a command authority is
+ * registered in game (the authority aims every command camera then).
+ */
+export interface CommandLookAt {
+	kind: CommandLookAtKind;
+	/** `vessel`: the craft's `Vessel.persistentId`. */
+	persistentId?: number;
+	/** `surface`: the body's name. */
+	body?: string;
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `surface`: metres above sea level. Default 0. */
+	altitude?: number;
+	/**
+	 * Metres of view kept around the point, as the framing margin. Default 0
+	 * (framed as tightly as the craft would be).
+	 */
+	framingMarginM?: number;
+}
+
+/** Which kind of place a created command camera stands at. */
+export enum CommandVantageKind {
+	/** Beside a launch site, the way the settings camera stands. */
+	LaunchSite = "launchSite",
+	/** At a CommNet ground station. */
+	Station = "station",
+	/** At any point on a body's surface. */
+	Surface = "surface",
+	/** Riding a craft. */
+	Vessel = "vessel",
+}
+
+/**
+ * Where a created command camera stands. `kind` says which fields apply;
+ * absent optional fields take the defaults given on each.
+ */
+export interface CommandVantage {
+	kind: CommandVantageKind;
+	/**
+	 * `launchSite`: the site's name (`"LaunchPad"`, `"Runway"`, a Making
+	 * History or Kerbal Konstructs site). Absent or empty: the active
+	 * craft's launch site, else the stock pad.
+	 */
+	site?: string;
+	/** `launchSite`: metres from the site to the lens. Default 500. */
+	distance?: number;
+	/**
+	 * `launchSite`: compass bearing in degrees from the site to the lens.
+	 * Default 180 (due south).
+	 */
+	bearing?: number;
+	/**
+	 * Metres above the ground under the lens (above the sea over water);
+	 * for `station`, above the station itself. Defaults: 5 for `launchSite`
+	 * and `surface`, 30 for `station`. Unused for `vessel`.
+	 */
+	height?: number;
+	/** `station`: the CommNet ground station's node name, e.g. `"KSC"`. */
+	station?: string;
+	/** `surface`: the body's name, e.g. `"Kerbin"`. */
+	body?: string;
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `vessel`: the craft's `Vessel.persistentId`. */
+	persistentId?: number;
+}
+
+/**
+ * Create a command camera for the rest of the current scene. Server-wide:
+ * the camera appears in every consumer's camera list (kind `command`) with
+ * `commandCentre.token` set to `token` once the game has built it,
+ * normally within a second. A request the game can not satisfy (unknown
+ * body, site, station or craft) never produces a camera; the game logs why.
+ * A token is used once per scene: a repeat with the same token is ignored.
+ */
+export interface CreateCommandCameraPayload {
+	/** Chosen by the client, unique per request (1 to 128 characters). */
+	token: string;
+	/**
+	 * Feed name; absent for the default ("Launchpad camera", "<site>
+	 * camera", "<station> tracking", "<craft> camera" or "<body> surface
+	 * camera").
+	 */
+	name?: string;
+	vantage: CommandVantage;
+	/**
+	 * The craft to watch (`Vessel.persistentId`); absent for the default
+	 * (the active craft in flight).
+	 */
+	targetPersistentId?: number;
+	/** A point to look at instead of the craft. */
+	lookAt?: CommandLookAt;
+}
+
+/**
+ * Destroy a command camera made by `CreateCommandCamera` (or created in
+ * game). The settings camera can not be destroyed.
+ */
+export interface DestroyCommandCameraPayload {
+	flightId: number;
+}
+
 export enum ErrorSource {
 	Sidecar = "sidecar",
 	Client = "client",
@@ -560,6 +689,15 @@ export interface SetBackgroundCaptureFpsPayload {
 	 * Clamped to the operator ceiling; 0 means no background capture.
 	 */
 	fps: number;
+}
+
+/**
+ * Point a command camera at `look_at` instead of its craft, or back at the
+ * craft with `look_at` absent or null.
+ */
+export interface SetCommandLookAtPayload {
+	flightId: number;
+	lookAt?: CommandLookAt;
 }
 
 /**
@@ -768,6 +906,18 @@ export type ClientMessage =
 	 * plugin applies it.
 	 */
 	| { type: "set-command-target", content: SetCommandTargetPayload }
+	/**
+	 * Create a command camera at a vantage for the rest of the scene.
+	 * Server-wide; find the new camera by its `commandCentre.token`.
+	 */
+	| { type: "create-command-camera", content: CreateCommandCameraPayload }
+	/** Destroy a created command camera. Server-wide. */
+	| { type: "destroy-command-camera", content: DestroyCommandCameraPayload }
+	/**
+	 * Point a command camera at a craft or a surface point instead of its
+	 * target, or back at the target. Server-wide.
+	 */
+	| { type: "set-command-look-at", content: SetCommandLookAtPayload }
 	/**
 	 * A consumer reporting its OWN current display size in px; the sidecar
 	 * aggregates MAX-across-consumers to drive auto-resolution

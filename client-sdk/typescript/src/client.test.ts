@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CameraKind,
   CameraLifecycle,
+  CommandLookAtKind,
+  CommandVantageKind,
   ErrorSource,
   Layer,
   QualityPreset,
@@ -478,6 +481,162 @@ describe("KerbcastClient", () => {
         content: { flightId: 2147483905, persistentId: 4000000001 },
       }),
     ]);
+  });
+
+  describe("command cameras", () => {
+    function commandCamera(flightId: number, token?: string) {
+      return {
+        flightId,
+        kind: CameraKind.Command,
+        partName: "kerbcast.commandCamera",
+        partTitle: "Command camera",
+        cameraName: "Launchpad camera",
+        vesselName: "Launch Pad",
+        layers: [Layer.Near],
+        operatorLayers: [Layer.Near],
+        renderWidth: 768,
+        renderHeight: 768,
+        operatorWidth: 768,
+        operatorHeight: 768,
+        supportsZoom: false,
+        fov: 30,
+        fovMin: 30,
+        fovMax: 30,
+        supportsPan: false,
+        panYaw: 0,
+        panPitch: 0,
+        panYawMin: 0,
+        panYawMax: 0,
+        panPitchMin: 0,
+        panPitchMax: 0,
+        encoderBitrateBps: 0,
+        targetBitrateBps: 0,
+        degradeLevel: 0,
+        commandCentre: {
+          stationId: "ground:LaunchPad",
+          nodeName: "LaunchPad",
+          displayName: "Launch Pad",
+          body: "Kerbin",
+          latitude: 0,
+          longitude: 0,
+          altitude: 0,
+          targetPersistentId: 0,
+          trackingLevel: 1,
+          targets: [],
+          created: token !== undefined,
+          ...(token !== undefined ? { token } : {}),
+        },
+      };
+    }
+
+    async function connected() {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      captured.dc?._open();
+      captured.dc!.sent.length = 0;
+      const snapshot = (cameras: unknown[]) =>
+        captured.dc?._msg(JSON.stringify({ type: "camera-snapshot", content: { cameras } }));
+      return { client, captured, snapshot };
+    }
+
+    it("createCommandCamera sends the request and resolves with the camera carrying its token", async () => {
+      const { client, captured, snapshot } = await connected();
+
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.LaunchSite, site: "LaunchPad" },
+        { token: "tok-1", name: "Pad cam" },
+      );
+      await Promise.resolve();
+      expect(captured.dc?.sent).toEqual([
+        JSON.stringify({
+          type: "create-command-camera",
+          content: {
+            token: "tok-1",
+            vantage: { kind: "launchSite", site: "LaunchPad" },
+            name: "Pad cam",
+          },
+        }),
+      ]);
+
+      snapshot([commandCamera(100), commandCamera(200, "someone-else")]);
+      snapshot([commandCamera(100), commandCamera(200, "someone-else"), commandCamera(300, "tok-1")]);
+      const cam = await created;
+      expect(cam.flightId).toBe(300);
+      expect(cam.commandCentre?.created).toBe(true);
+    });
+
+    it("createCommandCamera generates a token when none is given and passes target and look-at", async () => {
+      const { client, captured, snapshot } = await connected();
+      const lookAt = {
+        kind: CommandLookAtKind.Surface,
+        body: "Kerbin",
+        latitude: -0.0972,
+        longitude: -74.5577,
+        altitude: 70,
+        framingMarginM: 40,
+      };
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.Surface, body: "Kerbin", latitude: -0.05, longitude: -74.7 },
+        { targetPersistentId: 77, lookAt },
+      );
+      await Promise.resolve();
+      const sent = JSON.parse(captured.dc!.sent[0]);
+      expect(sent.type).toBe("create-command-camera");
+      expect(typeof sent.content.token).toBe("string");
+      expect(sent.content.token.length).toBeGreaterThan(0);
+      expect(sent.content.targetPersistentId).toBe(77);
+      expect(sent.content.lookAt).toEqual(lookAt);
+      expect("name" in sent.content).toBe(false);
+
+      snapshot([commandCamera(5, sent.content.token)]);
+      expect((await created).flightId).toBe(5);
+    });
+
+    it("createCommandCamera rejects when the camera never appears", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client } = await connected();
+        const created = client.createCommandCamera(
+          { kind: CommandVantageKind.Station, station: "Nowhere" },
+          { token: "t", timeoutMs: 1000 },
+        );
+        const outcome = created.then(
+          () => "resolved",
+          (e: Error) => e.message,
+        );
+        await vi.advanceTimersByTimeAsync(1001);
+        expect(await outcome).toMatch(/did not appear within 1000 ms/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("createCommandCamera throws when the control channel is not open", async () => {
+      const client = new KerbcastClient({ host: "h", port: 1 }, makeFakeTransport().transport);
+      await expect(
+        client.createCommandCamera({ kind: CommandVantageKind.LaunchSite }, { timeoutMs: 10 }),
+      ).rejects.toThrow(/control channel not open/);
+    });
+
+    it("destroyCommandCamera and setCommandLookAt send their commands", async () => {
+      const { client, captured } = await connected();
+      await client.destroyCommandCamera(2147483905);
+      await client.setCommandLookAt(2147483905, {
+        kind: CommandLookAtKind.Vessel,
+        persistentId: 4000000001,
+      });
+      await client.setCommandLookAt(2147483905, null);
+      expect(captured.dc?.sent).toEqual([
+        JSON.stringify({ type: "destroy-command-camera", content: { flightId: 2147483905 } }),
+        JSON.stringify({
+          type: "set-command-look-at",
+          content: { flightId: 2147483905, lookAt: { kind: "vessel", persistentId: 4000000001 } },
+        }),
+        JSON.stringify({ type: "set-command-look-at", content: { flightId: 2147483905 } }),
+      ]);
+    });
   });
 
   it("disconnect tears down peer + emits null MediaStream events", async () => {

@@ -1,5 +1,6 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraKind, CameraLifecycle, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import type { CreateCommandCameraPayload } from "../__generated__/types";
 import type {
   DiscoveredCamera,
   InboundVideoStats,
@@ -664,6 +665,32 @@ export class MockSidecar {
         }
         break;
       }
+      case "create-command-camera": {
+        this._createCommandCamera(msg.content);
+        break;
+      }
+      case "destroy-command-camera": {
+        const cam = this._cameras.get(msg.content.flightId);
+        if (!cam?.commandCentre?.created) {
+          this._sendToClient({
+            type: "error",
+            content: {
+              message: `camera ${msg.content.flightId} is not a created command camera`,
+              source: ErrorSource.Sidecar,
+            },
+          });
+          break;
+        }
+        this._cameras.delete(msg.content.flightId);
+        this._sendToClient({
+          type: "camera-snapshot",
+          content: { cameras: Array.from(this._cameras.values()) },
+        });
+        break;
+      }
+      /* Aiming has no visible effect on the mock's camera state; the command is still recorded. */
+      case "set-command-look-at":
+        break;
       case "subscribe": {
         const flightId = msg.content.flightId;
         const freeMid = this._slotMids.find((m) => !this._slotBindings.has(m));
@@ -738,6 +765,67 @@ export class MockSidecar {
       case "disconnect":
         break;
     }
+  }
+
+  /**
+   * Models the game building a created command camera at once: a `command`
+   * camera carrying the request's token appears in a fresh snapshot. A token
+   * already used creates nothing, as in game.
+   */
+  private _createCommandCamera(req: CreateCommandCameraPayload): void {
+    for (const cam of this._cameras.values()) {
+      if (cam.commandCentre?.token === req.token) return;
+    }
+    let flightId = 0x80000000 + 0x100 + this._cameras.size;
+    while (this._cameras.has(flightId)) flightId++;
+    const v = req.vantage;
+    const place =
+      v.kind === CommandVantageKind.Station
+        ? (v.station ?? "")
+        : v.kind === CommandVantageKind.Surface
+          ? (v.body ?? "")
+          : v.kind === CommandVantageKind.Vessel
+            ? `vessel:${v.persistentId ?? 0}`
+            : (v.site || "LaunchPad");
+    const defaultName =
+      v.kind === CommandVantageKind.Station
+        ? `${place} tracking`
+        : v.kind === CommandVantageKind.Surface
+          ? `${place} surface camera`
+          : v.kind === CommandVantageKind.Vessel
+            ? `${place} camera`
+            : place === "LaunchPad"
+              ? "Launchpad camera"
+              : `${place} camera`;
+    const cam = buildCamera({
+      flightId,
+      kind: CameraKind.Command,
+      cameraName: req.name ?? defaultName,
+      vesselName: place,
+      partName: "kerbcast.commandCamera",
+      partTitle: "Command camera",
+      supportsZoom: false,
+      commandCentre: {
+        stationId: `ground:${place}`,
+        nodeName: place,
+        displayName: place,
+        body: v.body ?? "Kerbin",
+        latitude: v.latitude ?? 0,
+        longitude: v.longitude ?? 0,
+        altitude: 0,
+        targetPersistentId: req.targetPersistentId ?? 0,
+        trackingLevel: 3,
+        targets: [],
+        created: true,
+        token: req.token,
+      },
+    });
+    this._cameras.set(flightId, cam);
+    this._maxRenderSizes.set(flightId, { maxWidth: 1280, maxHeight: 720 });
+    this._sendToClient({
+      type: "camera-snapshot",
+      content: { cameras: Array.from(this._cameras.values()) },
+    });
   }
 
   /**

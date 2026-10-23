@@ -83,6 +83,7 @@ namespace Kerbcast
         // Typed reference into _providers for the crew-scoped rescan
         // (OnVesselCrewWasModified must not touch HullcamProvider).
         private CrewProvider _crewProvider;
+        private CommandCameraProvider _commandProvider;
 
         // Status file (sidecar ← plugin). Rewritten ~1Hz when anything has
         // changed — KSP fps, shed level, per-camera effective layers / dims.
@@ -248,7 +249,8 @@ namespace Kerbcast
             _providers = new List<ICameraSourceProvider>();
             if (_atSpaceCenter)
             {
-                _providers.Add(new CommandCameraProvider(_settings, RingDir, RingSlots, spaceCenter: true, CommandAuthority));
+                _commandProvider = new CommandCameraProvider(_settings, RingDir, RingSlots, spaceCenter: true, CommandAuthority);
+                _providers.Add(_commandProvider);
                 Debug.Log("[Kerbcast][CMDCAM] scene start: Space Center, command camera only");
             }
             else
@@ -256,11 +258,13 @@ namespace Kerbcast
                 _crewProvider = new CrewProvider(RingDir, RingSlots, _settings.Width, _settings.Height);
                 _providers.Add(new HullcamProvider(_settings, RingDir, RingSlots));
                 _providers.Add(_crewProvider);
+                /* Always present so cameras can be created at runtime; the
+                   settings-driven one only when enabled. */
+                _commandProvider = new CommandCameraProvider(_settings, RingDir, RingSlots, spaceCenter: false, CommandAuthority,
+                    withDefault: _settings.EnableCommandCamera);
+                _providers.Add(_commandProvider);
                 if (_settings.EnableCommandCamera)
-                {
-                    _providers.Add(new CommandCameraProvider(_settings, RingDir, RingSlots, spaceCenter: false, CommandAuthority));
                     Debug.Log("[Kerbcast][CMDCAM] scene start: flight, command camera follows the active craft");
-                }
             }
             _staggerController = BuildStaggerController(_settings);
             /* Only built when the operator permits background capture at all:
@@ -314,6 +318,8 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] swept {swept} stale camera file(s) left by an earlier flight, skipped {skipped} in use");
                 _statusPath = Path.Combine(RingDir, "global.status.json");
                 _controlPath = Path.Combine(RingDir, "global.control.json");
+                _commandsPath = Path.Combine(RingDir, CommandsFileName);
+                SeedCommandRequests();
                 Debug.Log($"[Kerbcast] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
             }
             catch (Exception ex)
@@ -580,6 +586,119 @@ namespace Kerbcast
 
         private static bool IsCommandCamera(ICamera cam) => cam is KerbcastCamera kc && kc.Rig != null;
 
+        internal CommandCameraProvider CommandProvider => _commandProvider;
+
+        internal IReadOnlyCollection<uint> CameraFlightIds() => new HashSet<uint>(_cameras.Select(c => c.FlightId));
+
+        /* Forgets a created command camera and disposes it if built. False for
+           the default camera or an unknown id. */
+        internal bool DestroyCommandCamera(uint flightId)
+        {
+            if (_commandProvider == null || !_commandProvider.Destroy(flightId)) return false;
+            for (int i = _cameras.Count - 1; i >= 0; i--)
+            {
+                if (_cameras[i].FlightId != flightId) continue;
+                var cam = _cameras[i];
+                _cameras.RemoveAt(i);
+                cam.Dispose();
+            }
+            return true;
+        }
+
+        /* Requests from clients, which the sidecar appends to
+           global.commands.json. Read whole every CommandsPollSeconds; the
+           ledger applies each request once, in id order. */
+        private const string CommandsFileName = "global.commands.json";
+        private const float CommandsPollSeconds = 0.25f;
+        private string _commandsPath;
+        private string _commandsLastJson;
+        private float _commandsCooldown;
+        private readonly CommandRequestLedger _commandLedger = new CommandRequestLedger();
+
+        private void SeedCommandRequests()
+        {
+            try
+            {
+                if (!File.Exists(_commandsPath)) return;
+                _commandsLastJson = File.ReadAllText(_commandsPath);
+                _commandLedger.SeedFrom(CommandCameraRequest.ParseFile(_commandsLastJson, null));
+                if (_commandLedger.LastAppliedId > 0)
+                    Debug.Log($"[Kerbcast][CMDCAM] client requests up to id {_commandLedger.LastAppliedId} predate this scene; skipped");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] client request file read failed: {ex.Message}");
+            }
+        }
+
+        private void MaybeApplyCommandRequests()
+        {
+            if (_commandsPath == null || _commandProvider == null) return;
+            _commandsCooldown -= Time.unscaledDeltaTime;
+            if (_commandsCooldown > 0f) return;
+            _commandsCooldown = CommandsPollSeconds;
+            try
+            {
+                if (!File.Exists(_commandsPath)) return;
+                var json = File.ReadAllText(_commandsPath);
+                if (json == _commandsLastJson) return;
+                _commandsLastJson = json;
+                var skipped = new List<string>();
+                var requests = CommandCameraRequest.ParseFile(json, skipped);
+                foreach (var why in skipped)
+                    Debug.LogWarning($"[Kerbcast][CMDCAM] client request skipped: {why}");
+                foreach (var r in _commandLedger.Fresh(requests))
+                    ApplyCommandRequest(r);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] client request read failed: {ex.Message}");
+            }
+        }
+
+        private void ApplyCommandRequest(CommandCameraRequest r)
+        {
+            switch (r.Op)
+            {
+                case CommandRequestOp.Create:
+                {
+                    if (!_commandLedger.ClaimToken(r.Token) || _commandProvider.HasToken(r.Token))
+                    {
+                        Debug.Log($"[Kerbcast][CMDCAM] client request {r.Id}: token {r.Token} already used this scene; ignored");
+                        return;
+                    }
+                    string why = r.LookAt?.Invalid();
+                    if (why != null)
+                    {
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: look-at refused: {why}");
+                        return;
+                    }
+                    uint id = KerbcastControl.Create(r.Vantage, r.Name, r.TargetPersistentId, r.Token, out string error);
+                    if (id == 0)
+                    {
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: command camera refused: {error}");
+                        return;
+                    }
+                    if (r.LookAt != null && !KerbcastControl.SetCommandLookAt(id, KerbcastControl.AimOf(r.LookAt), r.LookAt.FramingMarginM))
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: look-at for cam={id} refused");
+                    return;
+                }
+                case CommandRequestOp.Destroy:
+                    if (!KerbcastControl.DestroyCommandCamera(r.FlightId))
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is not a created command camera; nothing destroyed");
+                    return;
+                case CommandRequestOp.LookAt:
+                {
+                    string why = r.LookAt?.Invalid();
+                    bool ok = why == null && KerbcastControl.SetCommandLookAt(r.FlightId,
+                        r.LookAt != null ? KerbcastControl.AimOf(r.LookAt) : null, r.LookAt?.FramingMarginM ?? 0);
+                    if (!ok)
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: look-at for cam={r.FlightId} refused{(why != null ? ": " + why : "")}");
+                    return;
+                }
+            }
+        }
+
         /* Every frame, paused or not, so a command feed's state transitions and
            the authority timeout are caught close to when they happen even while
            nobody is watching it (a rendered feed solves on every frame anyway). */
@@ -602,20 +721,14 @@ namespace Kerbcast
 
         /* On the first scene of a process the launch site's coordinates arrive
            after startup, so the command camera waits for them (additively, like
-           a docking rebuild) instead of standing at (0,0). */
+           a docking rebuild) instead of standing at (0,0). A camera created at
+           runtime is due at once, so it is built on the next frame. */
         private void RetryPendingCommandCamera()
         {
-            if (_providers == null) return;
+            if (_commandProvider == null || !_commandProvider.RetryDue) return;
             var vessel = FlightGlobals.ActiveVessel;
             if (vessel == null && !_atSpaceCenter) return;
-            for (int i = 0; i < _providers.Count; i++)
-            {
-                if (_providers[i] is CommandCameraProvider gp && gp.RetryDue)
-                {
-                    RebuildCameraList(vessel, disposeMissing: false);
-                    return;
-                }
-            }
+            RebuildCameraList(vessel, disposeMissing: false);
         }
 
         // LateUpdate drives explicit camera.Render() calls via each
@@ -641,6 +754,7 @@ namespace Kerbcast
             }
 
             UpdateFpsAverage();
+            MaybeApplyCommandRequests();
             RetryPendingCommandCamera();
             PollCommandRigs();
 

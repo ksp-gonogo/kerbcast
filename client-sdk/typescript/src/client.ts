@@ -2,6 +2,8 @@ import type {
   AdaptiveShedPayload,
   CameraState,
   ClientMessage,
+  CommandLookAt,
+  CommandVantage,
   DisplaySizeReport,
   ErrorPayload,
   Layer,
@@ -10,7 +12,7 @@ import type {
   SettingsStatePayload,
   TrackMode,
 } from "./__generated__/types";
-import { CameraLifecycle, ErrorSource } from "./__generated__/types";
+import { CameraKind, CameraLifecycle, ErrorSource } from "./__generated__/types";
 import {
   type DisplayedFrameUt,
   type FrameUt,
@@ -297,6 +299,37 @@ export interface DiscoveredCamera {
   keyframeRequestsReceived?: number;
   /** Largest display size held across consumers; null when none is held. */
   displaySize?: DisplaySizeReport | null;
+}
+
+/** How long {@link KerbcastClient.createCommandCamera} waits for the camera by default. */
+export const COMMAND_CAMERA_CREATE_TIMEOUT_MS = 35_000;
+
+/** Options for {@link KerbcastClient.createCommandCamera}. */
+export interface CreateCommandCameraOptions {
+  /** Feed name; omit for the game's default for the vantage. */
+  name?: string;
+  /** The craft to watch, by `Vessel.persistentId`; omit for the active craft. */
+  targetPersistentId?: number;
+  /** A craft or surface point to look at instead of the target. */
+  lookAt?: CommandLookAt;
+  /**
+   * Identifies the request; the new camera carries it as
+   * `commandCentre.token`. Omit for a random one. Reusing a token within a
+   * scene creates nothing.
+   */
+  token?: string;
+  /**
+   * Milliseconds to wait for the camera to appear before rejecting. The
+   * game retries a launch site, station or craft that is not placed yet for
+   * up to 30 s. Default {@link COMMAND_CAMERA_CREATE_TIMEOUT_MS}.
+   */
+  timeoutMs?: number;
+}
+
+function randomToken(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 /** Event payloads emitted by a {@link KerbcastClient}. */
@@ -1391,6 +1424,91 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    */
   async setCommandTarget(flightId: number, persistentId: number): Promise<void> {
     await this._send({ type: "set-command-target", content: { flightId, persistentId } });
+  }
+
+  /**
+   * Create a command camera standing at `vantage` for the rest of the
+   * current game scene (flight or Space Center), and resolve with its state
+   * once it appears in {@link cameras}. Every consumer sees it. It watches
+   * the active craft unless `targetPersistentId` or `lookAt` says otherwise,
+   * and takes {@link setCommandTarget}, {@link setCommandLookAt} and
+   * {@link destroyCommandCamera} like any command camera.
+   *
+   * Rejects if the camera has not appeared within `timeoutMs`: the game
+   * builds nothing for a body, launch site, station or craft it can not
+   * find, and logs why. A malformed vantage is refused by the sidecar with
+   * an `error` event.
+   */
+  async createCommandCamera(
+    vantage: CommandVantage,
+    opts: CreateCommandCameraOptions = {},
+  ): Promise<CameraState> {
+    const token = opts.token ?? randomToken();
+    const timeoutMs = opts.timeoutMs ?? COMMAND_CAMERA_CREATE_TIMEOUT_MS;
+    const find = (cams: ReadonlyArray<CameraState>) =>
+      cams.find(
+        (c) =>
+          c.kind === CameraKind.Command &&
+          c.commandCentre?.token === token &&
+          c.lifecycle !== CameraLifecycle.Destroyed,
+      );
+    const appeared = new Promise<CameraState>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        off();
+        reject(
+          new Error(
+            `[kerbcast] command camera ${token} did not appear within ${timeoutMs} ms`,
+          ),
+        );
+      }, timeoutMs);
+      const off = this.on("cameras-change", (cams) => {
+        const cam = find(cams);
+        if (!cam) return;
+        clearTimeout(timer);
+        off();
+        resolve(cam);
+      });
+    });
+    try {
+      await this._send({
+        type: "create-command-camera",
+        content: {
+          token,
+          vantage,
+          ...(opts.name !== undefined ? { name: opts.name } : {}),
+          ...(opts.targetPersistentId !== undefined
+            ? { targetPersistentId: opts.targetPersistentId }
+            : {}),
+          ...(opts.lookAt !== undefined ? { lookAt: opts.lookAt } : {}),
+        },
+      });
+    } catch (err) {
+      appeared.catch(() => {});
+      throw err;
+    }
+    return appeared;
+  }
+
+  /**
+   * Destroy a command camera made by {@link createCommandCamera} (or created
+   * in game); its feed ends. The game's own command camera can not be
+   * destroyed. Destroying one that is already gone does nothing.
+   */
+  async destroyCommandCamera(flightId: number): Promise<void> {
+    await this._send({ type: "destroy-command-camera", content: { flightId } });
+  }
+
+  /**
+   * Point a command camera at a craft or a surface point instead of its
+   * target, or back at the target with `null`. The target is still drawn
+   * wherever it truly is. Ignored while a command authority is registered
+   * in game.
+   */
+  async setCommandLookAt(flightId: number, lookAt: CommandLookAt | null): Promise<void> {
+    await this._send({
+      type: "set-command-look-at",
+      content: lookAt ? { flightId, lookAt } : { flightId },
+    });
   }
 
   /**

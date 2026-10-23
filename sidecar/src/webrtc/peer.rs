@@ -56,12 +56,13 @@ use crate::cameras::CameraState as InternalCameraState;
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
-    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorCode, ErrorPayload,
-    ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
-    SceneStateChangedPayload, ServerMessage, SetBackgroundCaptureFpsPayload,
-    SetCommandTargetPayload, SetDegradePayload, SetForceFullResolutionPayload, SetFovPayload,
-    SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload, SetRenderSizePayload,
-    SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
+    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, DestroyCommandCameraPayload,
+    ErrorCode, ErrorPayload, ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset,
+    ReportDisplaySizePayload, SceneStateChangedPayload, ServerMessage,
+    SetBackgroundCaptureFpsPayload, SetCommandTargetPayload, SetDegradePayload,
+    SetForceFullResolutionPayload, SetFovPayload, SetLayersPayload, SetPanPayload,
+    SetPanRatePayload, SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload,
+    SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -607,6 +608,17 @@ impl KerbcastPeer {
     }
 }
 
+fn send_error(dc: &Outbox, message: String) {
+    send_server_message(
+        dc,
+        &ServerMessage::Error(ErrorPayload {
+            message,
+            source: ErrorSource::Sidecar,
+            ..Default::default()
+        }),
+    );
+}
+
 /// Single-message dispatch. Pulled out of the closure so the error
 /// paths and per-variant logic don't drown the construction code.
 async fn handle_client_message(
@@ -758,6 +770,31 @@ async fn handle_client_message(
                 );
             } else {
                 info!(flight_id, persistent_id, "command target set");
+            }
+        }
+        ClientMessage::CreateCommandCamera(payload) => {
+            /* The plugin builds it on its next read of global.commands.json;
+            the client finds it in the camera list by its token. */
+            let token = payload.token.clone();
+            match registry.request_create_command_camera(payload).await {
+                Ok(id) => info!(request = id, token, "command camera requested"),
+                Err(message) => send_error(&dc, message),
+            }
+        }
+        ClientMessage::DestroyCommandCamera(DestroyCommandCameraPayload { flight_id }) => {
+            match registry.request_destroy_command_camera(flight_id).await {
+                Ok(id) => info!(
+                    request = id,
+                    flight_id, "command camera destruction requested"
+                ),
+                Err(message) => send_error(&dc, message),
+            }
+        }
+        ClientMessage::SetCommandLookAt(payload) => {
+            let flight_id = payload.flight_id;
+            match registry.request_command_look_at(payload).await {
+                Ok(id) => info!(request = id, flight_id, "command look-at requested"),
+                Err(message) => send_error(&dc, message),
             }
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {

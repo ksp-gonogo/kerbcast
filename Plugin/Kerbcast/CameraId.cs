@@ -57,6 +57,15 @@ namespace Kerbcast
             return (NameHash(CommandCentreId(stationNodeName)) & PartMask) | KerbalTag;
         }
 
+        /* The key a created command camera's wire id hashes, in place of a
+           station node name. Never a CommNet nodeName, so a created camera
+           can not take the default camera's id, and a fresh serial per
+           creation keeps created cameras apart from each other. */
+        public static string CreatedCommandCameraKey(int serial)
+        {
+            return "kerbcast:command:" + serial;
+        }
+
         /* gonogo's command-centre id for a CommNet home: "ground:<nodeName>". */
         public static string CommandCentreId(string stationNodeName)
         {

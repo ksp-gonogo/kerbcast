@@ -3,6 +3,7 @@
 //! (binary entry) and integration tests.
 
 pub mod cameras;
+pub mod commands;
 pub mod encoder;
 pub mod heartbeat;
 pub mod protocol;

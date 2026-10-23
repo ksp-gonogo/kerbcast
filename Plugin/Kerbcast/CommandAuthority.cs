@@ -109,6 +109,8 @@ namespace Kerbcast
         public int TrackingLevel;
         /* Whether the craft plus the framing margin fits the widest view. */
         public bool FramingFits;
+        /* Made by KerbcastControl.CreateCommandCamera or a client, rather than from settings. */
+        public bool Created;
     }
 
     /* One feed's instructions from the authority. */

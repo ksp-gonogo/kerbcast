@@ -106,8 +106,9 @@ controls each part actually supports.
   skip, producing the macroblocking and stuttering aesthetic of
   in-game CommNet signal loss. Also a real CPU optimisation when
   every consumer wants degraded video.
-- `kind` (`"part"` | `"kerbal"`) and, for a kerbal face camera,
-  `crewLocation` (`"seat"` | `"eva"`). Distinguish crew face cameras
+- `kind` (`"part"` | `"kerbal"` | `"command"`) and, for a kerbal face
+  camera, `crewLocation` (`"seat"` | `"eva"`). Distinguish crew face
+  cameras and command cameras (see [Command cameras](#command-cameras))
   from part cameras.
 - `trackMode` (`"none"` | `"activeVessel"` | `"target"`). Server-authoritative
   auto-track state on a pan+zoom camera, so every consumer reflects the same
@@ -122,6 +123,176 @@ controls each part actually supports.
 - `client.setTrackTarget(flightId, mode)`. Ask a pan+zoom camera to auto-track
   the active vessel or its target (`TrackMode`), or `"none"` to stop. The
   chosen mode is published back on `CameraState.trackMode`.
+
+## Command cameras
+
+A command camera is a camera that stands on the ground (or rides a craft)
+and watches a craft from there, the way a tracking station would. The
+game's settings give each scene one, the Launchpad camera, and a client can
+create more at any vantage. Each appears in `client.cameras` with
+`kind: "command"` and a `commandCentre` describing where it stands and what
+it watches.
+
+A created camera lasts for the rest of the game scene (a flight, or the
+Space Center while the game's command camera setting is on); leaving the
+scene removes it. Every connected client sees it, and any of them can aim
+or destroy it.
+
+The vantage is one of:
+
+- `launchSite`: beside a launch site. `site` names it (`"LaunchPad"`,
+  `"Runway"`, a Making History or Kerbal Konstructs site); omit it for the
+  active craft's launch site. `distance` (default 500 m), `bearing` from the
+  site (default 180, due south) and `height` (default 5 m)
+- `station`: at a CommNet ground station, by its node name (`"KSC"`), with
+  `height` above it (default 30 m)
+- `surface`: at any `latitude` and `longitude` on a `body`, `height` metres
+  above the ground there (above the sea over water; default 5 m)
+- `vessel`: riding the craft with that `persistentId`. Keep that craft
+  beyond physics range of the active one, or the lens sits inside its parts
+
+`createCommandCamera` resolves with the new camera's `CameraState` once the
+game has built it, normally within a second. The request carries a token
+(random unless you pass `token`) that the camera reports back as
+`commandCentre.token`; that is how the promise finds it, and how any other
+code can. A vantage the game can not find (an unknown body, site, station
+or craft) builds nothing, and the promise rejects after `timeoutMs`
+(default 35 s, since the game waits up to 30 s for a site to be placed).
+
+Lens reach depends on the vantage: a launch site camera has the tracking
+camera's lens at every Tracking Station level, a station's lens follows the
+Tracking Station's level in career, and surface and vessel vantages zoom
+fully.
+
+### A launchpad camera
+
+```ts
+import { CommandVantageKind, KerbcastClient } from "@ksp-gonogo/kerbcast";
+
+const client = new KerbcastClient({ host: "192.168.1.74", port: 8088 });
+await client.connect([], { slots: 2 });
+// Commands need the control channel, which opens just after connect resolves.
+await new Promise<void>((resolve) => {
+  const off = client.on("control-open", () => {
+    off();
+    resolve();
+  });
+});
+
+// 500 m south of the active craft's launch site, 5 m up.
+const pad = await client.createCommandCamera(
+  { kind: CommandVantageKind.LaunchSite },
+  { name: "Pad south" },
+);
+
+const video = document.querySelector("video")!;
+client.camera(pad.flightId).on("stream", (stream) => {
+  video.srcObject = stream;
+});
+await client.subscribe(pad.flightId);
+
+// Later: the feed ends for every client.
+await client.destroyCommandCamera(pad.flightId);
+```
+
+`{ kind: CommandVantageKind.LaunchSite, site: "Runway", distance: 800,
+bearing: 90, height: 20 }` stands one 800 m east of the runway, 20 m up.
+
+### Between two vantages
+
+A camera can watch a point instead of its craft. Here one stands on a rise
+west of the KSC and watches the launch pad, then a particular craft, then
+whichever craft is active. The coordinates are illustrative.
+
+```ts
+import {
+  CommandLookAtKind,
+  CommandVantageKind,
+  type KerbcastClient,
+} from "@ksp-gonogo/kerbcast";
+
+declare const client: KerbcastClient; // connected as above
+
+const hill = await client.createCommandCamera(
+  {
+    kind: CommandVantageKind.Surface,
+    body: "Kerbin",
+    latitude: -0.08,
+    longitude: -74.75,
+    height: 10,
+  },
+  {
+    name: "West ridge",
+    // Look at the pad: altitude is metres above sea level, and the margin
+    // keeps 60 m of view around the point.
+    lookAt: {
+      kind: CommandLookAtKind.Surface,
+      body: "Kerbin",
+      latitude: -0.0972,
+      longitude: -74.5577,
+      altitude: 70,
+      framingMarginM: 60,
+    },
+  },
+);
+
+// Now follow a particular craft, by Vessel.persistentId.
+await client.setCommandLookAt(hill.flightId, {
+  kind: CommandLookAtKind.Vessel,
+  persistentId: 4000000001,
+});
+
+// Back to its own target (the active craft), and pick another target.
+await client.setCommandLookAt(hill.flightId, null);
+await client.setCommandTarget(hill.flightId, 4000000001);
+```
+
+A station watching a craft is the same with
+`{ kind: CommandVantageKind.Station, station: "KSC" }` and
+`targetPersistentId` at creation (or `setCommandTarget` later). The craft
+is always drawn where it truly is, so a look-at point that is not the
+craft shows it off centre, or not at all.
+
+A command authority registered in game (`KerbcastControl.SetCommandAuthority`)
+aims every command camera itself while it holds the registration; look-at
+points apply again once it clears.
+
+### In game (C#)
+
+Another KSP mod can do the same through `Kerbcast.KerbcastControl`, with
+no sidecar round trip:
+
+```csharp
+using Kerbcast;
+
+// Returns the flightId the feed will have, or 0 when refused.
+uint pad = KerbcastControl.CreateCommandCamera(CommandVantage.LaunchSite());
+
+uint ridge = KerbcastControl.CreateCommandCamera(
+    CommandVantage.Surface("Kerbin", -0.08, -74.75, height: 10), "West ridge");
+KerbcastControl.SetCommandLookAt(ridge, CommandAim.Surface("Kerbin", -0.0972, -74.5577, 70),
+    framingMarginM: 60);
+KerbcastControl.SetCommandLookAt(ridge, null);
+KerbcastControl.SetCommandTarget(ridge, vessel.persistentId);
+
+KerbcastControl.DestroyCommandCamera(ridge);
+```
+
+- `CommandVantage.LaunchSite(site, distance, bearing, height)`,
+  `CommandVantage.Station(nodeName, height)`,
+  `CommandVantage.Surface(body, latitude, longitude, height)` and
+  `CommandVantage.Vessel(persistentId)` mirror the vantage kinds above, with
+  the same defaults
+- `CreateCommandCamera(vantage, name = null, targetPersistentId = 0)`
+  returns the flightId at once; the feed appears when the vantage resolves.
+  `SetCommandTarget`, `SetCommandLookAt` and `SetCommandAim` work on it
+  before then too
+- `SetCommandLookAt(flightId, aim, framingMarginM = 0)` takes any
+  `CommandAim`, including `Orbit` and `PositionAt`
+- `DestroyCommandCamera(flightId)` returns false for the settings camera or
+  an unknown id
+- `CommandFeeds()` lists every built command camera, with `Created` set on
+  the ones made at runtime
 
 ## Pan/zoom input helper
 
