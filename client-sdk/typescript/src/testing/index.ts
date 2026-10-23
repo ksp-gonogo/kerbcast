@@ -94,6 +94,8 @@ function buildCamera(init: MockCameraInit): CameraState {
     renderHeight: init.renderHeight ?? 720,
     operatorWidth: init.operatorWidth ?? 1280,
     operatorHeight: init.operatorHeight ?? 720,
+    maxWidth: init.maxWidth ?? init.operatorWidth ?? 1280,
+    maxHeight: init.maxHeight ?? init.operatorHeight ?? 720,
     supportsZoom: init.supportsZoom ?? true,
     fov: init.fov ?? 60,
     fovMin: init.fovMin ?? 10,

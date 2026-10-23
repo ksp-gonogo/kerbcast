@@ -589,6 +589,8 @@ async fn broadcast_destroyed_cameras(
             render_height: 0,
             operator_width: 0,
             operator_height: 0,
+            max_width: Some(cam.max_width),
+            max_height: Some(cam.max_height),
             supports_zoom: cam.supports_zoom,
             fov: 0.0,
             fov_min: cam.fov_min,

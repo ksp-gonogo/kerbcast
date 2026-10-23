@@ -4,7 +4,7 @@
  *
  * Used by the flat grid to grow tiles to fill the viewport: a wide-but-short
  * area packs tiles into more columns; a tall area uses more rows. The caller
- * then sizes each tile to the largest 16:9 box that fits a cell and centers
+ * then sizes each tile to the largest box of that aspect that fits a cell and centers
  * the block, so tiles are never stretched — this only decides the split.
  */
 export function bestGrid(

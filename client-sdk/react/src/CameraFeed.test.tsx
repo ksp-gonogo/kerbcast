@@ -44,7 +44,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { createRef } from "react";
+import { createRef, useEffect } from "react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -55,6 +55,7 @@ import {
   type FeedAction,
 } from "./CameraFeed";
 import { KerbcastProvider } from "./context";
+import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 
 /*
  * The REC control reads/drives `useRecordings()` (see CameraFeed - REC below).
@@ -220,6 +221,8 @@ function toInit(c: CameraStateLike): MockCameraInit {
     renderHeight: c.renderHeight as number | undefined,
     operatorWidth: c.operatorWidth as number | undefined,
     operatorHeight: c.operatorHeight as number | undefined,
+    maxWidth: c.maxWidth as number | undefined,
+    maxHeight: c.maxHeight as number | undefined,
     supportsZoom: c.supportsZoom as boolean | undefined,
     fov: c.fov as number | undefined,
     fovMin: c.fovMin as number | undefined,
@@ -1498,8 +1501,10 @@ describe("CameraFeed - ResizeObserver render-size feedback", () => {
     resizeCallback = undefined;
   });
 
-  it("reports the measured display size (report-display-size, real w x h)", async () => {
-    const { client, sidecar } = await buildConnectedSource();
+  it("reports the measured display size at 16:9 (report-display-size)", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam", maxWidth: 1280, maxHeight: 720 }),
+    ]);
 
     renderFeed(client, { flightId: 42 });
 
@@ -1513,13 +1518,43 @@ describe("CameraFeed - ResizeObserver render-size feedback", () => {
 
     const msg = sidecar.lastCommand("report-display-size");
     expect(msg).toBeTruthy();
-    // Measured w x h (no synthetic 16:9 crop), bucketed to a 16-multiple:
-    // 400 -> 400, 224 -> 224.
+    // The 16:9 picture that fits 400x224 is ~398 wide: bucketed to 400, height
+    // 225 rounded to even.
     expect(msg?.content.width).toBe(400);
-    expect(msg?.content.height).toBe(224);
+    expect(msg?.content.height).toBe(226);
     // Measurement no longer drives the operator set-render-size (that path is
     // the manual quality cap only).
     expect(sidecar.commands.some((c) => c.type === "set-render-size")).toBe(false);
+  });
+
+  it("asks for the camera's configured shape, not the box's, and gives the feed that shape", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam", maxWidth: 1024, maxHeight: 768 }),
+    ]);
+
+    const { container } = renderFeed(client, { flightId: 42 });
+
+    await act(async () => {
+      resizeCallback?.(
+        [{ contentRect: { width: 400, height: 224 } }] as ResizeObserverEntry[],
+        {} as ResizeObserver,
+      );
+    });
+
+    // The 4:3 picture that fits 400x224 is ~299 wide: 304x228.
+    const msg = sidecar.lastCommand("report-display-size");
+    expect(msg?.content).toMatchObject({ width: 304, height: 228 });
+    const box = container.firstElementChild as HTMLElement;
+    expect(box.style.getPropertyValue("--kc-feed-w")).toBe("1024");
+    expect(box.style.getPropertyValue("--kc-feed-h")).toBe("768");
+  });
+
+  it("falls back to 16:9 while no configured size is known", async () => {
+    const { client } = await buildConnectedSource([]);
+    const { container } = renderFeed(client, { flightId: null });
+    const box = container.firstElementChild as HTMLElement;
+    expect(box.style.getPropertyValue("--kc-feed-w")).toBe("16");
+    expect(box.style.getPropertyValue("--kc-feed-h")).toBe("9");
   });
 
   it("does not report when renderSize is none", async () => {
@@ -1530,6 +1565,212 @@ describe("CameraFeed - ResizeObserver render-size feedback", () => {
     // The observer is never armed when reporting is disabled.
     expect(resizeCallback).toBeUndefined();
     expect(sidecar.commands.some((c) => c.type === "report-display-size")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Render size in a narrow, tall tile, with a frame sized from the stream
+// ---------------------------------------------------------------------------
+
+describe("CameraFeed - render size in a narrow, tall tile", () => {
+  const PHONE_HALF_TILE = { width: 170, height: 400 };
+  let tile = PHONE_HALF_TILE;
+  let watched: Array<{ el: Element; cb: ResizeObserverCallback; last: string | null }> = [];
+  const originalResizeObserver = globalThis.ResizeObserver;
+
+  /* An element sized in px by its own style has that size, anything inside it fills it, anything else is the tile. */
+  function boxOf(el: Element): { width: number; height: number } {
+    for (let at: Element | null = el; at; at = at.parentElement) {
+      const style = (at as HTMLElement).style;
+      if (style?.width.endsWith("px") && style.height.endsWith("px")) {
+        return { width: Number.parseFloat(style.width), height: Number.parseFloat(style.height) };
+      }
+    }
+    return tile;
+  }
+
+  function layout() {
+    for (const w of watched) {
+      const box = boxOf(w.el);
+      const key = `${box.width}x${box.height}`;
+      if (key === w.last) continue;
+      w.last = key;
+      w.cb(
+        [{ target: w.el, contentRect: box as DOMRectReadOnly } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+    }
+  }
+
+  async function run(ms: number) {
+    for (let t = 0; t < ms; t += 16) {
+      await act(async () => {
+        vi.advanceTimersByTime(16);
+      });
+      act(() => layout());
+    }
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    tile = PHONE_HALF_TILE;
+    watched = [];
+    globalThis.ResizeObserver = class {
+      private readonly cb: ResizeObserverCallback;
+      constructor(cb: ResizeObserverCallback) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        watched.push({ el, cb: this.cb, last: null });
+      }
+      unobserve() {}
+      disconnect() {
+        watched = watched.filter((w) => w.cb !== this.cb);
+      }
+    } as unknown as typeof ResizeObserver;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.ResizeObserver = originalResizeObserver;
+  });
+
+  /*
+   * The natural way to keep a video's shape: a frame whose height comes from
+   * the playing video's size, or the camera's render size before it plays.
+   */
+  function StreamShapedFrame({ client }: { client: KerbcastClient }) {
+    const [root, setRoot] = useState<HTMLDivElement | null>(null);
+    const [, bump] = useState(0);
+    useEffect(() => {
+      if (!root) return;
+      const sync = () => bump((n) => n + 1);
+      root.addEventListener("resize", sync, true);
+      root.addEventListener("loadedmetadata", sync, true);
+      return () => {
+        root.removeEventListener("resize", sync, true);
+        root.removeEventListener("loadedmetadata", sync, true);
+      };
+    }, [root]);
+    return (
+      <KerbcastProvider client={client}>
+        <Shaped root={root} setRoot={setRoot} />
+      </KerbcastProvider>
+    );
+  }
+
+  function Shaped({
+    root,
+    setRoot,
+  }: {
+    root: HTMLDivElement | null;
+    setRoot: (el: HTMLDivElement | null) => void;
+  }) {
+    const camera = useKerbcastCameras().find((c) => c.flightId === 42);
+    const video = root?.querySelector("video");
+    const aspect =
+      video && video.videoWidth > 0
+        ? video.videoWidth / video.videoHeight
+        : camera
+          ? camera.renderWidth / camera.renderHeight
+          : 16 / 9;
+    const width = Math.min(tile.width, tile.height * aspect);
+    return (
+      <div
+        ref={setRoot}
+        style={{ width: `${Math.floor(width)}px`, height: `${Math.floor(width / aspect)}px` }}
+      >
+        <CameraFeed flightId={42} />
+      </div>
+    );
+  }
+
+  async function connect() {
+    return buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        cameraName: "Starboard Cam",
+        renderWidth: 1280,
+        renderHeight: 720,
+        maxWidth: 1280,
+        maxHeight: 720,
+      }),
+    ]);
+  }
+
+  function sizeReports(sidecar: MockSidecar) {
+    return sidecar.commands
+      .filter((c) => c.type === "report-display-size")
+      .map((c) => (c as { content: { flightId: number; width: number; height: number } }).content);
+  }
+
+  async function mountShaped() {
+    const { client, sidecar } = await connect();
+    const view = render(<StreamShapedFrame client={client} />);
+    await run(500);
+    const video = view.container.querySelector("video");
+    if (!video) throw new Error("no video element");
+    return { sidecar, video, view, client };
+  }
+
+  async function streamBecomes(
+    sidecar: MockSidecar,
+    video: HTMLVideoElement,
+    width: number,
+    height: number,
+  ) {
+    Object.defineProperty(video, "videoWidth", { value: width, configurable: true });
+    Object.defineProperty(video, "videoHeight", { value: height, configurable: true });
+    await act(async () => {
+      sidecar.updateCamera(42, { renderWidth: width, renderHeight: height });
+      video.dispatchEvent(new Event("loadedmetadata"));
+      video.dispatchEvent(new Event("resize"));
+    });
+    await run(300);
+  }
+
+  it("asks a layout-sized tile for one size at the camera's shape", async () => {
+    const { client, sidecar } = await connect();
+    renderFeed(client, { flightId: 42 });
+    await run(500);
+    expect(sizeReports(sidecar)).toEqual([{ flightId: 42, width: 176, height: 100 }]);
+  });
+
+  it("sends no request when the stream comes back smaller, larger or another shape", async () => {
+    const { sidecar, video } = await mountShaped();
+    const before = sizeReports(sidecar).length;
+    for (const [w, h] of [
+      [96, 54],
+      [1920, 1080],
+      [160, 120],
+      [176, 400],
+    ] as const) {
+      await streamBecomes(sidecar, video, w, h);
+      await run(2000);
+    }
+    expect(sizeReports(sidecar).length - before).toBe(0);
+  });
+
+  it("sends nothing while the tile holds still and the stream flips between two sizes", async () => {
+    const { sidecar, video } = await mountShaped();
+    const before = sizeReports(sidecar);
+    for (let i = 0; i < 6; i++) {
+      await streamBecomes(sidecar, video, 176, i % 2 ? 128 : 96);
+    }
+    await run(3000);
+    expect(sizeReports(sidecar)).toEqual(before);
+  });
+
+  it("sends exactly one request, sized from the tile, for a resize dragged across several sizes", async () => {
+    const { sidecar, view, client } = await mountShaped();
+    const before = sizeReports(sidecar).length;
+    for (const width of [240, 280, 320]) {
+      tile = { width, height: 400 };
+      view.rerender(<StreamShapedFrame client={client} />);
+      act(() => layout());
+    }
+    await run(1000);
+    expect(sizeReports(sidecar).slice(before)).toEqual([{ flightId: 42, width: 320, height: 180 }]);
   });
 });
 

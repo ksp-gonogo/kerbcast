@@ -177,12 +177,12 @@ export function KerbalFaceFeed({
   // Reporting follows the mount lifecycle; the registry collapses multiple
   // feeds of the same kerbal to one MAX report.
   const frameRef = useRef<HTMLDivElement>(null);
-  useReportDisplaySize(flightId, frameRef, { square: true, enabled: reportSize });
+  const videoRef = useRef<HTMLVideoElement>(null);
+  useReportDisplaySize(flightId, frameRef, { square: true, enabled: reportSize, videoRef });
 
   // Bind the stream to the persistent <video> without remounting it — the
   // element stays mounted across every re-layout / prop change, only its
   // srcObject is (re)assigned. A stall (stream -> null) leaves the last frame.
-  const videoRef = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;

@@ -68,6 +68,19 @@ comments):
   feed, and whether it draws its own standby icon (set `false` when a
   container renders a single shared out-of-flight overlay).
 - `useStream`. Override how the stream is sourced. See below.
+- `renderSize`. `"auto"` (the default) measures the feed and asks the
+  sidecar for a matching resolution; `"none"` leaves resolution alone.
+
+`renderSize="auto"` picks the resolution, never the shape. The feed takes
+the camera's configured capture aspect (`CameraState.maxWidth` x
+`maxHeight`, from settings.cfg; 16:9 when unknown), centres itself at that
+aspect inside whatever box you give it, and asks for the size of that
+picture: width rounded up to a multiple of 16, height at the aspect. A
+resize that only follows the incoming stream is never reported back, so a
+frame you size from the video (or from `renderWidth`/`renderHeight`)
+cannot loop with the request. A resize within about a second of the stream
+changing that matches its new shape counts as following it. Layout changes
+outside that window always report.
 
 An imperative `CameraFeedHandle` (via `ref`) exposes `stepCamera`,
 `setPanAxis`, `setZoomRate`, `nudgePan`, and `nudgeZoom` for wiring feeds
@@ -89,10 +102,12 @@ quality follows how large it is shown (pass `reportSize={false}` to opt out).
 
 ## Hooks
 
-- `useReportDisplaySize(flightId, ref)`. Self-measure an element and drive the
-  client's per-consumer `reportDisplaySize` (auto-resolution). The feed
-  primitives use it internally; multiple views of one camera from a client
-  collapse to a single MAX report.
+- `useReportDisplaySize(flightId, ref, options)`. Self-measure an element and
+  drive the client's per-consumer `reportDisplaySize` (auto-resolution). The
+  feed primitives use it internally; multiple views of one camera from a
+  client collapse to a single MAX report. Pass `aspect` for the shape to ask
+  for (default 16:9), and `videoRef` / `streamSize` so a resize that follows
+  the stream is not reported.
 
 - `useKerbcastCameras(): CameraState[]`. The live camera registry,
   re-rendering as cameras appear, change, or are destroyed.

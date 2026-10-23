@@ -383,6 +383,15 @@ export interface CameraState {
 	operatorWidth: number;
 	operatorHeight: number;
 	/**
+	 * Configured capture size: the most this camera renders at (settings.cfg
+	 * `MaxQuality` or `Width`/`Height`, or a kerbal face camera's square
+	 * ring). Its aspect is the feed's shape: auto-resolution picks a size at
+	 * this aspect and never follows the viewer's box. Absent from a sidecar
+	 * that predates the field.
+	 */
+	maxWidth?: number;
+	maxHeight?: number;
+	/**
 	 * Whether the part's Hullcam module supports runtime FoV changes
 	 * (i.e. it's a `MuMechModuleHullCameraZoom`, not the fixed base
 	 * `MuMechModuleHullCamera`). 19 of 21 stock parts do.
