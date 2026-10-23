@@ -727,7 +727,8 @@ namespace Kerbcast
          */
         private void DropLostVantages()
         {
-            if (_commandProvider == null) return;
+            /* A scene unload destroys every vessel; the teardown disposes the cameras. */
+            if (_commandProvider == null || _teardown.LostCameraDisposal != CameraDisposal.Destroyed) return;
             List<KerbcastCamera> lost = null;
             foreach (var cam in _cameras)
                 if (cam is KerbcastCamera kc && kc.Rig is CommandCameraRig gr && gr.VantageLost)
