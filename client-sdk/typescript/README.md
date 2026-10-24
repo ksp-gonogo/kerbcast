@@ -48,10 +48,6 @@ await cam.setZoomRate(1); // +1 zooms in, holds until superseded
 const videoEl = document.querySelector("video")!;
 videoEl.srcObject = cam.mediaStream;
 
-// The untouched WebRTC track, before any static or frame-lock canvas. Its
-// track is the receiver's own object, so it can be matched to an RTCRtpReceiver.
-cam.on("rawStream", (raw) => console.log("raw source", raw?.getVideoTracks()[0]));
-
 cam.on("change", (state) => {
   console.log("camera state", state);
 });
@@ -92,6 +88,65 @@ const setLayers: ClientMessage = {
 };
 controlChannel.send(JSON.stringify(setLayers));
 ```
+
+### Encoded-frame transforms
+
+`cam.setEncodedTransform(factory)` runs your transform on a camera's encoded
+frames before the browser decodes them. It always runs before Kerbcast's
+static and frame lock, so anything it does (holding frames back, dropping
+them) shows up in `cam.mediaStream` with the static still drawn on top.
+
+Kerbcast installs the transform on whichever receiver carries the camera. A
+transform instance works on one receiver only, so you pass a factory:
+Kerbcast calls it for a fresh instance when the camera is bound, again when a
+slot rebind moves the camera to another receiver, and again after a
+reconnect. A receiver the camera leaves goes back to passthrough, and frames
+the old instance still holds are dropped. `setEncodedTransform(null)`
+detaches. It works in both legacy and dynamic slot modes.
+
+It needs `encodedTransforms: true` when the client is constructed, and
+`setEncodedTransform` throws without it. The option gives every receiver a
+passthrough transform from the start, because Chrome only honours a receiver
+transform that was in place before negotiation. It costs a worker hop per
+frame for every camera, so leave it off unless you use this. The passthrough
+worker loads from a `blob:` URL, so a Content Security Policy must allow
+`worker-src blob:`. `setEncodedTransform` also throws when the browser has no
+install path; `client.encodedTransformPath` reports which one you will get:
+
+- `"script"`: return an `RTCRtpScriptTransform` (Chrome, Safari and Firefox)
+- `"streams"`: return a `TransformStream` of `RTCEncodedVideoFrame`, run on the main thread over `createEncodedStreams()` (older Chrome)
+
+A one-second delay on the `"script"` path:
+
+```ts
+const client = new KerbcastClient({ host, port, encodedTransforms: true });
+const worker = new Worker(new URL("./delay-worker.js", import.meta.url));
+
+client.camera(2592004302).setEncodedTransform(({ flightId, path }) =>
+  path === "script"
+    ? new RTCRtpScriptTransform(worker, { flightId, delayMs: 1000 })
+    : delayStream(1000),
+);
+
+// delay-worker.js
+onrtctransform = ({ transformer }) => {
+  const { delayMs } = transformer.options;
+  transformer.readable
+    .pipeThrough(
+      new TransformStream({
+        transform(frame, controller) {
+          setTimeout(() => controller.enqueue(frame), delayMs);
+        },
+      }),
+    )
+    .pipeTo(transformer.writable)
+    .catch(() => {}); // a replaced instance is aborted
+};
+```
+
+`delayStream` is the same `TransformStream` built on the main thread. A
+factory that throws, or returns the wrong kind for the path, is reported as a
+client `error` event carrying the camera's `flightId`.
 
 ## Per-camera capabilities
 

@@ -61,13 +61,6 @@ export interface KerbcastCameraHandle {
   readonly state: CameraState | null;
   readonly mediaStream: MediaStream | null;
   /**
-   * The stream wrapping the WebRTC track exactly as it arrived, before any
-   * static or frame-lock canvas. Its video track is the receiver's own track
-   * object, never a clone, so `RTCPeerConnection.getReceivers()` can be
-   * matched against it. Null while the camera has no track.
-   */
-  readonly rawStream: MediaStream | null;
-  /**
    * True while the camera has a live source whose frames have stopped
    * arriving (the noise pipeline's stall detector). Always false when the
    * noise pipeline is unavailable (no `captureStream`) or bypassed.
@@ -143,6 +136,21 @@ export interface KerbcastCameraHandle {
    */
   setShowStatic(enabled: boolean): void;
 
+  /**
+   * Run a transform on this camera's encoded frames before they are decoded,
+   * and so before Kerbcast's static and frame lock see them. Kerbcast calls
+   * `factory` for a fresh instance each time the camera lands on a receiver
+   * (connect, slot rebind, reconnect) and removes it from a receiver the
+   * camera leaves; frames the old instance still holds are discarded. The
+   * setting persists across reconnects. `null` detaches.
+   *
+   * Needs {@link KerbcastClientConfig.encodedTransforms}; throws without it,
+   * or when the browser has no install path. Failures while installing
+   * (the factory throws, or returns the wrong kind for the path) surface as
+   * client `error` events.
+   */
+  setEncodedTransform(factory: EncodedTransformFactory | null): void;
+
   on<K extends keyof KerbcastCameraEvents>(
     event: K,
     handler: (data: KerbcastCameraEvents[K]) => void,
@@ -155,15 +163,35 @@ export interface KerbcastCameraEvents {
   change: CameraState;
   /** Track arrival or teardown for this camera. `null` on disconnect. */
   stream: MediaStream | null;
-  /**
-   * The raw source changed (see {@link KerbcastCameraHandle.rawStream}),
-   * including a slot rebind under a stable `stream`. `null` when the camera
-   * loses its track or the client disconnects.
-   */
-  rawStream: MediaStream | null;
   /** Frames stopped arriving on a live source (`true`) / resumed (`false`). */
   stall: boolean;
 }
+
+/**
+ * How a peer installs encoded transforms. `"script"` sets an
+ * `RTCRtpScriptTransform` as the receiver's `transform`, used wherever the
+ * browser has it; `"streams"` runs a main-thread `TransformStream` over the
+ * receiver's `createEncodedStreams()`, used on Chrome builds without it.
+ */
+export type EncodedTransformPath = "script" | "streams";
+
+/** A transform over encoded video frames: an `RTCRtpScriptTransform` on the `"script"` path, a `TransformStream` on `"streams"`. */
+export type EncodedTransform =
+  | RTCRtpScriptTransform
+  | TransformStream<RTCEncodedVideoFrame, RTCEncodedVideoFrame>;
+
+/** Passed to an {@link EncodedTransformFactory}. */
+export interface EncodedTransformContext {
+  flightId: number;
+  /** Which kind of {@link EncodedTransform} to return. */
+  path: EncodedTransformPath;
+}
+
+/**
+ * Builds a transform instance for one receiver. An instance is single-use,
+ * so Kerbcast asks for a new one whenever the camera moves receiver.
+ */
+export type EncodedTransformFactory = (ctx: EncodedTransformContext) => EncodedTransform;
 
 /** Configuration for {@link KerbcastClient} construction. */
 export interface KerbcastClientConfig {
@@ -192,6 +220,18 @@ export interface KerbcastClientConfig {
    * Default false.
    */
   frameLock?: boolean;
+  /**
+   * Enable {@link KerbcastCameraHandle.setEncodedTransform}. Every receiver
+   * then carries a passthrough transform from creation, because Chrome only
+   * honours a receiver transform that was in place before negotiation and
+   * stops a receiver's frames when its transform is cleared. This routes
+   * every camera's frames through a worker (or, on Chrome builds without
+   * `RTCRtpScriptTransform`, a main-thread `createEncodedStreams` pipe), so
+   * it is off by default. The worker is a `blob:` URL, so a page with a
+   * Content Security Policy must allow `worker-src blob:`. Set it before
+   * connecting; a peer keeps the path it was created with.
+   */
+  encodedTransforms?: boolean;
   /**
    * ICE gathering timeout in milliseconds. Passed to the default
    * {@link BrowserKerbcastTransport}; ignored when a custom transport is
@@ -422,7 +462,18 @@ export interface KerbcastClientEvents {
  * implementation to exercise the state machine without a real peer.
  */
 export interface KerbcastTransport {
-  createPeer(iceServers: RTCIceServer[]): KerbcastPeer;
+  createPeer(iceServers: RTCIceServer[], opts?: KerbcastPeerOptions): KerbcastPeer;
+  /**
+   * The encoded-transform path a peer created with `opts` would use, or null
+   * when it has none. Optional; a transport without it offers no path.
+   */
+  encodedTransformPath?(opts: KerbcastPeerOptions): EncodedTransformPath | null;
+}
+
+/** Peer creation options passed to {@link KerbcastTransport.createPeer}. */
+export interface KerbcastPeerOptions {
+  /** Mirrors {@link KerbcastClientConfig.encodedTransforms}. */
+  encodedTransforms?: boolean;
 }
 
 export interface KerbcastPeer {
@@ -444,6 +495,12 @@ export interface KerbcastPeer {
    * changes. Equivalent to `RTCPeerConnection.getStats(null)`.
    */
   getStats?(): Promise<RTCStatsReport>;
+  /**
+   * Install `transform` on the receiver of slot `mid`, replacing any
+   * previous one; `null` restores passthrough. Throws when the receiver is
+   * unknown or the transform's kind does not match the peer's path.
+   */
+  setReceiverTransform?(mid: string, transform: EncodedTransform | null): void;
 }
 
 export interface KerbcastDataChannel {
@@ -477,12 +534,45 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
     this.opts = { iceGatheringTimeoutMs: opts.iceGatheringTimeoutMs ?? 2000 };
   }
 
-  createPeer(iceServers: RTCIceServer[]): KerbcastPeer {
+  encodedTransformPath(opts: KerbcastPeerOptions): EncodedTransformPath | null {
+    return opts.encodedTransforms === true ? detectEncodedTransformPath() : null;
+  }
+
+  createPeer(iceServers: RTCIceServer[], opts: KerbcastPeerOptions = {}): KerbcastPeer {
+    const transformPath = this.encodedTransformPath(opts);
     /* max-bundle: every slot shares one ICE transport, so a relayed
        connection takes one TURN allocation however many slots it has. The
        sidecar always answers with a single BUNDLE group. */
-    const pc = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
+    const config: RTCConfiguration & { encodedInsertableStreams?: boolean } = {
+      iceServers,
+      bundlePolicy: "max-bundle",
+    };
+    if (transformPath === "streams") config.encodedInsertableStreams = true;
+    const pc = new RTCPeerConnection(config);
     const { iceGatheringTimeoutMs } = this.opts;
+    /* Streams path: every receiver's frames must be taken exactly once, so
+       each gets a pipe that runs passthrough until a transform is set.
+       Script path: each receiver holds a passthrough transform from
+       creation, and swaps back to a fresh one instead of clearing. */
+    let passthroughWorker: { worker: Worker; url: string } | null = null;
+    const passthrough = (): RTCRtpScriptTransform => {
+      if (!passthroughWorker) {
+        const url = URL.createObjectURL(
+          new Blob([PASSTHROUGH_WORKER_SOURCE], { type: "text/javascript" }),
+        );
+        passthroughWorker = { worker: new Worker(url), url };
+      }
+      return new RTCRtpScriptTransform(passthroughWorker.worker);
+    };
+    const pipes = new Map<RTCRtpTransceiver, SwitchableFramePipe>();
+    const pipeFor = (t: RTCRtpTransceiver): SwitchableFramePipe => {
+      let pipe = pipes.get(t);
+      if (!pipe) {
+        pipe = new SwitchableFramePipe((t.receiver as ReceiverWithEncodedStreams).createEncodedStreams());
+        pipes.set(t, pipe);
+      }
+      return pipe;
+    };
     let trackIdx = 0;
     let onTrack:
       | ((t: MediaStreamTrack, idx: number, mid: string) => void)
@@ -490,6 +580,7 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
     let onStateChange: ((s: KerbcastConnectionState) => void) | null = null;
 
     pc.ontrack = (ev) => {
+      if (transformPath === "streams") pipeFor(ev.transceiver);
       // ev.transceiver.mid is the stable m-line id the sidecar keys its
       // SlotMap on; it's set by the time ontrack fires (post-answer).
       onTrack?.(ev.track, trackIdx++, ev.transceiver.mid ?? "");
@@ -500,7 +591,8 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
 
     return {
       addRecvOnlyTransceiver: () => {
-        pc.addTransceiver("video", { direction: "recvonly" });
+        const t = pc.addTransceiver("video", { direction: "recvonly" });
+        if (transformPath === "script") t.receiver.transform = passthrough();
       },
       createDataChannel: (label) =>
         wrapBrowserDataChannel(pc.createDataChannel(label)),
@@ -549,10 +641,107 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
         }),
       localSdp: () => pc.localDescription?.sdp ?? "",
       getStats: () => pc.getStats(null),
+      setReceiverTransform: (mid, transform) => {
+        const transceiver = pc.getTransceivers().find((t) => t.mid === mid);
+        if (!transceiver) throw new Error(`[kerbcast] no receiver for slot ${mid}`);
+        if (transformPath === "streams") {
+          if (transform !== null && !(transform instanceof TransformStream)) {
+            throw new TypeError("[kerbcast] the streams path needs a TransformStream");
+          }
+          pipeFor(transceiver).set(transform);
+        } else if (transformPath === "script") {
+          if (transform !== null && !(transform instanceof RTCRtpScriptTransform)) {
+            throw new TypeError("[kerbcast] the script path needs an RTCRtpScriptTransform");
+          }
+          transceiver.receiver.transform = transform ?? passthrough();
+        } else {
+          throw new Error("[kerbcast] encoded transforms are unavailable on this peer");
+        }
+      },
       close: () => {
         pc.close();
+        if (passthroughWorker) {
+          passthroughWorker.worker.terminate();
+          URL.revokeObjectURL(passthroughWorker.url);
+          passthroughWorker = null;
+        }
       },
     };
+  }
+}
+
+const PASSTHROUGH_WORKER_SOURCE =
+  "onrtctransform = (e) => { e.transformer.readable.pipeTo(e.transformer.writable).catch(() => {}); };";
+
+interface EncodedVideoStreams {
+  readable: ReadableStream<RTCEncodedVideoFrame>;
+  writable: WritableStream<RTCEncodedVideoFrame>;
+}
+
+/* Chrome's legacy insertable streams API, absent from lib.dom. */
+type ReceiverWithEncodedStreams = RTCRtpReceiver & {
+  createEncodedStreams(): EncodedVideoStreams;
+};
+
+function detectEncodedTransformPath(): EncodedTransformPath | null {
+  if (typeof RTCRtpReceiver === "undefined") return null;
+  const proto = RTCRtpReceiver.prototype as Partial<ReceiverWithEncodedStreams>;
+  if (typeof RTCRtpScriptTransform !== "undefined" && "transform" in proto) return "script";
+  if (typeof proto.createEncodedStreams === "function") return "streams";
+  return null;
+}
+
+/**
+ * Forwards one receiver's encoded frames to its decoder, through a
+ * TransformStream while one is set. Swapping aborts the old transform, so
+ * frames it still holds are dropped.
+ */
+class SwitchableFramePipe {
+  private readonly out: WritableStreamDefaultWriter<RTCEncodedVideoFrame>;
+  private stage: WritableStreamDefaultWriter<RTCEncodedVideoFrame> | null = null;
+
+  constructor(streams: EncodedVideoStreams) {
+    this.out = streams.writable.getWriter();
+    void this.pump(streams.readable.getReader());
+  }
+
+  set(transform: TransformStream<RTCEncodedVideoFrame, RTCEncodedVideoFrame> | null): void {
+    const old = this.stage;
+    this.stage = null;
+    old?.abort().catch(() => {});
+    if (!transform) return;
+    const stage = transform.writable.getWriter();
+    this.stage = stage;
+    void this.drain(transform.readable.getReader(), stage);
+  }
+
+  private async pump(reader: ReadableStreamDefaultReader<RTCEncodedVideoFrame>): Promise<void> {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        const stage = this.stage;
+        if (stage) await stage.write(value).catch(() => {});
+        else await this.out.write(value);
+      }
+    } catch {
+      /* The receiver closed with its peer. */
+    }
+  }
+
+  private async drain(
+    reader: ReadableStreamDefaultReader<RTCEncodedVideoFrame>,
+    stage: WritableStreamDefaultWriter<RTCEncodedVideoFrame>,
+  ): Promise<void> {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done || this.stage !== stage) return;
+        await this.out.write(value);
+      }
+    } catch {
+      /* Aborted by a swap, or the receiver closed. */
+    }
   }
 }
 
@@ -655,6 +844,8 @@ class CameraHandle
   private _showStatic = true;
   /** True while the pipeline runs as a static-free frame-lock passthrough (noise off, `frameLock` on). */
   private _clear = false;
+  /** Set by {@link setEncodedTransform}; the client installs it on whichever receiver carries this camera. */
+  _encodedTransform: EncodedTransformFactory | null = null;
   private readonly client: KerbcastClient;
 
   constructor(flightId: number, client: KerbcastClient) {
@@ -669,10 +860,6 @@ class CameraHandle
 
   get mediaStream(): MediaStream | null {
     return this._mediaStream;
-  }
-
-  get rawStream(): MediaStream | null {
-    return this._rawStream;
   }
 
   get stalled(): boolean {
@@ -697,6 +884,12 @@ class CameraHandle
   setShowStatic(enabled: boolean): void {
     this._showStatic = enabled;
     if (!this._clear) this._noisePipeline?.setShowStatic(enabled);
+  }
+
+  setEncodedTransform(factory: EncodedTransformFactory | null): void {
+    if (factory) this.client._assertEncodedTransforms();
+    this._encodedTransform = factory;
+    this.client._syncEncodedTransforms();
   }
 
   /**
@@ -746,10 +939,8 @@ class CameraHandle
    * thereafter so the output stream stays stable across source swaps.
    */
   private _applySource(raw: MediaStream | null): void {
-    const rawChanged = raw !== this._rawStream;
     this._rawStream = raw;
     this._sourceless = raw === null;
-    if (rawChanged) this.emit("rawStream", raw);
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
     this._clear = !noiseEnabled && this.client._frameLock();
@@ -872,10 +1063,8 @@ class CameraHandle
     }
     this._noisePipeline?.destroy();
     this._noisePipeline = null;
-    const hadRaw = this._rawStream !== null;
     this._rawStream = null;
     this._sourceless = false;
-    if (hadRaw) this.emit("rawStream", null);
     this._setStalled(false);
     this._setOutput(null);
   }
@@ -1009,6 +1198,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * matches by mid instead).
    */
   private readonly flightByTrackId = new Map<string, number>();
+  /** Legacy mode: transceiver mid -> the camera routed to it by index. */
+  private readonly legacyFlightByMid = new Map<string, number>();
+  /** The encoded-transform path the current peer was created with. */
+  private peerTransformPath: EncodedTransformPath | null = null;
+  /** Receivers holding a camera's encoded transform, by mid, with the factory that built it. */
+  private readonly transformInstalls = new Map<
+    string,
+    { flightId: number; factory: EncodedTransformFactory }
+  >();
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
   private _encoderBackend: string | null = null;
@@ -1310,13 +1508,17 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.trackByMid.clear();
     this.flightByMid.clear();
     this.flightByTrackId.clear();
+    this.legacyFlightByMid.clear();
     /* RTP timestamps restart from a fresh random base on every peer. */
     this.frameStamps.clear();
 
+    const peerOpts = this.peerOptions();
     const peer = this.transport.createPeer(
       this.cfg.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
+      peerOpts,
     );
     this.peer = peer;
+    this.peerTransformPath = this.transport.encodedTransformPath?.(peerOpts) ?? null;
 
     // Slot-pool size = the recv-only transceivers we offer. Dynamic mode
     // uses the explicit pool size (spares subscribable at runtime); legacy
@@ -1333,6 +1535,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     peer.onStateChange((s) => {
       this.setState(s);
       if (s === "disconnected" || s === "failed") {
+        if (this.peer === peer) this.clearEncodedTransforms();
         this.tearDownStreams();
       }
       /* A failed peer never recovers; closing it frees its relay allocations. */
@@ -1416,6 +1619,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   disconnect(): void {
+    this.clearEncodedTransforms();
     this.peer?.close();
     this.peer = null;
     this.control = null;
@@ -1706,6 +1910,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     // Legacy: m-line index maps to the requested camera list.
     const flightId = this.requestedOrder[idx];
     if (flightId === undefined) return;
+    if (mid) {
+      this.legacyFlightByMid.set(mid, flightId);
+      this._syncEncodedTransforms();
+    }
     // Record the raw track id so inboundVideoStats() can match it against
     // the report's trackIdentifier field.
     if (track.id) this.flightByTrackId.set(track.id, flightId);
@@ -1785,6 +1993,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
             this.getOrCreateHandle(flightId)._setMediaStream(null);
           }
         }
+        this._syncEncodedTransforms();
         break;
       }
       case "adaptive-shed":
@@ -1915,6 +2124,94 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     });
 
     return result;
+  }
+
+  /** The encoded-transform path this client's next peer will use, or null when it has none. */
+  get encodedTransformPath(): EncodedTransformPath | null {
+    return this.transport.encodedTransformPath?.(this.peerOptions()) ?? null;
+  }
+
+  private peerOptions(): KerbcastPeerOptions {
+    return { encodedTransforms: this.cfg.encodedTransforms === true };
+  }
+
+  /** Internal: throws unless {@link KerbcastCameraHandle.setEncodedTransform} can work here. */
+  _assertEncodedTransforms(): void {
+    if (this.encodedTransformPath) return;
+    const optIn = this.transport.encodedTransformPath?.({ encodedTransforms: true });
+    if (optIn && this.cfg.encodedTransforms !== true) {
+      throw new Error(
+        "[kerbcast] encoded transforms need the client constructed with encodedTransforms: true",
+      );
+    }
+    throw new Error(
+      "[kerbcast] encoded transforms are unavailable: this browser has neither RTCRtpScriptTransform nor createEncodedStreams",
+    );
+  }
+
+  /**
+   * Internal: bring each receiver's installed transform in line with the
+   * camera now bound to it. A receiver whose camera or factory changed loses
+   * its instance; a bound camera with a factory gets a fresh one.
+   */
+  _syncEncodedTransforms(): void {
+    const peer = this.peer;
+    const path = this.peerTransformPath;
+    if (!peer?.setReceiverTransform || !path) return;
+    const bindings = this.dynamicMode ? this.flightByMid : this.legacyFlightByMid;
+    for (const [mid, installed] of this.transformInstalls) {
+      const flightId = bindings.get(mid);
+      const factory = flightId === undefined ? null : (this.handles.get(flightId)?._encodedTransform ?? null);
+      if (flightId === installed.flightId && factory === installed.factory) continue;
+      this.transformInstalls.delete(mid);
+      this.setReceiverTransform(peer, mid, installed.flightId, null);
+    }
+    for (const [mid, flightId] of bindings) {
+      if (this.transformInstalls.has(mid)) continue;
+      const factory = this.handles.get(flightId)?._encodedTransform;
+      if (!factory) continue;
+      let transform: EncodedTransform;
+      try {
+        transform = factory({ flightId, path });
+      } catch (err) {
+        this.emitTransformError(flightId, err);
+        continue;
+      }
+      if (this.setReceiverTransform(peer, mid, flightId, transform)) {
+        this.transformInstalls.set(mid, { flightId, factory });
+      }
+    }
+  }
+
+  private clearEncodedTransforms(): void {
+    const peer = this.peer;
+    for (const [mid, installed] of this.transformInstalls) {
+      if (peer) this.setReceiverTransform(peer, mid, installed.flightId, null);
+    }
+    this.transformInstalls.clear();
+  }
+
+  private setReceiverTransform(
+    peer: KerbcastPeer,
+    mid: string,
+    flightId: number,
+    transform: EncodedTransform | null,
+  ): boolean {
+    try {
+      peer.setReceiverTransform?.(mid, transform);
+      return true;
+    } catch (err) {
+      this.emitTransformError(flightId, err);
+      return false;
+    }
+  }
+
+  private emitTransformError(flightId: number, err: unknown): void {
+    this.emit("error", {
+      message: `[kerbcast] encoded transform for camera ${flightId}: ${err instanceof Error ? err.message : String(err)}`,
+      source: ErrorSource.Client,
+      flightId,
+    });
   }
 
   private tearDownStreams(): void {
