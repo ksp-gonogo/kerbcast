@@ -60,9 +60,9 @@ use crate::protocol::{
     ErrorCode, ErrorPayload, ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset,
     ReportDisplaySizePayload, SceneStateChangedPayload, ServerMessage,
     SetBackgroundCaptureFpsPayload, SetDegradePayload, SetForceFullResolutionPayload,
-    SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload,
-    SetRenderSizePayload, SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload,
-    SlotMapPayload,
+    SetFovPayload, SetFrameStampsPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload,
+    SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload, SetTrackTargetPayload,
+    SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -660,6 +660,7 @@ async fn handle_client_message(
                 &ServerMessage::Hello(HelloPayload {
                     sidecar_version: crate::VERSION.to_owned(),
                     encoder_backend: selected_backend_name().to_owned(),
+                    frame_stamps: Some(true),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -728,6 +729,9 @@ async fn handle_client_message(
         }
         ClientMessage::SetZoomRate(SetZoomRatePayload { flight_id, rate }) => {
             apply_zoom_rate_change(&registry, &dc, flight_id, rate).await;
+        }
+        ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled }) => {
+            dc.set_stamps_wanted(enabled);
         }
         ClientMessage::SetDegrade(SetDegradePayload { flight_id, level }) => {
             apply_degrade_change(&registry, &dc, peer_id, flight_id, level).await;

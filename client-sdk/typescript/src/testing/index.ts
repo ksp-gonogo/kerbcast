@@ -304,7 +304,7 @@ export class MockSidecar {
    */
   open(): void {
     this._openHandler?.();
-    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock" } });
+    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true } });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
@@ -771,6 +771,7 @@ export class MockSidecar {
       case "hello":
       case "pong":
       case "request-keyframe":
+      case "set-frame-stamps":
         break;
       case "set-throttle-main-screen": {
         /* Flip state and echo SettingsState back, mirroring the sidecar's broadcast. */

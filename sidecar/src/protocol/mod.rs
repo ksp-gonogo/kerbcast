@@ -896,6 +896,17 @@ pub struct SlotMapPayload {
 pub struct HelloPayload {
     pub sidecar_version: String,
     pub encoder_backend: String,
+    /// True when this sidecar sends `FrameStamp` to a client that asks with
+    /// `SetFrameStamps`. Absent from sidecars older than 1.11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_stamps: Option<bool>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFrameStampsPayload {
+    pub enabled: bool,
 }
 
 #[typeshare]
@@ -1174,6 +1185,10 @@ pub enum ClientMessage {
     /// across saves (writes the per-save difficulty parameter). Server-wide:
     /// all peers see the resulting `SettingsState` broadcast.
     SetThrottleMainScreen(SetThrottleMainScreenPayload),
+    /// Start or stop `FrameStamp` messages on this peer's control channel.
+    /// Off until asked for, so clients that predate stamps never receive
+    /// them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+    SetFrameStamps(SetFrameStampsPayload),
 }
 
 /// Messages sent FROM the sidecar TO the client.
@@ -1222,7 +1237,8 @@ pub enum ServerMessage {
     /// re-broadcast when the polled in-flight flag changes.
     SceneStateChanged(SceneStateChangedPayload),
     /// Capture UT of one frame about to go out on a video track, keyed by
-    /// its RTP timestamp. One per frame per track.
+    /// its RTP timestamp. One per frame per track, only to a peer that
+    /// enabled them with `SetFrameStamps`.
     FrameStamp(FrameStampPayload),
 }
 
@@ -1243,6 +1259,28 @@ mod tests {
             s,
             r#"{"type":"frame-stamp","content":{"flightId":7,"rtpTimestamp":4000000000,"captureUt":86400.25,"captureEpoch":3}}"#
         );
+    }
+
+    /// Clients before 1.11 ignore the extra Hello field and never send
+    /// `set-frame-stamps`; newer ones read the field and opt in.
+    #[test]
+    fn hello_announces_frame_stamps_and_clients_opt_in() {
+        let hello = ServerMessage::Hello(HelloPayload {
+            sidecar_version: "1.11.0".to_owned(),
+            encoder_backend: "x".to_owned(),
+            frame_stamps: Some(true),
+        });
+        assert!(serde_json::to_string(&hello)
+            .unwrap()
+            .contains(r#""frameStamps":true"#));
+
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"set-frame-stamps","content":{"enabled":true}}"#)
+                .unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled: true })
+        ));
     }
 
     #[test]

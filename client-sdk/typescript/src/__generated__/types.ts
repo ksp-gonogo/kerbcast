@@ -706,6 +706,11 @@ export interface FrameStampPayload {
 export interface HelloPayload {
 	sidecarVersion: string;
 	encoderBackend: string;
+	/**
+	 * True when this sidecar sends `FrameStamp` to a client that asks with
+	 * `SetFrameStamps`. Absent from sidecars older than 1.11.
+	 */
+	frameStamps?: boolean;
 }
 
 /**
@@ -783,6 +788,10 @@ export interface SetForceFullResolutionPayload {
 export interface SetFovPayload {
 	flightId: number;
 	fov: number;
+}
+
+export interface SetFrameStampsPayload {
+	enabled: boolean;
 }
 
 export interface SetLayersPayload {
@@ -1088,7 +1097,13 @@ export type ClientMessage =
 	 * across saves (writes the per-save difficulty parameter). Server-wide:
 	 * all peers see the resulting `SettingsState` broadcast.
 	 */
-	| { type: "set-throttle-main-screen", content: SetThrottleMainScreenPayload };
+	| { type: "set-throttle-main-screen", content: SetThrottleMainScreenPayload }
+	/**
+	 * Start or stop `FrameStamp` messages on this peer's control channel.
+	 * Off until asked for, so clients that predate stamps never receive
+	 * them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+	 */
+	| { type: "set-frame-stamps", content: SetFrameStampsPayload };
 
 /** Messages sent FROM the sidecar TO the client. */
 export type ServerMessage = 
@@ -1147,7 +1162,8 @@ export type ServerMessage =
 	| { type: "scene-state-changed", content: SceneStateChangedPayload }
 	/**
 	 * Capture UT of one frame about to go out on a video track, keyed by
-	 * its RTP timestamp. One per frame per track.
+	 * its RTP timestamp. One per frame per track, only to a peer that
+	 * enabled them with `SetFrameStamps`.
 	 */
 	| { type: "frame-stamp", content: FrameStampPayload };
 

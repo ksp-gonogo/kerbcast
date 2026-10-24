@@ -197,6 +197,39 @@ mod tests {
      */
     #[tokio::test]
     async fn stamp_names_the_rtp_timestamp_the_viewer_receives() {
+        let (sent, stamps, rtp_seen) = loopback_stamps(true).await;
+        let matched: Vec<_> = stamps
+            .iter()
+            .filter(|(ts, _)| rtp_seen.contains(ts))
+            .collect();
+        assert!(
+            !matched.is_empty(),
+            "a stamped frame arrived: stamps={stamps:?} rtp={rtp_seen:?}"
+        );
+        for (ts, ut) in &matched {
+            assert!(
+                sent.contains(&(*ts, *ut)),
+                "stamp ({ts}, {ut}) pairs the UT with the timestamp that frame was sent under"
+            );
+        }
+    }
+
+    /// A viewer that never asks for stamps (any SDK before 1.11) gets its
+    /// frames and no stamps.
+    #[tokio::test]
+    async fn a_viewer_that_never_asks_gets_no_stamps() {
+        let (_, stamps, rtp_seen) = loopback_stamps(false).await;
+        assert!(!rtp_seen.is_empty(), "frames still arrive");
+        assert!(stamps.is_empty(), "no stamps sent: {stamps:?}");
+    }
+
+    /**
+     * Send stamped frames over a real loopback connection whose viewer has
+     * (or has not) asked for stamps. Returns what was sent as (RTP timestamp,
+     * UT), the stamps the viewer received, and the RTP timestamps it saw.
+     */
+    #[allow(clippy::type_complexity)]
+    async fn loopback_stamps(wanted: bool) -> (Vec<(u32, f64)>, Vec<(u32, f64)>, Vec<u32>) {
         use tokio::sync::mpsc;
         use webrtc::api::media_engine::MediaEngine;
         use webrtc::api::APIBuilder;
@@ -269,7 +302,11 @@ mod tests {
             },
             "video".to_owned(),
             "stream".to_owned(),
-            Some(Outbox::spawn(control.clone())),
+            Some({
+                let outbox = Outbox::spawn(control.clone());
+                outbox.set_stamps_wanted(wanted);
+                outbox
+            }),
         ));
         sidecar
             .add_track(vt.rtp_track() as Arc<dyn TrackLocal + Send + Sync>)
@@ -350,28 +387,20 @@ mod tests {
                     Seen::Rtp(ts) => rtp_seen.push(ts),
                 }
             }
-            if stamps.iter().any(|(ts, _)| rtp_seen.contains(ts)) {
+            let done = if wanted {
+                stamps.iter().any(|(ts, _)| rtp_seen.contains(ts))
+            } else {
+                /* Long enough for a stamp to have overtaken its frame. */
+                rtp_seen.len() >= 10
+            };
+            if done {
                 break;
             }
         }
 
-        let matched: Vec<_> = stamps
-            .iter()
-            .filter(|(ts, _)| rtp_seen.contains(ts))
-            .collect();
-        assert!(
-            !matched.is_empty(),
-            "a stamped frame arrived: stamps={stamps:?} rtp={rtp_seen:?}"
-        );
-        for (ts, ut) in &matched {
-            assert!(
-                sent.contains(&(*ts, *ut)),
-                "stamp ({ts}, {ut}) pairs the UT with the timestamp that frame was sent under"
-            );
-        }
-
         viewer.close().await.ok();
         sidecar.close().await.ok();
+        (sent, stamps, rtp_seen)
     }
 
     mod churn {
@@ -535,6 +564,7 @@ mod tests {
             let sidecar = pc_on(sidecar_net).await;
             let control: ControlChannel = Arc::new(Mutex::new(None));
             let outbox = Outbox::spawn(control.clone());
+            outbox.set_stamps_wanted(true);
             let mut tracks = Vec::new();
             for i in 0..TRACKS_PER_VIEWER {
                 let vt = Arc::new(VideoTrack::new(

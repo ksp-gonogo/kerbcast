@@ -48,6 +48,9 @@ const STAMP_BUFFER_LIMIT: usize = 16 * 1024;
 pub struct Outbox {
     control_tx: mpsc::Sender<String>,
     stamp_tx: mpsc::Sender<FrameStampPayload>,
+    /// Whether the client asked for frame stamps. Off by default: a client
+    /// that predates them would only pay to receive and discard them.
+    stamps_wanted: Arc<AtomicBool>,
     dead: Arc<AtomicBool>,
     shutdown: Arc<watch::Sender<bool>>,
 }
@@ -69,6 +72,7 @@ impl Outbox {
         Self {
             control_tx,
             stamp_tx,
+            stamps_wanted: Arc::new(AtomicBool::new(false)),
             dead,
             shutdown: Arc::new(shutdown),
         }
@@ -95,9 +99,17 @@ impl Outbox {
         }
     }
 
-    /// Queue a frame stamp, or drop it when the peer is behind.
+    /// Queue a frame stamp, or drop it when the peer did not ask for stamps
+    /// or is behind.
     pub fn offer_stamp(&self, stamp: FrameStampPayload) {
-        let _ = self.stamp_tx.try_send(stamp);
+        if self.stamps_wanted.load(Ordering::Relaxed) {
+            let _ = self.stamp_tx.try_send(stamp);
+        }
+    }
+
+    /// Start or stop frame stamps for this peer.
+    pub fn set_stamps_wanted(&self, wanted: bool) {
+        self.stamps_wanted.store(wanted, Ordering::Relaxed);
     }
 
     /// True once a control message could not be delivered.

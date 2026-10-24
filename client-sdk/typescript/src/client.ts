@@ -1706,6 +1706,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       case "hello":
         this._sidecarVersion = msg.content.sidecarVersion;
         this._encoderBackend = msg.content.encoderBackend;
+        /* Stamps are opt-in so clients that predate them never pay for them. */
+        if (msg.content.frameStamps === true) {
+          void this._send({ type: "set-frame-stamps", content: { enabled: true } }).catch(() => {});
+        }
         break;
       case "camera-snapshot":
         this._cameras = msg.content.cameras;

@@ -17,7 +17,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kerbcast_sidecar::shared_mem::{MmapFrameRing, MmapRingConfig};
+use kerbcast_sidecar::shared_mem::{CaptureStamp, MmapFrameRing, MmapRingConfig};
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
@@ -70,7 +70,13 @@ fn main() {
     loop {
         let t = start.elapsed().as_secs_f64();
         render(&mut pixels, flight_id, t);
-        ring.produce(WIDTH, HEIGHT, t * 1000.0, &pixels)
+        /* A mission clock that starts at one day, so viewers exercise the
+        frame-stamp path the way they would in a flight. */
+        let capture = CaptureStamp {
+            ut: Some(86_400.0 + t),
+            epoch: 0,
+        };
+        ring.produce_stamped(WIDTH, HEIGHT, t * 1000.0, capture, &pixels)
             .expect("ring produce");
         n += 1;
         if n.is_multiple_of(FPS * 5) {

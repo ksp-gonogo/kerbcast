@@ -221,6 +221,28 @@ describe("KerbcastClient", () => {
     expect(captured.dc?.sent).toContain(JSON.stringify({ type: "hello" }));
   });
 
+  it("asks for frame stamps only from a sidecar that offers them", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+    await client.connect();
+    captured.dc?._open();
+    const optIns = () => (captured.dc?.sent ?? []).filter((m) => JSON.parse(m).type === "set-frame-stamps");
+
+    captured.dc?._msg(
+      JSON.stringify({ type: "hello", content: { sidecarVersion: "1.10.3", encoderBackend: "x" } }),
+    );
+    expect(optIns()).toEqual([]);
+
+    captured.dc?._msg(
+      JSON.stringify({
+        type: "hello",
+        content: { sidecarVersion: "1.11.0", encoderBackend: "x", frameStamps: true },
+      }),
+    );
+    expect(optIns()).toEqual([JSON.stringify({ type: "set-frame-stamps", content: { enabled: true } })]);
+  });
+
   it("emits `control-open` once per control channel open, after hello is sent", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);
