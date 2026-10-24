@@ -835,6 +835,28 @@ describe("KerbcastClient", () => {
     expect(streams[streams.length - 1]).toBeNull();
   });
 
+  it("a failed connection closes its peer, freeing any relay allocations", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
+
+    await client.connect([42]);
+    captured.onState?.("disconnected");
+    expect(captured.closed).toBe(false);
+    captured.onState?.("failed");
+    expect(captured.closed).toBe(true);
+    expect(client.state).toBe("failed");
+  });
+
+  it("a failed /offer closes the peer it gathered", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("nope", { status: 500 }));
+
+    await expect(client.connect([42])).rejects.toThrow();
+    expect(captured.closed).toBe(true);
+  });
+
   it("non-OK /offer response throws with status code and transitions to failed", async () => {
     const { transport } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);

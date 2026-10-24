@@ -465,7 +465,10 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
   }
 
   createPeer(iceServers: RTCIceServer[]): KerbcastPeer {
-    const pc = new RTCPeerConnection({ iceServers });
+    /* max-bundle: every slot shares one ICE transport, so a relayed
+       connection takes one TURN allocation however many slots it has. The
+       sidecar always answers with a single BUNDLE group. */
+    const pc = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
     const { iceGatheringTimeoutMs } = this.opts;
     let trackIdx = 0;
     let onTrack:
@@ -1311,6 +1314,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       if (s === "disconnected" || s === "failed") {
         this.tearDownStreams();
       }
+      /* A failed peer never recovers; closing it frees its relay allocations. */
+      if (s === "failed") peer.close();
     });
 
     const control = peer.createDataChannel("kerbcast-control");
@@ -1361,6 +1366,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         ? this.cfg.negotiate(body)
         : this.httpNegotiate(body));
     } catch (err) {
+      peer.close();
       this.setState("failed");
       throw err;
     }
