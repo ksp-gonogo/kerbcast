@@ -205,6 +205,41 @@ where
     }
 }
 
+/*
+ * Whether a command track moved enough to tell viewers. Its `ut` advances on
+ * every status write, and a still craft's range and bracket wobble below
+ * anything visible; broadcasting those alone would send every viewer a camera
+ * update each second for nothing.
+ */
+fn command_track_changed(a: &Option<CommandTrackState>, b: &Option<CommandTrackState>) -> bool {
+    fn near(a: Option<f64>, b: Option<f64>, tol: f64) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => (x - y).abs() <= tol,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    match (a, b) {
+        (None, None) => false,
+        (Some(a), Some(b)) => {
+            let range_tol = a.range_m.unwrap_or(0.0).abs() * 1e-3;
+            a.has_fix != b.has_fix
+                || !near(a.range_m, b.range_m, range_tol)
+                || a.occluded != b.occluded
+                || a.occluder != b.occluder
+                || a.sunlit != b.sunlit
+                || !near(a.bracket_half_px, b.bracket_half_px, 0.5)
+                || a.frame_height_px != b.frame_height_px
+                || a.framing_fits != b.framing_fits
+                || !near(a.true_offset_px, b.true_offset_px, 0.5)
+                || a.authority != b.authority
+                || a.blank != b.blank
+                || a.events != b.events
+        }
+        _ => true,
+    }
+}
+
 fn lenient_command_track<'de, D>(d: D) -> Result<Option<CommandTrackState>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1833,7 +1868,7 @@ impl CameraRegistry {
                         || (p.fov - cam_status.fov).abs() > 0.01
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
-                        || p.command_track != cam_status.command_track
+                        || command_track_changed(&p.command_track, &cam_status.command_track)
                         || p.command_centre != cam_status.command_centre
                 }
             };
@@ -2978,6 +3013,24 @@ mod tests {
         assert!(
             registry.poll_status().await.changed_cameras.is_empty(),
             "an equal command track does not re-broadcast"
+        );
+
+        write(
+            &COMMAND_TRACK_JSON
+                .replace(r#""ut":637599435.82"#, r#""ut":637599436.82"#)
+                .replace(r#""rangeM":11507905.1"#, r#""rangeM":11507910.4"#)
+                .replace(r#""bracketHalfPx":4.2"#, r#""bracketHalfPx":4.3"#),
+        );
+        assert!(
+            registry.poll_status().await.changed_cameras.is_empty(),
+            "a later ut with sub-visible range and bracket drift does not re-broadcast"
+        );
+
+        write(&COMMAND_TRACK_JSON.replace(r#""bracketHalfPx":4.2"#, r#""bracketHalfPx":6.0"#));
+        assert_eq!(
+            registry.poll_status().await.changed_cameras.len(),
+            1,
+            "a visible bracket change re-broadcasts"
         );
 
         write(&COMMAND_TRACK_JSON.replace(
