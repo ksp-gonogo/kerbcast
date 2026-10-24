@@ -48,6 +48,10 @@ await cam.setZoomRate(1); // +1 zooms in, holds until superseded
 const videoEl = document.querySelector("video")!;
 videoEl.srcObject = cam.mediaStream;
 
+// The untouched WebRTC track, before any static or frame-lock canvas. Its
+// track is the receiver's own object, so it can be matched to an RTCRtpReceiver.
+cam.on("rawStream", (raw) => console.log("raw source", raw?.getVideoTracks()[0]));
+
 cam.on("change", (state) => {
   console.log("camera state", state);
 });

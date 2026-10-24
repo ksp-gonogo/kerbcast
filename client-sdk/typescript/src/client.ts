@@ -61,6 +61,13 @@ export interface KerbcastCameraHandle {
   readonly state: CameraState | null;
   readonly mediaStream: MediaStream | null;
   /**
+   * The stream wrapping the WebRTC track exactly as it arrived, before any
+   * static or frame-lock canvas. Its video track is the receiver's own track
+   * object, never a clone, so `RTCPeerConnection.getReceivers()` can be
+   * matched against it. Null while the camera has no track.
+   */
+  readonly rawStream: MediaStream | null;
+  /**
    * True while the camera has a live source whose frames have stopped
    * arriving (the noise pipeline's stall detector). Always false when the
    * noise pipeline is unavailable (no `captureStream`) or bypassed.
@@ -148,6 +155,12 @@ export interface KerbcastCameraEvents {
   change: CameraState;
   /** Track arrival or teardown for this camera. `null` on disconnect. */
   stream: MediaStream | null;
+  /**
+   * The raw source changed (see {@link KerbcastCameraHandle.rawStream}),
+   * including a slot rebind under a stable `stream`. `null` when the camera
+   * loses its track or the client disconnects.
+   */
+  rawStream: MediaStream | null;
   /** Frames stopped arriving on a live source (`true`) / resumed (`false`). */
   stall: boolean;
 }
@@ -658,6 +671,10 @@ class CameraHandle
     return this._mediaStream;
   }
 
+  get rawStream(): MediaStream | null {
+    return this._rawStream;
+  }
+
   get stalled(): boolean {
     return this._stalled;
   }
@@ -729,8 +746,10 @@ class CameraHandle
    * thereafter so the output stream stays stable across source swaps.
    */
   private _applySource(raw: MediaStream | null): void {
+    const rawChanged = raw !== this._rawStream;
     this._rawStream = raw;
     this._sourceless = raw === null;
+    if (rawChanged) this.emit("rawStream", raw);
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
     this._clear = !noiseEnabled && this.client._frameLock();
@@ -853,8 +872,10 @@ class CameraHandle
     }
     this._noisePipeline?.destroy();
     this._noisePipeline = null;
+    const hadRaw = this._rawStream !== null;
     this._rawStream = null;
     this._sourceless = false;
+    if (hadRaw) this.emit("rawStream", null);
     this._setStalled(false);
     this._setOutput(null);
   }

@@ -857,6 +857,31 @@ describe("KerbcastClient", () => {
     expect(streams[streams.length - 1]).toBeNull();
   });
 
+  it("rawStream carries the receiver's own track and follows it to teardown", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([42]));
+    await client.connect([42]);
+
+    const cam = client.camera(42);
+    const raws: (MediaStream | null)[] = [];
+    cam.on("rawStream", (s) => raws.push(s));
+    expect(cam.rawStream).toBeNull();
+
+    const track = { kind: "video" } as MediaStreamTrack;
+    captured.onTrack?.(track, 0);
+    expect(raws).toHaveLength(1);
+    expect(cam.rawStream).toBe(raws[0]);
+    expect(cam.rawStream?.getTracks()[0]).toBe(track);
+
+    cam.configure({ noise: { enabled: false } });
+    expect(raws).toHaveLength(1);
+
+    client.disconnect();
+    expect(raws[raws.length - 1]).toBeNull();
+    expect(cam.rawStream).toBeNull();
+  });
+
   it("a failed connection closes its peer, freeing any relay allocations", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);
