@@ -22,7 +22,12 @@ export {
   type KerbcastCameraEvents,
   type KerbcastTransport,
   type KerbcastPeer,
+  type KerbcastPeerOptions,
   type KerbcastDataChannel,
+  type EncodedTransform,
+  type EncodedTransformContext,
+  type EncodedTransformFactory,
+  type EncodedTransformPath,
   type DiscoveredCamera,
   type NoiseConfig,
 } from "./client";

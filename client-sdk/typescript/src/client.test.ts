@@ -19,6 +19,7 @@ import {
   type KerbcastConnectionState,
   type KerbcastDataChannel,
   type KerbcastPeer,
+  type KerbcastPeerOptions,
   type KerbcastTransport,
   KerbcastClient,
 } from "./client";
@@ -35,7 +36,7 @@ interface FakeChannel extends KerbcastDataChannel {
 function makeFakeTransport() {
   const captured: {
     dc?: FakeChannel;
-    onTrack?: (t: MediaStreamTrack, idx: number) => void;
+    onTrack?(t: MediaStreamTrack, idx: number, mid?: string): void;
     onState?: (s: KerbcastConnectionState) => void;
     closed: boolean;
   } = { closed: false };
@@ -2507,5 +2508,211 @@ describe("KerbcastClient frame UT", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("KerbcastCameraHandle.setEncodedTransform", () => {
+  type Path = "script" | "streams" | null;
+
+  /* The fake transport plus an encoded-transform probe and an install log. */
+  function makeTransformTransport(probe: (optedIn: boolean) => Path) {
+    const base = makeFakeTransport();
+    const installs: { mid: string; transform: unknown }[] = [];
+    const peerOpts: (KerbcastPeerOptions | undefined)[] = [];
+    const transport: KerbcastTransport = {
+      createPeer: (ice, opts) => {
+        peerOpts.push(opts);
+        return {
+          ...base.transport.createPeer(ice),
+          setReceiverTransform: (mid, transform) => {
+            installs.push({ mid, transform });
+          },
+        };
+      },
+      encodedTransformPath: (opts) => probe(opts.encodedTransforms === true),
+    };
+    return { transport, captured: base.captured, installs, peerOpts };
+  }
+
+  function slotMap(captured: { dc?: FakeChannel }, mid: string, flightId: number | null) {
+    captured.dc?._msg(JSON.stringify({ type: "slot-map", content: { mid, flightId } }));
+  }
+
+  /* Each call yields a distinct instance so tests can tell fresh ones apart. */
+  function countingFactory() {
+    const made: { flightId: number; path: string; n: number }[] = [];
+    const factory = vi.fn((ctx: { flightId: number; path: string }) => {
+      const t = { ...ctx, n: made.length };
+      made.push(t);
+      return t as unknown as TransformStream<RTCEncodedVideoFrame, RTCEncodedVideoFrame>;
+    });
+    return { factory, made };
+  }
+
+  const optedInScript = (optedIn: boolean): Path => (optedIn ? "script" : null);
+
+  async function connectDynamic() {
+    const t = makeTransformTransport(optedInScript);
+    const client = new KerbcastClient({ host: "h", port: 1, encodedTransforms: true }, t.transport);
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(fakeAnswer([])));
+    await client.connect([], { slots: 2 });
+    return { ...t, client };
+  }
+
+  it("installs a fresh instance when the camera is bound to a slot", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    expect(installs).toHaveLength(0);
+
+    slotMap(captured, "0", 7);
+    expect(factory).toHaveBeenCalledWith({ flightId: 7, path: "script" });
+    expect(installs).toEqual([{ mid: "0", transform: made[0] }]);
+  });
+
+  it("installs at once when set on a camera that is already bound", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    slotMap(captured, "1", 7);
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    expect(installs).toEqual([{ mid: "1", transform: made[0] }]);
+  });
+
+  it("keeps the instance when the slot's track arrives", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const { factory } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    slotMap(captured, "0", 7);
+    captured.onTrack?.({ kind: "video" } as MediaStreamTrack, 0, "0");
+    expect(client.camera(7).mediaStream).not.toBeNull();
+    expect(factory).toHaveBeenCalledOnce();
+    expect(installs).toHaveLength(1);
+  });
+
+  it("moves to the new slot with a fresh instance and clears the old one", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    slotMap(captured, "0", 7);
+    slotMap(captured, "1", 7);
+    slotMap(captured, "0", null);
+    expect(installs).toEqual([
+      { mid: "0", transform: made[0] },
+      { mid: "1", transform: made[1] },
+      { mid: "0", transform: null },
+    ]);
+  });
+
+  it("swaps instances when another camera takes the slot", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const a = countingFactory();
+    const b = countingFactory();
+    client.camera(1).setEncodedTransform(a.factory);
+    client.camera(2).setEncodedTransform(b.factory);
+    slotMap(captured, "0", 1);
+    slotMap(captured, "0", 2);
+    expect(installs).toEqual([
+      { mid: "0", transform: a.made[0] },
+      { mid: "0", transform: null },
+      { mid: "0", transform: b.made[0] },
+    ]);
+  });
+
+  it("null detaches, and a new factory replaces the instance", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const first = countingFactory();
+    const second = countingFactory();
+    const cam = client.camera(7);
+    slotMap(captured, "0", 7);
+    cam.setEncodedTransform(first.factory);
+    cam.setEncodedTransform(second.factory);
+    cam.setEncodedTransform(null);
+    expect(installs).toEqual([
+      { mid: "0", transform: first.made[0] },
+      { mid: "0", transform: null },
+      { mid: "0", transform: second.made[0] },
+      { mid: "0", transform: null },
+    ]);
+  });
+
+  it("removes the instance at disconnect and reinstalls after reconnect", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    slotMap(captured, "0", 7);
+    client.disconnect();
+    expect(installs).toEqual([
+      { mid: "0", transform: made[0] },
+      { mid: "0", transform: null },
+    ]);
+
+    await client.connect([], { slots: 2 });
+    slotMap(captured, "1", 7);
+    expect(installs.at(-1)).toEqual({ mid: "1", transform: made[1] });
+  });
+
+  it("removes the instance when the peer fails", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    client.camera(7).setEncodedTransform(countingFactory().factory);
+    slotMap(captured, "0", 7);
+    captured.onState?.("failed");
+    expect(installs.at(-1)).toEqual({ mid: "0", transform: null });
+  });
+
+  it("works in legacy mode, routing by track index", async () => {
+    const t = makeTransformTransport(optedInScript);
+    const client = new KerbcastClient({ host: "h", port: 1, encodedTransforms: true }, t.transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([10, 20]));
+    const { factory, made } = countingFactory();
+    client.camera(20).setEncodedTransform(factory);
+    await client.connect([10, 20]);
+    t.captured.onTrack?.({ kind: "video" } as MediaStreamTrack, 0, "0");
+    t.captured.onTrack?.({ kind: "video" } as MediaStreamTrack, 1, "1");
+    expect(t.installs).toEqual([{ mid: "1", transform: made[0] }]);
+    expect(made[0].flightId).toBe(20);
+  });
+
+  it("surfaces a throwing factory as a client error and installs nothing", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    const errors: { message: string; flightId?: number }[] = [];
+    client.on("error", (e) => errors.push(e));
+    client.camera(7).setEncodedTransform(() => {
+      throw new Error("boom");
+    });
+    slotMap(captured, "0", 7);
+    expect(installs).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].flightId).toBe(7);
+    expect(errors[0].message).toMatch(/boom/);
+  });
+
+  it("requires the encodedTransforms opt-in", async () => {
+    const t = makeTransformTransport((optedIn) => (optedIn ? "streams" : null));
+    const plain = new KerbcastClient({ host: "h", port: 1 }, t.transport);
+    expect(plain.encodedTransformPath).toBeNull();
+    expect(() => plain.camera(1).setEncodedTransform(countingFactory().factory)).toThrow(
+      /encodedTransforms: true/,
+    );
+    expect(() => plain.camera(1).setEncodedTransform(null)).not.toThrow();
+
+    const optedIn = new KerbcastClient({ host: "h", port: 1, encodedTransforms: true }, t.transport);
+    expect(optedIn.encodedTransformPath).toBe("streams");
+    const { factory } = countingFactory();
+    optedIn.camera(1).setEncodedTransform(factory);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([]));
+    await optedIn.connect([], { slots: 1 });
+    expect(t.peerOpts.at(-1)).toEqual({ encodedTransforms: true });
+    slotMap(t.captured, "0", 1);
+    expect(factory).toHaveBeenCalledWith({ flightId: 1, path: "streams" });
+  });
+
+  it("throws when the browser has no install path", () => {
+    const t = makeTransformTransport(() => null);
+    const client = new KerbcastClient({ host: "h", port: 1, encodedTransforms: true }, t.transport);
+    expect(() => client.camera(1).setEncodedTransform(countingFactory().factory)).toThrow(
+      /neither RTCRtpScriptTransform nor createEncodedStreams/,
+    );
+    const bare = new KerbcastClient({ host: "h", port: 1 }, makeFakeTransport().transport);
+    expect(() => bare.camera(1).setEncodedTransform(countingFactory().factory)).toThrow(/unavailable/);
   });
 });
