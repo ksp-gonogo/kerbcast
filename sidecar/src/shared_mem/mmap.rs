@@ -475,6 +475,15 @@ impl MmapFrameRing {
         Ok(new_seq)
     }
 
+    /// The newest sequence the writer has claimed, 0 before any frame. Cheap
+    /// (no pixel copy), so a reader can skip `latest` when nothing is new. The
+    /// writer claims a sequence before filling its slot, so a frame read right
+    /// after may still carry the previous one.
+    pub fn latest_sequence(&self) -> u64 {
+        self.header_atomic_u64(HEADER_OFF_SEQUENCE)
+            .load(Ordering::Acquire)
+    }
+
     /// Reader side. Returns the most-recently-published frame, or `None` if
     /// nothing has been produced yet. Implements the seqlock retry protocol
     /// — if the writer clobbers our slot mid-read we bail and re-try once

@@ -644,6 +644,42 @@ fn warn_escalated(cam: &Arc<CameraState>, backend_name: &str, what_happened: &st
     );
 }
 
+/// Whether a tick sends a frame, and the wall time it carries if so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameTiming {
+    Skip,
+    Send(Duration),
+}
+
+/* Decides a tick from the time of the last frame actually sent. The plugin
+already paces capture (MaxCaptureFps), so this is only a burst guard: it skips
+a frame less than half a frame interval after the last one, which still lets
+an irregular capture (a 40 ms median with 0 to 200 ms spread was measured on
+the Deck) through while stopping a catch-up burst after a hitch from feeding
+the encoder at more than twice its configured rate. The first frame carries one
+frame interval. */
+fn frame_timing(
+    last_sent: Option<Instant>,
+    now: Instant,
+    frame_duration: Duration,
+    has_new_frame: bool,
+) -> FrameTiming {
+    if !has_new_frame {
+        return FrameTiming::Skip;
+    }
+    match last_sent {
+        None => FrameTiming::Send(frame_duration),
+        Some(prev) => {
+            let elapsed = now.saturating_duration_since(prev);
+            if elapsed < frame_duration / 2 {
+                FrameTiming::Skip
+            } else {
+                FrameTiming::Send(elapsed)
+            }
+        }
+    }
+}
+
 async fn encode_and_fan_out(
     cam: &Arc<CameraState>,
     encoder_choice: EncoderChoice,
@@ -651,40 +687,21 @@ async fn encode_and_fan_out(
     bitrate_bps: u32,
     frame_duration: Duration,
 ) {
-    // Throttle against configured fps. The plugin writes into the ring at
-    // LateUpdate's cadence (40–60 Hz on the Deck), but the encoder is
-    // configured for `fps` and each emitted sample carries duration=1/fps —
-    // tagging samples wall-clock-too-fast makes the receiver drop about
-    // half of them (`framesReceived` ≫ `framesDecoded`). Skipping encodes
-    // until enough wall time has elapsed since the last one keeps the
-    // encoder running at its configured rate and the receiver's playback
-    // clock honest.
-    // Wall-clock interval since the previous encode for this camera.
-    // Drives both (a) the throttle (skip if it's too soon) and (b) the
-    // sample duration we tag on the wire. The browser playback clock
-    // advances by `sample.duration` per frame; if we always tag the
-    // configured 1/fps but real encodes arrive every ~140ms (CPU-bound
-    // openh264 across 6 cams), playback time falls behind arrival
-    // monotonically — jitterBufferDelay grows from 0 to hundreds of
-    // ms over a session, which presents visually as "framerate slowly
-    // drops as time goes by". Tagging with the actual interval keeps
-    // playback honest.
-    let actual_duration: Duration;
-    {
-        let mut last_at = cam.last_encoded_at.lock().await;
-        let now = Instant::now();
-        actual_duration = match *last_at {
-            Some(prev) => {
-                let elapsed = now.duration_since(prev);
-                if elapsed < frame_duration {
-                    return;
-                }
-                elapsed
-            }
-            None => frame_duration, // first encode — no prior reference
-        };
-        *last_at = Some(now);
-    }
+    /* Each sample's duration (its RTP timestamp step) is the wall time since the
+    last frame actually sent, so the receiver's playback clock tracks real
+    time however irregularly the plugin captures. Ticks with nothing new, and
+    frames dropped below, leave `last_encoded_at` alone so their time rides on
+    the next sent frame. */
+    let now = Instant::now();
+    let last_sent = *cam.last_encoded_at.lock().await;
+    let last = cam.last_sequence.load(Ordering::Acquire);
+    /* Any change, not just an advance, so a recreated ring that restarts low
+    still reaches the backwards-sequence warning below. */
+    let has_new = cam.ring.latest_sequence() != last;
+    let actual_duration = match frame_timing(last_sent, now, frame_duration, has_new) {
+        FrameTiming::Skip => return,
+        FrameTiming::Send(d) => d,
+    };
 
     let frame = match cam.ring.latest() {
         Ok(Some(f)) => f,
@@ -698,7 +715,6 @@ async fn encode_and_fan_out(
         }
     };
 
-    let last = cam.last_sequence.load(Ordering::Acquire);
     if frame.sequence <= last {
         /* Stale-or-equal frame. Equal is the normal idle case (we already
         sent it). BEHIND is not normal and is unrecoverable on its own: a
@@ -967,6 +983,7 @@ async fn encode_and_fan_out(
     // Fan-out + GC dead weak refs in one pass. Pruned weaks mean a peer
     // dropped without telling us — decrement the camera's subscriber
     // count so the encoder can idle once the last viewer leaves.
+    *cam.last_encoded_at.lock().await = Some(now);
     let mut tracks = cam.tracks.write().await;
     let prev = std::mem::take(&mut *tracks);
     let mut alive = Vec::with_capacity(prev.len());
@@ -1018,6 +1035,66 @@ async fn encode_and_fan_out(
 mod tests {
     use super::*;
     use kerbcast_sidecar::encoder::{Nvenc, Software};
+
+    /// Over an irregular capture the sent durations add up to the wall time
+    /// they cover, ticks with no new frame cost nothing, and only a frame less
+    /// than half an interval after the last sent one is skipped.
+    #[test]
+    fn frame_timing_keeps_the_rtp_clock_on_wall_time() {
+        let fd = Duration::from_secs(1) / 30;
+        let start = Instant::now();
+        let ms = |n: u64| start + Duration::from_millis(n);
+        /* (tick time in ms, whether the ring has a new frame) */
+        let ticks = [
+            (0, true),
+            (16, false),
+            (40, true),
+            (56, false),
+            (72, false),
+            (240, true),
+            (250, true), // 10 ms after the last send: a burst, skipped
+            (260, false),
+            (280, true),
+            (300, false),
+            (330, true),
+        ];
+        let mut last_sent = None;
+        let mut sent_total = Duration::ZERO;
+        let mut first_sent_at = None;
+        for (t, has_new) in ticks {
+            match frame_timing(last_sent, ms(t), fd, has_new) {
+                FrameTiming::Skip => {
+                    if has_new {
+                        let since = ms(t) - last_sent.expect("only a repeat is skipped");
+                        assert!(
+                            since < fd / 2,
+                            "frame at {t} ms dropped {since:?} after the last"
+                        );
+                    }
+                }
+                FrameTiming::Send(d) => {
+                    if first_sent_at.is_none() {
+                        assert_eq!(d, fd, "the first frame carries one interval");
+                        first_sent_at = Some(ms(t));
+                    } else {
+                        sent_total += d;
+                    }
+                    last_sent = Some(ms(t));
+                }
+            }
+        }
+        assert_eq!(
+            sent_total,
+            last_sent.unwrap() - first_sent_at.unwrap(),
+            "durations after the first must sum to the wall time between sends"
+        );
+        assert_eq!(
+            frame_timing(Some(ms(0)), ms(17), fd, true),
+            FrameTiming::Send(Duration::from_millis(17)),
+            "a frame half an interval late is sent, not dropped"
+        );
+        assert_eq!(frame_timing(None, ms(0), fd, false), FrameTiming::Skip);
+    }
 
     #[test]
     fn idle_state_is_reported_only_on_change() {
