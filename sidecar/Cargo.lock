@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "kerbcast-sidecar"
-version = "1.10.3"
+version = "1.11.0-rc.10"
 dependencies = [
  "anyhow",
  "axum",
