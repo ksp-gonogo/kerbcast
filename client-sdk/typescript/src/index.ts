@@ -7,6 +7,12 @@ export * from "./__generated__/types";
 export {
   KerbcastClient,
   BrowserKerbcastTransport,
+  COMMAND_CAMERA_CREATE_TIMEOUT_MS,
+  CommandLockedError,
+  CommandTargetUnknownError,
+  COMMAND_CAMERA_STATE_WAIT_MS,
+  CONTROL_OPEN_TIMEOUT_MS,
+  type CreateCommandCameraOptions,
   type BrowserKerbcastTransportOptions,
   type InboundVideoStats,
   type KerbcastCameraHandle,
@@ -20,6 +26,16 @@ export {
   type DiscoveredCamera,
   type NoiseConfig,
 } from "./client";
+
+export {
+  FRAME_STAMP_HISTORY,
+  MAX_UT_EXTRAPOLATION_MS,
+  STAMP_TO_DISPLAY_MAX_MS,
+  extrapolateCaptureUt,
+  type DisplayedFrameUt,
+  type FrameUt,
+  type FrameUtSource,
+} from "./frameUt";
 
 export {
   PanZoomController,
@@ -51,3 +67,14 @@ export {
   type StartRecordingOptions,
   type StopGroupedRecordingOptions,
 } from "./recording";
+
+export {
+  COMMAND_TRACK_LABELS,
+  effectiveCommandTrack,
+  commandEventAt,
+  formatCommandRange,
+  commandCameraLabel,
+  commandReadout,
+  type EffectiveCommandTrack,
+  type CommandCameraAxis,
+} from "./commandTrack";

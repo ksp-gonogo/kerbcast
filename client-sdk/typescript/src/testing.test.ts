@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CameraLifecycle, Layer, TrackMode } from "./__generated__/types";
-import { KerbcastClient } from "./index";
+import {
+  CameraKind,
+  CameraLifecycle,
+  CommandAimKind,
+  CommandTargetEligibility,
+  CommandVantageKind,
+  ErrorCode,
+  type ErrorPayload,
+  Layer,
+  TrackMode,
+} from "./__generated__/types";
+import { CommandLockedError, CommandTargetUnknownError, KerbcastClient } from "./index";
 import { MockSidecar } from "./testing/index";
 
 beforeEach(() => {
@@ -28,6 +38,104 @@ describe("MockSidecar", () => {
     expect(client.cameras).toHaveLength(1);
     expect(client.cameras[0].flightId).toBe(42);
     expect(cameraEvents).toHaveLength(1);
+  });
+
+  it("models command camera create and destroy", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+
+    const pad = await client.createCommandCamera({ kind: CommandVantageKind.LaunchSite });
+    expect(pad.cameraName).toBe("Launchpad camera");
+    expect(pad.commandCentre?.created).toBe(true);
+
+    const hill = await client.createCommandCamera(
+      { kind: CommandVantageKind.Surface, body: "Kerbin", latitude: -0.05, longitude: -74.7 },
+      {
+        name: "Hill",
+        aim: { kind: CommandAimKind.Vessel, persistentId: 9 },
+      },
+    );
+    expect(hill.cameraName).toBe("Hill");
+    expect(hill.flightId).not.toBe(pad.flightId);
+    expect(sidecar.lastCommand("create-command-camera")).toMatchObject({
+      content: { name: "Hill", aim: { kind: "vessel", persistentId: 9 } },
+    });
+
+    await client.destroyCommandCamera(pad.flightId);
+    expect(client.cameras.map((c) => c.flightId)).toEqual([hill.flightId]);
+  });
+
+  it("models command camera aims and the authority lock", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.setDefaultCommandSubject(5);
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+
+    const pad = await client.createCommandCamera({ kind: CommandVantageKind.LaunchSite });
+    expect(pad.commandCentre?.aimKind).toBeUndefined();
+    expect(pad.commandCentre?.subjectPersistentId).toBe(5);
+    const centre = () => client.cameras.find((c) => c.flightId === pad.flightId)?.commandCentre;
+
+    await client.setCommandAim(pad.flightId, { kind: CommandAimKind.Vessel, persistentId: 9 });
+    expect(centre()?.aimKind).toBe(CommandAimKind.Vessel);
+    expect(centre()?.subjectPersistentId).toBe(9);
+    await client.setCommandAim(pad.flightId, { kind: CommandAimKind.Direction, azimuth: 0, elevation: 45 });
+    expect(centre()?.aimKind).toBe(CommandAimKind.Direction);
+    expect(centre()?.subjectPersistentId).toBe(5);
+
+    sidecar.setCommandAuthority("gonogo");
+    await expect(client.setCommandAim(pad.flightId, null)).rejects.toBeInstanceOf(CommandLockedError);
+
+    sidecar.setCommandAuthority(null);
+    expect(centre()?.aimKind).toBeUndefined();
+    await client.setCommandAim(pad.flightId, null);
+  });
+
+  it("refuses a command aim at a craft outside the target list", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({
+      flightId: 300,
+      kind: CameraKind.Command,
+      commandCentre: {
+        stationId: "ground:LaunchPad",
+        nodeName: "LaunchPad",
+        displayName: "Launch Pad",
+        body: "Kerbin",
+        latitude: 0,
+        longitude: 0,
+        altitude: 0,
+        subjectPersistentId: 5,
+        trackingLevel: 1,
+        targets: [
+          {
+            persistentId: 5,
+            vesselName: "Kerbal X",
+            vesselType: "Ship",
+            eligibility: CommandTargetEligibility.Ok,
+            eligibilityText: "Trackable",
+          },
+        ],
+      },
+    });
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+    const errors: ErrorPayload[] = [];
+    client.on("error", (e) => errors.push(e));
+
+    await expect(
+      client.setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 9 }),
+    ).rejects.toBeInstanceOf(CommandTargetUnknownError);
+
+    /* A client that skips the up-front check still gets the sidecar's refusal. */
+    await client._send({
+      type: "set-command-aim",
+      content: { flightId: 300, aim: { kind: CommandAimKind.Vessel, persistentId: 9 } },
+    });
+    expect(errors.map((e) => e.code)).toEqual([ErrorCode.CommandTargetUnknown]);
   });
 
   it("client sends hello on open()", async () => {

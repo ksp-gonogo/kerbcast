@@ -5,13 +5,13 @@
 //    capture path (#2) skip the Texture2D round-trip + GPU Apply() and write
 //    the AsyncGPUReadback NativeArray straight into the ring.
 // 2. Cross-language layout contract: regenerating the committed golden ring
-//    (sidecar/testdata/frame_ring_v1.ring) must be byte-identical. The Rust
+//    (sidecar/testdata/frame_ring_v2.ring) must be byte-identical. The Rust
 //    reader test (sidecar/src/shared_mem/mmap.rs,
 //    csharp_written_fixture_reads_back_exactly) consumes the same file, so
 //    the two language sides of the ring layout cannot silently drift.
 //
 // Regenerate the fixture (only on a deliberate, versioned layout change):
-//   dotnet run -- --write-fixture ../../sidecar/testdata/frame_ring_v1.ring
+//   dotnet run -- --write-fixture ../../sidecar/testdata/frame_ring_v2.ring
 //
 // Exit code 0 = pass, 1 = fail.
 
@@ -31,10 +31,10 @@ static void WriteFixture(string path)
     var ring = MmapFrameRing.Create(path, Slots, W, H);
     var f1 = new byte[W * H * 4];
     for (int i = 0; i < f1.Length; i++) f1[i] = (byte)((i * 7 + 13) & 0xFF);
-    ring.Produce(W, H, 1234.5, f1, 0, f1.Length);
+    ring.Produce(W, H, 1234.5, 86400.0, 7, f1, 0, f1.Length);
     var f2 = new byte[W * H * 4];
     for (int i = 0; i < f2.Length; i++) f2[i] = (byte)((i * 11 + 29) & 0xFF);
-    ring.Produce(W, H, 1235.5, f2, 0, f2.Length);
+    ring.Produce(W, H, 1235.5, 86400.25, 7, f2, 0, f2.Length);
     ring.Dispose();
 }
 
@@ -66,7 +66,7 @@ string pathPtr = Path.Combine(dir, "ptr.ring");
 // Ring A: write via the byte[] overload.
 {
     var ring = MmapFrameRing.Create(pathArr, Slots, W, H);
-    ulong seq = ring.Produce(W, H, ts, pixels, 0, pixels.Length);
+    ulong seq = ring.Produce(W, H, ts, 5000.5, 2, pixels, 0, pixels.Length);
     Check(seq == 1, "byte[] Produce returns seq 1 on first write");
     ring.Dispose();
 }
@@ -78,7 +78,7 @@ unsafe
     ulong seq;
     fixed (byte* p = pixels)
     {
-        seq = ring.Produce(W, H, ts, p, pixels.Length);
+        seq = ring.Produce(W, H, ts, 5000.5, 2, p, pixels.Length);
     }
     Check(seq == 1, "byte* Produce returns seq 1 on first write");
     ring.Dispose();
@@ -98,10 +98,10 @@ Check(a.Any(x => x != 0), "ring file is not all-zero (pixels were written)");
 // committed bytes exactly. A mismatch means the C# writer's layout moved —
 // which silently breaks the Rust reader unless both sides change together.
 {
-    string committed = Path.Combine(AppContext.BaseDirectory, "frame_ring_v1.ring");
+    string committed = Path.Combine(AppContext.BaseDirectory, "frame_ring_v2.ring");
     string regen = Path.Combine(dir, "regen.ring");
     WriteFixture(regen);
-    Check(File.Exists(committed), "committed frame_ring_v1.ring fixture present");
+    Check(File.Exists(committed), "committed frame_ring_v2.ring fixture present");
     if (File.Exists(committed))
     {
         byte[] want = File.ReadAllBytes(committed);

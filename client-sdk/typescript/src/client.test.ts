@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CameraKind,
   CameraLifecycle,
+  CommandAimKind,
+  CommandVantageKind,
+  ErrorCode,
   ErrorSource,
   Layer,
   QualityPreset,
@@ -8,6 +12,10 @@ import {
 } from "./__generated__/types";
 import {
   BrowserKerbcastTransport,
+  COMMAND_CAMERA_STATE_WAIT_MS,
+  CommandLockedError,
+  CommandTargetUnknownError,
+  CONTROL_OPEN_TIMEOUT_MS,
   type KerbcastConnectionState,
   type KerbcastDataChannel,
   type KerbcastPeer,
@@ -214,6 +222,28 @@ describe("KerbcastClient", () => {
     expect(captured.dc?.sent).toContain(JSON.stringify({ type: "hello" }));
   });
 
+  it("asks for frame stamps only from a sidecar that offers them", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+    await client.connect();
+    captured.dc?._open();
+    const optIns = () => (captured.dc?.sent ?? []).filter((m) => JSON.parse(m).type === "set-frame-stamps");
+
+    captured.dc?._msg(
+      JSON.stringify({ type: "hello", content: { sidecarVersion: "1.10.3", encoderBackend: "x" } }),
+    );
+    expect(optIns()).toEqual([]);
+
+    captured.dc?._msg(
+      JSON.stringify({
+        type: "hello",
+        content: { sidecarVersion: "1.11.0", encoderBackend: "x", frameStamps: true },
+      }),
+    );
+    expect(optIns()).toEqual([JSON.stringify({ type: "set-frame-stamps", content: { enabled: true } })]);
+  });
+
   it("emits `control-open` once per control channel open, after hello is sent", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);
@@ -229,6 +259,67 @@ describe("KerbcastClient", () => {
     await client.connect();
     captured.dc?._open();
     expect(sentAtOpen).toHaveLength(2);
+  });
+
+  describe("commands sent before the control channel opens", () => {
+    it("wait for it and go out after hello, in send order", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+
+      const fov = client.camera(7).setFov(40);
+      const sub = client.subscribe(7);
+      await Promise.resolve();
+      expect(captured.dc?.sent).toEqual([]);
+
+      captured.dc?._open();
+      await expect(Promise.all([fov, sub])).resolves.toBeDefined();
+      expect(captured.dc?.sent.map((m) => JSON.parse(m).type)).toEqual([
+        "hello",
+        "set-fov",
+        "subscribe",
+      ]);
+    });
+
+    it("reject when the channel does not open in time", async () => {
+      vi.useFakeTimers();
+      try {
+        const { transport } = makeFakeTransport();
+        const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+        vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+        await client.connect();
+        const outcome = client.subscribe(7).then(
+          () => "sent",
+          (e: Error) => e.message,
+        );
+        await vi.advanceTimersByTimeAsync(CONTROL_OPEN_TIMEOUT_MS + 1);
+        expect(await outcome).toMatch(/did not open within/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reject when the client disconnects first", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      const pending = client.subscribe(7);
+      client.disconnect();
+      await expect(pending).rejects.toThrow(/disconnected before the control channel opened/);
+      expect(captured.dc?.sent).toEqual([]);
+    });
+
+    it("reject when the channel closes before opening", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      const pending = client.subscribe(7);
+      captured.dc?._close();
+      await expect(pending).rejects.toThrow(/closed before it opened/);
+    });
   });
 
   it("populates the camera registry from a snapshot push", async () => {
@@ -459,6 +550,324 @@ describe("KerbcastClient", () => {
         content: { flightId: 5, mode: TrackMode.ActiveVessel },
       }),
     ]);
+  });
+
+  describe("command cameras", () => {
+    /* `reported` adds the game's first status report: a target, a target list and commandTrack. */
+    function commandCamera(flightId: number, token?: string, reported = true) {
+      return {
+        flightId,
+        kind: CameraKind.Command,
+        partName: "kerbcast.commandCamera",
+        partTitle: "Command camera",
+        cameraName: "Launchpad camera",
+        vesselName: "Launch Pad",
+        layers: [Layer.Near],
+        operatorLayers: [Layer.Near],
+        renderWidth: 768,
+        renderHeight: 768,
+        operatorWidth: 768,
+        operatorHeight: 768,
+        supportsZoom: false,
+        fov: 30,
+        fovMin: 30,
+        fovMax: 30,
+        supportsPan: false,
+        panYaw: 0,
+        panPitch: 0,
+        panYawMin: 0,
+        panYawMax: 0,
+        panPitchMin: 0,
+        panPitchMax: 0,
+        encoderBitrateBps: 0,
+        targetBitrateBps: 0,
+        degradeLevel: 0,
+        commandCentre: {
+          stationId: "ground:LaunchPad",
+          nodeName: "LaunchPad",
+          displayName: "Launch Pad",
+          body: "Kerbin",
+          latitude: 0,
+          longitude: 0,
+          altitude: 0,
+          subjectPersistentId: reported ? 42 : 0,
+          trackingLevel: 1,
+          targets: reported
+            ? [
+                {
+                  persistentId: 42,
+                  vesselName: "Kerbal X",
+                  vesselType: "Ship",
+                  rangeM: 519,
+                  eligibility: "ok",
+                  eligibilityText: "Trackable",
+                },
+              ]
+            : [],
+          created: token !== undefined,
+          ...(token !== undefined ? { token } : {}),
+        },
+        ...(reported
+          ? {
+              commandTrack: {
+                ut: 1,
+                hasFix: true,
+                rangeM: 519,
+                occluded: false,
+                occluder: "",
+                sunlit: true,
+                frameHeightPx: 768,
+                framingFits: true,
+                events: [],
+              },
+            }
+          : {}),
+      };
+    }
+
+    async function connected() {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      captured.dc?._open();
+      captured.dc!.sent.length = 0;
+      const snapshot = (cameras: unknown[]) =>
+        captured.dc?._msg(JSON.stringify({ type: "camera-snapshot", content: { cameras } }));
+      return { client, captured, snapshot };
+    }
+
+    it("createCommandCamera sends the request and resolves with the camera carrying its token", async () => {
+      const { client, captured, snapshot } = await connected();
+
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.LaunchSite, site: "LaunchPad" },
+        { token: "tok-1", name: "Pad cam" },
+      );
+      await Promise.resolve();
+      expect(captured.dc?.sent).toEqual([
+        JSON.stringify({
+          type: "create-command-camera",
+          content: {
+            token: "tok-1",
+            vantage: { kind: "launchSite", site: "LaunchPad" },
+            name: "Pad cam",
+          },
+        }),
+      ]);
+
+      snapshot([commandCamera(100), commandCamera(200, "someone-else")]);
+      snapshot([commandCamera(100), commandCamera(200, "someone-else"), commandCamera(300, "tok-1")]);
+      const cam = await created;
+      expect(cam.flightId).toBe(300);
+      expect(cam.commandCentre?.created).toBe(true);
+    });
+
+    it("createCommandCamera generates a token when none is given and passes target and look-at", async () => {
+      const { client, captured, snapshot } = await connected();
+      const aim = {
+        kind: CommandAimKind.Surface,
+        body: "Kerbin",
+        latitude: -0.0972,
+        longitude: -74.5577,
+        altitude: 70,
+        framingMarginM: 40,
+      };
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.Surface, body: "Kerbin", latitude: -0.05, longitude: -74.7 },
+        { aim },
+      );
+      await Promise.resolve();
+      const sent = JSON.parse(captured.dc!.sent[0]);
+      expect(sent.type).toBe("create-command-camera");
+      expect(typeof sent.content.token).toBe("string");
+      expect(sent.content.token.length).toBeGreaterThan(0);
+      expect(sent.content.aim).toEqual(aim);
+      expect("name" in sent.content).toBe(false);
+
+      snapshot([commandCamera(5, sent.content.token)]);
+      expect((await created).flightId).toBe(5);
+    });
+
+    it("createCommandCamera rejects when the camera never appears", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client } = await connected();
+        const created = client.createCommandCamera(
+          { kind: CommandVantageKind.Station, station: "Nowhere" },
+          { token: "t", timeoutMs: 1000 },
+        );
+        const outcome = created.then(
+          () => "resolved",
+          (e: Error) => e.message,
+        );
+        await vi.advanceTimersByTimeAsync(1001);
+        expect(await outcome).toMatch(/did not appear within 1000 ms/);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("createCommandCamera works straight after connect resolves", async () => {
+      const { transport, captured } = makeFakeTransport();
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+      await client.connect();
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.LaunchSite },
+        { token: "early" },
+      );
+      captured.dc?._open();
+      await Promise.resolve();
+      expect(captured.dc?.sent.map((m) => JSON.parse(m).type)).toEqual([
+        "hello",
+        "create-command-camera",
+      ]);
+      captured.dc?._msg(
+        JSON.stringify({
+          type: "camera-snapshot",
+          content: { cameras: [commandCamera(9, "early")] },
+        }),
+      );
+      expect((await created).flightId).toBe(9);
+    });
+
+    it("createCommandCamera resolves only once the camera's target is reported", async () => {
+      const { client, snapshot } = await connected();
+      let resolved = false;
+      const created = client.createCommandCamera(
+        { kind: CommandVantageKind.LaunchSite },
+        { token: "tok-2" },
+      );
+      void created.then(() => {
+        resolved = true;
+      });
+
+      snapshot([commandCamera(300, "tok-2", false)]);
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      snapshot([commandCamera(300, "tok-2")]);
+      const cam = await created;
+      expect(cam.commandCentre?.subjectPersistentId).toBe(42);
+      expect(cam.commandCentre?.targets.map((t) => t.persistentId)).toEqual([42]);
+    });
+
+    it("createCommandCamera resolves with what is known when no report comes", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client, snapshot } = await connected();
+        const created = client.createCommandCamera(
+          { kind: CommandVantageKind.LaunchSite },
+          { token: "bare", timeoutMs: 1000 },
+        );
+        const outcome = created.then(
+          (c) => c,
+          (e: Error) => e.message,
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        snapshot([commandCamera(300, "bare", false)]);
+        await vi.advanceTimersByTimeAsync(COMMAND_CAMERA_STATE_WAIT_MS + 1);
+        const cam = await outcome;
+        expect(typeof cam).not.toBe("string");
+        expect((cam as { flightId: number }).flightId).toBe(300);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("createCommandCamera throws when the control channel is not open", async () => {
+      const client = new KerbcastClient({ host: "h", port: 1 }, makeFakeTransport().transport);
+      await expect(
+        client.createCommandCamera({ kind: CommandVantageKind.LaunchSite }, { timeoutMs: 10 }),
+      ).rejects.toThrow(/control channel not open/);
+    });
+
+    it("destroyCommandCamera and setCommandAim send their commands", async () => {
+      const { client, captured } = await connected();
+      await client.destroyCommandCamera(2147483905);
+      await client.setCommandAim(2147483905, {
+        kind: CommandAimKind.Vessel,
+        persistentId: 4000000001,
+      });
+      await client.setCommandAim(2147483905, {
+        kind: CommandAimKind.Direction,
+        azimuth: 90,
+        elevation: 30,
+        framingMarginM: 50,
+      });
+      await client.setCommandAim(2147483905, null);
+      expect(captured.dc?.sent).toEqual([
+        JSON.stringify({ type: "destroy-command-camera", content: { flightId: 2147483905 } }),
+        JSON.stringify({
+          type: "set-command-aim",
+          content: { flightId: 2147483905, aim: { kind: "vessel", persistentId: 4000000001 } },
+        }),
+        JSON.stringify({
+          type: "set-command-aim",
+          content: {
+            flightId: 2147483905,
+            aim: { kind: "direction", azimuth: 90, elevation: 30, framingMarginM: 50 },
+          },
+        }),
+        JSON.stringify({ type: "set-command-aim", content: { flightId: 2147483905 } }),
+      ]);
+    });
+
+    it("setCommandAim rejects while a command authority holds the lock", async () => {
+      const { client, captured, snapshot } = await connected();
+      const locked = {
+        ...commandCamera(300),
+        commandTrack: { ...commandCamera(300).commandTrack, authority: { owner: "gonogo" } },
+      };
+      snapshot([locked]);
+      const err = await client
+        .setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 7 })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CommandLockedError);
+      expect((err as CommandLockedError).owner).toBe("gonogo");
+      expect((err as CommandLockedError).code).toBe(ErrorCode.CommandLocked);
+      expect(captured.dc?.sent).toEqual([]);
+
+      snapshot([commandCamera(300)]);
+      await client.setCommandAim(300, null);
+      expect(captured.dc?.sent).toEqual([
+        JSON.stringify({ type: "set-command-aim", content: { flightId: 300 } }),
+      ]);
+    });
+
+    it("setCommandAim rejects an aim at a craft missing from the target list", async () => {
+      const { client, captured, snapshot } = await connected();
+      snapshot([commandCamera(300)]);
+
+      const err = await client
+        .setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 99 })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CommandTargetUnknownError);
+      expect((err as CommandTargetUnknownError).code).toBe(ErrorCode.CommandTargetUnknown);
+      expect((err as CommandTargetUnknownError).persistentId).toBe(99);
+      expect((err as CommandTargetUnknownError).flightId).toBe(300);
+      await expect(
+        client.setCommandAim(300, {
+          kind: CommandAimKind.PositionAt,
+          body: "Kerbin",
+          ut: 0,
+          position: [0, 0, 7e5],
+          velocity: [0, 0, 0],
+          subjectPersistentId: 99,
+        }),
+      ).rejects.toBeInstanceOf(CommandTargetUnknownError);
+      expect(captured.dc?.sent).toEqual([]);
+
+      await client.setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 42 });
+      await client.setCommandAim(300, { kind: CommandAimKind.Direction, azimuth: 0, elevation: 10 });
+      expect(captured.dc?.sent).toHaveLength(2);
+
+      /* No list yet: the game decides. */
+      snapshot([commandCamera(301, undefined, false)]);
+      await client.setCommandAim(301, { kind: CommandAimKind.Vessel, persistentId: 99 });
+      expect(captured.dc?.sent).toHaveLength(3);
+    });
   });
 
   it("disconnect tears down peer + emits null MediaStream events", async () => {
@@ -875,6 +1284,51 @@ describe("KerbcastClient", () => {
       expect(streams[streams.length - 1]).toBeNull();
     });
 
+    it("frameLock keeps a noise-disabled camera on the pipeline with no static", async () => {
+      const fakeProcessed = new MediaStream();
+      const mockCaptureStream = vi.fn().mockReturnValue(fakeProcessed);
+      const fakeCtx = {
+        drawImage: vi.fn(),
+        fillRect: vi.fn(),
+        createImageData: vi.fn().mockReturnValue({ data: new Uint8ClampedArray(4) }),
+        putImageData: vi.fn(),
+      };
+      const origGetContext = HTMLCanvasElement.prototype.getContext;
+      // @ts-expect-error -- jsdom augmentation
+      HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue(fakeCtx);
+      // @ts-expect-error -- jsdom augmentation
+      HTMLCanvasElement.prototype.captureStream = mockCaptureStream;
+      let draw: FrameRequestCallback | null = null;
+      const rafSpy = vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((cb) => {
+        draw = cb;
+        return 0;
+      });
+
+      try {
+        const { transport, captured } = makeFakeTransport();
+        const client = new KerbcastClient(
+          { host: "h", port: 1, noise: { enabled: false }, frameLock: true },
+          transport,
+        );
+        vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer([3]));
+
+        await client.connect([3]);
+        captured.onTrack?.({} as MediaStreamTrack, 0);
+        const cam = client.camera(3);
+        expect(cam.mediaStream).toBe(fakeProcessed);
+
+        /* showStatic can't bring static back, and the waiting frame is plain black. */
+        cam.setShowStatic(true);
+        (draw as FrameRequestCallback | null)?.(0);
+        expect(fakeCtx.putImageData).not.toHaveBeenCalled();
+      } finally {
+        HTMLCanvasElement.prototype.getContext = origGetContext;
+        // @ts-expect-error -- cleanup
+        delete HTMLCanvasElement.prototype.captureStream;
+        rafSpy.mockRestore();
+      }
+    });
+
     it("noise pipeline is used when captureStream is available", async () => {
       const fakeProcessed = new MediaStream();
       const mockCaptureStream = vi.fn().mockReturnValue(fakeProcessed);
@@ -899,7 +1353,8 @@ describe("KerbcastClient", () => {
         captured.onTrack?.({} as MediaStreamTrack, 0);
 
         expect(client.camera(3).mediaStream).toBe(fakeProcessed);
-        expect(mockCaptureStream).toHaveBeenCalledWith(30);
+        /* Frames are captured on demand, one per emitted composite. */
+        expect(mockCaptureStream).toHaveBeenCalledWith(0);
       } finally {
         HTMLCanvasElement.prototype.getContext = origGetContext;
         // @ts-expect-error — cleanup
@@ -958,6 +1413,7 @@ describe("KerbcastClient", () => {
           setIntensity,
           setSource,
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1006,6 +1462,7 @@ describe("KerbcastClient", () => {
           setIntensity,
           setSource,
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1050,6 +1507,7 @@ describe("KerbcastClient", () => {
           setIntensity: vi.fn(),
           setSource,
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1169,6 +1627,7 @@ describe("KerbcastClient", () => {
           setIntensity: vi.fn(),
           setSource: vi.fn(),
           setShowStatic: vi.fn(),
+          setPassthrough: vi.fn(),
           destroy,
         });
       try {
@@ -1856,5 +2315,175 @@ describe("KerbcastClient.inboundVideoStats", () => {
     expect(events).toHaveLength(2);
     expect(events[1].throttleMainScreen).toBe(true);
     expect(client.throttleMainScreen).toBe(true);
+  });
+});
+
+describe("KerbcastClient frame UT", () => {
+  async function connected() {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+    return { sidecar, client };
+  }
+
+  /** A video element whose frame callbacks the test fires by hand. */
+  function fakeVideo() {
+    const callbacks = new Map<number, (now: number, meta: object) => void>();
+    let next = 1;
+    const video = {
+      requestVideoFrameCallback: (cb: (now: number, meta: object) => void) => {
+        callbacks.set(next, cb);
+        return next++;
+      },
+      cancelVideoFrameCallback: (id: number) => callbacks.delete(id),
+    } as unknown as HTMLVideoElement;
+    const present = (meta: object, now = 0) => {
+      const pending = [...callbacks.values()];
+      callbacks.clear();
+      for (const cb of pending) cb(now, meta);
+    };
+    return { video, present, armed: () => callbacks.size };
+  }
+
+  it("is null with neither a stamp nor a clock", async () => {
+    const { client } = await connected();
+    expect(client.frameUt(7, 1234)).toBeNull();
+  });
+
+  it("is exact for a stamped RTP timestamp and estimated otherwise", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500, captureEpoch: 2 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 90_000, captureUt: 498.25, captureEpoch: 2 });
+
+    expect(client.frameUt(7, 90_000)).toEqual({ ut: 498.25, epoch: 2, source: "exact" });
+    expect(client.frameUt(7, 93_000)?.source).toBe("estimated");
+    expect(client.frameUt(8, 90_000)?.source).toBe("estimated");
+    expect(client.frameUt(7)?.source).toBe("estimated");
+  });
+
+  it("forgets stamps on reconnect, since RTP timestamps restart per peer", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 1, captureUt: 10, captureEpoch: 0 });
+    expect(client.frameUt(7, 1)?.source).toBe("exact");
+    await client.connect();
+    expect(client.frameUt(7, 1)).toBeNull();
+  });
+
+  it("watchDisplayedFrames reports each presented frame with its source", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    const { video, present, armed } = fakeVideo();
+    const frames: unknown[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    present({ rtpTimestamp: 3000, expectedDisplayTime: 42 });
+    present({ rtpTimestamp: 6000, expectedDisplayTime: 75 });
+    expect(frames).toEqual([
+      { ut: 499.5, epoch: 0, source: "exact", flightId: 7, rtpTimestamp: 3000, presentedAt: 42 },
+      /* Unstamped: bounded by the last exactly identified frame. */
+      { ut: 499.5, epoch: 0, source: "estimated", flightId: 7, rtpTimestamp: 3000, presentedAt: 75 },
+    ]);
+
+    stop();
+    expect(armed()).toBe(0);
+  });
+
+  it("watchDisplayedFrames resolves noise-pipeline frames and keeps inexact ones estimated", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    const handle = client.camera(7) as unknown as {
+      _displayedSourceFrame(m: object): { rtpTimestamp: number | null; exact: boolean } | null;
+    };
+    const resolve = vi.spyOn(handle, "_displayedSourceFrame");
+    const { video, present } = fakeVideo();
+    const frames: unknown[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    resolve.mockReturnValueOnce({ rtpTimestamp: 3000, exact: true });
+    present({ mediaTime: 1.5, expectedDisplayTime: 42 });
+    resolve.mockReturnValueOnce({ rtpTimestamp: 3000, exact: false });
+    present({ presentationTime: 70, expectedDisplayTime: 75 });
+    expect(resolve).toHaveBeenNthCalledWith(1, video, { mediaTime: 1.5, expectedDisplayTime: 42 });
+    expect(frames).toEqual([
+      { ut: 499.5, epoch: 0, source: "exact", flightId: 7, rtpTimestamp: 3000, presentedAt: 42 },
+      { ut: 499.5, epoch: 0, source: "estimated", flightId: 7, rtpTimestamp: 3000, presentedAt: 75 },
+    ]);
+    stop();
+  });
+
+  it("watchDisplayedFrames estimates unidentified frames from a stamp old enough to be on screen", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    const now = vi.spyOn(performance, "now");
+    now.mockReturnValue(1000);
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    now.mockReturnValue(1100);
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 6000, captureUt: 499.6, captureEpoch: 0 });
+    now.mockRestore();
+    const { video, present } = fakeVideo();
+    const frames: { ut: number; source: string; rtpTimestamp: number | null }[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    /* No rtpTimestamp in the metadata and no pipeline: never exact, never newer than the screen. */
+    present({ expectedDisplayTime: 1200 });
+    present({ expectedDisplayTime: 1260 });
+    /* A presented rtp the sidecar never stamped is estimated the same way. */
+    present({ rtpTimestamp: 9000, expectedDisplayTime: 1300 });
+    expect(frames.map((f) => [f.ut, f.source, f.rtpTimestamp])).toEqual([
+      [499.5, "estimated", 3000],
+      [499.6, "estimated", 6000],
+      [499.6, "estimated", 6000],
+    ]);
+    stop();
+  });
+
+  it("watchDisplayedFrames distrusts a pipeline identification that runs backwards", async () => {
+    const { sidecar, client } = await connected();
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3000, captureUt: 499.5, captureEpoch: 0 });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 6000, captureUt: 499.6, captureEpoch: 0 });
+    const handle = client.camera(7) as unknown as {
+      _displayedSourceFrame(v: unknown, m: object): { rtpTimestamp: number | null; exact: boolean } | null;
+    };
+    const resolve = vi.spyOn(handle, "_displayedSourceFrame");
+    const { video, present } = fakeVideo();
+    const frames: { ut: number; source: string }[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    resolve.mockReturnValueOnce({ rtpTimestamp: 6000, exact: true });
+    present({ mediaTime: 2, expectedDisplayTime: 100 });
+    resolve.mockReturnValueOnce({ rtpTimestamp: 3000, exact: true });
+    present({ mediaTime: 1.9, expectedDisplayTime: 133 });
+    resolve.mockReturnValueOnce(null);
+    present({ mediaTime: 2.1, expectedDisplayTime: 166 });
+    expect(frames.map((f) => [f.ut, f.source])).toEqual([
+      [499.6, "exact"],
+      [499.6, "estimated"],
+      [499.6, "estimated"],
+    ]);
+    stop();
+  });
+
+  it("watchDisplayedFrames falls back to timed estimates without frame callbacks", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sidecar, client } = await connected();
+      sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });
+      const frames: { source: string; rtpTimestamp: number | null }[] = [];
+      const stop = client.watchDisplayedFrames(7, {} as HTMLVideoElement, (f) => frames.push(f));
+      vi.advanceTimersByTime(250);
+      stop();
+      vi.advanceTimersByTime(500);
+      expect(frames).toHaveLength(2);
+      expect(frames.every((f) => f.source === "estimated" && f.rtpTimestamp === null)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

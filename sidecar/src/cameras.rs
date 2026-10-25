@@ -7,7 +7,7 @@
 //!
 //! Each `CameraState` owns one mmap ring, one lazy-initialised
 //! `EncoderBackend` (created on first frame so it sees the actual ring
-//! dimensions), and a list of `TrackLocalStaticSample` weak refs — one per
+//! dimensions), and a list of `VideoTrack` weak refs, one per
 //! peer-track subscribed to this camera. The consume loop iterates the
 //! registry once per tick, encodes only cameras with `subscribers > 0`,
 //! and fans the resulting NALs out to every alive track.
@@ -18,15 +18,18 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
+use crate::webrtc::video_track::VideoTrack;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+use crate::commands::{validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE};
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
-    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CrewLocation,
-    DisplaySizeReport, Layer, QualityPreset, SettingsStatePayload, TrackMode,
+    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
+    CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
+    CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
+    ErrorCode, Layer, QualityPreset, SetCommandAimPayload, SettingsStatePayload, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
@@ -111,6 +114,11 @@ struct GlobalStatusFile {
     capture_epoch: Option<u32>,
     #[serde(default)]
     time_warp_rate: Option<f64>,
+    /// Unix wall-clock milliseconds when the plugin sampled `capture_ut`.
+    /// Plugin and sidecar share a machine, so the sidecar can age the clock
+    /// up to the moment it sends. Absent in older plugin writes.
+    #[serde(default)]
+    capture_wall_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,13 +151,141 @@ struct PerCameraStatus {
     /// once per kOS set.
     #[serde(default)]
     track_report_seq: u32,
+    /// Aim and visibility of a command camera. Absent for every other
+    /// kind. A malformed object is dropped rather than failing the whole
+    /// status read, so one bad camera cannot freeze every feed's state.
+    #[serde(
+        default,
+        deserialize_with = "lenient_command_track",
+        skip_serializing_if = "Option::is_none"
+    )]
+    command_track: Option<CommandTrackState>,
+    /// A command camera's target, range, Tracking Station level and target
+    /// list. Absent for every other kind; a malformed object is dropped.
+    #[serde(
+        default,
+        deserialize_with = "lenient_command_centre",
+        skip_serializing_if = "Option::is_none"
+    )]
+    command_centre: Option<CommandCentreStatus>,
+}
+
+/// The per-write part of a command camera's `CommandCentreInfo`. The plugin
+/// rounds every range to 3 significant figures, so an unchanged list compares
+/// equal from one write to the next and only a visible move re-broadcasts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandCentreStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aim_kind: Option<CommandAimKind>,
+    #[serde(default)]
+    subject_persistent_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    range_m: Option<f64>,
+    #[serde(default)]
+    tracking_level: u32,
+    #[serde(default)]
+    targets: Vec<CommandTarget>,
+}
+
+fn lenient_command_centre<'de, D>(d: D) -> Result<Option<CommandCentreStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value(value) {
+        Ok(c) => Ok(Some(c)),
+        Err(e) => {
+            tracing::debug!(error = %e, "command centre parse failed; dropping it");
+            Ok(None)
+        }
+    }
+}
+
+/*
+ * Whether a command track moved enough to tell viewers. Its `ut` advances on
+ * every status write, and a still craft's range and bracket wobble below
+ * anything visible; broadcasting those alone would send every viewer a camera
+ * update each second for nothing.
+ */
+fn command_track_changed(a: &Option<CommandTrackState>, b: &Option<CommandTrackState>) -> bool {
+    fn near(a: Option<f64>, b: Option<f64>, tol: f64) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => (x - y).abs() <= tol,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    match (a, b) {
+        (None, None) => false,
+        (Some(a), Some(b)) => {
+            let range_tol = a.range_m.unwrap_or(0.0).abs() * 1e-3;
+            a.has_fix != b.has_fix
+                || !near(a.range_m, b.range_m, range_tol)
+                || a.occluded != b.occluded
+                || a.occluder != b.occluder
+                || a.sunlit != b.sunlit
+                || !near(a.bracket_half_px, b.bracket_half_px, 0.5)
+                || a.frame_height_px != b.frame_height_px
+                || a.framing_fits != b.framing_fits
+                || !near(a.true_offset_px, b.true_offset_px, 0.5)
+                || a.authority != b.authority
+                || a.blank != b.blank
+                || a.events != b.events
+        }
+        _ => true,
+    }
+}
+
+fn lenient_command_track<'de, D>(d: D) -> Result<Option<CommandTrackState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value(value) {
+        Ok(track) => Ok(Some(track)),
+        Err(e) => {
+            // debug, not warn: the status file is re-read every consume tick.
+            tracing::debug!(error = %e, "command track parse failed; dropping it");
+            Ok(None)
+        }
+    }
 }
 
 /// Project the wire `SettingsStatePayload` out of an on-disk status snapshot.
 fn settings_from_status(s: &GlobalStatusFile) -> SettingsStatePayload {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    settings_from_status_at(s, now_ms)
+}
+
+/// Longest the sidecar ages the capture clock past its write. A status write
+/// lands about once a second, so anything older means a paused or stalled game.
+const MAX_CAPTURE_CLOCK_AGE_MS: f64 = 1500.0;
+
+/*
+ * The capture clock aged from the plugin's write to `now_ms`, so a consumer
+ * extrapolating from arrival is not a poll interval behind the video.
+ */
+fn settings_from_status_at(s: &GlobalStatusFile, now_ms: f64) -> SettingsStatePayload {
+    let capture_ut = match (s.capture_ut, s.capture_wall_ms) {
+        (Some(ut), Some(wall)) => {
+            let age_ms = (now_ms - wall).clamp(0.0, MAX_CAPTURE_CLOCK_AGE_MS);
+            Some(ut + age_ms / 1000.0 * s.time_warp_rate.unwrap_or(1.0))
+        }
+        (ut, _) => ut,
+    };
     SettingsStatePayload {
         throttle_main_screen: s.throttle_main_screen,
-        capture_ut: s.capture_ut,
+        capture_ut,
         capture_epoch: s.capture_epoch,
         time_warp_rate: s.time_warp_rate,
     }
@@ -321,6 +457,10 @@ pub struct CameraInfo {
     /// Which source a kerbal camera is currently rendering. `None` for
     /// part cameras.
     pub crew_location: Option<CrewLocation>,
+    /// Station identity for a command camera; omitted for
+    /// every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_centre: Option<CommandCentreInfo>,
     /// Server-authoritative auto-track mode for a pan+zoom camera. `None` =
     /// not tracking. Every browser reflects this.
     pub track_mode: TrackMode,
@@ -422,6 +562,27 @@ struct InfoManifest {
     /// `"seat"` or `"eva"`. `None` for part cameras.
     #[serde(default)]
     crew_location: Option<String>,
+    /// Command camera station identity, present only on `"command"` manifests.
+    #[serde(default)]
+    station_id: Option<String>,
+    /// Set on a command camera created at runtime.
+    #[serde(default)]
+    command_created: Option<bool>,
+    /// The creating client's token, on a camera a client created.
+    #[serde(default)]
+    command_token: Option<String>,
+    #[serde(default)]
+    station_node_name: Option<String>,
+    #[serde(default)]
+    station_name: Option<String>,
+    #[serde(default)]
+    station_body: Option<String>,
+    #[serde(default)]
+    station_latitude: Option<f64>,
+    #[serde(default)]
+    station_longitude: Option<f64>,
+    #[serde(default)]
+    station_altitude: Option<f64>,
 }
 
 pub struct CameraState {
@@ -450,6 +611,9 @@ pub struct CameraState {
     /// (a fresh attach is never triggered by the switch). Read via
     /// `crew_location()`.
     crew_location: std::sync::Mutex<Option<CrewLocation>>,
+    /// Station identity for a command camera. Static for the
+    /// camera's life (the station does not move).
+    pub command_centre: Option<CommandCentreInfo>,
     pub part_name: String,
     pub part_title: String,
     pub camera_name: String,
@@ -559,10 +723,10 @@ pub struct CameraState {
     pub ramping: AtomicBool,
     /// Pending forced-IDR request, consumed by the encode path.
     pub keyframe_wanted: AtomicBool,
-    /// One `TrackLocalStaticSample` per subscribed peer-track. Weak refs so
+    /// One `VideoTrack` per subscribed peer-track. Weak refs so
     /// dropped peers get GC'd from this list naturally — no manual unsub
     /// bookkeeping per peer needed.
-    pub tracks: RwLock<Vec<Weak<TrackLocalStaticSample>>>,
+    pub tracks: RwLock<Vec<Weak<VideoTrack>>>,
     /// Per-consumer reported display size in px, keyed by `peer_id` (stable for
     /// the connection's lifetime, present at the report site AND every teardown
     /// site). Auto-resolution takes the per-dimension MAX across live entries;
@@ -596,7 +760,7 @@ impl CameraState {
     /// Add a track to this camera and bump the subscriber count. Returns
     /// the count after the increment so the caller can request a keyframe
     /// on the 0→1 transition.
-    pub async fn add_track(&self, track: Arc<TrackLocalStaticSample>) -> usize {
+    pub async fn add_track(&self, track: Arc<VideoTrack>) -> usize {
         let mut tracks = self.tracks.write().await;
         tracks.push(Arc::downgrade(&track));
         self.subscribers.fetch_add(1, Ordering::AcqRel) + 1
@@ -618,7 +782,7 @@ impl CameraState {
     /// never double-counts it (it's already out of the list). Returns the
     /// subscriber count after the decrement; removing a track this camera
     /// isn't feeding is a no-op.
-    pub async fn remove_track(&self, track: &Arc<TrackLocalStaticSample>) -> usize {
+    pub async fn remove_track(&self, track: &Arc<VideoTrack>) -> usize {
         let mut tracks = self.tracks.write().await;
         let before = tracks.len();
         tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
@@ -991,6 +1155,9 @@ pub struct CameraRegistry {
      * Subsequent writes bump atomically so concurrent peer handlers compose.
      */
     global_control_seq: AtomicU64,
+    /// The sidecar's copy of `global.commands.json`. Held across the whole
+    /// append and file write, so two requests can never land out of order.
+    command_queue: Mutex<CommandQueue>,
     /// Cameras whose sidecar-side state (e.g. viewer quality preset)
     /// changed and needs a `camera-state-changed` broadcast to EVERY
     /// connected peer. The plugin-status diff in `poll_status` can't see
@@ -1122,6 +1289,7 @@ impl CameraRegistry {
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
+            command_queue: Mutex::new(CommandQueue::default()),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1386,6 +1554,7 @@ impl CameraRegistry {
                             max_height: ring_dims.max_height,
                             kind: camera_kind_from_manifest(&manifest.kind),
                             kerbal_persistent_id: manifest.kerbal_persistent_id,
+                            command_centre: command_centre_from_manifest(&manifest),
                             crew_location: std::sync::Mutex::new(crew_location_from_manifest(
                                 manifest.crew_location.as_deref(),
                             )),
@@ -1511,6 +1680,18 @@ impl CameraRegistry {
     pub async fn list(&self) -> Vec<CameraInfo> {
         let cams = self.snapshot().await;
         let primary_fps = self.primary_capture_fps().await;
+        let centres: HashMap<u32, CommandCentreStatus> = self
+            .last_status
+            .lock()
+            .await
+            .as_ref()
+            .map(|st| {
+                st.cameras
+                    .iter()
+                    .filter_map(|c| c.command_centre.clone().map(|cc| (c.flight_id, cc)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut out = Vec::with_capacity(cams.len());
         for s in &cams {
             let ctrl = s.control.lock().await.clone();
@@ -1524,6 +1705,7 @@ impl CameraRegistry {
                 },
                 kind: s.kind,
                 kerbal_persistent_id: s.kerbal_persistent_id,
+                command_centre: command_centre_with(&s.command_centre, centres.get(&s.flight_id)),
                 crew_location: s.crew_location(),
                 track_mode: s.track_mode(),
                 max_width: s.max_width,
@@ -1686,6 +1868,8 @@ impl CameraRegistry {
                         || (p.fov - cam_status.fov).abs() > 0.01
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
+                        || command_track_changed(&p.command_track, &cam_status.command_track)
+                        || p.command_centre != cam_status.command_centre
                 }
             };
             if !changed {
@@ -1718,6 +1902,11 @@ impl CameraRegistry {
                 },
                 kind: cam.kind,
                 kerbal_persistent_id: cam.kerbal_persistent_id,
+                command_centre: command_centre_with(
+                    &cam.command_centre,
+                    cam_status.command_centre.as_ref(),
+                ),
+                command_track: cam_status.command_track.clone(),
                 capture_state: cam.capture_state_with(background_capturing),
                 crew_location: cam.crew_location(),
                 track_mode: cam.track_mode(),
@@ -1849,6 +2038,130 @@ impl CameraRegistry {
         tokio::fs::write(&tmp, json.as_bytes()).await?;
         tokio::fs::rename(&tmp, &path).await?;
         Ok(())
+    }
+
+    /// Append a request to `global.commands.json` under the next id and
+    /// return the id. The plugin applies each id once.
+    async fn append_command(&self, op: CommandOp) -> std::io::Result<u64> {
+        let path = self.shm_dir.join(COMMANDS_FILE);
+        let mut queue = self.command_queue.lock().await;
+        if !queue.is_seeded() {
+            let on_disk = tokio::fs::read(&path).await.ok();
+            queue.seed(on_disk.as_deref());
+        }
+        let id = queue.push(op);
+        let json = queue
+            .to_json()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, json.as_bytes()).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(id)
+    }
+
+    /// Queue a command camera for the plugin to create. Errors on a malformed
+    /// request or a failed write; whether the vantage exists is the game's
+    /// call, and a refused one simply never appears.
+    pub async fn request_create_command_camera(
+        &self,
+        payload: CreateCommandCameraPayload,
+    ) -> Result<u64, String> {
+        validate_create(&payload)?;
+        self.append_command(CommandOp::Create(payload))
+            .await
+            .map_err(|e| format!("command request write failed: {e}"))
+    }
+
+    /// Queue the destruction of a created command camera. Errors on an
+    /// unknown camera, one that is not a command camera, or the settings
+    /// camera.
+    pub async fn request_destroy_command_camera(&self, flight_id: u32) -> Result<u64, String> {
+        let Some(cam) = self.get(flight_id).await else {
+            return Err(format!("no camera with flight_id={flight_id}"));
+        };
+        if cam.kind != CameraKind::Command {
+            return Err(format!("camera {flight_id} is not a command camera"));
+        }
+        if !cam.command_centre.as_ref().is_some_and(|c| c.created) {
+            return Err(format!(
+                "camera {flight_id} is the game's own command camera and can not be destroyed"
+            ));
+        }
+        self.append_command(CommandOp::Destroy(DestroyCommandCameraPayload {
+            flight_id,
+        }))
+        .await
+        .map_err(|e| format!("command request write failed: {e}"))
+    }
+
+    /// Queue an aim change for a command camera. Errors on an unknown or
+    /// non-command camera, a malformed aim, while the plugin reports a
+    /// command authority holding the lock (with `ErrorCode::CommandLocked`),
+    /// or when the aim's craft is missing from the camera's latest target
+    /// list (with `ErrorCode::CommandTargetUnknown`).
+    pub async fn request_command_aim(
+        &self,
+        payload: SetCommandAimPayload,
+    ) -> Result<u64, (String, Option<ErrorCode>)> {
+        let flight_id = payload.flight_id;
+        let Some(cam) = self.get(flight_id).await else {
+            return Err((format!("no camera with flight_id={flight_id}"), None));
+        };
+        if cam.kind != CameraKind::Command {
+            return Err((format!("camera {flight_id} is not a command camera"), None));
+        }
+        if let Some(a) = &payload.aim {
+            validate_aim(a).map_err(|e| (e, None))?;
+        }
+        if let Some(owner) = self.command_lock_owner(flight_id).await {
+            return Err((
+                format!("{owner} holds the command camera lock; aim refused"),
+                Some(ErrorCode::CommandLocked),
+            ));
+        }
+        if let Some(pid) = payload.aim.as_ref().and_then(aim_craft) {
+            if self.command_target_unknown(flight_id, pid).await {
+                return Err((
+                    format!("craft {pid} is not among camera {flight_id}'s targets; aim refused"),
+                    Some(ErrorCode::CommandTargetUnknown),
+                ));
+            }
+        }
+        self.append_command(CommandOp::Aim(payload))
+            .await
+            .map_err(|e| (format!("command request write failed: {e}"), None))
+    }
+
+    /*
+     * Whether the plugin's last target list for this camera lacks `pid`. With
+     * no list yet, or an empty one (the plugin writes that when listing
+     * fails), the plugin decides.
+     */
+    async fn command_target_unknown(&self, flight_id: u32, pid: u32) -> bool {
+        let status = self.last_status.lock().await;
+        let Some(centre) = status
+            .as_ref()
+            .and_then(|s| s.cameras.iter().find(|c| c.flight_id == flight_id))
+            .and_then(|c| c.command_centre.as_ref())
+        else {
+            return false;
+        };
+        !centre.targets.is_empty() && !centre.targets.iter().any(|t| t.persistent_id == pid)
+    }
+
+    /// The command authority the plugin last reported for this camera, if any.
+    async fn command_lock_owner(&self, flight_id: u32) -> Option<String> {
+        let status = self.last_status.lock().await;
+        status
+            .as_ref()?
+            .cameras
+            .iter()
+            .find(|c| c.flight_id == flight_id)?
+            .command_track
+            .as_ref()?
+            .authority
+            .as_ref()
+            .map(|a| a.owner.clone())
     }
 
     /// Update the `subscribed` flag in the cam's ControlState and flush
@@ -2316,6 +2629,11 @@ impl CameraRegistry {
             },
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
+            command_centre: command_centre_with(
+                &cam.command_centre,
+                per.as_ref().and_then(|p| p.command_centre.as_ref()),
+            ),
+            command_track: per.as_ref().and_then(|p| p.command_track.clone()),
             capture_state: cam.capture_state_with(background_capturing),
             crew_location: cam.crew_location(),
             track_mode: cam.track_mode(),
@@ -2402,6 +2720,15 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
         pan_pitch_max: 0.0,
         kind: String::new(),
         kerbal_persistent_id: None,
+        station_id: None,
+        command_created: None,
+        command_token: None,
+        station_node_name: None,
+        station_name: None,
+        station_body: None,
+        station_latitude: None,
+        station_longitude: None,
+        station_altitude: None,
         crew_location: None,
     };
     let bytes = match tokio::fs::read(&path).await {
@@ -2426,8 +2753,68 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
 fn camera_kind_from_manifest(kind: &str) -> CameraKind {
     match kind {
         "kerbal" => CameraKind::Kerbal,
+        "command" => CameraKind::Command,
         _ => CameraKind::Part,
     }
+}
+
+/// Station identity from a `"command"` manifest. `None` for any other
+/// kind, or when the plugin wrote no station id.
+/// The craft an aim names: a `vessel` aim's craft, or an `orbit` or
+/// `positionAt` aim's subject.
+fn aim_craft(aim: &CommandAim) -> Option<u32> {
+    match aim.kind {
+        CommandAimKind::Vessel => aim.persistent_id,
+        CommandAimKind::Orbit | CommandAimKind::PositionAt => aim.subject_persistent_id,
+        CommandAimKind::Surface | CommandAimKind::Direction => None,
+    }
+    .filter(|&pid| pid != 0)
+}
+
+fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
+    if camera_kind_from_manifest(&m.kind) != CameraKind::Command {
+        return None;
+    }
+    let station_id = m.station_id.clone()?;
+    let node_name = m.station_node_name.clone().unwrap_or_default();
+    let display_name = m
+        .station_name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| node_name.clone());
+    Some(CommandCentreInfo {
+        station_id,
+        node_name,
+        display_name,
+        body: m.station_body.clone().unwrap_or_default(),
+        latitude: m.station_latitude.unwrap_or_default(),
+        longitude: m.station_longitude.unwrap_or_default(),
+        altitude: m.station_altitude.unwrap_or_default(),
+        aim_kind: None,
+        subject_persistent_id: 0,
+        range_m: None,
+        tracking_level: 0,
+        targets: Vec::new(),
+        created: m.command_created.unwrap_or(false),
+        token: m.command_token.clone().filter(|t| !t.is_empty()),
+    })
+}
+
+/// The static station identity from the manifest with the plugin's latest
+/// target, range, level and target list laid over it.
+fn command_centre_with(
+    info: &Option<CommandCentreInfo>,
+    status: Option<&CommandCentreStatus>,
+) -> Option<CommandCentreInfo> {
+    let mut out = info.clone()?;
+    if let Some(s) = status {
+        out.aim_kind = s.aim_kind;
+        out.subject_persistent_id = s.subject_persistent_id;
+        out.range_m = s.range_m;
+        out.tracking_level = s.tracking_level;
+        out.targets = s.targets.clone();
+    }
+    Some(out)
 }
 
 /// Manifest `crew_location` string -> protocol enum. Absent/unrecognised
@@ -2515,6 +2902,188 @@ mod tests {
                 .expect("advanced UT emits settings")
                 .capture_ut,
             Some(1004.0)
+        );
+    }
+
+    /// The clock is aged from the plugin's write to the send, at the warp
+    /// rate, and never by more than the cap.
+    #[test]
+    fn capture_clock_ages_from_write_to_send() {
+        let status: GlobalStatusFile = serde_json::from_str(
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[],"captureUt":1000.0,"timeWarpRate":4.0,"captureWallMs":50000.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings_from_status_at(&status, 50250.0).capture_ut,
+            Some(1001.0)
+        );
+        assert_eq!(
+            settings_from_status_at(&status, 49000.0).capture_ut,
+            Some(1000.0)
+        );
+        assert_eq!(
+            settings_from_status_at(&status, 90000.0).capture_ut,
+            Some(1006.0)
+        );
+
+        let old: GlobalStatusFile = serde_json::from_str(
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[],"captureUt":1000.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings_from_status_at(&old, 90000.0).capture_ut,
+            Some(1000.0)
+        );
+    }
+
+    const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"gonogo"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;
+
+    fn per_camera_with(command_track: Option<&str>) -> PerCameraStatus {
+        let extra = command_track
+            .map(|g| format!(r#","commandTrack":{g}"#))
+            .unwrap_or_default();
+        serde_json::from_str(&format!(
+            r#"{{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64{extra}}}"#
+        ))
+        .expect("per-camera status parses")
+    }
+
+    #[test]
+    fn command_track_parses_when_present() {
+        let track = per_camera_with(Some(COMMAND_TRACK_JSON))
+            .command_track
+            .expect("command track");
+        assert!(track.has_fix);
+        assert_eq!(track.range_m, Some(11507905.1));
+        assert!(track.occluded);
+        assert_eq!(track.occluder, "Mun");
+        assert_eq!(track.bracket_half_px, Some(4.2));
+        assert_eq!(track.frame_height_px, 576);
+        let authority = track.authority.expect("authority");
+        assert_eq!(authority.owner, "gonogo");
+        assert_eq!(track.blank, None);
+        assert_eq!(track.events.len(), 2);
+        assert!(track.events[1].occluded);
+    }
+
+    #[test]
+    fn command_track_absent_or_null_is_none() {
+        assert!(per_camera_with(None).command_track.is_none());
+        assert!(per_camera_with(Some("null")).command_track.is_none());
+    }
+
+    /// A standalone track (no authority, no fix) uses the defaults for every
+    /// optional field.
+    #[test]
+    fn command_track_standalone_without_fix_parses() {
+        let track = per_camera_with(Some(
+            r#"{"ut":1.0,"hasFix":false,"rangeM":null,"bracketHalfPx":null,"frameHeightPx":576,"authority":null,"events":[]}"#,
+        ))
+        .command_track
+        .expect("command track");
+        assert!(!track.has_fix);
+        assert!(track.range_m.is_none());
+        assert!(track.authority.is_none());
+        assert!(track.framing_fits, "absent framingFits defaults true");
+    }
+
+    /// A malformed command track drops only itself: the rest of the camera's
+    /// status still parses.
+    #[test]
+    fn command_track_malformed_is_tolerated() {
+        for bad in [
+            r#""nope""#,
+            r#"{"ut":1.0,"hasFix":"yes"}"#,
+            r#"{"ut":1.0,"authority":{"owner":7}}"#,
+        ] {
+            let status = per_camera_with(Some(bad));
+            assert!(status.command_track.is_none(), "{bad} dropped");
+            assert_eq!(status.render_width, 64);
+        }
+    }
+
+    /// A command track reaches the protocol camera state, re-broadcasts when
+    /// it changes, and an identical re-write does not re-broadcast.
+    #[tokio::test]
+    async fn poll_status_broadcasts_command_track_changes_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 5_002;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let status_path = shm.join("global.status.json");
+
+        let write = |track: &str| {
+            std::fs::write(
+                &status_path,
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{flight_id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandTrack":{track}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write(COMMAND_TRACK_JSON);
+        let delta = registry.poll_status().await;
+        let state = delta
+            .changed_cameras
+            .first()
+            .expect("first poll broadcasts");
+        assert_eq!(
+            state.command_track.as_ref().map(|t| t.occluder.as_str()),
+            Some("Mun")
+        );
+        let json = serde_json::to_value(state).unwrap();
+        assert_eq!(json["commandTrack"]["authority"]["owner"], "gonogo");
+        assert_eq!(json["commandTrack"]["bracketHalfPx"], 4.2);
+
+        write(COMMAND_TRACK_JSON);
+        assert!(
+            registry.poll_status().await.changed_cameras.is_empty(),
+            "an equal command track does not re-broadcast"
+        );
+
+        write(
+            &COMMAND_TRACK_JSON
+                .replace(r#""ut":637599435.82"#, r#""ut":637599436.82"#)
+                .replace(r#""rangeM":11507905.1"#, r#""rangeM":11507910.4"#)
+                .replace(r#""bracketHalfPx":4.2"#, r#""bracketHalfPx":4.3"#),
+        );
+        assert!(
+            registry.poll_status().await.changed_cameras.is_empty(),
+            "a later ut with sub-visible range and bracket drift does not re-broadcast"
+        );
+
+        write(&COMMAND_TRACK_JSON.replace(r#""bracketHalfPx":4.2"#, r#""bracketHalfPx":6.0"#));
+        assert_eq!(
+            registry.poll_status().await.changed_cameras.len(),
+            1,
+            "a visible bracket change re-broadcasts"
+        );
+
+        write(&COMMAND_TRACK_JSON.replace(
+            r#""blank":null,"events""#,
+            r#""blank":"Waiting for gonogo","events""#,
+        ));
+        let delta = registry.poll_status().await;
+        assert_eq!(
+            delta.changed_cameras[0]
+                .command_track
+                .as_ref()
+                .and_then(|t| t.blank.as_deref()),
+            Some("Waiting for gonogo")
+        );
+
+        let snapshot = registry.protocol_state(flight_id).await.expect("state");
+        assert!(
+            snapshot.command_track.is_some(),
+            "snapshot carries the track"
         );
     }
 
@@ -2844,13 +3413,14 @@ mod tests {
         );
 
         use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-        let track = Arc::new(TrackLocalStaticSample::new(
+        let track = Arc::new(VideoTrack::new(
             RTCRtpCodecCapability {
                 mime_type: "video/H264".to_owned(),
                 ..Default::default()
             },
             "video".to_owned(),
             "kerbcast-7104".to_owned(),
+            None,
         ));
         cam.add_track(track).await;
 
@@ -3148,6 +3718,356 @@ mod tests {
         assert_eq!(info.kind, CameraKind::Kerbal);
         assert_eq!(info.kerbal_persistent_id, Some(42));
         assert_eq!(info.crew_location, Some(CrewLocation::Seat));
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(
+            json.get("commandCentre").is_none(),
+            "non-command cameras omit commandCentre so existing payloads are unchanged"
+        );
+    }
+
+    /// A command camera manifest threads its kind and station
+    /// identity through `rescan` into `/cameras`, and the camera carries the
+    /// same per-camera stats fields as any other kind (it rides the normal
+    /// ring/registry path).
+    #[tokio::test]
+    async fn rescan_populates_command_centre_camera_from_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 0x8123_4567;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
+
+        let content = format!(
+            r#"{{"lifecycle":"active","kind":"command","flight_id":{flight_id},"part_name":"kerbcast.commandCamera","part_title":"Command camera","camera_name":"KSC tracking","vessel_name":"KSC","supports_zoom":false,"fov":30,"fov_min":30,"fov_max":30,"supports_pan":false,"pan_yaw_min":0,"pan_yaw_max":0,"pan_pitch_min":0,"pan_pitch_max":0,"station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center","station_body":"Kerbin","station_latitude":-0.13,"station_longitude":-74.6,"station_altitude":95.5}}"#,
+        );
+        tokio::fs::write(shm.join(format!("{flight_id}.info.json")), content)
+            .await
+            .unwrap();
+
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        assert_eq!(cam.kind, CameraKind::Command);
+        let station = cam.command_centre.clone().expect("station identity");
+        assert_eq!(station.station_id, "ground:KSC");
+        assert_eq!(station.node_name, "KSC");
+        assert_eq!(station.body, "Kerbin");
+        assert!((station.altitude - 95.5).abs() < 1e-9);
+
+        let info = registry
+            .list()
+            .await
+            .into_iter()
+            .find(|c| c.flight_id == flight_id)
+            .expect("camera in list");
+        assert_eq!(info.kind, CameraKind::Command);
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["kind"], "command");
+        assert_eq!(json["commandCentre"]["stationId"], "ground:KSC");
+        assert_eq!(json["commandCentre"]["displayName"], "Kerbal Space Center");
+        assert_eq!(json["commandCentre"]["subjectPersistentId"], 0);
+        assert!(json["commandCentre"].get("aimKind").is_none());
+        assert_eq!(json["commandCentre"]["targets"], serde_json::json!([]));
+        for key in [
+            "targetCaptureFps",
+            "displayed",
+            "captureFps",
+            "sentFps",
+            "keyframesSent",
+            "keyframeRequestsReceived",
+        ] {
+            assert!(json.get(key).is_some(), "command camera reports {key}");
+        }
+    }
+
+    /// A created command camera carries its creator's token, can be
+    /// destroyed and aimed through `global.commands.json`; the settings
+    /// camera can only be aimed.
+    #[tokio::test]
+    async fn created_command_cameras_and_the_request_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let created_id: u32 = 0x8000_0101;
+        let settings_id: u32 = 0x8000_0202;
+        for (id, extra) in [
+            (
+                created_id,
+                r#","command_created":true,"command_token":"tok-7""#,
+            ),
+            (settings_id, ""),
+        ] {
+            MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+            let content = format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","station_id":"ground:LaunchPad","station_node_name":"LaunchPad","station_name":"Launch Pad"{extra}}}"#
+            );
+            tokio::fs::write(shm.join(format!("{id}.info.json")), content)
+                .await
+                .unwrap();
+        }
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+
+        let list = registry.list().await;
+        let json = |id: u32| {
+            serde_json::to_value(list.iter().find(|c| c.flight_id == id).unwrap()).unwrap()
+        };
+        assert_eq!(json(created_id)["commandCentre"]["created"], true);
+        assert_eq!(json(created_id)["commandCentre"]["token"], "tok-7");
+        assert_eq!(json(settings_id)["commandCentre"]["created"], false);
+        assert!(json(settings_id)["commandCentre"].get("token").is_none());
+
+        assert!(registry
+            .request_destroy_command_camera(settings_id)
+            .await
+            .is_err());
+        assert!(registry
+            .request_destroy_command_camera(12345)
+            .await
+            .is_err());
+        let first = registry
+            .request_destroy_command_camera(created_id)
+            .await
+            .expect("created camera can be destroyed");
+        let look = registry
+            .request_command_aim(SetCommandAimPayload {
+                flight_id: settings_id,
+                aim: None,
+            })
+            .await
+            .expect("any command camera takes an aim");
+        assert_eq!(look, first + 1, "ids only grow");
+
+        let file: crate::commands::CommandFile =
+            serde_json::from_slice(&tokio::fs::read(shm.join(COMMANDS_FILE)).await.unwrap())
+                .unwrap();
+        assert_eq!(file.requests.len(), 2);
+        assert_eq!(
+            file.requests[0].op,
+            CommandOp::Destroy(DestroyCommandCameraPayload {
+                flight_id: created_id
+            })
+        );
+
+        /* A second registry (a restarted sidecar) carries the ids on. */
+        let restarted = CameraRegistry::new(shm.to_path_buf());
+        restarted.rescan().await;
+        let next = restarted
+            .request_destroy_command_camera(created_id)
+            .await
+            .unwrap();
+        assert_eq!(next, look + 1);
+    }
+
+    /// While the plugin reports a command authority, browser aims are refused
+    /// with a code and never reach the request file.
+    #[tokio::test]
+    async fn aims_are_refused_while_the_lock_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let id: u32 = 0x8000_0303;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+        tokio::fs::write(
+            shm.join(format!("{id}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","station_id":"ground:LaunchPad","station_node_name":"LaunchPad"}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let write = |track: &str| {
+            std::fs::write(
+                shm.join("global.status.json"),
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandTrack":{track}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let aim = || SetCommandAimPayload {
+            flight_id: id,
+            aim: None,
+        };
+
+        write(COMMAND_TRACK_JSON);
+        registry.poll_status().await;
+        let (message, code) = registry.request_command_aim(aim()).await.unwrap_err();
+        assert_eq!(code, Some(ErrorCode::CommandLocked));
+        assert!(message.contains("gonogo"), "{message}");
+        assert!(!shm.join(COMMANDS_FILE).exists());
+
+        write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"gonogo"},"#, ""));
+        registry.poll_status().await;
+        assert!(registry.request_command_aim(aim()).await.is_ok());
+    }
+
+    /// An aim at a craft missing from the camera's latest target list (one
+    /// merged away in a dock, say) is refused with a code; with no list yet,
+    /// or an empty one, the plugin decides.
+    #[tokio::test]
+    async fn aims_at_craft_outside_the_target_list_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let id: u32 = 0x8000_0304;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+        tokio::fs::write(
+            shm.join(format!("{id}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","station_id":"ground:LaunchPad","station_node_name":"LaunchPad"}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let write = |centre: &str| {
+            std::fs::write(
+                shm.join("global.status.json"),
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{centre}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let vessel = |pid: u32| SetCommandAimPayload {
+            flight_id: id,
+            aim: Some(CommandAim {
+                kind: CommandAimKind::Vessel,
+                persistent_id: Some(pid),
+                ..serde_json::from_str(r#"{"kind":"vessel"}"#).unwrap()
+            }),
+        };
+        let orbit_of = |pid: Option<u32>| {
+            SetCommandAimPayload {
+            flight_id: id,
+            aim: Some(CommandAim {
+                subject_persistent_id: pid,
+                ..serde_json::from_str(
+                    r#"{"kind":"orbit","body":"Kerbin","inclination":0,"eccentricity":0,"semiMajorAxis":700000,"lan":0,"argumentOfPeriapsis":0,"meanAnomalyAtEpoch":0,"epoch":0}"#,
+                )
+                .unwrap()
+            }),
+        }
+        };
+
+        /* No status yet: the plugin decides. */
+        assert!(registry.request_command_aim(vessel(99)).await.is_ok());
+
+        write(COMMAND_CENTRE_JSON);
+        registry.poll_status().await;
+        let (message, code) = registry.request_command_aim(vessel(99)).await.unwrap_err();
+        assert_eq!(code, Some(ErrorCode::CommandTargetUnknown));
+        assert!(message.contains("99"), "{message}");
+        let (_, code) = registry
+            .request_command_aim(orbit_of(Some(99)))
+            .await
+            .unwrap_err();
+        assert_eq!(code, Some(ErrorCode::CommandTargetUnknown));
+
+        /* Listed craft, whatever their eligibility, and subjectless aims pass. */
+        assert!(registry.request_command_aim(vessel(42)).await.is_ok());
+        assert!(registry.request_command_aim(vessel(7)).await.is_ok());
+        assert!(registry
+            .request_command_aim(orbit_of(Some(7)))
+            .await
+            .is_ok());
+        assert!(registry.request_command_aim(orbit_of(None)).await.is_ok());
+        assert!(registry
+            .request_command_aim(SetCommandAimPayload {
+                flight_id: id,
+                aim: None
+            })
+            .await
+            .is_ok());
+
+        write(r#"{"subjectPersistentId":0,"trackingLevel":1,"targets":[]}"#);
+        registry.poll_status().await;
+        assert!(registry.request_command_aim(vessel(99)).await.is_ok());
+    }
+
+    /// A station with no display name reads as its node name.
+    #[test]
+    fn command_centre_display_name_falls_back_to_node_name() {
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":1,"kind":"command","station_id":"ground:KSC","station_node_name":"KSC","station_name":""}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command_centre_from_manifest(&m).unwrap().display_name,
+            "KSC"
+        );
+    }
+
+    const COMMAND_CENTRE_JSON: &str = r#"{"aimKind":"vessel","subjectPersistentId":42,"rangeM":12300.0,"trackingLevel":2,"targets":[{"persistentId":42,"vesselName":"Kerbal X","vesselType":"Ship","rangeM":12300.0,"eligibility":"ok","eligibilityText":"Trackable"},{"persistentId":7,"vesselName":"Ast. HSJ-227","vesselType":"SpaceObject","eligibility":"levelTooLow","eligibilityText":"Upgrade the Tracking Station"}]}"#;
+
+    #[test]
+    fn command_centre_status_parses_and_merges_over_the_manifest() {
+        let per: PerCameraStatus = serde_json::from_str(&format!(
+            r#"{{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{COMMAND_CENTRE_JSON}}}"#
+        ))
+        .unwrap();
+        let status = per.command_centre.expect("command centre status");
+        assert_eq!(status.targets.len(), 2);
+        assert_eq!(
+            status.targets[1].eligibility,
+            crate::protocol::CommandTargetEligibility::LevelTooLow
+        );
+        assert!(status.targets[1].range_m.is_none());
+
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":7,"kind":"command","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center"}"#,
+        )
+        .unwrap();
+        let merged =
+            command_centre_with(&command_centre_from_manifest(&m), Some(&status)).expect("merged");
+        assert_eq!(merged.station_id, "ground:KSC");
+        assert_eq!(merged.subject_persistent_id, 42);
+        assert_eq!(merged.aim_kind, Some(CommandAimKind::Vessel));
+        assert_eq!(merged.range_m, Some(12300.0));
+        assert_eq!(merged.tracking_level, 2);
+        assert_eq!(merged.targets, status.targets);
+        assert!(command_centre_with(&None, Some(&status)).is_none());
+
+        let malformed: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"targets":"nope"}}"#,
+        )
+        .unwrap();
+        assert!(malformed.command_centre.is_none(), "malformed is dropped");
+    }
+
+    /// Station fields on a manifest of another kind are ignored.
+    #[test]
+    fn command_centre_identity_only_for_command_kind() {
+        let m: InfoManifest =
+            serde_json::from_str(r#"{"flight_id":1,"kind":"part","station_id":"ground:KSC"}"#)
+                .unwrap();
+        assert!(command_centre_from_manifest(&m).is_none());
+        let g: InfoManifest = serde_json::from_str(r#"{"flight_id":1,"kind":"command"}"#).unwrap();
+        assert!(
+            command_centre_from_manifest(&g).is_none(),
+            "no station id, no identity"
+        );
     }
 
     /// A kerbal camera's `crew_location` updates LIVE when the plugin
@@ -3314,13 +4234,14 @@ mod tests {
         let cam = registry.get(1).await.expect("camera attached from ring");
 
         let mk = || {
-            Arc::new(TrackLocalStaticSample::new(
+            Arc::new(VideoTrack::new(
                 RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_H264.to_owned(),
                     ..Default::default()
                 },
                 "video".to_owned(),
                 "stream".to_owned(),
+                None,
             ))
         };
         let a = mk();

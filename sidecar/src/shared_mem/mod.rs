@@ -15,7 +15,7 @@
 pub mod control;
 pub mod mmap;
 pub use control::ControlBlock;
-pub use mmap::{FrameView, MmapFrameRing, MmapRingConfig, MmapRingError};
+pub use mmap::{CaptureStamp, FrameView, MmapFrameRing, MmapRingConfig, MmapRingError};
 
 use std::sync::Mutex;
 

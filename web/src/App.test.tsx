@@ -364,6 +364,26 @@ describe("App - add all cameras", () => {
     expect(stored.map((t) => t.flightId)).toEqual([1, 2, 3]);
   });
 
+  it("adds a command camera with merge OFF", async () => {
+    saveTiles([{ flightId: 1, spotlit: false }]);
+
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 301, kind: CameraKind.Command, cameraName: "Launch Pad tracking" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null }[];
+    expect(stored.map((t) => t.flightId)).toEqual([1, 301]);
+  });
+
   it("offers no add-all control when every camera is already shown", async () => {
     saveTiles([
       { flightId: 1, spotlit: false },
@@ -562,6 +582,22 @@ describe("App - remove controls", () => {
         { flightId: number | null }[];
       expect(stored.map((t) => t.flightId)).toEqual([1]);
     });
+  });
+
+  it("merge OFF seeds a command camera into the grid", async () => {
+    const { client, openSidecar } = buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 301, kind: CameraKind.Command, cameraName: "KSC tracking" }),
+    ]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(2);
+    });
+    const stored = JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as
+      { flightId: number | null }[];
+    expect(stored.map((t) => t.flightId)).toEqual([1, 301]);
   });
 
   it("offers no remove-lost control when nothing is lost", async () => {

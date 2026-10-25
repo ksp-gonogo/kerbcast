@@ -41,6 +41,17 @@ namespace Kerbcast
         )]
         public bool ThrottleMainScreen;
 
+        /* Career only: the command camera's target list follows the Tracking
+           Station's rules (range and unowned-object tracking by level). Only
+           reports eligibility; any craft can still be chosen. */
+        [GameParameters.CustomParameterUI(
+            "Command camera: tracking rules",
+            toolTip =
+                "Mark craft beyond the Tracking Station's range, and objects it cannot " +
+                "track yet, as ineligible in the command camera's target list."
+        )]
+        public bool CommandCameraTrackingRules = true;
+
         // Override default-init so newly-created saves pick up the
         // settings.cfg seed. Existing saves with a stored value
         // ignore this (the loaded ConfigNode wins).
@@ -49,6 +60,13 @@ namespace Kerbcast
             // Presets don't apply — the value is independent of
             // Easy/Normal/Hard. Falls through to the field default
             // and the settings.cfg seed below.
+        }
+
+        public override bool Enabled(System.Reflection.MemberInfo member, GameParameters parameters)
+        {
+            if (member.Name == nameof(CommandCameraTrackingRules))
+                return HighLogic.CurrentGame == null || HighLogic.CurrentGame.Mode == Game.Modes.CAREER;
+            return true;
         }
 
         public KerbcastGameParameters()

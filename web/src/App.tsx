@@ -309,11 +309,12 @@ interface CameraSeederProps {
 }
 
 function CameraSeeder({ mergeCrew, tilesSeeded, onSeed }: CameraSeederProps): null {
-  // Merge OFF: part cams only (kerbal face cams live in the crew bar). Merge ON:
+  // Merge OFF: every camera except kerbal face cams (those live in the crew
+  // bar), so part and command cams seed the grid. Merge ON:
   // kerbal cams are seedable/addable grid tiles like part cams.
   const all = useKerbcastCameras();
   const cameras = useMemo(
-    () => (mergeCrew ? all : all.filter((c) => c.kind === CameraKind.Part)),
+    () => (mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal)),
     [all, mergeCrew],
   );
 
@@ -347,12 +348,12 @@ interface CameraReconcilerProps {
  * "reconnecting" until the user manually rebinds them.
  */
 function CameraReconciler({ mergeCrew, tiles, onReconcile }: CameraReconcilerProps): null {
-  // Merge OFF: part cams only (never rebind a grid tile onto a kerbal). Merge
+  // Merge OFF: non-kerbal cams only (never rebind a grid tile onto a kerbal). Merge
   // ON: kerbal cams reconcile like part cams. Memoised so a new filtered-array
   // identity doesn't re-run the effect every commit.
   const all = useKerbcastCameras();
   const cameras = useMemo(
-    () => (mergeCrew ? all : all.filter((c) => c.kind === CameraKind.Part)),
+    () => (mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal)),
     [all, mergeCrew],
   );
 

@@ -1,5 +1,6 @@
-import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraKind, CameraLifecycle, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import type { AdaptiveShedPayload, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import type { CreateCommandCameraPayload } from "../__generated__/types";
 import type {
   DiscoveredCamera,
   InboundVideoStats,
@@ -19,6 +20,10 @@ export interface MockCameraInit {
   crewLocation?: CrewLocation;
   /** Only meaningful for `kind: Kerbal`: informational raw persistentID. */
   kerbalPersistentId?: number;
+  /** Only meaningful for `kind: Command`: where the station stands. */
+  commandCentre?: CommandCentreInfo;
+  /** Only meaningful for `kind: Command`: aim and visibility for the brackets. */
+  commandTrack?: CommandTrackState;
   partName?: string;
   partTitle?: string;
   cameraName?: string;
@@ -59,6 +64,17 @@ export interface MockCameraInit {
   maxHeight?: number;
 }
 
+/** The `commandCentre` aim fields the game reports for `aim`; null is the default aim. */
+function aimFields(
+  aim: CommandAim | null,
+  defaultSubject: number,
+): { aimKind?: CommandAimKind; subjectPersistentId: number } {
+  if (!aim) return { aimKind: undefined, subjectPersistentId: defaultSubject };
+  const subject =
+    aim.kind === CommandAimKind.Vessel ? aim.persistentId : aim.subjectPersistentId;
+  return { aimKind: aim.kind, subjectPersistentId: subject || defaultSubject };
+}
+
 function buildCamera(init: MockCameraInit): CameraState {
   return {
     flightId: init.flightId,
@@ -66,6 +82,8 @@ function buildCamera(init: MockCameraInit): CameraState {
     kind: init.kind ?? CameraKind.Part,
     crewLocation: init.crewLocation,
     kerbalPersistentId: init.kerbalPersistentId,
+    commandCentre: init.commandCentre,
+    commandTrack: init.commandTrack,
     partName: init.partName ?? `part-${init.flightId}`,
     partTitle: init.partTitle ?? `Part ${init.flightId}`,
     cameraName: init.cameraName ?? `camera-${init.flightId}`,
@@ -147,6 +165,8 @@ export interface MockSidecarOptions {
  */
 export class MockSidecar {
   private readonly _cameras = new Map<number, CameraState>();
+  private _commandLockOwner: string | null = null;
+  private _defaultSubject = 0;
   private readonly _commands: ClientMessage[] = [];
   private _throttleMainScreen = false;
   private readonly _forceBumpDelayMs: number;
@@ -282,7 +302,7 @@ export class MockSidecar {
    */
   open(): void {
     this._openHandler?.();
-    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock" } });
+    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true } });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
@@ -366,6 +386,11 @@ export class MockSidecar {
   fireSettingsState(payload: SettingsStatePayload): void {
     this._throttleMainScreen = payload.throttleMainScreen;
     this._sendToClient({ type: "settings-state", content: payload });
+  }
+
+  /** Push a `frame-stamp` to the client: the capture UT of one frame, keyed by RTP timestamp. */
+  fireFrameStamp(payload: FrameStampPayload): void {
+    this._sendToClient({ type: "frame-stamp", content: payload });
   }
 
   /** Push a `scene-state-changed` event to the client (flight scene or not). */
@@ -640,6 +665,73 @@ export class MockSidecar {
         }
         break;
       }
+      case "set-command-aim": {
+        /* The game applies the aim and reports it on its next status write. */
+        const cam = this._cameras.get(msg.content.flightId);
+        if (!cam?.commandCentre) break;
+        if (this._commandLockOwner !== null) {
+          this._sendToClient({
+            type: "error",
+            content: {
+              message: `${this._commandLockOwner} holds the command camera lock; aim refused`,
+              source: ErrorSource.Sidecar,
+              flightId: msg.content.flightId,
+              code: ErrorCode.CommandLocked,
+            },
+          });
+          break;
+        }
+        const aim = msg.content.aim;
+        const craft =
+          aim?.kind === CommandAimKind.Vessel
+            ? aim.persistentId
+            : aim?.kind === CommandAimKind.Orbit || aim?.kind === CommandAimKind.PositionAt
+              ? aim.subjectPersistentId
+              : undefined;
+        const targets = cam.commandCentre.targets;
+        if (craft && targets.length > 0 && !targets.some((t) => t.persistentId === craft)) {
+          this._sendToClient({
+            type: "error",
+            content: {
+              message: `craft ${craft} is not among camera ${msg.content.flightId}'s targets; aim refused`,
+              source: ErrorSource.Sidecar,
+              flightId: msg.content.flightId,
+              code: ErrorCode.CommandTargetUnknown,
+            },
+          });
+          break;
+        }
+        const updated: CameraState = {
+          ...cam,
+          commandCentre: { ...cam.commandCentre, ...aimFields(msg.content.aim ?? null, this._defaultSubject) },
+        };
+        this._cameras.set(msg.content.flightId, updated);
+        this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
+        break;
+      }
+      case "create-command-camera": {
+        this._createCommandCamera(msg.content);
+        break;
+      }
+      case "destroy-command-camera": {
+        const cam = this._cameras.get(msg.content.flightId);
+        if (!cam?.commandCentre?.created) {
+          this._sendToClient({
+            type: "error",
+            content: {
+              message: `camera ${msg.content.flightId} is not a created command camera`,
+              source: ErrorSource.Sidecar,
+            },
+          });
+          break;
+        }
+        this._cameras.delete(msg.content.flightId);
+        this._sendToClient({
+          type: "camera-snapshot",
+          content: { cameras: Array.from(this._cameras.values()) },
+        });
+        break;
+      }
       case "subscribe": {
         const flightId = msg.content.flightId;
         const freeMid = this._slotMids.find((m) => !this._slotBindings.has(m));
@@ -697,6 +789,7 @@ export class MockSidecar {
       case "hello":
       case "pong":
       case "request-keyframe":
+      case "set-frame-stamps":
         break;
       case "set-throttle-main-screen": {
         /* Flip state and echo SettingsState back, mirroring the sidecar's broadcast. */
@@ -714,6 +807,114 @@ export class MockSidecar {
       case "disconnect":
         break;
     }
+  }
+
+  /**
+   * Models the game building a created command camera at once: a `command`
+   * camera carrying the request's token appears in a fresh snapshot. A token
+   * already used creates nothing, as in game.
+   */
+  private _createCommandCamera(req: CreateCommandCameraPayload): void {
+    for (const cam of this._cameras.values()) {
+      if (cam.commandCentre?.token === req.token) return;
+    }
+    let flightId = 0x80000000 + 0x100 + this._cameras.size;
+    while (this._cameras.has(flightId)) flightId++;
+    const v = req.vantage;
+    const place =
+      v.kind === CommandVantageKind.Station
+        ? (v.station ?? "")
+        : v.kind === CommandVantageKind.Surface
+          ? (v.body ?? "")
+          : v.kind === CommandVantageKind.Vessel
+            ? `vessel:${v.persistentId ?? 0}`
+            : (v.site || "LaunchPad");
+    const defaultName =
+      v.kind === CommandVantageKind.Station
+        ? `${place} tracking`
+        : v.kind === CommandVantageKind.Surface
+          ? `${place} surface camera`
+          : v.kind === CommandVantageKind.Vessel
+            ? `${place} camera`
+            : place === "LaunchPad"
+              ? "Launchpad camera"
+              : `${place} camera`;
+    const cam = buildCamera({
+      flightId,
+      kind: CameraKind.Command,
+      cameraName: req.name ?? defaultName,
+      vesselName: place,
+      partName: "kerbcast.commandCamera",
+      partTitle: "Command camera",
+      supportsZoom: false,
+      commandCentre: {
+        stationId: `ground:${place}`,
+        nodeName: place,
+        displayName: place,
+        body: v.body ?? "Kerbin",
+        latitude: v.latitude ?? 0,
+        longitude: v.longitude ?? 0,
+        altitude: 0,
+        ...aimFields(this._commandLockOwner === null ? (req.aim ?? null) : null, this._defaultSubject),
+        trackingLevel: 3,
+        targets: [],
+        created: true,
+        token: req.token,
+      },
+      commandTrack: {
+        ut: 0,
+        hasFix: false,
+        occluded: false,
+        occluder: "",
+        sunlit: true,
+        frameHeightPx: 720,
+        framingFits: true,
+        events: [],
+      },
+    });
+    this._cameras.set(flightId, cam);
+    this._maxRenderSizes.set(flightId, { maxWidth: 1280, maxHeight: 720 });
+    this._sendToClient({
+      type: "camera-snapshot",
+      content: { cameras: Array.from(this._cameras.values()) },
+    });
+  }
+
+  /**
+   * Model an in-game command authority taking (`owner`) or releasing (`null`)
+   * the lock on command camera aims. Every command camera's `commandTrack`
+   * reports the owner while it is held, and `set-command-aim` is refused with
+   * `ErrorCode.CommandLocked`. Releasing returns every command camera to its
+   * default aim, as the game does.
+   */
+  setCommandAuthority(owner: string | null): void {
+    this._commandLockOwner = owner;
+    for (const cam of this._cameras.values()) {
+      if (cam.kind !== CameraKind.Command || !cam.commandCentre) continue;
+      const track: CommandTrackState = cam.commandTrack ?? {
+        ut: 0,
+        hasFix: false,
+        occluded: false,
+        occluder: "",
+        sunlit: true,
+        frameHeightPx: 720,
+        framingFits: true,
+        events: [],
+      };
+      const updated: CameraState = {
+        ...cam,
+        commandTrack: { ...track, authority: owner === null ? undefined : { owner } },
+        commandCentre:
+          owner === null ? { ...cam.commandCentre, ...aimFields(null, this._defaultSubject) } : cam.commandCentre,
+      };
+      this._cameras.set(cam.flightId, updated);
+      this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
+    }
+  }
+
+  /** The craft a command camera falls back to as its subject; 0 for none. */
+  setDefaultCommandSubject(persistentId: number): void {
+    this._defaultSubject = persistentId;
   }
 
   /**

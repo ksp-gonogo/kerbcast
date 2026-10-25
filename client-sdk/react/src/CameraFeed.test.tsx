@@ -22,8 +22,19 @@
  *  - Station (brokered) mode -- gonogo-only KerbcastDataSource.attachBroker.
  */
 
-import { KerbcastClient, QualityPreset, TrackMode } from "@ksp-gonogo/kerbcast";
-import type { CameraLifecycle, ClientMessage } from "@ksp-gonogo/kerbcast";
+import {
+  CameraKind,
+  CommandTargetEligibility,
+  KerbcastClient,
+  QualityPreset,
+  TrackMode,
+} from "@ksp-gonogo/kerbcast";
+import type {
+  CameraLifecycle,
+  ClientMessage,
+  CommandCentreInfo,
+  CommandTrackState,
+} from "@ksp-gonogo/kerbcast";
 import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
   act,
@@ -39,6 +50,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CameraFeed,
   type CameraFeedHandle,
+  type CameraFeedProps,
   type CameraStreamHook,
   type FeedAction,
 } from "./CameraFeed";
@@ -225,6 +237,9 @@ function toInit(c: CameraStateLike): MockCameraInit {
     viewerQuality: c.viewerQuality as QualityPreset | undefined,
     qualityLimitedBy: c.qualityLimitedBy as string | undefined,
     trackMode: c.trackMode as TrackMode | undefined,
+    kind: c.kind as CameraKind | undefined,
+    commandCentre: c.commandCentre as CommandCentreInfo | undefined,
+    commandTrack: c.commandTrack as CommandTrackState | undefined,
   };
 }
 
@@ -282,6 +297,9 @@ function renderFeed(
     showStatic?: boolean;
     showStandbyIcon?: boolean;
     showActions?: boolean;
+    enableTargetBrackets?: boolean;
+    targetBracketOverlay?: CameraFeedProps["targetBracketOverlay"];
+    displayUt?: number;
     ref?: React.Ref<CameraFeedHandle>;
   },
 ) {
@@ -2481,5 +2499,276 @@ describe("CameraFeed - recording locks source and close", () => {
     );
     fireEvent.click(getByLabelText("Close"));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Command camera target brackets
+// ---------------------------------------------------------------------------
+
+describe("CameraFeed - command camera target brackets", () => {
+  const STATION: CommandCentreInfo = {
+    stationId: "ground:KSC",
+    nodeName: "KSC",
+    displayName: "Kerbal Space Center",
+    body: "Kerbin",
+    latitude: -0.1,
+    longitude: -74.6,
+    altitude: 95,
+    subjectPersistentId: 0,
+    trackingLevel: 3,
+    targets: [],
+  };
+
+  function commandTrack(overrides: Partial<CommandTrackState> = {}): CommandTrackState {
+    return {
+      ut: 1000,
+      hasFix: true,
+      rangeM: 11_507_905,
+      occluded: false,
+      occluder: "",
+      sunlit: true,
+      bracketHalfPx: 4,
+      frameHeightPx: 576,
+      framingFits: true,
+      events: [],
+      ...overrides,
+    };
+  }
+
+  function commandCamera(track: CommandTrackState | undefined = commandTrack()) {
+    return makeCamera({
+      flightId: 301,
+      kind: CameraKind.Command,
+      cameraName: "KSC tracking",
+      commandCentre: STATION,
+      commandTrack: track,
+    });
+  }
+
+  beforeEach(() => localStorage.clear());
+
+  it("shows the brackets readout and a pressed toggle on a command feed", async () => {
+    const { client } = await buildConnectedSource([commandCamera()]);
+    renderFeed(client, { flightId: 301 });
+    expect(screen.getByText("IN VIEW · 11,508 km")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("offers no toggle on a part feed", async () => {
+    const { client } = await buildConnectedSource();
+    renderFeed(client, { flightId: 42 });
+    expect(screen.queryByRole("button", { name: "Target brackets" })).toBeNull();
+  });
+
+  it("hides the brackets when toggled off and remembers it per camera", async () => {
+    const { client } = await buildConnectedSource([commandCamera()]);
+    const first = renderFeed(client, { flightId: 301 });
+    fireEvent.click(screen.getByRole("button", { name: "Target brackets" }));
+    expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
+    expect(localStorage.getItem("kerbcast:target-brackets:ground:KSC")).toBe("0");
+    first.unmount();
+
+    renderFeed(client, { flightId: 301 });
+    expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+  });
+
+  it("still labels a blanked feed with the brackets toggled off", async () => {
+    localStorage.setItem("kerbcast:target-brackets:ground:KSC", "0");
+    const { client, sidecar } = await buildConnectedSource([commandCamera()]);
+    renderFeed(client, { flightId: 301 });
+    expect(screen.queryByRole("status", { name: "Feed blanked" })).toBeNull();
+    await act(async () => {
+      sidecar.updateCamera(301, { commandTrack: commandTrack({ blank: "Waiting for gonogo" }) });
+    });
+    expect(screen.getByRole("status", { name: "Feed blanked" }).textContent).toBe(
+      "Waiting for gonogo",
+    );
+  });
+
+  it("shows the transition in force at the displayed UT", async () => {
+    const track = commandTrack({
+      authority: { owner: "gonogo" },
+      events: [
+        { ut: 990, occluded: true, occluder: "Mun", sunlit: true },
+        { ut: 999, occluded: false, occluder: "", sunlit: true },
+      ],
+    });
+    const { client } = await buildConnectedSource([commandCamera(track)]);
+    const view = renderFeed(client, { flightId: 301, displayUt: 995 });
+    expect(screen.getByText("OCCLUDED MUN · 11,508 km")).toBeTruthy();
+    view.rerender(
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={301} displayUt={999.5} />
+      </KerbcastProvider>,
+    );
+    expect(screen.getByText("IN VIEW · 11,508 km")).toBeTruthy();
+  });
+
+  it("passes the target bracket overlay through to the brackets", async () => {
+    const { client } = await buildConnectedSource([commandCamera()]);
+    const seenUts: number[] = [];
+    const { container } = renderFeed(client, {
+      flightId: 301,
+      displayUt: 1060,
+      targetBracketOverlay: {
+        render: (ctx) => {
+          seenUts.push(ctx.displayUt);
+          return <circle data-testid="overlay-mark" cx={ctx.geometry.cx} cy={ctx.geometry.cy} r={2} />;
+        },
+        corners: { bottomRight: { hidden: true } },
+        readout: (text, ctx) => `${text} · T+${ctx.displayUt}`,
+      },
+    });
+    expect(screen.getByTestId("overlay-mark")).toBeTruthy();
+    expect(seenUts).toContain(1060);
+    expect(container.querySelector('path[data-corner="bottomRight"]')).toBeNull();
+    expect(container.querySelector('path[data-corner="topLeft"]')).not.toBeNull();
+    expect(screen.getByText(/ · T\+1060$/)).toBeTruthy();
+  });
+
+  describe("target picker", () => {
+    const TARGETS: CommandCentreInfo = {
+      ...STATION,
+      subjectPersistentId: 11,
+      rangeM: 12_300,
+      trackingLevel: 1,
+      targets: [
+        {
+          persistentId: 11,
+          vesselName: "Kerbal X",
+          vesselType: "Ship",
+          rangeM: 12_300,
+          eligibility: CommandTargetEligibility.Ok,
+          eligibilityText: "Trackable",
+        },
+        {
+          persistentId: 22,
+          vesselName: "Relay 1",
+          vesselType: "Relay",
+          rangeM: 1_500_000,
+          eligibility: CommandTargetEligibility.Ok,
+          eligibilityText: "Trackable",
+        },
+        {
+          persistentId: 33,
+          vesselName: "Ast. HSJ-227",
+          vesselType: "SpaceObject",
+          eligibility: CommandTargetEligibility.LevelTooLow,
+          eligibilityText: "Upgrade the Tracking Station",
+        },
+      ],
+    };
+
+    function targetCamera() {
+      return makeCamera({
+        flightId: 301,
+        kind: CameraKind.Command,
+        cameraName: "KSC tracking",
+        commandCentre: TARGETS,
+        commandTrack: commandTrack(),
+      });
+    }
+
+    it("lists targets, marks the current one and disables ineligible ones", async () => {
+      const { client } = await buildConnectedSource([targetCamera()]);
+      renderFeed(client, { flightId: 301 });
+      const trigger = screen.getByRole("button", { name: "Choose target" });
+      expect(trigger.getAttribute("title")).toBe("Watching Kerbal X");
+      fireEvent.click(trigger);
+      const items = screen.getAllByRole("menuitemradio");
+      expect(items.map((i) => i.textContent)).toEqual([
+        "Kerbal X · 12 km",
+        "Relay 1 · 1,500 km",
+        "Ast. HSJ-227 · Upgrade the Tracking Station",
+      ]);
+      expect(items[0]!.getAttribute("aria-checked")).toBe("true");
+      expect(items[1]!.getAttribute("aria-checked")).toBe("false");
+      expect((items[2] as HTMLButtonElement).disabled).toBe(true);
+      expect(items[2]!.getAttribute("title")).toBe("Upgrade the Tracking Station");
+    });
+
+    it("keeps the quality menu reachable when the row overflows", async () => {
+      const { client } = await buildConnectedSource([targetCamera()]);
+      renderFeed(client, {
+        flightId: 301,
+        enableQualityControl: true,
+        enableFullscreen: true,
+        enablePictureInPicture: true,
+        actions: [
+          { id: "a", label: "Extra A", icon: null, onClick: () => {} },
+          { id: "b", label: "Extra B", icon: null, onClick: () => {} },
+        ],
+      });
+      fireEvent.click(screen.getByRole("button", { name: /quality/i }));
+      expect(screen.getByRole("menu", { name: "Quality" })).toBeTruthy();
+    });
+
+    it("keeps the target menu reachable when the row overflows", async () => {
+      const { client } = await buildConnectedSource([targetCamera()]);
+      renderFeed(client, {
+        flightId: 301,
+        enableFullscreen: true,
+        enablePictureInPicture: true,
+        actions: [
+          { id: "a", label: "Extra A", icon: null, onClick: () => {} },
+          { id: "b", label: "Extra B", icon: null, onClick: () => {} },
+        ],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Choose target" }));
+      expect(screen.getAllByRole("menuitemradio")).toHaveLength(3);
+    });
+
+    it("sends the choice and follows the published target", async () => {
+      const { client, sidecar } = await buildConnectedSource([targetCamera()]);
+      renderFeed(client, { flightId: 301 });
+      fireEvent.click(screen.getByRole("button", { name: "Choose target" }));
+      await act(async () => {
+        fireEvent.click(screen.getByRole("menuitemradio", { name: /Relay 1/ }));
+      });
+      expect(sidecar.lastCommand("set-command-aim", 301)?.content).toEqual({
+        flightId: 301,
+        aim: { kind: "vessel", persistentId: 22 },
+      });
+      expect(
+        screen.getByRole("button", { name: "Choose target" }).getAttribute("title"),
+      ).toBe("Watching Relay 1");
+    });
+
+    it("is hidden with no targets, with manual controls disabled or under the lock", async () => {
+      const { client } = await buildConnectedSource([targetCamera()]);
+      const view = renderFeed(client, { flightId: 301, disableManualControls: true });
+      expect(screen.queryByRole("button", { name: "Choose target" })).toBeNull();
+      view.unmount();
+
+      const locked = await buildConnectedSource([
+        makeCamera({
+          flightId: 301,
+          kind: CameraKind.Command,
+          cameraName: "KSC tracking",
+          commandCentre: TARGETS,
+          commandTrack: commandTrack({ authority: { owner: "gonogo" } }),
+        }),
+      ]);
+      const lockedView = renderFeed(locked.client, { flightId: 301 });
+      expect(screen.queryByRole("button", { name: "Choose target" })).toBeNull();
+      lockedView.unmount();
+
+      const empty = await buildConnectedSource([commandCamera()]);
+      renderFeed(empty.client, { flightId: 301 });
+      expect(screen.queryByRole("button", { name: "Choose target" })).toBeNull();
+    });
+  });
+
+  it("draws nothing with enableTargetBrackets off", async () => {
+    const { client } = await buildConnectedSource([commandCamera()]);
+    renderFeed(client, { flightId: 301, enableTargetBrackets: false });
+    expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Target brackets" })).toBeNull();
   });
 });

@@ -11,7 +11,7 @@ import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KerbcastProvider, type KerbcastDisplaySizes } from "../context";
-import { useReportDisplaySize } from "./useReportDisplaySize";
+import { displayReportSize, useReportDisplaySize } from "./useReportDisplaySize";
 
 // A controllable ResizeObserver: captures the callback so a test can fire a
 // resize with a chosen contentRect.
@@ -89,9 +89,15 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    // 40x30 -> ceil to a 16-multiple = 48x32, reported without advancing timers.
+    // 40x30 -> width ceiled to a 16-multiple (48), height at the box's 4:3 (36), reported without advancing timers.
     fireResize(40, 30);
-    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 32 }]);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 36 }]);
+  });
+
+  it("keeps the box's aspect so the frame fills it", () => {
+    expect(displayReportSize(441, 246)).toEqual({ width: 448, height: 250 });
+    expect(displayReportSize(372, 208)).toEqual({ width: 384, height: 214 });
+    expect(displayReportSize(1024, 576)).toEqual({ width: 1024, height: 576 });
   });
 
   it("reports a square (min edge) when square is set", () => {
@@ -181,6 +187,6 @@ describe("useReportDisplaySize", () => {
     expect(resizeCallback).toBeUndefined();
     rerender(view(true));
     fireResize(40, 30);
-    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 32 }]);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 36 }]);
   });
 });

@@ -21,8 +21,8 @@
   <ItemGroup>
     <!-- The cross-language golden ring; the Rust reader test consumes the
          same file. Copied next to the binary for the regen comparison. -->
-    <None Include="../../sidecar/testdata/frame_ring_v1.ring"
-          Link="frame_ring_v1.ring"
+    <None Include="../../sidecar/testdata/frame_ring_v2.ring"
+          Link="frame_ring_v2.ring"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

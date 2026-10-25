@@ -133,7 +133,11 @@ pub enum CaptureState {
 }
 
 /// Distinguishes an existing Hullcam part camera (`Part`) from a
-/// per-kerbal face camera (`Kerbal`).
+/// per-kerbal face camera (`Kerbal`) and a fixed command
+/// camera watching a craft from a CommNet station (`Command`).
+///
+/// Consumers must treat a value they do not recognise as "some other kind of
+/// camera" rather than failing: new kinds are added without a protocol bump.
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +145,325 @@ pub enum CameraKind {
     #[default]
     Part,
     Kerbal,
+    Command,
+}
+
+/// Where a command camera stands, what it watches and what it could watch.
+/// Present only when `CameraState.kind == Command`.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandCentreInfo {
+    /// gonogo's command-centre id for this station, `ground:<nodeName>`.
+    pub station_id: String,
+    /// The CommNet home's `nodeName` (KSC's is `"KSC"`).
+    pub node_name: String,
+    /// The station's name as the player reads it in game, or `node_name` when
+    /// it has none.
+    pub display_name: String,
+    /// Body the station sits on.
+    pub body: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Lens altitude above sea level in metres: the station's own altitude
+    /// plus the plugin's configured offset.
+    pub altitude: f64,
+    /// How the camera aims, as set by `SetCommandAim`. `None` for its
+    /// default: the active craft in flight, the configured craft at the Space
+    /// Center.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim_kind: Option<CommandAimKind>,
+    /// `Vessel.persistentId` of the camera's subject, the craft it draws,
+    /// brackets and reads out; 0 for none. A `vessel` aim's craft, an `orbit`
+    /// or `positionAt` aim's subject, otherwise the default craft.
+    pub subject_persistent_id: u32,
+    /// Station to the subject in metres, to 3 significant figures. `None`
+    /// without a position for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_m: Option<f64>,
+    /// The Tracking Station's level, 1-based (stock 1..=3). The highest level
+    /// outside career.
+    pub tracking_level: u32,
+    /// Every craft the camera could watch, eligible first, then nearest
+    /// first. Any of them can be aimed at with a `vessel` aim; eligibility
+    /// only reports what the tracking network would allow.
+    pub targets: Vec<CommandTarget>,
+    /// True for a camera made at runtime (`CreateCommandCamera`, or the
+    /// plugin's `KerbcastControl.CreateCommandCamera`), false for the one
+    /// from the game's settings. Only created cameras can be destroyed.
+    /// Older sidecars omit it.
+    #[serde(default)]
+    pub created: bool,
+    /// The `token` of the `CreateCommandCamera` request that made this
+    /// camera, so its creator can find it in the camera list. `None` for the
+    /// settings camera and for cameras created in game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// Which kind of place a created command camera stands at.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandVantageKind {
+    /// Beside a launch site, the way the settings camera stands.
+    LaunchSite,
+    /// At a CommNet ground station.
+    Station,
+    /// At any point on a body's surface.
+    Surface,
+    /// Riding a craft.
+    Vessel,
+}
+
+/// Where a created command camera stands. `kind` says which fields apply;
+/// absent optional fields take the defaults given on each.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandVantage {
+    pub kind: CommandVantageKind,
+    /// `launchSite`: the site's name (`"LaunchPad"`, `"Runway"`, a Making
+    /// History or Kerbal Konstructs site). Absent or empty: the active
+    /// craft's launch site, else the stock pad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// `launchSite`: metres from the site to the lens. Default 500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    /// `launchSite`: compass bearing in degrees from the site to the lens.
+    /// Default 180 (due south).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearing: Option<f64>,
+    /// Metres above the ground under the lens (above the sea over water);
+    /// for `station`, above the station itself. Defaults: 5 for `launchSite`
+    /// and `surface`, 30 for `station`. Unused for `vessel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    /// `station`: the CommNet ground station's node name, e.g. `"KSC"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station: Option<String>,
+    /// `surface`: the body's name, e.g. `"Kerbin"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// `surface`: degrees, -90..=90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// `surface`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// `vessel`: the craft's `Vessel.persistentId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_id: Option<u32>,
+}
+
+/// How a command camera aims.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandAimKind {
+    /// Follows a craft, which is the subject.
+    Vessel,
+    /// Follows a conic the game propagates.
+    Orbit,
+    /// Holds a point on a body, carried round by its rotation.
+    Surface,
+    /// Follows a position the caller propagated, extrapolated linearly.
+    PositionAt,
+    /// Holds a direction from the camera's local horizon.
+    Direction,
+}
+
+/// Where a command camera points. `kind` says which fields apply. With no
+/// subject (`surface`, `direction`, or `orbit` and `positionAt` without
+/// `subjectPersistentId`), the camera's default craft stays the subject.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandAim {
+    pub kind: CommandAimKind,
+    /// `vessel`: the craft's `Vessel.persistentId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_id: Option<u32>,
+    /// `orbit`, `surface` and `positionAt`: the reference body's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// `orbit`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclination: Option<f64>,
+    /// `orbit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eccentricity: Option<f64>,
+    /// `orbit`: metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semi_major_axis: Option<f64>,
+    /// `orbit`: longitude of the ascending node, degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan: Option<f64>,
+    /// `orbit`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_of_periapsis: Option<f64>,
+    /// `orbit`: radians.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_anomaly_at_epoch: Option<f64>,
+    /// `orbit`: UT the mean anomaly is given at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<f64>,
+    /// `surface`: degrees, -90..=90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// `surface`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// `surface`: metres above sea level. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<f64>,
+    /// `positionAt`: UT of the sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ut: Option<f64>,
+    /// `positionAt`: `[x, y, z]` metres from the body centre at `ut`, in its
+    /// non-rotating frame (the frame of `Orbit.getRelativePositionAtUT`, z up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Vec<f64>>,
+    /// `positionAt`: `[x, y, z]` metres per second in the same frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<Vec<f64>>,
+    /// `direction`: compass bearing in degrees from north, clockwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azimuth: Option<f64>,
+    /// `direction`: degrees above the horizon, -90..=90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elevation: Option<f64>,
+    /// `orbit` and `positionAt`: the craft the path belongs to, drawn and
+    /// bracketed as the subject. Absent: the default craft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_persistent_id: Option<u32>,
+    /// Metres of view kept around the subject's own size when framing. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framing_margin_m: Option<f64>,
+}
+
+/// Whether a command camera's tracking network could watch a craft. Only
+/// `NotTrackable` applies outside career (or with the tracking rules off).
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandTargetEligibility {
+    Ok,
+    /// Beyond the Tracking Station's range at its current level.
+    TooFar,
+    /// An unowned object, and the current level tracks none.
+    LevelTooLow,
+    /// An unowned object the player has found but not tracked.
+    NotTrackable,
+}
+
+/// One craft a command camera could watch.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandTarget {
+    pub persistent_id: u32,
+    pub vessel_name: String,
+    /// KSP's `VesselType` name, e.g. `"Ship"`, `"Probe"`, `"Debris"`.
+    pub vessel_type: String,
+    /// Station to craft in metres, to 3 significant figures. `None` without a
+    /// position for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_m: Option<f64>,
+    pub eligibility: CommandTargetEligibility,
+    /// Short display text for `eligibility`.
+    pub eligibility_text: String,
+}
+
+/// The registered command authority.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandAuthorityState {
+    pub owner: String,
+}
+
+/// A full snapshot of a command track's discrete fields at the exact UT they
+/// changed, so a delayed client can show the state that held at its own
+/// displayed UT.
+#[typeshare]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommandTrackEvent {
+    pub ut: f64,
+    pub occluded: bool,
+    pub occluder: String,
+    pub sunlit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blank: Option<String>,
+    /// True for a transition the plugin expects ahead of `ut` on the current
+    /// trajectory. Each write replaces the predictions; recorded events never
+    /// carry it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub predicted: bool,
+}
+
+/// What a command camera is aimed at and how well it can see
+/// it. The aim point always sits at frame centre; clients draw the target
+/// brackets from this. Present only on command cameras.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommandTrackState {
+    /// UT this state was evaluated at.
+    pub ut: f64,
+    pub has_fix: bool,
+    /// Range to the aimed point in metres. `None` without a fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_m: Option<f64>,
+    pub occluded: bool,
+    /// Name of the occluding body when `occluded`, otherwise empty.
+    pub occluder: String,
+    pub sunlit: bool,
+    /// Bracket half-extent in capture-frame pixels (craft extent plus the
+    /// authority's framing margin), relative to `frame_height_px`. `None` without a fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bracket_half_px: Option<f64>,
+    pub frame_height_px: u32,
+    /// False when the craft plus the framing margin would not fit even at
+    /// the widest FoV.
+    pub framing_fits: bool,
+    /// The true craft's offset from frame centre in capture-frame pixels.
+    /// Non-zero only when an authority aims away from the craft. `None`
+    /// without a true fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub true_offset_px: Option<f64>,
+    /// The registered authority. `None` when standalone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<CommandAuthorityState>,
+    /// Why the feed is blanked; the game sends black frames while set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blank: Option<String>,
+    /// Recent discrete transitions, oldest first.
+    pub events: Vec<CommandTrackEvent>,
+}
+
+/* Fields the plugin omits take these values. Container-level so the generated
+TypeScript keeps every always-serialised field required. */
+impl Default for CommandTrackState {
+    fn default() -> Self {
+        Self {
+            ut: 0.0,
+            has_fix: false,
+            range_m: None,
+            occluded: false,
+            occluder: String::new(),
+            sunlit: false,
+            bracket_half_px: None,
+            frame_height_px: 0,
+            framing_fits: true,
+            true_offset_px: None,
+            authority: None,
+            blank: None,
+            events: Vec::new(),
+        }
+    }
 }
 
 /// Which source a kerbal camera is currently rendering: a seated IVA
@@ -191,6 +514,15 @@ pub struct CameraState {
     /// part cameras.
     #[serde(default)]
     pub crew_location: Option<CrewLocation>,
+    /// Station identity for a command camera. `None` for
+    /// every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_centre: Option<CommandCentreInfo>,
+    /// Aim and visibility of a command camera, from the
+    /// plugin's last status write. `None` for every other kind, and before
+    /// the plugin has reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_track: Option<CommandTrackState>,
     /// Server-authoritative auto-track state for a pan+zoom camera (the
     /// operator's persistent intent). `None` (the default) = not tracking.
     /// Every browser reflects this; a browser track overrides a kOS aim on the
@@ -392,6 +724,51 @@ pub struct SetTrackTargetPayload {
     pub mode: TrackMode,
 }
 
+/// Create a command camera for the rest of the current scene. Server-wide:
+/// the camera appears in every consumer's camera list (kind `command`) with
+/// `commandCentre.token` set to `token` once the game has built it,
+/// normally within a second. A request the game can not satisfy (unknown
+/// body, site, station or craft) never produces a camera; the game logs why.
+/// A token is used once per scene: a repeat with the same token is ignored.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCommandCameraPayload {
+    /// Chosen by the client, unique per request (1 to 128 characters).
+    pub token: String,
+    /// Feed name; absent for the default ("Launchpad camera", "<site>
+    /// camera", "<station> tracking", "<craft> camera" or "<body> surface
+    /// camera").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub vantage: CommandVantage,
+    /// Where it points; absent for the default (the active craft in
+    /// flight). Not applied while a command authority holds the lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aim: Option<CommandAim>,
+}
+
+/// Destroy a command camera made by `CreateCommandCamera` (or created in
+/// game). The settings camera can not be destroyed.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DestroyCommandCameraPayload {
+    pub flight_id: u32,
+}
+
+/// Point a command camera at `aim`, or back at its default with `aim` absent
+/// or null. Refused with `ErrorCode::CommandLocked` while a command authority
+/// holds the lock.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCommandAimPayload {
+    pub flight_id: u32,
+    #[serde(default)]
+    pub aim: Option<CommandAim>,
+}
+
 /// A consumer reporting its OWN current display size in px for one camera.
 /// Unlike `SetRenderSizePayload` (an operator command that sets the shared
 /// render size directly, last-writer-wins), this is a per-consumer input the
@@ -510,6 +887,17 @@ pub struct SlotMapPayload {
 pub struct HelloPayload {
     pub sidecar_version: String,
     pub encoder_backend: String,
+    /// True when this sidecar sends `FrameStamp` to a client that asks with
+    /// `SetFrameStamps`. Absent from sidecars older than 1.11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_stamps: Option<bool>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFrameStampsPayload {
+    pub enabled: bool,
 }
 
 #[typeshare]
@@ -569,6 +957,11 @@ pub enum ErrorCode {
     CameraNotFound,
     /// The named camera exists but its part is gone.
     CameraDestroyed,
+    /// A command authority in game holds the command cameras' aim lock.
+    CommandLocked,
+    /// A command aim names a craft that is not in the camera's latest
+    /// `commandCentre.targets`, for example one merged away in a dock.
+    CommandTargetUnknown,
 }
 
 #[typeshare]
@@ -622,10 +1015,34 @@ pub struct SettingsStatePayload {
     pub time_warp_rate: Option<f64>,
 }
 
+/// Mission-time stamp of one video frame, sent on the control channel just
+/// before the frame's RTP packets. A browser matches it to a presented frame
+/// by `rtp_timestamp` (`requestVideoFrameCallback` metadata `rtpTimestamp`),
+/// which gives the exact UT that frame was rendered at.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameStampPayload {
+    /// Camera the frame came from.
+    pub flight_id: u32,
+    /// RTP timestamp (90 kHz clock) the frame's packets carry on this peer's
+    /// track for that camera.
+    pub rtp_timestamp: u32,
+    /// KSP universal time (seconds) the frame was rendered at.
+    pub capture_ut: f64,
+    /// Capture epoch (see `SettingsStatePayload::capture_epoch`) `capture_ut`
+    /// belongs to.
+    pub capture_epoch: u32,
+}
+
 /// Messages sent FROM the client TO the sidecar.
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "content", rename_all = "kebab-case")]
+/* A create-command-camera request is a few hundred bytes against a handful
+ * for most variants. Messages are parsed one at a time and dropped, so the
+ * size skew costs nothing worth a Box at every match site. */
+#[allow(clippy::large_enum_variant)]
 pub enum ClientMessage {
     /// First message on a new data channel. Sidecar replies with `Hello`
     /// + a `CameraSnapshot` so the client gets server version + every
@@ -646,6 +1063,13 @@ pub enum ClientMessage {
     /// consistent across browsers. A browser track OVERRIDES a kOS aim on the
     /// same camera; send `mode: none` to hand aiming back to kOS.
     SetTrackTarget(SetTrackTargetPayload),
+    /// Create a command camera at a vantage for the rest of the scene.
+    /// Server-wide; find the new camera by its `commandCentre.token`.
+    CreateCommandCamera(CreateCommandCameraPayload),
+    /// Destroy a created command camera. Server-wide.
+    DestroyCommandCamera(DestroyCommandCameraPayload),
+    /// Point a command camera, or return it to its default. Server-wide.
+    SetCommandAim(SetCommandAimPayload),
     /// A consumer reporting its OWN current display size in px; the sidecar
     /// aggregates MAX-across-consumers to drive auto-resolution
     /// (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
@@ -755,6 +1179,10 @@ pub enum ClientMessage {
     /// across saves (writes the per-save difficulty parameter). Server-wide:
     /// all peers see the resulting `SettingsState` broadcast.
     SetThrottleMainScreen(SetThrottleMainScreenPayload),
+    /// Start or stop `FrameStamp` messages on this peer's control channel.
+    /// Off until asked for, so clients that predate stamps never receive
+    /// them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+    SetFrameStamps(SetFrameStampsPayload),
 }
 
 /// Messages sent FROM the sidecar TO the client.
@@ -802,11 +1230,52 @@ pub enum ServerMessage {
     /// Whether KSP is in a flight scene. Primed after `Hello` and
     /// re-broadcast when the polled in-flight flag changes.
     SceneStateChanged(SceneStateChangedPayload),
+    /// Capture UT of one frame about to go out on a video track, keyed by
+    /// its RTP timestamp. One per frame per track, only to a peer that
+    /// enabled them with `SetFrameStamps`.
+    FrameStamp(FrameStampPayload),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_stamp_serialises_camel_case() {
+        let msg = ServerMessage::FrameStamp(FrameStampPayload {
+            flight_id: 7,
+            rtp_timestamp: 4_000_000_000,
+            capture_ut: 86400.25,
+            capture_epoch: 3,
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            s,
+            r#"{"type":"frame-stamp","content":{"flightId":7,"rtpTimestamp":4000000000,"captureUt":86400.25,"captureEpoch":3}}"#
+        );
+    }
+
+    /// Clients before 1.11 ignore the extra Hello field and never send
+    /// `set-frame-stamps`; newer ones read the field and opt in.
+    #[test]
+    fn hello_announces_frame_stamps_and_clients_opt_in() {
+        let hello = ServerMessage::Hello(HelloPayload {
+            sidecar_version: "1.11.0".to_owned(),
+            encoder_backend: "x".to_owned(),
+            frame_stamps: Some(true),
+        });
+        assert!(serde_json::to_string(&hello)
+            .unwrap()
+            .contains(r#""frameStamps":true"#));
+
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"set-frame-stamps","content":{"enabled":true}}"#)
+                .unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled: true })
+        ));
+    }
 
     #[test]
     fn set_track_target_roundtrips() {
@@ -836,6 +1305,98 @@ mod tests {
             (TrackMode::Target, "target"),
         ] {
             assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{tag}\""));
+        }
+    }
+
+    #[test]
+    fn set_command_aim_matches_the_wire() {
+        let wire = r#"{"type":"set-command-aim","content":{"flightId":2147483905,"aim":{"kind":"vessel","persistentId":4000000001,"framingMarginM":20.0}}}"#;
+        let msg: ClientMessage = serde_json::from_str(wire).unwrap();
+        match &msg {
+            ClientMessage::SetCommandAim(p) => {
+                assert_eq!(p.flight_id, 2_147_483_905);
+                let aim = p.aim.as_ref().unwrap();
+                assert_eq!(aim.kind, CommandAimKind::Vessel);
+                assert_eq!(aim.persistent_id, Some(4_000_000_001));
+                assert_eq!(aim.framing_margin_m, Some(20.0));
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+
+        let direction = r#"{"type":"set-command-aim","content":{"flightId":5,"aim":{"kind":"direction","azimuth":90.0,"elevation":30.0}}}"#;
+        let msg: ClientMessage = serde_json::from_str(direction).unwrap();
+        assert_eq!(serde_json::to_string(&msg).unwrap(), direction);
+
+        let position = r#"{"type":"set-command-aim","content":{"flightId":5,"aim":{"kind":"positionAt","body":"Kerbin","ut":100.0,"position":[1.0,2.0,3.0],"velocity":[0.0,0.0,1.0],"subjectPersistentId":9}}}"#;
+        let msg: ClientMessage = serde_json::from_str(position).unwrap();
+        assert_eq!(serde_json::to_string(&msg).unwrap(), position);
+
+        /* Returning to the default: absent and null both parse to none. */
+        for clear in [
+            r#"{"type":"set-command-aim","content":{"flightId":5}}"#,
+            r#"{"type":"set-command-aim","content":{"flightId":5,"aim":null}}"#,
+        ] {
+            match serde_json::from_str::<ClientMessage>(clear).unwrap() {
+                ClientMessage::SetCommandAim(p) => assert!(p.aim.is_none()),
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn command_camera_requests_match_the_wire() {
+        let create = r#"{"type":"create-command-camera","content":{"token":"t1","name":"Hill","vantage":{"kind":"surface","height":3.0,"body":"Kerbin","latitude":-0.05,"longitude":-74.7},"aim":{"kind":"surface","body":"Kerbin","latitude":-0.0972,"longitude":-74.5577,"altitude":70.0}}}"#;
+        let msg: ClientMessage = serde_json::from_str(create).unwrap();
+        match &msg {
+            ClientMessage::CreateCommandCamera(p) => {
+                assert_eq!(p.token, "t1");
+                assert_eq!(p.vantage.kind, CommandVantageKind::Surface);
+                assert_eq!(p.vantage.latitude, Some(-0.05));
+                assert!(p.vantage.site.is_none());
+                assert_eq!(p.aim.as_ref().unwrap().kind, CommandAimKind::Surface);
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(serde_json::to_string(&msg).unwrap(), create);
+
+        let pad = r#"{"type":"create-command-camera","content":{"token":"t2","vantage":{"kind":"launchSite"}}}"#;
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(pad).unwrap(),
+            ClientMessage::CreateCommandCamera(CreateCommandCameraPayload {
+                vantage: CommandVantage {
+                    kind: CommandVantageKind::LaunchSite,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let destroy = r#"{"type":"destroy-command-camera","content":{"flightId":2147483905}}"#;
+        let msg: ClientMessage = serde_json::from_str(destroy).unwrap();
+        assert_eq!(serde_json::to_string(&msg).unwrap(), destroy);
+    }
+
+    /// An older sidecar's commandCentre has no `created`; it reads as false.
+    #[test]
+    fn command_centre_created_defaults_false() {
+        let c: CommandCentreInfo = serde_json::from_str(
+            r#"{"stationId":"ground:KSC","nodeName":"KSC","displayName":"KSC","body":"Kerbin","latitude":0.0,"longitude":0.0,"altitude":0.0,"subjectPersistentId":0,"trackingLevel":1,"targets":[]}"#,
+        )
+        .unwrap();
+        assert!(!c.created);
+        assert!(c.token.is_none());
+    }
+
+    #[test]
+    fn command_target_eligibility_tags() {
+        for (e, tag) in [
+            (CommandTargetEligibility::Ok, "ok"),
+            (CommandTargetEligibility::TooFar, "tooFar"),
+            (CommandTargetEligibility::LevelTooLow, "levelTooLow"),
+            (CommandTargetEligibility::NotTrackable, "notTrackable"),
+        ] {
+            assert_eq!(serde_json::to_string(&e).unwrap(), format!("\"{tag}\""));
         }
     }
 
@@ -912,6 +1473,8 @@ mod tests {
                 kind: CameraKind::Part,
                 capture_state: CaptureState::Full,
                 kerbal_persistent_id: None,
+                command_centre: None,
+                command_track: None,
                 crew_location: None,
                 track_mode: TrackMode::None,
                 part_name: "navCam1".into(),
@@ -968,6 +1531,8 @@ mod tests {
             kind: CameraKind::Part,
             capture_state: CaptureState::Full,
             kerbal_persistent_id: None,
+            command_centre: None,
+            command_track: None,
             crew_location: None,
             track_mode: TrackMode::None,
             part_name: String::new(),
@@ -1476,6 +2041,8 @@ mod tests {
             kind: CameraKind::Kerbal,
             capture_state: CaptureState::Full,
             kerbal_persistent_id: Some(123456),
+            command_centre: None,
+            command_track: None,
             crew_location: Some(CrewLocation::Eva),
             track_mode: TrackMode::None,
             part_name: String::new(),

@@ -8,7 +8,7 @@
 //! offset   size   field
 //! ------   ----   -----
 //! 0        8      u64 magic = 0x4B45524243414D31  ("KERBCAM1", legacy, pinned for compat)
-//! 8        4      u32 version (this layout = 1)
+//! 8        4      u32 version (this layout = 2)
 //! 12       4      u32 slot_count
 //! 16       4      u32 max_width  (per-slot pixel capacity)
 //! 20       4      u32 max_height
@@ -21,10 +21,12 @@
 //!   +0   4      u32 width
 //!   +4   4      u32 height
 //!   +8   4      u32 stride_bytes
-//!   +12  4      padding
+//!   +12  4      u32 capture_epoch (plugin's UT discontinuity counter at render)
 //!   +16  8      f64 capture_ts_ms
 //!   +24  8      u64 sequence (matches header.sequence when this slot was written)
-//!   +32  ...    RGBA8 pixels, max_width * max_height * 4 bytes
+//!   +32  8      f64 capture_ut (KSP universal time at render; NaN = unknown)
+//!   +40  24     padding
+//!   +64  ...    RGBA8 pixels, max_width * max_height * 4 bytes
 //! ```
 //!
 //! Sync protocol (seqlock-style, one-writer / one-or-more-readers):
@@ -48,7 +50,7 @@ use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
 pub const MAGIC: u64 = 0x4B45_5242_4341_4D31; // "KERBCAM1" legacy ring magic; value pinned for plugin wire-format compat, not renamed
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// Header is one page so the first slot is page-aligned. Keeps the writer's
 /// per-slot `pixels` write inside one page-aligned region per slot, which
@@ -67,10 +69,25 @@ const HEADER_OFF_SEQUENCE: usize = 32;
 const SLOT_OFF_WIDTH: usize = 0;
 const SLOT_OFF_HEIGHT: usize = 4;
 const SLOT_OFF_STRIDE: usize = 8;
+const SLOT_OFF_CAPTURE_EPOCH: usize = 12;
 const SLOT_OFF_CAPTURE_TS: usize = 16;
 const SLOT_OFF_SEQUENCE: usize = 24;
-const SLOT_OFF_PIXELS: usize = 32;
-const SLOT_PIXELS_ALIGNMENT_PAD: usize = 0; // SLOT_OFF_PIXELS is already 32, 32-aligned
+const SLOT_OFF_CAPTURE_UT: usize = 32;
+const SLOT_OFF_PIXELS: usize = 64;
+const SLOT_PIXELS_ALIGNMENT_PAD: usize = 0; // SLOT_OFF_PIXELS is already 64, 32-aligned
+
+/// Mission-time stamp of one rendered frame: the KSP universal time it was
+/// rendered at plus the plugin's discontinuity epoch at that moment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureStamp {
+    /// `None` when the writer had no universal time (stored as NaN).
+    pub ut: Option<f64>,
+    pub epoch: u32,
+}
+
+impl CaptureStamp {
+    pub const UNKNOWN: CaptureStamp = CaptureStamp { ut: None, epoch: 0 };
+}
 
 #[derive(Debug, Error)]
 pub enum MmapRingError {
@@ -152,6 +169,7 @@ pub struct FrameView {
     pub stride_bytes: u32,
     pub capture_ts_ms: f64,
     pub sequence: u64,
+    pub capture: CaptureStamp,
     /// Owned copy of the RGBA pixels. We always copy out before returning
     /// because the underlying mmap slot can be overwritten by the writer at
     /// any time.
@@ -386,6 +404,18 @@ impl MmapFrameRing {
         capture_ts_ms: f64,
         rgba: &[u8],
     ) -> Result<u64, MmapRingError> {
+        self.produce_stamped(width, height, capture_ts_ms, CaptureStamp::UNKNOWN, rgba)
+    }
+
+    /// `produce` with the frame's mission-time stamp.
+    pub fn produce_stamped(
+        &mut self,
+        width: u32,
+        height: u32,
+        capture_ts_ms: f64,
+        capture: CaptureStamp,
+        rgba: &[u8],
+    ) -> Result<u64, MmapRingError> {
         let expected = (width as usize) * (height as usize) * 4;
         if rgba.len() != expected {
             return Err(MmapRingError::SizeMismatch {
@@ -429,7 +459,9 @@ impl MmapFrameRing {
         put_u32(slot, SLOT_OFF_WIDTH, width);
         put_u32(slot, SLOT_OFF_HEIGHT, height);
         put_u32(slot, SLOT_OFF_STRIDE, width * 4);
+        put_u32(slot, SLOT_OFF_CAPTURE_EPOCH, capture.epoch);
         put_f64(slot, SLOT_OFF_CAPTURE_TS, capture_ts_ms);
+        put_f64(slot, SLOT_OFF_CAPTURE_UT, capture.ut.unwrap_or(f64::NAN));
         // Pixels.
         slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + rgba.len()].copy_from_slice(rgba);
 
@@ -490,6 +522,16 @@ impl MmapFrameRing {
                     .try_into()
                     .unwrap(),
             );
+            let capture_epoch = u32::from_le_bytes(
+                slot[SLOT_OFF_CAPTURE_EPOCH..SLOT_OFF_CAPTURE_EPOCH + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let capture_ut = f64::from_le_bytes(
+                slot[SLOT_OFF_CAPTURE_UT..SLOT_OFF_CAPTURE_UT + 8]
+                    .try_into()
+                    .unwrap(),
+            );
             let pixel_bytes = (width as usize) * (height as usize) * 4;
             if pixel_bytes > slot_bytes - SLOT_OFF_PIXELS {
                 // Corrupt / writer wrote bigger-than-capacity. Re-poll once.
@@ -510,6 +552,10 @@ impl MmapFrameRing {
                     stride_bytes,
                     capture_ts_ms,
                     sequence: slot_seq_before,
+                    capture: CaptureStamp {
+                        ut: capture_ut.is_finite().then_some(capture_ut),
+                        epoch: capture_epoch,
+                    },
                     pixels,
                 }));
             }
@@ -551,7 +597,7 @@ mod tests {
     /// silently drift. Copied to a temp path first — open() maps read-write.
     #[test]
     fn csharp_written_fixture_reads_back_exactly() {
-        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/frame_ring_v1.ring");
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/frame_ring_v2.ring");
         let path = tmp_path("csfixture");
         fs::copy(fixture, &path).unwrap();
 
@@ -563,12 +609,20 @@ mod tests {
         let ring = MmapFrameRing::open(&path, cfg).unwrap();
         let frame = ring.latest().unwrap().expect("fixture must contain frames");
 
-        // Second of the two fixture frames: pattern (i*11+29)&0xFF @ 1235.5.
+        // Second of the two fixture frames: pattern (i*11+29)&0xFF @ 1235.5,
+        // UT 86400.25 in epoch 7.
         assert_eq!(frame.width, 32);
         assert_eq!(frame.height, 18);
         assert_eq!(frame.stride_bytes, 32 * 4);
         assert_eq!(frame.sequence, 2);
         assert_eq!(frame.capture_ts_ms, 1235.5);
+        assert_eq!(
+            frame.capture,
+            CaptureStamp {
+                ut: Some(86400.25),
+                epoch: 7
+            }
+        );
         let want: Vec<u8> = (0..32usize * 18 * 4)
             .map(|i| ((i * 11 + 29) & 0xFF) as u8)
             .collect();
@@ -607,6 +661,29 @@ mod tests {
         assert_eq!(frame.sequence, 1);
         assert_eq!(frame.pixels, pixels);
 
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn capture_stamp_roundtrips_and_unknown_ut_reads_none() {
+        let path = tmp_path("stamp");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        let pixels = vec![0u8; 4 * 4 * 4];
+        let stamp = CaptureStamp {
+            ut: Some(123_456.789),
+            epoch: 3,
+        };
+        writer.produce_stamped(4, 4, 1.0, stamp, &pixels).unwrap();
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert_eq!(reader.latest().unwrap().unwrap().capture, stamp);
+
+        writer.produce(4, 4, 2.0, &pixels).unwrap();
+        assert_eq!(
+            reader.latest().unwrap().unwrap().capture,
+            CaptureStamp::UNKNOWN
+        );
         drop(reader);
         drop(writer);
         fs::remove_file(&path).ok();

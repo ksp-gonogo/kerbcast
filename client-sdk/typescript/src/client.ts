@@ -2,6 +2,8 @@ import type {
   AdaptiveShedPayload,
   CameraState,
   ClientMessage,
+  CommandAim,
+  CommandVantage,
   DisplaySizeReport,
   ErrorPayload,
   Layer,
@@ -10,10 +12,28 @@ import type {
   SettingsStatePayload,
   TrackMode,
 } from "./__generated__/types";
-import { CameraLifecycle, ErrorSource } from "./__generated__/types";
-import { type NoisePipeline, tryCreateNoisePipeline } from "./noise";
+import { CameraKind, CameraLifecycle, CommandAimKind, ErrorCode, ErrorSource } from "./__generated__/types";
+import {
+  type DisplayedFrameUt,
+  type FrameUt,
+  FrameStampStore,
+  STAMP_TO_DISPLAY_MAX_MS,
+  type VideoWithFrameCallback,
+  extrapolateCaptureUt,
+  monotonicNowMs,
+} from "./frameUt";
+import {
+  type DisplayedFrameMetadata,
+  type DisplayedSourceFrame,
+  type NoisePipeline,
+  tryCreateNoisePipeline,
+} from "./noise";
 import { RecordingController, type RecordingControllerOptions } from "./recording";
 
+/** Cadence of estimated frames from a watcher on a browser without `requestVideoFrameCallback`. */
+const ESTIMATED_FRAME_INTERVAL_MS = 100;
+/* How long after an element's last exactly identified frame that frame still bounds an unidentified one. */
+const LAST_EXACT_MAX_AGE_MS = 1000;
 /** Intensity the static runs at when a camera has no live source (signal lost). */
 const SOURCELESS_INTENSITY = 1.0;
 /** Floor applied to the degrade-driven intensity of a live feed. */
@@ -149,6 +169,17 @@ export interface KerbcastClientConfig {
    */
   noise?: Partial<NoiseConfig>;
   /**
+   * Keep cameras whose noise is disabled on the frame-locked canvas path,
+   * with no static, instead of exposing the raw track. On Chrome this lets
+   * `watchDisplayedFrames` identify every displayed frame exactly even where
+   * the browser's frame callbacks carry no `rtpTimestamp`. Where the browser
+   * has MediaStreamTrackProcessor and MediaStreamTrackGenerator, frames are
+   * forwarded untouched with no canvas work; elsewhere it costs one canvas
+   * composite per frame. Cameras with noise enabled are always frame-locked.
+   * Default false.
+   */
+  frameLock?: boolean;
+  /**
    * ICE gathering timeout in milliseconds. Passed to the default
    * {@link BrowserKerbcastTransport}; ignored when a custom transport is
    * provided (the transport owns gathering). Defaults to 2000 ms.
@@ -268,6 +299,98 @@ export interface DiscoveredCamera {
   keyframeRequestsReceived?: number;
   /** Largest display size held across consumers; null when none is held. */
   displaySize?: DisplaySizeReport | null;
+}
+
+/**
+ * How long a command sent between `connect` resolving and the control channel
+ * opening waits for the channel before it rejects.
+ */
+export const CONTROL_OPEN_TIMEOUT_MS = 10_000;
+
+interface PendingSend {
+  payload: string;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * {@link KerbcastClient.setCommandAim} refused because a command authority in
+ * game holds the lock on command camera aims.
+ */
+export class CommandLockedError extends Error {
+  readonly code = ErrorCode.CommandLocked;
+
+  constructor(readonly owner: string) {
+    super(`[kerbcast] ${owner} holds the command camera lock; aim refused`);
+    this.name = "CommandLockedError";
+  }
+}
+
+/**
+ * {@link KerbcastClient.setCommandAim} refused because the aim's craft (a
+ * `vessel` aim's craft, or an `orbit` or `positionAt` aim's subject) is not in
+ * the camera's `commandCentre.targets`, for example one merged away in a dock.
+ */
+export class CommandTargetUnknownError extends Error {
+  readonly code = ErrorCode.CommandTargetUnknown;
+
+  constructor(
+    readonly flightId: number,
+    readonly persistentId: number,
+  ) {
+    super(`[kerbcast] craft ${persistentId} is not among camera ${flightId}'s targets; aim refused`);
+    this.name = "CommandTargetUnknownError";
+  }
+}
+
+/** The craft an aim names: a `vessel` aim's craft, or an `orbit` or `positionAt` aim's subject. */
+function aimCraft(aim: CommandAim): number | undefined {
+  const pid =
+    aim.kind === CommandAimKind.Vessel
+      ? aim.persistentId
+      : aim.kind === CommandAimKind.Orbit || aim.kind === CommandAimKind.PositionAt
+        ? aim.subjectPersistentId
+        : undefined;
+  return pid ? pid : undefined;
+}
+
+/** How long {@link KerbcastClient.createCommandCamera} waits for the camera by default. */
+export const COMMAND_CAMERA_CREATE_TIMEOUT_MS = 35_000;
+
+/**
+ * How long {@link KerbcastClient.createCommandCamera} waits, once the camera
+ * has appeared, for the game's first report of its target and target list.
+ */
+export const COMMAND_CAMERA_STATE_WAIT_MS = 5_000;
+
+/** Options for {@link KerbcastClient.createCommandCamera}. */
+export interface CreateCommandCameraOptions {
+  /** Feed name; omit for the game's default for the vantage. */
+  name?: string;
+  /**
+   * Where it points; omit for the default (the active craft in flight). Not
+   * applied while a command authority in game holds the lock.
+   */
+  aim?: CommandAim;
+  /**
+   * Identifies the request; the new camera carries it as
+   * `commandCentre.token`. Omit for a random one. Reusing a token within a
+   * scene creates nothing.
+   */
+  token?: string;
+  /**
+   * Milliseconds to wait for the camera to appear before rejecting. The
+   * game retries a launch site, station or craft that is not placed yet for
+   * up to 30 s. Default {@link COMMAND_CAMERA_CREATE_TIMEOUT_MS}.
+   */
+  timeoutMs?: number;
+}
+
+function randomToken(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 /** Event payloads emitted by a {@link KerbcastClient}. */
@@ -542,6 +665,8 @@ class CameraHandle
   private _keyframeRetry: ReturnType<typeof setInterval> | null = null;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
   private _showStatic = true;
+  /** True while the pipeline runs as a static-free frame-lock passthrough (noise off, `frameLock` on). */
+  private _clear = false;
   private readonly client: KerbcastClient;
 
   constructor(flightId: number, client: KerbcastClient) {
@@ -579,7 +704,7 @@ class CameraHandle
 
   setShowStatic(enabled: boolean): void {
     this._showStatic = enabled;
-    this._noisePipeline?.setShowStatic(enabled);
+    if (!this._clear) this._noisePipeline?.setShowStatic(enabled);
   }
 
   /**
@@ -601,7 +726,7 @@ class CameraHandle
 
     // Live feed: degrade drives intensity. Don't touch a sourceless pipeline,
     // which is pinned at full static.
-    if (!this._sourceless) {
+    if (!this._sourceless && !this._clear) {
       this._noisePipeline?.setIntensity(this._liveIntensity());
     }
 
@@ -633,26 +758,29 @@ class CameraHandle
     this._sourceless = raw === null;
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
+    this._clear = !noiseEnabled && this.client._frameLock();
 
-    if (noiseEnabled) {
+    if (noiseEnabled || this._clear) {
       // Sourceless feeds show static in flight, but go blank (black, no
       // noise) out of flight so a whole-scene unload is calm.
-      const showStatic = raw ? this._showStatic : this._sourcelessShowStatic();
+      const showStatic = this._clear ? false : raw ? this._showStatic : this._sourcelessShowStatic();
+      const intensity = this._clear ? 0 : raw ? this._liveIntensity() : SOURCELESS_INTENSITY;
       // Reuse an existing pipeline; otherwise try to create one.
       if (!this._noisePipeline) {
-        const initial = raw ? this._liveIntensity() : SOURCELESS_INTENSITY;
-        this._noisePipeline = tryCreateNoisePipeline(raw, initial, {
+        this._noisePipeline = tryCreateNoisePipeline(raw, intensity, {
           showStatic,
+          passthrough: this._clear,
           onStallChange: (stalled) => this._setStalled(stalled),
         });
       } else {
+        this._noisePipeline.setPassthrough(this._clear);
         this._noisePipeline.setSource(raw);
         this._noisePipeline.setShowStatic(showStatic);
       }
 
       const pipeline = this._noisePipeline;
       if (pipeline) {
-        pipeline.setIntensity(raw ? this._liveIntensity() : SOURCELESS_INTENSITY);
+        pipeline.setIntensity(intensity);
         this._setOutput(pipeline.processedStream);
         return;
       }
@@ -682,7 +810,7 @@ class CameraHandle
    * existing sourceless pipeline so it switches between static and blank.
    */
   _refreshSceneState(): void {
-    if (this._sourceless) {
+    if (this._sourceless && !this._clear) {
       this._noisePipeline?.setShowStatic(this._sourcelessShowStatic());
     }
   }
@@ -723,6 +851,20 @@ class CameraHandle
 
   private _liveIntensity(): number {
     return Math.max(LIVE_INTENSITY_FLOOR, this._state?.degradeLevel ?? 0);
+  }
+
+  /**
+   * Internal: the source frame shown by a frame `video` presented with
+   * `metadata`, when `video` is playing the noise pipeline's output, else
+   * null.
+   */
+  _displayedSourceFrame(
+    video: HTMLVideoElement,
+    metadata: DisplayedFrameMetadata,
+  ): DisplayedSourceFrame | null {
+    const pipeline = this._noisePipeline;
+    if (!pipeline || video.srcObject !== pipeline.processedStream) return null;
+    return pipeline.displayedFrame(metadata);
   }
 
   /**
@@ -848,6 +990,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private readonly transport: KerbcastTransport;
   private peer: KerbcastPeer | null = null;
   private control: KerbcastDataChannel | null = null;
+  /** Whether {@link control} has opened and not closed since. */
+  private controlOpen = false;
+  /** Commands sent after `connect` but before the control channel opened, in send order. */
+  private pendingSends: PendingSend[] = [];
   private _state: KerbcastConnectionState = "disconnected";
   private _cameras: CameraState[] = [];
   private readonly handles = new Map<number, CameraHandle>();
@@ -882,6 +1028,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _captureUt: number | null = null;
   private _captureEpoch = 0;
   private _warpRate = 1;
+  /** When `_captureUt` arrived, on the monotonic clock, for extrapolation. */
+  private _captureUtAt = 0;
+  /** Per-frame capture stamps from `frame-stamp`, for exact frame UT lookup. */
+  private readonly frameStamps = new FrameStampStore();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
   /** Client-side recording controller, lazily built on first `recording` access. */
@@ -942,6 +1092,140 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       captureUt: this._captureUt,
       epoch: this._captureEpoch,
       warpRate: this._warpRate,
+    };
+  }
+
+  /**
+   * Mission time of one frame of `flightId`'s video. With the frame's RTP
+   * timestamp (from `requestVideoFrameCallback` metadata `rtpTimestamp`, or a
+   * `VideoFrame`'s metadata) and a matching stamp from the sidecar, the
+   * result is the exact UT the frame was rendered at, `source: "exact"`.
+   * Otherwise it falls back to the capture clock extrapolated to `atMs`
+   * (default now, `performance.now()` clock), `source: "estimated"`. `null`
+   * only when there is no stamp and no clock either.
+   */
+  frameUt(flightId: number, rtpTimestamp?: number | null, atMs?: number): FrameUt | null {
+    if (rtpTimestamp != null) {
+      const stamp = this.frameStamps.lookup(flightId, rtpTimestamp);
+      if (stamp) return { ut: stamp.ut, epoch: stamp.epoch, source: "exact" };
+    }
+    if (this._captureUt === null) return null;
+    return {
+      ut: extrapolateCaptureUt(
+        this._captureUt,
+        this._warpRate,
+        this._captureUtAt,
+        atMs ?? monotonicNowMs(),
+      ),
+      epoch: this._captureEpoch,
+      source: "estimated",
+    };
+  }
+
+  /**
+   * Report the mission time of every frame `video` presents while it shows
+   * `flightId`'s feed. `video` may play the camera handle's `mediaStream`
+   * with or without the noise pipeline: through the pipeline, the frame is
+   * the source frame composited into the presented output frame.
+   *
+   * `source: "exact"` only when the presented frame itself identifies its
+   * source frame: the RTP timestamp in the element's own frame metadata, or
+   * the pipeline's output frame identified by `mediaTime` (Chrome). Anything
+   * else is `"estimated"` and lags the picture rather than leading it: an
+   * older frame's stamp, in order of preference the oldest pipeline
+   * composite that could be on screen, the element's last exactly identified
+   * frame (within the last second), or the newest stamp that arrived more
+   * than {@link STAMP_TO_DISPLAY_MAX_MS} before the frame was shown. Only
+   * with no stamp at all does it fall back to the capture clock, which
+   * leads.
+   * Without `requestVideoFrameCallback` estimated frames arrive every 100 ms
+   * instead. Frames with neither a stamp nor a clock are skipped. Returns a
+   * function that stops watching.
+   */
+  watchDisplayedFrames(
+    flightId: number,
+    video: HTMLVideoElement,
+    onFrame: (frame: DisplayedFrameUt) => void,
+  ): () => void {
+    const v = video as VideoWithFrameCallback;
+    /*
+     * The last frame of this element identified exactly. Frames are presented
+     * in order, so when a later frame can't be identified, this one is a
+     * bound that never leads the picture.
+     */
+    let lastExact: (DisplayedFrameUt & { mediaTime: number | undefined }) | null = null;
+    const estimate = (presentedAt: number) => {
+      if (lastExact && presentedAt - lastExact.presentedAt <= LAST_EXACT_MAX_AGE_MS) {
+        onFrame({
+          ut: lastExact.ut,
+          epoch: lastExact.epoch,
+          source: "estimated",
+          flightId,
+          rtpTimestamp: lastExact.rtpTimestamp,
+          presentedAt,
+        });
+        return;
+      }
+      const older = this.frameStamps.newestArrivedBy(
+        flightId,
+        presentedAt - STAMP_TO_DISPLAY_MAX_MS,
+      );
+      if (older) {
+        onFrame({ ...older, source: "estimated", flightId, presentedAt });
+        return;
+      }
+      const clock = this.frameUt(flightId, null, presentedAt);
+      if (clock) onFrame({ ...clock, flightId, rtpTimestamp: null, presentedAt });
+    };
+    const report = (
+      rtpTimestamp: number | null,
+      exact: boolean,
+      presentedAt: number,
+      mediaTime?: number,
+    ) => {
+      const stamp = rtpTimestamp === null ? null : this.frameStamps.lookup(flightId, rtpTimestamp);
+      /* An identification that runs backwards against the last exact frame is not trusted. */
+      const ordered =
+        mediaTime === undefined ||
+        lastExact?.mediaTime === undefined ||
+        mediaTime >= lastExact.mediaTime;
+      if (!stamp || !ordered) {
+        estimate(presentedAt);
+        return;
+      }
+      const frame: DisplayedFrameUt = {
+        ...stamp,
+        source: exact ? "exact" : "estimated",
+        flightId,
+        rtpTimestamp,
+        presentedAt,
+      };
+      if (exact) lastExact = { ...frame, mediaTime };
+      onFrame(frame);
+    };
+    if (typeof v.requestVideoFrameCallback !== "function") {
+      const timer = setInterval(() => estimate(monotonicNowMs()), ESTIMATED_FRAME_INTERVAL_MS);
+      return () => clearInterval(timer);
+    }
+    let stopped = false;
+    let id: number | null = null;
+    const arm = () => {
+      id = v.requestVideoFrameCallback!((now, metadata) => {
+        if (stopped) return;
+        const presentedAt = metadata?.expectedDisplayTime ?? now;
+        if (typeof metadata?.rtpTimestamp === "number") {
+          report(metadata.rtpTimestamp, true, presentedAt);
+        } else {
+          const shown = this.handles.get(flightId)?._displayedSourceFrame(video, metadata ?? {});
+          report(shown?.rtpTimestamp ?? null, shown?.exact ?? false, presentedAt, metadata?.mediaTime);
+        }
+        arm();
+      });
+    };
+    arm();
+    return () => {
+      stopped = true;
+      if (id !== null) v.cancelVideoFrameCallback?.(id);
     };
   }
 
@@ -1010,8 +1294,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    *
    * Two modes:
    * - **Legacy** (no `opts.slots`): one transceiver per requested camera;
-   *   an empty array subscribes to every currently-known camera. Tracks
-   *   route by m-line index. Unchanged behaviour.
+   *   an empty array offers one transceiver, which carries the first
+   *   currently-known camera. Tracks route by m-line index.
    * - **Dynamic** (`opts.slots` set): negotiates a pool of `opts.slots`
    *   recv-only video slots. `requestedCameras` are the *initial*
    *   subscription bound to the first slots; spare slots are filled at
@@ -1030,6 +1314,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.trackByMid.clear();
     this.flightByMid.clear();
     this.flightByTrackId.clear();
+    /* RTP timestamps restart from a fresh random base on every peer. */
+    this.frameStamps.clear();
 
     const peer = this.transport.createPeer(
       this.cfg.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }],
@@ -1055,17 +1341,37 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       }
     });
 
-    this.control = peer.createDataChannel("kerbcast-control");
-    this.control.onOpen(() => {
+    const control = peer.createDataChannel("kerbcast-control");
+    this.control = control;
+    control.onOpen(() => {
+      if (this.control !== control) return;
+      this.controlOpen = true;
       void this._send({ type: "hello" });
+      /* Queued commands follow hello, in order, ahead of control-open listeners. */
+      const pending = this.pendingSends;
+      this.pendingSends = [];
+      for (const p of pending) {
+        clearTimeout(p.timer);
+        try {
+          control.send(p.payload);
+          p.resolve();
+        } catch (err) {
+          p.reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
       this.emit("control-open", undefined);
     });
-    this.control.onMessage((raw) => {
+    control.onMessage((raw) => {
       this.handleServerMessage(raw);
     });
-    this.control.onClose(() => {
-      // Channel closure usually follows peer disconnect; the peer
-      // state-change handler covers the tear-down. Nothing to do here.
+    control.onClose(() => {
+      /*
+       * Channel closure usually follows peer disconnect; the peer
+       * state-change handler covers the tear-down.
+       */
+      if (this.control !== control) return;
+      this.controlOpen = false;
+      this.rejectPendingSends("[kerbcast] control channel closed before it opened");
     });
 
     await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
@@ -1114,6 +1420,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.peer?.close();
     this.peer = null;
     this.control = null;
+    this.controlOpen = false;
+    this.rejectPendingSends("[kerbcast] client disconnected before the control channel opened");
     this.tearDownStreams();
     this.setState("disconnected");
   }
@@ -1196,6 +1504,131 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * Point a command camera by `aim`, or return it to its default with `null`
+   * (the active craft in flight, the configured craft at the Space Center).
+   * A `vessel` aim follows any craft from `commandCentre.targets`, whatever
+   * its eligibility. The aim shows up in `commandCentre.aimKind` and
+   * `.subjectPersistentId` once the game applies it.
+   *
+   * Rejects at once while the camera's state reports a command authority
+   * (`commandTrack.authority`): it holds the lock and only it can aim. A
+   * refusal that races the lock being taken arrives as an `error` event with
+   * code `ErrorCode.CommandLocked` instead.
+   *
+   * Rejects with a {@link CommandTargetUnknownError} when the aim's craft is
+   * not in the camera's `commandCentre.targets` (a craft merged away in a
+   * dock, say). A refusal that races the list changing arrives as an `error`
+   * event with code `ErrorCode.CommandTargetUnknown`.
+   */
+  async setCommandAim(flightId: number, aim: CommandAim | null): Promise<void> {
+    const cam = this._cameras.find((c) => c.flightId === flightId);
+    const owner = cam?.commandTrack?.authority?.owner;
+    if (owner) {
+      throw new CommandLockedError(owner);
+    }
+    /* An empty list is what the game writes when listing fails, so it decides then. */
+    const craft = aim ? aimCraft(aim) : undefined;
+    const targets = cam?.commandCentre?.targets;
+    if (craft !== undefined && targets?.length && !targets.some((t) => t.persistentId === craft)) {
+      throw new CommandTargetUnknownError(flightId, craft);
+    }
+    await this._send({
+      type: "set-command-aim",
+      content: aim ? { flightId, aim } : { flightId },
+    });
+  }
+
+  /**
+   * Create a command camera standing at `vantage` for the rest of the
+   * current game scene (flight or Space Center), and resolve with its state
+   * once it appears in {@link cameras} and the game has reported its target
+   * and target list (`commandCentre.subjectPersistentId`, `.targets`).
+   * Every consumer sees it. It points at the active craft unless `aim` says
+   * otherwise, and takes {@link setCommandAim} and
+   * {@link destroyCommandCamera} like any command camera.
+   *
+   * Rejects if the camera has not appeared within `timeoutMs`: the game
+   * builds nothing for a body, launch site, station or craft it can not
+   * find, and logs why. A malformed vantage is refused by the sidecar with
+   * an `error` event.
+   */
+  async createCommandCamera(
+    vantage: CommandVantage,
+    opts: CreateCommandCameraOptions = {},
+  ): Promise<CameraState> {
+    const token = opts.token ?? randomToken();
+    const timeoutMs = opts.timeoutMs ?? COMMAND_CAMERA_CREATE_TIMEOUT_MS;
+    const find = (cams: ReadonlyArray<CameraState>) =>
+      cams.find(
+        (c) =>
+          c.kind === CameraKind.Command &&
+          c.commandCentre?.token === token &&
+          c.lifecycle !== CameraLifecycle.Destroyed,
+      );
+    /*
+     * The camera is announced before the game's first status report for it,
+     * so its first state has no target or target list yet. That report always
+     * carries commandTrack, so wait for it; a camera whose report never comes
+     * still resolves after COMMAND_CAMERA_STATE_WAIT_MS with what is known.
+     */
+    const appeared = new Promise<CameraState>((resolve, reject) => {
+      let latest: CameraState | undefined;
+      let stateTimer: ReturnType<typeof setTimeout> | undefined;
+      const timer = setTimeout(() => {
+        off();
+        reject(
+          new Error(
+            `[kerbcast] command camera ${token} did not appear within ${timeoutMs} ms`,
+          ),
+        );
+      }, timeoutMs);
+      const finish = (cam: CameraState) => {
+        clearTimeout(timer);
+        clearTimeout(stateTimer);
+        off();
+        resolve(cam);
+      };
+      const off = this.on("cameras-change", (cams) => {
+        const cam = find(cams);
+        if (!cam) return;
+        if (cam.commandTrack != null) {
+          finish(cam);
+          return;
+        }
+        if (latest === undefined) {
+          clearTimeout(timer);
+          stateTimer = setTimeout(() => finish(latest ?? cam), COMMAND_CAMERA_STATE_WAIT_MS);
+        }
+        latest = cam;
+      });
+    });
+    try {
+      await this._send({
+        type: "create-command-camera",
+        content: {
+          token,
+          vantage,
+          ...(opts.name !== undefined ? { name: opts.name } : {}),
+          ...(opts.aim !== undefined ? { aim: opts.aim } : {}),
+        },
+      });
+    } catch (err) {
+      appeared.catch(() => {});
+      throw err;
+    }
+    return appeared;
+  }
+
+  /**
+   * Destroy a command camera made by {@link createCommandCamera} (or created
+   * in game); its feed ends. The game's own command camera can not be
+   * destroyed. Destroying one that is already gone does nothing.
+   */
+  async destroyCommandCamera(flightId: number): Promise<void> {
+    await this._send({ type: "destroy-command-camera", content: { flightId } });
+  }
+
+  /**
    * Internal — resolves the effective noise enabled state for a camera,
    * merging the per-camera override (if any) with the client-level default.
    */
@@ -1204,17 +1637,54 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     return this.cfg.noise?.enabled !== false; // default: enabled
   }
 
+  /** Internal: whether noise-disabled cameras stay on the frame-locked path. */
+  _frameLock(): boolean {
+    return this.cfg.frameLock === true;
+  }
+
   /**
-   * Internal — sends a typed `ClientMessage` over the control
-   * channel. Drops silently if the channel hasn't opened yet (and
-   * logs to console). Public on the camera handle, but consumers
+   * Internal: sends a typed `ClientMessage` over the control channel. Throws
+   * when there is no connection. Between `connect` resolving and the channel
+   * opening, the message waits and goes out as soon as it opens; it rejects
+   * if the channel has not opened within {@link CONTROL_OPEN_TIMEOUT_MS}, or
+   * the client disconnects first. Public on the camera handle, but consumers
    * shouldn't need to call this directly.
    */
   async _send(msg: ClientMessage): Promise<void> {
-    if (!this.control) {
+    const control = this.control;
+    if (!control) {
       throw new Error("[kerbcast] control channel not open");
     }
-    this.control.send(JSON.stringify(msg));
+    const payload = JSON.stringify(msg);
+    if (this.controlOpen) {
+      control.send(payload);
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const entry: PendingSend = {
+        payload,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.pendingSends = this.pendingSends.filter((p) => p !== entry);
+          reject(
+            new Error(
+              `[kerbcast] control channel did not open within ${CONTROL_OPEN_TIMEOUT_MS} ms`,
+            ),
+          );
+        }, CONTROL_OPEN_TIMEOUT_MS),
+      };
+      this.pendingSends.push(entry);
+    });
+  }
+
+  private rejectPendingSends(message: string): void {
+    const pending = this.pendingSends;
+    this.pendingSends = [];
+    for (const p of pending) {
+      clearTimeout(p.timer);
+      p.reject(new Error(message));
+    }
   }
 
   // -- private --
@@ -1270,6 +1740,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       case "hello":
         this._sidecarVersion = msg.content.sidecarVersion;
         this._encoderBackend = msg.content.encoderBackend;
+        /* Stamps are opt-in so clients that predate them never pay for them. */
+        if (msg.content.frameStamps === true) {
+          void this._send({ type: "set-frame-stamps", content: { enabled: true } }).catch(() => {});
+        }
         break;
       case "camera-snapshot":
         this._cameras = msg.content.cameras;
@@ -1348,11 +1822,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
          * value updates it); warpRate falls back to 1 when absent.
          */
         this._captureUt = msg.content.captureUt ?? null;
+        this._captureUtAt = monotonicNowMs();
         if (msg.content.captureEpoch != null) {
           this._captureEpoch = msg.content.captureEpoch;
         }
         this._warpRate = msg.content.timeWarpRate ?? 1;
         this.emit("settings-change", msg.content);
+        break;
+      case "frame-stamp":
+        this.frameStamps.record(msg.content);
         break;
       case "scene-state-changed":
         this._inFlight = msg.content.inFlight;

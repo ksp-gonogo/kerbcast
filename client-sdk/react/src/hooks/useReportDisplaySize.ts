@@ -4,10 +4,12 @@ import { useKerbcastDisplaySizes } from "../context";
 /*
  * Debounce + bucket for self-measured display-size reporting. The first
  * measurement after mount reports promptly (so a feed never sits at a stale
- * resolution until it is resized); later churn is debounced. Sizes are ceiled
- * to a BUCKET_PX multiple: that meets-the-minimum-need (never under-serve),
- * yields an even value (H.264-friendly), and gives a material-change threshold
- * so a feed re-reports only when a resize crosses a bucket boundary.
+ * resolution until it is resized); later churn is debounced. The width is
+ * ceiled to a BUCKET_PX multiple: that meets-the-minimum-need (never
+ * under-serve) and gives a material-change threshold so a feed re-reports
+ * only when a resize crosses a bucket boundary. The height follows from the
+ * box's own aspect, rounded to even for H.264, so the frame fills the box
+ * instead of letterboxing inside it.
  */
 const DEBOUNCE_MS = 200;
 const BUCKET_PX = 16;
@@ -15,6 +17,14 @@ const BUCKET_PX = 16;
 function bucket(px: number): number {
   const b = Math.ceil(px / BUCKET_PX) * BUCKET_PX;
   return b < BUCKET_PX ? BUCKET_PX : b;
+}
+
+/** Report size for a `width` x `height` box: bucketed width, height at the box's aspect. */
+export function displayReportSize(width: number, height: number): { width: number; height: number } {
+  const w = bucket(width);
+  if (!(width > 0) || !(height > 0)) return { width: w, height: bucket(height) };
+  const h = Math.max(2, Math.round((w * height) / width / 2) * 2);
+  return { width: w, height: h };
 }
 
 export interface ReportDisplaySizeOptions {
@@ -70,9 +80,10 @@ export function useReportDisplaySize(
     let firstReported = false;
 
     const report = (width: number, height: number) => {
-      const side = square ? Math.min(width, height) : 0;
-      const bw = bucket(square ? side : width);
-      const bh = bucket(square ? side : height);
+      const side = bucket(Math.min(width, height));
+      const { width: bw, height: bh } = square
+        ? { width: side, height: side }
+        : displayReportSize(width, height);
       if (bw === lastW && bh === lastH) return;
       lastW = bw;
       lastH = bh;

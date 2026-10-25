@@ -22,11 +22,16 @@ export enum CameraLifecycle {
 
 /**
  * Distinguishes an existing Hullcam part camera (`Part`) from a
- * per-kerbal face camera (`Kerbal`).
+ * per-kerbal face camera (`Kerbal`) and a fixed command
+ * camera watching a craft from a CommNet station (`Command`).
+ * 
+ * Consumers must treat a value they do not recognise as "some other kind of
+ * camera" rather than failing: new kinds are added without a protocol bump.
  */
 export enum CameraKind {
 	Part = "part",
 	Kerbal = "kerbal",
+	Command = "command",
 }
 
 /**
@@ -67,6 +72,180 @@ export enum CaptureState {
 export enum CrewLocation {
 	Seat = "seat",
 	Eva = "eva",
+}
+
+/** How a command camera aims. */
+export enum CommandAimKind {
+	/** Follows a craft, which is the subject. */
+	Vessel = "vessel",
+	/** Follows a conic the game propagates. */
+	Orbit = "orbit",
+	/** Holds a point on a body, carried round by its rotation. */
+	Surface = "surface",
+	/** Follows a position the caller propagated, extrapolated linearly. */
+	PositionAt = "positionAt",
+	/** Holds a direction from the camera's local horizon. */
+	Direction = "direction",
+}
+
+/**
+ * Whether a command camera's tracking network could watch a craft. Only
+ * `NotTrackable` applies outside career (or with the tracking rules off).
+ */
+export enum CommandTargetEligibility {
+	Ok = "ok",
+	/** Beyond the Tracking Station's range at its current level. */
+	TooFar = "tooFar",
+	/** An unowned object, and the current level tracks none. */
+	LevelTooLow = "levelTooLow",
+	/** An unowned object the player has found but not tracked. */
+	NotTrackable = "notTrackable",
+}
+
+/** One craft a command camera could watch. */
+export interface CommandTarget {
+	persistentId: number;
+	vesselName: string;
+	/** KSP's `VesselType` name, e.g. `"Ship"`, `"Probe"`, `"Debris"`. */
+	vesselType: string;
+	/**
+	 * Station to craft in metres, to 3 significant figures. `None` without a
+	 * position for it.
+	 */
+	rangeM?: number;
+	eligibility: CommandTargetEligibility;
+	/** Short display text for `eligibility`. */
+	eligibilityText: string;
+}
+
+/**
+ * Where a command camera stands, what it watches and what it could watch.
+ * Present only when `CameraState.kind == Command`.
+ */
+export interface CommandCentreInfo {
+	/** gonogo's command-centre id for this station, `ground:<nodeName>`. */
+	stationId: string;
+	/** The CommNet home's `nodeName` (KSC's is `"KSC"`). */
+	nodeName: string;
+	/**
+	 * The station's name as the player reads it in game, or `node_name` when
+	 * it has none.
+	 */
+	displayName: string;
+	/** Body the station sits on. */
+	body: string;
+	latitude: number;
+	longitude: number;
+	/**
+	 * Lens altitude above sea level in metres: the station's own altitude
+	 * plus the plugin's configured offset.
+	 */
+	altitude: number;
+	/**
+	 * How the camera aims, as set by `SetCommandAim`. `None` for its
+	 * default: the active craft in flight, the configured craft at the Space
+	 * Center.
+	 */
+	aimKind?: CommandAimKind;
+	/**
+	 * `Vessel.persistentId` of the camera's subject, the craft it draws,
+	 * brackets and reads out; 0 for none. A `vessel` aim's craft, an `orbit`
+	 * or `positionAt` aim's subject, otherwise the default craft.
+	 */
+	subjectPersistentId: number;
+	/**
+	 * Station to the subject in metres, to 3 significant figures. `None`
+	 * without a position for it.
+	 */
+	rangeM?: number;
+	/**
+	 * The Tracking Station's level, 1-based (stock 1..=3). The highest level
+	 * outside career.
+	 */
+	trackingLevel: number;
+	/**
+	 * Every craft the camera could watch, eligible first, then nearest
+	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
+	 * only reports what the tracking network would allow.
+	 */
+	targets: CommandTarget[];
+	/**
+	 * True for a camera made at runtime (`CreateCommandCamera`, or the
+	 * plugin's `KerbcastControl.CreateCommandCamera`), false for the one
+	 * from the game's settings. Only created cameras can be destroyed.
+	 * Older sidecars omit it.
+	 */
+	created?: boolean;
+	/**
+	 * The `token` of the `CreateCommandCamera` request that made this
+	 * camera, so its creator can find it in the camera list. `None` for the
+	 * settings camera and for cameras created in game.
+	 */
+	token?: string;
+}
+
+/** The registered command authority. */
+export interface CommandAuthorityState {
+	owner: string;
+}
+
+/**
+ * A full snapshot of a command track's discrete fields at the exact UT they
+ * changed, so a delayed client can show the state that held at its own
+ * displayed UT.
+ */
+export interface CommandTrackEvent {
+	ut: number;
+	occluded: boolean;
+	occluder: string;
+	sunlit: boolean;
+	blank?: string;
+	/**
+	 * True for a transition the plugin expects ahead of `ut` on the current
+	 * trajectory. Each write replaces the predictions; recorded events never
+	 * carry it.
+	 */
+	predicted?: boolean;
+}
+
+/**
+ * What a command camera is aimed at and how well it can see
+ * it. The aim point always sits at frame centre; clients draw the target
+ * brackets from this. Present only on command cameras.
+ */
+export interface CommandTrackState {
+	/** UT this state was evaluated at. */
+	ut: number;
+	hasFix: boolean;
+	/** Range to the aimed point in metres. `None` without a fix. */
+	rangeM?: number;
+	occluded: boolean;
+	/** Name of the occluding body when `occluded`, otherwise empty. */
+	occluder: string;
+	sunlit: boolean;
+	/**
+	 * Bracket half-extent in capture-frame pixels (craft extent plus the
+	 * authority's framing margin), relative to `frame_height_px`. `None` without a fix.
+	 */
+	bracketHalfPx?: number;
+	frameHeightPx: number;
+	/**
+	 * False when the craft plus the framing margin would not fit even at
+	 * the widest FoV.
+	 */
+	framingFits: boolean;
+	/**
+	 * The true craft's offset from frame centre in capture-frame pixels.
+	 * Non-zero only when an authority aims away from the craft. `None`
+	 * without a true fix.
+	 */
+	trueOffsetPx?: number;
+	/** The registered authority. `None` when standalone. */
+	authority?: CommandAuthorityState;
+	/** Why the feed is blanked; the game sends black frames while set. */
+	blank?: string;
+	/** Recent discrete transitions, oldest first. */
+	events: CommandTrackEvent[];
 }
 
 /**
@@ -160,6 +339,17 @@ export interface CameraState {
 	 * part cameras.
 	 */
 	crewLocation?: CrewLocation;
+	/**
+	 * Station identity for a command camera. `None` for
+	 * every other kind.
+	 */
+	commandCentre?: CommandCentreInfo;
+	/**
+	 * Aim and visibility of a command camera, from the
+	 * plugin's last status write. `None` for every other kind, and before
+	 * the plugin has reported one.
+	 */
+	commandTrack?: CommandTrackState;
 	/**
 	 * Server-authoritative auto-track state for a pan+zoom camera (the
 	 * operator's persistent intent). `None` (the default) = not tracking.
@@ -306,6 +496,141 @@ export interface CameraStateChangedPayload {
 	state: CameraState;
 }
 
+/**
+ * Where a command camera points. `kind` says which fields apply. With no
+ * subject (`surface`, `direction`, or `orbit` and `positionAt` without
+ * `subjectPersistentId`), the camera's default craft stays the subject.
+ */
+export interface CommandAim {
+	kind: CommandAimKind;
+	/** `vessel`: the craft's `Vessel.persistentId`. */
+	persistentId?: number;
+	/** `orbit`, `surface` and `positionAt`: the reference body's name. */
+	body?: string;
+	/** `orbit`: degrees. */
+	inclination?: number;
+	/** `orbit`. */
+	eccentricity?: number;
+	/** `orbit`: metres. */
+	semiMajorAxis?: number;
+	/** `orbit`: longitude of the ascending node, degrees. */
+	lan?: number;
+	/** `orbit`: degrees. */
+	argumentOfPeriapsis?: number;
+	/** `orbit`: radians. */
+	meanAnomalyAtEpoch?: number;
+	/** `orbit`: UT the mean anomaly is given at. */
+	epoch?: number;
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `surface`: metres above sea level. Default 0. */
+	altitude?: number;
+	/** `positionAt`: UT of the sample. */
+	ut?: number;
+	/**
+	 * `positionAt`: `[x, y, z]` metres from the body centre at `ut`, in its
+	 * non-rotating frame (the frame of `Orbit.getRelativePositionAtUT`, z up).
+	 */
+	position?: number[];
+	/** `positionAt`: `[x, y, z]` metres per second in the same frame. */
+	velocity?: number[];
+	/** `direction`: compass bearing in degrees from north, clockwise. */
+	azimuth?: number;
+	/** `direction`: degrees above the horizon, -90..=90. */
+	elevation?: number;
+	/**
+	 * `orbit` and `positionAt`: the craft the path belongs to, drawn and
+	 * bracketed as the subject. Absent: the default craft.
+	 */
+	subjectPersistentId?: number;
+	/** Metres of view kept around the subject's own size when framing. Default 0. */
+	framingMarginM?: number;
+}
+
+/** Which kind of place a created command camera stands at. */
+export enum CommandVantageKind {
+	/** Beside a launch site, the way the settings camera stands. */
+	LaunchSite = "launchSite",
+	/** At a CommNet ground station. */
+	Station = "station",
+	/** At any point on a body's surface. */
+	Surface = "surface",
+	/** Riding a craft. */
+	Vessel = "vessel",
+}
+
+/**
+ * Where a created command camera stands. `kind` says which fields apply;
+ * absent optional fields take the defaults given on each.
+ */
+export interface CommandVantage {
+	kind: CommandVantageKind;
+	/**
+	 * `launchSite`: the site's name (`"LaunchPad"`, `"Runway"`, a Making
+	 * History or Kerbal Konstructs site). Absent or empty: the active
+	 * craft's launch site, else the stock pad.
+	 */
+	site?: string;
+	/** `launchSite`: metres from the site to the lens. Default 500. */
+	distance?: number;
+	/**
+	 * `launchSite`: compass bearing in degrees from the site to the lens.
+	 * Default 180 (due south).
+	 */
+	bearing?: number;
+	/**
+	 * Metres above the ground under the lens (above the sea over water);
+	 * for `station`, above the station itself. Defaults: 5 for `launchSite`
+	 * and `surface`, 30 for `station`. Unused for `vessel`.
+	 */
+	height?: number;
+	/** `station`: the CommNet ground station's node name, e.g. `"KSC"`. */
+	station?: string;
+	/** `surface`: the body's name, e.g. `"Kerbin"`. */
+	body?: string;
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `vessel`: the craft's `Vessel.persistentId`. */
+	persistentId?: number;
+}
+
+/**
+ * Create a command camera for the rest of the current scene. Server-wide:
+ * the camera appears in every consumer's camera list (kind `command`) with
+ * `commandCentre.token` set to `token` once the game has built it,
+ * normally within a second. A request the game can not satisfy (unknown
+ * body, site, station or craft) never produces a camera; the game logs why.
+ * A token is used once per scene: a repeat with the same token is ignored.
+ */
+export interface CreateCommandCameraPayload {
+	/** Chosen by the client, unique per request (1 to 128 characters). */
+	token: string;
+	/**
+	 * Feed name; absent for the default ("Launchpad camera", "<site>
+	 * camera", "<station> tracking", "<craft> camera" or "<body> surface
+	 * camera").
+	 */
+	name?: string;
+	vantage: CommandVantage;
+	/**
+	 * Where it points; absent for the default (the active craft in
+	 * flight). Not applied while a command authority holds the lock.
+	 */
+	aim?: CommandAim;
+}
+
+/**
+ * Destroy a command camera made by `CreateCommandCamera` (or created in
+ * game). The settings camera can not be destroyed.
+ */
+export interface DestroyCommandCameraPayload {
+	flightId: number;
+}
+
 export enum ErrorSource {
 	Sidecar = "sidecar",
 	Client = "client",
@@ -326,6 +651,13 @@ export enum ErrorCode {
 	CameraNotFound = "camera-not-found",
 	/** The named camera exists but its part is gone. */
 	CameraDestroyed = "camera-destroyed",
+	/** A command authority in game holds the command cameras' aim lock. */
+	CommandLocked = "command-locked",
+	/**
+	 * A command aim names a craft that is not in the camera's latest
+	 * `commandCentre.targets`, for example one merged away in a dock.
+	 */
+	CommandTargetUnknown = "command-target-unknown",
 }
 
 export interface ErrorPayload {
@@ -344,9 +676,37 @@ export interface FlightIdPayload {
 	flightId: number;
 }
 
+/**
+ * Mission-time stamp of one video frame, sent on the control channel just
+ * before the frame's RTP packets. A browser matches it to a presented frame
+ * by `rtp_timestamp` (`requestVideoFrameCallback` metadata `rtpTimestamp`),
+ * which gives the exact UT that frame was rendered at.
+ */
+export interface FrameStampPayload {
+	/** Camera the frame came from. */
+	flightId: number;
+	/**
+	 * RTP timestamp (90 kHz clock) the frame's packets carry on this peer's
+	 * track for that camera.
+	 */
+	rtpTimestamp: number;
+	/** KSP universal time (seconds) the frame was rendered at. */
+	captureUt: number;
+	/**
+	 * Capture epoch (see `SettingsStatePayload::capture_epoch`) `capture_ut`
+	 * belongs to.
+	 */
+	captureEpoch: number;
+}
+
 export interface HelloPayload {
 	sidecarVersion: string;
 	encoderBackend: string;
+	/**
+	 * True when this sidecar sends `FrameStamp` to a client that asks with
+	 * `SetFrameStamps`. Absent from sidecars older than 1.11.
+	 */
+	frameStamps?: boolean;
 }
 
 /**
@@ -386,6 +746,16 @@ export interface SetBackgroundCaptureFpsPayload {
 	fps: number;
 }
 
+/**
+ * Point a command camera at `aim`, or back at its default with `aim` absent
+ * or null. Refused with `ErrorCode::CommandLocked` while a command authority
+ * holds the lock.
+ */
+export interface SetCommandAimPayload {
+	flightId: number;
+	aim?: CommandAim;
+}
+
 export interface SetDegradePayload {
 	flightId: number;
 	/**
@@ -414,6 +784,10 @@ export interface SetForceFullResolutionPayload {
 export interface SetFovPayload {
 	flightId: number;
 	fov: number;
+}
+
+export interface SetFrameStampsPayload {
+	enabled: boolean;
 }
 
 export interface SetLayersPayload {
@@ -575,6 +949,15 @@ export type ClientMessage =
 	 */
 	| { type: "set-track-target", content: SetTrackTargetPayload }
 	/**
+	 * Create a command camera at a vantage for the rest of the scene.
+	 * Server-wide; find the new camera by its `commandCentre.token`.
+	 */
+	| { type: "create-command-camera", content: CreateCommandCameraPayload }
+	/** Destroy a created command camera. Server-wide. */
+	| { type: "destroy-command-camera", content: DestroyCommandCameraPayload }
+	/** Point a command camera, or return it to its default. Server-wide. */
+	| { type: "set-command-aim", content: SetCommandAimPayload }
+	/**
 	 * A consumer reporting its OWN current display size in px; the sidecar
 	 * aggregates MAX-across-consumers to drive auto-resolution
 	 * (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
@@ -710,7 +1093,13 @@ export type ClientMessage =
 	 * across saves (writes the per-save difficulty parameter). Server-wide:
 	 * all peers see the resulting `SettingsState` broadcast.
 	 */
-	| { type: "set-throttle-main-screen", content: SetThrottleMainScreenPayload };
+	| { type: "set-throttle-main-screen", content: SetThrottleMainScreenPayload }
+	/**
+	 * Start or stop `FrameStamp` messages on this peer's control channel.
+	 * Off until asked for, so clients that predate stamps never receive
+	 * them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+	 */
+	| { type: "set-frame-stamps", content: SetFrameStampsPayload };
 
 /** Messages sent FROM the sidecar TO the client. */
 export type ServerMessage = 
@@ -766,5 +1155,11 @@ export type ServerMessage =
 	 * Whether KSP is in a flight scene. Primed after `Hello` and
 	 * re-broadcast when the polled in-flight flag changes.
 	 */
-	| { type: "scene-state-changed", content: SceneStateChangedPayload };
+	| { type: "scene-state-changed", content: SceneStateChangedPayload }
+	/**
+	 * Capture UT of one frame about to go out on a video track, keyed by
+	 * its RTP timestamp. One per frame per track, only to a peer that
+	 * enabled them with `SetFrameStamps`.
+	 */
+	| { type: "frame-stamp", content: FrameStampPayload };
 

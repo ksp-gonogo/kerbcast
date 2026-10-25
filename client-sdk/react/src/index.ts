@@ -25,6 +25,7 @@ export type {
 export { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 export { useKerbcastStream } from "./hooks/useKerbcastStream";
 export { useKerbcastClock } from "./hooks/useKerbcastClock";
+export { useDisplayedFrameUt } from "./hooks/useDisplayedFrameUt";
 export { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 export { useReportDisplaySize } from "./hooks/useReportDisplaySize";
 export { useRecordings } from "./hooks/useRecordings";
@@ -52,6 +53,20 @@ export type {
   CameraStreamHook,
   FeedAction,
 } from "./CameraFeed";
+
+// Target brackets geometry and the overlay API for drawing on top of them
+export { bracketGeometry, containedContentRect, COMMAND_BRACKET_COLOURS } from "./CommandBrackets";
+export type {
+  BracketGeometry,
+  BracketPoint,
+  CommandBracketContext,
+  CommandBracketCorner,
+  CommandBracketCornerOverride,
+  CommandBracketCornerOverrides,
+  CommandBracketCornerStyle,
+  CommandBracketOverlay,
+  ContentRect,
+} from "./CommandBrackets";
 
 // FeedActionBar: the shared action row (tracking, fullscreen, PiP, quality,
 // close, REC) both CameraFeed and KerbalFaceFeed render, with the issue-#6

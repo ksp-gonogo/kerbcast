@@ -23,8 +23,7 @@ interface DrawRecord {
   /*
    * getContext call order in the pipeline: 0 = the noise scratch canvas,
    * 1 = the OUTPUT canvas (what the processed stream shows), 2 = the
-   * held-last-frame canvas (created lazily at stall onset, receives the
-   * snapshot copy).
+   * held-frame canvas (receives a copy of each decoded source frame).
    */
   ctx: number;
   kind: "drawImage" | "fillRect";
@@ -38,10 +37,12 @@ const OUTPUT_CTX = 1;
 interface StallEnv {
   setNow(t: number): void;
   /** Deliver one decoded frame (fires the captured rVFC callback). */
-  fireFrame(): void;
+  fireFrame(metadata?: { rtpTimestamp?: number }): void;
   /** Run one draw-loop iteration; returns the OUTPUT-canvas records it made. */
   draw(): DrawRecord[];
   putImageData: ReturnType<typeof vi.fn>;
+  /** `requestFrame` of the canvas-capture output track. */
+  requestFrame: ReturnType<typeof vi.fn>;
   restore(): void;
 }
 
@@ -81,8 +82,9 @@ function installStallEnv(): StallEnv {
   // @ts-expect-error -- jsdom augmentation
   HTMLCanvasElement.prototype.getContext = vi.fn(() => makeCtx());
   // @ts-expect-error -- jsdom augmentation
+  const requestFrame = vi.fn();
   HTMLCanvasElement.prototype.captureStream = vi.fn(
-    () => ({}) as MediaStream,
+    () => ({ getVideoTracks: () => [{ requestFrame }] }) as unknown as MediaStream,
   );
 
   let rafCb: FrameRequestCallback | null = null;
@@ -96,12 +98,13 @@ function installStallEnv(): StallEnv {
     .spyOn(globalThis, "cancelAnimationFrame")
     .mockImplementation(() => {});
 
-  let vfcCb: (() => void) | null = null;
+  type VfcCallback = (now: number, metadata: { rtpTimestamp?: number }) => void;
+  let vfcCb: VfcCallback | null = null;
   const proto = HTMLVideoElement.prototype as HTMLVideoElement & {
-    requestVideoFrameCallback?: (cb: () => void) => number;
+    requestVideoFrameCallback?: (cb: VfcCallback) => number;
     cancelVideoFrameCallback?: (id: number) => void;
   };
-  proto.requestVideoFrameCallback = (cb: () => void) => {
+  proto.requestVideoFrameCallback = (cb: VfcCallback) => {
     vfcCb = cb;
     return 1;
   };
@@ -118,8 +121,8 @@ function installStallEnv(): StallEnv {
     setNow(t: number) {
       now = t;
     },
-    fireFrame() {
-      vfcCb?.();
+    fireFrame(metadata = {}) {
+      vfcCb?.(now, metadata);
     },
     draw() {
       const start = records.length;
@@ -127,6 +130,7 @@ function installStallEnv(): StallEnv {
       return records.slice(start).filter((r) => r.ctx === OUTPUT_CTX);
     },
     putImageData,
+    requestFrame,
     restore() {
       HTMLCanvasElement.prototype.getContext = origGetContext;
       // @ts-expect-error -- cleanup
@@ -374,6 +378,223 @@ describe("noise pipeline sizing", () => {
     } finally {
       if (origW) Object.defineProperty(proto, "videoWidth", origW);
       if (origH) Object.defineProperty(proto, "videoHeight", origH);
+      env.restore();
+    }
+  });
+});
+
+/**
+ * Fake MediaStreamTrackProcessor / MediaStreamTrackGenerator / VideoFrame.
+ * `pushFrame` hands the pipeline one source frame; `written` collects what
+ * the pipeline writes to its output track.
+ */
+function installInsertableStreams() {
+  const written: { timestamp: number; src: unknown }[] = [];
+  let pendingRead: ((r: { value?: unknown; done: boolean }) => void) | null = null;
+  const closed: number[] = [];
+  const pushFrame = async (rtpTimestamp: number) => {
+    const frame = {
+      rtp: rtpTimestamp,
+      displayWidth: 640,
+      displayHeight: 360,
+      metadata: () => ({ rtpTimestamp }),
+      close: () => closed.push(rtpTimestamp),
+    };
+    pendingRead?.({ value: frame, done: false });
+    await Promise.resolve();
+    await Promise.resolve();
+    return frame;
+  };
+  const trackStop = vi.fn();
+  const stream = {
+    getTracks: () => [],
+    getVideoTracks: () => [{ stop: trackStop }],
+  } as unknown as MediaStream;
+  const g = globalThis as Record<string, unknown>;
+  const saved = {
+    gen: g.MediaStreamTrackGenerator,
+    proc: g.MediaStreamTrackProcessor,
+    frame: g.VideoFrame,
+    stream: g.MediaStream,
+  };
+  g.MediaStreamTrackProcessor = class {
+    readable = {
+      getReader: () => ({
+        read: () => new Promise((resolve) => (pendingRead = resolve)),
+        cancel: () => {
+          pendingRead?.({ done: true });
+          return Promise.resolve();
+        },
+      }),
+    };
+  };
+  g.MediaStreamTrackGenerator = class {
+    writable = {
+      getWriter: () => ({
+        write: (f: { timestamp: number; src: unknown }) => {
+          written.push(f);
+          return Promise.resolve();
+        },
+        close: () => Promise.resolve(),
+      }),
+    };
+  };
+  g.VideoFrame = class {
+    timestamp: number;
+    constructor(
+      readonly src: unknown,
+      init: { timestamp: number },
+    ) {
+      this.timestamp = init.timestamp;
+    }
+  };
+  g.MediaStream = class {
+    constructor(readonly tracks: unknown[]) {}
+  };
+  return {
+    written,
+    closed,
+    pushFrame,
+    stream,
+    trackStop,
+    restore() {
+      g.MediaStreamTrackGenerator = saved.gen;
+      g.MediaStreamTrackProcessor = saved.proc;
+      g.VideoFrame = saved.frame;
+      g.MediaStream = saved.stream;
+    },
+  };
+}
+
+describe("noise pipeline displayed frame", () => {
+  it("estimates the oldest composite that could be on screen without a track generator", () => {
+    const env = installStallEnv();
+    try {
+      const pipeline = tryCreateNoisePipeline(fakeStream(), 0.05)!;
+      expect(pipeline.displayedFrame({ presentationTime: 0 })).toBeNull();
+
+      env.setNow(1000);
+      env.fireFrame({ rtpTimestamp: 9000 });
+      env.draw();
+      expect(env.requestFrame).toHaveBeenCalledTimes(1);
+      env.setNow(1030);
+      env.fireFrame({ rtpTimestamp: 12000 });
+      env.draw();
+      expect(env.requestFrame).toHaveBeenCalledTimes(2);
+
+      /* Presented 35 ms after the second emit: too soon to rule out the first. */
+      expect(pipeline.displayedFrame({ presentationTime: 1065 })).toEqual({
+        rtpTimestamp: 9000,
+        exact: false,
+      });
+      expect(pipeline.displayedFrame({ presentationTime: 1075 })).toEqual({
+        rtpTimestamp: 12000,
+        exact: false,
+      });
+      /* Nothing emitted long enough before it. */
+      expect(pipeline.displayedFrame({ presentationTime: 1035 })).toBeNull();
+
+      /* A stall holds the last frame, so its timestamp stays. */
+      env.setNow(2000);
+      env.draw();
+      expect(pipeline.displayedFrame({ presentationTime: 2050 })?.rtpTimestamp).toBe(12000);
+
+      pipeline.setSource(null);
+      env.setNow(3000);
+      env.draw();
+      expect(pipeline.displayedFrame({ presentationTime: 3050 })).toEqual({
+        rtpTimestamp: null,
+        exact: false,
+      });
+      pipeline.destroy();
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("identifies each displayed frame exactly through a track processor and generator", async () => {
+    const env = installStallEnv();
+    const { written, closed, pushFrame, stream, trackStop, restore } = installInsertableStreams();
+    try {
+      const pipeline = tryCreateNoisePipeline(stream, 0.05)!;
+
+      env.setNow(1000);
+      await pushFrame(9000);
+      env.draw();
+      expect(written.map((f) => f.timestamp)).toEqual([1_000_000]);
+      expect(pipeline.displayedFrame({ mediaTime: 1 })).toEqual({ rtpTimestamp: 9000, exact: true });
+      expect(closed).toEqual([9000]);
+
+      /* No new source frame and under the output interval: nothing emitted. */
+      env.setNow(1010);
+      env.draw();
+      expect(written).toHaveLength(1);
+
+      /* A new source frame is emitted straight away. */
+      env.setNow(1016);
+      await pushFrame(12000);
+      env.draw();
+      expect(written.map((f) => f.timestamp)).toEqual([1_000_000, 1_016_000]);
+      expect(pipeline.displayedFrame({ mediaTime: 1.016 })).toEqual({ rtpTimestamp: 12000, exact: true });
+      expect(pipeline.displayedFrame({ mediaTime: 1 })?.rtpTimestamp).toBe(9000);
+      /* The presented frame's size must agree with the composite's. */
+      expect(pipeline.displayedFrame({ mediaTime: 1.016, width: 640, height: 360 })?.exact).toBe(true);
+      expect(pipeline.displayedFrame({ mediaTime: 1.016, width: 320, height: 180 })).toBeNull();
+
+      /* Unknown frames are not guessed at. */
+      expect(pipeline.displayedFrame({ mediaTime: 1.005 })).toBeNull();
+      expect(pipeline.displayedFrame({})).toBeNull();
+
+      /*
+       * A source swap only unsubscribes: the shared reader keeps closing the
+       * track's frames and the track is never stopped (processor teardown
+       * leaks frames in Chrome).
+       */
+      pipeline.setSource(null);
+      await pushFrame(15000);
+      expect(closed).toEqual([9000, 12000, 15000]);
+      env.setNow(1100);
+      env.draw();
+      expect(pipeline.displayedFrame({ mediaTime: 1.1 })).toEqual({ rtpTimestamp: null, exact: true });
+      expect(trackStop).not.toHaveBeenCalled();
+      pipeline.destroy();
+    } finally {
+      restore();
+      env.restore();
+    }
+  });
+
+  it("passthrough forwards source frames untouched and keeps them identifiable", async () => {
+    const env = installStallEnv();
+    const { written, closed, pushFrame, stream, restore } = installInsertableStreams();
+    try {
+      const pipeline = tryCreateNoisePipeline(stream, 0, { showStatic: false, passthrough: true })!;
+
+      env.setNow(1000);
+      const first = await pushFrame(9000);
+      /* Written on arrival, re-stamped, from the source frame itself rather than a canvas. */
+      expect(written).toHaveLength(1);
+      expect(written[0]!.src).toBe(first);
+      expect(closed).toEqual([9000]);
+      expect(pipeline.displayedFrame({ mediaTime: written[0]!.timestamp / 1e6 })).toEqual({
+        rtpTimestamp: 9000,
+        exact: true,
+      });
+
+      /* Live frames come only from the source: the draw loop adds nothing. */
+      env.setNow(1100);
+      env.draw();
+      expect(written).toHaveLength(1);
+
+      /* Sourceless: the draw loop composites black again. */
+      pipeline.setSource(null);
+      env.setNow(1200);
+      env.draw();
+      expect(written).toHaveLength(2);
+      expect(written[1]!.src).toBeInstanceOf(HTMLCanvasElement);
+      pipeline.destroy();
+    } finally {
+      restore();
       env.restore();
     }
   });

@@ -1,5 +1,14 @@
 import type { CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
-import { PanZoomController, QualityPreset, TrackMode } from "@ksp-gonogo/kerbcast";
+import {
+  CameraKind,
+  CommandAimKind,
+  CommandTargetEligibility,
+  PanZoomController,
+  QualityPreset,
+  TrackMode,
+  effectiveCommandTrack,
+  formatCommandRange,
+} from "@ksp-gonogo/kerbcast";
 import {
   forwardRef,
   useCallback,
@@ -23,11 +32,14 @@ import {
   type FeedAction,
   type FeedActionBarEntry,
 } from "./FeedActionBar";
+import { CommandBlank, CommandBrackets, type CommandBracketOverlay } from "./CommandBrackets";
+import { useCommandDisplayUt } from "./hooks/useCommandDisplayUt";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
 import { useRecordings } from "./hooks/useRecordings";
 import { useReportDisplaySize } from "./hooks/useReportDisplaySize";
+import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
 import { usePortalMenu } from "./menuPositioning";
@@ -290,6 +302,26 @@ export interface CameraFeedProps {
    * {@link CameraStreamHook}.
    */
   useStream?: CameraStreamHook;
+  /**
+   * Draw target brackets and their readout over command camera feeds, with a
+   * per-feed "Target brackets" toggle in the action bar (on by default,
+   * remembered per camera in this browser). Default true. A blanked command
+   * feed shows its reason whatever this is set to.
+   */
+  enableTargetBrackets?: boolean;
+  /**
+   * Extra drawing, corner styling and readout text for this feed's target
+   * brackets. See {@link CommandBracketOverlay}.
+   */
+  targetBracketOverlay?: CommandBracketOverlay;
+  /**
+   * Mission UT the displayed video was captured at, for a host running its
+   * own delayed playout. Picks which command-track transition is in force and
+   * ages the readout. Defaults to the displayed frame's own capture UT where
+   * the browser reports frame RTP timestamps, else the client's capture
+   * clock interpolated to now.
+   */
+  displayUt?: number;
 }
 
 export interface CameraFeedHandle {
@@ -328,6 +360,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       trailingActions,
       showActions = true,
       useStream,
+      enableTargetBrackets = true,
+      targetBracketOverlay,
+      displayUt: displayUtProp,
     },
     ref,
   ) {
@@ -427,7 +462,14 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // built-in hook is the default. See CameraStreamHook's rules-of-hooks note.
     const resolveStream = useStream ?? useKerbcastStream;
     const stream = resolveStream(flightId);
-    const videoRef = useRef<HTMLVideoElement>(null);
+    const videoRef = useRef<HTMLVideoElement | null>(null);
+    /* Mirrors videoRef as state so the bracket overlay can measure the element
+       once it mounts. Setting a ref never remounts the video. */
+    const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+    const attachVideo = useCallback((el: HTMLVideoElement | null) => {
+      videoRef.current = el;
+      setVideoEl(el);
+    }, []);
     // The feed frame; fullscreen targets this and ResizeObserver measures it.
     const wrapRef = useRef<HTMLDivElement>(null);
     useEffect(() => {
@@ -532,6 +574,26 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const manualDisabled = tracking;
     const supportsPitch =
       !!camera && camera.panPitchMax - camera.panPitchMin > 0;
+
+    /* Command camera feeds: target brackets, readout and blank label. */
+    const commandCamera =
+      camera?.kind === CameraKind.Command && !isDestroyed ? camera : null;
+    const isCommandFeed = commandCamera !== null;
+    const commandTrack = commandCamera?.commandTrack ?? null;
+    const commandDisplayUt = useCommandDisplayUt(
+      commandTrack !== null,
+      displayUtProp,
+      commandTrack?.events,
+      commandCamera?.flightId ?? null,
+      videoEl,
+    );
+    const commandState = commandTrack
+      ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut)
+      : null;
+    const [bracketsOn, toggleBrackets] = useTargetBracketsPreference(
+      commandCamera ? (commandCamera.commandCentre?.stationId ?? String(commandCamera.flightId)) : null,
+    );
+    const targetBracketsAvailable = enableTargetBrackets && isCommandFeed;
 
     // -------------------------------------------------------------------------
     // Camera selection callbacks (Next/Prev, picker)
@@ -767,6 +829,36 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     );
 
     // -------------------------------------------------------------------------
+    // Command camera target picker. Lists every craft the game offers; the
+    // ineligible ones stay visible but disabled with the game's reason, and
+    // the current target follows the published subjectPersistentId. Picking
+    // one aims the camera at it. Hidden while a command authority holds the
+    // aim lock, since only it can aim then.
+    // -------------------------------------------------------------------------
+    const commandTargets = commandCamera?.commandCentre?.targets ?? [];
+    const commandTargetId = commandCamera?.commandCentre?.subjectPersistentId ?? 0;
+    const commandLocked = commandCamera?.commandTrack?.authority != null;
+    const commandTargetAvailable =
+      isCommandFeed && !disableManualControls && !commandLocked && commandTargets.length > 0;
+    const commandTargetMenuId = useId();
+    const commandTargetMenu = usePortalMenu({
+      maxWidth: MENU_MAX_WIDTH,
+      maxHeight: MENU_MAX_HEIGHT,
+      align: "end",
+    });
+    const closeCommandTargetMenu = commandTargetMenu.close;
+    const selectCommandTarget = useCallback(
+      (persistentId: number) => {
+        if (flightId === null) return;
+        client
+          .setCommandAim(flightId, { kind: CommandAimKind.Vessel, persistentId })
+          .catch(() => {});
+        closeCommandTargetMenu();
+      },
+      [client, flightId, closeCommandTargetMenu],
+    );
+
+    // -------------------------------------------------------------------------
     // REC control (opt-in). A stateful toggle that starts/stops a client-side
     // recording of this feed via the recordings store; state is read from the
     // store (isRecording), never held locally, so it stays correct if the
@@ -899,6 +991,13 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const pipLabel = isPip ? "Exit picture in picture" : "Picture in picture";
     const fullscreenLabel = isFullscreen ? "Exit fullscreen" : "Enter fullscreen";
     const recordingLabel = recordingActive ? "Stop recording" : "Start recording";
+    const bracketsLabel = "Target brackets";
+    const commandTargetName = commandTargets.find(
+      (t) => t.persistentId === commandTargetId,
+    )?.vesselName;
+    const commandTargetLabel = commandTargetName
+      ? `Watching ${commandTargetName}`
+      : "Choose target";
 
     const entries: FeedActionBarEntry[] = [
       ...(actions?.map(feedActionToEntry) ?? []),
@@ -907,7 +1006,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             {
               id: "quality",
               label: "Quality",
-              stateful: false,
+              /* Stays inline: its menu anchors on this button, which the overflow menu unmounts on click. */
+              stateful: true,
               render: () => (
                 <OverlayIconButton
                   ref={qualityMenu.triggerRef}
@@ -948,6 +1048,52 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 >
                   <RecordIcon />
                 </RecordActionButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      ...(targetBracketsAvailable
+        ? [
+            {
+              id: "target-brackets",
+              label: bracketsLabel,
+              stateful: true,
+              render: () => (
+                <OverlayIconButton
+                  type="button"
+                  aria-label={bracketsLabel}
+                  aria-pressed={bracketsOn}
+                  title={bracketsLabel}
+                  $active={bracketsOn}
+                  onClick={toggleBrackets}
+                >
+                  <TargetBracketsIcon />
+                </OverlayIconButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      ...(commandTargetAvailable
+        ? [
+            {
+              id: "command-target",
+              label: commandTargetLabel,
+              /* Stays inline: its menu anchors on this button, which the overflow menu unmounts on click. */
+              stateful: true,
+              render: () => (
+                <OverlayIconButton
+                  ref={commandTargetMenu.triggerRef}
+                  type="button"
+                  aria-label="Choose target"
+                  aria-haspopup="menu"
+                  aria-expanded={commandTargetMenu.open}
+                  aria-controls={commandTargetMenuId}
+                  title={commandTargetLabel}
+                  $active={commandTargetMenu.open}
+                  onClick={commandTargetMenu.toggle}
+                >
+                  <CommandTargetIcon />
+                </OverlayIconButton>
               ),
             } satisfies FeedActionBarEntry,
           ]
@@ -1052,6 +1198,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         fullscreenAvailable ||
         qualityAvailable ||
         trackingAvailable ||
+        targetBracketsAvailable ||
+        commandTargetAvailable ||
         enableRecording);
     const hasActionBar =
       showActions &&
@@ -1094,7 +1242,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         ) : (
           <>
             <StyledVideo
-              ref={videoRef}
+              ref={attachVideo}
               autoPlay
               playsInline
               muted
@@ -1176,6 +1324,59 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   </CameraMenuItem>
                 </QualityMenu>,
                 document.body,
+              )}
+            {commandTargetAvailable &&
+              commandTargetMenu.open &&
+              commandTargetMenu.position &&
+              createPortal(
+                <CameraMenu
+                  ref={commandTargetMenu.menuRef}
+                  id={commandTargetMenuId}
+                  role="menu"
+                  aria-label="Target"
+                  style={commandTargetMenu.position}
+                >
+                  {commandTargets.map((t) => {
+                    const eligible = t.eligibility === CommandTargetEligibility.Ok;
+                    const current = t.persistentId === commandTargetId;
+                    return (
+                      <CameraMenuItem
+                        key={t.persistentId}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={current}
+                        $selected={current}
+                        disabled={!eligible}
+                        title={eligible ? undefined : t.eligibilityText}
+                        onClick={() => selectCommandTarget(t.persistentId)}
+                      >
+                        {t.vesselName}
+                        {t.rangeM != null ? ` · ${formatCommandRange(t.rangeM)}` : ""}
+                        {eligible ? "" : ` · ${t.eligibilityText}`}
+                      </CameraMenuItem>
+                    );
+                  })}
+                </CameraMenu>,
+                document.body,
+              )}
+            {commandState &&
+              !outOfFlight &&
+              (
+                <>
+                  {commandState.blank && <CommandBlank reason={commandState.blank} />}
+                  {targetBracketsAvailable && bracketsOn && (
+                    <CommandBrackets
+                      state={commandState}
+                      displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
+                      utSource={commandDisplayUt?.source ?? null}
+                      video={videoEl}
+                      fallbackSize={
+                        camera ? { width: camera.renderWidth, height: camera.renderHeight } : null
+                      }
+                      overlay={targetBracketOverlay}
+                    />
+                  )}
+                </>
               )}
             {outOfFlight ? (
               showStandbyIcon && (
@@ -1411,6 +1612,26 @@ function QualityIcon() {
       <circle cx="10.5" cy="4.5" r="1.6" fill="currentColor" stroke="none" />
       <circle cx="5.5" cy="8" r="1.6" fill="currentColor" stroke="none" />
       <circle cx="8.5" cy="11.5" r="1.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/* Target brackets: the top-left and bottom-right corners around a centre dot. */
+function TargetBracketsIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M2.5 7V2.5H7M13.5 9v4.5H9" />
+      <circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/* Command camera target: a craft silhouette inside a selection ring. */
+function CommandTargetIcon() {
+  return (
+    <svg {...iconProps}>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M8 4.5l1.6 4H6.4zM6.6 8.5l-.9 2.5M9.4 8.5l.9 2.5" />
     </svg>
   );
 }
@@ -1737,6 +1958,15 @@ const CameraMenuItem = styled.button<{ $selected: boolean }>`
   &:focus-visible {
     outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: -2px;
+  }
+
+  &:disabled {
+    cursor: default;
+    color: rgba(255, 255, 255, 0.45);
+  }
+
+  &:disabled:not([aria-checked="true"]) {
+    background: transparent;
   }
 `;
 
