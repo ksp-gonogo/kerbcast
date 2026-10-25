@@ -63,6 +63,11 @@ Commands can be sent as soon as `connect` resolves. Any sent before the
 control channel has opened wait for it, and reject if it has not opened
 within 10 s or the client disconnects first.
 
+Kerbcast streams H.264 only. A browser that offers none (some Firefox builds
+ship without OpenH264) is refused, and `connect` rejects with an
+`OfferRefusedError` whose `code` is `ErrorCode.CodecUnsupported` and whose
+message says what to change.
+
 ### Pre-handshake discovery
 
 ```ts

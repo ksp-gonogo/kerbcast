@@ -397,6 +397,21 @@ export class CommandTargetUnknownError extends Error {
   }
 }
 
+/**
+ * The sidecar refused `POST /offer` with a reason, for example
+ * `ErrorCode.CodecUnsupported` when the browser offers no H.264 video.
+ */
+export class OfferRefusedError extends Error {
+  constructor(
+    readonly status: number,
+    readonly reason: string,
+    readonly code?: ErrorCode,
+  ) {
+    super(`[kerbcast] connection refused: ${reason}`);
+    this.name = "OfferRefusedError";
+  }
+}
+
 /** The craft an aim names: a `vessel` aim's craft, or an `orbit` or `positionAt` aim's subject. */
 function aimCraft(aim: CommandAim): number | undefined {
   const pid =
@@ -1642,7 +1657,14 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(offer),
     });
-    if (!res.ok) throw new Error(`POST /offer returned ${res.status}`);
+    if (!res.ok) {
+      /* A refusal carries an ErrorPayload; anything else keeps the bare status. */
+      const refusal = (await res.json().catch(() => null)) as Partial<ErrorPayload> | null;
+      if (typeof refusal?.message === "string") {
+        throw new OfferRefusedError(res.status, refusal.message, refusal.code);
+      }
+      throw new Error(`POST /offer returned ${res.status}`);
+    }
     return (await res.json()) as { sdp: string; cameras: number[] };
   }
 

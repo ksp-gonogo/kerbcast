@@ -10,6 +10,7 @@ export {
   COMMAND_CAMERA_CREATE_TIMEOUT_MS,
   CommandLockedError,
   CommandTargetUnknownError,
+  OfferRefusedError,
   COMMAND_CAMERA_STATE_WAIT_MS,
   CONTROL_OPEN_TIMEOUT_MS,
   type CreateCommandCameraOptions,

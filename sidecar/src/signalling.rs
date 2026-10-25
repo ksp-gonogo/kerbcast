@@ -7,7 +7,8 @@
 //!   `KerbcastPeer` with one video track per selected camera AND a
 //!   "kerbcast-control" data channel, answers the SDP, and returns the
 //!   answer. Unknown camera IDs are dropped with a warning rather than
-//!   failing the whole request.
+//!   failing the whole request. An offer whose video has no H.264 is
+//!   refused with 422 and an `ErrorPayload` body (`code: codec-unsupported`).
 //! - `GET /` serves the bundled kerbcast web UI (web/dist/index.html,
 //!   embedded at compile time via include_str!).
 //! - `GET /assets/mediabunny.min.mjs` serves the Mediabunny remux-trim
@@ -39,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::cameras::{CameraInfo, CameraRegistry, StatusLogEntry};
 use crate::encoder::EncoderChoice;
+use crate::protocol::{ErrorCode, ErrorPayload, ErrorSource};
 use crate::webrtc::KerbcastPeer;
 
 #[derive(Clone)]
@@ -202,9 +204,29 @@ async fn reset_logs(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
+/// An offer refused for a reason the client can act on, answered with 422 and
+/// the payload as the JSON body instead of a 500.
+#[derive(Debug)]
+struct OfferRefused(ErrorPayload);
+
+impl std::fmt::Display for OfferRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+
+impl std::error::Error for OfferRefused {}
+
 async fn offer(State(state): State<AppState>, Json(req): Json<OfferRequest>) -> impl IntoResponse {
     match handle_offer(state, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) if e.is::<OfferRefused>() => {
+            let Ok(OfferRefused(payload)) = e.downcast::<OfferRefused>() else {
+                unreachable!("checked by is::<OfferRefused>()")
+            };
+            warn!(code = ?payload.code, message = %payload.message, "offer refused");
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response()
+        }
         Err(e) => {
             warn!(error = %e, "offer handling failed");
             (
@@ -237,6 +259,21 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
 }
 
 async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerResponse> {
+    /* Refused before the peer exists, so no camera is subscribed for an
+    exchange that would only fail later with webrtc-rs's "codec is not
+    supported by remote". */
+    if offered_video_sections(&req.sdp) > 0 && !offers_h264_mode1(&req.sdp) {
+        return Err(OfferRefused(ErrorPayload {
+            message: "the browser offered no H.264 video (packetization-mode=1), the only \
+                      video Kerbcast sends; enable H.264 in the browser (Firefox: the OpenH264 \
+                      plugin) or use another browser"
+                .to_owned(),
+            source: ErrorSource::Sidecar,
+            flight_id: None,
+            code: Some(ErrorCode::CodecUnsupported),
+        })
+        .into());
+    }
     // Resolve selection: if the browser didn't ask for specific cameras,
     // subscribe to all of them. Useful for the v0.2 test page which
     // populates the picker from /cameras but lets the user click
@@ -303,6 +340,41 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
 /// The number of video m-lines in an SDP offer.
 fn offered_video_sections(sdp: &str) -> usize {
     sdp.lines().filter(|l| l.starts_with("m=video")).count()
+}
+
+/// Whether any video section of an SDP offer has an H.264 payload type with
+/// packetization-mode=1, the mode every slot's track is pinned to.
+fn offers_h264_mode1(sdp: &str) -> bool {
+    let mut sections: Vec<(bool, Vec<&str>)> = Vec::new();
+    for line in sdp.lines().map(str::trim) {
+        if line.starts_with("m=") {
+            sections.push((line.starts_with("m=video"), Vec::new()));
+        } else if let Some((_, attrs)) = sections.last_mut() {
+            attrs.push(line);
+        }
+    }
+    sections
+        .iter()
+        .filter(|(video, _)| *video)
+        .any(|(_, attrs)| {
+            let payload_types = |prefix: &str, keep: fn(&str) -> bool| -> Vec<&str> {
+                attrs
+                    .iter()
+                    .filter_map(|l| l.strip_prefix(prefix)?.split_once(' '))
+                    .filter(|(_, rest)| keep(rest))
+                    .map(|(pt, _)| pt)
+                    .collect()
+            };
+            let h264 = payload_types("a=rtpmap:", |codec| {
+                codec.to_ascii_lowercase().starts_with("h264/")
+            });
+            let mode1 = payload_types("a=fmtp:", |params| {
+                params
+                    .split(';')
+                    .any(|p| p.trim().eq_ignore_ascii_case("packetization-mode=1"))
+            });
+            h264.iter().any(|pt| mode1.contains(pt))
+        })
 }
 
 #[cfg(test)]
@@ -443,7 +515,7 @@ mod tests {
         };
 
         let req = OfferRequest {
-            sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
                 .to_owned(),
             cameras: Vec::new(),
             slots: None,
@@ -456,6 +528,51 @@ mod tests {
             peers[0].subscribed.len(),
             1,
             "one video section, one camera"
+        );
+    }
+
+    /// The video section of a Firefox offer built without OpenH264.
+    const VP8_ONLY_OFFER: &str = "v=0\r\no=mozilla...THIS_IS_SDPARTA-99.0 1 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=video 9 UDP/TLS/RTP/SAVPF 120 124 121 125 126 127 97 98\r\nc=IN IP4 0.0.0.0\r\na=recvonly\r\na=mid:0\r\na=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1\r\na=fmtp:120 max-fs=12288;max-fr=60\r\na=rtpmap:120 VP8/90000\r\na=rtpmap:121 VP9/90000\r\na=rtpmap:124 rtx/90000\r\na=rtpmap:126 AV1/90000\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\na=sctp-port:5000\r\n";
+
+    #[test]
+    fn detects_h264_with_packetization_mode_1() {
+        assert!(!offers_h264_mode1(VP8_ONLY_OFFER));
+        let chrome = "v=0\r\nm=video 9 X 96 102 104\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\na=rtpmap:104 h264/90000\r\na=fmtp:104 level-asymmetry-allowed=1; packetization-mode=1;profile-level-id=42e01f\r\n";
+        assert!(offers_h264_mode1(chrome));
+        let mode0_only = "v=0\r\nm=video 9 X 102\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=0;profile-level-id=42e01f\r\n";
+        assert!(!offers_h264_mode1(mode0_only));
+        /* Payload types are per section: an fmtp in another section does not count. */
+        let split = "v=0\r\nm=video 9 X 102\r\na=rtpmap:102 H264/90000\r\nm=video 9 X 102\r\na=rtpmap:102 VP8/90000\r\na=fmtp:102 packetization-mode=1\r\n";
+        assert!(!offers_h264_mode1(split));
+    }
+
+    /// A browser with no H.264 gets a 422 naming the cause, and no peer is
+    /// built for it, instead of a 500 from deep inside the SDP exchange.
+    #[tokio::test]
+    async fn an_offer_without_h264_is_refused_with_a_reason() {
+        let state = empty_state();
+        let app = router(state.clone());
+        let body = serde_json::json!({ "sdp": VP8_ONLY_OFFER, "cameras": [], "slots": 1 });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/offer")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::CodecUnsupported));
+        assert!(refusal.message.contains("H.264"), "{}", refusal.message);
+        assert!(
+            state.peers.read().await.is_empty(),
+            "no peer for a refused offer"
         );
     }
 

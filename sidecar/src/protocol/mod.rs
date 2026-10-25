@@ -971,6 +971,10 @@ pub enum ErrorCode {
     /// A command aim names a craft that is not in the camera's latest
     /// `commandCentre.targets`, for example one merged away in a dock.
     CommandTargetUnknown,
+    /// `POST /offer` refused: the offer's video carries no H.264 with
+    /// packetization-mode=1, the only video Kerbcast sends. A browser
+    /// without H.264 support (some Firefox builds lack OpenH264) offers none.
+    CodecUnsupported,
 }
 
 #[typeshare]

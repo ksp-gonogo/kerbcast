@@ -667,6 +667,12 @@ export enum ErrorCode {
 	 * `commandCentre.targets`, for example one merged away in a dock.
 	 */
 	CommandTargetUnknown = "command-target-unknown",
+	/**
+	 * `POST /offer` refused: the offer's video carries no H.264 with
+	 * packetization-mode=1, the only video Kerbcast sends. A browser
+	 * without H.264 support (some Firefox builds lack OpenH264) offers none.
+	 */
+	CodecUnsupported = "codec-unsupported",
 }
 
 export interface ErrorPayload {

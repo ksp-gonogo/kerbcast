@@ -16,6 +16,7 @@ import {
   CommandLockedError,
   CommandTargetUnknownError,
   CONTROL_OPEN_TIMEOUT_MS,
+  OfferRefusedError,
   type KerbcastConnectionState,
   type KerbcastDataChannel,
   type KerbcastPeer,
@@ -926,6 +927,28 @@ describe("KerbcastClient", () => {
 
     await expect(client.connect()).rejects.toThrow("503");
     expect(states).toContain("failed");
+    expect(client.state).toBe("failed");
+  });
+
+  it("a refused /offer surfaces the sidecar's reason and code", async () => {
+    const { transport } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message: "the browser offered no H.264 video",
+          source: ErrorSource.Sidecar,
+          code: ErrorCode.CodecUnsupported,
+        }),
+        { status: 422, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const err = await client.connect().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(OfferRefusedError);
+    expect((err as OfferRefusedError).status).toBe(422);
+    expect((err as OfferRefusedError).code).toBe(ErrorCode.CodecUnsupported);
+    expect((err as Error).message).toMatch(/no H\.264 video/);
     expect(client.state).toBe("failed");
   });
 
