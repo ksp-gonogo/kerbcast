@@ -1062,8 +1062,8 @@ impl CameraState {
         }
     }
 
-    /// Effective render size = min(demand, manual cap), clamped to the ring's
-    /// max dims and made even (H.264 chroma). Demand is normally the auto MAX-
+    /// Effective render size = min(demand, manual cap) at the ring's aspect,
+    /// clamped to the ring's max dims and made even (H.264 chroma). Demand is normally the auto MAX-
     /// across-consumers display size; while ANY peer forces this camera (see
     /// `forced_full_res`), demand is instead the ring ceiling, so a forced feed
     /// sizes up regardless of what's actually being displayed. `None` when
@@ -1082,19 +1082,47 @@ impl CameraState {
                 .reduce(|(aw, ah), (w, h)| (aw.max(w), ah.max(h)))
         };
         let cap = *self.manual_render_cap.lock().await;
+        let (mw, mh) = (self.max_width, self.max_height);
         let combined = match (auto, cap) {
-            (Some((aw, ah)), Some((cw, ch))) => Some((aw.min(cw), ah.min(ch))),
-            (Some(a), None) => Some(a),
-            (None, Some(c)) => Some(c),
+            (Some(a), Some(c)) => {
+                let (aw, ah) = cover_at_aspect(a, mw, mh);
+                Some(fit_within(aw, ah, c.0, c.1))
+            }
+            (Some(a), None) => Some(cover_at_aspect(a, mw, mh)),
+            (None, Some(c)) => Some(fit_within(mw as f64, mh as f64, c.0, c.1)),
             (None, None) => None,
         };
         combined.map(|(w, h)| {
+            let (w, h) = fit_within(w, h, mw, mh);
             (
-                even_clamp(w, self.max_width),
-                even_clamp(h, self.max_height),
+                even_clamp(w.round() as u32, mw),
+                even_clamp(h.round() as u32, mh),
             )
         })
     }
+}
+
+/* The configured capture size fixes a feed's shape; viewers only scale or crop
+it. Demand becomes the smallest picture at the max_width:max_height aspect
+that covers the requested box, so a viewer that crops still gets enough
+pixels, and a box-shaped report from an older client cannot reshape the
+stream for everyone. */
+fn cover_at_aspect((w, h): (u32, u32), max_w: u32, max_h: u32) -> (f64, f64) {
+    if max_w == 0 || max_h == 0 {
+        return (w as f64, h as f64);
+    }
+    let aspect = max_w as f64 / max_h as f64;
+    let width = (w as f64).max(h as f64 * aspect);
+    (width, width / aspect)
+}
+
+/// Scale `(w, h)` down uniformly, keeping its aspect, until it fits `limit_w` x `limit_h`.
+fn fit_within(w: f64, h: f64, limit_w: u32, limit_h: u32) -> (f64, f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return (w, h);
+    }
+    let scale = (limit_w as f64 / w).min(limit_h as f64 / h).min(1.0);
+    (w * scale, h * scale)
 }
 
 /// Clamp a requested dimension to the ring's allocated max and force it even
@@ -3246,18 +3274,64 @@ mod tests {
     /// 512 fit without the max-dim clamp, and hand back the live CameraState.
     /// Keeps the TempDir alive for the caller's lifetime.
     async fn attach_camera_for_tracker(flight_id: u32) -> (tempfile::TempDir, Arc<CameraState>) {
+        attach_camera_sized(flight_id, 1024, 1024).await
+    }
+
+    async fn attach_camera_sized(
+        flight_id: u32,
+        max_width: u32,
+        max_height: u32,
+    ) -> (tempfile::TempDir, Arc<CameraState>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm = dir.path();
         let cfg = MmapRingConfig {
             slot_count: 4,
-            max_width: 1024,
-            max_height: 1024,
+            max_width,
+            max_height,
         };
         MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("create ring");
         let registry = CameraRegistry::new(shm.to_path_buf());
         registry.rescan().await;
         let cam = registry.get(flight_id).await.expect("camera attached");
         (dir, cam)
+    }
+
+    /// The configured capture size fixes the shape: a box-shaped report from
+    /// an older client gets the 16:9 picture that covers it, never its own shape.
+    #[tokio::test]
+    async fn render_size_keeps_the_configured_aspect() {
+        let (_dir, cam) = attach_camera_sized(7_050, 1280, 720).await;
+        cam.record_display_size(1, 1024, 400).await;
+        assert_eq!(cam.effective_render_size().await, Some((1024, 576)));
+
+        cam.record_display_size(1, 512, 192).await;
+        assert_eq!(cam.effective_render_size().await, Some((512, 288)));
+
+        /* A tall phone box needs a picture wider than the ring; it scales down
+        to the ring at the same shape. */
+        cam.record_display_size(1, 400, 800).await;
+        assert_eq!(cam.effective_render_size().await, Some((1280, 720)));
+    }
+
+    /// Mixed viewers: the per-axis max of their boxes is covered at the
+    /// configured aspect, so no viewer reshapes the stream for the others.
+    #[tokio::test]
+    async fn mixed_viewer_boxes_keep_the_configured_aspect() {
+        let (_dir, cam) = attach_camera_sized(7_051, 1920, 1080).await;
+        cam.record_display_size(1, 640, 360).await;
+        cam.record_display_size(2, 300, 500).await;
+        assert_eq!(cam.effective_render_size().await, Some((888, 500)));
+    }
+
+    /// A manual cap of another shape bounds the size but not the shape.
+    #[tokio::test]
+    async fn manual_cap_keeps_the_configured_aspect() {
+        let (_dir, cam) = attach_camera_sized(7_052, 1280, 720).await;
+        cam.set_manual_render_cap(Some((640, 480))).await;
+        assert_eq!(cam.effective_render_size().await, Some((640, 360)));
+
+        cam.record_display_size(1, 1024, 576).await;
+        assert_eq!(cam.effective_render_size().await, Some((640, 360)));
     }
 
     /// Auto-resolution aggregates each consumer's reported display size as the
