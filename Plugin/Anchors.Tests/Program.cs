@@ -158,6 +158,10 @@ Check(!outside.InFrame && !outside.Behind && outside.Y < 0, "above the field: of
 var behind = CommandCameraMath.Project(eye, fwd, up, m00, m11, 0, 0, 1280, 720, new DVec3(10, 0, -100));
 Check(behind.Behind && !behind.InFrame && behind.X > 1280, "behind and to the right: off the right edge");
 Check(behind.AngleOffAxisDeg > 90, "behind is more than 90 degrees off axis");
+var deadA = CommandCameraMath.Project(eye, fwd, up, m00, m11, 0, 0, 1280, 720, new DVec3(1e-9, -1e-9, -1e6));
+var deadB = CommandCameraMath.Project(eye, fwd, up, m00, m11, 0, 0, 1280, 720, new DVec3(-1e-9, 1e-9, -1e6));
+Check(deadA.Behind && Near(deadA.X, 640, 1e-6) && deadA.Y > 720, "dead behind: pinned below the frame");
+Check(Near(deadA.X, deadB.X, 1e-6) && Near(deadA.Y, deadB.Y, 1e-6), "dead behind: rounding noise does not pick the side");
 var shifted = CommandCameraMath.Project(eye, fwd, up, m00, m11, 0.1, 0, 1280, 720, new DVec3(0, 0, 100));
 Check(Near(shifted.X, 640 - 0.1 * 640, 1e-9), "an off-centre projection term moves the centre");
 /* Far from the floating origin at double precision: a station 600 km out, a craft 3 km beyond. */
