@@ -833,7 +833,9 @@ pub struct Anchor {
     /// `part`: the part's `Part.persistentId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<u32>,
-    /// `part`: `[x, y, z]` metres from the part's origin in its own axes.
+    /// `part`: `[x, y, z]` metres from the part's origin in its own axes. A
+    /// docking port is marked at its docking face, and the offset is in the
+    /// face's axes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<Vec<f64>>,
     /// `surface`: the body's name, e.g. `"Kerbin"`.
@@ -911,7 +913,8 @@ pub struct FrameAnchor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance_m: Option<f64>,
     /// The marked thing's radius (plus `marginM`) on screen, in capture
-    /// pixels. 0 for `surface` and `direction` anchors without a margin.
+    /// pixels. 0 for a `surface` anchor without a margin, and always 0 for a
+    /// `direction` anchor.
     pub apparent_radius_px: f64,
     /// Degrees between the camera's axis and the anchor.
     pub angle_off_axis: f64,

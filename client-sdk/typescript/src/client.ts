@@ -1,5 +1,6 @@
 import type {
   AdaptiveShedPayload,
+  Anchor,
   CameraState,
   ClientMessage,
   CommandAim,
@@ -29,6 +30,7 @@ import {
   tryCreateNoisePipeline,
 } from "./noise";
 import { RecordingController, type RecordingControllerOptions } from "./recording";
+import { MAX_ANCHORS_PER_CAMERA } from "./anchors";
 
 /** Cadence of estimated frames from a watcher on a browser without `requestVideoFrameCallback`. */
 const ESTIMATED_FRAME_INTERVAL_MS = 100;
@@ -1252,6 +1254,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   >();
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
+  /** Whether the connected sidecar's `hello` offered anchors. */
+  private _anchorsSupported = false;
+  /** This client's anchors per camera, re-sent on every connection that offers anchors. */
+  private readonly anchorsByFlight = new Map<number, Anchor[]>();
   private _encoderBackend: string | null = null;
   /** Last-received throttle state from `settings-state`. False until the first push. */
   private _throttleMainScreen = false;
@@ -1393,14 +1399,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     let lastExact: (DisplayedFrameUt & { mediaTime: number | undefined }) | null = null;
     const estimate = (presentedAt: number) => {
       if (lastExact && presentedAt - lastExact.presentedAt <= LAST_EXACT_MAX_AGE_MS) {
-        onFrame({
-          ut: lastExact.ut,
-          epoch: lastExact.epoch,
-          source: "estimated",
-          flightId,
-          rtpTimestamp: lastExact.rtpTimestamp,
-          presentedAt,
-        });
+        const { mediaTime: _mediaTime, ...last } = lastExact;
+        onFrame({ ...last, source: "estimated", presentedAt });
         return;
       }
       const older = this.frameStamps.newestArrivedBy(
@@ -1554,6 +1554,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.legacyFlightByMid.clear();
     /* RTP timestamps restart from a fresh random base on every peer. */
     this.frameStamps.clear();
+    this._anchorsSupported = false;
 
     const peerOpts = this.peerOptions();
     const peer = this.transport.createPeer(
@@ -1792,6 +1793,57 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * Mark things in the game on `flightId`'s picture: a part, a craft, a
+   * point on a body or a direction. Replaces this client's anchors on that
+   * camera; `null` or an empty list clears them. The game projects each
+   * anchor through the camera that rendered every frame, and the results
+   * arrive with that frame (see {@link watchDisplayedFrames} and
+   * `DisplayedFrameUt.anchors`), so they line up with the picture under any
+   * stream delay.
+   *
+   * Anchors belong to this client: other clients never see them, the
+   * command lock does not apply, and they are kept here and sent again
+   * whenever the client reconnects. Only a sidecar whose `hello` offers
+   * anchors (1.12 and later) receives them; against an older one they are
+   * kept but never sent. Rejects with a `RangeError` for more than
+   * {@link MAX_ANCHORS_PER_CAMERA} anchors or a repeated id; a malformed
+   * anchor is refused by the sidecar with an `error` event.
+   */
+  async setAnchors(flightId: number, anchors: readonly Anchor[] | null): Promise<void> {
+    const list = anchors ? [...anchors] : [];
+    if (list.length > MAX_ANCHORS_PER_CAMERA) {
+      throw new RangeError(
+        `at most ${MAX_ANCHORS_PER_CAMERA} anchors per camera, got ${list.length}`,
+      );
+    }
+    const ids = new Set<string>();
+    for (const a of list) {
+      if (ids.has(a.id)) throw new RangeError(`anchor id ${a.id} is used twice`);
+      ids.add(a.id);
+    }
+    if (list.length === 0) {
+      if (!this.anchorsByFlight.delete(flightId)) return;
+    } else {
+      this.anchorsByFlight.set(flightId, list);
+    }
+    if (!this._anchorsSupported) return;
+    await this._send({
+      type: "set-anchors",
+      content: list.length ? { flightId, anchors: list } : { flightId },
+    });
+  }
+
+  /** This client's anchors on `flightId`, as last set. Empty when none. */
+  anchorsFor(flightId: number): readonly Anchor[] {
+    return this.anchorsByFlight.get(flightId) ?? [];
+  }
+
+  /** Whether the connected sidecar takes anchors. False until its `hello`. */
+  get anchorsSupported(): boolean {
+    return this._anchorsSupported;
+  }
+
+  /**
    * Create a command camera standing at `vantage` for the rest of the
    * current game scene (flight or Space Center), and resolve with its state
    * once it appears in {@link cameras} and the game has reported its target
@@ -1998,8 +2050,18 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this._sidecarVersion = msg.content.sidecarVersion;
         this._encoderBackend = msg.content.encoderBackend;
         /* Stamps are opt-in so clients that predate them never pay for them. */
+        this._anchorsSupported = msg.content.anchors === true;
         if (msg.content.frameStamps === true) {
-          void this._send({ type: "set-frame-stamps", content: { enabled: true } }).catch(() => {});
+          void this._send({
+            type: "set-frame-stamps",
+            content: this._anchorsSupported ? { enabled: true, anchors: true } : { enabled: true },
+          }).catch(() => {});
+        }
+        /* A new connection starts with no anchors on the sidecar; send ours again. */
+        if (this._anchorsSupported) {
+          for (const [flightId, anchors] of this.anchorsByFlight) {
+            void this._send({ type: "set-anchors", content: { flightId, anchors } }).catch(() => {});
+          }
         }
         break;
       case "camera-snapshot":

@@ -39,9 +39,22 @@ export {
   STAMP_TO_DISPLAY_MAX_MS,
   extrapolateCaptureUt,
   type DisplayedFrameUt,
+  type FrameStampExtras,
   type FrameUt,
   type FrameUtSource,
 } from "./frameUt";
+
+export {
+  MAX_ANCHORS_PER_CAMERA,
+  KERBCAST_ANCHOR_OWNER,
+  COMMAND_SUBJECT_ANCHOR_ID,
+  fitFrame,
+  frameToScreen,
+  frameLengthToScreen,
+  findAnchor,
+  type FittedFrame,
+  type FrameFit,
+} from "./anchors";
 
 export {
   PanZoomController,

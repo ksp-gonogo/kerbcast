@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AnchorKind,
   CameraKind,
   CameraLifecycle,
   CommandAimKind,
@@ -25,6 +26,8 @@ import {
   KerbcastClient,
 } from "./client";
 import { MockSidecar } from "./testing";
+import { MAX_ANCHORS_PER_CAMERA } from "./anchors";
+import type { DisplayedFrameUt } from "./frameUt";
 import * as noise from "./noise";
 
 interface FakeChannel extends KerbcastDataChannel {
@@ -2531,6 +2534,132 @@ describe("KerbcastClient frame UT", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("watchDisplayedFrames carries each frame's anchors, fov and size from its own stamp", async () => {
+    const { sidecar, client } = await connected();
+    const port = {
+      id: "port",
+      x: 320,
+      y: 180,
+      inFrame: true,
+      behind: false,
+      distanceM: 40,
+      apparentRadiusPx: 9,
+      angleOffAxis: 0.2,
+      forward: [0, 0, -1],
+      up: [0, 1, 0],
+    };
+    sidecar.fireFrameStamp({
+      flightId: 7,
+      rtpTimestamp: 3000,
+      captureUt: 499.5,
+      captureEpoch: 0,
+      fov: 30,
+      width: 640,
+      height: 360,
+      anchors: [port],
+    });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 6000, captureUt: 499.6, captureEpoch: 0 });
+    const { video, present } = fakeVideo();
+    const frames: DisplayedFrameUt[] = [];
+    const stop = client.watchDisplayedFrames(7, video, (f) => frames.push(f));
+
+    present({ rtpTimestamp: 3000, expectedDisplayTime: 10 });
+    present({ rtpTimestamp: 9000, expectedDisplayTime: 20 });
+    present({ rtpTimestamp: 6000, expectedDisplayTime: 30 });
+    expect(frames[0]).toMatchObject({ source: "exact", anchors: [port], fov: 30, frameWidth: 640, frameHeight: 360 });
+    /* An unstamped frame reuses the last exact frame, anchors and all: they describe that picture. */
+    expect(frames[1]).toMatchObject({ source: "estimated", rtpTimestamp: 3000, anchors: [port] });
+    /* A stamp without anchors gives a frame without the key, not stale anchors. */
+    expect(frames[2].source).toBe("exact");
+    expect("anchors" in frames[2]).toBe(false);
+    stop();
+  });
+});
+
+describe("KerbcastClient anchors", () => {
+  function ship(id: string) {
+    return { id, kind: AnchorKind.Vessel, vessel: 42 };
+  }
+
+  async function connectedTo(hello: Record<string, unknown>) {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+    await client.connect();
+    captured.dc?._open();
+    const sent = (type: string) =>
+      (captured.dc?.sent ?? []).map((m) => JSON.parse(m)).filter((m) => m.type === type);
+    const sayHello = () =>
+      captured.dc?._msg(
+        JSON.stringify({ type: "hello", content: { sidecarVersion: "1.12.0", encoderBackend: "x", ...hello } }),
+      );
+    return { client, sent, sayHello };
+  }
+
+  it("asks for anchor results only from a sidecar that offers anchors", async () => {
+    const { sent, sayHello } = await connectedTo({ frameStamps: true, anchors: true });
+    sayHello();
+    expect(sent("set-frame-stamps")).toEqual([
+      { type: "set-frame-stamps", content: { enabled: true, anchors: true } },
+    ]);
+  });
+
+  it("keeps anchors set before hello and sends them once the sidecar offers anchors", async () => {
+    const { client, sent, sayHello } = await connectedTo({ frameStamps: true, anchors: true });
+    await client.setAnchors(7, [ship("a")]);
+    expect(sent("set-anchors")).toEqual([]);
+    sayHello();
+    expect(sent("set-anchors")).toEqual([
+      { type: "set-anchors", content: { flightId: 7, anchors: [ship("a")] } },
+    ]);
+    expect(client.anchorsSupported).toBe(true);
+
+    await client.setAnchors(7, null);
+    expect(sent("set-anchors").at(-1)).toEqual({ type: "set-anchors", content: { flightId: 7 } });
+    expect(client.anchorsFor(7)).toEqual([]);
+    /* Clearing what is already clear sends nothing. */
+    const before = sent("set-anchors").length;
+    await client.setAnchors(7, []);
+    expect(sent("set-anchors")).toHaveLength(before);
+  });
+
+  it("never sends anchors to a sidecar that predates them", async () => {
+    const { client, sent, sayHello } = await connectedTo({ frameStamps: true });
+    sayHello();
+    await client.setAnchors(7, [ship("a")]);
+    expect(sent("set-anchors")).toEqual([]);
+    expect(sent("set-frame-stamps")).toEqual([{ type: "set-frame-stamps", content: { enabled: true } }]);
+    expect(client.anchorsFor(7)).toEqual([ship("a")]);
+  });
+
+  it("refuses more than the cap and repeated ids before sending", async () => {
+    const { client, sayHello } = await connectedTo({ frameStamps: true, anchors: true });
+    sayHello();
+    const seventeen = Array.from({ length: MAX_ANCHORS_PER_CAMERA + 1 }, (_, i) => ship(`a${i}`));
+    await expect(client.setAnchors(7, seventeen)).rejects.toThrow(RangeError);
+    await expect(client.setAnchors(7, [ship("a"), ship("a")])).rejects.toThrow(/twice/);
+    expect(client.anchorsFor(7)).toEqual([]);
+  });
+
+  it("sends its anchors again on every new connection", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+    await client.setAnchors(7, [ship("a")]);
+    expect(sidecar.anchorsFor(7)).toEqual([ship("a")]);
+
+    const fresh = new MockSidecar();
+    const again = new KerbcastClient({ host: "h", port: 1 }, fresh.createTransport());
+    await again.setAnchors(7, [ship("b")]);
+    await again.connect();
+    fresh.open();
+    expect(fresh.anchorsFor(7)).toEqual([ship("b")]);
   });
 });
 

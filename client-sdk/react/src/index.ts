@@ -68,6 +68,27 @@ export type {
   ContentRect,
 } from "./CommandBrackets";
 
+// Anchored markers: CameraFeed's `anchors` and `anchorOverlay`, and the
+// pieces for drawing a frame's anchors over a video of your own
+export {
+  AnchorMarkers,
+  ANCHOR_MARKER_COLOURS,
+  anchorMarkerGeometry,
+  useDisplayedFrame,
+} from "./AnchorMarkers";
+export type {
+  AnchorContext,
+  AnchorCorner,
+  AnchorCornerOverride,
+  AnchorCornerOverrides,
+  AnchorCornerStyle,
+  AnchorMarkerGeometry,
+  AnchorMarkerShape,
+  AnchorMarkersProps,
+  AnchorOverlay,
+  PlacedAnchor,
+} from "./AnchorMarkers";
+
 // FeedActionBar: the shared action row (tracking, fullscreen, PiP, quality,
 // close, REC) both CameraFeed and KerbalFaceFeed render, with the issue-#6
 // overflow (⋮) engine.
