@@ -57,6 +57,10 @@ namespace Kerbcast
         // Mission time and UT epoch at render, carried with the readback so each ring frame names the UT it shows.
         private double _pendingCaptureUt;
         private uint _pendingCaptureEpoch;
+        // The frame's fov and anchor results, copied at render so the readback carries what that frame showed.
+        private float _pendingFov;
+        private byte[] _pendingMeta;
+        private int _pendingMetaLength;
 
         // Shared telemetry sink (owned by the camera) plus the failure-streak
         // callbacks: the camera keeps _consecutiveErrors and LogRateLimited, we
@@ -135,6 +139,13 @@ namespace Kerbcast
         // Readback phase timings into the shared PhaseTimings.
         internal void Publish(double captureTsMs, Action<RenderTexture, RenderTexture> blit)
         {
+            Publish(captureTsMs, blit, default);
+        }
+
+        /* Publish with the frame's metadata (fov and anchor results), which is
+           copied now and written beside the pixels when the readback lands. */
+        internal void Publish(double captureTsMs, Action<RenderTexture, RenderTexture> blit, FrameMeta meta)
+        {
             // Blit phase: the filter/nv/plain capture->readback blit AND the
             // vertical-flip correction below, all the main-thread Blit dispatch
             // this tick.
@@ -165,6 +176,14 @@ namespace Kerbcast
             _pendingCaptureTsMs = captureTsMs;
             _pendingCaptureUt = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
             _pendingCaptureEpoch = KerbcastCore.Instance != null ? KerbcastCore.Instance.CaptureEpochValue : 0;
+            _pendingFov = meta.FovDeg;
+            _pendingMetaLength = meta.Json != null ? meta.Length : 0;
+            if (_pendingMetaLength > 0)
+            {
+                if (_pendingMeta == null || _pendingMeta.Length < _pendingMetaLength)
+                    _pendingMeta = new byte[Math.Max(_pendingMetaLength, 1024)];
+                Buffer.BlockCopy(meta.Json, 0, _pendingMeta, 0, _pendingMetaLength);
+            }
             long reqStart = _telemetry ? Stopwatch.GetTimestamp() : 0;
             _pendingRequest = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
             if (_telemetry)
@@ -235,7 +254,8 @@ namespace Kerbcast
                     src = (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
                     length = data.Length;
                 }
-                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, _pendingCaptureUt, _pendingCaptureEpoch, src, length);
+                var meta = new FrameMeta { FovDeg = _pendingFov, Json = _pendingMetaLength > 0 ? _pendingMeta : null, Length = _pendingMetaLength };
+                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, _pendingCaptureUt, _pendingCaptureEpoch, meta, src, length);
                 _resetErrorStreak();
             }
             catch (Exception ex)

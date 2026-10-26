@@ -16,8 +16,11 @@ namespace Kerbcast
        Every layer, clip, occlusion and frame transition is logged once with UT
        and range under [Kerbcast][CMDCAM], so a pop or blank frame in a
        capture can be pinned to its cause. */
-    internal sealed class CommandCameraRig : ICameraRig
+    internal sealed class CommandCameraRig : ICameraRig, IAnchorRig
     {
+        /* The subject's anchor id; its owner is AnchorRegistry.KerbcastOwner. */
+        public const string SubjectAnchorId = "subject";
+
         private const string Tag = "[Kerbcast][CMDCAM]";
         private const double FovTau = 0.4;
         private const double FovSnapAfter = 1.0;
@@ -145,7 +148,13 @@ namespace Kerbcast
         private bool _trueSunlit;
         private double _trueOffsetRad;
 
-        /* The bracket contract (see AppendCommandTrack in KerbcastCore). */
+        /* The lens pose of the frame last rendered, for the anchor projector. */
+        private bool _poseValid;
+        private DVec3 _poseEye, _poseForward, _poseUp;
+        private readonly AnchorSpec _subjectAnchor = new AnchorSpec { Id = SubjectAnchorId, Kind = AnchorKind.Vessel, Occlusion = true };
+
+        /* The bracket contract (see AppendCommandTrack in KerbcastCore). Kept
+           for clients older than 1.12; newer ones draw the subject's anchor. */
         public double TrackUt { get; private set; }
         public double BracketHalfPx { get; private set; }
         public int FrameHeightPx => FrameRows();
@@ -695,6 +704,7 @@ namespace Kerbcast
             _lastPrepare = now;
             double ut = Planetarium.GetUniversalTime();
             _frameUt = ut;
+            _poseValid = false;
 
             bool solved = Solve(ut, now, out var station, out var aim, out var localUp, out var north, out var occluder);
             if (Blank != null) return RigFrame.Blank;
@@ -703,6 +713,10 @@ namespace Kerbcast
             CommandCameraMath.AimBasis(station, aim, localUp, north, out var fwd, out var up);
             anchor.position = new Vector3((float)station.X, (float)station.Y, (float)station.Z);
             anchor.rotation = Quaternion.LookRotation(ToF(fwd), ToF(up));
+            _poseValid = true;
+            _poseEye = station;
+            _poseForward = fwd;
+            _poseUp = up;
             SyncScaledBodies(cam, anchor.position);
             SyncScaledPose(cam);
             UpdateStationBodyMesh(cam, ut, _lastDistance);
@@ -774,6 +788,38 @@ namespace Kerbcast
 
             LogTransitions(ut, distance, aim, fwd, localUp, now);
             return RigFrame.Render;
+        }
+
+        public bool TryRenderPose(out DVec3 eye, out DVec3 forward, out DVec3 up)
+        {
+            eye = _poseEye;
+            forward = _poseForward;
+            up = _poseUp;
+            return _poseValid;
+        }
+
+        /* The subject as a vessel anchor with occlusion on: where the craft
+           really is in each frame, wherever the camera aims, sized by its
+           radius plus the framing margin. */
+        public void AddOwnAnchors(List<KeyValuePair<string, AnchorSpec>> into)
+        {
+            uint pid = _target.PersistentId;
+            if (pid == 0 || !_trueOk) return;
+            _subjectAnchor.Vessel = pid;
+            _subjectAnchor.MarginM = FramingMargin;
+            into.Add(new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, _subjectAnchor));
+        }
+
+        /* The subject where this rig solved it for the frame, with the radius
+           it frames and the terrain-aware occlusion it already ran. Unloaded
+           craft (the Space Center, or beyond physics range) are located from
+           their orbit, which the generic projector can not do. */
+        public bool TryLocateVessel(uint pid, out DVec3 world, out double radius, out bool occluded)
+        {
+            world = _truePos;
+            radius = _craftRadius;
+            occluded = _trueOccluded;
+            return _trueOk && pid != 0 && pid == _target.PersistentId;
         }
 
         private void NoteModelMode(double ut, double d, double proxy, double scale)
