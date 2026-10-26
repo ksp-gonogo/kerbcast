@@ -384,7 +384,7 @@ namespace Kerbcast
 
             _trueOk = _target.TryLocate(ut, out _truePos, out _trueBody);
             CelestialBody aimBody;
-            bool aimed = _aim != null && _aim.Kind != CommandAimKind.Vessel;
+            bool aimed = !AimIsCraft;
             if (!aimed)
             {
                 if (!_trueOk) return false;
@@ -404,7 +404,7 @@ namespace Kerbcast
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
-            occluder = _occlusion.FindOccluder(station, aim, out string occluderSource);
+            occluder = _occlusion.FindOccluder(station, aim, out string occluderSource, aimed ? 0 : _craftRadius);
             double distance = (aim - station).Magnitude;
             _lastDistance = distance;
             HasFix = true;
@@ -426,7 +426,7 @@ namespace Kerbcast
                 else
                 {
                     _trueDistance = (_truePos - station).Magnitude;
-                    _trueOccluded = _occlusion.FindOccluder(station, _truePos, out _) != null;
+                    _trueOccluded = _occlusion.FindOccluder(station, _truePos, out _, _craftRadius) != null;
                     _trueSunlit = IsSunlit(_truePos);
                 }
             }
@@ -623,7 +623,7 @@ namespace Kerbcast
                 double now = Planetarium.GetUniversalTime();
                 double horizon = Math.Min(ForecastRealSeconds * Math.Max(1.0, TimeWarp.CurrentRate), ForecastMaxUt);
                 _occlusion.UseSite(_mount.Site);
-                if (TryMotions(now, out var station, out var aim) && _forecast.Begin(now, horizon, station, aim))
+                if (TryMotions(now, out var station, out var aim) && _forecast.Begin(now, horizon, station, aim, AimIsCraft ? _craftRadius : 0))
                 {
                     CommandCameraMath.FindEdges(now, now + horizon, ForecastSamples, ForecastBisectSteps, ForecastToleranceUt,
                         _forecast.StateAt, (a, b) => a.SameCameraAxisAs(b), _edges);
@@ -842,6 +842,9 @@ namespace Kerbcast
            it frames and the terrain-aware occlusion it already ran. Unloaded
            craft (the Space Center, or beyond physics range) are located from
            their orbit, which the generic projector can not do. */
+        /* The default and Vessel aims point at the craft itself, so its size counts. */
+        private bool AimIsCraft => _aim == null || _aim.Kind == CommandAimKind.Vessel;
+
         public bool TryLocateVessel(uint pid, out DVec3 world, out double radius, out bool occluded)
         {
             world = _truePos;

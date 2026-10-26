@@ -468,6 +468,13 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     var eastward = relS + (mu * Math.Sin(ridgeEl - 0.005) + me * Math.Cos(ridgeEl - 0.005)) * 2e6;
     Check(!ridged.Blocks(relS, eastward, axis), "mask: the ridge only hides its own azimuth");
 
+    // A craft whose centre sits just under the crest still shows its top over it.
+    double skyline = ridged.MaskAt(0, 30000 / seaR, mu, mn, me);
+    var underCrest = relS + (mu * Math.Sin(skyline - 1e-5) + mn * Math.Cos(skyline - 1e-5)) * 30000;
+    Check(ridged.Blocks(relS, underCrest, axis), "mask: a centre just under the crest is hidden as a point");
+    Check(!ridged.Blocks(relS, underCrest, axis, 3.0), "mask: a 3 m craft with its centre just under the crest is not hidden");
+    Check(ridged.Blocks(relS, behind, axis, 3.0), "mask: a craft wholly under the crest is still hidden");
+
     // Interpolation between bins, and the budget fallback.
     Check(HorizonMask.CountBelow(new[] { 1.0, 2.0, 3.0 }, 2.0) == 1 && HorizonMask.CountBelow(new[] { 1.0, 2.0, 3.0 }, 9) == 3
         && HorizonMask.CountBelow(new[] { 1.0, 2.0, 3.0 }, 0.5) == 0, "mask: strictly-closer sample count");
