@@ -92,6 +92,59 @@ while a camera is tracking. `cameraFilter` narrows the selectable cameras
 (picker, stepper, auto-latch). `showActions={false}` hides the whole action
 bar without affecting resolution reporting.
 
+## Anchored markers
+
+`anchors` marks things in the game on the feed's picture (see the core
+SDK's "Anchored markers" for the kinds and fields). The feed sets them on
+the camera it shows, clears them when it moves on or unmounts, and draws a
+marker where each one lands in every displayed frame: four corner marks
+sized from `apparentRadiusPx` (never below 14 px), green when clear, red and
+dashed when occluded.
+
+`anchorOverlay` has the same shape as `targetBracketOverlay`: `corners`
+restyles the four marks (`top`, `right`, `bottom`, `left`, each
+`{ colour, dashed, hidden, shape }`), `render` adds SVG in screen pixels,
+`readout` puts text under the marker, and `shape` sets every mark to
+`"corners"` or `"triangles"`. Each is called per anchor with the raw result
+and a context: its screen geometry, the fitted content rect, the displayed
+frame's UT and the screen position of every drawn anchor. `owners` also
+draws anchors set in game by those owners. What a colour means is yours to
+decide; Kerbcast only reports geometry.
+
+A direction reticle on a docking port: four triangles, each side coloured
+from the port's axes.
+
+```tsx
+const anchors = useMemo(
+  () => [{ id: "port", kind: AnchorKind.Part, vessel: targetPid, part: portPid, orientation: true }],
+  [targetPid, portPid],
+);
+
+<CameraFeed
+  flightId={dockingCam}
+  anchors={anchors}
+  anchorOverlay={{
+    shape: "triangles",
+    corners: (a) => {
+      /* The port faces the lens along -z; tilt shows in its forward's x and y. */
+      const [fx = 0, fy = 0] = a.forward ?? [];
+      const side = (off: number) => ({ colour: Math.abs(off) < 0.02 ? "lime" : "orange" });
+      return { top: side(fy), bottom: side(fy), left: side(fx), right: side(fx) };
+    },
+    readout: (a) => (a.distanceM != null ? `${a.distanceM.toFixed(1)} m` : null),
+  }}
+/>
+```
+
+For a video of your own, `AnchorMarkers` draws a frame's anchors over any
+`<video>` and `useDisplayedFrame(enabled, flightId, video)` gives the
+displayed frame with its results.
+
+On command feeds the target brackets now follow the subject's anchor, so
+the box stays on the craft where it really is in each frame even while an
+aim points elsewhere, and leaves its corners out while the craft is out of
+frame. `targetBracketOverlay` is unchanged; its context gains `subject`.
+
 ## `KerbalFaceFeed`
 
 A single-kerbal face-camera primitive: one crew face in a square frame, keyed

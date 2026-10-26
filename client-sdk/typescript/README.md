@@ -448,6 +448,75 @@ KerbcastControl.ClearCommandAuthority("gonogo");
   into another drops out; the combined craft keeps the survivor's
   `persistentId`)
 
+## Anchored markers
+
+Anchors mark things in the game on a camera's picture. The game projects
+each one through the camera that rendered every frame (its pose and field
+of view at that moment, so zoom and pan are exact), and the result rides
+that frame's stamp. Markers drawn from it line up with the picture under
+any stream delay. There is no live position: everything is tied to frames.
+
+```ts
+import { AnchorDirection, AnchorKind } from "@ksp-gonogo/kerbcast";
+
+await client.setAnchors(flightId, [
+  { id: "port", kind: AnchorKind.Part, vessel: targetPid, part: portPid, orientation: true },
+  { id: "ship", kind: AnchorKind.Vessel, vessel: targetPid, occlusion: true },
+  { id: "site", kind: AnchorKind.Surface, body: "Mun", latitude: 2.4, longitude: 81.5 },
+  { id: "pro", kind: AnchorKind.Direction, direction: AnchorDirection.TargetRelativeVelocity },
+]);
+await client.setAnchors(flightId, null); // clear
+```
+
+- Kinds: `part` (craft and part persistentId, optional `offset` in the
+  part's axes; a docking port is marked at its docking face; follows the
+  part through docking), `vessel` (centre of mass; follows a craft merged
+  into another), `surface` (body, latitude, longitude, altitude) and
+  `direction` (a named direction of a craft, the active one by default, or
+  a fixed inertial `vector`), drawn at infinity
+- `orientation: true` on a part or vessel adds its `forward` and `up` axes
+  in camera space (x right, y up, z forward) to every result.
+  `occlusion: true` adds `occluded`, at the cost of a ray cast per frame.
+  `marginM` pads the radius `apparentRadiusPx` is worked out from
+- Anchors belong to the client that set them: other clients never see them,
+  the command lock does not apply, and the sidecar drops them when the
+  client disconnects. The client keeps them and sends them again on
+  reconnect. At most 16 per camera (`MAX_ANCHORS_PER_CAMERA`)
+- Needs a 1.12 sidecar and plugin; against an older sidecar they are kept
+  but never sent (`client.anchorsSupported`)
+
+Each result lands on the displayed frame through `watchDisplayedFrames`:
+
+```ts
+import { fitFrame, frameToScreen, frameLengthToScreen, findAnchor } from "@ksp-gonogo/kerbcast";
+
+client.watchDisplayedFrames(flightId, video, (frame) => {
+  const port = findAnchor(frame.anchors, "port");
+  if (!port || !frame.frameWidth || !frame.frameHeight) return;
+  const fitted = fitFrame(video.clientWidth, video.clientHeight,
+    frame.frameWidth, frame.frameHeight, "contain"); // or "cover"
+  const { x, y } = frameToScreen(port, frame.frameWidth, frame.frameHeight, fitted);
+  const r = frameLengthToScreen(port.apparentRadiusPx, frame.frameHeight, fitted);
+  draw(x, y, r, port.inFrame, port.behind);
+});
+```
+
+Each result has `x`, `y` (capture pixels from the top left), `inFrame`,
+`behind` (then `x`, `y` sit off the frame on the side it is nearest),
+`distanceM` (absent for directions), `apparentRadiusPx`, `angleOffAxis`
+(degrees), and `forward`, `up`, `occluded` when asked for. Anchors set in
+game carry their `owner`; this client's own have none. Every stamp also
+gives the frame's `fov` and size, for overlays that do their own maths.
+
+A command camera adds its own anchor: `id: "subject"`, owner `"kerbcast"`
+(`COMMAND_SUBJECT_ANCHOR_ID`, `KERBCAST_ANCHOR_OWNER`), a `vessel` anchor on
+the craft it watches with occlusion on. The React brackets are drawn from it.
+
+In game, `KerbcastControl.SetAnchors(flightId, anchors, owner)` does the same
+with `AnchorSpec.ForPart`, `ForVessel`, `ForSurface`, `ForDirection` and
+`ForVector`. Those results go to every client that asked for anchors, tagged
+with `owner`, until replaced, `ClearAnchors(owner)` or a scene change.
+
 ## Pan/zoom input helper
 
 Driving pan and zoom from a gamepad stick, nudge buttons, or an FoV
