@@ -816,6 +816,9 @@ namespace Kerbcast
      * when the terrain point's elevation from the station is higher, and a
      * target is hidden when its elevation is below the highest terrain
      * elevation closer to the station than itself.
+     * A target with a radius is hidden only when its top is: at a grazing
+     * angle the heightfield and the drawn terrain differ by metres, so a
+     * craft whose centre sits just under a crest still shows above it.
      *
      * Per azimuth bin the terrain is sampled out to ArcLimit (past which no
      * line still inside the radiusMax shell can be), and the running maximum
@@ -927,11 +930,17 @@ namespace Kerbcast
             elevation = Math.Atan2(v, h.Magnitude);
         }
 
-        /* True when the station's own terrain hides the target. */
-        public bool Blocks(DVec3 relStation, DVec3 relTarget, DVec3 axis)
+        /* True when the station's own terrain hides the target, all of it
+           when it has a radius. */
+        public bool Blocks(DVec3 relStation, DVec3 relTarget, DVec3 axis, double targetRadius = 0)
         {
             Basis(relStation, axis, out var up, out var north, out var east);
             Locate(relStation, relTarget, up, north, east, out double az, out double arc, out double el);
+            if (targetRadius > 0)
+            {
+                double range = (relTarget - relStation).Magnitude;
+                el += range > targetRadius ? Math.Asin(targetRadius / range) : Math.PI / 2;
+            }
             return el < MaskAt(az, arc, up, north, east);
         }
 

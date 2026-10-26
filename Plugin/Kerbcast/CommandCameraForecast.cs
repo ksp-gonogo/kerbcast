@@ -70,14 +70,17 @@ namespace Kerbcast
         /* StateAt calls since the last Begin. */
         public int LastSamples { get; private set; }
 
+        private double _aimRadius;
+
         public CommandCameraForecast(CommandCameraOcclusion occlusion)
         {
             _occlusion = occlusion;
         }
 
-        public bool Begin(double nowUt, double horizon, BodyMotion station, BodyMotion aim)
+        public bool Begin(double nowUt, double horizon, BodyMotion station, BodyMotion aim, double aimRadius)
         {
             LastSamples = 0;
+            _aimRadius = aimRadius;
             var bodies = FlightGlobals.Bodies;
             if (bodies == null || bodies.Count == 0) return false;
             _bodies.Clear();
@@ -162,7 +165,7 @@ namespace Kerbcast
             for (int k = 0; k < _occluders.Count; k++)
             {
                 int i = _occluders[k];
-                if (_occlusion.Blocks(_bodies[i], station, aim, CentreAt(i, t), _centresNow[i], _spins[i], dt, out _))
+                if (_occlusion.Blocks(_bodies[i], station, aim, CentreAt(i, t), _centresNow[i], _spins[i], dt, out _, _aimRadius))
                 {
                     occluder = _bodies[i].bodyName;
                     break;
