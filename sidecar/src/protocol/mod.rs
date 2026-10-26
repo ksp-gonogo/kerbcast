@@ -778,6 +778,159 @@ pub struct SetCommandAimPayload {
     pub aim: Option<CommandAim>,
 }
 
+/// What an anchor marks.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnchorKind {
+    /// One part of a craft, followed through docking.
+    Part,
+    /// A craft's centre of mass.
+    Vessel,
+    /// A point on a body's surface.
+    Surface,
+    /// A direction, drawn at infinity.
+    Direction,
+}
+
+/// A direction a `direction` anchor follows, taken from its craft's orbit
+/// (not the surface frame).
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnchorDirection {
+    Prograde,
+    Retrograde,
+    Normal,
+    Antinormal,
+    RadialIn,
+    RadialOut,
+    /// The first maneuver node's burn vector.
+    Maneuver,
+    /// From the craft towards the Sun.
+    Sun,
+    /// From the craft towards its target.
+    Target,
+    /// The craft's velocity relative to its target.
+    TargetRelativeVelocity,
+}
+
+/// Something a client wants marked on a camera's picture. `kind` says which
+/// fields apply. The game projects every anchor through the camera that
+/// rendered each frame and sends the result with that frame's `FrameStamp`.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Anchor {
+    /// The client's own name for the anchor, unique among its anchors on
+    /// one camera. 1 to 64 characters.
+    pub id: String,
+    pub kind: AnchorKind,
+    /// `part` and `vessel`: the craft's `Vessel.persistentId`. `direction`:
+    /// the craft whose direction is followed; absent for the active craft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel: Option<u32>,
+    /// `part`: the part's `Part.persistentId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
+    /// `part`: `[x, y, z]` metres from the part's origin in its own axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<Vec<f64>>,
+    /// `surface`: the body's name, e.g. `"Kerbin"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// `surface`: degrees, -90..=90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// `surface`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// `surface`: metres above sea level. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<f64>,
+    /// `direction`: a named direction of the craft. Give this or `vector`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<AnchorDirection>,
+    /// `direction`: a fixed `[x, y, z]` direction in the inertial frame of
+    /// `Orbit.getRelativePositionAtUT` (z up). Give this or `direction`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f64>>,
+    /// `part` and `vessel`: also report the thing's `forward` and `up` axes
+    /// in camera space every frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<bool>,
+    /// Also report whether something stands between the lens and the
+    /// anchor. Off by default: it costs a ray cast per anchor per frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occlusion: Option<bool>,
+    /// Metres added to the marked thing's radius before `apparentRadiusPx`
+    /// is worked out, to leave room around it. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_m: Option<f64>,
+}
+
+/// Replace this client's anchors on one camera, or clear them with
+/// `anchors` absent or null. Anchors belong to the client that set them:
+/// they are display, not commands, so the command lock does not apply, and
+/// they are cleared when the client disconnects. At most
+/// `MAX_ANCHORS_PER_CAMERA` per client per camera.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAnchorsPayload {
+    pub flight_id: u32,
+    #[serde(default)]
+    pub anchors: Option<Vec<Anchor>>,
+}
+
+/// Most anchors one client may hold on one camera.
+pub const MAX_ANCHORS_PER_CAMERA: usize = 16;
+
+/// Where one anchor landed in one frame. Pixel positions are in the
+/// capture frame (`FrameStamp.width` by `FrameStamp.height`, origin top
+/// left). Absent for a frame in which the anchor could not be located.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameAnchor {
+    /// The anchor's `id` as its owner set it.
+    pub id: String,
+    /// Who set it, for an anchor this client did not set: the game-side
+    /// owner passed to `KerbcastControl.SetAnchors`, or `"kerbcast"` for
+    /// Kerbcast's own. Absent for this client's own anchors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub x: f64,
+    pub y: f64,
+    /// Inside the frame and in front of the lens.
+    pub in_frame: bool,
+    /// Behind the lens. `x` and `y` then sit off the frame on the side the
+    /// anchor is nearest.
+    pub behind: bool,
+    /// Lens to anchor in metres. Absent for a `direction` anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance_m: Option<f64>,
+    /// The marked thing's radius (plus `marginM`) on screen, in capture
+    /// pixels. 0 for `surface` and `direction` anchors without a margin.
+    pub apparent_radius_px: f64,
+    /// Degrees between the camera's axis and the anchor.
+    pub angle_off_axis: f64,
+    /// The thing's forward axis in camera space (x right, y up, z forward),
+    /// when the anchor asked for `orientation`. For a craft, the direction
+    /// its control point faces; for a docking port, the way the port faces;
+    /// for another part, its stack axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward: Option<Vec<f64>>,
+    /// The thing's up axis in camera space, perpendicular to `forward`,
+    /// when the anchor asked for `orientation`. Gives its roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up: Option<Vec<f64>>,
+    /// Whether something stands between the lens and the anchor, when the
+    /// anchor asked for `occlusion`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occluded: Option<bool>,
+}
+
 /// A consumer reporting its OWN current display size in px for one camera.
 /// Unlike `SetRenderSizePayload` (an operator command that sets the shared
 /// render size directly, last-writer-wins), this is a per-consumer input the
@@ -900,6 +1053,11 @@ pub struct HelloPayload {
     /// `SetFrameStamps`. Absent from sidecars older than 1.11.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_stamps: Option<bool>,
+    /// True when this sidecar takes `SetAnchors` and sends anchor results
+    /// with frame stamps to a client that asks with `SetFrameStamps`
+    /// `anchors: true`. Absent from sidecars older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchors: Option<bool>,
 }
 
 #[typeshare]
@@ -907,6 +1065,10 @@ pub struct HelloPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SetFrameStampsPayload {
     pub enabled: bool,
+    /// Also send each frame's anchor results. Off unless asked for, so a
+    /// client that predates anchors never receives them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchors: Option<bool>,
 }
 
 #[typeshare]
@@ -1046,6 +1208,21 @@ pub struct FrameStampPayload {
     /// Capture epoch (see `SettingsStatePayload::capture_epoch`) `capture_ut`
     /// belongs to.
     pub capture_epoch: u32,
+    /// Vertical field of view the frame was rendered with, degrees. Absent
+    /// when the game did not report one (kerbal cameras, plugins older
+    /// than 1.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fov: Option<f64>,
+    /// The frame's size in capture pixels, the space anchor positions are in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Where each anchor landed in this frame: the client's own anchors and
+    /// those set in game. Only for a client that asked for anchors with
+    /// `SetFrameStamps`; absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchors: Option<Vec<FrameAnchor>>,
 }
 
 /// Messages sent FROM the client TO the sidecar.
@@ -1083,6 +1260,10 @@ pub enum ClientMessage {
     DestroyCommandCamera(DestroyCommandCameraPayload),
     /// Point a command camera, or return it to its default. Server-wide.
     SetCommandAim(SetCommandAimPayload),
+    /// Replace or clear this client's anchors on one camera. Per client:
+    /// other clients never see them, and they go when this client does.
+    /// Send only to a sidecar whose `Hello` has `anchors: true`.
+    SetAnchors(SetAnchorsPayload),
     /// A consumer reporting its OWN current display size in px; the sidecar
     /// aggregates MAX-across-consumers to drive auto-resolution
     /// (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
@@ -1194,7 +1375,8 @@ pub enum ClientMessage {
     SetThrottleMainScreen(SetThrottleMainScreenPayload),
     /// Start or stop `FrameStamp` messages on this peer's control channel.
     /// Off until asked for, so clients that predate stamps never receive
-    /// them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+    /// them. Send only to a sidecar whose `Hello` has `frameStamps: true`;
+    /// `anchors: true` only to one whose `Hello` has `anchors: true`.
     SetFrameStamps(SetFrameStampsPayload),
 }
 
@@ -1260,12 +1442,77 @@ mod tests {
             rtp_timestamp: 4_000_000_000,
             capture_ut: 86400.25,
             capture_epoch: 3,
+            fov: None,
+            width: None,
+            height: None,
+            anchors: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             s,
-            r#"{"type":"frame-stamp","content":{"flightId":7,"rtpTimestamp":4000000000,"captureUt":86400.25,"captureEpoch":3}}"#
+            r#"{"type":"frame-stamp","content":{"flightId":7,"rtpTimestamp":4000000000,"captureUt":86400.25,"captureEpoch":3}}"#,
+            "a stamp without the 1.12 fields is byte-identical to a 1.11 stamp"
         );
+    }
+
+    #[test]
+    fn frame_stamp_carries_fov_size_and_anchors() {
+        let msg = ServerMessage::FrameStamp(FrameStampPayload {
+            flight_id: 7,
+            rtp_timestamp: 1,
+            capture_ut: 2.0,
+            capture_epoch: 0,
+            fov: Some(40.0),
+            width: Some(1280),
+            height: Some(720),
+            anchors: Some(vec![FrameAnchor {
+                id: "port".into(),
+                owner: None,
+                x: 640.5,
+                y: 360.0,
+                in_frame: true,
+                behind: false,
+                distance_m: Some(52.0),
+                apparent_radius_px: 12.0,
+                angle_off_axis: 0.1,
+                forward: Some(vec![0.0, 0.0, -1.0]),
+                up: Some(vec![0.0, 1.0, 0.0]),
+                occluded: Some(false),
+            }]),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""fov":40.0,"width":1280,"height":720"#), "{s}");
+        assert!(
+            s.contains(r#""anchors":[{"id":"port","x":640.5,"y":360.0,"inFrame":true,"behind":false,"distanceM":52.0,"apparentRadiusPx":12.0,"angleOffAxis":0.1,"forward":[0.0,0.0,-1.0],"up":[0.0,1.0,0.0],"occluded":false}]"#),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn set_anchors_matches_the_wire() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"set-anchors","content":{"flightId":9,"anchors":[{"id":"port","kind":"part","vessel":11,"part":22,"orientation":true},{"id":"pro","kind":"direction","direction":"targetRelativeVelocity"}]}}"#,
+        )
+        .unwrap();
+        let ClientMessage::SetAnchors(p) = msg else {
+            panic!("expected set-anchors")
+        };
+        assert_eq!(p.flight_id, 9);
+        let anchors = p.anchors.unwrap();
+        assert_eq!(anchors[0].kind, AnchorKind::Part);
+        assert_eq!(anchors[0].part, Some(22));
+        assert_eq!(anchors[0].orientation, Some(true));
+        assert_eq!(
+            anchors[1].direction,
+            Some(AnchorDirection::TargetRelativeVelocity)
+        );
+
+        let clear: ClientMessage =
+            serde_json::from_str(r#"{"type":"set-anchors","content":{"flightId":9}}"#).unwrap();
+        assert!(matches!(
+            clear,
+            ClientMessage::SetAnchors(SetAnchorsPayload { anchors: None, .. })
+        ));
     }
 
     /// Clients before 1.11 ignore the extra Hello field and never send
@@ -1276,17 +1523,33 @@ mod tests {
             sidecar_version: "1.11.0".to_owned(),
             encoder_backend: "x".to_owned(),
             frame_stamps: Some(true),
+            anchors: Some(true),
         });
-        assert!(serde_json::to_string(&hello)
-            .unwrap()
-            .contains(r#""frameStamps":true"#));
+        let hello = serde_json::to_string(&hello).unwrap();
+        assert!(hello.contains(r#""frameStamps":true"#));
+        assert!(hello.contains(r#""anchors":true"#));
 
+        /* A 1.11 client's opt-in never asks for anchors. */
         let msg: ClientMessage =
             serde_json::from_str(r#"{"type":"set-frame-stamps","content":{"enabled":true}}"#)
                 .unwrap();
         assert!(matches!(
             msg,
-            ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled: true })
+            ClientMessage::SetFrameStamps(SetFrameStampsPayload {
+                enabled: true,
+                anchors: None
+            })
+        ));
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"set-frame-stamps","content":{"enabled":true,"anchors":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            msg,
+            ClientMessage::SetFrameStamps(SetFrameStampsPayload {
+                enabled: true,
+                anchors: Some(true)
+            })
         ));
     }
 

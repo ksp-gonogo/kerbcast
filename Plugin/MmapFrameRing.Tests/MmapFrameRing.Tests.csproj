@@ -24,6 +24,9 @@
     <None Include="../../sidecar/testdata/frame_ring_v2.ring"
           Link="frame_ring_v2.ring"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../sidecar/testdata/frame_ring_v2_meta.ring"
+          Link="frame_ring_v2_meta.ring"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

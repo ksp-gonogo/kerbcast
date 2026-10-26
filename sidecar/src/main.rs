@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
         max_dims = format!("{}x{}", ring_cfg.max_width, ring_cfg.max_height),
         "camera registry initialised — scanning for rings (per-ring geometry)",
     );
+    registry.reset_anchors().await;
 
     let peers: Arc<RwLock<Vec<Arc<KerbcastPeer>>>> = Arc::new(RwLock::new(Vec::new()));
     let state = AppState {
@@ -448,6 +449,8 @@ async fn consume_loop(
             if registry.forget_background_request(peer.peer_id).await {
                 registry.reflush_all_capture_rates().await;
             }
+            // And its anchors, on every camera it set them on.
+            registry.forget_anchors_all(peer.peer_id).await;
         }
 
         let cameras = registry.snapshot().await;
@@ -992,7 +995,7 @@ async fn encode_and_fan_out(
     for weak in prev {
         if let Some(track) = weak.upgrade() {
             if let Err(e) = track
-                .write_frame(&combined, actual_duration, cam.flight_id, frame.capture)
+                .write_frame(&combined, actual_duration, cam.flight_id, &frame.capture)
                 .await
             {
                 warn!(flight_id = cam.flight_id, error = %e, "write_frame failed");

@@ -270,7 +270,7 @@ impl KerbcastPeer {
         // the slot pool is shared (below), so each drain can resolve the camera
         // bound to its slot when it honors a PLI.
         let control_channel: ControlChannel = Arc::new(Mutex::new(None));
-        let outbox = Outbox::spawn(control_channel.clone());
+        let outbox = Outbox::spawn(control_channel.clone(), registry.anchor_owner(peer_id));
         let mut slots: Vec<Slot> = Vec::with_capacity(slot_count);
         let mut senders: Vec<Arc<RTCRtpSender>> = Vec::with_capacity(slot_count);
         for i in 0..slot_count {
@@ -661,6 +661,7 @@ async fn handle_client_message(
                     sidecar_version: crate::VERSION.to_owned(),
                     encoder_backend: selected_backend_name().to_owned(),
                     frame_stamps: Some(true),
+                    anchors: Some(true),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -730,8 +731,24 @@ async fn handle_client_message(
         ClientMessage::SetZoomRate(SetZoomRatePayload { flight_id, rate }) => {
             apply_zoom_rate_change(&registry, &dc, flight_id, rate).await;
         }
-        ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled }) => {
-            dc.set_stamps_wanted(enabled);
+        ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled, anchors }) => {
+            dc.set_stamps_wanted(enabled, anchors.unwrap_or(false));
+        }
+        // A client's own anchors on one camera. Keyed by peer_id; forgotten on
+        // disconnect / peer reap (below + in the consume-loop reaper).
+        ClientMessage::SetAnchors(payload) => {
+            let flight_id = payload.flight_id;
+            if let Err(message) = registry.set_anchors(peer_id, payload).await {
+                send_server_message(
+                    &dc,
+                    &ServerMessage::Error(ErrorPayload {
+                        message,
+                        source: ErrorSource::Sidecar,
+                        flight_id: Some(flight_id),
+                        ..Default::default()
+                    }),
+                );
+            }
         }
         ClientMessage::SetDegrade(SetDegradePayload { flight_id, level }) => {
             apply_degrade_change(&registry, &dc, peer_id, flight_id, level).await;
@@ -859,6 +876,8 @@ async fn handle_client_message(
             if registry.forget_background_request(peer_id).await {
                 registry.reflush_all_capture_rates().await;
             }
+            // Anchors go with their client, on every camera it set them on.
+            registry.forget_anchors_all(peer_id).await;
         }
     }
 }
@@ -1802,7 +1821,7 @@ mod tests {
         );
 
         let slots: Arc<Mutex<Vec<Slot>>> = Arc::new(Mutex::new(Vec::new()));
-        let dc = Outbox::spawn(Arc::new(Mutex::new(None)));
+        let dc = Outbox::spawn(Arc::new(Mutex::new(None)), registry.anchor_owner(peer_id));
 
         handle_unsubscribe(&registry, peer_id, &slots, &dc, 9001).await;
 

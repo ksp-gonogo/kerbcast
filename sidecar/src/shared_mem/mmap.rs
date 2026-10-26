@@ -15,7 +15,8 @@
 //! 24       4      u32 atomic write_index (most-recently-written slot)
 //! 28       4      padding
 //! 32       8      u64 atomic sequence (monotonic; wraps only after 2^64)
-//! 40       (HEADER_SIZE - 40) padding to align first slot
+//! 40       4      u32 meta_slot_bytes (per-slot metadata capacity; 0 = none)
+//! 44       (HEADER_SIZE - 44) padding to align first slot
 //!
 //! 4096 + (slot_idx * SLOT_SIZE):    slot start
 //!   +0   4      u32 width
@@ -25,9 +26,21 @@
 //!   +16  8      f64 capture_ts_ms
 //!   +24  8      u64 sequence (matches header.sequence when this slot was written)
 //!   +32  8      f64 capture_ut (KSP universal time at render; NaN = unknown)
-//!   +40  24     padding
+//!   +40  4      u32 meta_len (bytes of this frame's metadata; 0 = none)
+//!   +44  4      f32 fov_deg (vertical field of view at render; 0 = unknown)
+//!   +48  16     padding
 //!   +64  ...    RGBA8 pixels, max_width * max_height * 4 bytes
+//!
+//! 4096 + slot_count * SLOT_SIZE + (slot_idx * meta_slot_bytes):
+//!   per-slot metadata, `meta_len` bytes of UTF-8 JSON: the frame's anchor
+//!   results, an array of `FrameAnchor` each carrying its `owner`
 //! ```
+//!
+//! The metadata fields arrived in 1.12 without a version bump. Writers
+//! before 1.12 leave them zero (the header is zeroed and the slot padding
+//! never written), which reads as "no metadata, fov unknown". A reader
+//! before 1.12 maps only the slots, so it never sees the trailer, and
+//! ignores the two slot fields.
 //!
 //! Sync protocol (seqlock-style, one-writer / one-or-more-readers):
 //!
@@ -45,9 +58,12 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
+
+use crate::protocol::FrameAnchor;
 
 pub const MAGIC: u64 = 0x4B45_5242_4341_4D31; // "KERBCAM1" legacy ring magic; value pinned for plugin wire-format compat, not renamed
 pub const LAYOUT_VERSION: u32 = 2;
@@ -65,6 +81,7 @@ const HEADER_OFF_MAX_WIDTH: usize = 16;
 const HEADER_OFF_MAX_HEIGHT: usize = 20;
 const HEADER_OFF_WRITE_INDEX: usize = 24;
 const HEADER_OFF_SEQUENCE: usize = 32;
+const HEADER_OFF_META_SLOT_BYTES: usize = 40;
 
 const SLOT_OFF_WIDTH: usize = 0;
 const SLOT_OFF_HEIGHT: usize = 4;
@@ -73,20 +90,65 @@ const SLOT_OFF_CAPTURE_EPOCH: usize = 12;
 const SLOT_OFF_CAPTURE_TS: usize = 16;
 const SLOT_OFF_SEQUENCE: usize = 24;
 const SLOT_OFF_CAPTURE_UT: usize = 32;
+const SLOT_OFF_META_LEN: usize = 40;
+const SLOT_OFF_FOV: usize = 44;
 const SLOT_OFF_PIXELS: usize = 64;
 const SLOT_PIXELS_ALIGNMENT_PAD: usize = 0; // SLOT_OFF_PIXELS is already 64, 32-aligned
 
+/// Largest per-slot metadata capacity a reader accepts from a header, so a
+/// corrupt header cannot drive a wild mapping.
+pub const MAX_META_SLOT_BYTES: u32 = 1 << 20;
+
 /// Mission-time stamp of one rendered frame: the KSP universal time it was
-/// rendered at plus the plugin's discontinuity epoch at that moment.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// rendered at plus the plugin's discontinuity epoch at that moment, and
+/// what the game reported about how it was drawn.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CaptureStamp {
     /// `None` when the writer had no universal time (stored as NaN).
     pub ut: Option<f64>,
     pub epoch: u32,
+    /// Vertical field of view at render, degrees; `None` when unreported.
+    pub fov: Option<f64>,
+    /// The frame's size in pixels; `None` outside a ring read.
+    pub size: Option<(u32, u32)>,
+    /// Where each anchor landed in the frame, every owner's, each tagged
+    /// with its owner. `None` when the writer reported none.
+    pub anchors: Option<Arc<Vec<FrameAnchor>>>,
 }
 
 impl CaptureStamp {
-    pub const UNKNOWN: CaptureStamp = CaptureStamp { ut: None, epoch: 0 };
+    pub const UNKNOWN: CaptureStamp = CaptureStamp {
+        ut: None,
+        epoch: 0,
+        fov: None,
+        size: None,
+        anchors: None,
+    };
+
+    /// A stamp with only the UT and epoch known.
+    pub fn at(ut: Option<f64>, epoch: u32) -> Self {
+        Self {
+            ut,
+            epoch,
+            ..Self::UNKNOWN
+        }
+    }
+}
+
+/// Anchor results from a slot's metadata bytes. Unreadable metadata reads
+/// as none: a frame is never dropped over its anchors.
+fn parse_anchor_meta(bytes: &[u8]) -> Option<Arc<Vec<FrameAnchor>>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    match serde_json::from_slice::<Vec<FrameAnchor>>(bytes) {
+        Ok(v) if v.is_empty() => None,
+        Ok(v) => Some(Arc::new(v)),
+        Err(e) => {
+            tracing::debug!(error = %e, "frame anchor metadata unreadable; ignored");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -157,6 +219,9 @@ impl MmapRingConfig {
 pub struct MmapFrameRing {
     mmap: MmapMut,
     cfg: MmapRingConfig,
+    /// Per-slot metadata capacity, from the header; 0 when the writer
+    /// reserved none or the file is too short to hold it.
+    meta_slot_bytes: usize,
 }
 
 /// One frame's worth of data borrowed from a slot. Cheap to construct (no
@@ -181,7 +246,16 @@ impl MmapFrameRing {
     /// zero it, and write the layout header. Use this from the side that
     /// "owns" the ring — i.e. the writer side that's responsible for cleanup.
     pub fn create(path: &Path, cfg: MmapRingConfig) -> Result<Self, MmapRingError> {
-        let total = cfg.total_bytes();
+        Self::create_with_meta(path, cfg, 0)
+    }
+
+    /// `create` with `meta_slot_bytes` of per-frame metadata after the slots.
+    pub fn create_with_meta(
+        path: &Path,
+        cfg: MmapRingConfig,
+        meta_slot_bytes: u32,
+    ) -> Result<Self, MmapRingError> {
+        let total = cfg.total_bytes() + cfg.slot_count as usize * meta_slot_bytes as usize;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -190,7 +264,11 @@ impl MmapFrameRing {
             .open(path)?;
         file.set_len(total as u64)?;
         let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
-        let mut ring = Self { mmap, cfg };
+        let mut ring = Self {
+            mmap,
+            cfg,
+            meta_slot_bytes: meta_slot_bytes as usize,
+        };
         ring.write_header()?;
         Ok(ring)
     }
@@ -208,8 +286,29 @@ impl MmapFrameRing {
                 need: total as u64,
             });
         }
-        let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
-        let ring = Self { mmap, cfg };
+        /* The metadata trailer is optional: a writer before 1.12 reserves
+        none, and a header claiming more than the file holds is ignored. */
+        let header = unsafe { MmapOptions::new().len(HEADER_SIZE).map(&file)? };
+        let claimed = u32::from_le_bytes(
+            header[HEADER_OFF_META_SLOT_BYTES..HEADER_OFF_META_SLOT_BYTES + 4]
+                .try_into()
+                .unwrap(),
+        );
+        drop(header);
+        let meta_total = cfg.slot_count as u64 * claimed as u64;
+        let meta_slot_bytes =
+            if claimed <= MAX_META_SLOT_BYTES && meta.len() >= total as u64 + meta_total {
+                claimed as usize
+            } else {
+                0
+            };
+        let map_len = total + cfg.slot_count as usize * meta_slot_bytes;
+        let mmap = unsafe { MmapOptions::new().len(map_len).map_mut(&file)? };
+        let ring = Self {
+            mmap,
+            cfg,
+            meta_slot_bytes,
+        };
         ring.validate_header()?;
         Ok(ring)
     }
@@ -316,6 +415,11 @@ impl MmapFrameRing {
         put_u32(header, HEADER_OFF_SLOT_COUNT, self.cfg.slot_count);
         put_u32(header, HEADER_OFF_MAX_WIDTH, self.cfg.max_width);
         put_u32(header, HEADER_OFF_MAX_HEIGHT, self.cfg.max_height);
+        put_u32(
+            header,
+            HEADER_OFF_META_SLOT_BYTES,
+            self.meta_slot_bytes as u32,
+        );
         Ok(())
     }
 
@@ -386,6 +490,15 @@ impl MmapFrameRing {
         HEADER_SIZE + (slot_idx as usize) * self.cfg.slot_bytes()
     }
 
+    fn meta_offset(&self, slot_idx: u32) -> usize {
+        self.cfg.total_bytes() + (slot_idx as usize) * self.meta_slot_bytes
+    }
+
+    /// Per-slot metadata capacity this ring was opened with.
+    pub fn meta_slot_bytes(&self) -> usize {
+        self.meta_slot_bytes
+    }
+
     fn slot_atomic_u64(&self, slot_idx: u32, intra_slot_offset: usize) -> &AtomicU64 {
         let base = self.mmap.as_ptr();
         let slot_byte_offset = self.slot_offset(slot_idx) + intra_slot_offset;
@@ -414,6 +527,21 @@ impl MmapFrameRing {
         height: u32,
         capture_ts_ms: f64,
         capture: CaptureStamp,
+        rgba: &[u8],
+    ) -> Result<u64, MmapRingError> {
+        self.produce_with_meta(width, height, capture_ts_ms, &capture, &[], rgba)
+    }
+
+    /// `produce_stamped` plus the frame's metadata bytes. The stamp's `fov`
+    /// is written; its `size` and `anchors` are not (`meta` carries the
+    /// anchors). Metadata beyond the ring's capacity is dropped.
+    pub fn produce_with_meta(
+        &mut self,
+        width: u32,
+        height: u32,
+        capture_ts_ms: f64,
+        capture: &CaptureStamp,
+        meta: &[u8],
         rgba: &[u8],
     ) -> Result<u64, MmapRingError> {
         let expected = (width as usize) * (height as usize) * 4;
@@ -462,8 +590,20 @@ impl MmapFrameRing {
         put_u32(slot, SLOT_OFF_CAPTURE_EPOCH, capture.epoch);
         put_f64(slot, SLOT_OFF_CAPTURE_TS, capture_ts_ms);
         put_f64(slot, SLOT_OFF_CAPTURE_UT, capture.ut.unwrap_or(f64::NAN));
+        let meta_len = if meta.len() <= self.meta_slot_bytes {
+            meta.len()
+        } else {
+            0
+        };
+        put_u32(slot, SLOT_OFF_META_LEN, meta_len as u32);
+        slot[SLOT_OFF_FOV..SLOT_OFF_FOV + 4]
+            .copy_from_slice(&(capture.fov.unwrap_or(0.0) as f32).to_le_bytes());
         // Pixels.
         slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + rgba.len()].copy_from_slice(rgba);
+        if meta_len > 0 {
+            let at = self.meta_offset(next_slot);
+            self.mmap[at..at + meta_len].copy_from_slice(&meta[..meta_len]);
+        }
 
         // Publish: write the slot's sequence number first (Release), then
         // publish the new write_index (also Release). Readers do the reverse:
@@ -541,6 +681,12 @@ impl MmapFrameRing {
                     .try_into()
                     .unwrap(),
             );
+            let fov = f32::from_le_bytes(slot[SLOT_OFF_FOV..SLOT_OFF_FOV + 4].try_into().unwrap());
+            let meta_len = u32::from_le_bytes(
+                slot[SLOT_OFF_META_LEN..SLOT_OFF_META_LEN + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             let pixel_bytes = (width as usize) * (height as usize) * 4;
             if pixel_bytes > slot_bytes - SLOT_OFF_PIXELS {
                 // Corrupt / writer wrote bigger-than-capacity. Re-poll once.
@@ -548,6 +694,13 @@ impl MmapFrameRing {
                 continue;
             }
             let pixels = slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + pixel_bytes].to_vec();
+            /* Copied under the same seqlock check as the pixels; parsed after. */
+            let meta = if meta_len > 0 && meta_len <= self.meta_slot_bytes {
+                let at = self.meta_offset(write_index);
+                self.mmap[at..at + meta_len].to_vec()
+            } else {
+                Vec::new()
+            };
 
             // Verify the slot wasn't clobbered while we were copying. If
             // slot.sequence changed, the writer's lapped us — retry.
@@ -564,6 +717,9 @@ impl MmapFrameRing {
                     capture: CaptureStamp {
                         ut: capture_ut.is_finite().then_some(capture_ut),
                         epoch: capture_epoch,
+                        fov: (fov.is_finite() && fov > 0.0).then_some(fov as f64),
+                        size: Some((width, height)),
+                        anchors: parse_anchor_meta(&meta),
                     },
                     pixels,
                 }));
@@ -625,13 +781,11 @@ mod tests {
         assert_eq!(frame.stride_bytes, 32 * 4);
         assert_eq!(frame.sequence, 2);
         assert_eq!(frame.capture_ts_ms, 1235.5);
-        assert_eq!(
-            frame.capture,
-            CaptureStamp {
-                ut: Some(86400.25),
-                epoch: 7
-            }
-        );
+        assert_eq!(frame.capture.ut, Some(86400.25));
+        assert_eq!(frame.capture.epoch, 7);
+        assert_eq!(frame.capture.fov, None, "a pre-1.12 slot reads fov unknown");
+        assert_eq!(frame.capture.anchors, None, "and no anchors");
+        assert_eq!(ring.meta_slot_bytes(), 0);
         let want: Vec<u8> = (0..32usize * 18 * 4)
             .map(|i| ((i * 11 + 29) & 0xFF) as u8)
             .collect();
@@ -680,21 +834,106 @@ mod tests {
         let path = tmp_path("stamp");
         let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
         let pixels = vec![0u8; 4 * 4 * 4];
-        let stamp = CaptureStamp {
-            ut: Some(123_456.789),
-            epoch: 3,
-        };
+        let stamp = CaptureStamp::at(Some(123_456.789), 3);
         writer.produce_stamped(4, 4, 1.0, stamp, &pixels).unwrap();
         let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
-        assert_eq!(reader.latest().unwrap().unwrap().capture, stamp);
+        let read = reader.latest().unwrap().unwrap().capture;
+        assert_eq!((read.ut, read.epoch), (Some(123_456.789), 3));
+        assert_eq!(read.size, Some((4, 4)));
 
         writer.produce(4, 4, 2.0, &pixels).unwrap();
-        assert_eq!(
-            reader.latest().unwrap().unwrap().capture,
-            CaptureStamp::UNKNOWN
-        );
+        let read = reader.latest().unwrap().unwrap().capture;
+        assert_eq!((read.ut, read.epoch, read.fov), (None, 0, None));
         drop(reader);
         drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The C# writer's metadata fixture: fov and anchor results ride the
+    /// slot and the trailer after the slots.
+    #[test]
+    fn csharp_written_meta_fixture_reads_back_exactly() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/frame_ring_v2_meta.ring"
+        );
+        let path = tmp_path("csmetafixture");
+        fs::copy(fixture, &path).unwrap();
+        let ring = MmapFrameRing::open_self_describing(&path).unwrap();
+        assert_eq!(ring.meta_slot_bytes(), 512);
+        let frame = ring.latest().unwrap().expect("fixture must contain frames");
+        assert_eq!(frame.sequence, 2);
+        assert_eq!(frame.capture.ut, Some(86400.25));
+        assert_eq!(frame.capture.fov, Some(42.5));
+        let anchors = frame.capture.anchors.expect("anchors in the trailer");
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(a.id, "port");
+        assert_eq!(a.owner.as_deref(), Some("peer:7:3"));
+        assert_eq!((a.x, a.y), (16.5, 9.25));
+        assert!(a.in_frame && !a.behind);
+        assert_eq!(a.distance_m, Some(120.0));
+        assert_eq!(a.forward.as_deref(), Some(&[0.0, 0.0, 1.0][..]));
+        assert_eq!(a.occluded, Some(false));
+        drop(ring);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn metadata_roundtrips_and_clears_on_a_frame_without_it() {
+        let path = tmp_path("meta");
+        let mut writer = MmapFrameRing::create_with_meta(&path, small_cfg(), 256).unwrap();
+        let pixels = vec![0u8; 4 * 4 * 4];
+        let stamp = CaptureStamp {
+            fov: Some(30.0),
+            ..CaptureStamp::at(Some(5.0), 1)
+        };
+        let meta = br#"[{"id":"a","owner":"x","x":1,"y":2,"inFrame":true,"behind":false,"apparentRadiusPx":3,"angleOffAxis":4}]"#;
+        writer
+            .produce_with_meta(4, 4, 1.0, &stamp, meta, &pixels)
+            .unwrap();
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        let read = reader.latest().unwrap().unwrap().capture;
+        assert_eq!(read.fov, Some(30.0));
+        let anchors = read.anchors.unwrap();
+        assert_eq!(anchors[0].id, "a");
+        assert_eq!(anchors[0].owner.as_deref(), Some("x"));
+
+        /* A frame without metadata, written into the next slot, carries none. */
+        writer.produce(4, 4, 2.0, &pixels).unwrap();
+        assert_eq!(reader.latest().unwrap().unwrap().capture.anchors, None);
+
+        /* Metadata past the capacity is dropped, never truncated mid-JSON. */
+        let big = vec![b' '; 300];
+        writer
+            .produce_with_meta(4, 4, 3.0, &stamp, &big, &pixels)
+            .unwrap();
+        assert_eq!(reader.latest().unwrap().unwrap().capture.anchors, None);
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A header claiming a trailer the file cannot hold (a corrupt header, or
+    /// a file cut short) opens without metadata rather than failing.
+    #[test]
+    fn a_trailer_the_file_cannot_hold_is_ignored() {
+        let path = tmp_path("short-meta");
+        let writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        drop(writer);
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut map = unsafe { MmapOptions::new().len(HEADER_SIZE).map_mut(&file).unwrap() };
+            map[HEADER_OFF_META_SLOT_BYTES..HEADER_OFF_META_SLOT_BYTES + 4]
+                .copy_from_slice(&4096u32.to_le_bytes());
+        }
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert_eq!(reader.meta_slot_bytes(), 0);
+        drop(reader);
         fs::remove_file(&path).ok();
     }
 
