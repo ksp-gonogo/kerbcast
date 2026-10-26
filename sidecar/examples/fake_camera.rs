@@ -57,7 +57,7 @@ fn main() {
         max_height: 576,
     };
     let ring_path = shm_dir.join(format!("{flight_id}.ring"));
-    let mut ring = MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+    let mut ring = MmapFrameRing::create_with_meta(&ring_path, cfg, 4096).expect("create ring");
 
     println!(
         "fake camera {flight_id} ({name}) -> {}",
@@ -73,17 +73,45 @@ fn main() {
         /* A mission clock that starts at one day, so viewers exercise the
         frame-stamp path the way they would in a flight. */
         let capture = CaptureStamp {
-            ut: Some(86_400.0 + t),
-            epoch: 0,
+            fov: Some(60.0),
+            ..CaptureStamp::at(Some(86_400.0 + t), 0)
         };
-        ring.produce_stamped(WIDTH, HEIGHT, t * 1000.0, capture, &pixels)
-            .expect("ring produce");
+        ring.produce_with_meta(
+            WIDTH,
+            HEIGHT,
+            t * 1000.0,
+            &capture,
+            fake_anchor(t).as_bytes(),
+            &pixels,
+        )
+        .expect("ring produce");
         n += 1;
         if n.is_multiple_of(FPS * 5) {
             println!("{n} frames");
         }
         std::thread::sleep(Duration::from_millis(1000 / FPS));
     }
+}
+
+/// One game-owned anchor circling the frame, so a viewer that asks for
+/// anchors draws a marker that moves with the picture.
+fn fake_anchor(t: f64) -> String {
+    let (cx, cy) = (WIDTH as f64 / 2.0, HEIGHT as f64 / 2.0);
+    let x = cx + 120.0 * (t * 0.8).cos();
+    let y = cy + 80.0 * (t * 0.8).sin();
+    format!(
+        concat!(
+            "[{{\"id\":\"circler\",\"owner\":\"fake_camera\",\"x\":{x:.2},\"y\":{y:.2},",
+            "\"inFrame\":true,\"behind\":false,\"distanceM\":250,",
+            "\"apparentRadiusPx\":18,\"angleOffAxis\":5,",
+            "\"forward\":[{fx:.4},0,{fz:.4}],\"up\":[0,1,0],\"occluded\":{occ}}}]"
+        ),
+        x = x,
+        y = y,
+        fx = (t * 0.5).sin(),
+        fz = (t * 0.5).cos(),
+        occ = (t as u64 / 4) % 2 == 1,
+    )
 }
 
 /// Animated gradient + sweeping bar, hue varied by flight id so multiple

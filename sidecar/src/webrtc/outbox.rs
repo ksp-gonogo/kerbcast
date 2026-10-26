@@ -13,7 +13,9 @@ use tracing::warn;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 
+use crate::anchors::anchors_for;
 use crate::protocol::{FrameStampPayload, ServerMessage};
+use crate::shared_mem::CaptureStamp;
 
 /// The peer's control channel, filled once the browser opens it.
 pub type ControlChannel = Arc<Mutex<Option<Arc<RTCDataChannel>>>>;
@@ -51,13 +53,20 @@ pub struct Outbox {
     /// Whether the client asked for frame stamps. Off by default: a client
     /// that predates them would only pay to receive and discard them.
     stamps_wanted: Arc<AtomicBool>,
+    /// Whether the client asked for anchor results on its stamps. Off by
+    /// default for the same reason, and because a 1.11 client that asked for
+    /// stamps must not start receiving game-owned anchors.
+    anchors_wanted: Arc<AtomicBool>,
+    /// The owner tag this client's anchor results carry in the frame ring.
+    owner: Arc<str>,
     dead: Arc<AtomicBool>,
     shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl Outbox {
     /// Start the peer's sender task on `control`. It runs until `shutdown`.
-    pub fn spawn(control: ControlChannel) -> Self {
+    /// `owner` is the tag the client's own anchor results carry.
+    pub fn spawn(control: ControlChannel, owner: String) -> Self {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (stamp_tx, stamp_rx) = mpsc::channel(STAMP_QUEUE);
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -73,6 +82,8 @@ impl Outbox {
             control_tx,
             stamp_tx,
             stamps_wanted: Arc::new(AtomicBool::new(false)),
+            anchors_wanted: Arc::new(AtomicBool::new(false)),
+            owner: owner.into(),
             dead,
             shutdown: Arc::new(shutdown),
         }
@@ -99,17 +110,43 @@ impl Outbox {
         }
     }
 
-    /// Queue a frame stamp, or drop it when the peer did not ask for stamps
-    /// or is behind.
-    pub fn offer_stamp(&self, stamp: FrameStampPayload) {
-        if self.stamps_wanted.load(Ordering::Relaxed) {
-            let _ = self.stamp_tx.try_send(stamp);
+    /**
+     * Queue the stamp of the frame about to go out under `rtp_timestamp`, or
+     * drop it when the peer did not ask for stamps or is behind. A frame
+     * without a UT has no stamp. Anchor results are filtered to what this
+     * peer may see, and only for a peer that asked for them.
+     */
+    pub fn offer_stamp(&self, flight_id: u32, rtp_timestamp: u32, capture: &CaptureStamp) {
+        if !self.stamps_wanted.load(Ordering::Relaxed) {
+            return;
         }
+        let Some(ut) = capture.ut else { return };
+        let anchors = if self.anchors_wanted.load(Ordering::Relaxed) {
+            capture
+                .anchors
+                .as_deref()
+                .map(|all| anchors_for(&self.owner, all))
+                .filter(|mine| !mine.is_empty())
+        } else {
+            None
+        };
+        let _ = self.stamp_tx.try_send(FrameStampPayload {
+            flight_id,
+            rtp_timestamp,
+            capture_ut: ut,
+            capture_epoch: capture.epoch,
+            fov: capture.fov,
+            width: capture.size.map(|s| s.0),
+            height: capture.size.map(|s| s.1),
+            anchors,
+        });
     }
 
-    /// Start or stop frame stamps for this peer.
-    pub fn set_stamps_wanted(&self, wanted: bool) {
+    /// Start or stop frame stamps for this peer, and anchor results on them.
+    pub fn set_stamps_wanted(&self, wanted: bool, anchors: bool) {
         self.stamps_wanted.store(wanted, Ordering::Relaxed);
+        self.anchors_wanted
+            .store(wanted && anchors, Ordering::Relaxed);
     }
 
     /// True once a control message could not be delivered.

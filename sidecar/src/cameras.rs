@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
+use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
 use crate::commands::{validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE};
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
@@ -1158,6 +1159,13 @@ pub struct CameraRegistry {
     /// The sidecar's copy of `global.commands.json`. Held across the whole
     /// append and file write, so two requests can never land out of order.
     command_queue: Mutex<CommandQueue>,
+    /// Every browser client's anchors, written into `global.commands.json`
+    /// whole on each change. Peer-scoped like the display sizes: cleared on
+    /// graceful disconnect and in the dead-peer reaper.
+    anchors: Mutex<AnchorTable>,
+    /// Drawn once per process and folded into each client's anchor owner, so
+    /// a restarted sidecar's peer 1 is never taken for the last one's.
+    anchor_boot: u32,
     /// Cameras whose sidecar-side state (e.g. viewer quality preset)
     /// changed and needs a `camera-state-changed` broadcast to EVERY
     /// connected peer. The plugin-status diff in `poll_status` can't see
@@ -1290,8 +1298,15 @@ impl CameraRegistry {
             force_render: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
             command_queue: Mutex::new(CommandQueue::default()),
+            anchors: Mutex::new(AnchorTable::default()),
+            anchor_boot: boot_nonce(),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// The owner tag the plugin reports a client's anchor results under.
+    pub fn anchor_owner(&self, peer_id: u32) -> String {
+        peer_owner(self.anchor_boot, peer_id)
     }
 
     /// The shm directory the plugin writes rings + `global.status.json` into.
@@ -2045,20 +2060,85 @@ impl CameraRegistry {
     /// Append a request to `global.commands.json` under the next id and
     /// return the id. The plugin applies each id once.
     async fn append_command(&self, op: CommandOp) -> std::io::Result<u64> {
-        let path = self.shm_dir.join(COMMANDS_FILE);
         let mut queue = self.command_queue.lock().await;
+        self.seed_commands(&mut queue).await;
+        let id = queue.push(op);
+        self.write_commands(&queue).await?;
+        Ok(id)
+    }
+
+    async fn seed_commands(&self, queue: &mut CommandQueue) {
         if !queue.is_seeded() {
-            let on_disk = tokio::fs::read(&path).await.ok();
+            let on_disk = tokio::fs::read(self.shm_dir.join(COMMANDS_FILE)).await.ok();
             queue.seed(on_disk.as_deref());
         }
-        let id = queue.push(op);
+    }
+
+    async fn write_commands(&self, queue: &CommandQueue) -> std::io::Result<()> {
+        let path = self.shm_dir.join(COMMANDS_FILE);
         let json = queue
             .to_json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = path.with_extension("json.tmp");
         tokio::fs::write(&tmp, json.as_bytes()).await?;
         tokio::fs::rename(&tmp, &path).await?;
-        Ok(id)
+        Ok(())
+    }
+
+    /*
+     * Write the anchor table into the commands file. The table lock is held
+     * across the write so two changes can never land out of order.
+     */
+    async fn publish_anchors(&self, table: &AnchorTable) -> std::io::Result<()> {
+        let mut queue = self.command_queue.lock().await;
+        self.seed_commands(&mut queue).await;
+        queue.set_anchors(table.to_sets(self.anchor_boot));
+        self.write_commands(&queue).await
+    }
+
+    /// Start this process with no anchors in the commands file: whatever is
+    /// there belongs to the clients of a sidecar that has gone.
+    pub async fn reset_anchors(&self) {
+        let table = self.anchors.lock().await;
+        if let Err(e) = self.publish_anchors(&table).await {
+            warn!(error = %e, "anchor reset write failed");
+        }
+    }
+
+    /// Replace (or clear, with `anchors` absent) a client's anchors on one
+    /// camera. Errors on an unknown camera, a malformed set or a failed write.
+    pub async fn set_anchors(
+        &self,
+        peer_id: u32,
+        payload: crate::protocol::SetAnchorsPayload,
+    ) -> Result<(), String> {
+        let flight_id = payload.flight_id;
+        if let Some(anchors) = &payload.anchors {
+            if self.get(flight_id).await.is_none() {
+                return Err(format!("no camera with flight_id={flight_id}"));
+            }
+            validate_anchor_set(anchors)?;
+        }
+        let mut table = self.anchors.lock().await;
+        if !table.set(peer_id, flight_id, payload.anchors) {
+            return Ok(());
+        }
+        self.publish_anchors(&table)
+            .await
+            .map_err(|e| format!("anchor write failed: {e}"))
+    }
+
+    /// Forget a client's anchors on every camera. Peer-scoped for the same
+    /// reason as `forget_display_size_all`: a client can set anchors on a
+    /// camera it never bound a slot to. Called on graceful Disconnect and in
+    /// the dead-peer reaper.
+    pub async fn forget_anchors_all(&self, peer_id: u32) {
+        let mut table = self.anchors.lock().await;
+        if table.forget_peer(peer_id) {
+            if let Err(e) = self.publish_anchors(&table).await {
+                warn!(peer_id, error = %e, "anchor forget write failed");
+            }
+        }
     }
 
     /// Queue a command camera for the plugin to create. Errors on a malformed
@@ -4541,6 +4621,85 @@ mod tests {
         registry.rescan().await;
         let cam = registry.get(1).await.expect("camera attached from ring");
         (registry, cam)
+    }
+
+    fn ship_anchor(id: &str) -> crate::protocol::Anchor {
+        crate::protocol::Anchor {
+            id: id.into(),
+            kind: crate::protocol::AnchorKind::Vessel,
+            vessel: Some(77),
+            part: None,
+            offset: None,
+            body: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
+            direction: None,
+            vector: None,
+            orientation: None,
+            occlusion: Some(true),
+            margin_m: None,
+        }
+    }
+
+    async fn anchors_on_disk(dir: &tempfile::TempDir) -> serde_json::Value {
+        let bytes = tokio::fs::read(dir.path().join(COMMANDS_FILE))
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["anchors"].clone()
+    }
+
+    /// A client's anchors reach the plugin in the commands file under its
+    /// owner tag, an unknown camera or an oversized set is refused, and the
+    /// client's departure clears them on every camera at once.
+    #[tokio::test]
+    async fn anchors_are_written_per_client_and_forgotten_with_it() {
+        use crate::protocol::SetAnchorsPayload;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        registry.reset_anchors().await;
+        assert_eq!(anchors_on_disk(&dir).await, serde_json::json!([]));
+
+        registry
+            .set_anchors(
+                5,
+                SetAnchorsPayload {
+                    flight_id: 1,
+                    anchors: Some(vec![ship_anchor("ship")]),
+                },
+            )
+            .await
+            .unwrap();
+        let on_disk = anchors_on_disk(&dir).await;
+        assert_eq!(on_disk[0]["owner"], registry.anchor_owner(5));
+        assert_eq!(on_disk[0]["flightId"], 1);
+        assert_eq!(on_disk[0]["anchors"][0]["id"], "ship");
+
+        let unknown = registry
+            .set_anchors(
+                5,
+                SetAnchorsPayload {
+                    flight_id: 999,
+                    anchors: Some(vec![ship_anchor("ship")]),
+                },
+            )
+            .await;
+        assert!(unknown.is_err(), "no such camera");
+        let too_many: Vec<_> = (0..17).map(|i| ship_anchor(&format!("a{i}"))).collect();
+        assert!(registry
+            .set_anchors(
+                5,
+                SetAnchorsPayload {
+                    flight_id: 1,
+                    anchors: Some(too_many),
+                },
+            )
+            .await
+            .is_err());
+        assert_eq!(anchors_on_disk(&dir).await[0]["anchors"][0]["id"], "ship");
+
+        registry.forget_anchors_all(5).await;
+        assert_eq!(anchors_on_disk(&dir).await, serde_json::json!([]));
     }
 
     /// `apply_viewer_quality` stores the preset's viewer level, flushes it

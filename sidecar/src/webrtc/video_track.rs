@@ -17,7 +17,6 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 use super::outbox::Outbox;
-use crate::protocol::FrameStampPayload;
 use crate::shared_mem::CaptureStamp;
 
 /// RTP clock for video, fixed by RFC 6184 for H.264.
@@ -71,7 +70,7 @@ impl VideoTrack {
         data: &[u8],
         duration: Duration,
         flight_id: u32,
-        capture: CaptureStamp,
+        capture: &CaptureStamp,
     ) -> webrtc::error::Result<Option<u32>> {
         /* Unbound or paused everywhere (`all` is true with no bindings): send
         nothing and leave the sequence untouched, matching
@@ -85,13 +84,8 @@ impl VideoTrack {
         };
         let rtp_timestamp = first.header.timestamp;
 
-        if let (Some(ut), Some(stamps)) = (capture.ut, &self.stamps) {
-            stamps.offer_stamp(FrameStampPayload {
-                flight_id,
-                rtp_timestamp,
-                capture_ut: ut,
-                capture_epoch: capture.epoch,
-            });
+        if let Some(stamps) = &self.stamps {
+            stamps.offer_stamp(flight_id, rtp_timestamp, capture);
         }
 
         for p in &packets {
@@ -179,12 +173,9 @@ mod tests {
     #[tokio::test]
     async fn unbound_track_sends_nothing() {
         let t = track();
-        let stamp = CaptureStamp {
-            ut: Some(1.0),
-            epoch: 0,
-        };
+        let stamp = CaptureStamp::at(Some(1.0), 0);
         let got = t
-            .write_frame(&nal(64), Duration::from_millis(33), 1, stamp)
+            .write_frame(&nal(64), Duration::from_millis(33), 1, &stamp)
             .await
             .unwrap();
         assert_eq!(got, None);
@@ -197,7 +188,18 @@ mod tests {
      */
     #[tokio::test]
     async fn stamp_names_the_rtp_timestamp_the_viewer_receives() {
-        let (sent, stamps, rtp_seen) = loopback_stamps(true).await;
+        let (sent, stamps, rtp_seen, extra) = loopback_stamps(true).await;
+        let (anchors, fov, width) = extra.expect("a stamp arrived");
+        assert_eq!(fov, Some(35.0), "the frame's fov rides its stamp");
+        assert_eq!(width, Some(64), "and its size");
+        assert_eq!(
+            anchors,
+            vec![
+                ("mine".to_owned(), None),
+                ("subject".to_owned(), Some("kerbcast".to_owned()))
+            ],
+            "the viewer gets its own anchors and the game's, never another browser's"
+        );
         let matched: Vec<_> = stamps
             .iter()
             .filter(|(ts, _)| rtp_seen.contains(ts))
@@ -218,7 +220,7 @@ mod tests {
     /// frames and no stamps.
     #[tokio::test]
     async fn a_viewer_that_never_asks_gets_no_stamps() {
-        let (_, stamps, rtp_seen) = loopback_stamps(false).await;
+        let (_, stamps, rtp_seen, _) = loopback_stamps(false).await;
         assert!(!rtp_seen.is_empty(), "frames still arrive");
         assert!(stamps.is_empty(), "no stamps sent: {stamps:?}");
     }
@@ -229,7 +231,14 @@ mod tests {
      * UT), the stamps the viewer received, and the RTP timestamps it saw.
      */
     #[allow(clippy::type_complexity)]
-    async fn loopback_stamps(wanted: bool) -> (Vec<(u32, f64)>, Vec<(u32, f64)>, Vec<u32>) {
+    async fn loopback_stamps(
+        wanted: bool,
+    ) -> (
+        Vec<(u32, f64)>,
+        Vec<(u32, f64)>,
+        Vec<u32>,
+        Option<StampExtra>,
+    ) {
         use tokio::sync::mpsc;
         use webrtc::api::media_engine::MediaEngine;
         use webrtc::api::APIBuilder;
@@ -252,7 +261,7 @@ mod tests {
 
         #[derive(Debug)]
         enum Seen {
-            Stamp(u32, f64),
+            Stamp(u32, f64, StampExtra),
             Rtp(u32),
         }
         let (tx, mut rx) = mpsc::unbounded_channel::<Seen>();
@@ -273,7 +282,17 @@ mod tests {
             Box::pin(async move {
                 let msg: ServerMessage = serde_json::from_slice(&m.data).unwrap();
                 if let ServerMessage::FrameStamp(p) = msg {
-                    let _ = tx.send(Seen::Stamp(p.rtp_timestamp, p.capture_ut));
+                    let anchors = p
+                        .anchors
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.id, a.owner))
+                        .collect();
+                    let _ = tx.send(Seen::Stamp(
+                        p.rtp_timestamp,
+                        p.capture_ut,
+                        (anchors, p.fov, p.width),
+                    ));
                 }
             })
         }));
@@ -303,8 +322,8 @@ mod tests {
             "video".to_owned(),
             "stream".to_owned(),
             Some({
-                let outbox = Outbox::spawn(control.clone());
-                outbox.set_stamps_wanted(wanted);
+                let outbox = Outbox::spawn(control.clone(), "peer:0:1".to_owned());
+                outbox.set_stamps_wanted(wanted, wanted);
                 outbox
             }),
         ));
@@ -364,16 +383,23 @@ mod tests {
         let mut sent = Vec::new();
         let mut stamps = Vec::new();
         let mut rtp_seen = Vec::new();
+        let mut extra = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut n = 0u32;
         while tokio::time::Instant::now() < deadline {
             let ut = 1000.0 + n as f64;
             let stamp = CaptureStamp {
-                ut: Some(ut),
-                epoch: 2,
+                fov: Some(35.0),
+                size: Some((64, 36)),
+                anchors: Some(std::sync::Arc::new(vec![
+                    frame_anchor("mine", Some("peer:0:1")),
+                    frame_anchor("another-browser", Some("peer:0:2")),
+                    frame_anchor("subject", Some("kerbcast")),
+                ])),
+                ..CaptureStamp::at(Some(ut), 2)
             };
             if let Some(ts) = vt
-                .write_frame(&nal(64), Duration::from_millis(33), 9, stamp)
+                .write_frame(&nal(64), Duration::from_millis(33), 9, &stamp)
                 .await
                 .unwrap()
             {
@@ -383,7 +409,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(33)).await;
             while let Ok(seen) = rx.try_recv() {
                 match seen {
-                    Seen::Stamp(ts, ut) => stamps.push((ts, ut)),
+                    Seen::Stamp(ts, ut, e) => {
+                        stamps.push((ts, ut));
+                        extra = Some(e);
+                    }
                     Seen::Rtp(ts) => rtp_seen.push(ts),
                 }
             }
@@ -400,7 +429,27 @@ mod tests {
 
         viewer.close().await.ok();
         sidecar.close().await.ok();
-        (sent, stamps, rtp_seen)
+        (sent, stamps, rtp_seen, extra)
+    }
+
+    /// Anchor ids with owners, fov and width from one received stamp.
+    type StampExtra = (Vec<(String, Option<String>)>, Option<f64>, Option<u32>);
+
+    fn frame_anchor(id: &str, owner: Option<&str>) -> crate::protocol::FrameAnchor {
+        crate::protocol::FrameAnchor {
+            id: id.into(),
+            owner: owner.map(str::to_owned),
+            x: 10.0,
+            y: 5.0,
+            in_frame: true,
+            behind: false,
+            distance_m: Some(100.0),
+            apparent_radius_px: 3.0,
+            angle_off_axis: 0.5,
+            forward: None,
+            up: None,
+            occluded: None,
+        }
     }
 
     mod churn {
@@ -563,8 +612,8 @@ mod tests {
 
             let sidecar = pc_on(sidecar_net).await;
             let control: ControlChannel = Arc::new(Mutex::new(None));
-            let outbox = Outbox::spawn(control.clone());
-            outbox.set_stamps_wanted(true);
+            let outbox = Outbox::spawn(control.clone(), "peer:0:1".to_owned());
+            outbox.set_stamps_wanted(true, false);
             let mut tracks = Vec::new();
             for i in 0..TRACKS_PER_VIEWER {
                 let vt = Arc::new(VideoTrack::new(
@@ -662,10 +711,7 @@ mod tests {
             status_seq: &mut u64,
         ) {
             for n in 0..frames {
-                let stamp = CaptureStamp {
-                    ut: Some(ut_base + n as f64),
-                    epoch: 1,
-                };
+                let stamp = CaptureStamp::at(Some(ut_base + n as f64), 1);
                 let first_status = *status_seq;
                 *status_seq += status_per_tick as u64;
                 let tick = async {
@@ -675,7 +721,7 @@ mod tests {
                         }
                     }
                     for t in peers.iter().flat_map(|p| p.tracks.iter()) {
-                        let _ = t.write_frame(&nal(64), FRAME, 9, stamp).await;
+                        let _ = t.write_frame(&nal(64), FRAME, 9, &stamp).await;
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(2), tick)
