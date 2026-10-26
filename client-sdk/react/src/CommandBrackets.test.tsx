@@ -1,4 +1,4 @@
-import { effectiveCommandTrack, type CommandTrackState } from "@ksp-gonogo/kerbcast";
+import { effectiveCommandTrack, type CommandTrackState, type FrameAnchor } from "@ksp-gonogo/kerbcast";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -246,6 +246,100 @@ describe("CommandBrackets overlay", () => {
     cleanup();
     renderBrackets(track(), 1000, { readout: () => null });
     expect(screen.queryByText(/IN VIEW/)).toBeNull();
+  });
+});
+
+/** A video element with a laid-out box and a decoded size, as a browser reports them. */
+function sizedVideo(boxW: number, boxH: number, mediaW = boxW, mediaH = boxH): HTMLVideoElement {
+  const v = document.createElement("video");
+  Object.defineProperty(v, "clientWidth", { value: boxW });
+  Object.defineProperty(v, "clientHeight", { value: boxH });
+  Object.defineProperty(v, "videoWidth", { value: mediaW });
+  Object.defineProperty(v, "videoHeight", { value: mediaH });
+  return v;
+}
+
+function subjectAnchor(overrides: Partial<FrameAnchor> = {}): FrameAnchor {
+  return {
+    id: "subject",
+    owner: "kerbcast",
+    x: 256,
+    y: 144,
+    inFrame: true,
+    behind: false,
+    distanceM: 4200,
+    apparentRadiusPx: 40,
+    angleOffAxis: 12,
+    occluded: false,
+    ...overrides,
+  };
+}
+
+describe("CommandBrackets on the subject anchor", () => {
+  function renderOnSubject(
+    subject: FrameAnchor | null,
+    t: CommandTrackState = track(),
+    overlay?: CommandBracketOverlay,
+    frame = { width: 1024, height: 576 },
+  ) {
+    return render(
+      <CommandBrackets
+        state={effectiveCommandTrack(t, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={overlay}
+        subject={subject}
+        subjectFrameSize={frame}
+      />,
+    );
+  }
+
+  it("brackets the subject where it really is, not the frame centre", () => {
+    let seen: CommandBracketContext | null = null;
+    renderOnSubject(subjectAnchor(), track(), { render: (ctx) => ((seen = ctx), null) });
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy, g.half]).toEqual([256, 144, 40]);
+    expect((seen as CommandBracketContext | null)!.subject?.id).toBe("subject");
+  });
+
+  it("maps a capture frame larger than the decoded video by the frame's own size", () => {
+    let seen: CommandBracketContext | null = null;
+    renderOnSubject(
+      subjectAnchor({ x: 512, y: 288, apparentRadiusPx: 80 }),
+      track(),
+      { render: (ctx) => ((seen = ctx), null) },
+      { width: 2048, height: 1152 },
+    );
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy, g.half]).toEqual([256, 144, 40]);
+  });
+
+  it("takes red and dashed from the anchor's occlusion, green when it is clear", () => {
+    const { container } = renderOnSubject(subjectAnchor({ occluded: true }));
+    expect(corner(container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    cleanup();
+    const clear = renderOnSubject(subjectAnchor({ occluded: false }), track({ occluded: true, occluder: "Mun" }));
+    expect(corner(clear.container, "topLeft")!.getAttribute("stroke-dasharray")).toBeNull();
+    /* The readout still reads the camera axis at the displayed UT. */
+    expect(screen.getByText("OCCLUDED MUN · 4.2 km")).toBeTruthy();
+  });
+
+  it("leaves the corners out while the subject is out of frame, keeping the readout", () => {
+    const { container } = renderOnSubject(subjectAnchor({ inFrame: false, x: -40 }), track(), {
+      render: () => null,
+    });
+    expect(container.querySelectorAll("path")).toHaveLength(0);
+    expect(container.querySelector("svg")!.getAttribute("data-subject")).toBe("out-of-frame");
+    expect(screen.getByText("IN VIEW · 4.2 km")).toBeTruthy();
+  });
+
+  it("centres on the frame as before without a subject anchor", () => {
+    let seen: CommandBracketContext | null = null;
+    renderOnSubject(null, track(), { render: (ctx) => ((seen = ctx), null) });
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy]).toEqual([512, 288]);
+    expect((seen as CommandBracketContext | null)!.subject).toBeNull();
   });
 });
 

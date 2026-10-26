@@ -1,4 +1,4 @@
-import type { CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { Anchor, CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import {
   CameraKind,
   CommandAimKind,
@@ -32,7 +32,8 @@ import {
   type FeedAction,
   type FeedActionBarEntry,
 } from "./FeedActionBar";
-import { CommandBlank, CommandBrackets, type CommandBracketOverlay } from "./CommandBrackets";
+import { CommandBlank, LiveCommandBrackets, type CommandBracketOverlay } from "./CommandBrackets";
+import { LiveAnchorMarkers, type AnchorOverlay } from "./AnchorMarkers";
 import { useCommandDisplayUt } from "./hooks/useCommandDisplayUt";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
@@ -322,6 +323,21 @@ export interface CameraFeedProps {
    * clock interpolated to now.
    */
   displayUt?: number;
+  /**
+   * Things to mark on this feed's picture: parts, craft, points on a body or
+   * directions. Set for the displayed camera as this client's anchors and
+   * cleared when the feed shows another camera or unmounts; the game
+   * projects each through the camera that rendered every frame, and a
+   * default marker is drawn where it lands. One set per camera per client:
+   * two feeds on the same camera share it, the last to set winning. At
+   * most 16. Pass a stable or memoised array; it is compared by value.
+   */
+  anchors?: Anchor[];
+  /**
+   * Restyle the anchor markers, add SVG of your own, put text under them,
+   * or draw anchors set in game too. See {@link AnchorOverlay}.
+   */
+  anchorOverlay?: AnchorOverlay;
 }
 
 export interface CameraFeedHandle {
@@ -363,6 +379,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enableTargetBrackets = true,
       targetBracketOverlay,
       displayUt: displayUtProp,
+      anchors,
+      anchorOverlay,
     },
     ref,
   ) {
@@ -590,6 +608,20 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const commandState = commandTrack
       ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut)
       : null;
+    /* This feed's anchors go to the camera it displays, and leave with it. */
+    const anchorsKey = anchors?.length ? JSON.stringify(anchors) : "";
+    useEffect(() => {
+      if (flightId === null || !anchorsKey) return;
+      const target = flightId;
+      client.setAnchors(target, JSON.parse(anchorsKey) as Anchor[]).catch((err: unknown) => {
+        console.warn("[kerbcast] anchors refused", err);
+      });
+      return () => {
+        void client.setAnchors(target, null).catch(() => {});
+      };
+    }, [client, flightId, anchorsKey]);
+    const drawsAnchors = !!anchorsKey || !!anchorOverlay?.owners?.length;
+
     const [bracketsOn, toggleBrackets] = useTargetBracketsPreference(
       commandCamera ? (commandCamera.commandCentre?.stationId ?? String(commandCamera.flightId)) : null,
     );
@@ -1392,7 +1424,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   <>
                     {commandState.blank && <CommandBlank reason={commandState.blank} />}
                     {targetBracketsAvailable && bracketsOn && (
-                      <CommandBrackets
+                      <LiveCommandBrackets
+                        flightId={commandCamera?.flightId ?? null}
                         state={commandState}
                         displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
                         utSource={commandDisplayUt?.source ?? null}
@@ -1405,6 +1438,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
+              {drawsAnchors && !outOfFlight && !isDestroyed && !commandState?.blank && (
+                <LiveAnchorMarkers flightId={flightId} video={videoEl} overlay={anchorOverlay} />
+              )}
               {outOfFlight ? (
                 showStandbyIcon && (
                   <StandbyOverlay role="status" aria-label="Standby, no active flight">

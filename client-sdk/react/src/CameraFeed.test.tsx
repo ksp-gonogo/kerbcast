@@ -23,6 +23,7 @@
  */
 
 import {
+  AnchorKind,
   CameraKind,
   CommandTargetEligibility,
   KerbcastClient,
@@ -30,6 +31,7 @@ import {
   TrackMode,
 } from "@ksp-gonogo/kerbcast";
 import type {
+  Anchor,
   CameraLifecycle,
   ClientMessage,
   CommandCentreInfo,
@@ -2873,6 +2875,46 @@ describe("CameraFeed - command camera target brackets", () => {
     expect(screen.getByText(/ · T\+1060$/)).toBeTruthy();
   });
 
+  it("gives the brackets the subject's anchor from the displayed frame's stamp", async () => {
+    const { client, sidecar } = await buildConnectedSource([commandCamera()]);
+    const subjects: (string | undefined)[] = [];
+    renderFeed(client, {
+      flightId: 301,
+      targetBracketOverlay: {
+        render: (ctx) => {
+          subjects.push(ctx.subject ? `${ctx.subject.owner}/${ctx.subject.id}` : undefined);
+          return null;
+        },
+      },
+    });
+    await act(async () => {
+      sidecar.fireFrameStamp({
+        flightId: 301,
+        rtpTimestamp: 1,
+        captureUt: 1000,
+        captureEpoch: 0,
+        width: 1024,
+        height: 576,
+        anchors: [
+          {
+            id: "subject",
+            owner: "kerbcast",
+            x: 100,
+            y: 100,
+            inFrame: true,
+            behind: false,
+            distanceM: 11_507_905,
+            apparentRadiusPx: 4,
+            angleOffAxis: 3,
+            occluded: false,
+          },
+        ],
+      });
+    });
+    /* Without frame callbacks (jsdom) a stamp is taken as on screen once it is old enough. */
+    await waitFor(() => expect(subjects).toContain("kerbcast/subject"), { timeout: 2000 });
+  });
+
   describe("target picker", () => {
     const TARGETS: CommandCentreInfo = {
       ...STATION,
@@ -3011,5 +3053,39 @@ describe("CameraFeed - command camera target brackets", () => {
     renderFeed(client, { flightId: 301, enableTargetBrackets: false });
     expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
     expect(screen.queryByRole("button", { name: "Target brackets" })).toBeNull();
+  });
+});
+
+describe("CameraFeed - anchors", () => {
+  const port = { id: "port", kind: AnchorKind.Part, vessel: 11, part: 22, orientation: true };
+
+  function Feed({ client, flightId, anchors }: { client: KerbcastClient; flightId: number; anchors?: Anchor[] }) {
+    return (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={flightId} anchors={anchors} />
+      </KerbcastProvider>
+    );
+  }
+
+  it("sets its anchors on the displayed camera and clears them when it moves or unmounts", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+      makeCamera({ flightId: 43, cameraName: "Port Cam" }),
+    ]);
+    const view = render(<Feed client={client} flightId={42} anchors={[port]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port]));
+
+    /* A new array with the same anchors is no change. */
+    const sent = () => sidecar.commands.filter((c) => c.type === "set-anchors").length;
+    const before = sent();
+    view.rerender(<Feed client={client} flightId={42} anchors={[{ ...port }]} />);
+    expect(sent()).toBe(before);
+
+    view.rerender(<Feed client={client} flightId={43} anchors={[port]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(43)).toEqual([port]));
+    expect(sidecar.anchorsFor(42)).toEqual([]);
+
+    view.unmount();
+    await waitFor(() => expect(sidecar.anchorsFor(43)).toEqual([]));
   });
 });
