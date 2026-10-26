@@ -140,10 +140,16 @@ For a video of your own, `AnchorMarkers` draws a frame's anchors over any
 `<video>` and `useDisplayedFrame(enabled, flightId, video)` gives the
 displayed frame with its results.
 
-On command feeds the target brackets now follow the subject's anchor, so
-the box stays on the craft where it really is in each frame even while an
-aim points elsewhere, and leaves its corners out while the craft is out of
-frame. `targetBracketOverlay` is unchanged; its context gains `subject`.
+On command feeds the target brackets follow the subject's anchor while it
+is visible and no command lock is held, so the box stays on the craft where
+the picture shows it even while an aim points elsewhere. With the craft out
+of frame or occluded, or under the lock, the box is the 1.11 one: centred on
+the aim, sized from the aimed range, red and dashed when the aim line is
+occluded. `targetBracketOverlay` is unchanged; its context gains `subject`,
+the observed anchor, so you can draw it as a second mark.
+
+An observed anchor out of view (see the core SDK) carries no position and
+draws no marker; it is still in `ctx.frame.anchors`.
 
 ## `KerbalFaceFeed`
 

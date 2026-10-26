@@ -1518,7 +1518,7 @@ namespace Kerbcast
             sb.Append($"        \"bracketHalfPx\": {(gr.HasFix ? gr.BracketHalfPx.ToString("0.###", ci) : "null")},\n");
             sb.Append($"        \"frameHeightPx\": {gr.FrameHeightPx},\n");
             sb.Append($"        \"framingFits\": {(gr.FramingFits ? "true" : "false")},\n");
-            var offset = gr.TrueOffsetPx;
+            var offset = gr.ReportedTrueOffsetPx;
             sb.Append($"        \"trueOffsetPx\": {(offset.HasValue ? offset.Value.ToString("0.###", ci) : "null")},\n");
             sb.Append(gr.AuthorityOwner == null
                 ? "        \"authority\": null,\n"

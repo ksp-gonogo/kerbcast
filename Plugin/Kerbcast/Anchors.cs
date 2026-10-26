@@ -31,6 +31,30 @@ namespace Kerbcast
         TargetRelativeVelocity,
     }
 
+    /* How much of a browser client's anchor results a camera sends while a
+       command authority holds the lock. Full sends everything; ObservedOnly
+       sends only what the picture shows (see AnchorResult.Observed). */
+    public enum AnchorPolicy
+    {
+        ObservedOnly,
+        Full,
+    }
+
+    /* Which results are limited to what the picture shows. */
+    internal static class AnchorRules
+    {
+        /* Kerbcast's own anchors always are; a browser client's are while a
+           lock is held and the camera's policy says so; anchors set in game
+           never are. */
+        public static bool Observed(string owner, bool lockHeld, AnchorPolicy policy)
+        {
+            if (string.Equals(owner, AnchorRegistry.KerbcastOwner, StringComparison.Ordinal)) return true;
+            if (owner != null && owner.StartsWith(AnchorRegistry.PeerPrefix, StringComparison.Ordinal))
+                return lockHeld && policy == AnchorPolicy.ObservedOnly;
+            return false;
+        }
+    }
+
     /* Something a client wants marked on a camera's picture. Kind says which
        fields apply; see the wire's Anchor for each. Absent numbers are NaN so
        validation can tell them from zero. */
@@ -200,22 +224,37 @@ namespace Kerbcast
         public DVec3 Forward, Up;
         public bool HasOcclusion;
         public bool Occluded;
+        /* Limited to what the picture shows: the position, size and axes only
+           while in frame and not occluded, and never the range, the angle off
+           axis or whether it is behind the lens. Needs HasOcclusion. */
+        public bool Observed;
+
+        /* Whether the position goes out: always, unless observed and out of view. */
+        public bool ShowsPosition => !Observed || (InFrame && HasOcclusion && !Occluded);
 
         /* This result as one JSON object, appended to `sb`. */
         public void AppendJson(StringBuilder sb)
         {
+            bool pos = ShowsPosition;
             sb.Append("{\"id\":");
             AnchorJson.AppendString(sb, Id);
             sb.Append(",\"owner\":");
             AnchorJson.AppendString(sb, Owner);
-            sb.Append(",\"x\":").Append(AnchorJson.Num(X));
-            sb.Append(",\"y\":").Append(AnchorJson.Num(Y));
+            if (Observed) sb.Append(",\"observed\":true");
+            if (pos)
+            {
+                sb.Append(",\"x\":").Append(AnchorJson.Num(X));
+                sb.Append(",\"y\":").Append(AnchorJson.Num(Y));
+            }
             sb.Append(",\"inFrame\":").Append(InFrame ? "true" : "false");
-            sb.Append(",\"behind\":").Append(Behind ? "true" : "false");
-            if (!double.IsNaN(DistanceM)) sb.Append(",\"distanceM\":").Append(AnchorJson.Num(DistanceM));
-            sb.Append(",\"apparentRadiusPx\":").Append(AnchorJson.Num(ApparentRadiusPx));
-            sb.Append(",\"angleOffAxis\":").Append(AnchorJson.Num(AngleOffAxisDeg));
-            if (HasOrientation)
+            if (!Observed)
+            {
+                sb.Append(",\"behind\":").Append(Behind ? "true" : "false");
+                if (!double.IsNaN(DistanceM)) sb.Append(",\"distanceM\":").Append(AnchorJson.Num(DistanceM));
+            }
+            if (pos) sb.Append(",\"apparentRadiusPx\":").Append(AnchorJson.Num(ApparentRadiusPx));
+            if (!Observed) sb.Append(",\"angleOffAxis\":").Append(AnchorJson.Num(AngleOffAxisDeg));
+            if (HasOrientation && pos)
             {
                 sb.Append(",\"forward\":");
                 AnchorJson.AppendVec(sb, Forward);

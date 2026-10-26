@@ -161,6 +161,15 @@ namespace Kerbcast
         /* Angle between the aim and the true craft as seen from the station, in
            capture pixels; null without a true fix. */
         public double? TrueOffsetPx { get; private set; }
+        /* The true craft is in frame and not occluded: the picture shows it. */
+        public bool TrueVisible { get; private set; }
+        private DVec3 _solveEye, _solveForward, _solveUp;
+
+        /* TrueOffsetPx as the status file sends it. Under a held lock it is the
+           true craft's position, so it goes out only while the picture shows
+           the craft, like the subject anchor. */
+        public double? ReportedTrueOffsetPx =>
+            _authority != null && _authority.Registered && !TrueVisible ? null : TrueOffsetPx;
         public bool FramingFits { get; private set; } = true;
         public string Blank { get; private set; }
         public CommandTrackEventRing Events => _events;
@@ -330,6 +339,11 @@ namespace Kerbcast
 
             bool ok = SolveGeometry(ut, out station, out aim, out localUp, out north, out occluder);
             if (!ok) HasFix = false;
+            else
+            {
+                CommandCameraMath.AimBasis(station, aim, localUp, north, out _solveForward, out _solveUp);
+                _solveEye = station;
+            }
             FramingFits = !ok || CommandCameraMath.FramingFits(_craftRadius + FramingMargin, RangeM, _fovMax);
             Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost);
             UpdateBracket(now);
@@ -501,6 +515,17 @@ namespace Kerbcast
             int rows = FrameRows();
             BracketHalfPx = CommandCameraMath.BracketHalfPx(radius, RangeM, fov, rows);
             TrueOffsetPx = _trueOk ? CommandCameraMath.AngleInPixels(_trueOffsetRad, fov, rows) : (double?)null;
+            TrueVisible = _trueOk && !_trueOccluded && TrueInFrame(fov, rows);
+        }
+
+        /* Whether the true craft lands inside the frame the aim gives. */
+        private bool TrueInFrame(double fov, int rows)
+        {
+            var rt = _cam.NearLayer != null ? _cam.NearLayer.targetTexture : null;
+            int cols = rt != null ? rt.width : _cam.RenderWidth;
+            if (cols <= 0 || rows <= 0) return false;
+            CommandCameraMath.PerspectiveTerms(fov, (double)cols / rows, out double m00, out double m11);
+            return CommandCameraMath.Project(_solveEye, _solveForward, _solveUp, m00, m11, 0, 0, cols, rows, _truePos).InFrame;
         }
 
         private int FrameRows()
@@ -800,11 +825,14 @@ namespace Kerbcast
 
         /* The subject as a vessel anchor with occlusion on: where the craft
            really is in each frame, wherever the camera aims, sized by its
-           radius plus the framing margin. */
+           radius plus the framing margin. Kerbcast's own anchors are always
+           observed-only (AnchorRules), so it carries only what the picture
+           shows. Under a held lock the owner can withhold it. */
         public void AddOwnAnchors(List<KeyValuePair<string, AnchorSpec>> into)
         {
             uint pid = _target.PersistentId;
             if (pid == 0 || !_trueOk) return;
+            if (_authority != null && _authority.Registered && !_authority.SubjectAnchorVisible) return;
             _subjectAnchor.Vessel = pid;
             _subjectAnchor.MarginM = FramingMargin;
             into.Add(new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, _subjectAnchor));

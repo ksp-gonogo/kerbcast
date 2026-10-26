@@ -1,4 +1,5 @@
 import {
+  anchorPoint,
   fitFrame,
   frameToScreen,
   type DisplayedFrameUt,
@@ -104,7 +105,9 @@ export interface AnchorOverlay {
   /**
    * SVG content drawn above the marks, in the same pixel space. Runs for an
    * anchor out of frame or behind the lens too (its marks are left out then),
-   * so an overlay can point to it from the edge.
+   * so an overlay can point to it from the edge. An observed result out of
+   * view carries no position and is not drawn at all; it is still in
+   * `ctx.frame.anchors`.
    */
   render?: (anchor: FrameAnchor, ctx: AnchorContext) => ReactNode;
   /** Text under the marker, or null for none. Default none. */
@@ -188,14 +191,17 @@ export function AnchorMarkers({ frame, video, overlay, fit }: AnchorMarkersProps
   const frameH = frame.frameHeight || mediaH;
   if (!(frameW > 0 && frameH > 0 && boxW > 0 && boxH > 0)) return null;
   const content = fitFrame(boxW, boxH, frameW, frameH, fit ?? videoFit(video));
-  const placed: PlacedAnchor[] = frame.anchors
-    .filter((a) => drawn(a, overlay?.owners))
-    .map((a) => ({ anchor: a, ...frameToScreen(a, frameW, frameH, content) }));
+  /* An observed result out of view has no position, so it has no marker. */
+  const placed: PlacedAnchor[] = [];
+  for (const a of frame.anchors) {
+    const point = drawn(a, overlay?.owners) ? anchorPoint(a) : null;
+    if (point) placed.push({ anchor: a, ...frameToScreen(point, frameW, frameH, content) });
+  }
   if (placed.length === 0) return null;
   const shape = overlay?.shape ?? "corners";
 
   const items = placed.map(({ anchor, x, y }) => {
-    const geometry = anchorMarkerGeometry({ x, y }, anchor.apparentRadiusPx, frameH, content);
+    const geometry = anchorMarkerGeometry({ x, y }, anchor.apparentRadiusPx ?? 0, frameH, content);
     const ctx: AnchorContext = {
       geometry,
       content,

@@ -488,15 +488,16 @@ await client.setAnchors(flightId, null); // clear
 Each result lands on the displayed frame through `watchDisplayedFrames`:
 
 ```ts
-import { fitFrame, frameToScreen, frameLengthToScreen, findAnchor } from "@ksp-gonogo/kerbcast";
+import { anchorPoint, fitFrame, frameToScreen, frameLengthToScreen, findAnchor } from "@ksp-gonogo/kerbcast";
 
 client.watchDisplayedFrames(flightId, video, (frame) => {
   const port = findAnchor(frame.anchors, "port");
-  if (!port || !frame.frameWidth || !frame.frameHeight) return;
+  const point = port && anchorPoint(port); // null when the result carries no position
+  if (!point || !frame.frameWidth || !frame.frameHeight) return;
   const fitted = fitFrame(video.clientWidth, video.clientHeight,
     frame.frameWidth, frame.frameHeight, "contain"); // or "cover"
-  const { x, y } = frameToScreen(port, frame.frameWidth, frame.frameHeight, fitted);
-  const r = frameLengthToScreen(port.apparentRadiusPx, frame.frameHeight, fitted);
+  const { x, y } = frameToScreen(point, frame.frameWidth, frame.frameHeight, fitted);
+  const r = frameLengthToScreen(port.apparentRadiusPx ?? 0, frame.frameHeight, fitted);
   draw(x, y, r, port.inFrame, port.behind);
 });
 ```
@@ -508,9 +509,25 @@ Each result has `x`, `y` (capture pixels from the top left), `inFrame`,
 game carry their `owner`; this client's own have none. Every stamp also
 gives the frame's `fov` and size, for overlays that do their own maths.
 
+An `observed: true` result carries only what the picture shows: `x`, `y`,
+`apparentRadiusPx` (and `forward`, `up`) only while the anchor is in frame and
+not occluded, and never `distanceM`, `angleOffAxis` or `behind`. Out of view it
+is just `inFrame` and `occluded`. Use `anchorPoint(result)`, which is `null`
+when there is no position.
+
 A command camera adds its own anchor: `id: "subject"`, owner `"kerbcast"`
 (`COMMAND_SUBJECT_ANCHOR_ID`, `KERBCAST_ANCHOR_OWNER`), a `vessel` anchor on
-the craft it watches with occlusion on. The React brackets are drawn from it.
+the craft it watches with occlusion on. It is always observed, so it never
+gives away a craft the picture does not show. The React brackets follow it.
+
+While a command authority holds the lock, every browser client's anchors
+are observed-only by default. The holder can relax that
+(`KerbcastControl.SetAnchorPolicy(AnchorPolicy.Full, owner)`, for every
+camera or one) and can withhold the subject anchor
+(`KerbcastControl.SetSubjectAnchor(false, owner)`). Both return to the
+unrestricted behaviour when the lock clears. Under the lock
+`commandTrack.trueOffsetPx` is likewise sent only while the true craft is in
+frame and not occluded.
 
 In game, `KerbcastControl.SetAnchors(flightId, anchors, owner)` does the same
 with `AnchorSpec.ForPart`, `ForVessel`, `ForSurface`, `ForDirection` and

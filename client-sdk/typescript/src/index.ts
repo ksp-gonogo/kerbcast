@@ -52,6 +52,7 @@ export {
   frameToScreen,
   frameLengthToScreen,
   findAnchor,
+  anchorPoint,
   type FittedFrame,
   type FrameFit,
 } from "./anchors";

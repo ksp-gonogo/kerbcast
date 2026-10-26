@@ -295,12 +295,27 @@ describe("CommandBrackets on the subject anchor", () => {
     );
   }
 
-  it("brackets the subject where it really is, not the frame centre", () => {
+  function seenWith(subject: FrameAnchor | null, t: CommandTrackState = track()) {
     let seen: CommandBracketContext | null = null;
-    renderOnSubject(subjectAnchor(), track(), { render: (ctx) => ((seen = ctx), null) });
-    const g = (seen as CommandBracketContext | null)!.geometry;
-    expect([g.cx, g.cy, g.half]).toEqual([256, 144, 40]);
-    expect((seen as CommandBracketContext | null)!.subject?.id).toBe("subject");
+    const view = renderOnSubject(subject, t, { render: (ctx) => ((seen = ctx), null) });
+    return { ctx: seen as unknown as CommandBracketContext, view };
+  }
+
+  /* An observed result out of frame or occluded: no coordinates at all. */
+  const unseen = (o: Partial<FrameAnchor>): FrameAnchor => ({
+    id: "subject",
+    owner: "kerbcast",
+    observed: true,
+    inFrame: true,
+    ...o,
+  });
+
+  it("brackets the subject where it really is, not the frame centre", () => {
+    const { ctx, view } = seenWith(subjectAnchor());
+    expect([ctx.geometry.cx, ctx.geometry.cy, ctx.geometry.half]).toEqual([256, 144, 40]);
+    expect(ctx.subject?.id).toBe("subject");
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("placed");
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBeNull();
   });
 
   it("maps a capture frame larger than the decoded video by the frame's own size", () => {
@@ -315,31 +330,37 @@ describe("CommandBrackets on the subject anchor", () => {
     expect([g.cx, g.cy, g.half]).toEqual([256, 144, 40]);
   });
 
-  it("takes red and dashed from the anchor's occlusion, green when it is clear", () => {
-    const { container } = renderOnSubject(subjectAnchor({ occluded: true }));
-    expect(corner(container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
-    cleanup();
-    const clear = renderOnSubject(subjectAnchor({ occluded: false }), track({ occluded: true, occluder: "Mun" }));
-    expect(corner(clear.container, "topLeft")!.getAttribute("stroke-dasharray")).toBeNull();
-    /* The readout still reads the camera axis at the displayed UT. */
-    expect(screen.getByText("OCCLUDED MUN · 4.2 km")).toBeTruthy();
+  it("falls back to the 1.11 box when the subject is occluded: centred, aimed range, aim-line colour", () => {
+    const t = track({ occluded: true, occluder: "Mun" });
+    const { ctx, view } = seenWith(unseen({ occluded: true }), t);
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 20, 576));
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("centred");
+    expect(ctx.subject?.occluded).toBe(true);
   });
 
-  it("leaves the corners out while the subject is out of frame, keeping the readout", () => {
-    const { container } = renderOnSubject(subjectAnchor({ inFrame: false, x: -40 }), track(), {
-      render: () => null,
-    });
-    expect(container.querySelectorAll("path")).toHaveLength(0);
-    expect(container.querySelector("svg")!.getAttribute("data-subject")).toBe("out-of-frame");
+  it("falls back to the 1.11 box, corners drawn, when the subject is out of frame", () => {
+    const { ctx, view } = seenWith(unseen({ inFrame: false, occluded: false }));
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(view.container.querySelectorAll("path")).toHaveLength(2);
     expect(screen.getByText("IN VIEW · 4.2 km")).toBeTruthy();
   });
 
+  it("keeps the 1.11 box under the command lock even with the subject in view", () => {
+    /* The authority aims somewhere else; the box is its aim, the anchor a second mark for the consumer. */
+    const locked = track({ authority: AUTHORITY, occluded: true, occluder: "Mun", bracketHalfPx: 30 });
+    const { ctx, view } = seenWith(subjectAnchor(), locked);
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 30, 576));
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    expect(ctx.subject).toMatchObject({ id: "subject", x: 256, y: 144 });
+    expect(screen.getByText("OCCLUDED MUN · 4.2 km")).toBeTruthy();
+  });
+
   it("centres on the frame as before without a subject anchor", () => {
-    let seen: CommandBracketContext | null = null;
-    renderOnSubject(null, track(), { render: (ctx) => ((seen = ctx), null) });
-    const g = (seen as CommandBracketContext | null)!.geometry;
-    expect([g.cx, g.cy]).toEqual([512, 288]);
-    expect((seen as CommandBracketContext | null)!.subject).toBeNull();
+    const { ctx } = seenWith(null);
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(ctx.subject).toBeNull();
   });
 });
 

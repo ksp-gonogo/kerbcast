@@ -144,6 +144,17 @@ describe("AnchorMarkers", () => {
     expect(top.startsWith(`M${cx - 14} `)).toBe(true);
   });
 
+  it("draws no marker for an observed anchor out of view, which carries no position", () => {
+    const hidden: FrameAnchor = { id: "port", observed: true, inFrame: true, occluded: true };
+    let rendered = 0;
+    const { container } = draw([hidden, anchor({ id: "seen", observed: true, occluded: false })], {
+      render: () => (rendered++, null),
+    });
+    const ids = [...container.querySelectorAll("g[data-anchor]")].map((g) => g.getAttribute("data-anchor"));
+    expect(ids).toEqual(["seen"]);
+    expect(rendered).toBe(1);
+  });
+
   it("draws nothing for a frame without anchors", () => {
     const { container } = render(<AnchorMarkers frame={null} video={sizedVideo(640, 360)} />);
     expect(container.innerHTML).toBe("");

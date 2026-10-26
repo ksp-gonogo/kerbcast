@@ -262,6 +262,53 @@ namespace Kerbcast
             return ok;
         }
 
+        /* While `owner` holds the command lock, whether command feeds send
+           Kerbcast's subject anchor ("subject", owner "kerbcast"). It is on by
+           default and is always observed-only: a position only while the
+           picture shows the craft, never its range. Each call is a heartbeat.
+           False when `owner` does not hold the lock. The setting goes with the
+           lock. */
+        public static bool SetSubjectAnchor(bool visible, string owner)
+        {
+            var auth = HeldBy(owner);
+            if (auth == null) return false;
+            auth.SubjectAnchorVisible = visible;
+            return true;
+        }
+
+        /* While `owner` holds the command lock, how much of browser clients'
+           anchor results every camera sends. ObservedOnly (the default under
+           the lock) sends a position and size only while the anchor is in
+           frame and not occluded, and never its range or angle off axis; Full
+           sends everything. Replaces any per-camera policy. Anchors set in game
+           are never limited. Each call is a heartbeat. False when `owner` does
+           not hold the lock. Unrestricted again once the lock clears. */
+        public static bool SetAnchorPolicy(AnchorPolicy policy, string owner)
+        {
+            var auth = HeldBy(owner);
+            if (auth == null) return false;
+            auth.SetAnchorPolicy(policy);
+            return true;
+        }
+
+        /* SetAnchorPolicy for one camera. */
+        public static bool SetAnchorPolicy(uint flightId, AnchorPolicy policy, string owner)
+        {
+            var auth = HeldBy(owner);
+            if (auth == null) return false;
+            auth.SetAnchorPolicy(flightId, policy);
+            return true;
+        }
+
+        /* The authority when `owner` holds the lock, after counting the call as a heartbeat. */
+        private static CommandAuthority HeldBy(string owner)
+        {
+            var auth = KerbcastCore.Instance?.CommandAuthority;
+            if (auth == null || !auth.Registered || !string.Equals(auth.Owner, owner, System.StringComparison.Ordinal)) return null;
+            auth.Heartbeat(Time.realtimeSinceStartup);
+            return auth;
+        }
+
         /* Forgets every anchor `owner` set, on every camera. */
         public static void ClearAnchors(string owner)
         {

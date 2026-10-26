@@ -100,6 +100,45 @@ var first = MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, small)) as List<objec
 Check(first != null && first.Count == 1, "past the capacity whole results are left out and the rest still parses");
 Check(AnchorJson.Encode(new List<AnchorResult>(), sb, ref buf, 4096) == 0, "no results, no metadata");
 
+/* Observed-only: Kerbcast's own always, browsers' under a lock unless relaxed, the game's never. */
+Check(AnchorRules.Observed("kerbcast", false, AnchorPolicy.Full), "the subject anchor is observed with no lock");
+Check(!AnchorRules.Observed("peer:1:2", false, AnchorPolicy.ObservedOnly), "a browser's anchors are full with no lock");
+Check(AnchorRules.Observed("peer:1:2", true, AnchorPolicy.ObservedOnly), "and observed under a lock by default");
+Check(!AnchorRules.Observed("peer:1:2", true, AnchorPolicy.Full), "unless the owner relaxes it");
+Check(!AnchorRules.Observed("gonogo", true, AnchorPolicy.ObservedOnly), "anchors set in game are never limited");
+
+string Json(AnchorResult r)
+{
+    var b = new StringBuilder();
+    r.AppendJson(b);
+    return b.ToString();
+}
+var seen = new AnchorResult
+{
+    Id = "subject", Owner = "kerbcast", X = 10, Y = 20, InFrame = true, DistanceM = 9e6,
+    ApparentRadiusPx = 5, AngleOffAxisDeg = 3, HasOcclusion = true, Occluded = false, Observed = true,
+    HasOrientation = true, Forward = new DVec3(0, 0, 1), Up = new DVec3(0, 1, 0),
+};
+Check(Json(seen) == "{\"id\":\"subject\",\"owner\":\"kerbcast\",\"observed\":true,\"x\":10,\"y\":20,\"inFrame\":true,"
+    + "\"apparentRadiusPx\":5,\"forward\":[0,0,1],\"up\":[0,1,0],\"occluded\":false}",
+    "observed and visible: position and size, never range, angle off axis or behind: " + Json(seen));
+var hidden = seen;
+hidden.Occluded = true;
+Check(Json(hidden) == "{\"id\":\"subject\",\"owner\":\"kerbcast\",\"observed\":true,\"inFrame\":true,\"occluded\":true}",
+    "observed and occluded: no coordinates at all: " + Json(hidden));
+var gone = seen;
+gone.InFrame = false;
+gone.Behind = true;
+Check(Json(gone) == "{\"id\":\"subject\",\"owner\":\"kerbcast\",\"observed\":true,\"inFrame\":false,\"occluded\":false}",
+    "observed and out of frame: no coordinates, nothing about behind: " + Json(gone));
+var untested = seen;
+untested.HasOcclusion = false;
+Check(!untested.ShowsPosition, "an observed result with no occlusion test shows nothing");
+var full = seen;
+full.Observed = false;
+Check(Json(full).Contains("\"distanceM\":9000000") && Json(full).Contains("\"angleOffAxis\":3") && !Json(full).Contains("observed"),
+    "a full result keeps everything");
+
 /* Projection: a 90 degree lens looking down +Z with +Y up. */
 var eye = new DVec3(0, 0, 0);
 var fwd = new DVec3(0, 0, 1);
