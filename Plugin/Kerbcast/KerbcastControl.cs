@@ -232,6 +232,42 @@ namespace Kerbcast
             return true;
         }
 
+        /* Replaces `owner`'s anchors on camera `flightId`, or clears them with
+           null or an empty list. Each anchor marks a part, a craft, a point on
+           a body or a direction (see AnchorSpec's factories); the game projects
+           every one through the camera that rendered each frame and sends the
+           results with that frame to every browser client that asked for
+           anchors, tagged with `owner`. Anchors are display, not commands: the
+           command lock does not apply. They last until replaced, cleared with
+           ClearAnchors, or the scene changes. False, with nothing changed, when
+           Kerbcast is not running here, the camera is unknown, `owner` is
+           empty or reserved ("kerbcast", or starting "peer:"), there are more
+           than 16, two share an id, or one is malformed (`error` says which). */
+        public static bool SetAnchors(uint flightId, IList<AnchorSpec> anchors, string owner, out string error)
+        {
+            var core = KerbcastCore.Instance;
+            if (core == null) { error = "Kerbcast is not running in this scene"; return false; }
+            if (anchors != null && anchors.Count > 0 && Find(flightId) == null)
+            {
+                error = $"no camera with flightId {flightId}";
+                return false;
+            }
+            return core.Anchors.Set(owner, flightId, anchors, out error);
+        }
+
+        public static bool SetAnchors(uint flightId, IList<AnchorSpec> anchors, string owner)
+        {
+            bool ok = SetAnchors(flightId, anchors, owner, out string error);
+            if (!ok) Debug.LogWarning($"[Kerbcast][ANCHOR] anchors from {owner} for cam={flightId} refused: {error}");
+            return ok;
+        }
+
+        /* Forgets every anchor `owner` set, on every camera. */
+        public static void ClearAnchors(string owner)
+        {
+            KerbcastCore.Instance?.Anchors.Clear(owner);
+        }
+
         /* The holder of the command lock, or null when nobody holds it. */
         internal static string CommandAuthorityOwner => KerbcastCore.Instance?.CommandAuthority?.Owner;
 
