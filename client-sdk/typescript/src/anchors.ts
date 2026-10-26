@@ -71,6 +71,16 @@ export function frameToScreen(
   return { x: fitted.x + point.x * sx, y: fitted.y + point.y * sy };
 }
 
+/**
+ * An anchor's position in capture-frame pixels, or `null` when the result
+ * carries none: an observed result out of frame or occluded.
+ */
+export function anchorPoint(anchor: FrameAnchor): { x: number; y: number } | null {
+  return typeof anchor.x === "number" && typeof anchor.y === "number"
+    ? { x: anchor.x, y: anchor.y }
+    : null;
+}
+
 /** A length in capture-frame pixels (an anchor's `apparentRadiusPx`) in element pixels. */
 export function frameLengthToScreen(length: number, frameHeight: number, fitted: FittedFrame): number {
   return frameHeight > 0 ? (length * fitted.height) / frameHeight : length;

@@ -100,6 +100,11 @@ namespace Kerbcast
                 /* Vertical field of view as the projection actually has it. */
                 double fov = 2.0 * Math.Atan(1.0 / m11) * 180.0 / Math.PI;
 
+                /* Under a held lock browser anchors are observed-only unless the owner relaxed it. */
+                var auth = KerbcastCore.Instance != null ? KerbcastCore.Instance.CommandAuthority : null;
+                bool locked = auth != null && auth.Registered;
+                var policy = locked ? auth.BrowserAnchorPolicy(_flightId) : AnchorPolicy.Full;
+
                 _results.Clear();
                 var frame = new Frame
                 {
@@ -108,7 +113,9 @@ namespace Kerbcast
                 };
                 for (int i = 0; i < _anchors.Count && _results.Count < MaxAnchorsPerFrame; i++)
                 {
-                    if (TryProject(frame, _anchors[i].Key, _anchors[i].Value, out var r)) _results.Add(r);
+                    string owner = _anchors[i].Key;
+                    bool observed = AnchorRules.Observed(owner, locked, policy);
+                    if (TryProject(frame, owner, _anchors[i].Value, observed, out var r)) _results.Add(r);
                 }
                 meta.Length = AnchorJson.Encode(_results, _sb, ref _buffer, MetaSlotBytes);
                 meta.Json = meta.Length > 0 ? _buffer : null;
@@ -135,7 +142,9 @@ namespace Kerbcast
             public double Fov;
         }
 
-        private bool TryProject(Frame f, string owner, AnchorSpec a, out AnchorResult r)
+        /* An observed anchor always gets its occlusion tested: what the picture
+           shows depends on it. */
+        private bool TryProject(Frame f, string owner, AnchorSpec a, bool observed, out AnchorResult r)
         {
             r = default;
             DVec3 world = default;
@@ -206,7 +215,8 @@ namespace Kerbcast
                     var dp = CommandCameraMath.ProjectCameraSpace(CommandCameraMath.ToCameraSpace(dir, f.Forward, f.Up),
                         f.M00, f.M11, f.M02, f.M12, f.Width, f.Height);
                     r = Result(owner, a, dp, double.NaN, 0);
-                    if (a.Occlusion)
+                    r.Observed = observed;
+                    if (a.Occlusion || observed)
                     {
                         r.HasOcclusion = true;
                         r.Occluded = Hidden(f, f.Eye + dir * 1e13, null, null, false);
@@ -218,13 +228,14 @@ namespace Kerbcast
             var p = CommandCameraMath.Project(f.Eye, f.Forward, f.Up, f.M00, f.M11, f.M02, f.M12, f.Width, f.Height, world);
             double apparent = CommandCameraMath.ApparentRadiusPx(radius + a.MarginM, p.Distance, f.Fov, f.Height);
             r = Result(owner, a, p, p.Distance, apparent);
+            r.Observed = observed;
             if (a.Orientation && hasAxes)
             {
                 r.HasOrientation = true;
                 r.Forward = CommandCameraMath.ToCameraSpace(axisForward.Normalized, f.Forward, f.Up);
                 r.Up = CommandCameraMath.ToCameraSpace(axisUp.Normalized, f.Forward, f.Up);
             }
-            if (a.Occlusion)
+            if (a.Occlusion || observed)
             {
                 r.HasOcclusion = true;
                 r.Occluded = occlusionKnown ? occluded : Hidden(f, world, ignorePart, ignoreVessel, true);

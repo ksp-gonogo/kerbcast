@@ -891,6 +891,13 @@ pub const MAX_ANCHORS_PER_CAMERA: usize = 16;
 /// Where one anchor landed in one frame. Pixel positions are in the
 /// capture frame (`FrameStamp.width` by `FrameStamp.height`, origin top
 /// left). Absent for a frame in which the anchor could not be located.
+///
+/// An `observed` result carries only what the picture shows: `x`, `y`,
+/// `apparentRadiusPx` (and `forward` and `up` when asked for) only while the
+/// anchor is in frame and not occluded, and never `distanceM`,
+/// `angleOffAxis` or `behind`. Kerbcast's own `"subject"` anchor is always
+/// observed; a browser client's anchors are observed by default while a
+/// command authority holds the lock.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -902,22 +909,33 @@ pub struct FrameAnchor {
     /// Kerbcast's own. Absent for this client's own anchors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
-    pub x: f64,
-    pub y: f64,
+    /// True when the result is limited to what the picture shows (see above).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observed: bool,
+    /// Absent from an observed result that is out of frame or occluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
     /// Inside the frame and in front of the lens.
     pub in_frame: bool,
     /// Behind the lens. `x` and `y` then sit off the frame on the side the
-    /// anchor is nearest.
-    pub behind: bool,
-    /// Lens to anchor in metres. Absent for a `direction` anchor.
+    /// anchor is nearest. Absent from an observed result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<bool>,
+    /// Lens to anchor in metres. Absent for a `direction` anchor and from an
+    /// observed result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance_m: Option<f64>,
     /// The marked thing's radius (plus `marginM`) on screen, in capture
     /// pixels. 0 for a `surface` anchor without a margin, and always 0 for a
-    /// `direction` anchor.
-    pub apparent_radius_px: f64,
-    /// Degrees between the camera's axis and the anchor.
-    pub angle_off_axis: f64,
+    /// `direction` anchor. Absent with `x` and `y`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apparent_radius_px: Option<f64>,
+    /// Degrees between the camera's axis and the anchor. Absent from an
+    /// observed result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_off_axis: Option<f64>,
     /// The thing's forward axis in camera space (x right, y up, z forward),
     /// when the anchor asked for `orientation`. For a craft, the direction
     /// its control point faces; for a docking port, the way the port faces;
@@ -929,7 +947,7 @@ pub struct FrameAnchor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<Vec<f64>>,
     /// Whether something stands between the lens and the anchor, when the
-    /// anchor asked for `occlusion`.
+    /// anchor asked for `occlusion`, and always on an observed result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occluded: Option<bool>,
 }
@@ -1471,13 +1489,14 @@ mod tests {
             anchors: Some(vec![FrameAnchor {
                 id: "port".into(),
                 owner: None,
-                x: 640.5,
-                y: 360.0,
+                observed: false,
+                x: Some(640.5),
+                y: Some(360.0),
                 in_frame: true,
-                behind: false,
+                behind: Some(false),
                 distance_m: Some(52.0),
-                apparent_radius_px: 12.0,
-                angle_off_axis: 0.1,
+                apparent_radius_px: Some(12.0),
+                angle_off_axis: Some(0.1),
                 forward: Some(vec![0.0, 0.0, -1.0]),
                 up: Some(vec![0.0, 1.0, 0.0]),
                 occluded: Some(false),
@@ -1488,6 +1507,26 @@ mod tests {
         assert!(
             s.contains(r#""anchors":[{"id":"port","x":640.5,"y":360.0,"inFrame":true,"behind":false,"distanceM":52.0,"apparentRadiusPx":12.0,"angleOffAxis":0.1,"forward":[0.0,0.0,-1.0],"up":[0.0,1.0,0.0],"occluded":false}]"#),
             "{s}"
+        );
+    }
+
+    /// An observed result out of view carries no position or range at all,
+    /// and the reader takes it as such rather than as zeros.
+    #[test]
+    fn an_observed_result_out_of_view_carries_no_coordinates() {
+        let json =
+            r#"{"id":"subject","owner":"kerbcast","observed":true,"inFrame":true,"occluded":true}"#;
+        let a: FrameAnchor = serde_json::from_str(json).unwrap();
+        assert!(a.observed);
+        assert_eq!((a.x, a.y, a.apparent_radius_px), (None, None, None));
+        assert_eq!(
+            (a.distance_m, a.angle_off_axis, a.behind),
+            (None, None, None)
+        );
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            json,
+            "and writes back the same"
         );
     }
 

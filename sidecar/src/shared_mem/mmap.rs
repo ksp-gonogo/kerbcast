@@ -870,8 +870,8 @@ mod tests {
         let a = &anchors[0];
         assert_eq!(a.id, "port");
         assert_eq!(a.owner.as_deref(), Some("peer:7:3"));
-        assert_eq!((a.x, a.y), (16.5, 9.25));
-        assert!(a.in_frame && !a.behind);
+        assert_eq!((a.x, a.y), (Some(16.5), Some(9.25)));
+        assert!(a.in_frame && a.behind == Some(false));
         assert_eq!(a.distance_m, Some(120.0));
         assert_eq!(a.forward.as_deref(), Some(&[0.0, 0.0, 1.0][..]));
         assert_eq!(a.occluded, Some(false));

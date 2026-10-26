@@ -1,6 +1,7 @@
 import {
   COMMAND_SUBJECT_ANCHOR_ID,
   KERBCAST_ANCHOR_OWNER,
+  anchorPoint,
   commandReadout,
   findAnchor,
   frameToScreen,
@@ -189,9 +190,8 @@ export interface CommandBracketsProps {
   fallbackSize?: { width: number; height: number } | null;
   overlay?: CommandBracketOverlay | null;
   /**
-   * The subject's anchor in the displayed frame. With it the box sits on
-   * the craft wherever it is in the picture, takes its size and occlusion
-   * from the anchor, and is left out while the craft is out of frame.
+   * The subject's anchor in the displayed frame. While it is visible and no
+   * command lock is held the box sits on it and takes its size from it.
    */
   subject?: FrameAnchor | null;
   /** The capture frame size `subject` is in (the stamp's width and height). */
@@ -199,14 +199,17 @@ export interface CommandBracketsProps {
 }
 
 /**
- * Target brackets for a command camera feed. With the subject's anchor the
- * box is drawn where the game projected the craft in the displayed frame,
- * so it stays on the craft when an aim points elsewhere; without one it is
- * centred on the displayed video, where the aim point sits. Both corners
- * show the camera axis by default: green when clear, red and dashed when
- * occluded. An overlay can restyle either and draw its own marks. Without a
- * fix, over a blanked feed, or with the subject out of frame, the default
- * corners are left out but the overlay and readout still run.
+ * Target brackets for a command camera feed. With no command lock held and
+ * the subject's anchor visible in the displayed frame, the box sits on the
+ * craft where the game saw it, so it stays on the craft when an aim points
+ * elsewhere. Otherwise (the anchor out of frame or occluded, which then
+ * carries no position, no anchor at all, or a command authority holding the
+ * lock) the box is the 1.11 one: centred on the aim, sized from the aimed
+ * range, red and dashed when the aim line is occluded. `ctx.subject` always
+ * carries the anchor, so a consumer can draw it as a second mark. An overlay
+ * can restyle either corner and draw its own marks. Without a fix, or over a
+ * blanked feed, the default corners are left out but the overlay and readout
+ * still run.
  */
 export function CommandBrackets({
   state,
@@ -227,13 +230,16 @@ export function CommandBrackets({
   );
   const frameW = subjectFrameSize?.width || mediaW || fallbackSize?.width || 0;
   const frameH = subjectFrameSize?.height || mediaH || fallbackSize?.height || 0;
-  const placed = subject && subject.inFrame && frameW > 0 && frameH > 0 ? subject : null;
-  const g = placed
+  /* Under the lock the box is the authority's aim, as in 1.11. */
+  const point =
+    subject && !state.authority && frameW > 0 && frameH > 0 ? anchorPoint(subject) : null;
+  const placed = point !== null;
+  const g = point
     ? bracketGeometry(
         rect,
-        placed.apparentRadiusPx,
+        subject?.apparentRadiusPx ?? null,
         frameH,
-        frameToScreen(placed, frameW, frameH, { ...rect, scale: 1 }),
+        frameToScreen(point, frameW, frameH, { ...rect, scale: 1 }),
       )
     : bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH);
   const ctx: CommandBracketContext = {
@@ -247,13 +253,13 @@ export function CommandBrackets({
   };
   const overrides =
     typeof overlay?.corners === "function" ? overlay.corners(ctx) : overlay?.corners;
-  const camera = cameraCornerStyle(subject?.occluded ?? state.occluded);
+  const camera = cameraCornerStyle(placed ? !!subject?.occluded : state.occluded);
   const topLeft = applyCorner(camera, overrides?.topLeft);
   const bottomRight = applyCorner(camera, overrides?.bottomRight);
   const { x: left, y: top } = g.topLeft;
   const { x: right, y: bottom } = g.bottomRight;
   const blanked = !!state.blank;
-  const drawCorners = state.hasFix && !blanked && (!subject || placed !== null);
+  const drawCorners = state.hasFix && !blanked;
   const defaultReadout = blanked ? "" : commandReadout(state);
   const readout = overlay?.readout ? overlay.readout(defaultReadout, ctx) : defaultReadout;
 
@@ -263,7 +269,7 @@ export function CommandBrackets({
         <BracketSvg
           aria-hidden="true"
           data-camera-axis={state.camera}
-          data-subject={subject ? (placed ? "in-frame" : "out-of-frame") : undefined}
+          data-subject={subject ? (placed ? "placed" : "centred") : undefined}
           width={boxW}
           height={boxH}
         >

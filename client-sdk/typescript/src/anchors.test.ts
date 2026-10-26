@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findAnchor, fitFrame, frameLengthToScreen, frameToScreen } from "./anchors";
+import { anchorPoint, findAnchor, fitFrame, frameLengthToScreen, frameToScreen } from "./anchors";
 
 describe("fitFrame", () => {
   it("letterboxes under contain", () => {
@@ -55,5 +55,14 @@ describe("findAnchor", () => {
     expect(findAnchor(anchors, "subject", "kerbcast")).toBe(anchors[0]);
     expect(findAnchor(anchors, "nope")).toBeNull();
     expect(findAnchor(undefined, "subject")).toBeNull();
+  });
+});
+
+describe("anchorPoint", () => {
+  it("is null for an observed result out of view, which carries no coordinates", () => {
+    expect(
+      anchorPoint({ id: "subject", owner: "kerbcast", observed: true, inFrame: true, occluded: true }),
+    ).toBeNull();
+    expect(anchorPoint({ id: "a", inFrame: true, x: 3, y: 4 })).toEqual({ x: 3, y: 4 });
   });
 });

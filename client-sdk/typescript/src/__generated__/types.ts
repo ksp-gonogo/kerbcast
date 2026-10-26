@@ -785,6 +785,13 @@ export interface FlightIdPayload {
  * Where one anchor landed in one frame. Pixel positions are in the
  * capture frame (`FrameStamp.width` by `FrameStamp.height`, origin top
  * left). Absent for a frame in which the anchor could not be located.
+ * 
+ * An `observed` result carries only what the picture shows: `x`, `y`,
+ * `apparentRadiusPx` (and `forward` and `up` when asked for) only while the
+ * anchor is in frame and not occluded, and never `distanceM`,
+ * `angleOffAxis` or `behind`. Kerbcast's own `"subject"` anchor is always
+ * observed; a browser client's anchors are observed by default while a
+ * command authority holds the lock.
  */
 export interface FrameAnchor {
 	/** The anchor's `id` as its owner set it. */
@@ -795,25 +802,34 @@ export interface FrameAnchor {
 	 * Kerbcast's own. Absent for this client's own anchors.
 	 */
 	owner?: string;
-	x: number;
-	y: number;
+	/** True when the result is limited to what the picture shows (see above). */
+	observed?: boolean;
+	/** Absent from an observed result that is out of frame or occluded. */
+	x?: number;
+	y?: number;
 	/** Inside the frame and in front of the lens. */
 	inFrame: boolean;
 	/**
 	 * Behind the lens. `x` and `y` then sit off the frame on the side the
-	 * anchor is nearest.
+	 * anchor is nearest. Absent from an observed result.
 	 */
-	behind: boolean;
-	/** Lens to anchor in metres. Absent for a `direction` anchor. */
+	behind?: boolean;
+	/**
+	 * Lens to anchor in metres. Absent for a `direction` anchor and from an
+	 * observed result.
+	 */
 	distanceM?: number;
 	/**
 	 * The marked thing's radius (plus `marginM`) on screen, in capture
 	 * pixels. 0 for a `surface` anchor without a margin, and always 0 for a
-	 * `direction` anchor.
+	 * `direction` anchor. Absent with `x` and `y`.
 	 */
-	apparentRadiusPx: number;
-	/** Degrees between the camera's axis and the anchor. */
-	angleOffAxis: number;
+	apparentRadiusPx?: number;
+	/**
+	 * Degrees between the camera's axis and the anchor. Absent from an
+	 * observed result.
+	 */
+	angleOffAxis?: number;
 	/**
 	 * The thing's forward axis in camera space (x right, y up, z forward),
 	 * when the anchor asked for `orientation`. For a craft, the direction
@@ -828,7 +844,7 @@ export interface FrameAnchor {
 	up?: number[];
 	/**
 	 * Whether something stands between the lens and the anchor, when the
-	 * anchor asked for `occlusion`.
+	 * anchor asked for `occlusion`, and always on an observed result.
 	 */
 	occluded?: boolean;
 }
