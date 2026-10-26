@@ -238,7 +238,9 @@ namespace Kerbcast
             if (a.Occlusion || observed)
             {
                 r.HasOcclusion = true;
-                r.Occluded = occlusionKnown ? occluded : Hidden(f, world, ignorePart, ignoreVessel, true);
+                /* The rig's own test covers bodies and terrain; buildings and other
+                   colliders near the lens still need the physics ray. */
+                r.Occluded = (occlusionKnown && occluded) || Hidden(f, world, ignorePart, ignoreVessel, true);
             }
             return true;
         }

@@ -548,7 +548,9 @@ namespace Kerbcast
             p.Behind = true;
             double dx = c.X, dy = -c.Y;
             double len = Math.Sqrt(dx * dx + dy * dy);
-            if (len < 1e-12) { dx = 0; dy = 1; len = 1; }
+            /* Dead behind the lens the side is only rounding noise, so it is
+               pinned below the frame. */
+            if (len < 1e-6 * Math.Max(1e-12, c.Magnitude)) { dx = 0; dy = 1; len = 1; }
             double reach = Math.Sqrt(w * w + h * h);
             p.X = w * 0.5 + dx / len * reach;
             p.Y = h * 0.5 + dy / len * reach;
