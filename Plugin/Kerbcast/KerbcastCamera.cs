@@ -146,7 +146,6 @@ namespace Kerbcast
             }
             catch (Exception ex)
             {
-                _capture.AbortInFlight();
                 LogRateLimited($"blank frame threw: {ex.GetType().Name}: {ex.Message}");
             }
         }
@@ -260,7 +259,7 @@ namespace Kerbcast
         // Which FX layers this camera runs (subject to the _enableFx master).
         private AtmoFxLayers _fxLayers;
         // Reusable capture tail: owns the pooled capture/readback RT pair, the
-        // in-flight readback bookkeeping, the ReadbackTargetTracker and the ring
+        // in-flight readbacks and the ring
         // write. This camera renders its layer stack into _capture.CaptureRt then
         // hands the blit/flip/readback/produce tail to CaptureCore. Shared with
         // future camera types (kerbal-face) so the streaming path stays one impl.
@@ -368,8 +367,9 @@ namespace Kerbcast
             => _pacing.Overdue(now, effectiveFps);
         public void MarkCaptureGranted(float now, float effectiveFps)
             => _pacing.MarkGranted(now, effectiveFps);
-        public bool ReadyToCapture
-            => _capture == null || !_capture.ReadbackInFlight || _capture.ReadbackReady;
+        public bool ReadyToCapture => _capture == null || _capture.CanIssue;
+        public double LastCaptureUt => _capture != null ? _capture.LastPublishedUt : double.NaN;
+        public CaptureCounters Counters { get; } = new CaptureCounters();
 
         private bool _disposed;
         private bool _firstRender = true;
@@ -525,7 +525,7 @@ namespace Kerbcast
             // PhaseTimings sink stay owned here; the tail invokes them so a
             // readback error and a render error share one rate-limit counter and
             // one telemetry object.
-            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0, LiveLightTimeNow);
+            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0, LiveLightTimeNow, Counters);
 
             _capture.BuildTargets(renderWidth, renderHeight);
             SetCameras();
@@ -2038,11 +2038,11 @@ namespace Kerbcast
                 return;
             }
 
-            // Poll: drain a completed readback before issuing a new one. If one
-            // is still in flight (not done), skip this tick so the one-in-flight
-            // invariant holds — no new readback is issued below.
-            if (_capture.ReadbackInFlight && !_capture.ReadbackReady) return;
+            /* Poll: drain landed readbacks before issuing a new one. If every
+               slot is still in flight, skip this tick: no new readback is issued
+               below until one lands. */
             _capture.Drain();
+            if (!_capture.HasFreeSlot) return;
 
             // Capture staggering: KerbcastCore grants only a round-robin subset of
             // cameras a new capture each frame, so they don't all render + read
@@ -2262,9 +2262,8 @@ namespace Kerbcast
 
                 // Capture tail: blit _capture.CaptureRt -> ReadbackRt (via this
                 // camera's filter/nightvision/plain _captureBlit), apply the
-                // vertical-flip correction, issue the readback under the
-                // one-in-flight invariant, and record the Blit/Readback phase
-                // timings. All of it lives in CaptureCore so a second camera type
+                // vertical-flip correction, issue the readback, and record the
+                // Blit/Readback phase timings. All of it lives in CaptureCore so a second camera type
                 // reuses the exact streaming path.
                 double captureTsMs = KerbcastCore.FrameClockMs;
                 var rt = _capture.CaptureRt;
@@ -2273,7 +2272,6 @@ namespace Kerbcast
             }
             catch (Exception ex)
             {
-                _capture.AbortInFlight();
                 // Safety net: if a layer Render() threw mid-composite, the normal
                 // restore above was skipped. Re-attach here so the main flight
                 // render never loses Scatterer's sun-light shadow buffers. No-op

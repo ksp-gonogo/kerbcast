@@ -1,12 +1,12 @@
 /* Reusable frame-capture tail shared by every kerbcast camera type.
 
    Owns the pooled capture/readback RenderTexture pair, the in-flight
-   readback bookkeeping, the ReadbackTargetTracker and the mmap ring
-   write. A camera renders its own layer stack into CaptureRt, then hands
-   the tail here: Publish blits CaptureRt -> ReadbackRt (via the caller's
-   filter/nightvision/plain blit), applies the vertical-flip correction,
-   and issues one AsyncGPUReadback with the one-in-flight invariant; Drain
-   copies a completed readback straight into the ring.
+   readbacks (InFlightReadbacks) and the mmap ring write. A camera renders
+   its own layer stack into CaptureRt, then hands the tail here: Publish
+   blits CaptureRt -> ReadbackRt (via the caller's filter/nightvision/plain
+   blit), applies the vertical-flip correction, and issues one
+   AsyncGPUReadback while fewer than MaxInFlight are pending; Drain copies
+   completed readbacks, oldest first, straight into the ring.
 
    Deck-critical details preserved verbatim from KerbcastCamera: the
    readback RT is depth=0 (clean GL_TEXTURE_2D handle on Mesa), the flip
@@ -45,22 +45,32 @@ namespace Kerbcast
         private readonly System.Collections.Generic.Dictionary<long, RenderTargetSet> _rtPool =
             new System.Collections.Generic.Dictionary<long, RenderTargetSet>();
 
-        // The in-flight readback is described independently of the *current*
-        // target so a resolution change mid-readback still drains the pending
-        // frame at its original dimensions before switching.
-        private readonly ReadbackTargetTracker _targets = new ReadbackTargetTracker();
+        /* Readbacks a camera may have in flight at once. */
+        internal const int MaxInFlight = 1;
+
+        /* Each in-flight readback's size and issue frame, described
+           independently of the *current* target so a resolution change
+           mid-readback still drains the pending frame at its original
+           dimensions. The rest of its data sits in _pending under the same slot. */
+        private readonly InFlightReadbacks _inFlight = new InFlightReadbacks(MaxInFlight);
+        private readonly Pending[] _pending = new Pending[MaxInFlight];
+
+        private struct Pending
+        {
+            public UniversalAsyncGPUReadbackRequest Request;
+            public double CaptureTsMs;
+            // Mission time and UT epoch at render, carried with the readback so each ring frame names the UT it shows.
+            public double CaptureUt;
+            public uint CaptureEpoch;
+            public double LiveLightTimeS;
+            // The frame's fov and anchor results, copied at render so the readback carries what that frame showed.
+            public float Fov;
+            public byte[] Meta;
+            public int MetaLength;
+        }
 
         private readonly MmapFrameRing _ring;
-        private UniversalAsyncGPUReadbackRequest _pendingRequest;
-        private bool _readbackInFlight;
-        private double _pendingCaptureTsMs;
-        // Mission time and UT epoch at render, carried with the readback so each ring frame names the UT it shows.
-        private double _pendingCaptureUt;
-        private uint _pendingCaptureEpoch;
-        // The frame's fov and anchor results, copied at render so the readback carries what that frame showed.
-        private float _pendingFov;
-        private byte[] _pendingMeta;
-        private int _pendingMetaLength;
+        private readonly CaptureCounters _counters;
 
         // Shared telemetry sink (owned by the camera) plus the failure-streak
         // callbacks: the camera keeps _consecutiveErrors and LogRateLimited, we
@@ -71,7 +81,6 @@ namespace Kerbcast
         private readonly Action _resetErrorStreak;
         /* The camera's live bound, read at render beside the UT so a frame carries the value of its own instant. */
         private readonly Func<double> _liveLightTimeS;
-        private double _pendingLiveLightTimeS = double.NaN;
 
         // Cached per Refresh tick via BeginTick. When false every timing bracket
         // is skipped so the OFF path makes zero GetTimestamp calls. When true the
@@ -87,9 +96,11 @@ namespace Kerbcast
             PhaseTimings phaseTimings,
             Action<string> logRateLimited,
             Action resetErrorStreak,
-            Func<double> liveLightTimeS)
+            Func<double> liveLightTimeS,
+            CaptureCounters counters)
         {
             _ring = ring;
+            _counters = counters;
             _phaseTimings = phaseTimings;
             _logRateLimited = logRateLimited;
             _resetErrorStreak = resetErrorStreak;
@@ -98,8 +109,18 @@ namespace Kerbcast
 
         internal RenderTexture CaptureRt => _captureRt;
         internal RenderTexture ReadbackRt => _readbackRt;
-        internal bool ReadbackInFlight => _readbackInFlight;
-        internal bool ReadbackReady => _readbackInFlight && _pendingRequest.done;
+        /* For granting a permit before the camera refreshes: a slot is free, or
+           the oldest has landed and the Drain at the top of Refresh will free
+           it. Not the check before rendering, since the render thread can land
+           a readback between a Drain and this read; that is HasFreeSlot. */
+        internal bool CanIssue => !_inFlight.Full || _pending[_inFlight.Oldest].Request.done;
+
+        /* Whether Publish has a slot now. Only Publish fills one, so a true read
+           after Drain holds until the camera publishes. */
+        internal bool HasFreeSlot => !_inFlight.Full;
+
+        /* The UT of the last frame issued, NaN before the first. */
+        internal double LastPublishedUt { get; private set; } = double.NaN;
 
         // Select (or lazily create) the pooled render-target set for this size
         // and make it current. Never destroys — see the _rtPool comment.
@@ -126,7 +147,7 @@ namespace Kerbcast
             }
             _captureRt = set.Capture;
             _readbackRt = set.Readback;
-            _targets.SetCurrent(width, height);
+            _inFlight.SetCurrent(width, height);
         }
 
         // Reset the per-tick drain accumulator and snapshot the telemetry gate,
@@ -140,8 +161,8 @@ namespace Kerbcast
 
         // Blit CaptureRt -> ReadbackRt (caller supplies the filter/nightvision/
         // plain pass), apply the vertical-flip correction, then issue one
-        // readback under the one-in-flight invariant. Records the Blit and
-        // Readback phase timings into the shared PhaseTimings.
+        // readback into a free slot. Records the Blit and Readback phase
+        // timings into the shared PhaseTimings.
         internal void Publish(double captureTsMs, Action<RenderTexture, RenderTexture> blit)
         {
             Publish(captureTsMs, blit, default);
@@ -151,6 +172,12 @@ namespace Kerbcast
            copied now and written beside the pixels when the readback lands. */
         internal void Publish(double captureTsMs, Action<RenderTexture, RenderTexture> blit, FrameMeta meta)
         {
+            /* The callers check HasFreeSlot after draining, so this only guards a
+               caller that did not: drop the frame before any GPU work is queued
+               rather than have Issue throw after a Request. */
+            if (_inFlight.Full) Drain();
+            if (_inFlight.Full) return;
+
             // Blit phase: the filter/nv/plain capture->readback blit AND the
             // vertical-flip correction below, all the main-thread Blit dispatch
             // this tick.
@@ -166,32 +193,29 @@ namespace Kerbcast
                 _phaseTimings.Record(RenderPhase.Blit,
                     (Stopwatch.GetTimestamp() - blitStart) * _msPerTick);
 
-            // INVARIANT: at most one readback is in flight per camera. The drain
-            // guards in the caller early-return until _pendingRequest.done and
-            // clear the flag before we reach here, so this Request only runs when
-            // none is pending. The pending-dims snapshot below relies on this — if
-            // a second request were ever issued before the first drained,
-            // _targets' pending dims would be clobbered and Drain would corrupt
-            // the in-flight frame.
-            _readbackInFlight = true;
-            // Snapshot the target this readback belongs to, so a resolution change
-            // before it completes doesn't make Drain use the new (mismatched)
-            // dimensions.
-            _targets.CapturePending();
-            _pendingCaptureTsMs = captureTsMs;
-            _pendingCaptureUt = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
-            _pendingCaptureEpoch = KerbcastCore.Instance != null ? KerbcastCore.Instance.CaptureEpochValue : 0;
-            _pendingLiveLightTimeS = LiveLightTimeNow();
-            _pendingFov = meta.FovDeg;
-            _pendingMetaLength = meta.Json != null ? meta.Length : 0;
-            if (_pendingMetaLength > 0)
-            {
-                if (_pendingMeta == null || _pendingMeta.Length < _pendingMetaLength)
-                    _pendingMeta = new byte[Math.Max(_pendingMetaLength, 1024)];
-                Buffer.BlockCopy(meta.Json, 0, _pendingMeta, 0, _pendingMetaLength);
-            }
+            /* A slot is free (checked above, and only Publish fills one). It is
+               taken only once the request exists: a Request that throws leaves
+               nothing in flight to wait on. */
             long reqStart = _telemetry ? Stopwatch.GetTimestamp() : 0;
-            _pendingRequest = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
+            var request = UniversalAsyncGPUReadbackRequest.Request(_readbackRt, 0);
+            int others = _inFlight.Count;
+            int slot = _inFlight.Issue(Time.frameCount);
+            ref Pending p = ref _pending[slot];
+            p.Request = request;
+            p.CaptureTsMs = captureTsMs;
+            p.CaptureUt = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
+            p.CaptureEpoch = KerbcastCore.Instance != null ? KerbcastCore.Instance.CaptureEpochValue : 0;
+            p.LiveLightTimeS = LiveLightTimeNow();
+            p.Fov = meta.FovDeg;
+            p.MetaLength = meta.Json != null ? meta.Length : 0;
+            if (p.MetaLength > 0)
+            {
+                if (p.Meta == null || p.Meta.Length < p.MetaLength)
+                    p.Meta = new byte[Math.Max(p.MetaLength, 1024)];
+                Buffer.BlockCopy(meta.Json, 0, p.Meta, 0, p.MetaLength);
+            }
+            LastPublishedUt = p.CaptureUt;
+            _counters.Publish(others);
             if (_telemetry)
             {
                 // Readback phase = this tick's drain of the PREVIOUS frame's
@@ -205,17 +229,21 @@ namespace Kerbcast
             }
         }
 
-        // Drain a completed readback into the ring and clear the in-flight flag.
-        // No-op while none is pending or the pending one isn't done yet.
+        /* Drain every landed readback into the ring, oldest first, stopping at
+           the first still in flight so frames reach the ring in capture order. */
         internal void Drain()
         {
-            if (!_readbackInFlight || !_pendingRequest.done) return;
-            ProcessReadback(_pendingRequest);
-            _readbackInFlight = false;
+            while (_inFlight.Count > 0)
+            {
+                int slot = _inFlight.Oldest;
+                if (!_pending[slot].Request.done) return;
+                _counters.Land(Time.frameCount - _inFlight.IssuedFrame(slot));
+                ProcessReadback(slot);
+                _pending[slot].Request = default;
+                _inFlight.Land();
+            }
         }
 
-        // Reset the in-flight flag after a throw in the capture pipeline so a new
-        // readback can be issued next tick (mirrors the camera's catch block).
         /* A read that throws is unknown, never no delay, which could release the frame early. */
         private double LiveLightTimeNow()
         {
@@ -228,13 +256,10 @@ namespace Kerbcast
             }
         }
 
-        internal void AbortInFlight()
+        private unsafe void ProcessReadback(int slot)
         {
-            _readbackInFlight = false;
-        }
-
-        private unsafe void ProcessReadback(UniversalAsyncGPUReadbackRequest request)
-        {
+            ref Pending p = ref _pending[slot];
+            var request = p.Request;
             // Time the drain (the full-frame ring memcpy in Produce) and
             // accumulate into the per-tick drain total. The Readback-phase sample
             // is recorded once at the Request site, combining this with the issue.
@@ -274,12 +299,12 @@ namespace Kerbcast
                 }
                 var meta = new FrameMeta
                 {
-                    FovDeg = _pendingFov,
-                    Json = _pendingMetaLength > 0 ? _pendingMeta : null,
-                    Length = _pendingMetaLength,
-                    LiveLightTimeS = _pendingLiveLightTimeS,
+                    FovDeg = p.Fov,
+                    Json = p.MetaLength > 0 ? p.Meta : null,
+                    Length = p.MetaLength,
+                    LiveLightTimeS = p.LiveLightTimeS,
                 };
-                _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, _pendingCaptureUt, _pendingCaptureEpoch, meta, src, length);
+                _ring.Produce(_inFlight.Width(slot), _inFlight.Height(slot), p.CaptureTsMs, p.CaptureUt, p.CaptureEpoch, meta, src, length);
                 _resetErrorStreak();
             }
             catch (Exception ex)

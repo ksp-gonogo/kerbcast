@@ -998,16 +998,25 @@ namespace Kerbcast
                     float eff = cam.EffectiveCaptureFps(primaryFps, backgroundCeiling);
                     if (eff <= 0f) continue;
                     _streamSubscribedCount++;
-                    /* Due is enough to be ranked. Whether its last readback has
-                       landed is asked only when the capture pass reaches it (see
+                    /* Before this frame is counted, so a report covers whole
+                       frames. Counted always, logged only with EnableTelemetry. */
+                    string report = cam.Counters.TakeReport(now, cam.FlightId);
+                    if (report != null && KerbcastSettings.EnableTelemetry) Debug.Log(report);
+                    cam.Counters.Frame(now);
+                    /* Due is enough to be ranked. Whether a readback slot is
+                       free is asked only when the capture pass reaches it (see
                        ReadbackScheduler.GrantAsReached). */
-                    if (!cam.CaptureDue(now, eff)) continue;
+                    if (!cam.CaptureDue(now, eff))
+                    {
+                        cam.Counters.Miss(CaptureMiss.NotDue);
+                        continue;
+                    }
+                    float overdue = cam.CaptureOverdue(now, eff);
                     /* Ordered most-overdue-first, because when more cameras come
                        due than the frame's concurrency bound allows the scheduler
                        grants the front of this list, and the camera furthest behind
                        has to be there. Insertion sort: a handful of entries, and no
                        allocation on the main thread. */
-                    float overdue = cam.CaptureOverdue(now, eff);
                     int at = _streamCount;
                     while (at > 0 && _streamOverdue[at - 1] < overdue)
                     {
@@ -1134,7 +1143,12 @@ namespace Kerbcast
         private void RunRank(int rank, bool permit)
         {
             var cam = _cameras[_subscribedIdx[rank]];
-            if (permit) cam.MarkCaptureGranted(_grantNow, _streamEff[rank]);
+            if (permit)
+            {
+                cam.MarkCaptureGranted(_grantNow, _streamEff[rank]);
+                cam.Counters.Grant();
+            }
+            else cam.Counters.Miss(cam.ReadyToCapture ? CaptureMiss.NoPermit : CaptureMiss.ReadbackPending);
             RefreshCamera(cam, permit);
         }
 

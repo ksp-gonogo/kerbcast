@@ -126,7 +126,7 @@
     <Compile Remove="ShedController.Tests/**/*.cs" />
     <Compile Remove="StaggerBudgetController.Tests/**/*.cs" />
     <Compile Remove="RenderSizeKey.Tests/**/*.cs" />
-    <Compile Remove="ReadbackTargetTracker.Tests/**/*.cs" />
+    <Compile Remove="InFlightReadbacks.Tests/**/*.cs" />
     <Compile Remove="ReadbackScheduler.Tests/**/*.cs" />
     <Compile Remove="MmapFrameRing.Tests/**/*.cs" />
     <Compile Remove="PhaseTimings.Tests/**/*.cs" />

@@ -165,8 +165,9 @@ namespace Kerbcast
             => _pacing.Overdue(now, effectiveFps);
         public void MarkCaptureGranted(float now, float effectiveFps)
             => _pacing.MarkGranted(now, effectiveFps);
-        public bool ReadyToCapture
-            => _capture == null || !_capture.ReadbackInFlight || _capture.ReadbackReady;
+        public bool ReadyToCapture => _capture == null || _capture.CanIssue;
+        public double LastCaptureUt => _capture != null ? _capture.LastPublishedUt : double.NaN;
+        public CaptureCounters Counters { get; } = new CaptureCounters();
 
         public int RefreshFailureStreak { get; set; }
 
@@ -239,7 +240,8 @@ namespace Kerbcast
                 // must leave _capture null so the next tick retries construction,
                 // rather than latching a half-initialized capture tail.
                 var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0,
-                    () => LiveLightTime.For(_occupiedPart != null ? _occupiedPart.transform.position : Vector3.zero, Vessel));
+                    () => LiveLightTime.For(_occupiedPart != null ? _occupiedPart.transform.position : Vector3.zero, Vessel),
+                    Counters);
                 capture.BuildTargets(_renderSide, _renderSide);
                 _capture = capture;
             }
@@ -449,22 +451,19 @@ namespace Kerbcast
             PollSubscription();
             if (!_subscribed) return;
 
-            // CaptureCore.Publish sets its in-flight flag BEFORE issuing the
-            // AsyncGPUReadback request, which can throw (Deck/Mesa GPU-readback
-            // quirks). Wrap the whole capture attempt so a throw anywhere in
-            // here (including EnsureCapture's BuildTargets) aborts the in-flight
-            // flag instead of leaving it stuck true, which would otherwise make
-            // every later Refresh return early at the ReadbackInFlight guard
-            // forever, silently freezing this camera. Mirrors KerbcastCamera.
+            /* Wrap the whole capture attempt so a throw anywhere in here
+               (including EnsureCapture's BuildTargets or a Deck/Mesa readback
+               quirk) costs this tick only. CaptureCore takes a readback slot
+               only once its request exists, so a throw never leaves one stuck.
+               Mirrors KerbcastCamera. */
             try
             {
                 var capture = EnsureCapture();
                 if (!mayIssueReadback) return;
 
-                // One-in-flight invariant: CaptureCore.Publish assumes at most one
-                // readback outstanding. If the previous one hasn't completed, skip
-                // issuing another this tick (it drains via the Drain above).
-                if (capture.ReadbackInFlight) return;
+                /* Every readback slot still in flight: skip issuing another this
+                   tick (they drain via the Drain above). */
+                if (!capture.HasFreeSlot) return;
 
                 // Where is the kerbal this tick? Never caches the resolved refs.
                 var loc = ResolveLocation(out _, out var eva);
@@ -509,12 +508,11 @@ namespace Kerbcast
                 if (!rendered) return;
 
                 // Plain blit (no Hullcam filter); CaptureCore applies the flip and
-                // issues the readback under the one-in-flight invariant.
+                // issues the readback.
                 capture.Publish(KerbcastCore.FrameClockMs, (c, r) => Graphics.Blit(c, r));
             }
             catch (Exception ex)
             {
-                _capture?.AbortInFlight();
                 LogRateLimited($"capture pipeline threw: {ex.GetType().Name}: {ex.Message}");
             }
         }

@@ -19,9 +19,13 @@ namespace Kerbcast
         bool CaptureDue(float now, float effectiveFps);
         float CaptureOverdue(float now, float effectiveFps);
         void MarkCaptureGranted(float now, float effectiveFps);
-        /* False while the previous readback is still in flight, when Refresh
+        /* False while every readback slot is still in flight, when Refresh
            would spend a grant without capturing. */
         bool ReadyToCapture { get; }
+        /* The UT of the last frame this camera captured, NaN before the first. */
+        double LastCaptureUt { get; }
+        /* Why it did or did not capture each frame, reported to KSP.log every few seconds with EnableTelemetry. */
+        CaptureCounters Counters { get; }
         int RefreshFailureStreak { get; set; }
         bool OwnsPart(Part part);
         void MarkFxDirty();
