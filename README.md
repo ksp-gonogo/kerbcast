@@ -31,6 +31,19 @@ A from-scratch, high-performance oriented successor to OCISLY for streaming Kerb
 - Streams them out as WebRTC media tracks, with adaptive bitrate, congestion control, and packet loss recovery for free
 - Renders cameras only when a peer is subscribed, so no idle CPU work and no in-game UI required
 
+## Command cameras
+
+<p align="center">
+  <img src="docs/screenshots/launchpad-and-onboard.gif" alt="A rocket lifting off and coming down under its parachute, seen from the Launchpad camera on the left and from a hull camera looking down its side on the right" width="880">
+</p>
+
+Command cameras aren't parts on a craft. They stand beside a launch site, at a ground station or anywhere on a body's surface, or ride along with a craft, and stream like any other feed.
+
+- **Launchpad camera**: the web UI comes with one, beside the launch pad. It follows the active craft from the pad, panning and zooming to keep it framed through liftoff and the climb
+- Point one at a craft, a spot on the ground or a direction in the sky, and it turns smoothly onto the new aim
+- Create and aim them from the browser through the TypeScript SDK (`createCommandCamera`, `setCommandAim`)
+- Other mods can drive command cameras from their own game logic through `Kerbcast.API`, published on NuGet
+
 ## Status: Initial Release - expect bugs
 
 Kerbcast is just becoming ready for general consumption. It supports Linux, with limited testing on Windows and MacOS.
