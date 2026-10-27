@@ -19,6 +19,9 @@ namespace Kerbcast
         bool CaptureDue(float now, float effectiveFps);
         float CaptureOverdue(float now, float effectiveFps);
         void MarkCaptureGranted(float now, float effectiveFps);
+        /* False while the previous readback is still in flight, when Refresh
+           would spend a grant without capturing. */
+        bool ReadyToCapture { get; }
         int RefreshFailureStreak { get; set; }
         bool OwnsPart(Part part);
         void MarkFxDirty();

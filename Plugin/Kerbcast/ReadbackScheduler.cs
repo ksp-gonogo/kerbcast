@@ -110,21 +110,56 @@ namespace Kerbcast
         }
 
         /// <summary>
-        /// Fill <paramref name="permit"/>[0..count) with the <paramref
-        /// name="budget"/> cameras allowed to capture this tick: the first ones in
-        /// rank order. <paramref name="permit"/> must have length &gt;= count.
+        /// Run the tick's capture pass over the <paramref name="count"/> eligible
+        /// cameras, granting up to <paramref name="budget"/> permits as each is
+        /// reached. <paramref name="run"/> refreshes a rank with or without a
+        /// permit, <paramref name="others"/> refreshes every camera that is not
+        /// eligible, and <paramref name="deferred"/> (length &gt;= count) is
+        /// scratch. Returns how many permits were granted.
         /// </summary>
         /// <remarks>
-        /// The caller ranks the eligible cameras most-overdue-first, so rank order
-        /// IS priority order and no rotation state is needed. Starvation is
+        /// <para>The caller ranks the eligible cameras most-overdue-first, so rank
+        /// order IS priority order and no rotation state is needed. Starvation is
         /// impossible by construction: a camera that loses a draw keeps its
         /// deadline and so falls further behind every tick, while every camera
         /// that wins has its lateness reset, so the loser overtakes them within a
-        /// tick or two and must be granted.
+        /// tick or two and must be granted.</para>
+        /// <para>Readiness is read when a camera is reached, not when the tick
+        /// starts, because a readback completes on the render thread while the
+        /// main thread is mid-frame. Read once at the top of the tick, a readback
+        /// that lands a few milliseconds later cost the camera a whole frame: on
+        /// the Deck that took the share of captures on consecutive frames from
+        /// about a quarter to a tenth or less, and capture fps from 22 to 18 with
+        /// three cameras. A camera still not ready is passed over, so its permit
+        /// goes to the next one down, and asked again after every other camera
+        /// has run, since each of those renders gives its readback time to land.
+        /// It is never granted while not ready: the grant would move its deadline
+        /// on for a capture it cannot make.</para>
         /// </remarks>
-        public static void GrantByPriority(int count, int budget, bool[] permit)
+        public static int GrantAsReached(int count, int budget, Func<int, bool> ready,
+            Action<int, bool> run, Action others, int[] deferred)
         {
-            for (int i = 0; i < count; i++) permit[i] = i < budget;
+            int granted = 0;
+            int waiting = 0;
+            for (int rank = 0; rank < count; rank++)
+            {
+                if (granted >= budget) run(rank, false);
+                else if (ready(rank))
+                {
+                    granted++;
+                    run(rank, true);
+                }
+                else deferred[waiting++] = rank;
+            }
+            others();
+            for (int i = 0; i < waiting; i++)
+            {
+                int rank = deferred[i];
+                bool permit = granted < budget && ready(rank);
+                if (permit) granted++;
+                run(rank, permit);
+            }
+            return granted;
         }
     }
 }

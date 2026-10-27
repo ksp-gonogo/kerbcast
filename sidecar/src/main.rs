@@ -34,6 +34,7 @@ use kerbcast_sidecar::protocol::{
 };
 use kerbcast_sidecar::shared_mem::MmapRingConfig;
 use kerbcast_sidecar::signalling::{router, AppState};
+use kerbcast_sidecar::webrtc::video_track::CaptureTime;
 use kerbcast_sidecar::webrtc::{resync_after_camera_churn, KerbcastPeer};
 use kerbcast_sidecar::VERSION;
 
@@ -647,11 +648,11 @@ fn warn_escalated(cam: &Arc<CameraState>, backend_name: &str, what_happened: &st
     );
 }
 
-/// Whether a tick sends a frame, and the wall time it carries if so.
+/// Whether a tick sends a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameTiming {
     Skip,
-    Send(Duration),
+    Send,
 }
 
 /* Decides a tick from the time of the last frame actually sent. The plugin
@@ -659,8 +660,7 @@ already paces capture (MaxCaptureFps), so this is only a burst guard: it skips
 a frame less than half a frame interval after the last one, which still lets
 an irregular capture (a 40 ms median with 0 to 200 ms spread was measured on
 the Deck) through while stopping a catch-up burst after a hitch from feeding
-the encoder at more than twice its configured rate. The first frame carries one
-frame interval. */
+the encoder at more than twice its configured rate. */
 fn frame_timing(
     last_sent: Option<Instant>,
     now: Instant,
@@ -671,15 +671,8 @@ fn frame_timing(
         return FrameTiming::Skip;
     }
     match last_sent {
-        None => FrameTiming::Send(frame_duration),
-        Some(prev) => {
-            let elapsed = now.saturating_duration_since(prev);
-            if elapsed < frame_duration / 2 {
-                FrameTiming::Skip
-            } else {
-                FrameTiming::Send(elapsed)
-            }
-        }
+        Some(prev) if now.saturating_duration_since(prev) < frame_duration / 2 => FrameTiming::Skip,
+        _ => FrameTiming::Send,
     }
 }
 
@@ -690,21 +683,18 @@ async fn encode_and_fan_out(
     bitrate_bps: u32,
     frame_duration: Duration,
 ) {
-    /* Each sample's duration (its RTP timestamp step) is the wall time since the
-    last frame actually sent, so the receiver's playback clock tracks real
-    time however irregularly the plugin captures. Ticks with nothing new, and
-    frames dropped below, leave `last_encoded_at` alone so their time rides on
-    the next sent frame. */
+    /* Ticks with nothing new, and frames dropped below, leave `last_encoded_at`
+    alone, so the burst guard measures from the last frame actually sent. Each
+    track spaces its RTP timestamps by the frames' capture times. */
     let now = Instant::now();
     let last_sent = *cam.last_encoded_at.lock().await;
     let last = cam.last_sequence.load(Ordering::Acquire);
     /* Any change, not just an advance, so a recreated ring that restarts low
     still reaches the backwards-sequence warning below. */
     let has_new = cam.ring.latest_sequence() != last;
-    let actual_duration = match frame_timing(last_sent, now, frame_duration, has_new) {
-        FrameTiming::Skip => return,
-        FrameTiming::Send(d) => d,
-    };
+    if frame_timing(last_sent, now, frame_duration, has_new) == FrameTiming::Skip {
+        return;
+    }
 
     let frame = match cam.ring.latest() {
         Ok(Some(f)) => f,
@@ -987,6 +977,10 @@ async fn encode_and_fan_out(
     // dropped without telling us — decrement the camera's subscriber
     // count so the encoder can idle once the last viewer leaves.
     *cam.last_encoded_at.lock().await = Some(now);
+    let capture_time = CaptureTime {
+        game_clock_ms: frame.capture_ts_ms,
+        picked_up: now,
+    };
     let mut tracks = cam.tracks.write().await;
     let prev = std::mem::take(&mut *tracks);
     let mut alive = Vec::with_capacity(prev.len());
@@ -995,7 +989,7 @@ async fn encode_and_fan_out(
     for weak in prev {
         if let Some(track) = weak.upgrade() {
             if let Err(e) = track
-                .write_frame(&combined, actual_duration, cam.flight_id, &frame.capture)
+                .write_frame(&combined, capture_time, cam.flight_id, &frame.capture)
                 .await
             {
                 warn!(flight_id = cam.flight_id, error = %e, "write_frame failed");
@@ -1039,64 +1033,29 @@ mod tests {
     use super::*;
     use kerbcast_sidecar::encoder::{Nvenc, Software};
 
-    /// Over an irregular capture the sent durations add up to the wall time
-    /// they cover, ticks with no new frame cost nothing, and only a frame less
-    /// than half an interval after the last sent one is skipped.
+    /// Ticks with no new frame send nothing, and only a frame less than half
+    /// an interval after the last sent one is skipped.
     #[test]
-    fn frame_timing_keeps_the_rtp_clock_on_wall_time() {
+    fn frame_timing_only_guards_against_bursts() {
         let fd = Duration::from_secs(1) / 30;
         let start = Instant::now();
         let ms = |n: u64| start + Duration::from_millis(n);
-        /* (tick time in ms, whether the ring has a new frame) */
-        let ticks = [
-            (0, true),
-            (16, false),
-            (40, true),
-            (56, false),
-            (72, false),
-            (240, true),
-            (250, true), // 10 ms after the last send: a burst, skipped
-            (260, false),
-            (280, true),
-            (300, false),
-            (330, true),
-        ];
-        let mut last_sent = None;
-        let mut sent_total = Duration::ZERO;
-        let mut first_sent_at = None;
-        for (t, has_new) in ticks {
-            match frame_timing(last_sent, ms(t), fd, has_new) {
-                FrameTiming::Skip => {
-                    if has_new {
-                        let since = ms(t) - last_sent.expect("only a repeat is skipped");
-                        assert!(
-                            since < fd / 2,
-                            "frame at {t} ms dropped {since:?} after the last"
-                        );
-                    }
-                }
-                FrameTiming::Send(d) => {
-                    if first_sent_at.is_none() {
-                        assert_eq!(d, fd, "the first frame carries one interval");
-                        first_sent_at = Some(ms(t));
-                    } else {
-                        sent_total += d;
-                    }
-                    last_sent = Some(ms(t));
-                }
-            }
-        }
+        assert_eq!(frame_timing(None, ms(0), fd, true), FrameTiming::Send);
+        assert_eq!(frame_timing(None, ms(0), fd, false), FrameTiming::Skip);
         assert_eq!(
-            sent_total,
-            last_sent.unwrap() - first_sent_at.unwrap(),
-            "durations after the first must sum to the wall time between sends"
+            frame_timing(Some(ms(0)), ms(10), fd, true),
+            FrameTiming::Skip,
+            "a burst 10 ms after the last send"
         );
         assert_eq!(
             frame_timing(Some(ms(0)), ms(17), fd, true),
-            FrameTiming::Send(Duration::from_millis(17)),
-            "a frame half an interval late is sent, not dropped"
+            FrameTiming::Send,
+            "a frame half an interval later is sent, not dropped"
         );
-        assert_eq!(frame_timing(None, ms(0), fd, false), FrameTiming::Skip);
+        assert_eq!(
+            frame_timing(Some(ms(0)), ms(240), fd, true),
+            FrameTiming::Send
+        );
     }
 
     #[test]

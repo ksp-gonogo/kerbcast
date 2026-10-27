@@ -135,9 +135,13 @@ const float Primary = 30f;
     /* Achieved capture rate per camera, in fps. requestedFps[i] <= 0 means "no
        request", i.e. a primary camera; anything else is a background request.
        shedBudget > 0 stands in for the stagger controller having cut the budget
-       under load, which the concurrency bound would otherwise never do. */
+       under load, which the concurrency bound would otherwise never do.
+       readbackTicks > 0 makes each capture's readback land that many ticks
+       later, partway through the tick's pass (after the cameras that were
+       ready at its start have run), as a readback finishing on the render
+       thread does. */
     double[] Simulate(float[] requestedFps, float gameFps, float ceiling, double seconds,
-                      int shedBudget = 0)
+                      int shedBudget = 0, int readbackTicks = 0)
     {
         int n = requestedFps.Length;
         var pacing = new CapturePacing[n];
@@ -146,16 +150,36 @@ const float Primary = 30f;
                 ? new CapturePacing { RequestedFps = requestedFps[i] }
                 : new CapturePacing();
 
-        var permit = new bool[n];
         var rankIdx = new int[n];
         var rankEff = new float[n];
         var rankOverdue = new float[n];
         var grants = new int[n];
+        var deferred = new int[n];
+        var landsAt = new int[n];
+        for (int i = 0; i < n; i++) landsAt[i] = -1;
+        int tick = 0;
+        float now = 0f;
+        bool othersRan = false;
+        Func<int, bool> ready = rank =>
+        {
+            int at = landsAt[rankIdx[rank]];
+            return at < tick || (at == tick && othersRan);
+        };
+        Action<int, bool> run = (rank, granted) =>
+        {
+            if (!granted) return;
+            int i = rankIdx[rank];
+            grants[i]++;
+            pacing[i].MarkGranted(now, rankEff[rank]);
+            if (readbackTicks > 0) landsAt[i] = tick + readbackTicks;
+        };
+        Action others = () => othersRan = true;
 
         int ticks = (int)Math.Round(seconds * gameFps);
-        for (int tick = 0; tick < ticks; tick++)
+        for (tick = 0; tick < ticks; tick++)
         {
-            float now = (float)(tick / (double)gameFps);
+            now = (float)(tick / (double)gameFps);
+            othersRan = false;
             int streamCount = 0;      // eligible this tick
             int subscribedCount = 0;  // capturing at all, due or not
             for (int i = 0; i < n; i++)
@@ -183,13 +207,7 @@ const float Primary = 30f;
 
             int budget = ReadbackScheduler.ConcurrencyBudget(subscribedCount, Primary, gameFps);
             if (shedBudget > 0 && shedBudget < budget) budget = shedBudget;
-            ReadbackScheduler.GrantByPriority(streamCount, budget, permit);
-            for (int rank = 0; rank < streamCount; rank++)
-            {
-                if (!permit[rank]) continue;
-                grants[rankIdx[rank]]++;
-                pacing[rankIdx[rank]].MarkGranted(now, rankEff[rank]);
-            }
+            ReadbackScheduler.GrantAsReached(streamCount, budget, ready, run, others, deferred);
         }
 
         var rates = new double[n];
@@ -274,6 +292,16 @@ const float Primary = 30f;
         double share = total / rates.Length;
         Check(max - min <= share * 0.15,
             $"shed to 2/tick: spread {max - min:F1}fps is fair on a {share:F1}fps share");
+    }
+
+    // (h) The Deck's case: a readback lands a tick after its capture, partway
+    //     through the next tick's pass, with three cameras on two permits a
+    //     tick. Asked at the top of the tick the camera was never ready and
+    //     every gap was at least two ticks (25fps at best on a 50fps game);
+    //     asked when the pass reaches it, the camera holds the cap.
+    {
+        var rates = Simulate(new float[3], 50f, 0f, 20.0, shedBudget: 2, readbackTicks: 1);
+        CheckPrimaries(rates, 3, "3 primaries @50fps on 2 permits, readback landing mid-tick");
     }
 }
 

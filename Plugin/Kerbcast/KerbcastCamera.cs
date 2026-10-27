@@ -142,7 +142,7 @@ namespace Kerbcast
                 RenderTexture.active = _capture.CaptureRt;
                 GL.Clear(true, true, Color.black);
                 RenderTexture.active = prev;
-                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit, _anchors.BuildBlank(this));
+                _capture.Publish(KerbcastCore.FrameClockMs, s_plainBlit, _anchors.BuildBlank(this));
             }
             catch (Exception ex)
             {
@@ -368,6 +368,8 @@ namespace Kerbcast
             => _pacing.Overdue(now, effectiveFps);
         public void MarkCaptureGranted(float now, float effectiveFps)
             => _pacing.MarkGranted(now, effectiveFps);
+        public bool ReadyToCapture
+            => _capture == null || !_capture.ReadbackInFlight || _capture.ReadbackReady;
 
         private bool _disposed;
         private bool _firstRender = true;
@@ -2263,10 +2265,8 @@ namespace Kerbcast
                 // vertical-flip correction, issue the readback under the
                 // one-in-flight invariant, and record the Blit/Readback phase
                 // timings. All of it lives in CaptureCore so a second camera type
-                // reuses the exact streaming path. Time.unscaledTime is
-                // frame-constant, so reading it here yields the same value the
-                // pre-extraction Request site read.
-                double captureTsMs = Time.unscaledTime * 1000.0;
+                // reuses the exact streaming path.
+                double captureTsMs = KerbcastCore.FrameClockMs;
                 var rt = _capture.CaptureRt;
                 var meta = _anchors.Build(this, rt != null ? rt.width : 0, rt != null ? rt.height : 0);
                 _capture.Publish(captureTsMs, _captureBlit, meta);

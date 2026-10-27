@@ -165,6 +165,8 @@ namespace Kerbcast
             => _pacing.Overdue(now, effectiveFps);
         public void MarkCaptureGranted(float now, float effectiveFps)
             => _pacing.MarkGranted(now, effectiveFps);
+        public bool ReadyToCapture
+            => _capture == null || !_capture.ReadbackInFlight || _capture.ReadbackReady;
 
         public int RefreshFailureStreak { get; set; }
 
@@ -477,7 +479,7 @@ namespace Kerbcast
                 if (_evaNow != null && _picture.Prepare() == RigFrame.Blank)
                 {
                     ClearBlack(capture.CaptureRt);
-                    capture.Publish(Time.unscaledTime * 1000.0, (c, r) => Graphics.Blit(c, r));
+                    capture.Publish(KerbcastCore.FrameClockMs, (c, r) => Graphics.Blit(c, r));
                     return;
                 }
 
@@ -508,7 +510,7 @@ namespace Kerbcast
 
                 // Plain blit (no Hullcam filter); CaptureCore applies the flip and
                 // issues the readback under the one-in-flight invariant.
-                capture.Publish(Time.unscaledTime * 1000.0, (c, r) => Graphics.Blit(c, r));
+                capture.Publish(KerbcastCore.FrameClockMs, (c, r) => Graphics.Blit(c, r));
             }
             catch (Exception ex)
             {

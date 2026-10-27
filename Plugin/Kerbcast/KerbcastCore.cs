@@ -114,6 +114,13 @@ namespace Kerbcast
         private readonly CaptureEpoch _captureEpoch = new CaptureEpoch();
         // Read by CaptureCore so every ring frame carries the epoch its UT belongs to.
         internal uint CaptureEpochValue => _captureEpoch.Value;
+        /* The real-time clock every ring frame is stamped with, read once per
+           frame so all of a frame's captures share it. A Stopwatch in double
+           ms, because Time.unscaledTime is a float that coarsens to whole
+           milliseconds after a couple of hours, and the sidecar spaces RTP
+           timestamps by its differences. */
+        private static readonly System.Diagnostics.Stopwatch s_frameClock = System.Diagnostics.Stopwatch.StartNew();
+        internal static double FrameClockMs { get; private set; }
         // Tombstone-or-normal decision for cameras whose part goes away. See CameraTeardown.
         private readonly CameraTeardown _teardown = new CameraTeardown();
         // Adaptive-shed decision state machine. The fps thresholds + hysteresis
@@ -173,20 +180,25 @@ namespace Kerbcast
         // render thread on any leftover readback tasks until KSP is restarted.
         private GameObject _readbackUpdaterGo;
 
-        // Bounds how many cameras capture each frame (see ReadbackScheduler), so
-        // they don't all issue a GPU render + readback on the same frame.
-        private bool[] _capturePermit = new bool[0];
         // Staggering is budgeted over the SUBSCRIBED (streaming) cameras only —
         // idle/attached cameras cost nothing and must not consume permits.
         // _subscribedIdx[0.._streamCount) maps a rank to a full _cameras index,
         // ordered most-overdue-first so the scheduler can grant the front of it;
-        // _streamPermit is the rank-indexed permit set, _streamEff the rank-indexed
-        // capture rate a grant is stamped at, _streamOverdue the sort key.
+        // _streamEff is the rank-indexed capture rate a grant is stamped at,
+        // _streamOverdue the sort key.
         private int[] _subscribedIdx = new int[0];
-        private bool[] _streamPermit = new bool[0];
         private float[] _streamEff = new float[0];
         private float[] _streamOverdue = new float[0];
         private int _streamCount;
+        /* The capture pass (ReadbackScheduler.GrantAsReached): which cameras are
+           ranked this tick, its scratch, the tick's grant time, and its
+           callbacks, cached so the pass allocates nothing. */
+        private bool[] _ranked = new bool[0];
+        private int[] _deferredRanks = new int[0];
+        private float _grantNow;
+        private Func<int, bool> _rankReady;
+        private Action<int, bool> _runRank;
+        private Action _runUnranked;
         /* Cameras capturing at all, due this tick or not. _streamCount is only
            the ones ELIGIBLE this tick, and now that every camera is paced (not
            just background ones) that number dips below the streaming count on
@@ -889,6 +901,7 @@ namespace Kerbcast
         // render pass — we own the render timing entirely.
         private void LateUpdate()
         {
+            FrameClockMs = s_frameClock.Elapsed.TotalMilliseconds;
             /* The library loaded but its render-thread GL setup failed, so every
                readback errors and feeds would stay empty. Shut down exactly as
                if startup had been refused: OnDestroy disposes the cameras and
@@ -937,6 +950,24 @@ namespace Kerbcast
                     GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2),
                     Time.unscaledDeltaTime);
             }
+            // Defensive: scan for cameras whose Hullcam part has gone null
+            // (e.g. a destruction event we missed, or a KSP internal teardown
+            // that doesn't fire onPartDestroyed). DisposeDestroyed + remove them
+            // so the orphaned Unity Camera GameObjects and ring files are cleaned
+            // up even if the event path failed. Iterate backwards to allow
+            // removal by index. Runs before the subscribed set is built, whose
+            // ranks are indices into _cameras for the rest of the tick.
+            for (int i = _cameras.Count - 1; i >= 0; i--)
+            {
+                var cam = _cameras[i];
+                if (!cam.IsAlive)
+                {
+                    Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null part/vessel, disposing (missed destruction event?)");
+                    _cameras.RemoveAt(i);
+                    DisposeLost(cam);
+                }
+            }
+
             // Build the subscribed (streaming) set first — staggering is
             // budgeted over it, not over all attached cameras. Filled here so
             // both UpdateDegradeLevel (the controller) and the capture loop below
@@ -967,6 +998,9 @@ namespace Kerbcast
                     float eff = cam.EffectiveCaptureFps(primaryFps, backgroundCeiling);
                     if (eff <= 0f) continue;
                     _streamSubscribedCount++;
+                    /* Due is enough to be ranked. Whether its last readback has
+                       landed is asked only when the capture pass reaches it (see
+                       ReadbackScheduler.GrantAsReached). */
                     if (!cam.CaptureDue(now, eff)) continue;
                     /* Ordered most-overdue-first, because when more cameras come
                        due than the frame's concurrency bound allows the scheduler
@@ -1018,23 +1052,6 @@ namespace Kerbcast
             if (_mainScreenThrottled)
                 _mainThrottle.Enforce();
 
-            // Defensive: scan for cameras whose Hullcam part has gone null
-            // (e.g. a destruction event we missed, or a KSP internal teardown
-            // that doesn't fire onPartDestroyed). DisposeDestroyed + remove them
-            // so the orphaned Unity Camera GameObjects and ring files are cleaned
-            // up even if the event path failed. Iterate backwards to allow
-            // removal by index.
-            for (int i = _cameras.Count - 1; i >= 0; i--)
-            {
-                var cam = _cameras[i];
-                if (!cam.IsAlive)
-                {
-                    Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null part/vessel — disposing (missed destruction event?)");
-                    _cameras.RemoveAt(i);
-                    DisposeLost(cam);
-                }
-            }
-
             // Stagger captures so the cameras don't all render +
             // read back on the same frame. Budget = how many captures per frame
             // the whole streaming set needs to sustain MaxCaptureFps at the
@@ -1044,9 +1061,9 @@ namespace Kerbcast
             // than the budget allows delays the extras by a frame rather than
             // speeding anyone up.
             int camCount = _cameras.Count;
-            if (_capturePermit.Length < camCount) _capturePermit = new bool[camCount];
+            if (_ranked.Length < camCount) _ranked = new bool[camCount];
+            if (_deferredRanks.Length < camCount) _deferredRanks = new int[camCount];
             if (_subscribedIdx.Length < camCount) _subscribedIdx = new int[camCount];
-            if (_streamPermit.Length < camCount) _streamPermit = new bool[camCount];
             if (_streamEff.Length < camCount) _streamEff = new float[camCount];
             if (_streamOverdue.Length < camCount) _streamOverdue = new float[camCount];
 
@@ -1071,72 +1088,83 @@ namespace Kerbcast
                     : _streamSubscribedCount;
                 budget = Math.Min(rateBudget, staggerBudget);
             }
-            if (_streamCount > 0)
-                ReadbackScheduler.GrantByPriority(_streamCount, budget, _streamPermit);
             _staggerBudget = budget;
 
-            // Map the rank-indexed stream permits back onto the full camera list;
-            // idle cameras get no permit (they skip render anyway, but this keeps
-            // _lastCapturedCount honest).
-            for (int i = 0; i < camCount; i++) _capturePermit[i] = false;
+            for (int i = 0; i < camCount; i++) _ranked[i] = false;
+            for (int rank = 0; rank < _streamCount; rank++) _ranked[_subscribedIdx[rank]] = true;
+            if (_runRank == null)
             {
-                /* Stamp the grant, not the eligibility: a camera that was due but
-                   lost the draw keeps its deadline and stays due, so a busy tick
-                   delays it rather than silently skipping a whole interval. It
-                   also gets more overdue, which is what puts it at the front of
-                   the next tick's order. */
-                float now = Time.unscaledTime;
-                for (int rank = 0; rank < _streamCount; rank++)
-                {
-                    if (!_streamPermit[rank]) continue;
-                    int idx = _subscribedIdx[rank];
-                    _capturePermit[idx] = true;
-                    _cameras[idx].MarkCaptureGranted(now, _streamEff[rank]);
-                }
+                _rankReady = RankReady;
+                _runRank = RunRank;
+                _runUnranked = RunUnranked;
             }
+            _grantNow = Time.unscaledTime;
 
             // Measure kerbcast's own main-thread cost this frame (the capture loop
             // wall-time), EMA-smoothed, + how many cameras actually captured —
             // together they give the per-camera cost the controller regulates.
-            int captured = 0;
-            for (int i = 0; i < camCount; i++) if (_capturePermit[i]) captured++;
-            _lastCapturedCount = captured > 0 ? captured : 1;
             long capStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            /* Backwards so a quarantine removal doesn't shift the
-               permit-to-camera index alignment of cameras not yet visited. */
-            for (int i = camCount - 1; i >= 0; i--)
+            int captured = ReadbackScheduler.GrantAsReached(
+                _streamCount, budget, _rankReady, _runRank, _runUnranked, _deferredRanks);
+            _lastCapturedCount = captured > 0 ? captured : 1;
+            /* Quarantined after the pass rather than during it, so every rank
+               still names the camera it was given for. */
+            for (int i = _cameras.Count - 1; i >= 0; i--)
             {
                 var cam = _cameras[i];
-                try
-                {
-                    cam.Refresh(_capturePermit[i]);
-                    cam.RefreshFailureStreak = 0;
-                }
-                catch (Exception ex)
-                {
-                    /* Isolate per-camera failures: one camera throwing must
-                       not abort the other cameras' captures or the control
-                       logic below. A sustained streak means the camera is
-                       broken beyond self-recovery (it would otherwise spam
-                       the log every frame forever) — dispose it like a
-                       missed-destruction part. */
-                    cam.RefreshFailureStreak++;
-                    if (cam.RefreshFailureStreak == 1)
-                        Debug.LogError($"[Kerbcast] cam={cam.FlightId} Refresh threw: {ex}");
-                    if (cam.RefreshFailureStreak >= RefreshQuarantineThreshold)
-                    {
-                        Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantined after {cam.RefreshFailureStreak} consecutive Refresh failures");
-                        _cameras.RemoveAt(i);
-                        try { cam.DisposeDestroyed(); }
-                        catch (Exception dex) { Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantine dispose threw: {dex}"); }
-                    }
-                }
+                if (cam.RefreshFailureStreak < RefreshQuarantineThreshold) continue;
+                Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantined after {cam.RefreshFailureStreak} consecutive Refresh failures");
+                _cameras.RemoveAt(i);
+                try { cam.DisposeDestroyed(); }
+                catch (Exception dex) { Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantine dispose threw: {dex}"); }
             }
             double capMs = (System.Diagnostics.Stopwatch.GetTimestamp() - capStart) * _msPerTick;
             _kerbcastFrameMs = _kerbcastFrameMs <= 0.0 ? capMs : _kerbcastFrameMs * 0.8 + capMs * 0.2;
 
             MaybeApplyGlobalControl();
             MaybeWriteStatusFile();
+        }
+
+        private bool RankReady(int rank) => _cameras[_subscribedIdx[rank]].ReadyToCapture;
+
+        /* Stamp the grant, not the eligibility: a camera that was due but lost
+           the draw keeps its deadline and stays due, so a busy tick delays it
+           rather than silently skipping a whole interval. It also gets more
+           overdue, which is what puts it at the front of the next tick's order. */
+        private void RunRank(int rank, bool permit)
+        {
+            var cam = _cameras[_subscribedIdx[rank]];
+            if (permit) cam.MarkCaptureGranted(_grantNow, _streamEff[rank]);
+            RefreshCamera(cam, permit);
+        }
+
+        /* Idle cameras and those not due get no permit; they still refresh, to
+           drain a landed readback and keep their aim moving. */
+        private void RunUnranked()
+        {
+            for (int i = _cameras.Count - 1; i >= 0; i--)
+                if (!_ranked[i]) RefreshCamera(_cameras[i], false);
+        }
+
+        private static void RefreshCamera(ICamera cam, bool permit)
+        {
+            try
+            {
+                cam.Refresh(permit);
+                cam.RefreshFailureStreak = 0;
+            }
+            catch (Exception ex)
+            {
+                /* Isolate per-camera failures: one camera throwing must
+                   not abort the other cameras' captures or the control
+                   logic below. A sustained streak means the camera is
+                   broken beyond self-recovery (it would otherwise spam
+                   the log every frame forever), and the pass quarantines
+                   it like a missed-destruction part. */
+                cam.RefreshFailureStreak++;
+                if (cam.RefreshFailureStreak == 1)
+                    Debug.LogError($"[Kerbcast] cam={cam.FlightId} Refresh threw: {ex}");
+            }
         }
 
         // Warning overlay shown to the operator while the main flight

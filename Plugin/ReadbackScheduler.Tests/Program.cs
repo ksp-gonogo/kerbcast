@@ -38,29 +38,39 @@ for (int c = 1; c <= 8; c++)
         $"{c} cams @53fps: the bound never sits below what the set needs");
 
 // --- The grant takes the front of the rank order: the caller has already sorted
-//     the eligible cameras most-overdue-first, so priority is the order. ---
+//     the eligible cameras most-overdue-first, so priority is the order. Each
+//     pass records the order cameras ran in and which got a permit. ---
+string Pass(int count, int budget, Func<int, bool> ready, Action others = null)
 {
-    var permit = new bool[8];
-    ReadbackScheduler.GrantByPriority(8, 3, permit);
-    Check(permit[0] && permit[1] && permit[2]
-        && !permit[3] && !permit[4] && !permit[5] && !permit[6] && !permit[7],
-        "budget 3 of 8 grants the three highest-priority ranks");
-
-    ReadbackScheduler.GrantByPriority(3, 5, permit);
-    Check(permit[0] && permit[1] && permit[2], "budget >= count grants all");
-
-    ReadbackScheduler.GrantByPriority(3, 0, permit);
-    Check(!permit[0] && !permit[1] && !permit[2], "budget 0 grants nobody");
-
-    /* Stateless: the same inputs must give the same answer, so nothing carries
-       between ticks. The rotation state this replaced was what starved a camera
-       whose rank moved as the eligible set changed size. */
-    ReadbackScheduler.GrantByPriority(8, 3, permit);
-    bool same = permit[0] && permit[1] && permit[2] && !permit[3];
-    ReadbackScheduler.GrantByPriority(8, 3, permit);
-    same = same && permit[0] && permit[1] && permit[2] && !permit[3];
-    Check(same, "the grant carries no state from tick to tick");
+    var log = new System.Text.StringBuilder();
+    int granted = ReadbackScheduler.GrantAsReached(count, budget, ready,
+        (rank, permit) => log.Append(permit ? $"{rank}+ " : $"{rank}- "),
+        () => { log.Append("| "); others?.Invoke(); },
+        new int[count]);
+    return log.ToString().Trim() + $" ={granted}";
 }
+Check(Pass(8, 3, _ => true) == "0+ 1+ 2+ 3- 4- 5- 6- 7- | =3",
+    "budget 3 of 8 grants the three highest-priority ranks");
+Check(Pass(3, 5, _ => true) == "0+ 1+ 2+ | =3", "budget >= count grants all");
+Check(Pass(3, 0, _ => true) == "0- 1- 2- | =0", "budget 0 grants nobody");
+Check(Pass(8, 3, _ => true) == Pass(8, 3, _ => true),
+    "the grant carries no state from tick to tick");
+
+/* A camera whose readback is still out gives its permit to the next one down,
+   rather than spending it, and is asked again once the others have run. */
+Check(Pass(3, 2, r => r != 0) == "1+ 2+ | 0- =2",
+    "a not-ready camera's permit goes to the next eligible camera");
+{
+    bool landed = false;
+    Check(Pass(3, 2, r => r == 1 || landed, () => landed = true) == "1+ | 0+ 2- =2",
+        "a readback that lands while the others run is granted the same tick");
+}
+{
+    bool landed = false;
+    Check(Pass(3, 1, r => r != 0 || landed, () => landed = true) == "1+ 2- | 0- =1",
+        "but never past the budget");
+}
+Check(Pass(2, 2, _ => false) == "| 0- 1- =0", "a camera never gets a permit while not ready");
 
 // --- Degrade budget: scales cuts up as the level rises, floored at 1. ---
 Check(ReadbackScheduler.DegradeBudget(8, 0) == 8, "level 0 -> no temporal cut (all 8)");
