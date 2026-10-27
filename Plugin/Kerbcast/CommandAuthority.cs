@@ -200,7 +200,34 @@ namespace Kerbcast
         {
             Owner = null;
             _feeds.Clear();
+            SubjectAnchorVisible = true;
+            _defaultAnchorPolicy = AnchorPolicy.ObservedOnly;
+            _anchorPolicies.Clear();
         }
+
+        /* Whether command feeds send Kerbcast's subject anchor while the lock
+           is held. The owner can switch it off; it returns with the lock. */
+        public bool SubjectAnchorVisible { get; set; } = true;
+
+        private AnchorPolicy _defaultAnchorPolicy = AnchorPolicy.ObservedOnly;
+        private readonly Dictionary<uint, AnchorPolicy> _anchorPolicies = new Dictionary<uint, AnchorPolicy>();
+
+        /* Browser clients' anchors on camera `flightId`: observed-only while
+           the lock is held unless the owner relaxed it, everything otherwise. */
+        public AnchorPolicy BrowserAnchorPolicy(uint flightId)
+        {
+            if (!Registered) return AnchorPolicy.Full;
+            return _anchorPolicies.TryGetValue(flightId, out var p) ? p : _defaultAnchorPolicy;
+        }
+
+        /* The policy for every camera, replacing any per-camera ones. */
+        public void SetAnchorPolicy(AnchorPolicy policy)
+        {
+            _defaultAnchorPolicy = policy;
+            _anchorPolicies.Clear();
+        }
+
+        public void SetAnchorPolicy(uint flightId, AnchorPolicy policy) => _anchorPolicies[flightId] = policy;
 
         public void Heartbeat(float realNow) => _lastCall = realNow;
 

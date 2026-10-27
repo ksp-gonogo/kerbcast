@@ -10,8 +10,15 @@
 //    csharp_written_fixture_reads_back_exactly) consumes the same file, so
 //    the two language sides of the ring layout cannot silently drift.
 //
-// Regenerate the fixture (only on a deliberate, versioned layout change):
+// 3. The same for the 1.12 metadata (fov plus anchor results after the
+//    slots): sidecar/testdata/frame_ring_v2_meta.ring, read by
+//    csharp_written_meta_fixture_reads_back_exactly. The v2 fixture above
+//    must stay byte-identical, which is what keeps older sidecars reading
+//    rings from a 1.12 plugin.
+//
+// Regenerate the fixtures (only on a deliberate, versioned layout change):
 //   dotnet run -- --write-fixture ../../sidecar/testdata/frame_ring_v2.ring
+//   dotnet run -- --write-meta-fixture ../../sidecar/testdata/frame_ring_v2_meta.ring
 //
 // Exit code 0 = pass, 1 = fail.
 
@@ -38,10 +45,31 @@ static void WriteFixture(string path)
     ring.Dispose();
 }
 
+/* Two frames, the second with fov 42.5 and one anchor result; the Rust test
+   reads the second back field by field. */
+static void WriteMetaFixture(string path)
+{
+    var ring = MmapFrameRing.Create(path, Slots, W, H, 512);
+    var f1 = new byte[W * H * 4];
+    ring.Produce(W, H, 1234.5, 86400.0, 7, f1, 0, f1.Length);
+    var json = System.Text.Encoding.UTF8.GetBytes(
+        "[{\"id\":\"port\",\"owner\":\"peer:7:3\",\"x\":16.5,\"y\":9.25,\"inFrame\":true,\"behind\":false,"
+        + "\"distanceM\":120,\"apparentRadiusPx\":4,\"angleOffAxis\":0.5,\"forward\":[0,0,1],\"up\":[0,1,0],\"occluded\":false}]");
+    var meta = new FrameMeta { FovDeg = 42.5f, Json = json, Length = json.Length };
+    ring.Produce(W, H, 1235.5, 86400.25, 7, meta, f1, 0, f1.Length);
+    ring.Dispose();
+}
+
 if (args.Length == 2 && args[0] == "--write-fixture")
 {
     WriteFixture(args[1]);
     Console.WriteLine($"fixture written to {args[1]}");
+    return 0;
+}
+if (args.Length == 2 && args[0] == "--write-meta-fixture")
+{
+    WriteMetaFixture(args[1]);
+    Console.WriteLine($"meta fixture written to {args[1]}");
     return 0;
 }
 
@@ -109,6 +137,33 @@ Check(a.Any(x => x != 0), "ring file is not all-zero (pixels were written)");
         Check(got.Length == want.Length, $"fixture same size ({got.Length} vs {want.Length})");
         Check(got.SequenceEqual(want), "C# writer reproduces the committed cross-language fixture byte-for-byte");
     }
+}
+
+{
+    string committed = Path.Combine(AppContext.BaseDirectory, "frame_ring_v2_meta.ring");
+    string regen = Path.Combine(dir, "regen_meta.ring");
+    WriteMetaFixture(regen);
+    Check(File.Exists(committed), "committed frame_ring_v2_meta.ring fixture present");
+    if (File.Exists(committed))
+    {
+        byte[] want = File.ReadAllBytes(committed);
+        byte[] got = File.ReadAllBytes(regen);
+        Check(got.SequenceEqual(want), "C# writer reproduces the committed metadata fixture byte-for-byte");
+    }
+}
+
+// Metadata too long for the ring is dropped whole, and a frame without any
+// clears the previous slot's length so stale anchors never resurface.
+{
+    string path = Path.Combine(dir, "meta.ring");
+    var ring = MmapFrameRing.Create(path, 1, W, H, 16);
+    var big = new byte[17];
+    ring.Produce(W, H, 1, 1, 0, new FrameMeta { FovDeg = 30f, Json = big, Length = big.Length }, pixels, 0, pixels.Length);
+    ring.Dispose();
+    byte[] bytes = File.ReadAllBytes(path);
+    Check(BitConverter.ToUInt32(bytes, 4096 + 40) == 0, "oversized metadata writes no length");
+    Check(BitConverter.ToSingle(bytes, 4096 + 44) == 30f, "fov is written regardless");
+    Check(bytes.Length == 4096 + (64 + W * H * 4) + 16, "the trailer follows the slots");
 }
 
 try { Directory.Delete(dir, true); } catch { /* best effort */ }

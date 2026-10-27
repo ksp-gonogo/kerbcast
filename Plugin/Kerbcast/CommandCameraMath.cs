@@ -57,6 +57,17 @@ namespace Kerbcast
         public bool Split;
     }
 
+    /* Where one point lands in a frame; see CommandCameraMath.ProjectCameraSpace. */
+    public struct FrameProjection
+    {
+        /* Pixels from the frame's top left. */
+        public double X, Y;
+        public bool InFrame, Behind;
+        public double AngleOffAxisDeg;
+        /* Lens to point in metres; 0 for a direction. */
+        public double Distance;
+    }
+
     /* Unity-free maths for the command camera: where the station
        is, where it looks, how wide it zooms, which layers carry the craft and
        whether a body is in the way. Compiled verbatim by CommandCameraMath.Tests. */
@@ -490,6 +501,78 @@ namespace Kerbcast
             if (fovDeg <= 0) return 0;
             return angleRad * Rad2Deg / (fovDeg / Math.Max(1, rows));
         }
+
+        /* A world direction in a lens's own axes: x right, y up, z forward.
+           `forward` and `up` are the lens's unit axes in world space. */
+        public static DVec3 ToCameraSpace(DVec3 v, DVec3 forward, DVec3 up)
+        {
+            var right = DVec3.Cross(up, forward);
+            return new DVec3(DVec3.Dot(v, right), DVec3.Dot(v, up), DVec3.Dot(v, forward));
+        }
+
+        /* The m00 and m11 terms of a symmetric perspective projection with
+           vertical `fovDeg` over a frame `aspect` wide per unit high, for a
+           lens with no projection matrix to read. */
+        public static void PerspectiveTerms(double fovDeg, double aspect, out double m00, out double m11)
+        {
+            m11 = 1.0 / Math.Tan(Math.Max(1e-6, fovDeg) * 0.5 * Deg2Rad);
+            m00 = m11 / Math.Max(1e-6, aspect);
+        }
+
+        /*
+         * Where a camera-space point (x right, y up, z forward) lands in a
+         * `width` by `height` frame, pixels from the top left, through the
+         * m00, m11, m02 and m12 terms of the lens's projection matrix (Unity's
+         * layout, so an off-centre lens is honoured). A point behind the lens
+         * is placed off the frame on the side it is nearest to turning
+         * towards, at the frame's diagonal from the centre.
+         */
+        public static FrameProjection ProjectCameraSpace(DVec3 c, double m00, double m11, double m02, double m12,
+            int width, int height)
+        {
+            double w = Math.Max(1, width), h = Math.Max(1, height);
+            var p = new FrameProjection
+            {
+                AngleOffAxisDeg = AngleBetween(new DVec3(0, 0, 1), c) * Rad2Deg,
+            };
+            const double MinDepth = 1e-9;
+            if (c.Z > MinDepth * Math.Max(1.0, Math.Abs(c.X) + Math.Abs(c.Y)))
+            {
+                double ndcX = m00 * c.X / c.Z - m02;
+                double ndcY = m11 * c.Y / c.Z - m12;
+                p.X = (ndcX + 1.0) * 0.5 * w;
+                p.Y = (1.0 - ndcY) * 0.5 * h;
+                p.InFrame = p.X >= 0 && p.X <= w && p.Y >= 0 && p.Y <= h;
+                return p;
+            }
+            p.Behind = true;
+            double dx = c.X, dy = -c.Y;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            /* Dead behind the lens the side is only rounding noise, so it is
+               pinned below the frame. */
+            if (len < 1e-6 * Math.Max(1e-12, c.Magnitude)) { dx = 0; dy = 1; len = 1; }
+            double reach = Math.Sqrt(w * w + h * h);
+            p.X = w * 0.5 + dx / len * reach;
+            p.Y = h * 0.5 + dy / len * reach;
+            return p;
+        }
+
+        /* `point` seen from a lens at `eye` with unit axes `forward` and `up`,
+           with the lens-to-point distance filled in. */
+        public static FrameProjection Project(DVec3 eye, DVec3 forward, DVec3 up, double m00, double m11, double m02,
+            double m12, int width, int height, DVec3 point)
+        {
+            var d = point - eye;
+            var p = ProjectCameraSpace(ToCameraSpace(d, forward, up), m00, m11, m02, m12, width, height);
+            p.Distance = d.Magnitude;
+            return p;
+        }
+
+        /* Screen radius, in pixels of a `rows`-high frame at vertical `fovDeg`,
+           of a sphere of `radius` at `distance`; 0 for no radius. The bracket
+           half-size, which the command camera's subject marker is drawn at. */
+        public static double ApparentRadiusPx(double radius, double distance, double fovDeg, int rows) =>
+            radius > 0 && distance > 0 ? BracketHalfPx(radius, distance, fovDeg, rows) : 0;
 
         /*
          * The changes of a discrete state over [from, to]. The span is sampled

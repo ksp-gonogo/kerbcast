@@ -1,10 +1,18 @@
 import {
+  COMMAND_SUBJECT_ANCHOR_ID,
+  KERBCAST_ANCHOR_OWNER,
+  anchorPoint,
   commandReadout,
+  findAnchor,
+  frameToScreen,
   type EffectiveCommandTrack,
+  type FrameAnchor,
   type FrameUtSource,
 } from "@ksp-gonogo/kerbcast";
-import { useEffect, useState, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import styled from "styled-components";
+import { useDisplayedFrame } from "./AnchorMarkers";
+import { useVideoBox } from "./videoBox";
 
 const BRACKET_STROKE_PX = 2;
 const BRACKET_MIN_HALF_PX = 14;
@@ -51,7 +59,10 @@ export interface BracketPoint {
 
 /** The bracket box, in the pixel space of the bracket SVG (the video element's box). */
 export interface BracketGeometry {
-  /** Box centre, which is the aim point. */
+  /**
+   * Box centre: where the subject is in the displayed frame, or the frame
+   * centre (the aim point) while that is not known.
+   */
   cx: number;
   cy: number;
   /** Half the box side in display px. */
@@ -65,20 +76,22 @@ export interface BracketGeometry {
 }
 
 /**
- * The bracket box centred on the displayed frame. `bracketHalfPx` is in
- * capture px of a `frameHeightPx`-tall frame, so it scales by the displayed
- * height; a missing half-size draws the minimum box.
+ * The bracket box, centred on the displayed frame or on `centre` (in the
+ * same pixel space as `rect`). `bracketHalfPx` is in capture px of a
+ * `frameHeightPx`-tall frame, so it scales by the displayed height; a
+ * missing half-size draws the minimum box.
  */
 export function bracketGeometry(
   rect: ContentRect,
   bracketHalfPx: number | null,
   frameHeightPx: number,
+  centre?: BracketPoint | null,
 ): BracketGeometry {
   const scale = frameHeightPx > 0 ? rect.height / frameHeightPx : 1;
   const half = Math.max(BRACKET_MIN_HALF_PX, (bracketHalfPx ?? 0) * scale);
   const arm = Math.max(BRACKET_MIN_ARM_PX, BRACKET_ARM_FRACTION * half * 2);
-  const cx = rect.x + rect.width / 2;
-  const cy = rect.y + rect.height / 2;
+  const cx = centre ? centre.x : rect.x + rect.width / 2;
+  const cy = centre ? centre.y : rect.y + rect.height / 2;
   return {
     cx,
     cy,
@@ -118,6 +131,13 @@ export interface CommandBracketContext {
   displayUt: number;
   utSource: FrameUtSource | "override" | null;
   state: EffectiveCommandTrack;
+  /**
+   * The subject's anchor in the displayed frame: where the game projected
+   * the craft, whether it is in frame and whether something hides it.
+   * `null` without one (an older sidecar or plugin, or before the first
+   * stamped frame), when the box is centred on the frame instead.
+   */
+  subject?: FrameAnchor | null;
 }
 
 /**
@@ -143,8 +163,8 @@ export interface CommandBracketOverlay {
   readout?: (defaultText: string, ctx: CommandBracketContext) => string | null;
 }
 
-function cameraCornerStyle(state: EffectiveCommandTrack): CommandBracketCornerStyle {
-  return state.occluded
+function cameraCornerStyle(occluded: boolean): CommandBracketCornerStyle {
+  return occluded
     ? { colour: COMMAND_BRACKET_COLOURS.occluded, dashed: true }
     : { colour: COMMAND_BRACKET_COLOURS.clear, dashed: false };
 }
@@ -160,41 +180,6 @@ function applyCorner(
   };
 }
 
-/** Tracks the rendered box and intrinsic size of a video element. */
-function useVideoBox(video: HTMLVideoElement | null) {
-  const [box, setBox] = useState({ boxW: 0, boxH: 0, mediaW: 0, mediaH: 0 });
-  useEffect(() => {
-    if (!video) return;
-    const measure = () => {
-      const next = {
-        boxW: video.clientWidth,
-        boxH: video.clientHeight,
-        mediaW: video.videoWidth,
-        mediaH: video.videoHeight,
-      };
-      setBox((prev) =>
-        prev.boxW === next.boxW &&
-        prev.boxH === next.boxH &&
-        prev.mediaW === next.mediaW &&
-        prev.mediaH === next.mediaH
-          ? prev
-          : next,
-      );
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(video);
-    video.addEventListener("loadedmetadata", measure);
-    video.addEventListener("resize", measure);
-    return () => {
-      observer.disconnect();
-      video.removeEventListener("loadedmetadata", measure);
-      video.removeEventListener("resize", measure);
-    };
-  }, [video]);
-  return box;
-}
-
 export interface CommandBracketsProps {
   state: EffectiveCommandTrack;
   displayUt: number;
@@ -204,14 +189,27 @@ export interface CommandBracketsProps {
   /** Frame aspect to assume until the video reports its own size. */
   fallbackSize?: { width: number; height: number } | null;
   overlay?: CommandBracketOverlay | null;
+  /**
+   * The subject's anchor in the displayed frame. While it is visible and no
+   * command lock is held the box sits on it and takes its size from it.
+   */
+  subject?: FrameAnchor | null;
+  /** The capture frame size `subject` is in (the stamp's width and height). */
+  subjectFrameSize?: { width: number; height: number } | null;
 }
 
 /**
- * Target brackets for a command camera feed: the aim point sits at frame
- * centre, so the box is always centred on the displayed video. Both corners
- * show the camera axis by default; an overlay can restyle either and draw
- * its own marks. Without a fix, or over a blanked feed, the default corners
- * are left out but the overlay and readout still run.
+ * Target brackets for a command camera feed. With no command lock held and
+ * the subject's anchor visible in the displayed frame, the box sits on the
+ * craft where the game saw it, so it stays on the craft when an aim points
+ * elsewhere. Otherwise (the anchor out of frame or occluded, which then
+ * carries no position, no anchor at all, or a command authority holding the
+ * lock) the box is the 1.11 one: centred on the aim, sized from the aimed
+ * range, red and dashed when the aim line is occluded. `ctx.subject` always
+ * carries the anchor, so a consumer can draw it as a second mark. An overlay
+ * can restyle either corner and draw its own marks. Without a fix, or over a
+ * blanked feed, the default corners are left out but the overlay and readout
+ * still run.
  */
 export function CommandBrackets({
   state,
@@ -220,6 +218,8 @@ export function CommandBrackets({
   video,
   fallbackSize,
   overlay,
+  subject,
+  subjectFrameSize,
 }: CommandBracketsProps) {
   const { boxW, boxH, mediaW, mediaH } = useVideoBox(video);
   const rect = containedContentRect(
@@ -228,7 +228,20 @@ export function CommandBrackets({
     mediaW || fallbackSize?.width || 0,
     mediaH || fallbackSize?.height || 0,
   );
-  const g = bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH);
+  const frameW = subjectFrameSize?.width || mediaW || fallbackSize?.width || 0;
+  const frameH = subjectFrameSize?.height || mediaH || fallbackSize?.height || 0;
+  /* Under the lock the box is the authority's aim, as in 1.11. */
+  const point =
+    subject && !state.authority && frameW > 0 && frameH > 0 ? anchorPoint(subject) : null;
+  const placed = point !== null;
+  const g = point
+    ? bracketGeometry(
+        rect,
+        subject?.apparentRadiusPx ?? null,
+        frameH,
+        frameToScreen(point, frameW, frameH, { ...rect, scale: 1 }),
+      )
+    : bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH);
   const ctx: CommandBracketContext = {
     geometry: g,
     width: boxW,
@@ -236,10 +249,11 @@ export function CommandBrackets({
     displayUt,
     utSource: utSource ?? null,
     state,
+    subject: subject ?? null,
   };
   const overrides =
     typeof overlay?.corners === "function" ? overlay.corners(ctx) : overlay?.corners;
-  const camera = cameraCornerStyle(state);
+  const camera = cameraCornerStyle(placed ? !!subject?.occluded : state.occluded);
   const topLeft = applyCorner(camera, overrides?.topLeft);
   const bottomRight = applyCorner(camera, overrides?.bottomRight);
   const { x: left, y: top } = g.topLeft;
@@ -252,7 +266,13 @@ export function CommandBrackets({
   return (
     <>
       {(drawCorners || overlay?.render) && (
-        <BracketSvg aria-hidden="true" data-camera-axis={state.camera} width={boxW} height={boxH}>
+        <BracketSvg
+          aria-hidden="true"
+          data-camera-axis={state.camera}
+          data-subject={subject ? (placed ? "placed" : "centred") : undefined}
+          width={boxW}
+          height={boxH}
+        >
           {drawCorners && !topLeft.hidden && (
             <path
               data-corner="topLeft"
@@ -286,6 +306,24 @@ export function CommandBrackets({
       )}
     </>
   );
+}
+
+/**
+ * CommandBrackets fed with the subject's anchor from each frame of
+ * `flightId` that `video` presents. Re-renders at the frame rate, which is
+ * why it is its own component.
+ */
+export function LiveCommandBrackets({
+  flightId,
+  ...props
+}: CommandBracketsProps & { flightId: number | null }) {
+  const frame = useDisplayedFrame(true, flightId, props.video);
+  const subject = findAnchor(frame?.anchors, COMMAND_SUBJECT_ANCHOR_ID, KERBCAST_ANCHOR_OWNER);
+  const size =
+    frame?.frameWidth && frame.frameHeight
+      ? { width: frame.frameWidth, height: frame.frameHeight }
+      : null;
+  return <CommandBrackets {...props} subject={subject} subjectFrameSize={size} />;
 }
 
 /** Reason a command feed is blanked, centred on black over the feed. */

@@ -1,4 +1,4 @@
-import type { AdaptiveShedPayload, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
+import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
 import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
 import type { CreateCommandCameraPayload } from "../__generated__/types";
 import type {
@@ -304,7 +304,7 @@ export class MockSidecar {
    */
   open(): void {
     this._openHandler?.();
-    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true } });
+    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true, anchors: true } });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
@@ -390,10 +390,20 @@ export class MockSidecar {
     this._sendToClient({ type: "settings-state", content: payload });
   }
 
-  /** Push a `frame-stamp` to the client: the capture UT of one frame, keyed by RTP timestamp. */
+  /**
+   * Push a `frame-stamp` to the client: the capture UT of one frame, keyed by
+   * RTP timestamp, with any `fov`, size and `anchors` results given.
+   */
   fireFrameStamp(payload: FrameStampPayload): void {
     this._sendToClient({ type: "frame-stamp", content: payload });
   }
+
+  /** The anchors the client last set on `flightId` with `set-anchors`. Empty when none. */
+  anchorsFor(flightId: number): readonly Anchor[] {
+    return this._anchors.get(flightId) ?? [];
+  }
+
+  private readonly _anchors = new Map<number, Anchor[]>();
 
   /** Push a `scene-state-changed` event to the client (flight scene or not). */
   fireSceneState(inFlight: boolean): void {
@@ -709,6 +719,12 @@ export class MockSidecar {
         };
         this._cameras.set(msg.content.flightId, updated);
         this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
+        break;
+      }
+      case "set-anchors": {
+        /* Per client in the real sidecar; the mock has one client. */
+        if (msg.content.anchors?.length) this._anchors.set(msg.content.flightId, msg.content.anchors);
+        else this._anchors.delete(msg.content.flightId);
         break;
       }
       case "create-command-camera": {

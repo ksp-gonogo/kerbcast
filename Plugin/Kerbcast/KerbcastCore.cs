@@ -339,6 +339,7 @@ namespace Kerbcast
                a UT that will never arrive. */
             GameEvents.onGameSceneLoadRequested.Add(OnGameSceneLoadRequested);
             GameEvents.onGameStatePostLoad.Add(OnGameStatePostLoad);
+            GameEvents.onVesselPersistentIdChanged.Add(OnVesselPersistentIdChanged);
 
             /* Defensive: at Awake the scene's source cameras (Camera 00,
                ScaledSpace, GalaxyCamera, FXCamera) may already be disabled, for
@@ -622,6 +623,8 @@ namespace Kerbcast
                 if (!File.Exists(_commandsPath)) return;
                 _commandsLastJson = File.ReadAllText(_commandsPath);
                 _commandLedger.SeedFrom(CommandCameraRequest.ParseFile(_commandsLastJson, null));
+                /* Anchors are state, not requests: the table on disk applies to this scene too. */
+                ApplyRemoteAnchors(_commandsLastJson);
                 if (_commandLedger.LastAppliedId > 0)
                     Debug.Log($"[Kerbcast][CMDCAM] client requests up to id {_commandLedger.LastAppliedId} predate this scene; skipped");
             }
@@ -633,7 +636,7 @@ namespace Kerbcast
 
         private void MaybeApplyCommandRequests()
         {
-            if (_commandsPath == null || _commandProvider == null) return;
+            if (_commandsPath == null) return;
             _commandsCooldown -= Time.unscaledDeltaTime;
             if (_commandsCooldown > 0f) return;
             _commandsCooldown = CommandsPollSeconds;
@@ -643,6 +646,8 @@ namespace Kerbcast
                 var json = File.ReadAllText(_commandsPath);
                 if (json == _commandsLastJson) return;
                 _commandsLastJson = json;
+                ApplyRemoteAnchors(json);
+                if (_commandProvider == null) return;
                 var skipped = new List<string>();
                 var requests = CommandCameraRequest.ParseFile(json, skipped);
                 foreach (var why in skipped)
@@ -654,6 +659,26 @@ namespace Kerbcast
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] client request read failed: {ex.Message}");
             }
+        }
+
+        /* Every browser client's anchors, from the sidecar. */
+        internal AnchorRegistry Anchors { get; } = new AnchorRegistry();
+
+        private void ApplyRemoteAnchors(string json)
+        {
+            var skipped = new List<string>();
+            int before = Anchors.Count;
+            Anchors.ReplaceRemote(AnchorRegistry.ParseRemote(json, skipped), skipped);
+            foreach (var why in skipped)
+                Debug.LogWarning($"[Kerbcast][ANCHOR] client anchors skipped: {why}");
+            if (Anchors.Count != before)
+                Debug.Log($"[Kerbcast][ANCHOR] anchors now {Anchors.Count} (was {before})");
+        }
+
+        /* A dock or claw grab: anchors naming the absorbed craft follow it into the survivor. */
+        private void OnVesselPersistentIdChanged(uint oldPid, uint newPid)
+        {
+            Anchors.Merged(oldPid, newPid);
         }
 
         private void ApplyCommandRequest(CommandCameraRequest r)
@@ -1493,7 +1518,7 @@ namespace Kerbcast
             sb.Append($"        \"bracketHalfPx\": {(gr.HasFix ? gr.BracketHalfPx.ToString("0.###", ci) : "null")},\n");
             sb.Append($"        \"frameHeightPx\": {gr.FrameHeightPx},\n");
             sb.Append($"        \"framingFits\": {(gr.FramingFits ? "true" : "false")},\n");
-            var offset = gr.TrueOffsetPx;
+            var offset = gr.ReportedTrueOffsetPx;
             sb.Append($"        \"trueOffsetPx\": {(offset.HasValue ? offset.Value.ToString("0.###", ci) : "null")},\n");
             sb.Append(gr.AuthorityOwner == null
                 ? "        \"authority\": null,\n"
@@ -1803,6 +1828,7 @@ namespace Kerbcast
             GameEvents.onVesselCrewWasModified.Remove(OnVesselCrewWasModified);
             GameEvents.onGameSceneLoadRequested.Remove(OnGameSceneLoadRequested);
             GameEvents.onGameStatePostLoad.Remove(OnGameStatePostLoad);
+            GameEvents.onVesselPersistentIdChanged.Remove(OnVesselPersistentIdChanged);
             foreach (var cam in _cameras) cam.Dispose();
             _cameras.Clear();
             /* Deliberately NOT stopping the sidecar: KerbcastSidecarHost owns

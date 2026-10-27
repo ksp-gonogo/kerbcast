@@ -1,4 +1,4 @@
-import type { FrameStampPayload } from "./__generated__/types";
+import type { FrameAnchor, FrameStampPayload } from "./__generated__/types";
 
 /**
  * Where a frame's UT came from. `"exact"`: looked up from the frame's own
@@ -20,8 +20,27 @@ export interface FrameUt {
   source: FrameUtSource;
 }
 
+/**
+ * What a frame's stamp reports beyond its UT. Each field is present only when
+ * the stamp carried it: a 1.12 sidecar and plugin for `fov` and the size, and
+ * `anchors` only once this client has set some (or the game has).
+ */
+export interface FrameStampExtras {
+  /**
+   * Where each anchor landed in this frame, in capture pixels of a
+   * `frameWidth` by `frameHeight` frame: this client's own (no `owner`) and
+   * those set in game (with their `owner`).
+   */
+  anchors?: FrameAnchor[];
+  /** Vertical field of view the frame was rendered with, degrees. */
+  fov?: number;
+  /** The capture frame's size, the space anchor positions are in. */
+  frameWidth?: number;
+  frameHeight?: number;
+}
+
 /** A frame the browser presented on a watched video element. */
-export interface DisplayedFrameUt extends FrameUt {
+export interface DisplayedFrameUt extends FrameUt, FrameStampExtras {
   flightId: number;
   /**
    * RTP timestamp of the source frame `ut` was looked up for (through the
@@ -66,8 +85,26 @@ export const STAMP_TO_DISPLAY_MAX_MS = 150;
 interface StoredStamp {
   ut: number;
   epoch: number;
+  extras: FrameStampExtras | null;
   /** When the stamp arrived, on the `monotonicNowMs` clock. */
   arrivedAt: number;
+}
+
+/** A looked-up stamp: the frame's UT and epoch plus whatever extras it carried. */
+export type StampLookup = { ut: number; epoch: number } & FrameStampExtras;
+
+/** Only the extras a stamp carried, so a frame without them has no such keys. */
+function extrasOf(stamp: FrameStampPayload): FrameStampExtras | null {
+  const extras: FrameStampExtras = {};
+  if (stamp.anchors?.length) extras.anchors = stamp.anchors;
+  if (stamp.fov != null) extras.fov = stamp.fov;
+  if (stamp.width != null) extras.frameWidth = stamp.width;
+  if (stamp.height != null) extras.frameHeight = stamp.height;
+  return Object.keys(extras).length ? extras : null;
+}
+
+function withExtras<T extends object>(base: T, extras: FrameStampExtras | null): T & FrameStampExtras {
+  return extras ? { ...base, ...extras } : base;
 }
 
 /**
@@ -86,16 +123,21 @@ export class FrameStampStore {
     }
     /* Re-inserting moves the key to the back, keeping eviction oldest-first. */
     stamps.delete(stamp.rtpTimestamp);
-    stamps.set(stamp.rtpTimestamp, { ut: stamp.captureUt, epoch: stamp.captureEpoch, arrivedAt });
+    stamps.set(stamp.rtpTimestamp, {
+      ut: stamp.captureUt,
+      epoch: stamp.captureEpoch,
+      extras: extrasOf(stamp),
+      arrivedAt,
+    });
     while (stamps.size > FRAME_STAMP_HISTORY) {
       const oldest = stamps.keys().next().value as number;
       stamps.delete(oldest);
     }
   }
 
-  lookup(flightId: number, rtpTimestamp: number): { ut: number; epoch: number } | null {
+  lookup(flightId: number, rtpTimestamp: number): StampLookup | null {
     const s = this.byFlight.get(flightId)?.get(rtpTimestamp);
-    return s ? { ut: s.ut, epoch: s.epoch } : null;
+    return s ? withExtras({ ut: s.ut, epoch: s.epoch }, s.extras) : null;
   }
 
   /**
@@ -106,15 +148,17 @@ export class FrameStampStore {
   newestArrivedBy(
     flightId: number,
     atMs: number,
-  ): { ut: number; epoch: number; rtpTimestamp: number } | null {
+  ): (StampLookup & { rtpTimestamp: number }) | null {
     const stamps = this.byFlight.get(flightId);
     if (!stamps) return null;
-    let found: { ut: number; epoch: number; rtpTimestamp: number } | null = null;
+    let found: [number, StoredStamp] | null = null;
     for (const [rtpTimestamp, s] of stamps) {
       if (s.arrivedAt > atMs) break;
-      found = { ut: s.ut, epoch: s.epoch, rtpTimestamp };
+      found = [rtpTimestamp, s];
     }
-    return found;
+    if (!found) return null;
+    const [rtpTimestamp, s] = found;
+    return withExtras({ ut: s.ut, epoch: s.epoch, rtpTimestamp }, s.extras);
   }
 
   clear(): void {

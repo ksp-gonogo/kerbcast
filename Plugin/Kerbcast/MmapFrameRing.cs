@@ -14,7 +14,8 @@
 //     [24..28] u32 atomic write_index (most-recently-written slot)
 //     [28..32] padding
 //     [32..40] u64 atomic sequence (monotonic; wraps only after 2^64)
-//     [40..4096] padding
+//     [40..44] u32 meta_slot_bytes (per-slot metadata capacity; 0 = none)
+//     [44..4096] padding
 //
 //   per slot (starting at 4096 + slot_idx * slot_bytes):
 //     [+0..4]   u32 width
@@ -24,8 +25,18 @@
 //     [+16..24] f64 capture_ts_ms
 //     [+24..32] u64 sequence (matches header.sequence when written)
 //     [+32..40] f64 capture_ut (KSP universal time at render; NaN = unknown)
-//     [+40..64] padding
+//     [+40..44] u32 meta_len (bytes of this frame's metadata; 0 = none)
+//     [+44..48] f32 fov_deg (vertical field of view at render; 0 = unknown)
+//     [+48..64] padding
 //     [+64..]   RGBA8 pixels, max_width * max_height * 4 bytes
+//
+//   per-slot metadata (starting at 4096 + slot_count * slot_bytes
+//   + slot_idx * meta_slot_bytes): meta_len bytes of UTF-8 JSON, the
+//   frame's anchor results.
+//
+//   The metadata fields arrived in 1.12 without a version bump: a writer
+//   that reserves no metadata leaves them zero, and an older reader maps
+//   only the slots and ignores the two slot fields.
 //
 // Sync protocol (writer side):
 //   1. Bump `header.sequence` atomically (Interlocked.Increment).
@@ -59,6 +70,7 @@ namespace Kerbcast
         private const int HeaderOffMaxHeight = 20;
         private const int HeaderOffWriteIndex = 24;
         private const int HeaderOffSequence = 32;
+        private const int HeaderOffMetaSlotBytes = 40;
 
         private const int SlotOffWidth = 0;
         private const int SlotOffHeight = 4;
@@ -67,12 +79,16 @@ namespace Kerbcast
         private const int SlotOffCaptureTs = 16;
         private const int SlotOffSequence = 24;
         private const int SlotOffCaptureUt = 32;
+        private const int SlotOffMetaLen = 40;
+        private const int SlotOffFov = 44;
         private const int SlotOffPixels = 64;
 
         private readonly int _slotCount;
         private readonly int _maxWidth;
         private readonly int _maxHeight;
         private readonly int _slotBytes;
+        private readonly int _metaSlotBytes;
+        private readonly long _metaStart;
         private readonly long _totalBytes;
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewAccessor _view;
@@ -87,9 +103,12 @@ namespace Kerbcast
         /// <summary>
         /// Create or truncate-and-replace the ring file at <paramref name="path"/>
         /// and stamp the header. Call this from the writer side (KSP plugin).
+        /// <paramref name="metaSlotBytes"/> reserves that much per-frame
+        /// metadata after the slots; 0 reserves none.
         /// </summary>
-        public static MmapFrameRing Create(string path, int slotCount, int maxWidth, int maxHeight)
+        public static MmapFrameRing Create(string path, int slotCount, int maxWidth, int maxHeight, int metaSlotBytes = 0)
         {
+            if (metaSlotBytes < 0) throw new ArgumentOutOfRangeException(nameof(metaSlotBytes));
             if (slotCount <= 0) throw new ArgumentOutOfRangeException(nameof(slotCount));
             if (maxWidth <= 0 || maxWidth % 2 != 0)
                 throw new ArgumentOutOfRangeException(nameof(maxWidth), "must be > 0 and even");
@@ -97,7 +116,7 @@ namespace Kerbcast
                 throw new ArgumentOutOfRangeException(nameof(maxHeight), "must be > 0 and even");
 
             int slotBytes = SlotOffPixels + maxWidth * maxHeight * 4;
-            long total = HeaderSize + (long)slotCount * slotBytes;
+            long total = HeaderSize + (long)slotCount * slotBytes + (long)slotCount * metaSlotBytes;
 
             // Create or truncate the regular file. Using FileShare.ReadWrite
             // so the sidecar can map it concurrently from another process.
@@ -119,7 +138,7 @@ namespace Kerbcast
                 leaveOpen: false);
             var view = mmf.CreateViewAccessor(0, total, MemoryMappedFileAccess.ReadWrite);
 
-            var ring = new MmapFrameRing(mmf, view, slotCount, maxWidth, maxHeight, slotBytes, total);
+            var ring = new MmapFrameRing(mmf, view, slotCount, maxWidth, maxHeight, slotBytes, metaSlotBytes, total);
             ring.WriteHeader();
             return ring;
         }
@@ -131,6 +150,7 @@ namespace Kerbcast
             int maxWidth,
             int maxHeight,
             int slotBytes,
+            int metaSlotBytes,
             long totalBytes)
         {
             _mmf = mmf;
@@ -139,6 +159,8 @@ namespace Kerbcast
             _maxWidth = maxWidth;
             _maxHeight = maxHeight;
             _slotBytes = slotBytes;
+            _metaSlotBytes = metaSlotBytes;
+            _metaStart = HeaderSize + (long)slotCount * slotBytes;
             _totalBytes = totalBytes;
             unsafe
             {
@@ -149,6 +171,7 @@ namespace Kerbcast
         public int SlotCount => _slotCount;
         public int MaxWidth => _maxWidth;
         public int MaxHeight => _maxHeight;
+        public int MetaSlotBytes => _metaSlotBytes;
 
         private void WriteHeader()
         {
@@ -160,6 +183,7 @@ namespace Kerbcast
             _view.Write(HeaderOffSlotCount, (uint)_slotCount);
             _view.Write(HeaderOffMaxWidth, (uint)_maxWidth);
             _view.Write(HeaderOffMaxHeight, (uint)_maxHeight);
+            _view.Write(HeaderOffMetaSlotBytes, (uint)_metaSlotBytes);
         }
 
         /// <summary>
@@ -172,8 +196,18 @@ namespace Kerbcast
         /// </summary>
         public ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, byte[] rgba, int rgbaOffset, int rgbaLength)
         {
+            return Produce(width, height, captureTsMs, captureUt, captureEpoch, default, rgba, rgbaOffset, rgbaLength);
+        }
+
+        /// <summary>
+        /// <c>Produce</c> with the frame's metadata: its field of view and
+        /// anchor results. Metadata longer than the ring reserves is dropped
+        /// whole, never cut short.
+        /// </summary>
+        public ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, FrameMeta meta, byte[] rgba, int rgbaOffset, int rgbaLength)
+        {
             ValidateFrame(width, height, rgbaLength);
-            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch);
+            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch, meta);
             _view.WriteArray(slotStart + SlotOffPixels, rgba, rgbaOffset, rgbaLength);
             PublishSlot(slot, slotStart, newSeq);
             return (ulong)newSeq;
@@ -189,8 +223,13 @@ namespace Kerbcast
         /// </summary>
         public unsafe ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, byte* src, int length)
         {
+            return Produce(width, height, captureTsMs, captureUt, captureEpoch, default, src, length);
+        }
+
+        public unsafe ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, FrameMeta meta, byte* src, int length)
+        {
             ValidateFrame(width, height, length);
-            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch);
+            var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch, meta);
             Buffer.MemoryCopy(src, _basePtr + slotStart + SlotOffPixels, length, length);
             PublishSlot(slot, slotStart, newSeq);
             return (ulong)newSeq;
@@ -213,7 +252,7 @@ namespace Kerbcast
         // Steps 1-2 of the seqlock write plus the slot header. The pixel copy
         // (step 3) is the caller's job — the only part that differs between the
         // byte[] and unmanaged-pointer overloads. PublishSlot does steps 4-5.
-        private (int slot, int slotStart, long seq) BeginSlot(int width, int height, double captureTsMs, double captureUt, uint captureEpoch)
+        private (int slot, int slotStart, long seq) BeginSlot(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, FrameMeta meta)
         {
             // Interlocked.Increment on Int64 is an atomic add + load — same
             // semantics as Rust's AtomicU64.fetch_add(1, Release) cross-process.
@@ -228,6 +267,11 @@ namespace Kerbcast
             _view.Write(slotStart + SlotOffCaptureEpoch, captureEpoch);
             _view.Write(slotStart + SlotOffCaptureTs, captureTsMs);
             _view.Write(slotStart + SlotOffCaptureUt, captureUt);
+            int metaLen = meta.Json != null && meta.Length > 0 && meta.Length <= _metaSlotBytes ? meta.Length : 0;
+            _view.Write(slotStart + SlotOffMetaLen, (uint)metaLen);
+            _view.Write(slotStart + SlotOffFov, meta.FovDeg > 0f && !float.IsNaN(meta.FovDeg) && !float.IsInfinity(meta.FovDeg) ? meta.FovDeg : 0f);
+            if (metaLen > 0)
+                _view.WriteArray(_metaStart + nextSlot * (long)_metaSlotBytes, meta.Json, 0, metaLen);
             return ((int)nextSlot, slotStart, newSeq);
         }
 
@@ -274,5 +318,16 @@ namespace Kerbcast
             _view.Dispose();
             _mmf.Dispose();
         }
+    }
+
+    /* What the game reports about one frame beside its pixels. The default
+       carries nothing: fov unknown, no metadata. */
+    public struct FrameMeta
+    {
+        /* Vertical field of view the frame was rendered with, degrees; 0 when unknown. */
+        public float FovDeg;
+        /* The frame's anchor results as UTF-8 JSON, the first Length bytes; null for none. */
+        public byte[] Json;
+        public int Length;
     }
 }

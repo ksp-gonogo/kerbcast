@@ -8,6 +8,96 @@ export interface AdaptiveShedPayload {
 	reason: string;
 }
 
+/** What an anchor marks. */
+export enum AnchorKind {
+	/** One part of a craft, followed through docking. */
+	Part = "part",
+	/** A craft's centre of mass. */
+	Vessel = "vessel",
+	/** A point on a body's surface. */
+	Surface = "surface",
+	/** A direction, drawn at infinity. */
+	Direction = "direction",
+}
+
+/**
+ * A direction a `direction` anchor follows, taken from its craft's orbit
+ * (not the surface frame).
+ */
+export enum AnchorDirection {
+	Prograde = "prograde",
+	Retrograde = "retrograde",
+	Normal = "normal",
+	Antinormal = "antinormal",
+	RadialIn = "radialIn",
+	RadialOut = "radialOut",
+	/** The first maneuver node's burn vector. */
+	Maneuver = "maneuver",
+	/** From the craft towards the Sun. */
+	Sun = "sun",
+	/** From the craft towards its target. */
+	Target = "target",
+	/** The craft's velocity relative to its target. */
+	TargetRelativeVelocity = "targetRelativeVelocity",
+}
+
+/**
+ * Something a client wants marked on a camera's picture. `kind` says which
+ * fields apply. The game projects every anchor through the camera that
+ * rendered each frame and sends the result with that frame's `FrameStamp`.
+ */
+export interface Anchor {
+	/**
+	 * The client's own name for the anchor, unique among its anchors on
+	 * one camera. 1 to 64 characters.
+	 */
+	id: string;
+	kind: AnchorKind;
+	/**
+	 * `part` and `vessel`: the craft's `Vessel.persistentId`. `direction`:
+	 * the craft whose direction is followed; absent for the active craft.
+	 */
+	vessel?: number;
+	/** `part`: the part's `Part.persistentId`. */
+	part?: number;
+	/**
+	 * `part`: `[x, y, z]` metres from the part's origin in its own axes. A
+	 * docking port is marked at its docking face, and the offset is in the
+	 * face's axes.
+	 */
+	offset?: number[];
+	/** `surface`: the body's name, e.g. `"Kerbin"`. */
+	body?: string;
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `surface`: metres above sea level. Default 0. */
+	altitude?: number;
+	/** `direction`: a named direction of the craft. Give this or `vector`. */
+	direction?: AnchorDirection;
+	/**
+	 * `direction`: a fixed `[x, y, z]` direction in the inertial frame of
+	 * `Orbit.getRelativePositionAtUT` (z up). Give this or `direction`.
+	 */
+	vector?: number[];
+	/**
+	 * `part` and `vessel`: also report the thing's `forward` and `up` axes
+	 * in camera space every frame.
+	 */
+	orientation?: boolean;
+	/**
+	 * Also report whether something stands between the lens and the
+	 * anchor. Off by default: it costs a ray cast per anchor per frame.
+	 */
+	occlusion?: boolean;
+	/**
+	 * Metres added to the marked thing's radius before `apparentRadiusPx`
+	 * is worked out, to leave room around it. Default 0.
+	 */
+	marginM?: number;
+}
+
 /**
  * Lifecycle state of a camera. Transmitted in `CameraState` so clients
  * can react to part destruction without a new message type.
@@ -692,6 +782,74 @@ export interface FlightIdPayload {
 }
 
 /**
+ * Where one anchor landed in one frame. Pixel positions are in the
+ * capture frame (`FrameStamp.width` by `FrameStamp.height`, origin top
+ * left). Absent for a frame in which the anchor could not be located.
+ * 
+ * An `observed` result carries only what the picture shows: `x`, `y`,
+ * `apparentRadiusPx` (and `forward` and `up` when asked for) only while the
+ * anchor is in frame and not occluded, and never `distanceM`,
+ * `angleOffAxis` or `behind`. Kerbcast's own `"subject"` anchor is always
+ * observed; a browser client's anchors are observed by default while a
+ * command authority holds the lock.
+ */
+export interface FrameAnchor {
+	/** The anchor's `id` as its owner set it. */
+	id: string;
+	/**
+	 * Who set it, for an anchor this client did not set: the game-side
+	 * owner passed to `KerbcastControl.SetAnchors`, or `"kerbcast"` for
+	 * Kerbcast's own. Absent for this client's own anchors.
+	 */
+	owner?: string;
+	/** True when the result is limited to what the picture shows (see above). */
+	observed?: boolean;
+	/** Absent from an observed result that is out of frame or occluded. */
+	x?: number;
+	y?: number;
+	/** Inside the frame and in front of the lens. */
+	inFrame: boolean;
+	/**
+	 * Behind the lens. `x` and `y` then sit off the frame on the side the
+	 * anchor is nearest. Absent from an observed result.
+	 */
+	behind?: boolean;
+	/**
+	 * Lens to anchor in metres. Absent for a `direction` anchor and from an
+	 * observed result.
+	 */
+	distanceM?: number;
+	/**
+	 * The marked thing's radius (plus `marginM`) on screen, in capture
+	 * pixels. 0 for a `surface` anchor without a margin, and always 0 for a
+	 * `direction` anchor. Absent with `x` and `y`.
+	 */
+	apparentRadiusPx?: number;
+	/**
+	 * Degrees between the camera's axis and the anchor. Absent from an
+	 * observed result.
+	 */
+	angleOffAxis?: number;
+	/**
+	 * The thing's forward axis in camera space (x right, y up, z forward),
+	 * when the anchor asked for `orientation`. For a craft, the direction
+	 * its control point faces; for a docking port, the way the port faces;
+	 * for another part, its stack axis.
+	 */
+	forward?: number[];
+	/**
+	 * The thing's up axis in camera space, perpendicular to `forward`,
+	 * when the anchor asked for `orientation`. Gives its roll.
+	 */
+	up?: number[];
+	/**
+	 * Whether something stands between the lens and the anchor, when the
+	 * anchor asked for `occlusion`, and always on an observed result.
+	 */
+	occluded?: boolean;
+}
+
+/**
  * Mission-time stamp of one video frame, sent on the control channel just
  * before the frame's RTP packets. A browser matches it to a presented frame
  * by `rtp_timestamp` (`requestVideoFrameCallback` metadata `rtpTimestamp`),
@@ -712,6 +870,21 @@ export interface FrameStampPayload {
 	 * belongs to.
 	 */
 	captureEpoch: number;
+	/**
+	 * Vertical field of view the frame was rendered with, degrees. Absent
+	 * when the game did not report one (kerbal cameras, plugins older
+	 * than 1.12).
+	 */
+	fov?: number;
+	/** The frame's size in capture pixels, the space anchor positions are in. */
+	width?: number;
+	height?: number;
+	/**
+	 * Where each anchor landed in this frame: the client's own anchors and
+	 * those set in game. Only for a client that asked for anchors with
+	 * `SetFrameStamps`; absent when there are none.
+	 */
+	anchors?: FrameAnchor[];
 }
 
 export interface HelloPayload {
@@ -722,6 +895,12 @@ export interface HelloPayload {
 	 * `SetFrameStamps`. Absent from sidecars older than 1.11.
 	 */
 	frameStamps?: boolean;
+	/**
+	 * True when this sidecar takes `SetAnchors` and sends anchor results
+	 * with frame stamps to a client that asks with `SetFrameStamps`
+	 * `anchors: true`. Absent from sidecars older than 1.12.
+	 */
+	anchors?: boolean;
 }
 
 /**
@@ -746,6 +925,18 @@ export interface ReportDisplaySizePayload {
  */
 export interface SceneStateChangedPayload {
 	inFlight: boolean;
+}
+
+/**
+ * Replace this client's anchors on one camera, or clear them with
+ * `anchors` absent or null. Anchors belong to the client that set them:
+ * they are display, not commands, so the command lock does not apply, and
+ * they are cleared when the client disconnects. At most
+ * `MAX_ANCHORS_PER_CAMERA` per client per camera.
+ */
+export interface SetAnchorsPayload {
+	flightId: number;
+	anchors?: Anchor[];
 }
 
 /**
@@ -803,6 +994,11 @@ export interface SetFovPayload {
 
 export interface SetFrameStampsPayload {
 	enabled: boolean;
+	/**
+	 * Also send each frame's anchor results. Off unless asked for, so a
+	 * client that predates anchors never receives them.
+	 */
+	anchors?: boolean;
 }
 
 export interface SetLayersPayload {
@@ -973,6 +1169,12 @@ export type ClientMessage =
 	/** Point a command camera, or return it to its default. Server-wide. */
 	| { type: "set-command-aim", content: SetCommandAimPayload }
 	/**
+	 * Replace or clear this client's anchors on one camera. Per client:
+	 * other clients never see them, and they go when this client does.
+	 * Send only to a sidecar whose `Hello` has `anchors: true`.
+	 */
+	| { type: "set-anchors", content: SetAnchorsPayload }
+	/**
 	 * A consumer reporting its OWN current display size in px; the sidecar
 	 * aggregates MAX-across-consumers to drive auto-resolution
 	 * (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
@@ -1112,7 +1314,8 @@ export type ClientMessage =
 	/**
 	 * Start or stop `FrameStamp` messages on this peer's control channel.
 	 * Off until asked for, so clients that predate stamps never receive
-	 * them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+	 * them. Send only to a sidecar whose `Hello` has `frameStamps: true`;
+	 * `anchors: true` only to one whose `Hello` has `anchors: true`.
 	 */
 	| { type: "set-frame-stamps", content: SetFrameStampsPayload };
 

@@ -2,6 +2,7 @@
 //! protocol types, and shared-memory ring buffer used by both `main.rs`
 //! (binary entry) and integration tests.
 
+pub mod anchors;
 pub mod cameras;
 pub mod commands;
 pub mod encoder;

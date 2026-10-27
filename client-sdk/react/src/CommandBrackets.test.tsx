@@ -1,4 +1,4 @@
-import { effectiveCommandTrack, type CommandTrackState } from "@ksp-gonogo/kerbcast";
+import { effectiveCommandTrack, type CommandTrackState, type FrameAnchor } from "@ksp-gonogo/kerbcast";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -246,6 +246,121 @@ describe("CommandBrackets overlay", () => {
     cleanup();
     renderBrackets(track(), 1000, { readout: () => null });
     expect(screen.queryByText(/IN VIEW/)).toBeNull();
+  });
+});
+
+/** A video element with a laid-out box and a decoded size, as a browser reports them. */
+function sizedVideo(boxW: number, boxH: number, mediaW = boxW, mediaH = boxH): HTMLVideoElement {
+  const v = document.createElement("video");
+  Object.defineProperty(v, "clientWidth", { value: boxW });
+  Object.defineProperty(v, "clientHeight", { value: boxH });
+  Object.defineProperty(v, "videoWidth", { value: mediaW });
+  Object.defineProperty(v, "videoHeight", { value: mediaH });
+  return v;
+}
+
+function subjectAnchor(overrides: Partial<FrameAnchor> = {}): FrameAnchor {
+  return {
+    id: "subject",
+    owner: "kerbcast",
+    x: 256,
+    y: 144,
+    inFrame: true,
+    behind: false,
+    distanceM: 4200,
+    apparentRadiusPx: 40,
+    angleOffAxis: 12,
+    occluded: false,
+    ...overrides,
+  };
+}
+
+describe("CommandBrackets on the subject anchor", () => {
+  function renderOnSubject(
+    subject: FrameAnchor | null,
+    t: CommandTrackState = track(),
+    overlay?: CommandBracketOverlay,
+    frame = { width: 1024, height: 576 },
+  ) {
+    return render(
+      <CommandBrackets
+        state={effectiveCommandTrack(t, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={overlay}
+        subject={subject}
+        subjectFrameSize={frame}
+      />,
+    );
+  }
+
+  function seenWith(subject: FrameAnchor | null, t: CommandTrackState = track()) {
+    let seen: CommandBracketContext | null = null;
+    const view = renderOnSubject(subject, t, { render: (ctx) => ((seen = ctx), null) });
+    return { ctx: seen as unknown as CommandBracketContext, view };
+  }
+
+  /* An observed result out of frame or occluded: no coordinates at all. */
+  const unseen = (o: Partial<FrameAnchor>): FrameAnchor => ({
+    id: "subject",
+    owner: "kerbcast",
+    observed: true,
+    inFrame: true,
+    ...o,
+  });
+
+  it("brackets the subject where it really is, not the frame centre", () => {
+    const { ctx, view } = seenWith(subjectAnchor());
+    expect([ctx.geometry.cx, ctx.geometry.cy, ctx.geometry.half]).toEqual([256, 144, 40]);
+    expect(ctx.subject?.id).toBe("subject");
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("placed");
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBeNull();
+  });
+
+  it("maps a capture frame larger than the decoded video by the frame's own size", () => {
+    let seen: CommandBracketContext | null = null;
+    renderOnSubject(
+      subjectAnchor({ x: 512, y: 288, apparentRadiusPx: 80 }),
+      track(),
+      { render: (ctx) => ((seen = ctx), null) },
+      { width: 2048, height: 1152 },
+    );
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy, g.half]).toEqual([256, 144, 40]);
+  });
+
+  it("falls back to the 1.11 box when the subject is occluded: centred, aimed range, aim-line colour", () => {
+    const t = track({ occluded: true, occluder: "Mun" });
+    const { ctx, view } = seenWith(unseen({ occluded: true }), t);
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 20, 576));
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("centred");
+    expect(ctx.subject?.occluded).toBe(true);
+  });
+
+  it("falls back to the 1.11 box, corners drawn, when the subject is out of frame", () => {
+    const { ctx, view } = seenWith(unseen({ inFrame: false, occluded: false }));
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(view.container.querySelectorAll("path")).toHaveLength(2);
+    expect(screen.getByText("IN VIEW · 4.2 km")).toBeTruthy();
+  });
+
+  it("keeps the 1.11 box under the command lock even with the subject in view", () => {
+    /* The authority aims somewhere else; the box is its aim, the anchor a second mark for the consumer. */
+    const locked = track({ authority: AUTHORITY, occluded: true, occluder: "Mun", bracketHalfPx: 30 });
+    const { ctx, view } = seenWith(subjectAnchor(), locked);
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 30, 576));
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    expect(ctx.subject).toMatchObject({ id: "subject", x: 256, y: 144 });
+    expect(screen.getByText("OCCLUDED MUN · 4.2 km")).toBeTruthy();
+  });
+
+  it("centres on the frame as before without a subject anchor", () => {
+    const { ctx } = seenWith(null);
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(ctx.subject).toBeNull();
   });
 });
 

@@ -119,7 +119,7 @@ namespace Kerbcast
                 RenderTexture.active = _capture.CaptureRt;
                 GL.Clear(true, true, Color.black);
                 RenderTexture.active = prev;
-                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit);
+                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit, new FrameMeta { FovDeg = Fov });
             }
             catch (Exception ex)
             {
@@ -246,6 +246,7 @@ namespace Kerbcast
         // closure allocation on the hot path).
         private readonly Action<RenderTexture, RenderTexture> _captureBlit;
         private readonly MmapFrameRing _ring;
+        private readonly AnchorProjector _anchors;
         private readonly string _ringPath;
         private readonly string _infoPath;
         private readonly string _controlPath;
@@ -490,7 +491,8 @@ namespace Kerbcast
             // shrinks the rendered frame but the ring's slot capacity
             // stays the same. Each slot's header carries the actual
             // content size so the sidecar encodes at the current dim.
-            _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight);
+            _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight, AnchorProjector.MetaSlotBytes);
+            _anchors = new AnchorProjector(FlightId);
             WriteInfoManifest();
 
             // Failure-streak (_consecutiveErrors + LogRateLimited) and the
@@ -2205,7 +2207,9 @@ namespace Kerbcast
                 // frame-constant, so reading it here yields the same value the
                 // pre-extraction Request site read.
                 double captureTsMs = Time.unscaledTime * 1000.0;
-                _capture.Publish(captureTsMs, _captureBlit);
+                var rt = _capture.CaptureRt;
+                var meta = _anchors.Build(this, rt != null ? rt.width : 0, rt != null ? rt.height : 0);
+                _capture.Publish(captureTsMs, _captureBlit, meta);
             }
             catch (Exception ex)
             {
