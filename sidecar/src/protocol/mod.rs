@@ -384,6 +384,12 @@ pub struct CommandAim {
     /// Metres of view kept around the subject's own size when framing. Default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing_margin_m: Option<f64>,
+    /// `vessel`: accept a craft whose position is too uncertain for the view
+    /// to frame, as a deliberate search of the region it may be in; without
+    /// it such an aim is refused as `tooUncertain`. Ignored on other kinds.
+    /// Default false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_uncertain: Option<bool>,
 }
 
 /// Whether a command camera's tracking network could watch a craft. Only

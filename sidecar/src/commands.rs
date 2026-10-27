@@ -325,6 +325,7 @@ mod tests {
             elevation: None,
             subject_persistent_id: None,
             framing_margin_m: None,
+            allow_uncertain: None,
         }
     }
 
@@ -379,6 +380,21 @@ mod tests {
     #[test]
     fn aim_validation() {
         assert!(validate_aim(&aim(CommandAimKind::Vessel)).is_err());
+
+        let search: CommandAim =
+            serde_json::from_str(r#"{"kind":"vessel","persistentId":7,"allowUncertain":true}"#)
+                .unwrap();
+        assert_eq!(search.allow_uncertain, Some(true));
+        assert!(validate_aim(&search).is_ok());
+        let json = serde_json::to_string(&search).unwrap();
+        assert!(json.contains(r#""allowUncertain":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<CommandAim>(&json).unwrap(), search);
+        let plain: CommandAim =
+            serde_json::from_str(r#"{"kind":"vessel","persistentId":7}"#).unwrap();
+        assert_eq!(plain.allow_uncertain, None, "absent is false");
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("allowUncertain"));
         assert!(validate_aim(&CommandAim {
             persistent_id: Some(7),
             ..aim(CommandAimKind::Vessel)

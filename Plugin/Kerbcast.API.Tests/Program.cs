@@ -146,6 +146,9 @@ using (var kc = RecordingKerbcast.Install())
     Check(cmd.SetAim(501, Aim.Vessel(42), "modA") == AimResult.NotCommandFeed, "an unknown feed is refused");
     kc.Command.AimJudge = (id, a) => a.SubjectPersistentId == 13 ? AimResult.TooUncertain : AimResult.Ok;
     Check(cmd.SetAim(500, Aim.Vessel(13), "modA") == AimResult.TooUncertain && kc.Command.Aims.Count == 0, "the judge decides and a refusal is not kept");
+    kc.Command.AimJudge = (id, a) => a.SubjectPersistentId == 13 && !a.AllowUncertain ? AimResult.TooUncertain : AimResult.Ok;
+    Check(cmd.SetAim(500, Aim.Vessel(13, allowUncertain: true), "modA") == AimResult.Ok && kc.Command.Aims[500].AllowUncertain,
+        "an aim that allows an uncertain craft reaches the implementation with the flag");
     Check(cmd.SetAim(500, Aim.Orbit(1, 0, 0.01, 700000, 0, 0, 0, 0, 42), "modA") == AimResult.Ok
         && kc.Command.Aims[500].Kind == AimKind.Orbit && kc.Command.Aims[500].SemiMajorAxis == 700000, "the holder's aim is kept");
     Check(cmd.Feeds().Single().SiteKey == "KSC" && cmd.Targets(500).Count == 0, "feeds and targets as arranged");
@@ -442,6 +445,8 @@ Check(Quatd.Identity.W == 1 && !new Quatd(0, 0, 0, double.PositiveInfinity).IsFi
 var surfaceAim = Aim.Surface(1, -0.1, -74.5, 70, 5);
 Check(surfaceAim.Kind == AimKind.Surface && surfaceAim.BodyIndex == 1 && surfaceAim.FramingMarginM == 5 && !surfaceAim.AllowUncertain, "Aim factories fill their kind");
 Check(Aim.Vessel(5, allowUncertain: true).AllowUncertain && Aim.Direction(90, 10).Elevation == 10, "Aim flags and direction");
+Check(Aim.Vessel(5, allowUncertain: true).ToString() == "Vessel(5, allowUncertain)" && Aim.Vessel(5).ToString() == "Vessel(5)",
+    "a vessel aim's text says when it allows an uncertain craft, so a recording shows it");
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

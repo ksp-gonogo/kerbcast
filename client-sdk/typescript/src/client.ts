@@ -1766,7 +1766,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * Point a command camera by `aim`, or return it to its default with `null`
    * (the active craft in flight, the configured craft at the Space Center).
    * A `vessel` aim follows any craft from `commandCentre.targets`, whatever
-   * its eligibility. The aim shows up in `commandCentre.aimKind` and
+   * its eligibility; `allowUncertain` also accepts one whose position a
+   * governing world model cannot narrow enough to frame (`tooUncertain`), as
+   * a deliberate search of the region. The aim shows up in
+   * `commandCentre.aimKind` and
    * `.subjectPersistentId` once the game applies it.
    *
    * Rejects at once while the camera's state reports a command authority

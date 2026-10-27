@@ -768,6 +768,13 @@ export interface CommandAim {
 	subjectPersistentId?: number;
 	/** Metres of view kept around the subject's own size when framing. Default 0. */
 	framingMarginM?: number;
+	/**
+	 * `vessel`: accept a craft whose position is too uncertain for the view
+	 * to frame, as a deliberate search of the region it may be in; without
+	 * it such an aim is refused as `tooUncertain`. Ignored on other kinds.
+	 * Default false.
+	 */
+	allowUncertain?: boolean;
 }
 
 /** Which kind of place a created command camera stands at. */

@@ -636,6 +636,19 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         Check(lag < 1e-6 && !slewed, $"slew: {aimRate} deg/s with 1 Hz publishes that agree stays on the aim with no slew ({lag:G2} deg)");
     }
 
+    /* A world model publishing on every solve: no smooth step at all. Steady and accelerating aims stay on. */
+    foreach (var (name, at) in new (string, Func<double, double>)[] { ("8 deg/s", t => 8 * t), ("accelerating at 8 deg/s^2", t => 4 * t * t) })
+    {
+        var every = new AimSlew();
+        double lag = 0;
+        for (int i = 0; i < 600; i++)
+        {
+            var aim = Dir(at(i * Dt));
+            lag = Math.Max(lag, Deg(every.Step(aim, Dt, true, 1.0), aim));
+        }
+        Check(lag < 0.02, $"slew: {name} with a publish every frame stays within 2% of a 1 degree field ({lag:G2} deg)");
+    }
+
     /* A 30 degree jump. */
     var slew = new AimSlew();
     slew.Step(Dir(0), Dt, false, Fov);

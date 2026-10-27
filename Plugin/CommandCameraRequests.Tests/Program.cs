@@ -94,6 +94,10 @@ Check(CommandCameraRequest.ParseFile(@"{""requests"":[{""id"":1,""op"":""create"
 CommandAimSpec AimOf(string json) =>
     CommandCameraRequest.ParseFile(@"{""requests"":[{""id"":1,""op"":""aim"",""flightId"":5,""aim"":" + json + "}]}", null)[0].Aim;
 Check(new CommandAimSpec { Kind = "vessel", PersistentId = 0 }.Invalid() != null, "vessel aim needs an id");
+var search = AimOf(@"{""kind"":""vessel"",""persistentId"":7,""allowUncertain"":true}");
+Check(search.AllowUncertain && search.PersistentId == 7 && search.Invalid() == null, "a vessel aim can allow an uncertain craft");
+Check(!AimOf(@"{""kind"":""vessel"",""persistentId"":7}").AllowUncertain, "allowUncertain is false when absent");
+Check(!AimOf(@"{""kind"":""vessel"",""persistentId"":7,""allowUncertain"":""yes""}").AllowUncertain, "and anything but true is false");
 Check(new CommandAimSpec { Kind = "vessel", PersistentId = 9 }.Invalid() == null, "vessel aim with an id is valid");
 Check(new CommandAimSpec { Kind = "surface", Body = "Mun", Latitude = 0, Longitude = 0, FramingMarginM = -1 }.Invalid() != null,
     "negative framing margin refused");

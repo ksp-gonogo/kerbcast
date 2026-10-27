@@ -28,6 +28,8 @@ namespace Kerbcast
         public double Azimuth = double.NaN, Elevation = double.NaN;
         public uint SubjectPersistentId;
         public double FramingMarginM;
+        /* A vessel aim at a craft too uncertain to frame, accepted on purpose: a search. */
+        public bool AllowUncertain;
 
         public string Invalid()
         {
@@ -182,6 +184,7 @@ namespace Kerbcast
                 Elevation = Num(a, "elevation", double.NaN),
                 SubjectPersistentId = U32(a, "subjectPersistentId"),
                 FramingMarginM = Num(a, "framingMarginM", 0),
+                AllowUncertain = Bool(a, "allowUncertain"),
             };
         }
 
@@ -203,6 +206,9 @@ namespace Kerbcast
 
         private static string Str(Dictionary<string, object> o, string key) =>
             o.TryGetValue(key, out var v) && v is string s ? s : "";
+
+        private static bool Bool(Dictionary<string, object> o, string key) =>
+            o.TryGetValue(key, out var v) && v is bool b && b;
 
         private static double Num(Dictionary<string, object> o, string key, double fallback) =>
             o.TryGetValue(key, out var v) && v is double d ? d : fallback;

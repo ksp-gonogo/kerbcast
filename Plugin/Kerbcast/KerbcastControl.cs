@@ -447,7 +447,7 @@ namespace Kerbcast
             switch (spec.Kind)
             {
                 case "vessel":
-                    return CommandAim.Vessel(spec.PersistentId, spec.FramingMarginM);
+                    return CommandAim.Vessel(spec.PersistentId, spec.FramingMarginM, spec.AllowUncertain);
                 case "orbit":
                     return CommandAim.Orbit(spec.Body, spec.Inclination, spec.Eccentricity, spec.SemiMajorAxis, spec.Lan,
                         spec.ArgumentOfPeriapsis, spec.MeanAnomalyAtEpoch, spec.Epoch, spec.SubjectPersistentId, spec.FramingMarginM);

@@ -801,6 +801,11 @@ describe("KerbcastClient", () => {
         elevation: 30,
         framingMarginM: 50,
       });
+      await client.setCommandAim(2147483905, {
+        kind: CommandAimKind.Vessel,
+        persistentId: 4000000002,
+        allowUncertain: true,
+      });
       await client.setCommandAim(2147483905, null);
       expect(captured.dc?.sent).toEqual([
         JSON.stringify({ type: "destroy-command-camera", content: { flightId: 2147483905 } }),
@@ -813,6 +818,13 @@ describe("KerbcastClient", () => {
           content: {
             flightId: 2147483905,
             aim: { kind: "direction", azimuth: 90, elevation: 30, framingMarginM: 50 },
+          },
+        }),
+        JSON.stringify({
+          type: "set-command-aim",
+          content: {
+            flightId: 2147483905,
+            aim: { kind: "vessel", persistentId: 4000000002, allowUncertain: true },
           },
         }),
         JSON.stringify({ type: "set-command-aim", content: { flightId: 2147483905 } }),
@@ -832,6 +844,10 @@ describe("KerbcastClient", () => {
       expect(err).toBeInstanceOf(CommandLockedError);
       expect((err as CommandLockedError).owner).toBe("mission-control");
       expect((err as CommandLockedError).code).toBe(ErrorCode.CommandLocked);
+      const search = await client
+        .setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 7, allowUncertain: true })
+        .catch((e: unknown) => e);
+      expect(search).toBeInstanceOf(CommandLockedError);
       expect(captured.dc?.sent).toEqual([]);
 
       snapshot([commandCamera(300)]);

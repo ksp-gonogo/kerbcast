@@ -22,12 +22,23 @@ namespace Kerbcast
         public const double SnapAfterS = 1.0;
         /* An offset under this fraction of the vertical field (about a quarter pixel at 1080 rows) is not slewed. */
         public const double MinOffsetFieldFraction = 1.0 / 4320.0;
+        /*
+         * A jump that leaves less than this fraction of the field over is the
+         * aim's own motion as much as a correction, so the rate is learned from
+         * it too: a world model publishing on every solve leaves no smooth step
+         * to learn from. Before any rate is known, a jump of FirstLearnFields
+         * fields or less is learned from and followed; a larger one is slewed
+         * as from a still view.
+         */
+        public const double LearnFieldFraction = 0.02;
+        public const double FirstLearnFields = 0.5;
         private const double Deg2Rad = Math.PI / 180.0;
 
         private bool _has;
         private DVec3 _lastAim, _lastView;
-        /* The aim's own turn, as a rotation vector per second, from its last step that was not a jump. */
+        /* The aim's own turn, as a rotation vector per second, from its last step that was not a jump or was one close to the motion. */
         private DVec3 _rate;
+        private bool _rateKnown;
         /* The view's offset from the aim, as a rotation vector, and the speed it is being turned out at. */
         private DVec3 _offset;
         private double _speed;
@@ -40,6 +51,7 @@ namespace Kerbcast
         {
             _has = false;
             _offset = _rate = default;
+            _rateKnown = false;
             _speed = 0;
         }
 
@@ -53,15 +65,25 @@ namespace Kerbcast
                 _lastAim = _lastView = aim;
                 return aim;
             }
-            if (jumped)
+            double field = fovDeg * Deg2Rad;
+            var moved = RotationVector(_lastAim, aim);
+            if (jumped && !_rateKnown && dt > 0 && moved.Magnitude <= FirstLearnFields * field)
+            {
+                /* Nothing to carry the view on with yet: a step the size of motion is learned from and followed. */
+                Learn(moved, dt);
+                _offset = default;
+                _speed = 0;
+            }
+            else if (jumped)
             {
                 /* The view carries on with the aim's own motion; only what is left over is turned out, keeping any speed already turning. */
                 var carried = Turn(_lastView, _rate * dt);
                 _offset = RotationVector(aim, carried);
-                if (_offset.Magnitude < MinOffsetFieldFraction * fovDeg * Deg2Rad) _offset = default;
+                if (dt > 0 && _offset.Magnitude < LearnFieldFraction * field) Learn(moved, dt);
+                if (_offset.Magnitude < MinOffsetFieldFraction * field) _offset = default;
                 if (_offset.Magnitude == 0) _speed = 0;
             }
-            else if (dt > 0) _rate = RotationVector(_lastAim, aim) * (1.0 / dt);
+            else if (dt > 0) Learn(moved, dt);
 
             double left = _offset.Magnitude;
             if (left > 0)
@@ -82,6 +104,12 @@ namespace Kerbcast
             _lastAim = aim;
             _lastView = view;
             return view;
+        }
+
+        private void Learn(DVec3 moved, double dt)
+        {
+            _rate = moved * (1.0 / dt);
+            _rateKnown = true;
         }
 
         /* The rotation vector taking unit `from` to unit `to`. */

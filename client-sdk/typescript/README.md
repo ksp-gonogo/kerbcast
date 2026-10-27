@@ -251,7 +251,12 @@ at the Space Center. `createCommandCamera` takes the same `aim` as an option.
 The aim is one of:
 
 - `vessel`: follows the craft with that `persistentId` (any entry of
-  `commandCentre.targets`, whatever its eligibility)
+  `commandCentre.targets`, whatever its eligibility). Where a world model
+  governs the feed, a craft whose position it cannot narrow enough for the
+  view to frame is refused as `tooUncertain`; add `allowUncertain: true` to
+  aim at it anyway, as a deliberate search of the region it may be in. Under
+  the game's own knowledge every known craft is accepted, and while a command
+  lock is held browser aims are refused whatever they allow
 - `orbit`: follows a conic (`body`, `inclination`, `eccentricity`,
   `semiMajorAxis`, `lan`, `argumentOfPeriapsis` in degrees and metres,
   `meanAnomalyAtEpoch` in radians, `epoch`)

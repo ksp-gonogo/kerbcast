@@ -72,7 +72,7 @@ namespace Kerbcast.Api
         public int BodyIndex { get; }
         public double FramingMarginM { get; }
 
-        /** <summary>Accept a subject whose uncertainty is wider than the view could frame: a deliberate search of a region.</summary> */
+        /** <summary>Accept a subject whose uncertainty is wider than the view could frame: a deliberate search of a region. Only a Vessel aim is judged for uncertainty, so on any other kind it changes nothing.</summary> */
         public bool AllowUncertain { get; }
 
         public double Inclination { get; }
@@ -156,7 +156,7 @@ namespace Kerbcast.Api
         {
             switch (Kind)
             {
-                case AimKind.Vessel: return $"Vessel({SubjectPersistentId})";
+                case AimKind.Vessel: return AllowUncertain ? $"Vessel({SubjectPersistentId}, allowUncertain)" : $"Vessel({SubjectPersistentId})";
                 case AimKind.Orbit: return $"Orbit(body {BodyIndex}, sma {SemiMajorAxis}, e {Eccentricity})";
                 case AimKind.Surface: return $"Surface(body {BodyIndex}, {Latitude}, {Longitude}, {Altitude})";
                 case AimKind.PositionAt: return $"PositionAt(body {BodyIndex}, ut {Ut})";

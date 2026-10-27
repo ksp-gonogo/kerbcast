@@ -4229,9 +4229,24 @@ mod tests {
         assert!(message.contains("mission-control"), "{message}");
         assert!(!shm.join(COMMANDS_FILE).exists());
 
+        /* A search of a region is still an aim: the holder's lock refuses it as well. */
+        let search = || SetCommandAimPayload {
+            flight_id: id,
+            aim: Some(
+                serde_json::from_str(r#"{"kind":"vessel","persistentId":7,"allowUncertain":true}"#)
+                    .unwrap(),
+            ),
+        };
+        let (_, code) = registry.request_command_aim(search()).await.unwrap_err();
+        assert_eq!(code, Some(ErrorCode::CommandLocked));
+        assert!(!shm.join(COMMANDS_FILE).exists());
+
         write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"mission-control"},"#, ""));
         registry.poll_status().await;
         assert!(registry.request_command_aim(aim()).await.is_ok());
+        assert!(registry.request_command_aim(search()).await.is_ok());
+        let written = std::fs::read_to_string(shm.join(COMMANDS_FILE)).unwrap();
+        assert!(written.contains(r#""allowUncertain":true"#), "{written}");
     }
 
     /// An aim at a craft missing from the camera's latest target list (one
