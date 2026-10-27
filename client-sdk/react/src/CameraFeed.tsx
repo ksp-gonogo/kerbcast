@@ -267,8 +267,9 @@ export interface CameraFeedProps {
   enableRecording?: boolean;
   /**
    * Record this feed at the operator's full render size for the duration of
-   * the built-in REC control's recording (overrides only the display-size
-   * demand; still yields to the adaptive framerate shed). Off by default.
+   * the built-in REC control's recording (overrides the display-size
+   * demand and any viewer quality preset; still capped by an operator
+   * render-size cap and the adaptive shed). Off by default.
    * Threaded straight into `start(flightId, { forceFullResolution })`; has
    * no effect unless `enableRecording` is also set. While the feed is armed
    * (force sent, waiting for the resolution bump) the tile shows an
@@ -955,6 +956,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
        yet (see ActiveRecordingInfo.arming). Drives the ARMING pill below in
        place of the REC badge. */
     const armingActive = activeRecording?.arming === true;
+    /* Stopped, clip not in the store yet (ActiveRecordingInfo.stopping). */
+    const savingActive = activeRecording?.stopping === true;
 
     // Ticks once a second while recording so the elapsed timer stays live;
     // the timer itself is derived from activeRecording.startedAt each render.
@@ -1499,10 +1502,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   ARMING
                 </ArmingBadge>
               )}
-              {recordingActive && !armingActive && (
+              {recordingActive && !armingActive && !savingActive && (
                 <RecBadge role="status" aria-label="Recording">
                   <RecDot aria-hidden="true" />
                   REC {formatElapsed(recordingElapsedMs)}
+                </RecBadge>
+              )}
+              {recordingActive && savingActive && (
+                <RecBadge role="status" aria-label="Saving recording">
+                  SAVING
                 </RecBadge>
               )}
               {showZoom && (

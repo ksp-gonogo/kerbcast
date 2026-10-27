@@ -1,11 +1,16 @@
 /*
  * Client-side camera recording.
  *
- * Records an already-received WebRTC camera track with the browser's
- * MediaRecorder, annotating the clip with the mission-time (UT) clock so a
- * consumer can align frames to telemetry. Pure client-side: no sidecar,
- * plugin, protocol, or network involvement. The sidecar never learns a
- * recording happened.
+ * Records an already-received WebRTC camera feed, annotating the clip with
+ * the mission-time (UT) clock so a consumer can align frames to telemetry.
+ * Two timings: "capture" keeps the feed's encoded H.264 frames as received
+ * and times them by their RTP timestamps (when the game captured them), so
+ * a network stall leaves no trace in the file; "arrival" records the decoded
+ * track with the browser's MediaRecorder, which times frames as they arrive.
+ * Capture timing needs the client built with `recordingTiming: "capture"`;
+ * a clip falls back to arrival timing when its frames cannot be copied.
+ * Client-side apart from one keyframe request when a capture-timed clip
+ * starts.
  *
  * The value-add over a bare MediaRecorder is the UT track: `utStart` /
  * `utEnd` bracket the clip, and `utSamples` is a ~1Hz series of
@@ -15,17 +20,74 @@
  * and upgrade automatically once UT appears.
  */
 
-import type { CameraState } from "./__generated__/types";
+import { CameraLifecycle, type CameraState } from "./__generated__/types";
+import { CaptureClip, type CaptureClipCut, type EncodedFrameCopy } from "./captureClip";
+import type { ContactGap } from "./client";
 
 /**
- * One point on a recording's UT track. `t` is milliseconds since recording
- * start; `ut` is the KSP universal time (seconds) the capture clock reported
- * at that instant, or absent when out of flight (no clock).
+ * How a clip's frames are timed. `"capture"`: by when the game captured each
+ * frame (its RTP timestamp), so playback keeps the game's pace through
+ * network stalls; an MP4 of the frames as received, never re-encoded.
+ * `"arrival"`: by when each frame reached the browser (MediaRecorder), so a
+ * stall plays back as a freeze followed by a burst.
+ */
+export type RecordingTiming = "capture" | "arrival";
+
+/**
+ * One point on a recording's UT track. `t` is milliseconds into the clip;
+ * `ut` is the KSP universal time (seconds) at that point, or absent when out
+ * of flight (no clock).
  */
 export interface UtSample {
   t: number;
   ut?: number;
 }
+
+/**
+ * Why a recording ended. `"user"`: stopped by a call (a Stop button, a
+ * grouped stop). `"max-duration"`: its `maxDurationMs` ran out.
+ * `"camera-gone"`: its camera went away (destroyed, as in a scene change, or
+ * dropped from the camera list). `"feed-closed"`: the camera is still there
+ * but its feed left this client (its tile removed or switched to another
+ * camera, its track ended) and did not come back within
+ * {@link SOURCE_LOST_GRACE_MS}. `"disconnected"`: the client
+ * lost the sidecar and did not get the camera back within
+ * {@link RECONNECT_GRACE_MS}. Whatever the reason, the clip keeps everything
+ * recorded up to then.
+ */
+export type RecordingEndReason =
+  | "user"
+  | "max-duration"
+  | "camera-gone"
+  | "feed-closed"
+  | "disconnected";
+
+/**
+ * How long a recording waits for its camera's feed to come back after the
+ * feed leaves this client while still connected (a slot freed or moved, a
+ * track ended) before it finishes as `"feed-closed"`. Covers a feed that is
+ * unmounted and mounted again in one layout change.
+ */
+export const SOURCE_LOST_GRACE_MS = 2000;
+
+/**
+ * How long a recording waits for the client to reconnect and its camera's
+ * feed to return before it finishes as `"disconnected"`, counted from when
+ * the client last heard from the sidecar, so a page that was paused or asleep
+ * through the drop counts that time too. A silence this long that ends with
+ * messages arriving again (ones held back while the page was paused) ends
+ * the recording the same way.
+ *
+ * A sidecar that takes `resume` keeps a departed client's force and size
+ * hold for 30 s from when it reaps the old connection. The earliest reap is
+ * at the client's last contact (a connection closed outright); a silent one
+ * is reaped about 30 s later (ICE reports Disconnected after 5 s of silence,
+ * the reaper waits 30 s). So the holds last at least 30 s from last contact,
+ * and 25 s leaves 5 s for the resume itself, while a drop the page only
+ * finds through its 15 s ping watchdog and 2 s reconnect backoff still has
+ * about 8 s to come back.
+ */
+export const RECONNECT_GRACE_MS = 25_000;
 
 /** The finished, in-memory result of a single-feed recording. */
 export interface RecordingHandle {
@@ -36,24 +98,53 @@ export interface RecordingHandle {
   blob: Blob;
   /** The negotiated container/codec (e.g. `video/mp4;codecs=avc1`). */
   mimeType: string;
+  /**
+   * How the clip's frames are timed. Always set by
+   * {@link RecordingController}; a handle built elsewhere without it is
+   * taken as `"arrival"`.
+   */
+  timing?: RecordingTiming;
   /** UT (seconds) at recording start, or absent when out of flight. */
   utStart?: number;
   /** UT (seconds) at recording stop, or absent when out of flight. */
   utEnd?: number;
-  /** ~1Hz (recording-time, UT) series across the clip. Always present. */
+  /**
+   * (clip-time, UT) series across the clip. Always present. A capture-timed
+   * clip whose frames carried capture stamps has one sample per frame, `t`
+   * being the frame's own time in the file and `ut` exact; otherwise the
+   * samples come from the ~1Hz capture clock.
+   */
   utSamples: UtSample[];
   /** `blob.size` in bytes. */
   byteSize: number;
-  /** Wall-clock recording duration in milliseconds. */
+  /**
+   * Recording duration in milliseconds: the media length for a
+   * capture-timed clip with frames, the wall-clock span otherwise.
+   */
   durationMs: number;
+  /**
+   * Why the recording ended. Always set by {@link RecordingController}; a
+   * handle built elsewhere without it is taken as `"user"`.
+   */
+  endedBy?: RecordingEndReason;
+}
+
+/** Passed to {@link RecordingController.onRecordingEnded}. */
+export interface RecordingEndedEvent {
+  /** The saved clip, as it stands in the snapshot. */
+  recording: RecordingHandle;
+  /** Set when the clip belongs to a grouped recording. */
+  groupId?: string;
+  endedBy: RecordingEndReason;
 }
 
 /** Options for {@link RecordingController.startRecording}. */
 export interface StartRecordingOptions {
   /**
-   * Preferred container/codec. Tried first; if MediaRecorder can't support
-   * it, negotiation falls back (mp4 -> webm/vp9 -> webm). Omit to let
-   * negotiation choose.
+   * Preferred container/codec for an arrival-timed clip. Tried first; if
+   * MediaRecorder can't support it, negotiation falls back (mp4 -> webm/vp9
+   * -> webm). Omit to let negotiation choose. A capture-timed clip is always
+   * H.264 in MP4, the codec the feed already uses.
    */
   mimeType?: string;
   /**
@@ -64,8 +155,9 @@ export interface StartRecordingOptions {
   maxDurationMs?: number;
   /**
    * Force this feed to the operator's full render size for the duration of
-   * the recording (overrides the display-size demand only; still yields to
-   * the adaptive framerate shed). Off by default. The recording arms and
+   * the recording (overrides the display-size demand and any viewer
+   * quality preset; still capped by an operator render-size cap and the
+   * adaptive shed). Off by default. The recording arms and
    * waits (bounded) until the browser is decoding full-size frames before
    * the clip starts: MediaRecorder fixes the clip's frame size when it
    * starts, so a later bump would never reach the file. A grouped recording
@@ -131,8 +223,11 @@ export interface GroupedRecordingHandle {
   /** One handle per feed, in the order the group was started. */
   recordings: RecordingHandle[];
   /**
-   * The UT span all feeds cover: [max(utStart), min(utEnd)] across the clips.
-   * Absent when any clip lacks UT or the ranges don't overlap. Each clip's
+   * The UT span all feeds cover: [max(utStart), min(utEnd)] across the clips
+   * that ran to the group's stop. A clip whose camera went away early does
+   * not narrow it (unless every clip did), so losing one camera never cuts
+   * the others short. Absent when any clip lacks UT or the ranges don't
+   * overlap. Each clip's
    * own `utSamples` let a consumer map this window to that clip's
    * recording-time and trim/seek itself (metadata alignment; no physical cut).
    */
@@ -157,6 +252,14 @@ export interface ActiveRecordingInfo {
    * distinct "arming" state while this is true.
    */
   arming: boolean;
+  /**
+   * True from the moment the recording is stopped until its clip is in
+   * {@link RecordingsSnapshot.recordings} (or its group's). A capture-timed
+   * clip settles within milliseconds; an arrival-timed one waits for
+   * MediaRecorder's last chunk. A page that must not close mid-save waits
+   * for this to clear, or awaits the promise `stopRecording` returns.
+   */
+  stopping: boolean;
 }
 
 /**
@@ -191,7 +294,29 @@ export interface RecordingClientCamera {
    */
   readonly maxRenderSize: { width: number; height: number } | null;
   setForceFullResolution(force: boolean): Promise<void>;
+  /**
+   * Holds the feed at its current size while it is recorded. Without it a
+   * recording that crosses a size change still plays (the clip gets a
+   * sample entry per size), but some tools handle that worse.
+   */
+  setSizeHold?(hold: boolean): Promise<void>;
+  /**
+   * Whether this client receives the feed now. A recording whose feed stays
+   * gone past a grace finishes on its own; without it only a destroyed or
+   * unlisted camera ends one.
+   */
+  readonly hasSource?: boolean;
   on(event: "change", handler: (state: CameraState) => void): () => void;
+  on(event: "source", handler: (hasSource: boolean) => void): () => void;
+  /**
+   * Copies the feed's encoded frames until the returned function is called,
+   * or returns null when it can't. Without it every clip is arrival-timed.
+   */
+  tapEncodedFrames?(onFrame: (frame: EncodedFrameCopy) => void): (() => void) | null;
+  /** Whether {@link tapEncodedFrames} would copy frames now; decides a clip's timing at start. */
+  canTapEncodedFrames?(): boolean;
+  /** Asks the sidecar for a keyframe, so a capture-timed clip can open promptly. */
+  requestKeyframe?(): Promise<void>;
 }
 
 /**
@@ -202,7 +327,29 @@ export interface RecordingClientCamera {
 export interface RecordingClient {
   camera(flightId: number): RecordingClientCamera;
   readonly clock: { readonly captureUt: number | null };
+  /** The connection state; a recording losing its feed while not `"connected"` waits for a reconnect. */
+  readonly state?: string;
+  /**
+   * When the client last heard from the sidecar, as `Date.now()`. A dropped
+   * connection's {@link RECONNECT_GRACE_MS} counts from here; without it,
+   * from when the recording saw its feed go.
+   */
+  readonly lastContactAt?: number | null;
   on(event: "settings-change", handler: (data: unknown) => void): () => void;
+  /** A recording whose camera leaves the list, or is listed as destroyed, finishes. */
+  on(event: "cameras-change", handler: (cameras: CameraState[]) => void): () => void;
+  /** A connection that drops while a feed is missing gives the feed {@link RECONNECT_GRACE_MS} to return. */
+  on(event: "state-change", handler: (state: string) => void): () => void;
+  /** A silence of {@link RECONNECT_GRACE_MS} or more ends a recording as `"disconnected"`. */
+  on(event: "contact-gap", handler: (gap: ContactGap) => void): () => void;
+  /**
+   * A frame's mission time by RTP timestamp; only `source: "exact"` results
+   * are used, giving a capture-timed clip its per-frame UT track.
+   */
+  frameUt?(
+    flightId: number,
+    rtpTimestamp: number,
+  ): { ut: number; source: "exact" | "estimated" } | null;
 }
 
 /* MediaRecorder is a DOM lib global; keep a minimal structural view so this
@@ -217,6 +364,222 @@ interface MediaRecorderLike {
 interface MediaRecorderCtor {
   new (stream: MediaStream, options?: { mimeType?: string }): MediaRecorderLike;
   isTypeSupported?(type: string): boolean;
+}
+
+/** What a {@link ClipRecorder} hands back when it stops. */
+interface ClipOutput {
+  blob: Blob;
+  mimeType: string;
+  timing: RecordingTiming;
+  /** Per-frame UT samples on the clip's own timeline (capture timing only). */
+  frameUtSamples?: UtSample[];
+  /** When the clip's first frame arrived (capture timing only), `now()` clock. */
+  firstFrameAt?: number | null;
+  /** The clip's media length in ms (capture timing only, when it has frames). */
+  mediaDurationMs?: number;
+  /** Cuts a stretch of the clip from its own samples (capture timing only). */
+  cut?: (startMs: number, endMs: number) => CaptureClipCut | null;
+}
+
+/** One clip's media capture, either timing. Started at most once. */
+interface ClipRecorder {
+  readonly timing: RecordingTiming;
+  /** The clip's container type as known before it stops. */
+  readonly mimeType: string;
+  start(): void;
+  /** Ends a started clip and resolves its media. */
+  stop(): Promise<ClipOutput>;
+  /** Abandons the clip, started or not, releasing everything it holds. */
+  cancel(): void;
+  /**
+   * Sets what to call when a started clip ends without {@link stop}: the
+   * browser stopped MediaRecorder because its track ended.
+   */
+  onEndedByItself?(handler: () => void): void;
+}
+
+/** Arrival timing: MediaRecorder over the decoded track. */
+function mediaRecorderClip(recorder: MediaRecorderLike, mimeType: string): ClipRecorder {
+  const chunks: Blob[] = [];
+  let ended = false;
+  let stopping = false;
+  let endedByItself: (() => void) | null = null;
+  const waiting: Array<() => void> = [];
+  recorder.addEventListener("dataavailable", (e) => {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  });
+  /* The browser stops a recorder whose tracks all end and fires "stop"
+     once; a later stop() would wait for it forever. */
+  recorder.addEventListener("stop", () => {
+    ended = true;
+    if (!stopping) endedByItself?.();
+    for (const settle of waiting.splice(0)) settle();
+  });
+  return {
+    timing: "arrival",
+    mimeType,
+    start: () => recorder.start(),
+    stop: () =>
+      new Promise<ClipOutput>((resolve) => {
+        const settle = (): void =>
+          resolve({ blob: new Blob(chunks, { type: mimeType }), mimeType, timing: "arrival" });
+        if (ended) {
+          settle();
+          return;
+        }
+        stopping = true;
+        waiting.push(settle);
+        try {
+          recorder.stop();
+        } catch {
+          /* Already inactive: its "stop" event is on the way. */
+        }
+      }),
+    onEndedByItself: (handler) => {
+      endedByItself = handler;
+    },
+    cancel: () => {
+      stopping = true;
+      try {
+        if (recorder.state !== "inactive") recorder.stop();
+      } catch {
+        /* a recorder already torn down by the browser is fine to ignore */
+      }
+    },
+  };
+}
+
+/**
+ * How often a capture-timed clip waiting for a keyframe asks again. The
+ * sidecar honours each request with an IDR on the next encoded frame, and
+ * its periodic keyframe (every 2 s) bounds the wait if a request is lost.
+ */
+export const KEYFRAME_RETRY_MS = 1000;
+
+/**
+ * A hidden tab runs no animation frames, and a clip must still save there,
+ * so the wait for a paint gives up after this long.
+ */
+const PAINT_WAIT_MAX_MS = 100;
+
+/** Resolves once the page has had a frame to paint in, or after {@link PAINT_WAIT_MAX_MS}. */
+function afterPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    const raf = (globalThis as { requestAnimationFrame?: (cb: () => void) => number })
+      .requestAnimationFrame;
+    if (typeof raf !== "function") {
+      setTimeout(resolve, 16);
+      return;
+    }
+    raf(() => setTimeout(resolve, 0));
+    setTimeout(resolve, PAINT_WAIT_MAX_MS);
+  });
+}
+
+/** The muxes waiting their turn, so they run one per frame. */
+let muxQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Runs a clip's mux after the next paint. A long clip's mux holds the page
+ * for a noticeable moment, so the stopping state a UI shows (a SAVING badge)
+ * has to reach the screen first; queued muxes, as a REC+ stop makes, each
+ * get their own frame rather than running back to back.
+ */
+function muxAfterPaint<T>(mux: () => T): Promise<T> {
+  const turn = muxQueue.then(afterPaint).then(mux);
+  muxQueue = turn.catch(() => {});
+  return turn;
+}
+
+/**
+ * Capture timing: copies the feed's encoded frames from start to stop and
+ * muxes them into an MP4 timed by RTP. Returns null when the feed's frames
+ * can't be copied, so the caller falls back to arrival timing.
+ */
+function captureClipRecorder(
+  cam: RecordingClientCamera,
+  lookupUt: (rtpTimestamp: number) => { ut: number } | null,
+): ClipRecorder | null {
+  if (!cam.tapEncodedFrames || !cam.canTapEncodedFrames?.()) return null;
+  let clip: CaptureClip | null = null;
+  let untap: (() => void) | null = null;
+  let retry: ReturnType<typeof setInterval> | undefined;
+  const release = (): void => {
+    untap?.();
+    untap = null;
+    if (retry != null) clearInterval(retry);
+    retry = undefined;
+  };
+  const askForKeyframe = (): void => {
+    void cam.requestKeyframe?.().catch(() => {});
+  };
+  return {
+    timing: "capture",
+    mimeType: "video/mp4",
+    start: () => {
+      const target = new CaptureClip(lookupUt);
+      clip = target;
+      untap = cam.tapEncodedFrames?.((frame) => target.push(frame)) ?? null;
+      if (!untap) {
+        /* Lost between the decision and the start (a transform set while arming). */
+        console.warn("kerbcast: frame copy became unavailable before the recording started; the clip will be empty");
+        return;
+      }
+      askForKeyframe();
+      /* Also covers a mid-clip source change, which waits for a fresh keyframe. */
+      retry = setInterval(() => {
+        if (target.waitingForKeyframe) askForKeyframe();
+      }, KEYFRAME_RETRY_MS);
+    },
+    stop: () => {
+      release();
+      const finished = clip ?? new CaptureClip();
+      clip = null;
+      return muxAfterPaint((): ClipOutput => {
+        const result = finished.finish();
+        return {
+          blob: result.blob,
+          mimeType: result.mimeType,
+          timing: "capture",
+          frameUtSamples: result.frameUtSamples,
+          firstFrameAt: result.firstFrameAt,
+          ...(result.frameCount > 0 ? { mediaDurationMs: result.mediaDurationMs } : {}),
+          cut: (startMs: number, endMs: number) => finished.cut(startMs, endMs),
+        };
+      });
+    },
+    cancel: () => {
+      release();
+      clip = null;
+    },
+  };
+}
+
+/**
+ * The UT track for a finished clip. Per-frame stamps win when there are any;
+ * otherwise the ~1Hz clock samples, which for a capture-timed clip are moved
+ * onto its timeline (it opens at its first keyframe, not at start).
+ */
+function clipUtTrack(
+  output: ClipOutput,
+  clockSamples: UtSample[],
+  startedAt: number,
+  utStart: number | undefined,
+  utEnd: number | undefined,
+): { utSamples: UtSample[]; utStart?: number; utEnd?: number } {
+  const frames = output.frameUtSamples ?? [];
+  if (frames.length > 0) {
+    return { utSamples: frames, utStart: frames[0].ut, utEnd: frames[frames.length - 1].ut };
+  }
+  if (output.timing === "capture" && output.firstFrameAt != null) {
+    const offset = output.firstFrameAt - startedAt;
+    return {
+      utSamples: clockSamples.map((s) => ({ ...s, t: Math.max(0, s.t - offset) })),
+      utStart,
+      utEnd,
+    };
+  }
+  return { utSamples: clockSamples, utStart, utEnd };
 }
 
 /** Preference order for mime negotiation, after any caller-supplied choice. */
@@ -492,8 +855,7 @@ interface ActiveRecording {
   recordingId: string;
   flightId: number;
   mimeType: string;
-  recorder: MediaRecorderLike;
-  chunks: Blob[];
+  recorder: ClipRecorder;
   startedAt: number;
   utStart?: number;
   utSamples: UtSample[];
@@ -517,6 +879,8 @@ interface ActiveRecording {
   arming?: boolean;
   /** True once this recording has acquired the per-feed force ref-count. */
   forced?: boolean;
+  /** True while this recording holds the per-feed size hold ref-count. */
+  held?: boolean;
   /**
    * Cancels a pending arm-wait subscription (single, or one member of a
    * group). Set while a {@link RecordingController.watchResolutionReady}
@@ -527,6 +891,8 @@ interface ActiveRecording {
   cancelResolutionWatch?: () => void;
   /** The last decoded frame size the arm-wait saw, for the start log line. */
   lastDecodedSize?: () => { width: number; height: number } | null;
+  /** Detaches the watch on the camera that ends this recording when the camera goes away. */
+  unwatchCamera: () => void;
 }
 
 /** Arm state for a forced grouped recording whose recorders have not started yet. */
@@ -573,6 +939,8 @@ export class RecordingController {
   private readonly groupMemberIds = new Set<string>();
   /** recordingId -> groupId, so discarding one member can pull it out of its group's array. */
   private readonly memberOfGroup = new Map<string, string>();
+  /** Grouped capture-timed members' own cutters, held from their stop until the group is trimmed. */
+  private readonly cutters = new Map<string, NonNullable<ClipOutput["cut"]>>();
   /**
    * Per-feed force ref-count. The sidecar OR-aggregates force across
    * viewers already; this is the local mirror so two overlapping
@@ -588,9 +956,14 @@ export class RecordingController {
    * one; see {@link acquireForce}.
    */
   private readonly forceSendState = new Map<number, "pending" | "sent">();
+  /** Per-feed size hold ref-count: held while any recording of the feed runs. */
+  private readonly holdCounts = new Map<number, number>();
   /** groupId -> arm state, present only while a forced group is still arming. */
   private readonly groupArms = new Map<string, GroupArm>();
   private readonly listeners = new Set<() => void>();
+  private readonly endedListeners = new Set<(event: RecordingEndedEvent) => void>();
+  /** groupId -> the stop in progress, so a second stop (user or automatic) joins it. */
+  private readonly groupStops = new Map<string, Promise<GroupedRecordingHandle>>();
   private snapshot: RecordingsSnapshot = { recordings: [], groups: [], active: [] };
   /** While true, {@link rebuild} is a no-op; used to batch startGroupedRecording's
    *  per-member starts into a single notification once the group is fully set up. */
@@ -612,6 +985,149 @@ export class RecordingController {
 
   /** The current snapshot; the same object reference until the next mutation. */
   getSnapshot = (): RecordingsSnapshot => this.snapshot;
+
+  /**
+   * Calls `fn` each time a recording's clip is saved, with why it ended, so a
+   * UI can say when a recording stopped on its own (its camera went away, the
+   * connection did not come back). A grouped member is reported when its own
+   * clip is saved, before the group is trimmed. Returns an unsubscribe
+   * function.
+   */
+  onRecordingEnded(fn: (event: RecordingEndedEvent) => void): () => void {
+    this.endedListeners.add(fn);
+    return () => {
+      this.endedListeners.delete(fn);
+    };
+  }
+
+  private emitEnded(handle: RecordingHandle): void {
+    const groupId = this.memberOfGroup.get(handle.recordingId);
+    const event: RecordingEndedEvent = {
+      recording: handle,
+      ...(groupId != null ? { groupId } : {}),
+      endedBy: handle.endedBy ?? "user",
+    };
+    for (const fn of this.endedListeners) {
+      try {
+        fn(event);
+      } catch (err) {
+        console.error("kerbcast: recording-ended listener failed", err);
+      }
+    }
+  }
+
+  /**
+   * Ends a recording when its camera goes away, so the clip is saved rather
+   * than left recording a camera nobody can stop any more. A destroyed or
+   * unlisted camera ends it at once. A feed that leaves this client gets
+   * {@link SOURCE_LOST_GRACE_MS} to come back, or, once the connection has
+   * dropped, until {@link RECONNECT_GRACE_MS} after the sidecar was last
+   * heard from, as a reconnect brings it back.
+   */
+  private watchCamera(rec: ActiveRecording): () => void {
+    const cam = this.client.camera(rec.flightId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const clearTimer = (): void => {
+      if (timer != null) clearTimeout(timer);
+      timer = undefined;
+    };
+    const gone = (reason: RecordingEndReason): void => {
+      clearTimer();
+      this.endOnItsOwn(rec.recordingId, reason);
+    };
+    const connected = (): boolean => this.client.state == null || this.client.state === "connected";
+    /* Whether the connection dropped while the feed was missing: a reconnect
+       that is already back by the short grace still rebinds feeds after it. */
+    let dropped = false;
+    /* When the feed was last known live, as Date.now(). Once the connection
+       has dropped that is the last word from the sidecar, which can be long
+       before the page saw the drop if it was paused or asleep. */
+    let liveAt = 0;
+    const noteDropped = (): void => {
+      dropped = true;
+      liveAt = Math.min(liveAt, this.client.lastContactAt ?? liveAt);
+    };
+    const pastReconnectGrace = (): boolean => Date.now() - liveAt >= RECONNECT_GRACE_MS;
+    const waitForReconnect = (): void => {
+      clearTimer();
+      if (pastReconnectGrace()) {
+        gone(connected() ? "feed-closed" : "disconnected");
+        return;
+      }
+      timer = setTimeout(waitForReconnect, liveAt + RECONNECT_GRACE_MS - Date.now());
+    };
+    const onSource = (hasSource: boolean): void => {
+      if (hasSource) {
+        /* A page that was paused or asleep runs its overdue timers late, and
+           a reconnect can bring the feed back before they do. */
+        if (timer != null && dropped && pastReconnectGrace()) {
+          gone("disconnected");
+          return;
+        }
+        clearTimer();
+        return;
+      }
+      if (timer != null) return;
+      liveAt = Date.now();
+      dropped = false;
+      if (!connected()) {
+        noteDropped();
+        waitForReconnect();
+        return;
+      }
+      /* A camera that left the list ended the recording already, so one
+         still recording here is listed and only its feed is gone. */
+      timer = setTimeout(() => {
+        if (connected() && !dropped) gone("feed-closed");
+        else waitForReconnect();
+      }, SOURCE_LOST_GRACE_MS);
+    };
+    /* Every camera state change also arrives as a new list. */
+    const offCameras = this.client.on("cameras-change", (cameras) => {
+      const listed = cameras.find((c) => c.flightId === rec.flightId);
+      if (!listed || listed.lifecycle === CameraLifecycle.Destroyed) gone("camera-gone");
+    });
+    const offSource = cam.on("source", onSource);
+    const offState = this.client.on("state-change", (state) => {
+      if (state === "connected" || timer == null || dropped) return;
+      /* A watchdog tears the feeds down just before it reports the drop. */
+      noteDropped();
+      waitForReconnect();
+    });
+    /* A paused page can be handed the messages held back during the pause
+       before its watchdog runs, so the silence they end counts on its own. */
+    const offGap = this.client.on("contact-gap", (gap) => {
+      if (gap.to - gap.from >= RECONNECT_GRACE_MS) gone("disconnected");
+    });
+    if (cam.hasSource === false) onSource(false);
+    return () => {
+      clearTimer();
+      offCameras();
+      offSource();
+      offState();
+      offGap();
+    };
+  }
+
+  /**
+   * Finishes a recording that ended without a stop call and saves its clip.
+   * A grouped member that was the last one recording finishes its group too,
+   * so a scene change that takes every camera still yields the grouped set.
+   */
+  private endOnItsOwn(recordingId: string, reason: RecordingEndReason): void {
+    const rec = this.active.get(recordingId);
+    if (!rec || rec.stopPromise) return;
+    console.info(`kerbcast: recording ${recordingId} of camera ${rec.flightId} ended (${reason}); saving what it has`);
+    void this.stopWith(recordingId, reason).catch(() => {});
+    const groupId = this.memberOfGroup.get(recordingId);
+    if (groupId == null) return;
+    const ids = this.groups.get(groupId) ?? [];
+    const allEnded = ids.every((id) => {
+      const member = this.active.get(id);
+      return !member || member.stopPromise != null;
+    });
+    if (allEnded) void this.stopGroupedRecording(groupId).catch(() => {});
+  }
 
   /**
    * Recompute the snapshot from current state and notify subscribers. Called
@@ -638,6 +1154,7 @@ export class RecordingController {
         startedAt: rec.startedAt,
         groupId,
         arming: rec.arming ?? false,
+        stopping: rec.stopPromise != null,
       };
     });
     this.snapshot = { recordings, groups, active };
@@ -696,6 +1213,43 @@ export class RecordingController {
     } else {
       this.forceCounts.set(flightId, count);
     }
+  }
+
+  /**
+   * Starts a recording's recorder and holds its feed at the size it is
+   * rendering now, so the clip never changes size. Sent as the recorder
+   * starts, after any arming, so a forced feed is held at full size.
+   */
+  private startRecorder(rec: ActiveRecording): void {
+    rec.recorder.onEndedByItself?.(() => {
+      const connected = this.client.state == null || this.client.state === "connected";
+      this.endOnItsOwn(rec.recordingId, connected ? "feed-closed" : "disconnected");
+    });
+    rec.recorder.start();
+    rec.held = true;
+    const count = (this.holdCounts.get(rec.flightId) ?? 0) + 1;
+    this.holdCounts.set(rec.flightId, count);
+    if (count === 1) this.sendSizeHold(rec.flightId, true);
+  }
+
+  /** Lets go of a recording's size hold; the feed is released with its last holder. */
+  private releaseHold(rec: ActiveRecording): void {
+    if (!rec.held) return;
+    rec.held = false;
+    const count = (this.holdCounts.get(rec.flightId) ?? 0) - 1;
+    if (count > 0) {
+      this.holdCounts.set(rec.flightId, count);
+      return;
+    }
+    this.holdCounts.delete(rec.flightId);
+    this.sendSizeHold(rec.flightId, false);
+  }
+
+  private sendSizeHold(flightId: number, hold: boolean): void {
+    const send = this.client.camera(flightId).setSizeHold?.(hold);
+    void send?.catch((err: unknown) => {
+      console.warn(`kerbcast: setSizeHold(${hold}) failed for feed ${flightId}`, err);
+    });
   }
 
   /**
@@ -863,10 +1417,8 @@ export class RecordingController {
       throw new Error(`camera ${flightId} has no live track to record`);
     }
 
-    const mimeType = negotiateMimeType(opts?.mimeType);
-    const ctor = (globalThis as { MediaRecorder?: MediaRecorderCtor }).MediaRecorder;
-    if (!ctor) throw new Error("MediaRecorder is not available in this environment");
-    const recorder = new ctor(stream, { mimeType });
+    const recorder = this.createClipRecorder(flightId, stream, opts?.mimeType);
+    const mimeType = recorder.mimeType;
 
     const recordingId = mintId("rec");
     const startedAt = now();
@@ -877,17 +1429,13 @@ export class RecordingController {
       flightId,
       mimeType,
       recorder,
-      chunks: [],
       startedAt,
       utStart,
       utSamples: [{ t: 0, ut: utStart }],
       latestUt: utStart,
       unsubscribeClock: () => {},
+      unwatchCamera: () => {},
     };
-
-    recorder.addEventListener("dataavailable", (e) => {
-      if (e.data && e.data.size > 0) rec.chunks.push(e.data);
-    });
 
     /* Sample the capture clock on each ~1Hz settings-change push. Duplicates
        (a paused sim) are kept so `t` still advances; ut upgrades from absent
@@ -909,7 +1457,7 @@ export class RecordingController {
 
     if (opts?.maxDurationMs != null) {
       rec.maxDurationTimer = setTimeout(() => {
-        void this.stopRecording(recordingId).catch(() => {});
+        void this.stopWith(recordingId, "max-duration").catch(() => {});
       }, opts.maxDurationMs);
     }
 
@@ -942,15 +1490,38 @@ export class RecordingController {
         rec.utStart = this.client.clock.captureUt ?? undefined;
         rec.utSamples = [{ t: 0, ut: rec.utStart }];
         rec.latestUt = rec.utStart;
-        rec.recorder.start();
+        this.startRecorder(rec);
         this.rebuild();
       });
     } else {
-      recorder.start();
+      this.startRecorder(rec);
     }
+
+    /* Last, so a feed already gone too long ends a recording that holds
+       everything its stop releases. */
+    const unwatch = this.watchCamera(rec);
+    if (rec.stopPromise) unwatch();
+    else rec.unwatchCamera = unwatch;
 
     this.rebuild();
     return recordingId;
+  }
+
+  /** A capture-timed recorder when the feed's frames can be copied, else MediaRecorder. */
+  private createClipRecorder(
+    flightId: number,
+    stream: MediaStream,
+    preferredMime: string | undefined,
+  ): ClipRecorder {
+    const capture = captureClipRecorder(this.client.camera(flightId), (rtp) => {
+      const frame = this.client.frameUt?.(flightId, rtp);
+      return frame?.source === "exact" ? { ut: frame.ut } : null;
+    });
+    if (capture) return capture;
+    const mimeType = negotiateMimeType(preferredMime);
+    const ctor = (globalThis as { MediaRecorder?: MediaRecorderCtor }).MediaRecorder;
+    if (!ctor) throw new Error("MediaRecorder is not available in this environment");
+    return mediaRecorderClip(new ctor(stream, { mimeType }), mimeType);
   }
 
   /**
@@ -1023,7 +1594,7 @@ export class RecordingController {
       rec.utStart = utStart;
       rec.utSamples = [{ t: 0, ut: utStart }];
       rec.latestUt = utStart;
-      rec.recorder.start();
+      this.startRecorder(rec);
     }
     const reason = members.every((rec) => arm.ready.has(rec.recordingId))
       ? "all at full resolution"
@@ -1054,6 +1625,10 @@ export class RecordingController {
    * pending/settled result.
    */
   stopRecording(recordingId: string): Promise<RecordingHandle> {
+    return this.stopWith(recordingId, "user");
+  }
+
+  private stopWith(recordingId: string, reason: RecordingEndReason): Promise<RecordingHandle> {
     const rec = this.active.get(recordingId);
     if (!rec) {
       const done = this.finished.get(recordingId);
@@ -1064,6 +1639,7 @@ export class RecordingController {
 
     if (rec.maxDurationTimer) clearTimeout(rec.maxDurationTimer);
     rec.unsubscribeClock();
+    rec.unwatchCamera();
     rec.cancelResolutionWatch?.();
     rec.cancelResolutionWatch = undefined;
 
@@ -1074,6 +1650,7 @@ export class RecordingController {
          never fire its "stop" event (hanging this promise forever). Settle
          immediately with an empty clip instead. Force is still released
          unconditionally. */
+      rec.recorder.cancel();
       if (rec.forced) this.releaseForce(rec.flightId);
       const utEnd = this.client.clock.captureUt ?? undefined;
       const handle: RecordingHandle = {
@@ -1081,17 +1658,20 @@ export class RecordingController {
         flightId: rec.flightId,
         blob: new Blob([], { type: rec.mimeType }),
         mimeType: rec.mimeType,
+        timing: rec.recorder.timing,
         utStart: rec.utStart,
         utEnd,
         utSamples: [...rec.utSamples, { t: now() - rec.startedAt, ut: utEnd }],
         byteSize: 0,
         durationMs: now() - rec.startedAt,
+        endedBy: reason,
       };
       rec.stopPromise = Promise.resolve(handle);
       this.finished.set(recordingId, handle);
       this.active.delete(recordingId);
       this.byFlight.delete(rec.flightId);
       this.rebuild();
+      this.emitEnded(handle);
       /* An arming group member stopped on its own: the rest of its group
          may now be ready to start without it. */
       const groupId = this.memberOfGroup.get(recordingId);
@@ -1101,21 +1681,21 @@ export class RecordingController {
 
     const utEnd = this.client.clock.captureUt ?? undefined;
     rec.utSamples.push({ t: now() - rec.startedAt, ut: utEnd });
+    this.releaseHold(rec);
 
-    rec.stopPromise = new Promise<RecordingHandle>((resolve) => {
-      const onStop = (): void => {
-        rec.recorder.removeEventListener("stop", onStop);
-        const blob = new Blob(rec.chunks, { type: rec.mimeType });
+    rec.stopPromise = new Promise<RecordingHandle>((resolve, reject) => {
+      const onStop = (output: ClipOutput): void => {
+        const { blob } = output;
         const handle: RecordingHandle = {
           recordingId,
           flightId: rec.flightId,
           blob,
-          mimeType: rec.mimeType,
-          utStart: rec.utStart,
-          utEnd,
-          utSamples: rec.utSamples,
+          mimeType: output.mimeType,
+          timing: output.timing,
+          ...clipUtTrack(output, rec.utSamples, rec.startedAt, rec.utStart, utEnd),
           byteSize: blob.size,
-          durationMs: now() - rec.startedAt,
+          durationMs: output.mediaDurationMs ?? now() - rec.startedAt,
+          endedBy: reason,
         };
         /* Unconditional: a discarded-while-settling recording still held the
            force ref-count and must release it, even though it won't be
@@ -1125,16 +1705,37 @@ export class RecordingController {
            `finished`, standalone or grouped. Still resolve so a caller
            awaiting this same promise doesn't hang. */
         if (!rec.discarded) {
+          if (output.cut && this.memberOfGroup.has(recordingId)) this.cutters.set(recordingId, output.cut);
           this.finished.set(recordingId, handle);
           this.active.delete(recordingId);
           this.byFlight.delete(rec.flightId);
           this.rebuild();
+          this.emitEnded(handle);
         }
         resolve(handle);
       };
-      rec.recorder.addEventListener("stop", onStop);
-      rec.recorder.stop();
+      /* A clip that fails to finish still has to leave the active set, or the
+         feed would show as recording for good and refuse a new start. */
+      const onFail = (err: unknown): void => {
+        console.error(`kerbcast: recording ${recordingId} could not be finished`, err);
+        if (rec.forced) this.releaseForce(rec.flightId);
+        if (!rec.discarded) {
+          this.active.delete(recordingId);
+          this.byFlight.delete(rec.flightId);
+          this.rebuild();
+        }
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      let stopping: Promise<ClipOutput>;
+      try {
+        stopping = rec.recorder.stop();
+      } catch (err) {
+        stopping = Promise.reject(err);
+      }
+      void stopping.then(onStop, onFail);
     });
+    /* Show the stopping state while the clip settles. */
+    this.rebuild();
 
     return rec.stopPromise;
   }
@@ -1170,13 +1771,11 @@ export class RecordingController {
       } else {
         if (rec.maxDurationTimer) clearTimeout(rec.maxDurationTimer);
         rec.unsubscribeClock();
+        rec.unwatchCamera();
         rec.cancelResolutionWatch?.();
         rec.cancelResolutionWatch = undefined;
-        try {
-          if (rec.recorder.state !== "inactive") rec.recorder.stop();
-        } catch {
-          /* a recorder already torn down by the browser is fine to ignore */
-        }
+        rec.recorder.cancel();
+        this.releaseHold(rec);
         /* No pending stopRecording to release it later (this is the only
            teardown path this recording will see): release the force
            ref-count now, unconditionally. Covers a discard mid-arm too --
@@ -1189,6 +1788,7 @@ export class RecordingController {
       changed = true;
     }
     if (this.finished.delete(recordingId)) changed = true;
+    this.cutters.delete(recordingId);
 
     const groupId = this.memberOfGroup.get(recordingId);
     if (groupId != null) {
@@ -1281,15 +1881,30 @@ export class RecordingController {
    * `commonUtWindow`. See {@link StopGroupedRecordingOptions.targetUt} for the
    * coverage caveat around a member's own `maxDurationMs`.
    */
-  async stopGroupedRecording(
+  stopGroupedRecording(
     groupId: string,
     opts?: StopGroupedRecordingOptions,
   ): Promise<GroupedRecordingHandle> {
     const done = this.finishedGroups.get(groupId);
-    if (done) return done;
+    if (done) return Promise.resolve(done);
+    const pending = this.groupStops.get(groupId);
+    if (pending) return pending;
     const ids = this.groups.get(groupId);
-    if (!ids) throw new Error(`no grouped recording ${groupId}`);
+    if (!ids) return Promise.reject(new Error(`no grouped recording ${groupId}`));
+    const stop = this.finishGroup(groupId, ids, opts);
+    this.groupStops.set(groupId, stop);
+    const forget = (): void => {
+      this.groupStops.delete(groupId);
+    };
+    stop.then(forget, forget);
+    return stop;
+  }
 
+  private async finishGroup(
+    groupId: string,
+    ids: string[],
+    opts?: StopGroupedRecordingOptions,
+  ): Promise<GroupedRecordingHandle> {
     if (opts?.targetUt != null) {
       await this.awaitCoverage(
         ids,
@@ -1303,8 +1918,10 @@ export class RecordingController {
        single recording stopped mid-arm. */
     this.cancelGroupArm(groupId);
 
-    const recordings = await Promise.all(ids.map((id) => this.stopRecording(id)));
-    const window = commonUtWindow(recordings);
+    const settled = await Promise.allSettled(ids.map((id) => this.stopRecording(id)));
+    const recordings = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    const ranToStop = recordings.filter((r) => r.endedBy === "user" || r.endedBy === "max-duration");
+    const window = commonUtWindow(ranToStop.length > 0 ? ranToStop : recordings);
 
     /* Physically remux-trim each clip to the common window so the grouped
        output is pre-aligned by default. The UT metadata (utSamples +
@@ -1314,12 +1931,11 @@ export class RecordingController {
     let finalRecordings = recordings;
     if (window) {
       const trimmer = await (this.groupTrimmers.get(groupId) ?? Promise.resolve(null));
-      if (trimmer) {
-        finalRecordings = await Promise.all(
-          recordings.map((rec) => this.maybeTrim(rec, window, trimmer)),
-        );
-      }
+      finalRecordings = await Promise.all(
+        recordings.map((rec) => this.maybeTrim(rec, window, trimmer)),
+      );
     }
+    for (const rec of recordings) this.cutters.delete(rec.recordingId);
 
     const handle: GroupedRecordingHandle = {
       groupId,
@@ -1334,15 +1950,17 @@ export class RecordingController {
   }
 
   /**
-   * Remux-trim one clip to the common UT window, or return it untouched
+   * Trim one clip to the common UT window, or return it untouched
    * (metadata-only) when it can't be cut cleanly: a non-mp4 container, an
-   * unmappable window, or a trimmer error. The stored per-clip handle is
+   * unmappable window, or a trimmer error. A capture-timed clip is cut from
+   * its own samples, keeping a sample entry per size it passed through; any
+   * other mp4 is remuxed by `trimmer`. The stored per-clip handle is
    * replaced with the trimmed one so fetch/discard stay consistent.
    */
   private async maybeTrim(
     rec: RecordingHandle,
     window: [number, number],
-    trimmer: GroupTrimmer,
+    trimmer: GroupTrimmer | null,
   ): Promise<RecordingHandle> {
     /* MediaRecorder webm output isn't remuxed to mp4 here; degrade to
        metadata-only for those clips (mp4 is the default container). */
@@ -1352,6 +1970,28 @@ export class RecordingController {
     const startMs = utToRecordingTimeMs(rec.utSamples, window[0]);
     const endMs = utToRecordingTimeMs(rec.utSamples, window[1]);
     if (startMs == null || endMs == null || endMs <= startMs) return rec;
+    const cutter = this.cutters.get(rec.recordingId);
+    if (cutter) {
+      const cut = cutter(startMs, endMs);
+      if (!cut) return rec;
+      const utSamples = cut.frameUtSamples.length > 0
+        ? cut.frameUtSamples
+        : rec.utSamples
+            .filter((s) => s.t >= cut.startMs && s.t <= cut.startMs + cut.mediaDurationMs)
+            .map((s) => ({ ...s, t: s.t - cut.startMs }));
+      const trimmed: RecordingHandle = {
+        ...rec,
+        blob: cut.blob,
+        utSamples,
+        utStart: utSamples[0]?.ut ?? rec.utStart,
+        utEnd: utSamples[utSamples.length - 1]?.ut ?? rec.utEnd,
+        byteSize: cut.blob.size,
+        durationMs: cut.mediaDurationMs,
+      };
+      this.finished.set(rec.recordingId, trimmed);
+      return trimmed;
+    }
+    if (!trimmer) return rec;
     try {
       const blob = await trimmer.trim(rec.blob, rec.mimeType, startMs, endMs);
       const trimmed: RecordingHandle = {

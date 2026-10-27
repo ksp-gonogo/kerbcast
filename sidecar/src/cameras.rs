@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::webrtc::video_track::{CaptureTime, VideoTrack};
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,8 @@ use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
     CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
-    ErrorCode, Layer, QualityPreset, SetCommandAimPayload, SettingsStatePayload, SiteKind,
-    TrackMode,
+    ErrorCode, Layer, QualityPreset, ResumePayload, SetCommandAimPayload, SettingsStatePayload,
+    SiteKind, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::send_tally::SendTally;
@@ -455,6 +455,11 @@ pub struct ControlState {
     /// without paying full capture cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_fps: Option<f32>,
+    /// Keep the render size where it is (a viewer is recording). Not stored
+    /// here by any setter: `flush_control` derives it from the camera's
+    /// holds on every write, so no flush path can drop it.
+    #[serde(default)]
+    pub size_held: bool,
 }
 
 /// serde skip helper: keep the debug JSON clean for the common not-tracking case.
@@ -788,6 +793,10 @@ pub struct CameraState {
     /// reap), not `effective_degrade` (a camera-global scalar): forcing is a
     /// genuine per-consumer demand, not a camera-wide property.
     pub forced_full_res: Mutex<std::collections::HashSet<u32>>,
+    /// Peers recording this camera, keyed by `peer_id`: while any is present
+    /// the plugin keeps the render size where it is (see `SetSizeHold`).
+    /// Forgotten alongside `forced_full_res`.
+    pub size_holds: Mutex<std::collections::HashSet<u32>>,
     /// Frames the plugin produced into the ring, counted from sequence advances.
     pub capture_rate: RateWindow,
     /// Encoded frames handed to at least one track.
@@ -998,11 +1007,69 @@ impl CameraState {
         }
     }
 
-    /// Forget a peer's force (on unsubscribe / disconnect / peer reap) so the
-    /// OR relaxes once no peer still forces it. Returns whether an entry was
-    /// actually removed (so callers skip a redundant reflush).
+    /// Forget a peer's force and size hold (on unsubscribe / disconnect /
+    /// peer reap) so each relaxes once no peer still holds it. Returns
+    /// whether an entry was actually removed (so callers skip a redundant
+    /// reflush).
     pub async fn forget_forced(&self, peer_id: u32) -> bool {
-        self.forced_full_res.lock().await.remove(&peer_id)
+        let forced = self.forced_full_res.lock().await.remove(&peer_id);
+        let held = self.size_holds.lock().await.remove(&peer_id);
+        forced || held
+    }
+
+    /// Whether `peer_id` forces or holds this camera.
+    pub async fn forced_or_held_by(&self, peer_id: u32) -> bool {
+        self.forced_full_res.lock().await.contains(&peer_id)
+            || self.size_holds.lock().await.contains(&peer_id)
+    }
+
+    /// Moves a departed peer's force and size hold onto the peer that resumed
+    /// its client, keeping each only if the client still asks for it. The new
+    /// entry goes in before the old one comes out, so a camera kept on both
+    /// never reads as released. Returns whether either aggregate changed, so
+    /// callers skip a redundant reflush.
+    pub async fn hand_over(&self, from: u32, to: u32, keep_force: bool, keep_hold: bool) -> bool {
+        async fn move_entry(
+            set: &Mutex<std::collections::HashSet<u32>>,
+            from: u32,
+            to: u32,
+            keep: bool,
+        ) -> bool {
+            let mut set = set.lock().await;
+            let was_empty = set.is_empty();
+            if set.contains(&from) && keep {
+                set.insert(to);
+            }
+            set.remove(&from);
+            was_empty != set.is_empty()
+        }
+        let force = move_entry(&self.forced_full_res, from, to, keep_force).await;
+        let hold = move_entry(&self.size_holds, from, to, keep_hold).await;
+        force || hold
+    }
+
+    /// Hold (or release) this camera's render size for one peer.
+    pub async fn set_size_hold(&self, peer_id: u32, hold: bool) {
+        let mut holds = self.size_holds.lock().await;
+        if hold {
+            holds.insert(peer_id);
+        } else {
+            holds.remove(&peer_id);
+        }
+    }
+
+    /// The control state as the plugin should see it. A held camera carries
+    /// the hold. A forced camera drops the viewer quality clamp: a
+    /// full-resolution recording asked for the full size, which a preset
+    /// another viewer picked for their own screen must not undercut. The
+    /// stored clamp is kept and comes back once the force is released.
+    pub async fn control_for_plugin(&self, state: &ControlState) -> ControlState {
+        let mut out = state.clone();
+        out.size_held = !self.size_holds.lock().await.is_empty();
+        if !self.forced_full_res.lock().await.is_empty() {
+            out.viewer_level = None;
+        }
+        out
     }
 
     /// Whether anyone is actually displaying this camera at size right now.
@@ -1044,11 +1111,19 @@ impl CameraState {
         self.note_ring_advance_at(Instant::now(), prev, seq);
     }
 
-    /// Start over from the ring's newest frame, as on attach. A camera nobody
-    /// watched was not read, so the frames it skipped are neither captured
-    /// for a viewer nor owed to one.
+    /**
+     * Start from the next frame the plugin captures. A camera nobody watched
+     * was not read, so the frames it skipped are not owed to anyone, and the
+     * plugin stops capturing an unwatched camera: whatever the ring still
+     * holds was captured before the viewers left. Sending one of those first
+     * would show a returning viewer the picture from before the gap, and its
+     * old capture time would put the next frame the whole gap later on the
+     * track's media clock, so the viewer's player would hold the fresh
+     * frames back for it.
+     */
     pub fn rebase_after_idle(&self) {
-        self.last_sequence.store(0, Ordering::Release);
+        self.last_sequence
+            .store(self.ring.latest_sequence(), Ordering::Release);
     }
 
     pub fn note_frame_sent(&self) {
@@ -1258,9 +1333,23 @@ pub struct CameraRegistry {
     /// while shed already holds the camera lower), so the consume loop
     /// drains this set each tick and broadcasts directly.
     dirty_cameras: Mutex<std::collections::HashSet<u32>>,
+    /// The client each live peer named in `Resume`, keyed by `peer_id`.
+    peer_clients: Mutex<HashMap<u32, String>>,
+    /// Clients whose connection went while they forced or held a camera:
+    /// their old `peer_id`, whose entries stay in place, and when those are
+    /// released unless the client resumes first.
+    departed_clients: Mutex<HashMap<String, (u32, Instant)>>,
 }
 
 const STATUS_LOG_CAP: usize = 12_288;
+
+/// How long a departed client's force and size holds outlive its connection,
+/// waiting for it to `Resume`, so a recorded camera never resizes while the
+/// client reconnects. Counted from the reap, which is never before the client
+/// last heard from this connection, where the client's 25 s recorder grace
+/// starts: any reconnect the client still records through finds its holds
+/// kept.
+pub const RESUME_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1387,6 +1476,8 @@ impl CameraRegistry {
             anchors: Mutex::new(AnchorTable::default()),
             anchor_boot: boot_nonce(),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
+            peer_clients: Mutex::new(HashMap::new()),
+            departed_clients: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1694,6 +1785,7 @@ impl CameraRegistry {
                             display_sizes: Mutex::new(std::collections::HashMap::new()),
                             manual_render_cap: Mutex::new(None),
                             forced_full_res: Mutex::new(std::collections::HashSet::new()),
+                            size_holds: Mutex::new(std::collections::HashSet::new()),
                             capture_rate: RateWindow::new(),
                             sent_rate: RateWindow::new(),
                             send_tally: SendTally::default(),
@@ -1999,7 +2091,10 @@ impl CameraRegistry {
                 continue;
             };
             let (viewer_quality, background_capturing, stats) = {
-                let ctrl = cam.control.lock().await.clone();
+                /* What the plugin was told, so a forced camera reports no preset. */
+                let ctrl = cam
+                    .control_for_plugin(&cam.control.lock().await.clone())
+                    .await;
                 let primary_fps = parsed
                     .max_capture_fps
                     .filter(|f| *f > 0.0)
@@ -2113,12 +2208,16 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(());
         };
+        let state = cam.control_for_plugin(state).await;
         let mut guard = cam.control_block.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let path = self.shm_dir.join(format!("{flight_id}.control.bin"));
             *guard = Some(ControlBlock::create(&path)?);
         }
-        guard.as_mut().expect("just created if absent").write(state);
+        guard
+            .as_mut()
+            .expect("just created if absent")
+            .write(&state);
         Ok(())
     }
 
@@ -2715,6 +2814,18 @@ impl CameraRegistry {
         }
     }
 
+    /// A peer started (or stopped) recording this camera: record its size
+    /// hold and reflush so the plugin sees it. See `SetSizeHold`.
+    pub async fn set_size_hold(&self, flight_id: u32, peer_id: u32, hold: bool) {
+        match self.get(flight_id).await {
+            Some(cam) => cam.set_size_hold(peer_id, hold).await,
+            None => return,
+        }
+        if let Err(e) = self.flush_effective_render_size(flight_id).await {
+            warn!(flight_id, error = %e, "size hold flush failed");
+        }
+    }
+
     /// A consumer stopped displaying ONE camera (explicit unsubscribe /
     /// rebind-away): forget its force for that camera and reflush so the
     /// ceiling relaxes if it was the last peer forcing it. Mirrors
@@ -2752,6 +2863,113 @@ impl CameraRegistry {
         }
     }
 
+    /// A connection named its client (`Resume`). If that client's last
+    /// connection left forces or holds behind, this one takes over the ones
+    /// it still asks for and the rest are released.
+    pub async fn resume_client(&self, peer_id: u32, payload: &ResumePayload) {
+        self.peer_clients
+            .lock()
+            .await
+            .insert(peer_id, payload.client_id.clone());
+        let departed = self
+            .departed_clients
+            .lock()
+            .await
+            .remove(&payload.client_id);
+        let Some((old_peer, _)) = departed else {
+            return;
+        };
+        let flight_ids: Vec<u32> = self.cameras.read().await.keys().copied().collect();
+        for flight_id in flight_ids {
+            let Some(cam) = self.get(flight_id).await else {
+                continue;
+            };
+            let keep_force = payload.forced.contains(&flight_id);
+            let keep_hold = payload.held.contains(&flight_id);
+            if cam
+                .hand_over(old_peer, peer_id, keep_force, keep_hold)
+                .await
+            {
+                if let Err(e) = self.flush_effective_render_size(flight_id).await {
+                    warn!(flight_id, error = %e, "resume flush failed");
+                }
+            }
+        }
+        info!(
+            peer_id,
+            old_peer, "client resumed; its force and size holds carried over"
+        );
+    }
+
+    /// A peer said goodbye: it will not resume, so nothing is kept for it.
+    pub async fn forget_client(&self, peer_id: u32) {
+        self.peer_clients.lock().await.remove(&peer_id);
+    }
+
+    /// A peer's connection is gone (the reaper). Its forces and holds are
+    /// released, unless its client named itself, has no other connection
+    /// open and forced or held something: then they stay for
+    /// `RESUME_GRACE`, for the client's next connection to take over.
+    pub async fn depart_peer(&self, peer_id: u32, now: Instant) {
+        let client = {
+            let mut clients = self.peer_clients.lock().await;
+            let client = clients.remove(&peer_id);
+            /* A connection that resumed before this one was reaped already
+            holds what the client wants. */
+            client.filter(|c| !clients.values().any(|other| other == c))
+        };
+        if let Some(client) = client {
+            if self.forces_or_holds_any(peer_id).await {
+                let previous = self
+                    .departed_clients
+                    .lock()
+                    .await
+                    .insert(client, (peer_id, now + RESUME_GRACE));
+                if let Some((older, _)) = previous {
+                    self.forget_forced_all(older).await;
+                }
+                info!(
+                    peer_id,
+                    grace_s = RESUME_GRACE.as_secs(),
+                    "keeping a departed client's force and size holds for its return"
+                );
+                return;
+            }
+        }
+        self.forget_forced_all(peer_id).await;
+    }
+
+    /// Releases the forces and holds of departed clients whose grace ran out.
+    pub async fn expire_departed(&self, now: Instant) {
+        let expired: Vec<u32> = {
+            let mut departed = self.departed_clients.lock().await;
+            let expired = departed
+                .values()
+                .filter(|(_, until)| *until <= now)
+                .map(|(peer, _)| *peer)
+                .collect();
+            departed.retain(|_, (_, until)| *until > now);
+            expired
+        };
+        for peer_id in expired {
+            info!(
+                peer_id,
+                "departed client did not return; releasing its force and size holds"
+            );
+            self.forget_forced_all(peer_id).await;
+        }
+    }
+
+    async fn forces_or_holds_any(&self, peer_id: u32) -> bool {
+        let cams: Vec<Arc<CameraState>> = self.cameras.read().await.values().cloned().collect();
+        for cam in cams {
+            if cam.forced_or_held_by(peer_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Operator `SetRenderSize`: set (or clear) the manual cap and reflush the
     /// effective size (min(auto, cap)).
     pub async fn set_manual_render_size(
@@ -2786,7 +3004,10 @@ impl CameraRegistry {
     /// the first status write, exactly like the Hello snapshot always did.
     pub async fn protocol_state(&self, flight_id: u32) -> Option<ProtocolCameraState> {
         let cam = self.get(flight_id).await?;
-        let ctrl = cam.control.lock().await.clone();
+        /* What the plugin was told, so a forced camera reports no preset. */
+        let ctrl = cam
+            .control_for_plugin(&cam.control.lock().await.clone())
+            .await;
         let per = {
             let status = self.last_status.lock().await;
             status
@@ -5136,6 +5357,161 @@ mod tests {
     /// all-peers broadcast. Multi-peer policy is last write wins: a second
     /// apply (from any peer) replaces the first, and clearing (auto)
     /// removes the field from the block entirely.
+    /// A recording's size hold reaches the plugin, and a force lifts the
+    /// viewer quality clamp for its duration without forgetting it.
+    #[tokio::test]
+    async fn size_hold_and_force_shape_what_the_plugin_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let read = || async {
+            let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+                .await
+                .expect("control block flushed");
+            crate::shared_mem::control::decode(&bytes).expect("decodes")
+        };
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::ThreeQuarter))
+            .await
+            .expect("apply");
+
+        registry.set_size_hold(1, 5, true).await;
+        let snap = read().await;
+        assert!(snap.size_held);
+        assert_eq!(snap.viewer_level, Some(1), "a hold alone leaves the clamp");
+
+        registry.set_forced_full_res(1, 5, true).await;
+        assert_eq!(read().await.viewer_level, None, "forced: clamp lifted");
+
+        /* Any later flush keeps both, whichever setter triggered it. */
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::Half))
+            .await
+            .expect("apply");
+        let snap = read().await;
+        assert!(snap.size_held);
+        assert_eq!(snap.viewer_level, None);
+        let published = registry.protocol_state(1).await.expect("state");
+        assert_eq!(
+            published.viewer_quality, None,
+            "viewers see the preset as lifted"
+        );
+
+        /* The peer leaving releases both; the stored clamp comes back. */
+        registry.forget_forced(1, 5).await;
+        let snap = read().await;
+        assert!(!snap.size_held);
+        assert_eq!(snap.viewer_level, Some(2));
+        let published = registry.protocol_state(1).await.expect("state");
+        assert_eq!(published.viewer_quality, Some(QualityPreset::Half));
+    }
+
+    fn resume(client: &str, forced: &[u32], held: &[u32]) -> ResumePayload {
+        ResumePayload {
+            client_id: client.into(),
+            forced: forced.to_vec(),
+            held: held.to_vec(),
+        }
+    }
+
+    /// A reconnect inside the grace never lets the plugin see the force or
+    /// hold drop, so a recorded camera keeps its size across it.
+    #[tokio::test]
+    async fn a_resuming_client_takes_over_its_force_and_hold_with_no_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        let read = || async {
+            let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+                .await
+                .expect("control block flushed");
+            crate::shared_mem::control::decode(&bytes).expect("decodes")
+        };
+        registry.resume_client(5, &resume("c1", &[1], &[1])).await;
+        registry.set_forced_full_res(1, 5, true).await;
+        registry.set_size_hold(1, 5, true).await;
+
+        let t0 = Instant::now();
+        registry.depart_peer(5, t0).await;
+        assert!(read().await.size_held, "kept while the client may return");
+        assert!(cam.forced_full_res.lock().await.contains(&5));
+        registry.expire_departed(t0 + RESUME_GRACE / 2).await;
+        assert!(read().await.size_held);
+
+        registry.resume_client(6, &resume("c1", &[1], &[1])).await;
+        assert!(read().await.size_held);
+        assert_eq!(*cam.forced_full_res.lock().await, [6].into());
+        assert_eq!(*cam.size_holds.lock().await, [6].into());
+        /* The grace ending later does not touch the new connection's entries. */
+        registry.expire_departed(t0 + RESUME_GRACE * 2).await;
+        assert!(read().await.size_held);
+        assert_eq!(*cam.forced_full_res.lock().await, [6].into());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_does_not_return_is_released_after_the_grace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.resume_client(5, &resume("c1", &[1], &[1])).await;
+        registry.set_forced_full_res(1, 5, true).await;
+        registry.set_size_hold(1, 5, true).await;
+
+        let t0 = Instant::now();
+        registry.depart_peer(5, t0).await;
+        registry.expire_departed(t0 + RESUME_GRACE).await;
+        assert!(cam.forced_full_res.lock().await.is_empty());
+        assert!(cam.size_holds.lock().await.is_empty());
+        /* Too late: nothing left to take over. */
+        registry.resume_client(6, &resume("c1", &[1], &[1])).await;
+        assert!(cam.size_holds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resume_keeps_only_what_the_client_still_asks_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.resume_client(5, &resume("c1", &[1], &[1])).await;
+        registry.set_forced_full_res(1, 5, true).await;
+        registry.set_size_hold(1, 5, true).await;
+        registry.depart_peer(5, Instant::now()).await;
+
+        /* The recording stopped while disconnected: the force stays, the hold goes. */
+        registry.resume_client(6, &resume("c1", &[1], &[])).await;
+        assert_eq!(*cam.forced_full_res.lock().await, [6].into());
+        assert!(cam.size_holds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_or_goodbye_peer_is_released_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.set_size_hold(1, 5, true).await;
+        registry.depart_peer(5, Instant::now()).await;
+        assert!(
+            cam.size_holds.lock().await.is_empty(),
+            "never named a client"
+        );
+
+        registry.resume_client(7, &resume("c2", &[], &[1])).await;
+        registry.set_size_hold(1, 7, true).await;
+        registry.forget_client(7).await;
+        registry.depart_peer(7, Instant::now()).await;
+        assert!(cam.size_holds.lock().await.is_empty(), "said goodbye");
+    }
+
+    /// The new connection resumed before the old one was reaped: the old
+    /// one's entries go at once, as the new one already holds what it needs.
+    #[tokio::test]
+    async fn an_old_connection_reaped_after_its_client_resumed_is_released_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.resume_client(5, &resume("c1", &[], &[1])).await;
+        registry.set_size_hold(1, 5, true).await;
+        registry.resume_client(6, &resume("c1", &[], &[1])).await;
+        registry.set_size_hold(1, 6, true).await;
+
+        registry.depart_peer(5, Instant::now()).await;
+        assert_eq!(*cam.size_holds.lock().await, [6].into());
+    }
+
     #[tokio::test]
     async fn apply_viewer_quality_flushes_and_marks_dirty() {
         let dir = tempfile::tempdir().expect("tempdir");

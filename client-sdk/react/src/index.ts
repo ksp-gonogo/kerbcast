@@ -100,5 +100,5 @@ export { KerbalFaceFeed } from "./KerbalFaceFeed";
 export type { KerbalFaceFeedProps, KerbalFeedState } from "./KerbalFaceFeed";
 
 // RecordingsTray: a presentational drawer over the recordings store
-export { RecordingsTray } from "./RecordingsTray";
+export { RecordingsTray, recordingEndNote } from "./RecordingsTray";
 export type { RecordingsTrayProps } from "./RecordingsTray";

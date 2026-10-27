@@ -61,8 +61,8 @@ use crate::protocol::{
     ReportDisplaySizePayload, SceneStateChangedPayload, ServerMessage,
     SetBackgroundCaptureFpsPayload, SetDegradePayload, SetForceFullResolutionPayload,
     SetFovPayload, SetFrameStampsPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload,
-    SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload, SetTrackTargetPayload,
-    SetZoomRatePayload, SlotMapPayload,
+    SetQualityPayload, SetRenderSizePayload, SetSizeHoldPayload, SetThrottleMainScreenPayload,
+    SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -664,6 +664,8 @@ async fn handle_client_message(
                     anchors: Some(true),
                     frame_command: Some(true),
                     max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
+                    size_hold: Some(true),
+                    resume: Some(true),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -849,6 +851,16 @@ async fn handle_client_message(
                 .set_forced_full_res(flight_id, peer_id, force)
                 .await;
         }
+        // A recording holding this camera at its current size. Released with
+        // the force below on unsubscribe / disconnect / peer reap.
+        ClientMessage::SetSizeHold(SetSizeHoldPayload { flight_id, hold }) => {
+            registry.set_size_hold(flight_id, peer_id, hold).await;
+        }
+        // A reconnecting client taking over the force and size holds its last
+        // connection left behind (see `CameraRegistry::depart_peer`).
+        ClientMessage::Resume(payload) => {
+            registry.resume_client(peer_id, &payload).await;
+        }
         // Background capture ("background capture"): this consumer asking that cameras it
         // isn't displaying keep ticking over instead of stopping. Per-peer and
         // MAX-aggregated; forgotten on disconnect / peer reap so a departed
@@ -874,7 +886,10 @@ async fn handle_client_message(
             // reported a size for, including any it never bound a slot to.
             registry.forget_display_size_all(peer_id).await;
             // Same peer-scoped sweep for any force this peer held, so a feed
-            // never stays pinned at the ceiling after its forcer leaves.
+            // never stays pinned at the ceiling after its forcer leaves. A
+            // client that says goodbye is not coming back, so nothing is
+            // kept for a resume.
+            registry.forget_client(peer_id).await;
             registry.forget_forced_all(peer_id).await;
             // And background capture request, or a departed consumer keeps background
             // capture running for the rest of the session with nobody watching

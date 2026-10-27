@@ -10,10 +10,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CameraState } from "./__generated__/types";
+import { CameraLifecycle, type CameraState } from "./__generated__/types";
 import {
   ARM_TIMEOUT_MS,
+  RECONNECT_GRACE_MS,
   RecordingController,
+  SOURCE_LOST_GRACE_MS,
   commonUtWindow,
   createMediabunnyTrimmerLoader,
   negotiateMimeType,
@@ -21,9 +23,11 @@ import {
   type GroupTrimmer,
   type RecordingClient,
   type RecordingClientCamera,
+  type RecordingEndedEvent,
   type RecordingHandle,
   type RecordingsSnapshot,
 } from "./recording";
+import type { ContactGap } from "./client";
 import { installDomStubs, StubMediaRecorder } from "./testing/index";
 
 /**
@@ -146,7 +150,9 @@ class FakeCamera implements RecordingClientCamera {
   /** When > 0, the next N calls to setForceFullResolution reject instead of
    * resolving (consumed one per call), to simulate a dropped send. */
   forceRejectCount = 0;
+  hasSource = true;
   private readonly listeners = new Set<(state: CameraState) => void>();
+  private readonly sourceListeners = new Set<(hasSource: boolean) => void>();
 
   constructor(stream: MediaStream | null) {
     this.mediaStream = stream;
@@ -160,9 +166,18 @@ class FakeCamera implements RecordingClientCamera {
     }
   }
 
-  on(_event: "change", handler: (state: CameraState) => void): () => void {
-    this.listeners.add(handler);
-    return () => this.listeners.delete(handler);
+  on(event: "change", handler: (state: CameraState) => void): () => void;
+  on(event: "source", handler: (hasSource: boolean) => void): () => void;
+  on(event: "change" | "source", handler: (data: never) => void): () => void {
+    const set = (event === "change" ? this.listeners : this.sourceListeners) as Set<typeof handler>;
+    set.add(handler);
+    return () => set.delete(handler);
+  }
+
+  /** Test hook: the feed leaves or returns to this client. */
+  setSource(hasSource: boolean): void {
+    this.hasSource = hasSource;
+    for (const l of [...this.sourceListeners]) l(hasSource);
   }
 
   /** Test hook: push a new state and notify subscribers. */
@@ -213,9 +228,14 @@ class FakeCamera implements RecordingClientCamera {
  */
 class FakeRecordingClient implements RecordingClient {
   captureUt: number | null = null;
+  state = "connected";
+  lastContactAt: number | null = null;
   private readonly streams = new Map<number, MediaStream | null>();
   private readonly cams = new Map<number, FakeCamera>();
   private readonly listeners = new Set<(data: unknown) => void>();
+  private readonly cameraListeners = new Set<(cameras: CameraState[]) => void>();
+  private readonly stateListeners = new Set<(state: string) => void>();
+  private readonly gapListeners = new Set<(gap: ContactGap) => void>();
 
   setStream(flightId: number, stream: MediaStream | null): void {
     this.streams.set(flightId, stream);
@@ -236,9 +256,42 @@ class FakeRecordingClient implements RecordingClient {
     return { captureUt: this.captureUt };
   }
 
-  on(_event: "settings-change", handler: (data: unknown) => void): () => void {
-    this.listeners.add(handler);
-    return () => this.listeners.delete(handler);
+  on(event: "settings-change", handler: (data: unknown) => void): () => void;
+  on(event: "cameras-change", handler: (cameras: CameraState[]) => void): () => void;
+  on(event: "state-change", handler: (state: string) => void): () => void;
+  on(event: "contact-gap", handler: (gap: ContactGap) => void): () => void;
+  on(
+    event: "settings-change" | "cameras-change" | "state-change" | "contact-gap",
+    handler: (data: never) => void,
+  ): () => void {
+    const set = (
+      event === "settings-change"
+        ? this.listeners
+        : event === "cameras-change"
+          ? this.cameraListeners
+          : event === "contact-gap"
+            ? this.gapListeners
+            : this.stateListeners
+    ) as Set<typeof handler>;
+    set.add(handler);
+    return () => set.delete(handler);
+  }
+
+  /** Test hook: the connection state changes. */
+  setState(state: string): void {
+    this.state = state;
+    for (const l of [...this.stateListeners]) l(state);
+  }
+
+  /** Test hook: messages arrive after a silence, as the client reports it. */
+  emitGap(gap: ContactGap): void {
+    this.lastContactAt = gap.to;
+    for (const l of [...this.gapListeners]) l(gap);
+  }
+
+  /** Test hook: a new camera list arrives. */
+  emitCameras(cameras: CameraState[]): void {
+    for (const l of [...this.cameraListeners]) l(cameras);
   }
 
   /** Advance the shared capture clock and fire a settings-change push. */
@@ -1578,6 +1631,284 @@ describe("RecordingController grouped", () => {
     for (const rec of handle.recordings) {
       expect(ctrl.fetchRecording(rec.recordingId)).toBeUndefined();
     }
+  });
+});
+
+/** A StubMediaRecorder whose last instance a test can stop as the browser would. */
+class EndableRecorder extends StubMediaRecorder {
+  static last: EndableRecorder | null = null;
+  constructor(stream: MediaStream, options?: { mimeType?: string }) {
+    super(stream, options);
+    EndableRecorder.last = this;
+  }
+  /** The browser stops the recorder itself, as when its track ends. */
+  endByItself(): void {
+    super.stop();
+  }
+}
+
+describe("RecordingController when the camera goes away", () => {
+  let client: FakeRecordingClient;
+  let ctrl: RecordingController;
+  let ended: RecordingEndedEvent[];
+  const listed = (...ids: number[]): CameraState[] => ids.map((flightId) => makeCameraState({ flightId }));
+
+  beforeEach(() => {
+    client = new FakeRecordingClient();
+    client.setStream(1, liveStream());
+    client.setStream(2, liveStream());
+    ctrl = new RecordingController(client, { loadTrimmer: () => Promise.resolve(null) });
+    ended = [];
+    ctrl.onRecordingEnded((e) => ended.push(e));
+    vi.spyOn(console, "info").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("saves the clip when a scene change destroys the camera", async () => {
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    client.captureUt = 104;
+    client.emitCameras([makeCameraState({ flightId: 1, lifecycle: CameraLifecycle.Destroyed })]);
+    await flush();
+
+    expect(ctrl.isRecording(1)).toBe(false);
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.byteSize).toBeGreaterThan(0);
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utEnd).toBe(104);
+    expect(ctrl.getSnapshot().recordings.map((r) => r.recordingId)).toEqual([id]);
+    expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
+  });
+
+  it("saves the clip when the camera drops out of the camera list", async () => {
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(1, 2));
+    expect(ctrl.isRecording(1)).toBe(true);
+    client.emitCameras(listed(2));
+    await flush();
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("marks a clip stopped by a call as ended by the user and one that ran out as max-duration", async () => {
+    vi.useFakeTimers();
+    const a = ctrl.startRecording(1);
+    const b = ctrl.startRecording(2, { maxDurationMs: 1000 });
+    expect((await ctrl.stopRecording(a)).endedBy).toBe("user");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ctrl.fetchRecording(b)?.endedBy).toBe("max-duration");
+    expect(ended.map((e) => e.endedBy)).toEqual(["user", "max-duration"]);
+  });
+
+  it("waits a short grace for a feed that leaves while connected, then saves it as feed-closed", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    const cam = client.camera(1);
+
+    cam.setSource(false);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS - 1);
+    cam.setSource(true);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS * 2);
+    expect(ctrl.isRecording(1)).toBe(true);
+
+    cam.setSource(false);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS);
+    expect(ctrl.isRecording(1)).toBe(false);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("feed-closed");
+  });
+
+  it("keeps recording through a reconnect that brings the feed back in time", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    const cam = client.camera(1);
+
+    /* The watchdog tears the feeds down before the state says so. */
+    cam.setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(1500);
+    client.setState("connected");
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(ctrl.isRecording(1)).toBe(true);
+    cam.setSource(true);
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS);
+    expect(ctrl.isRecording(1)).toBe(true);
+  });
+
+  it("saves the clip as disconnected when the client does not come back", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.setState("disconnected");
+    client.camera(1).setSource(false);
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ctrl.isRecording(1)).toBe(false);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+  });
+
+  it("counts the reconnect grace from when the sidecar was last heard from", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    /* The drop is only noticed now, by a watchdog. */
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS - 15_000 - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+  });
+
+  it("ends at once as disconnected when a paused page wakes long after the sidecar went quiet", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    vi.setSystemTime(Date.now() + 75_000);
+
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.isRecording(1)).toBe(false);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+    expect(ended.map((e) => e.endedBy)).toEqual(["disconnected"]);
+  });
+
+  it("ends as disconnected when the feed returns after the grace before its timer could run", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    client.setState("disconnected");
+    client.camera(1).setSource(false);
+
+    /* The page sleeps: the clock moves on and no timer runs. */
+    vi.setSystemTime(Date.now() + RECONNECT_GRACE_MS + 5_000);
+    client.setState("connected");
+    client.camera(1).setSource(true);
+    expect(ctrl.getSnapshot().active.map((a) => a.stopping)).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+  });
+
+  it("keeps recording through a drop found by the ping watchdog that reconnects in time", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(2_500);
+    client.setState("connected");
+    client.camera(1).setSource(true);
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS * 2);
+    expect(ctrl.isRecording(1)).toBe(true);
+    expect(ended).toEqual([]);
+  });
+
+  it("ends as disconnected when a paused page is handed held-back messages before its watchdog runs", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    const quietFrom = Date.now();
+    client.lastContactAt = quietFrom;
+    vi.setSystemTime(quietFrom + 75_000);
+
+    /* The burst of stale messages comes first and says the client was heard from just now. */
+    client.emitGap({ from: quietFrom, to: Date.now() });
+    expect(ctrl.getSnapshot().active.map((a) => a.stopping)).toEqual([true]);
+
+    /* Then the watchdog finds the dead connection. */
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+    expect(ended.map((e) => e.endedBy)).toEqual(["disconnected"]);
+  });
+
+  it("keeps recording through a silence shorter than the grace", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    const quietFrom = Date.now();
+    client.emitGap({ from: quietFrom, to: quietFrom + RECONNECT_GRACE_MS - 1 });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.isRecording(1)).toBe(true);
+  });
+
+  it("finishes a REC+ group as disconnected when the connection does not come back", async () => {
+    vi.useFakeTimers();
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.lastContactAt = Date.now();
+    client.setState("disconnected");
+    client.camera(1).setSource(false);
+    client.camera(2).setSource(false);
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS + 500);
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => r.recordingId)).toEqual(recordingIds);
+    expect(group.recordings.every((r) => r.endedBy === "disconnected")).toBe(true);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+    expect(ended.map((e) => [e.groupId, e.endedBy])).toEqual([
+      [groupId, "disconnected"],
+      [groupId, "disconnected"],
+    ]);
+  });
+
+  it("saves an arrival-timed clip whose MediaRecorder the browser stopped, and a later stop returns it", async () => {
+    const original = (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+    (globalThis as { MediaRecorder?: unknown }).MediaRecorder = EndableRecorder;
+    try {
+      const id = ctrl.startRecording(1);
+      EndableRecorder.last!.endByItself();
+      await flush();
+
+      const handle = ctrl.fetchRecording(id)!;
+      expect(handle.byteSize).toBeGreaterThan(0);
+      expect(handle.endedBy).toBe("feed-closed");
+      await expect(ctrl.stopRecording(id)).resolves.toBe(handle);
+    } finally {
+      (globalThis as { MediaRecorder?: unknown }).MediaRecorder = original;
+    }
+  });
+
+  it("finishes a REC+ group whose cameras all went away in one scene change", async () => {
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.captureUt = 110;
+    client.emitCameras([]);
+    await flush();
+    await flush();
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => r.recordingId)).toEqual(recordingIds);
+    expect(group.recordings.every((r) => r.endedBy === "camera-gone" && r.byteSize > 0)).toBe(true);
+    expect(ctrl.getSnapshot().groups).toEqual([group]);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+    expect(ended.map((e) => e.groupId)).toEqual([groupId, groupId]);
+    /* A user stop that arrives afterwards gets the same set. */
+    await expect(ctrl.stopGroupedRecording(groupId)).resolves.toBe(group);
+  });
+
+  it("keeps a REC+ group recording when one camera goes, and does not cut the others to its end", async () => {
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.captureUt = 105;
+    client.emitCameras(listed(2));
+    await flush();
+    expect(ctrl.fetchGroupedRecording(groupId)).toBeUndefined();
+    expect(ctrl.isRecording(2)).toBe(true);
+
+    client.captureUt = 120;
+    const group = await ctrl.stopGroupedRecording(groupId);
+    expect(group.recordings.map((r) => [r.recordingId, r.endedBy])).toEqual([
+      [recordingIds[0], "camera-gone"],
+      [recordingIds[1], "user"],
+    ]);
+    expect(group.commonUtWindow).toEqual([100, 120]);
   });
 });
 

@@ -13,6 +13,8 @@ export {
   OfferRefusedError,
   COMMAND_CAMERA_STATE_WAIT_MS,
   CONTROL_OPEN_TIMEOUT_MS,
+  CONTACT_GAP_MS,
+  type ContactGap,
   type CreateCommandCameraOptions,
   type BrowserKerbcastTransportOptions,
   type InboundVideoStats,
@@ -73,12 +75,18 @@ export {
   utToRecordingTimeMs,
   DEFAULT_COVERAGE_TIMEOUT_MS,
   ARM_TIMEOUT_MS,
+  KEYFRAME_RETRY_MS,
+  SOURCE_LOST_GRACE_MS,
+  RECONNECT_GRACE_MS,
   videoElementDecodedSizeProbe,
   type ActiveRecordingInfo,
   type DecodedSizeProbe,
   type RecordingClient,
   type RecordingControllerOptions,
   type RecordingHandle,
+  type RecordingEndReason,
+  type RecordingEndedEvent,
+  type RecordingTiming,
   type RecordingsSnapshot,
   type GroupedRecordingHandle,
   type GroupedRecordingStart,
@@ -88,6 +96,8 @@ export {
   type StartRecordingOptions,
   type StopGroupedRecordingOptions,
 } from "./recording";
+
+export { type EncodedFrameCopy } from "./captureClip";
 
 export {
   COMMAND_TRACK_LABELS,

@@ -1166,6 +1166,16 @@ export interface HelloPayload {
 	 * sidecars older than 1.12.
 	 */
 	maxAnchorsPerCamera?: number;
+	/**
+	 * True when this sidecar takes `SetSizeHold`. Absent from sidecars
+	 * older than 1.12, which answer it with an error.
+	 */
+	sizeHold?: boolean;
+	/**
+	 * True when this sidecar takes `Resume`. Absent from sidecars older
+	 * than 1.12.
+	 */
+	resume?: boolean;
 }
 
 /**
@@ -1180,6 +1190,26 @@ export interface ReportDisplaySizePayload {
 	flightId: number;
 	width: number;
 	height: number;
+}
+
+/**
+ * Names the client behind a new connection, so a reconnect keeps what its
+ * last connection asked for. When a connection drops, the sidecar keeps that
+ * client's `SetForceFullResolution` and `SetSizeHold` for a grace period
+ * instead of releasing them at once; a connection that resumes the same
+ * `client_id` within it takes them over, so a recorded camera never
+ * resizes across the reconnect. Only the cameras still listed in `forced`
+ * and `held` are kept. A client that does not return in time is released
+ * as before. Send right after `Hello`, before resending any force or hold,
+ * and only to a sidecar whose `Hello` has `resume: true`.
+ */
+export interface ResumePayload {
+	/** Stable for the life of the client, across its connections. */
+	clientId: string;
+	/** Cameras this client still forces to full resolution. */
+	forced: number[];
+	/** Cameras this client still holds at their size. */
+	held: number[];
 }
 
 /**
@@ -1244,8 +1274,9 @@ export interface SetDegradePayload {
  * Forces a camera to render at the operator ceiling regardless of
  * display-size demand. Per-viewer, OR-aggregated by the sidecar: a feed
  * stays forced while any connected viewer forces it, and releases when
- * the last one clears it (or disconnects). Still yields to the adaptive
- * framerate shed; overrides only the demand term.
+ * the last one clears it (or disconnects). Overrides the demand term and
+ * any viewer quality preset (which returns on release); still capped by
+ * an operator render-size cap and the adaptive shed.
  */
 export interface SetForceFullResolutionPayload {
 	flightId: number;
@@ -1314,6 +1345,20 @@ export interface SetRenderSizePayload {
 	flightId: number;
 	width: number;
 	height: number;
+}
+
+/**
+ * Holds a camera at the size it is rendering now, for as long as a viewer
+ * is recording it, so the clip never changes size mid-file. While held, the
+ * adaptive ladder sheds this camera's frame rate rather than its resolution,
+ * and display-size reports, quality presets and render-size changes wait
+ * until the last hold is released. Per-viewer, OR-aggregated like
+ * `SetForceFullResolution`, and released when the viewer unsubscribes or
+ * disconnects (after a grace for a client that may `Resume`).
+ */
+export interface SetSizeHoldPayload {
+	flightId: number;
+	hold: boolean;
 }
 
 export interface SetThrottleMainScreenPayload {
@@ -1456,11 +1501,21 @@ export type ClientMessage =
 	 * Force a camera to render at the operator ceiling regardless of
 	 * display-size demand. Per-viewer, OR-aggregated by the sidecar: a
 	 * feed stays forced while any connected viewer forces it, and
-	 * releases when the last one clears it (or disconnects). Still
-	 * yields to the adaptive framerate shed; overrides only the demand
-	 * term, never the perf-protection ceiling.
+	 * releases when the last one clears it (or disconnects). Overrides
+	 * the demand term and any viewer quality preset, never the
+	 * perf-protection ceiling.
 	 */
 	| { type: "set-force-full-resolution", content: SetForceFullResolutionPayload }
+	/**
+	 * Hold a camera at its current size while a viewer records it. See
+	 * `SetSizeHoldPayload`.
+	 */
+	| { type: "set-size-hold", content: SetSizeHoldPayload }
+	/**
+	 * Name the client behind this connection and take over what its last
+	 * connection forced and held. See `ResumePayload`.
+	 */
+	| { type: "resume", content: ResumePayload }
 	/**
 	 * Ask for background capture: subscribed cameras that this
 	 * consumer is NOT displaying keep capturing at a low rate instead of

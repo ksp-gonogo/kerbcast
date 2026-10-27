@@ -56,11 +56,26 @@ if (block != null)
     // capture_fps is a later append on the same terms: the fixture predates it,
     // so the bit is clear and null means "capture at the primary rate".
     Check(s.CaptureFps == null, "captureFps == null (fixture predates the append)");
+    Check(!s.SizeHeld, "sizeHeld == false (fixture predates the append)");
     Check(s.Seq == 2L, "seqlock seq == 2 (exactly one published write)");
 
     // Change detection: re-reading the same (unchanged) block yields nothing.
     Check(!block.TryReadChanged(out _), "second read returns false (unchanged)");
     block.Dispose();
+
+    // The size hold is its fields_present bit alone: set it on a copy of the
+    // fixture and the rest of the snapshot reads exactly as before.
+    string held = Path.Combine(Path.GetTempPath(), $"kerbcast-held-{Guid.NewGuid():N}.bin");
+    byte[] bytes = File.ReadAllBytes(fixture);
+    uint present = BitConverter.ToUInt32(bytes, ControlBlock.HeaderSize);
+    BitConverter.GetBytes(present | ControlBlock.FpSizeHeld).CopyTo(bytes, ControlBlock.HeaderSize);
+    File.WriteAllBytes(held, bytes);
+    ControlBlock heldBlock = ControlBlock.Open(held, out _);
+    Check(heldBlock != null && heldBlock.TryReadChanged(out ControlSnapshot h)
+        && h.SizeHeld && h.Width == 640u && h.ViewerLevel == 2u && h.CaptureFps == null,
+        "size-held bit decodes alone, every other field unchanged");
+    heldBlock?.Dispose();
+    File.Delete(held);
 }
 
 Console.WriteLine();

@@ -153,6 +153,21 @@ describe("RecordingsTray - single clips", () => {
     expect(screen.getByText(/unsaved clips/i)).toBeTruthy();
   });
 
+  it("says why a clip stopped on its own, and nothing for one a person stopped", () => {
+    fakeStoreSeed.recordings = [
+      makeRecording({ recordingId: "rec-1", endedBy: "camera-gone" }),
+      makeRecording({ recordingId: "rec-2", endedBy: "disconnected" }),
+      makeRecording({ recordingId: "rec-3", endedBy: "feed-closed" }),
+      makeRecording({ recordingId: "rec-4", endedBy: "user" }),
+    ];
+    render(<RecordingsTray />);
+    expect(screen.getAllByText(/stopped:/i).map((el) => el.textContent)).toEqual([
+      "Stopped: the camera went away",
+      "Stopped: the connection was lost",
+      "Stopped: its feed was closed",
+    ]);
+  });
+
   it("falls back to 'Camera <flightId>' when no cameraLabel prop is given", () => {
     fakeStoreSeed.recordings = [makeRecording({ recordingId: "rec-1", flightId: 7 })];
     render(<RecordingsTray />);

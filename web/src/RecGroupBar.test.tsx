@@ -24,6 +24,8 @@ interface FakeActive {
 
 const startGroupSpy = vi.fn<(flightIds: number[], opts?: { forceFullResolution?: boolean }) => string>();
 const stopGroupSpy = vi.fn<(groupId: string) => Promise<unknown>>();
+/* Ends every member as the controller does when their cameras go away. */
+let endAllMembers: () => void = () => {};
 
 /* Matches RecGroupBar's own nowMs(): performance.now() when available, same
    clock the real RecordingController stamps `startedAt` with. Date.now() (a
@@ -40,6 +42,7 @@ vi.mock("@ksp-gonogo/kerbcast-react", async (importOriginal) => {
 
   function useRecordings() {
     const [active, setActive] = useReactState<FakeActive[]>([]);
+    endAllMembers = () => setActive([]);
 
     return {
       recordings: [],
@@ -406,6 +409,37 @@ describe("RecGroupBar - recording", () => {
     });
 
     expect(stopGroupSpy).toHaveBeenCalledWith("grp-1");
+    expect(onStopped).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls onStopped once the group ends on its own, as when its cameras went away", () => {
+    const onStopped = vi.fn();
+    startThenRecord(onStopped);
+    expect(onStopped).not.toHaveBeenCalled();
+
+    act(() => endAllMembers());
+
+    expect(onStopped).toHaveBeenCalledTimes(1);
+    expect(stopGroupSpy).not.toHaveBeenCalled();
+  });
+
+  it("reports the end once when Stop races the members running out", async () => {
+    let finishStop: (value: unknown) => void = () => {};
+    stopGroupSpy.mockReturnValueOnce(new Promise((resolve) => (finishStop = resolve)));
+    const onStopped = vi.fn();
+    startThenRecord(onStopped);
+
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /stop grouped recording/i }));
+    });
+    act(() => endAllMembers());
+    expect(onStopped).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      finishStop({ groupId: "grp-1", recordings: [] });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(onStopped).toHaveBeenCalledTimes(1);
   });
 

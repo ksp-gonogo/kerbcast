@@ -460,9 +460,10 @@ async fn consume_loop(
             // Subscribe), which a binding-scoped clear would leak forever
             // (the v1.6.3 pin-high class).
             registry.forget_display_size_all(peer.peer_id).await;
-            // Same peer-scoped sweep for any force this peer held, so a feed
-            // never stays pinned at the ceiling after a dead-peer reap.
-            registry.forget_forced_all(peer.peer_id).await;
+            // Same peer-scoped sweep for any force and size hold this peer
+            // held, so a feed never stays pinned after a dead-peer reap. A
+            // client that may reconnect keeps them for a short grace instead.
+            registry.depart_peer(peer.peer_id, Instant::now()).await;
             // Same for background capture request: a dead peer must not leave background
             // capture pinned on (the v1.6.3 pin-high class).
             if registry.forget_background_request(peer.peer_id).await {
@@ -471,6 +472,7 @@ async fn consume_loop(
             // And its anchors, on every camera it set them on.
             registry.forget_anchors_all(peer.peer_id).await;
         }
+        registry.expire_departed(Instant::now()).await;
 
         let cameras = registry.snapshot().await;
         let mut any_active = false;
@@ -1251,9 +1253,10 @@ mod tests {
     }
 
     /// A camera nobody watched was not read. When a viewer returns it starts
-    /// from the newest frame, without counting the unwatched ones as owed.
+    /// from the first frame captured after, sending none of what the ring
+    /// held from before the gap and counting none of it as owed.
     #[tokio::test]
-    async fn resubscribing_starts_from_the_newest_frame() {
+    async fn resubscribing_starts_from_the_next_captured_frame() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
         let pixels = vec![0x80u8; 64 * 64 * 4];
@@ -1268,9 +1271,22 @@ mod tests {
         cam.rebase_after_idle();
         tick(&cam).await;
         let counts = cam.send_tally.take();
+        assert_eq!(
+            (counts.sent, counts.advanced),
+            (0, 0),
+            "nothing from before the gap"
+        );
+
+        ring.produce(64, 64, 9_000.0, &pixels).unwrap();
+        tick(&cam).await;
+        let counts = cam.send_tally.take();
         assert_eq!((counts.sent, counts.behind, counts.overwritten), (1, 0, 0));
-        assert_eq!(counts.advanced, 0, "the first read only sets the baseline");
-        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 7);
+        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 8);
+        assert_eq!(
+            cam.last_sent.lock().await.map(|t| t.game_clock_ms),
+            Some(9_000.0),
+            "the first frame sent is the fresh one"
+        );
     }
 
     /// Past the catch-up allowance the oldest frames are passed over, so a

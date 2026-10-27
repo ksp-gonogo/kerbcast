@@ -30,7 +30,12 @@ import {
   type NoisePipeline,
   tryCreateNoisePipeline,
 } from "./noise";
-import { RecordingController, type RecordingControllerOptions } from "./recording";
+import {
+  RecordingController,
+  type RecordingControllerOptions,
+  type RecordingTiming,
+} from "./recording";
+import type { EncodedFrameCopy } from "./captureClip";
 import { MAX_ANCHORS_PER_CAMERA } from "./anchors";
 import { CommandCentreHistory } from "./commandTrack";
 
@@ -71,6 +76,13 @@ export interface KerbcastCameraHandle {
    * Transitions are emitted as `stall` events.
    */
   readonly stalled: boolean;
+  /**
+   * True while this client receives the camera's video: its track is bound
+   * and live. False before the first track, after its slot is freed or moved
+   * to another camera, once the camera is destroyed or its track ends, and
+   * while disconnected. Transitions are emitted as `source` events.
+   */
+  readonly hasSource: boolean;
   /** Current {@link setShowStatic} setting. */
   readonly showStatic: boolean;
   /**
@@ -119,10 +131,23 @@ export interface KerbcastCameraHandle {
    * regardless of display size, until released by calling this with
    * `false`. Per-viewer, OR-aggregated server-side across viewers: a feed
    * stays forced while any viewer forces it, and releases when the last one
-   * clears it (or disconnects). Still yields to the adaptive framerate
-   * shed; it only overrides the display-size demand term.
+   * clears it (or disconnects); sent again after a reconnect. Overrides the
+   * display-size demand and any viewer quality preset (the preset returns
+   * on release); still capped by an operator render-size cap and the
+   * adaptive shed.
    */
   setForceFullResolution(force: boolean): Promise<void>;
+  /**
+   * Hold this feed at the size it is rendering now, until released by
+   * calling this with `false`, so a recording never changes size mid-clip.
+   * While held, load is shed through the frame rate instead, and size
+   * changes (display size, quality presets) wait for the release.
+   * Per-viewer and OR-aggregated server-side, like
+   * {@link setForceFullResolution}, and sent again after a reconnect. Only a
+   * sidecar whose `hello` offers holds (1.12 and later) receives it. The
+   * recorder holds a feed for as long as it records it.
+   */
+  setSizeHold(hold: boolean): Promise<void>;
   requestKeyframe(): Promise<void>;
 
   /**
@@ -155,6 +180,23 @@ export interface KerbcastCameraHandle {
    */
   setEncodedTransform(factory: EncodedTransformFactory | null): void;
 
+  /**
+   * Copy this camera's encoded frames, as received and before decode, to
+   * `onFrame` until the returned function is called. What the camera shows
+   * is unchanged. Returns null when frames cannot be copied: the client was
+   * built without `recordingTiming: "capture"`, the browser has no encoded
+   * transform path, or (where the browser uses `RTCRtpScriptTransform`) the
+   * camera already runs its own {@link setEncodedTransform}. Follows the
+   * camera across receivers, so a copy can switch synchronisation source
+   * mid-stream. On that same `RTCRtpScriptTransform` path, setting a
+   * transform on a tapped camera stops the copies until it is removed; the
+   * client emits an `error` event when that happens.
+   */
+  tapEncodedFrames(onFrame: (frame: EncodedFrameCopy) => void): (() => void) | null;
+
+  /** Whether {@link tapEncodedFrames} would copy frames right now. */
+  canTapEncodedFrames(): boolean;
+
   on<K extends keyof KerbcastCameraEvents>(
     event: K,
     handler: (data: KerbcastCameraEvents[K]) => void,
@@ -169,6 +211,8 @@ export interface KerbcastCameraEvents {
   stream: MediaStream | null;
   /** Frames stopped arriving on a live source (`true`) / resumed (`false`). */
   stall: boolean;
+  /** {@link KerbcastCameraHandle.hasSource} changed. */
+  source: boolean;
 }
 
 /**
@@ -236,6 +280,20 @@ export interface KerbcastClientConfig {
    * connecting; a peer keeps the path it was created with.
    */
   encodedTransforms?: boolean;
+  /**
+   * How `client.recording` times a clip. `"capture"` records the encoded
+   * H.264 frames as received, without re-encoding, into an MP4 timed by each
+   * frame's RTP timestamp, which follows when the game captured the frame:
+   * a network stall no longer shows as a freeze and then a burst. It needs
+   * the same per-receiver passthrough as {@link encodedTransforms} (a worker
+   * on a `blob:` URL, or Chrome's legacy `createEncodedStreams` where that is
+   * the only path), so it too is set before connecting and is off by
+   * default. `"arrival"` (the default) records the decoded track with
+   * `MediaRecorder`, timed by arrival. A clip falls back to arrival timing
+   * when its frames cannot be copied; `RecordingHandle.timing` says which
+   * it got.
+   */
+  recordingTiming?: RecordingTiming;
   /**
    * ICE gathering timeout in milliseconds. Passed to the default
    * {@link BrowserKerbcastTransport}; ignored when a custom transport is
@@ -497,7 +555,22 @@ export interface KerbcastClientEvents {
    * it here, because the sidecar forgets a peer's state when it leaves.
    */
   "control-open": undefined;
+  /**
+   * Fired when a message arrives after the sidecar was silent for
+   * {@link CONTACT_GAP_MS} or more, as when the page was paused or asleep
+   * and is handed the messages held back meanwhile.
+   */
+  "contact-gap": ContactGap;
 }
+
+/** A silence from the sidecar: when it was last heard from and when it next was, both as `Date.now()`. */
+export interface ContactGap {
+  from: number;
+  to: number;
+}
+
+/** Two of the sidecar's 5 s pings missed: shorter silences are not reported as a {@link ContactGap}. */
+export const CONTACT_GAP_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // Transport abstraction for tests
@@ -521,6 +594,8 @@ export interface KerbcastTransport {
 export interface KerbcastPeerOptions {
   /** Mirrors {@link KerbcastClientConfig.encodedTransforms}. */
   encodedTransforms?: boolean;
+  /** Set when {@link KerbcastClientConfig.recordingTiming} is `"capture"`: receivers carry a passthrough that can copy frames. */
+  frameTaps?: boolean;
 }
 
 export interface KerbcastPeer {
@@ -548,6 +623,13 @@ export interface KerbcastPeer {
    * unknown or the transform's kind does not match the peer's path.
    */
   setReceiverTransform?(mid: string, transform: EncodedTransform | null): void;
+  /**
+   * Copy each encoded frame the receiver of slot `mid` gets to `onFrame`
+   * (`null` stops). Only on a peer created with `frameTaps`; a script-path
+   * receiver running a custom transform copies nothing until passthrough
+   * is restored.
+   */
+  setReceiverTap?(mid: string, onFrame: ((frame: EncodedFrameCopy) => void) | null): void;
 }
 
 export interface KerbcastDataChannel {
@@ -582,7 +664,9 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
   }
 
   encodedTransformPath(opts: KerbcastPeerOptions): EncodedTransformPath | null {
-    return opts.encodedTransforms === true ? detectEncodedTransformPath() : null;
+    return opts.encodedTransforms === true || opts.frameTaps === true
+      ? detectEncodedTransformPath()
+      : null;
   }
 
   createPeer(iceServers: RTCIceServer[], opts: KerbcastPeerOptions = {}): KerbcastPeer {
@@ -602,14 +686,29 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
        Script path: each receiver holds a passthrough transform from
        creation, and swaps back to a fresh one instead of clearing. */
     let passthroughWorker: { worker: Worker; url: string } | null = null;
-    const passthrough = (): RTCRtpScriptTransform => {
+    const taps = new Map<RTCRtpTransceiver, (frame: EncodedFrameCopy) => void>();
+    /* Script path with frame taps: each receiver's passthrough reports to the page over its own port. */
+    const tapPorts = new Map<RTCRtpTransceiver, MessagePort>();
+    const passthrough = (t: RTCRtpTransceiver): RTCRtpScriptTransform => {
       if (!passthroughWorker) {
         const url = URL.createObjectURL(
           new Blob([PASSTHROUGH_WORKER_SOURCE], { type: "text/javascript" }),
         );
         passthroughWorker = { worker: new Worker(url), url };
       }
-      return new RTCRtpScriptTransform(passthroughWorker.worker);
+      if (opts.frameTaps !== true) return new RTCRtpScriptTransform(passthroughWorker.worker);
+      tapPorts.get(t)?.close();
+      const channel = new MessageChannel();
+      channel.port1.onmessage = (ev: MessageEvent<Omit<EncodedFrameCopy, "receivedAt">>) => {
+        taps.get(t)?.({ ...ev.data, receivedAt: monotonicNowMs() });
+      };
+      channel.port1.postMessage(taps.has(t));
+      tapPorts.set(t, channel.port1);
+      return new RTCRtpScriptTransform(
+        passthroughWorker.worker,
+        { port: channel.port2 },
+        [channel.port2],
+      );
     };
     const pipes = new Map<RTCRtpTransceiver, SwitchableFramePipe>();
     const pipeFor = (t: RTCRtpTransceiver): SwitchableFramePipe => {
@@ -639,7 +738,7 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
     return {
       addRecvOnlyTransceiver: () => {
         const t = pc.addTransceiver("video", { direction: "recvonly" });
-        if (transformPath === "script") t.receiver.transform = passthrough();
+        if (transformPath === "script") t.receiver.transform = passthrough(t);
       },
       createDataChannel: (label) =>
         wrapBrowserDataChannel(pc.createDataChannel(label)),
@@ -700,12 +799,30 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
           if (transform !== null && !(transform instanceof RTCRtpScriptTransform)) {
             throw new TypeError("[kerbcast] the script path needs an RTCRtpScriptTransform");
           }
-          transceiver.receiver.transform = transform ?? passthrough();
+          if (transform) {
+            tapPorts.get(transceiver)?.close();
+            tapPorts.delete(transceiver);
+          }
+          transceiver.receiver.transform = transform ?? passthrough(transceiver);
         } else {
           throw new Error("[kerbcast] encoded transforms are unavailable on this peer");
         }
       },
+      setReceiverTap: (mid, onFrame) => {
+        if (opts.frameTaps !== true || !transformPath) {
+          throw new Error("[kerbcast] frame taps are unavailable on this peer");
+        }
+        const transceiver = pc.getTransceivers().find((t) => t.mid === mid);
+        if (!transceiver) throw new Error(`[kerbcast] no receiver for slot ${mid}`);
+        if (onFrame) taps.set(transceiver, onFrame);
+        else taps.delete(transceiver);
+        if (transformPath === "streams") pipeFor(transceiver).tap = onFrame;
+        else tapPorts.get(transceiver)?.postMessage(onFrame !== null);
+      },
       close: () => {
+        for (const port of tapPorts.values()) port.close();
+        tapPorts.clear();
+        taps.clear();
         pc.close();
         if (passthroughWorker) {
           passthroughWorker.worker.terminate();
@@ -717,8 +834,38 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
   }
 }
 
-const PASSTHROUGH_WORKER_SOURCE =
-  "onrtctransform = (e) => { e.transformer.readable.pipeTo(e.transformer.writable).catch(() => {}); };";
+/*
+ * Forwards every frame untouched. A receiver given a port (frame taps on)
+ * also posts a copy of each frame to it while the page has switched the
+ * copy on. The original goes on to the decoder either way: a failed copy
+ * loses only the copy, never the live picture.
+ */
+const PASSTHROUGH_WORKER_SOURCE = `onrtctransform = (e) => {
+  const { readable, writable, options } = e.transformer;
+  const port = options && options.port;
+  if (!port) {
+    readable.pipeTo(writable).catch(() => {});
+    return;
+  }
+  let tap = false;
+  port.onmessage = (m) => { tap = m.data === true; };
+  readable.pipeThrough(new TransformStream({
+    transform(frame, out) {
+      if (tap) {
+        try {
+          const meta = frame.getMetadata();
+          const data = frame.data.slice(0);
+          port.postMessage({
+            data,
+            rtpTimestamp: meta.rtpTimestamp ?? frame.timestamp,
+            ssrc: meta.synchronizationSource,
+          }, [data]);
+        } catch {}
+      }
+      out.enqueue(frame);
+    },
+  })).pipeTo(writable).catch(() => {});
+};`;
 
 interface EncodedVideoStreams {
   readable: ReadableStream<RTCEncodedVideoFrame>;
@@ -729,6 +876,20 @@ interface EncodedVideoStreams {
 type ReceiverWithEncodedStreams = RTCRtpReceiver & {
   createEncodedStreams(): EncodedVideoStreams;
 };
+
+/* Metadata fields not every lib.dom version declares. */
+type EncodedFrameWithTimestamp = RTCEncodedVideoFrame & { timestamp?: number };
+type EncodedMetadataWithRtp = RTCEncodedVideoFrameMetadata & { rtpTimestamp?: number };
+
+function copyEncodedFrame(frame: RTCEncodedVideoFrame): EncodedFrameCopy {
+  const meta = frame.getMetadata() as EncodedMetadataWithRtp;
+  return {
+    data: frame.data.slice(0),
+    rtpTimestamp: meta.rtpTimestamp ?? (frame as EncodedFrameWithTimestamp).timestamp ?? 0,
+    ssrc: meta.synchronizationSource,
+    receivedAt: monotonicNowMs(),
+  };
+}
 
 function detectEncodedTransformPath(): EncodedTransformPath | null {
   if (typeof RTCRtpReceiver === "undefined") return null;
@@ -743,9 +904,11 @@ function detectEncodedTransformPath(): EncodedTransformPath | null {
  * TransformStream while one is set. Swapping aborts the old transform, so
  * frames it still holds are dropped.
  */
-class SwitchableFramePipe {
+export class SwitchableFramePipe {
   private readonly out: WritableStreamDefaultWriter<RTCEncodedVideoFrame>;
   private stage: WritableStreamDefaultWriter<RTCEncodedVideoFrame> | null = null;
+  /** Gets a copy of each received frame, before any transform, while set. */
+  tap: ((frame: EncodedFrameCopy) => void) | null = null;
 
   constructor(streams: EncodedVideoStreams) {
     this.out = streams.writable.getWriter();
@@ -767,9 +930,31 @@ class SwitchableFramePipe {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) return;
+        /* Copied before the write, which hands the frame's data on; delivered
+           after it and off this loop, so a failing tap never stalls the
+           decoder (an exception here would read as the receiver closing). */
+        const tap = this.tap;
+        let copy: EncodedFrameCopy | null = null;
+        if (tap) {
+          try {
+            copy = copyEncodedFrame(value);
+          } catch {
+            /* lose this copy, keep the picture */
+          }
+        }
         const stage = this.stage;
         if (stage) await stage.write(value).catch(() => {});
         else await this.out.write(value);
+        if (tap && copy) {
+          const frame = copy;
+          queueMicrotask(() => {
+            try {
+              tap(frame);
+            } catch (err) {
+              console.error("kerbcast: encoded frame tap failed", err);
+            }
+          });
+        }
       }
     } catch {
       /* The receiver closed with its peer. */
@@ -838,6 +1023,21 @@ function mapPeerState(state: RTCPeerConnectionState): KerbcastConnectionState {
 
 type Listener<T> = (data: T) => void;
 
+/**
+ * A random id for {@link KerbcastClient}'s resume name. `randomUUID` only
+ * exists in a secure context, and the page is usually served over plain
+ * http from the game machine's LAN address.
+ */
+function mintClientId(): string {
+  const crypto = (globalThis as { crypto?: Crypto }).crypto;
+  if (typeof crypto?.randomUUID === "function") return crypto.randomUUID();
+  if (typeof crypto?.getRandomValues === "function") {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 // No bound on E so consumers can use `interface` declarations
 // (interfaces don't carry an implicit string index signature, so
 // `extends Record<string, unknown>` would reject them).
@@ -885,6 +1085,9 @@ class CameraHandle
   private _sourceless = false;
   /** Stall state mirrored from the pipeline's onStallChange callback. */
   private _stalled = false;
+  private _hasSource = false;
+  /** The raw stream {@link _watchSource} last subscribed to, so a re-apply of it adds no listener. */
+  private _watchedStream: MediaStream | null = null;
   /** Interval that re-requests keyframes while stalled; null when not stalled. */
   private _keyframeRetry: ReturnType<typeof setInterval> | null = null;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
@@ -893,6 +1096,8 @@ class CameraHandle
   private _clear = false;
   /** Set by {@link setEncodedTransform}; the client installs it on whichever receiver carries this camera. */
   _encodedTransform: EncodedTransformFactory | null = null;
+  /** Listeners from {@link tapEncodedFrames}; the client taps whichever receiver carries this camera while any are set. */
+  readonly _frameTaps = new Set<(frame: EncodedFrameCopy) => void>();
   private readonly client: KerbcastClient;
 
   constructor(flightId: number, client: KerbcastClient) {
@@ -911,6 +1116,10 @@ class CameraHandle
 
   get stalled(): boolean {
     return this._stalled;
+  }
+
+  get hasSource(): boolean {
+    return this._hasSource;
   }
 
   get showStatic(): boolean {
@@ -935,8 +1144,36 @@ class CameraHandle
 
   setEncodedTransform(factory: EncodedTransformFactory | null): void {
     if (factory) this.client._assertEncodedTransforms();
+    if (factory && !this._encodedTransform && this._frameTaps.size > 0) {
+      this.client._warnTapsDisplaced(this.flightId);
+    }
     this._encodedTransform = factory;
     this.client._syncEncodedTransforms();
+  }
+
+  canTapEncodedFrames(): boolean {
+    return this.client._frameTapAvailable(this.flightId);
+  }
+
+  tapEncodedFrames(onFrame: (frame: EncodedFrameCopy) => void): (() => void) | null {
+    if (!this.client._frameTapAvailable(this.flightId)) return null;
+    this._frameTaps.add(onFrame);
+    this.client._syncEncodedTransforms();
+    return () => {
+      if (!this._frameTaps.delete(onFrame)) return;
+      this.client._syncEncodedTransforms();
+    };
+  }
+
+  /** Internal: hands a copied frame to every tap. */
+  _deliverFrame(frame: EncodedFrameCopy): void {
+    for (const tap of this._frameTaps) {
+      try {
+        tap(frame);
+      } catch (err) {
+        console.error(`kerbcast: encoded frame tap for camera ${this.flightId} failed`, err);
+      }
+    }
   }
 
   /**
@@ -988,6 +1225,7 @@ class CameraHandle
   private _applySource(raw: MediaStream | null): void {
     this._rawStream = raw;
     this._sourceless = raw === null;
+    this._watchSource(raw);
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
     this._clear = !noiseEnabled && this.client._frameLock();
@@ -1045,6 +1283,27 @@ class CameraHandle
     if (this._sourceless && !this._clear) {
       this._noisePipeline?.setShowStatic(this._sourcelessShowStatic());
     }
+  }
+
+  /** Follows whether `raw` still carries a live track, for {@link hasSource}. */
+  private _watchSource(raw: MediaStream | null): void {
+    if (raw !== null && raw === this._watchedStream) return;
+    this._watchedStream = raw;
+    const track = raw?.getVideoTracks?.()[0];
+    this._setHasSource(raw !== null && track?.readyState !== "ended");
+    track?.addEventListener?.(
+      "ended",
+      () => {
+        if (this._rawStream === raw) this._setHasSource(false);
+      },
+      { once: true },
+    );
+  }
+
+  private _setHasSource(hasSource: boolean): void {
+    if (this._hasSource === hasSource) return;
+    this._hasSource = hasSource;
+    this.emit("source", hasSource);
   }
 
   private _setOutput(stream: MediaStream | null): void {
@@ -1111,7 +1370,9 @@ class CameraHandle
     this._noisePipeline?.destroy();
     this._noisePipeline = null;
     this._rawStream = null;
+    this._watchedStream = null;
     this._sourceless = false;
+    this._setHasSource(false);
     this._setStalled(false);
     this._setOutput(null);
   }
@@ -1175,10 +1436,11 @@ class CameraHandle
   }
 
   async setForceFullResolution(force: boolean): Promise<void> {
-    await this.client._send({
-      type: "set-force-full-resolution",
-      content: { flightId: this.flightId, force },
-    });
+    await this.client._setForceFullResolution(this.flightId, force);
+  }
+
+  async setSizeHold(hold: boolean): Promise<void> {
+    await this.client._setSizeHold(this.flightId, hold);
   }
 
   async requestKeyframe(): Promise<void> {
@@ -1254,6 +1516,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     string,
     { flightId: number; factory: EncodedTransformFactory }
   >();
+  /** Receivers copying frames for a camera's taps, by mid. */
+  private readonly tapInstalls = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
   /** Whether the connected sidecar's `hello` offered anchors. */
@@ -1264,6 +1528,18 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private readonly anchorsSent = new Set<number>();
   /** Whether this connection has sent its camera list; until then the last one may be stale. */
   private camerasListed = false;
+  /** Whether the connected sidecar's `hello` offered size holds. */
+  private _sizeHoldSupported = false;
+  /** Cameras this client forces to full resolution, sent again on every connection. */
+  private readonly forcedFlights = new Set<number>();
+  /** Cameras this client holds at their size, sent again on every connection that takes holds. */
+  private readonly heldFlights = new Set<number>();
+  /**
+   * Names this client to the sidecar across its connections, so a reconnect
+   * takes over the force and holds the last connection left behind instead
+   * of the camera resizing in between.
+   */
+  private readonly clientId = mintClientId();
   /** The sidecar's per-camera anchor cap from `hello`. */
   private _maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
   /** A snapshot split across messages, until its last camera arrives. */
@@ -1289,6 +1565,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private readonly commandCentres = new CommandCentreHistory();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
+  private _lastContactAt: number | null = null;
   /** Client-side recording controller, lazily built on first `recording` access. */
   private _recording: RecordingController | null = null;
   /**
@@ -1499,6 +1776,16 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * When the last message from the sidecar arrived, as `Date.now()`, or null
+   * before the first. Kept across connections, so once a connection drops it
+   * still says when that connection was last heard from, including time the
+   * page spent paused or asleep without noticing the drop.
+   */
+  get lastContactAt(): number | null {
+    return this._lastContactAt;
+  }
+
+  /**
    * Send a `set-throttle-main-screen` command to the sidecar, which writes
    * `global.control.json` for the plugin to apply. The plugin persists the
    * change in the per-save difficulty parameter. The resulting
@@ -1568,6 +1855,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.frameStamps.clear();
     this.commandCentres.clear();
     this._anchorsSupported = false;
+    this._sizeHoldSupported = false;
     this.anchorsSent.clear();
     this.camerasListed = false;
     this._maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
@@ -1892,6 +2180,52 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     }
   }
 
+  /**
+   * Internal: records a camera's force and sends it. Kept here rather than
+   * on the handle so a reconnect can send it again: the sidecar forgets a
+   * viewer's force when its connection drops.
+   */
+  async _setForceFullResolution(flightId: number, force: boolean): Promise<void> {
+    if (force) this.forcedFlights.add(flightId);
+    else this.forcedFlights.delete(flightId);
+    await this._send({ type: "set-force-full-resolution", content: { flightId, force } });
+  }
+
+  /**
+   * Internal: records a camera's size hold and sends it when the sidecar
+   * takes holds. Kept across connections like the force; a sidecar older
+   * than 1.12 never receives it.
+   */
+  async _setSizeHold(flightId: number, hold: boolean): Promise<void> {
+    if (hold) this.heldFlights.add(flightId);
+    else this.heldFlights.delete(flightId);
+    if (!this._sizeHoldSupported) return;
+    await this._send({ type: "set-size-hold", content: { flightId, hold } });
+  }
+
+  /** Must go ahead of {@link _sendHeldSizes}: the sidecar hands over what a resume names. */
+  private _sendResume(): void {
+    void this._send({
+      type: "resume",
+      content: {
+        clientId: this.clientId,
+        forced: [...this.forcedFlights],
+        held: this._sizeHoldSupported ? [...this.heldFlights] : [],
+      },
+    }).catch(() => {});
+  }
+
+  /** Sends a new connection the forces and holds this client still has in place. */
+  private _sendHeldSizes(): void {
+    for (const flightId of this.forcedFlights) {
+      void this._send({ type: "set-force-full-resolution", content: { flightId, force: true } }).catch(() => {});
+    }
+    if (!this._sizeHoldSupported) return;
+    for (const flightId of this.heldFlights) {
+      void this._send({ type: "set-size-hold", content: { flightId, hold: true } }).catch(() => {});
+    }
+  }
+
   /** This client's anchors on `flightId`, as last set. Empty when none. */
   anchorsFor(flightId: number): readonly Anchor[] {
     return this.anchorsByFlight.get(flightId) ?? [];
@@ -2127,6 +2461,12 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       });
       return;
     }
+    const heardAt = Date.now();
+    const lastHeard = this._lastContactAt;
+    this._lastContactAt = heardAt;
+    if (lastHeard != null && heardAt - lastHeard >= CONTACT_GAP_MS) {
+      this.emit("contact-gap", { from: lastHeard, to: heardAt });
+    }
     /* A split snapshot's cameras arrive back to back; anything else means the rest were lost. */
     if (this.pendingSnapshot && msg.type !== "camera-state-changed") {
       const pending = this.pendingSnapshot;
@@ -2140,6 +2480,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         /* Stamps are opt-in so clients that predate them never pay for them. */
         this._anchorsSupported = msg.content.anchors === true;
         this._maxAnchorsPerCamera = msg.content.maxAnchorsPerCamera ?? MAX_ANCHORS_PER_CAMERA;
+        this._sizeHoldSupported = msg.content.sizeHold === true;
+        if (msg.content.resume === true) this._sendResume();
+        this._sendHeldSizes();
         /* A new connection starts with no anchors on the sidecar. */
         this.anchorsSent.clear();
         this.camerasListed = false;
@@ -2356,12 +2699,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   private peerOptions(): KerbcastPeerOptions {
-    return { encodedTransforms: this.cfg.encodedTransforms === true };
+    return {
+      encodedTransforms: this.cfg.encodedTransforms === true,
+      ...(this.cfg.recordingTiming === "capture" ? { frameTaps: true } : {}),
+    };
   }
 
   /** Internal: throws unless {@link KerbcastCameraHandle.setEncodedTransform} can work here. */
   _assertEncodedTransforms(): void {
-    if (this.encodedTransformPath) return;
+    if (this.encodedTransformPath && this.cfg.encodedTransforms === true) return;
     const optIn = this.transport.encodedTransformPath?.({ encodedTransforms: true });
     if (optIn && this.cfg.encodedTransforms !== true) {
       throw new Error(
@@ -2379,6 +2725,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * its instance; a bound camera with a factory gets a fresh one.
    */
   _syncEncodedTransforms(): void {
+    this.syncFrameTaps();
     const peer = this.peer;
     const path = this.peerTransformPath;
     if (!peer?.setReceiverTransform || !path) return;
@@ -2407,7 +2754,64 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     }
   }
 
+  /** Internal: whether {@link KerbcastCameraHandle.tapEncodedFrames} can copy `flightId`'s frames on this client. */
+  _frameTapAvailable(flightId: number): boolean {
+    const path = this.encodedTransformPath;
+    if (!path || this.cfg.recordingTiming !== "capture") return false;
+    /* A script-path receiver holds one transform: the camera's own replaces the copying passthrough. */
+    return !(path === "script" && this.handles.get(flightId)?._encodedTransform);
+  }
+
+  /** Internal: a camera's own transform is about to replace the passthrough its taps copy from. */
+  _warnTapsDisplaced(flightId: number): void {
+    if (this.encodedTransformPath !== "script") return;
+    this.emit("error", {
+      message: `[kerbcast] camera ${flightId}'s encoded transform stops its frame copies until it is removed; a capture-timed recording of it misses those frames`,
+      source: ErrorSource.Client,
+      flightId,
+    });
+  }
+
+  /** Points each receiver's frame copy at the camera bound to it, while that camera has taps. */
+  private syncFrameTaps(): void {
+    const peer = this.peer;
+    if (!peer?.setReceiverTap) return;
+    const bindings = this.dynamicMode ? this.flightByMid : this.legacyFlightByMid;
+    for (const [mid, flightId] of this.tapInstalls) {
+      if (bindings.get(mid) === flightId && this.handles.get(flightId)?._frameTaps.size) continue;
+      this.tapInstalls.delete(mid);
+      this.setReceiverTap(peer, mid, flightId, null);
+    }
+    for (const [mid, flightId] of bindings) {
+      if (this.tapInstalls.has(mid) || !this.handles.get(flightId)?._frameTaps.size) continue;
+      const deliver = (frame: EncodedFrameCopy): void => {
+        this.handles.get(flightId)?._deliverFrame(frame);
+      };
+      if (this.setReceiverTap(peer, mid, flightId, deliver)) this.tapInstalls.set(mid, flightId);
+    }
+  }
+
+  private setReceiverTap(
+    peer: KerbcastPeer,
+    mid: string,
+    flightId: number,
+    onFrame: ((frame: EncodedFrameCopy) => void) | null,
+  ): boolean {
+    try {
+      peer.setReceiverTap?.(mid, onFrame);
+      return true;
+    } catch (err) {
+      this.emit("error", {
+        message: `[kerbcast] frame copy for camera ${flightId}: ${err instanceof Error ? err.message : String(err)}`,
+        source: ErrorSource.Client,
+        flightId,
+      });
+      return false;
+    }
+  }
+
   private clearEncodedTransforms(): void {
+    this.tapInstalls.clear();
     const peer = this.peer;
     for (const [mid, installed] of this.transformInstalls) {
       if (peer) this.setReceiverTransform(peer, mid, installed.flightId, null);

@@ -1537,6 +1537,11 @@ namespace Kerbcast
         // never touch each other; ApplyEffectiveQuality min()s their scales.
         private int _shedLevel;
         private int _viewerLevel;
+        /* A viewer is recording this camera. Its size stays put until the
+           hold is released: the ladder still sheds load, through the stagger
+           regulator's frame rate and the other cameras' resolution, and the
+           inputs that arrive meanwhile apply on release. */
+        private bool _sizeHeld;
 
         /// <summary>Currently-applied viewer quality level (index into
         /// QualityClamp.ViewerScales; 0 = no viewer clamp).</summary>
@@ -1573,6 +1578,19 @@ namespace Kerbcast
             ApplyEffectiveQuality();
         }
 
+        /// <summary>
+        /// Hold (or release) the render size while a viewer records this
+        /// camera, so the recording never changes size mid-clip. Releasing
+        /// applies whatever the quality inputs settled on meanwhile.
+        /// </summary>
+        public void SetSizeHeld(bool held)
+        {
+            if (_sizeHeld == held) return;
+            _sizeHeld = held;
+            Debug.Log($"[Kerbcast] cam={FlightId} size hold → {held} at {RenderWidth}×{RenderHeight}");
+            if (!held) ApplyEffectiveQuality();
+        }
+
         // THE single resolution-change path. Every quality input (operator
         // ceiling changes, adaptive shed moves, viewer clamp moves) funnels
         // here, so the pooled-RT SetRenderSize mechanism is the only way
@@ -1584,7 +1602,7 @@ namespace Kerbcast
 
             int targetW = QualityClamp.ScaleDimension(OperatorWidth, scale);
             int targetH = QualityClamp.ScaleDimension(OperatorHeight, scale);
-            if (targetW != RenderWidth || targetH != RenderHeight)
+            if (!_sizeHeld && (targetW != RenderWidth || targetH != RenderHeight))
             {
                 SetRenderSize(targetW, targetH);
             }
@@ -1699,6 +1717,11 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] cam={FlightId} operator layers → {_operatorLayers}");
                 }
 
+                /* A hold lands before the size inputs below, so none of them
+                   resizes a held camera; a release lands after them, so the
+                   camera resizes once, to where they all settled. */
+                if (snap.SizeHeld) SetSizeHeld(true);
+
                 // Viewer quality clamp. Absent means auto (level 0, no
                 // clamp); SetViewerQualityLevel no-ops when unchanged, so
                 // re-published snapshots are free. Applies even when the
@@ -1725,6 +1748,7 @@ namespace Kerbcast
                         Debug.Log($"[Kerbcast] cam={FlightId} operator render size → {w}×{h}");
                     }
                 }
+                if (!snap.SizeHeld) SetSizeHeld(false);
 
                 // Absolute FoV is applied only when its seq changes (see
                 // _lastFovSeq) so the stale fov re-published on unrelated writes /

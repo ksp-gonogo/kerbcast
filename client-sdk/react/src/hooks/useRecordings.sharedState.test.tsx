@@ -31,13 +31,16 @@ function liveStream(): MediaStream {
 /** Fake RecordingClient with a settable clock; enough for the controller. */
 class FakeRecordingClient implements RecordingClient {
   captureUt: number | null = 100;
-  camera(_flightId: number): { readonly mediaStream: MediaStream | null } {
-    return { mediaStream: liveStream() };
+  camera(_flightId: number): {
+    readonly mediaStream: MediaStream | null;
+    on(): () => void;
+  } {
+    return { mediaStream: liveStream(), on: () => () => {} };
   }
   get clock(): { readonly captureUt: number | null } {
     return { captureUt: this.captureUt };
   }
-  on(_event: "settings-change", _handler: (data: unknown) => void): () => void {
+  on(): () => void {
     return () => {};
   }
 }

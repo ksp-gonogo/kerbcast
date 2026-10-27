@@ -750,14 +750,51 @@ pub struct SetRenderSizePayload {
 /// Forces a camera to render at the operator ceiling regardless of
 /// display-size demand. Per-viewer, OR-aggregated by the sidecar: a feed
 /// stays forced while any connected viewer forces it, and releases when
-/// the last one clears it (or disconnects). Still yields to the adaptive
-/// framerate shed; overrides only the demand term.
+/// the last one clears it (or disconnects). Overrides the demand term and
+/// any viewer quality preset (which returns on release); still capped by
+/// an operator render-size cap and the adaptive shed.
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetForceFullResolutionPayload {
     pub flight_id: u32,
     pub force: bool,
+}
+
+/// Holds a camera at the size it is rendering now, for as long as a viewer
+/// is recording it, so the clip never changes size mid-file. While held, the
+/// adaptive ladder sheds this camera's frame rate rather than its resolution,
+/// and display-size reports, quality presets and render-size changes wait
+/// until the last hold is released. Per-viewer, OR-aggregated like
+/// `SetForceFullResolution`, and released when the viewer unsubscribes or
+/// disconnects (after a grace for a client that may `Resume`).
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSizeHoldPayload {
+    pub flight_id: u32,
+    pub hold: bool,
+}
+
+/// Names the client behind a new connection, so a reconnect keeps what its
+/// last connection asked for. When a connection drops, the sidecar keeps that
+/// client's `SetForceFullResolution` and `SetSizeHold` for a grace period
+/// instead of releasing them at once; a connection that resumes the same
+/// `client_id` within it takes them over, so a recorded camera never
+/// resizes across the reconnect. Only the cameras still listed in `forced`
+/// and `held` are kept. A client that does not return in time is released
+/// as before. Send right after `Hello`, before resending any force or hold,
+/// and only to a sidecar whose `Hello` has `resume: true`.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumePayload {
+    /// Stable for the life of the client, across its connections.
+    pub client_id: String,
+    /// Cameras this client still forces to full resolution.
+    pub forced: Vec<u32>,
+    /// Cameras this client still holds at their size.
+    pub held: Vec<u32>,
 }
 
 /// Consumer's background-capture request. Global rather than
@@ -1307,6 +1344,14 @@ pub struct HelloPayload {
     /// sidecars older than 1.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_anchors_per_camera: Option<u32>,
+    /// True when this sidecar takes `SetSizeHold`. Absent from sidecars
+    /// older than 1.12, which answer it with an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_hold: Option<bool>,
+    /// True when this sidecar takes `Resume`. Absent from sidecars older
+    /// than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<bool>,
 }
 
 #[typeshare]
@@ -1567,10 +1612,16 @@ pub enum ClientMessage {
     /// Force a camera to render at the operator ceiling regardless of
     /// display-size demand. Per-viewer, OR-aggregated by the sidecar: a
     /// feed stays forced while any connected viewer forces it, and
-    /// releases when the last one clears it (or disconnects). Still
-    /// yields to the adaptive framerate shed; overrides only the demand
-    /// term, never the perf-protection ceiling.
+    /// releases when the last one clears it (or disconnects). Overrides
+    /// the demand term and any viewer quality preset, never the
+    /// perf-protection ceiling.
     SetForceFullResolution(SetForceFullResolutionPayload),
+    /// Hold a camera at its current size while a viewer records it. See
+    /// `SetSizeHoldPayload`.
+    SetSizeHold(SetSizeHoldPayload),
+    /// Name the client behind this connection and take over what its last
+    /// connection forced and held. See `ResumePayload`.
+    Resume(ResumePayload),
     /// Ask for background capture: subscribed cameras that this
     /// consumer is NOT displaying keep capturing at a low rate instead of
     /// stopping, so switching to one promotes an already-flowing stream rather
@@ -1853,8 +1904,12 @@ mod tests {
             anchors: Some(true),
             frame_command: Some(true),
             max_anchors_per_camera: Some(16),
+            size_hold: Some(true),
+            resume: Some(true),
         });
         let hello = serde_json::to_string(&hello).unwrap();
+        assert!(hello.contains(r#""sizeHold":true"#));
+        assert!(hello.contains(r#""resume":true"#));
         assert!(hello.contains(r#""maxAnchorsPerCamera":16"#));
         assert!(hello.contains(r#""frameStamps":true"#));
         assert!(hello.contains(r#""anchors":true"#));
@@ -2132,6 +2187,35 @@ mod tests {
         }
         let re_serialized = serde_json::to_string(&back).unwrap();
         assert_eq!(re_serialized, s);
+    }
+
+    #[test]
+    fn set_size_hold_roundtrips() {
+        let s = r#"{"type":"set-size-hold","content":{"flightId":7,"hold":true}}"#;
+        let back: ClientMessage = serde_json::from_str(s).unwrap();
+        match &back {
+            ClientMessage::SetSizeHold(p) => {
+                assert_eq!(p.flight_id, 7);
+                assert!(p.hold);
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(serde_json::to_string(&back).unwrap(), s);
+    }
+
+    #[test]
+    fn resume_roundtrips() {
+        let s = r#"{"type":"resume","content":{"clientId":"c1","forced":[7],"held":[7,9]}}"#;
+        let back: ClientMessage = serde_json::from_str(s).unwrap();
+        match &back {
+            ClientMessage::Resume(p) => {
+                assert_eq!(p.client_id, "c1");
+                assert_eq!(p.forced, vec![7]);
+                assert_eq!(p.held, vec![7, 9]);
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert_eq!(serde_json::to_string(&back).unwrap(), s);
     }
 
     #[test]

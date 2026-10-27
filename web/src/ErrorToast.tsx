@@ -1,4 +1,4 @@
-import type { ErrorPayload, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { ErrorPayload, KerbcastClient, RecordingEndReason } from "@ksp-gonogo/kerbcast";
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
@@ -15,23 +15,46 @@ interface Notice {
 /* How long a notice lingers before it auto-dismisses. */
 const AUTO_DISMISS_MS = 6000;
 
+const RECORDING_END_NOTICES: Partial<Record<RecordingEndReason, string>> = {
+  "camera-gone": "A recording stopped because its camera went away. What it caught is in Recordings.",
+  "feed-closed": "A recording stopped because its feed was closed. What it caught is in Recordings.",
+  disconnected: "A recording stopped because the connection was lost. What it caught is in Recordings.",
+};
+
 /**
- * Surfaces sidecar error replies (e.g. a failed rebind, "no free slot") as a
- * stack of transient, dismissible notices in the corner of the screen. Each
- * notice auto-clears after a few seconds; the operator can also dismiss it.
+ * Surfaces sidecar error replies (e.g. a failed rebind, "no free slot") and
+ * recordings that stopped on their own as a stack of transient, dismissible
+ * notices in the corner of the screen. Each notice auto-clears after a few
+ * seconds; the operator can also dismiss it.
  */
 export function ErrorToast({ client }: ErrorToastProps): React.JSX.Element | null {
   const [notices, setNotices] = useState<Notice[]>([]);
   const nextId = useRef(0);
 
   useEffect(() => {
-    return client.on("error", (payload: ErrorPayload) => {
+    const push = (message: string): void => {
       const id = nextId.current++;
-      setNotices((prev) => [...prev, { id, message: payload.message }]);
+      setNotices((prev) => [...prev, { id, message }]);
       setTimeout(() => {
         setNotices((prev) => prev.filter((n) => n.id !== id));
       }, AUTO_DISMISS_MS);
+    };
+    /* A REC+ set that loses its cameras together gets one notice, not one per feed. */
+    const noticedGroups = new Set<string>();
+    const offError = client.on("error", (payload: ErrorPayload) => push(payload.message));
+    const offEnded = client.recording.onRecordingEnded((event) => {
+      const message = RECORDING_END_NOTICES[event.endedBy];
+      if (!message) return;
+      if (event.groupId != null) {
+        if (noticedGroups.has(event.groupId)) return;
+        noticedGroups.add(event.groupId);
+      }
+      push(message);
     });
+    return () => {
+      offError();
+      offEnded();
+    };
   }, [client]);
 
   if (notices.length === 0) return null;

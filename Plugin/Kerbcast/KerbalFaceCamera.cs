@@ -209,8 +209,9 @@ namespace Kerbcast
                 // size into Width/Height (both present-flag gated). A face is
                 // square, so fit it to the smaller reported side, rounded even and
                 // clamped to [MinSide, _maxSide]. SetRenderSize no-ops when unchanged
-                // (re-published snapshots are free).
-                if (snap.Width.HasValue && snap.Height.HasValue)
+                // (re-published snapshots are free). A held size (a viewer is
+                // recording) waits; the release snapshot carries the latest size.
+                if (!snap.SizeHeld && snap.Width.HasValue && snap.Height.HasValue)
                 {
                     int even = MakeEven((int)Math.Min(snap.Width.Value, snap.Height.Value));
                     int lo = Math.Min(MinSide, _maxSide);
