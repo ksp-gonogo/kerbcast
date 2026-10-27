@@ -43,6 +43,7 @@ import { DEFAULT_FEED_ASPECT, useReportDisplaySize } from "./hooks/useReportDisp
 import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
+import { claimAnchors } from "./sharedAnchors";
 import { usePortalMenu } from "./menuPositioning";
 import { formatElapsed, nowMs } from "./timing";
 
@@ -623,13 +624,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const anchorsKey = anchors?.length ? JSON.stringify(anchors) : "";
     useEffect(() => {
       if (flightId === null || !anchorsKey) return;
-      const target = flightId;
-      client.setAnchors(target, JSON.parse(anchorsKey) as Anchor[]).catch((err: unknown) => {
-        console.warn("[kerbcast] anchors refused", err);
-      });
-      return () => {
-        void client.setAnchors(target, null).catch(() => {});
-      };
+      return claimAnchors(client, flightId, JSON.parse(anchorsKey) as Anchor[]);
     }, [client, flightId, anchorsKey]);
     const drawsAnchors = !!anchorsKey || !!anchorOverlay?.owners?.length;
 

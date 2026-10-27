@@ -1,6 +1,6 @@
 import type { FrameAnchor } from "./__generated__/types";
 
-/** Most anchors one client may hold on one camera; the sidecar refuses more. */
+/** Most anchors one client may hold on one camera when the sidecar's `hello` does not say; see `KerbcastClient.maxAnchorsPerCamera`. */
 export const MAX_ANCHORS_PER_CAMERA = 16;
 
 /** The `owner` on anchors Kerbcast sets itself. */

@@ -372,9 +372,18 @@ export interface CommandCentreInfo {
 	/**
 	 * Every craft the camera could watch, eligible first, then nearest
 	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
-	 * only reports what the tracking network would allow.
+	 * only reports what the tracking network would allow. A control channel
+	 * message has a size limit, so with hundreds of craft the list over it
+	 * is cut from the end and `targets_omitted` counts what was left out.
+	 * A cut list keeps the feed's subject, appended at the end out of the
+	 * eligible-then-nearest order when it fell in the cut part.
 	 */
 	targets: CommandTarget[];
+	/**
+	 * How many craft were cut from the end of `targets` to fit the message.
+	 * Absent when none were.
+	 */
+	targetsOmitted?: number;
 	/**
 	 * True for a camera made at runtime (`CreateCommandCamera`, or the
 	 * plugin's `KerbcastControl.CreateCommandCamera`), false for the one
@@ -705,6 +714,14 @@ export interface CameraState {
 
 export interface CameraSnapshotPayload {
 	cameras: CameraState[];
+	/**
+	 * How many more cameras complete this snapshot. A snapshot too large
+	 * for one message carries the first cameras, and each of the rest
+	 * follows straight after it as a `CameraStateChanged`, which a client
+	 * that predates this field applies as it would any state change.
+	 * Absent when the snapshot is whole.
+	 */
+	follows?: number;
 }
 
 export interface CameraStateChangedPayload {
@@ -1123,6 +1140,11 @@ export interface HelloPayload {
 	 * sidecars older than 1.12.
 	 */
 	frameCommand?: boolean;
+	/**
+	 * The most anchors one client may set on one camera. Absent from
+	 * sidecars older than 1.12.
+	 */
+	maxAnchorsPerCamera?: number;
 }
 
 /**

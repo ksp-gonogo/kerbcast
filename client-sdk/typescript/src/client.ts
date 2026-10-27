@@ -1258,8 +1258,16 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _sidecarVersion: string | null = null;
   /** Whether the connected sidecar's `hello` offered anchors. */
   private _anchorsSupported = false;
-  /** This client's anchors per camera, re-sent on every connection that offers anchors. */
+  /** This client's anchors per camera, kept across connections until cleared. */
   private readonly anchorsByFlight = new Map<number, Anchor[]>();
+  /** Cameras whose anchors this connection's sidecar holds. */
+  private readonly anchorsSent = new Set<number>();
+  /** Whether this connection has sent its camera list; until then the last one may be stale. */
+  private camerasListed = false;
+  /** The sidecar's per-camera anchor cap from `hello`. */
+  private _maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
+  /** A snapshot split across messages, until its last camera arrives. */
+  private pendingSnapshot: { cameras: CameraState[]; remaining: number } | null = null;
   private _encoderBackend: string | null = null;
   /** Last-received throttle state from `settings-state`. False until the first push. */
   private _throttleMainScreen = false;
@@ -1560,6 +1568,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.frameStamps.clear();
     this.commandCentres.clear();
     this._anchorsSupported = false;
+    this.anchorsSent.clear();
+    this.camerasListed = false;
+    this._maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
+    this.pendingSnapshot = null;
 
     const peerOpts = this.peerOptions();
     const peer = this.transport.createPeer(
@@ -1779,8 +1791,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    *
    * Rejects with a {@link CommandTargetUnknownError} when the aim's craft is
    * not in the camera's `commandCentre.targets` (a craft merged away in a
-   * dock, say). A refusal that races the list changing arrives as an `error`
-   * event with code `ErrorCode.CommandTargetUnknown`.
+   * dock, say). A list cut to fit the control channel
+   * (`commandCentre.targetsOmitted` set) may leave the craft out, so the
+   * sidecar decides then. A refusal that races the list changing, or that the
+   * sidecar makes, arrives as an `error` event with code
+   * `ErrorCode.CommandTargetUnknown`.
    */
   async setCommandAim(flightId: number, aim: CommandAim | null): Promise<void> {
     const cam = this._cameras.find((c) => c.flightId === flightId);
@@ -1788,10 +1803,12 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     if (owner) {
       throw new CommandLockedError(owner);
     }
-    /* An empty list is what the game writes when listing fails, so it decides then. */
+    /* An empty list is what the game writes when listing fails, and a cut one
+       leaves craft out, so the sidecar decides then. */
     const craft = aim ? aimCraft(aim) : undefined;
     const targets = cam?.commandCentre?.targets;
-    if (craft !== undefined && targets?.length && !targets.some((t) => t.persistentId === craft)) {
+    const whole = !cam?.commandCentre?.targetsOmitted;
+    if (craft !== undefined && whole && targets?.length && !targets.some((t) => t.persistentId === craft)) {
       throw new CommandTargetUnknownError(flightId, craft);
     }
     await this._send({
@@ -1828,18 +1845,19 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * stream delay.
    *
    * Anchors belong to this client: other clients never see them, the
-   * command lock does not apply, and they are kept here and sent again
-   * whenever the client reconnects. Only a sidecar whose `hello` offers
-   * anchors (1.12 and later) receives them; against an older one they are
-   * kept but never sent. Rejects with a `RangeError` for more than
-   * {@link MAX_ANCHORS_PER_CAMERA} anchors or a repeated id; a malformed
+   * command lock does not apply, and they are kept here until cleared and
+   * sent again whenever the client reconnects. Anchors on a camera missing
+   * from {@link cameras} wait until it appears. Only a sidecar whose
+   * `hello` offers anchors (1.12 and later) receives them; against an older
+   * one they are kept but never sent. Rejects with a `RangeError` for more
+   * than {@link maxAnchorsPerCamera} anchors or a repeated id; a malformed
    * anchor is refused by the sidecar with an `error` event.
    */
   async setAnchors(flightId: number, anchors: readonly Anchor[] | null): Promise<void> {
     const list = anchors ? [...anchors] : [];
-    if (list.length > MAX_ANCHORS_PER_CAMERA) {
+    if (list.length > this._maxAnchorsPerCamera) {
       throw new RangeError(
-        `at most ${MAX_ANCHORS_PER_CAMERA} anchors per camera, got ${list.length}`,
+        `at most ${this._maxAnchorsPerCamera} anchors per camera, got ${list.length}`,
       );
     }
     const ids = new Set<string>();
@@ -1848,20 +1866,44 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       ids.add(a.id);
     }
     if (list.length === 0) {
-      if (!this.anchorsByFlight.delete(flightId)) return;
-    } else {
-      this.anchorsByFlight.set(flightId, list);
+      this.anchorsByFlight.delete(flightId);
+      /* A camera the sidecar no longer lists would answer with an error. */
+      if (!this.anchorsSent.delete(flightId) || !this._isListed(flightId)) return;
+      await this._send({ type: "set-anchors", content: { flightId } });
+      return;
     }
+    this.anchorsByFlight.set(flightId, list);
+    if (!this._anchorsSupported || !this._isListed(flightId)) return;
+    this.anchorsSent.add(flightId);
+    await this._send({ type: "set-anchors", content: { flightId, anchors: list } });
+  }
+
+  private _isListed(flightId: number): boolean {
+    return this.camerasListed && this._cameras.some((c) => c.flightId === flightId);
+  }
+
+  /** Send the sidecar the anchors it lacks for cameras it now lists. */
+  private _sendHeldAnchors(): void {
     if (!this._anchorsSupported) return;
-    await this._send({
-      type: "set-anchors",
-      content: list.length ? { flightId, anchors: list } : { flightId },
-    });
+    for (const [flightId, anchors] of this.anchorsByFlight) {
+      if (this.anchorsSent.has(flightId) || !this._isListed(flightId)) continue;
+      this.anchorsSent.add(flightId);
+      void this._send({ type: "set-anchors", content: { flightId, anchors } }).catch(() => {});
+    }
   }
 
   /** This client's anchors on `flightId`, as last set. Empty when none. */
   anchorsFor(flightId: number): readonly Anchor[] {
     return this.anchorsByFlight.get(flightId) ?? [];
+  }
+
+  /**
+   * The most anchors {@link setAnchors} takes on one camera: what the
+   * connected sidecar's `hello` says, or {@link MAX_ANCHORS_PER_CAMERA}
+   * before it and from a sidecar that does not say.
+   */
+  get maxAnchorsPerCamera(): number {
+    return this._maxAnchorsPerCamera;
   }
 
   /** Whether the connected sidecar takes anchors. False until its `hello`. */
@@ -2060,6 +2102,20 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.getOrCreateHandle(flightId)._setMediaStream(new MediaStream([track]));
   }
 
+  private _applySnapshot(cameras: CameraState[]): void {
+    this._cameras = cameras;
+    this.camerasListed = true;
+    this.commandCentres.retain(cameras.map((c) => c.flightId));
+    for (const cam of cameras) {
+      this.commandCentres.record(cam.flightId, cam.commandCentre);
+      if (this.getOrCreateHandle(cam.flightId)._setState(cam)) {
+        this._resourceHandle(cam.flightId);
+      }
+    }
+    this.emit("cameras-change", cameras);
+    this._sendHeldAnchors();
+  }
+
   private handleServerMessage(raw: string): void {
     let msg: ServerMessage;
     try {
@@ -2071,12 +2127,22 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       });
       return;
     }
+    /* A split snapshot's cameras arrive back to back; anything else means the rest were lost. */
+    if (this.pendingSnapshot && msg.type !== "camera-state-changed") {
+      const pending = this.pendingSnapshot;
+      this.pendingSnapshot = null;
+      this._applySnapshot(pending.cameras);
+    }
     switch (msg.type) {
       case "hello":
         this._sidecarVersion = msg.content.sidecarVersion;
         this._encoderBackend = msg.content.encoderBackend;
         /* Stamps are opt-in so clients that predate them never pay for them. */
         this._anchorsSupported = msg.content.anchors === true;
+        this._maxAnchorsPerCamera = msg.content.maxAnchorsPerCamera ?? MAX_ANCHORS_PER_CAMERA;
+        /* A new connection starts with no anchors on the sidecar. */
+        this.anchorsSent.clear();
+        this.camerasListed = false;
         if (msg.content.frameStamps === true) {
           void this._send({
             type: "set-frame-stamps",
@@ -2087,25 +2153,25 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
             },
           }).catch(() => {});
         }
-        /* A new connection starts with no anchors on the sidecar; send ours again. */
-        if (this._anchorsSupported) {
-          for (const [flightId, anchors] of this.anchorsByFlight) {
-            void this._send({ type: "set-anchors", content: { flightId, anchors } }).catch(() => {});
-          }
-        }
         break;
       case "camera-snapshot":
-        this._cameras = msg.content.cameras;
-        this.commandCentres.retain(this._cameras.map((c) => c.flightId));
-        for (const cam of this._cameras) {
-          this.commandCentres.record(cam.flightId, cam.commandCentre);
-          if (this.getOrCreateHandle(cam.flightId)._setState(cam)) {
-            this._resourceHandle(cam.flightId);
-          }
+        /* The rest of a split snapshot follows straight after as state changes. */
+        if (msg.content.follows) {
+          this.pendingSnapshot = { cameras: [...msg.content.cameras], remaining: msg.content.follows };
+          break;
         }
-        this.emit("cameras-change", this._cameras);
+        this.pendingSnapshot = null;
+        this._applySnapshot(msg.content.cameras);
         break;
       case "camera-state-changed": {
+        const pending = this.pendingSnapshot;
+        if (pending) {
+          pending.cameras.push(msg.content.state);
+          if (--pending.remaining > 0) break;
+          this.pendingSnapshot = null;
+          this._applySnapshot(pending.cameras);
+          break;
+        }
         const next = this._cameras.filter(
           (c) => c.flightId !== msg.content.state.flightId,
         );
@@ -2121,6 +2187,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           this._resourceHandle(msg.content.state.flightId);
         }
         this.emit("cameras-change", this._cameras);
+        this._sendHeldAnchors();
         break;
       }
       case "slot-map": {

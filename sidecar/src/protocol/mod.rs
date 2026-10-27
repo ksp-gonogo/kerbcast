@@ -206,8 +206,16 @@ pub struct CommandCentreInfo {
     pub ut: Option<f64>,
     /// Every craft the camera could watch, eligible first, then nearest
     /// first. Any of them can be aimed at with a `vessel` aim; eligibility
-    /// only reports what the tracking network would allow.
+    /// only reports what the tracking network would allow. A control channel
+    /// message has a size limit, so with hundreds of craft the list over it
+    /// is cut from the end and `targets_omitted` counts what was left out.
+    /// A cut list keeps the feed's subject, appended at the end out of the
+    /// eligible-then-nearest order when it fell in the cut part.
     pub targets: Vec<CommandTarget>,
+    /// How many craft were cut from the end of `targets` to fit the message.
+    /// Absent when none were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets_omitted: Option<u32>,
     /// True for a camera made at runtime (`CreateCommandCamera`, or the
     /// plugin's `KerbcastControl.CreateCommandCamera`), false for the one
     /// from the game's settings. Only created cameras can be destroyed.
@@ -1289,6 +1297,10 @@ pub struct HelloPayload {
     /// sidecars older than 1.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_command: Option<bool>,
+    /// The most anchors one client may set on one camera. Absent from
+    /// sidecars older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_anchors_per_camera: Option<u32>,
 }
 
 #[typeshare]
@@ -1311,6 +1323,13 @@ pub struct SetFrameStampsPayload {
 #[serde(rename_all = "camelCase")]
 pub struct CameraSnapshotPayload {
     pub cameras: Vec<CameraState>,
+    /// How many more cameras complete this snapshot. A snapshot too large
+    /// for one message carries the first cameras, and each of the rest
+    /// follows straight after it as a `CameraStateChanged`, which a client
+    /// that predates this field applies as it would any state change.
+    /// Absent when the snapshot is whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows: Option<u32>,
 }
 
 #[typeshare]
@@ -1808,8 +1827,10 @@ mod tests {
             frame_stamps: Some(true),
             anchors: Some(true),
             frame_command: Some(true),
+            max_anchors_per_camera: Some(16),
         });
         let hello = serde_json::to_string(&hello).unwrap();
+        assert!(hello.contains(r#""maxAnchorsPerCamera":16"#));
         assert!(hello.contains(r#""frameStamps":true"#));
         assert!(hello.contains(r#""anchors":true"#));
         assert!(hello.contains(r#""frameCommand":true"#));
@@ -2116,8 +2137,13 @@ mod tests {
                 quality_limited_by: Some("throttled".into()),
                 ..Default::default()
             }],
+            follows: None,
         });
         let s = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !s.contains("follows"),
+            "a whole snapshot is unchanged on the wire"
+        );
         assert!(s.contains("\"type\":\"camera-snapshot\""));
         assert!(s.contains("\"flightId\":99"));
         assert!(s.contains("\"vesselName\":\"Perf Test 1\""));

@@ -3099,4 +3099,34 @@ describe("CameraFeed - anchors", () => {
     view.unmount();
     await waitFor(() => expect(sidecar.anchorsFor(43)).toEqual([]));
   });
+
+  it("gives two feeds on one camera both their anchors, until each unmounts", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+    ]);
+    const dock = { id: "dock", kind: AnchorKind.Vessel, vessel: 12 };
+    const first = render(<Feed client={client} flightId={42} anchors={[port]} />);
+    const second = render(<Feed client={client} flightId={42} anchors={[port, dock]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port, dock]));
+
+    first.unmount();
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port, dock]));
+    second.rerender(<Feed client={client} flightId={42} anchors={[dock]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([dock]));
+    second.unmount();
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([]));
+  });
+
+  it("warns when two feeds on one camera use one anchor id for different things", async () => {
+    const { client, sidecar } = await buildConnectedSource([makeCamera({ flightId: 42 })]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const other = { ...port, part: 23 };
+    render(<Feed client={client} flightId={42} anchors={[port]} />);
+    render(<Feed client={client} flightId={42} anchors={[port]} />);
+    expect(warn).not.toHaveBeenCalled();
+    render(<Feed client={client} flightId={42} anchors={[other]} />);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("id port"));
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port]));
+    warn.mockRestore();
+  });
 });

@@ -888,6 +888,12 @@ describe("KerbcastClient", () => {
       snapshot([commandCamera(301, undefined, false)]);
       await client.setCommandAim(301, { kind: CommandAimKind.Vessel, persistentId: 99 });
       expect(captured.dc?.sent).toHaveLength(3);
+
+      /* A list cut to fit the message may leave the craft out: the sidecar decides. */
+      const cut = commandCamera(302);
+      snapshot([{ ...cut, commandCentre: { ...cut.commandCentre!, targetsOmitted: 400 } }]);
+      await client.setCommandAim(302, { kind: CommandAimKind.Vessel, persistentId: 99 });
+      expect(captured.dc?.sent).toHaveLength(4);
     });
   });
 
@@ -2612,7 +2618,18 @@ describe("KerbcastClient anchors", () => {
         JSON.stringify({ type: "hello", content: { sidecarVersion: "1.12.0", encoderBackend: "x", ...hello } }),
       );
     const push = (msg: object) => captured.dc?._msg(JSON.stringify(msg));
-    return { client, sent, sayHello, push };
+    const list = (...flightIds: number[]) =>
+      push({ type: "camera-snapshot", content: { cameras: flightIds.map(listedCamera) } });
+    return { client, sent, sayHello, push, list };
+  }
+
+  function listedCamera(flightId: number) {
+    return {
+      flightId, kind: "part", partName: "", partTitle: "", cameraName: "", vesselName: "",
+      layers: [], operatorLayers: [], renderWidth: 64, renderHeight: 64, operatorWidth: 64, operatorHeight: 64,
+      supportsZoom: false, fov: 30, fovMin: 30, fovMax: 30, supportsPan: false, panYaw: 0, panPitch: 0,
+      panYawMin: 0, panYawMax: 0, panPitchMin: 0, panPitchMax: 0,
+    };
   }
 
   it("asks for anchor results only from a sidecar that offers anchors", async () => {
@@ -2660,11 +2677,13 @@ describe("KerbcastClient anchors", () => {
     expect(client.commandCentreAt(9, 250)).toBeNull();
   });
 
-  it("keeps anchors set before hello and sends them once the sidecar offers anchors", async () => {
-    const { client, sent, sayHello } = await connectedTo({ frameStamps: true, anchors: true });
+  it("keeps anchors set before hello and sends them once the sidecar offers anchors and lists the camera", async () => {
+    const { client, sent, sayHello, list } = await connectedTo({ frameStamps: true, anchors: true });
     await client.setAnchors(7, [ship("a")]);
     expect(sent("set-anchors")).toEqual([]);
     sayHello();
+    expect(sent("set-anchors")).toEqual([]);
+    list(7);
     expect(sent("set-anchors")).toEqual([
       { type: "set-anchors", content: { flightId: 7, anchors: [ship("a")] } },
     ]);
@@ -2691,10 +2710,87 @@ describe("KerbcastClient anchors", () => {
   it("refuses more than the cap and repeated ids before sending", async () => {
     const { client, sayHello } = await connectedTo({ frameStamps: true, anchors: true });
     sayHello();
+    expect(client.maxAnchorsPerCamera).toBe(MAX_ANCHORS_PER_CAMERA);
     const seventeen = Array.from({ length: MAX_ANCHORS_PER_CAMERA + 1 }, (_, i) => ship(`a${i}`));
     await expect(client.setAnchors(7, seventeen)).rejects.toThrow(RangeError);
     await expect(client.setAnchors(7, [ship("a"), ship("a")])).rejects.toThrow(/twice/);
     expect(client.anchorsFor(7)).toEqual([]);
+  });
+
+  it("takes the anchor cap the sidecar announces", async () => {
+    const { client, sayHello } = await connectedTo({ frameStamps: true, anchors: true, maxAnchorsPerCamera: 2 });
+    sayHello();
+    expect(client.maxAnchorsPerCamera).toBe(2);
+    await expect(client.setAnchors(7, [ship("a"), ship("b"), ship("c")])).rejects.toThrow(/at most 2/);
+  });
+
+  it("holds anchors for a camera the sidecar does not list until it appears", async () => {
+    const { client, sent, sayHello, list, push } = await connectedTo({ frameStamps: true, anchors: true });
+    sayHello();
+    list(1);
+    await client.setAnchors(7, [ship("a")]);
+    expect(sent("set-anchors")).toEqual([]);
+    push({ type: "camera-state-changed", content: { state: listedCamera(7) } });
+    expect(sent("set-anchors")).toEqual([
+      { type: "set-anchors", content: { flightId: 7, anchors: [ship("a")] } },
+    ]);
+    /* Gone and back on one connection: the sidecar kept them. */
+    list(1);
+    list(1, 7);
+    expect(sent("set-anchors")).toHaveLength(1);
+  });
+
+  it("applies what it has of a split snapshot when another message cuts it short", async () => {
+    const { client, sayHello, push } = await connectedTo({ frameStamps: true });
+    sayHello();
+    push({ type: "camera-snapshot", content: { cameras: [listedCamera(1)], follows: 3 } });
+    push({ type: "camera-state-changed", content: { state: listedCamera(2) } });
+    expect(client.cameras).toEqual([]);
+    push({ type: "ping" });
+    expect(client.cameras.map((c) => c.flightId)).toEqual([1, 2]);
+  });
+
+  it("sends no clear for a camera the sidecar no longer lists", async () => {
+    const { client, sent, sayHello, list } = await connectedTo({ frameStamps: true, anchors: true });
+    sayHello();
+    list(7);
+    await client.setAnchors(7, [ship("a")]);
+    list(8);
+    await client.setAnchors(7, null);
+    expect(sent("set-anchors")).toHaveLength(1);
+    expect(client.anchorsFor(7)).toEqual([]);
+  });
+
+  it("does not send anchors held from an earlier connection for a camera that has gone", async () => {
+    const { client, sent, sayHello, list } = await connectedTo({ frameStamps: true, anchors: true });
+    sayHello();
+    list(7);
+    await client.setAnchors(7, [ship("a")]);
+    expect(sent("set-anchors")).toHaveLength(1);
+    /* The sidecar restarts without camera 7. */
+    sayHello();
+    list(1);
+    expect(sent("set-anchors")).toHaveLength(1);
+    expect(client.anchorsFor(7)).toEqual([ship("a")]);
+    /* Clearing anchors this sidecar never had sends nothing. */
+    await client.setAnchors(7, null);
+    expect(sent("set-anchors")).toHaveLength(1);
+  });
+
+  it("applies a snapshot split across messages once, when its last camera arrives", async () => {
+    const { client, sayHello, push } = await connectedTo({ frameStamps: true });
+    sayHello();
+    const changes: number[][] = [];
+    client.on("cameras-change", (cams) => changes.push(cams.map((c) => c.flightId)));
+    push({ type: "camera-snapshot", content: { cameras: [listedCamera(1), listedCamera(2)], follows: 2 } });
+    push({ type: "camera-state-changed", content: { state: listedCamera(3) } });
+    expect(changes).toEqual([]);
+    push({ type: "camera-state-changed", content: { state: listedCamera(4) } });
+    expect(changes).toEqual([[1, 2, 3, 4]]);
+    expect(client.cameras.map((c) => c.flightId)).toEqual([1, 2, 3, 4]);
+    /* Later state changes apply one by one again. */
+    push({ type: "camera-state-changed", content: { state: listedCamera(5) } });
+    expect(changes.at(-1)).toEqual([1, 2, 3, 4, 5]);
   });
 
   it("sends its anchors again on every new connection", async () => {
@@ -2703,12 +2799,14 @@ describe("KerbcastClient anchors", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(() =>
       Promise.resolve(MockSidecar.makeOfferResponse([])),
     );
+    sidecar.addCamera({ flightId: 7 });
     await client.connect();
     sidecar.open();
     await client.setAnchors(7, [ship("a")]);
     expect(sidecar.anchorsFor(7)).toEqual([ship("a")]);
 
     const fresh = new MockSidecar();
+    fresh.addCamera({ flightId: 7 });
     const again = new KerbcastClient({ host: "h", port: 1 }, fresh.createTransport());
     await again.setAnchors(7, [ship("b")]);
     await again.connect();

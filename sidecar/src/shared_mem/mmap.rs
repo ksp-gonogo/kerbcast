@@ -46,6 +46,12 @@
 //! reader before 1.12 maps only the slots, so it never sees the trailer,
 //! and ignores the three slot fields.
 //!
+//! The version stays 2 because both readers refuse any other: a bump would
+//! turn that graceful mix into no picture at all. A later change that old
+//! readers can ignore takes the header padding at 44 (zero from every writer
+//! so far) as a minor version; one they cannot ignore bumps `LAYOUT_VERSION`,
+//! and the reader that brings it accepts 2 as well.
+//!
 //! Sync protocol (seqlock-style, one-writer / one-or-more-readers):
 //!
 //! - **Writer**: bumps `header.sequence` (fetch_add Release), picks
@@ -252,6 +258,8 @@ pub enum MmapRingError {
     },
     #[error("reader gave up after {retries} retries — writer is clobbering slots faster than we can read")]
     ReadStarved { retries: u32 },
+    #[error("ring header names slot {index} of {slot_count}")]
+    BadWriteIndex { index: u32, slot_count: u32 },
 }
 
 /// Configuration for `MmapFrameRing::create_or_open` and friends. The
@@ -706,6 +714,13 @@ impl MmapFrameRing {
             let write_index = self
                 .header_atomic_u32(HEADER_OFF_WRITE_INDEX)
                 .load(Ordering::Acquire);
+            /* Every slot access below is offset by it, unchecked. */
+            if write_index >= self.cfg.slot_count {
+                return Err(MmapRingError::BadWriteIndex {
+                    index: write_index,
+                    slot_count: self.cfg.slot_count,
+                });
+            }
             let slot_start = self.slot_offset(write_index);
             let slot_bytes = self.cfg.slot_bytes();
             let slot = &self.mmap[slot_start..slot_start + slot_bytes];
@@ -880,6 +895,27 @@ mod tests {
         let ring = MmapFrameRing::create(&path, small_cfg()).unwrap();
         assert!(ring.latest().unwrap().is_none());
         drop(ring);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_write_index_past_the_slots_is_refused() {
+        let path = tmp_path("badindex");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        writer.produce(8, 8, 1.0, &vec![0u8; 8 * 8 * 4]).unwrap();
+        writer
+            .header_atomic_u32(HEADER_OFF_WRITE_INDEX)
+            .store(small_cfg().slot_count, Ordering::Release);
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert!(matches!(
+            reader.latest(),
+            Err(MmapRingError::BadWriteIndex {
+                index: 4,
+                slot_count: 4
+            })
+        ));
+        drop(reader);
+        drop(writer);
         fs::remove_file(&path).ok();
     }
 

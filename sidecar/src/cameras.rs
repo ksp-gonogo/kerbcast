@@ -2978,6 +2978,7 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         tracking_level: 0,
         ut: None,
         targets: Vec::new(),
+        targets_omitted: None,
         created: m.command_created.unwrap_or(false),
         token: m.command_token.clone().filter(|t| !t.is_empty()),
     })

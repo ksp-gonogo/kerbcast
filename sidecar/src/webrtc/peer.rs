@@ -663,6 +663,7 @@ async fn handle_client_message(
                     frame_stamps: Some(true),
                     anchors: Some(true),
                     frame_command: Some(true),
+                    max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -1577,7 +1578,10 @@ async fn send_camera_snapshot(registry: &Arc<CameraRegistry>, dc: &Outbox) {
     }
     send_server_message(
         dc,
-        &ServerMessage::CameraSnapshot(CameraSnapshotPayload { cameras }),
+        &ServerMessage::CameraSnapshot(CameraSnapshotPayload {
+            cameras,
+            follows: None,
+        }),
     );
 }
 

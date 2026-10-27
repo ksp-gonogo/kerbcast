@@ -502,8 +502,11 @@ await client.setAnchors(flightId, null); // clear
   `marginM` pads the radius `apparentRadiusPx` is worked out from
 - Anchors belong to the client that set them: other clients never see them,
   the command lock does not apply, and the sidecar drops them when the
-  client disconnects. The client keeps them and sends them again on
-  reconnect. At most 16 per camera (`MAX_ANCHORS_PER_CAMERA`)
+  client disconnects. The client keeps them until cleared and sends them
+  again on reconnect; anchors on a camera the sidecar does not list wait
+  until it appears. At most `client.maxAnchorsPerCamera` per camera, which
+  the sidecar announces in `hello` (16 when it does not say,
+  `MAX_ANCHORS_PER_CAMERA`)
 - Needs a 1.12 sidecar and plugin; against an older sidecar they are kept
   but never sent (`client.anchorsSupported`)
 
@@ -596,11 +599,9 @@ in `commandCentre` carries the `ut` it describes:
 `client.commandCentreAt(flightId, displayUt)` gives the list as it stood at
 the displayed frame, and `null` while every list sent is newer. With no
 displayed UT it gives the newest, except under a lock, where it gives `null`.
-Lists are kept back to two hours of UT before the newest
-(`COMMAND_CENTRE_MAX_LAG_UT`), at most 600 per camera
-(`COMMAND_CENTRE_MAX_ENTRIES`; a UT older than every list kept finds none),
-and are forgotten when the camera leaves the
-list or the client reconnects.
+Lists are kept back to two hours of UT before the newest, at most 600 per
+camera (a UT older than every list kept finds none), and are forgotten when
+the camera leaves the list or the client reconnects.
 
 In game, `KerbcastControl.SetAnchors(flightId, anchors, owner)` does the same
 with `AnchorSpec.ForPart`, `ForVessel`, `ForSurface`, `ForDirection` and
