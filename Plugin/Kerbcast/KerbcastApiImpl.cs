@@ -222,7 +222,7 @@ namespace Kerbcast
             switch (a.Kind)
             {
                 case AimKind.Vessel:
-                    command = CommandAim.Vessel(a.SubjectPersistentId, a.FramingMarginM);
+                    command = CommandAim.Vessel(a.SubjectPersistentId, a.FramingMarginM, a.AllowUncertain);
                     break;
                 case AimKind.Orbit:
                     command = CommandAim.Orbit(body, a.Inclination, a.Eccentricity, a.SemiMajorAxis, a.Lan, a.ArgumentOfPeriapsis,

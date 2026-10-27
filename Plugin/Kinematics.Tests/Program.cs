@@ -287,6 +287,58 @@ foreach (bool inverse in new[] { false, true })
     Check(placed == tried, $"solver: Jool's far orbits and a Kerbol escape place at every read ({placed} of {tried})");
 }
 
+/*
+ * After the iteration cap the best iterate can be small beside its huge
+ * terms and still be tens of gigametres off: a state read far out on a
+ * hyperbola and propagated back through periapsis. Such a read must refuse
+ * or be right, checked against an independent hyperbolic Kepler solve.
+ */
+foreach (var (e, a) in new[] { (30.0, -1e6), (3.0, -1e5) })
+{
+    double n = Math.Sqrt(KerbinMu / -(a * a * a));
+    KeplerPath.TryFromElements(10, e, a, 20, 30, 0, 0, KerbinMu, out var far);
+    Kinematics.OrbitalFrame(20 * Math.PI / 180, 10 * Math.PI / 180, 30 * Math.PI / 180, out var px, out var py);
+    double H(double t)
+    {
+        double m = n * t, h = Math.Asinh(m / e);
+        for (int i = 0; i < 300; i++) h -= (e * Math.Sinh(h) - h - m) / (e * Math.Cosh(h) - 1);
+        return h;
+    }
+    DVec3 Truth(double t)
+    {
+        double h = H(t);
+        return px * (-a * (e - Math.Cosh(h))) + py * (-a * Math.Sqrt(e * e - 1) * Math.Sinh(h));
+    }
+    DVec3 VTruth(double t)
+    {
+        double h = H(t);
+        return (px * (a * Math.Sinh(h)) + py * (-a * Math.Sqrt(e * e - 1) * Math.Cosh(h))) * (n / (e * Math.Cosh(h) - 1));
+    }
+    int wrong = 0, refused = 0, right = 0;
+    void Read(KeplerPath p, double ut, double tol)
+    {
+        var want = Truth(ut);
+        if (!p.TryAt(ut, out var got, out _)) refused++;
+        else if ((got - want).Magnitude <= tol * want.Magnitude + 1) right++;
+        else
+        {
+            wrong++;
+            Console.WriteLine($"     wrong: e {e} at {ut:G3} off {(got - want).Magnitude:G3} m");
+        }
+    }
+    for (double t = 10; t < 1e11 / Math.Sqrt(KerbinMu / -a); t *= 1.37)
+    {
+        Read(far, t, 1e-6);
+        Read(far, -t, 1e-6);
+    }
+    foreach (double t0 in new[] { 1.1e7, -1.1e7, 1.34e7, 2.87e7, 5.3e7 })
+    {
+        KeplerPath.TryFromState(Truth(t0), VTruth(t0), t0, KerbinMu, out var fromFar);
+        foreach (double dt in new[] { -1e7, -1e5, 1, 1e5, 1e7 }) Read(fromFar, t0 + dt, 1e-5);
+    }
+    Check(wrong == 0, $"solver: an e = {e} hyperbola out to 1e11 m reads right or refuses ({right} right, {refused} refused, {wrong} wrong)");
+}
+
 /* Near a parabola the conic guesses mislead; the plain guess is used instead. */
 {
     double vesc = Math.Sqrt(2 * KerbinMu / 700000.0);

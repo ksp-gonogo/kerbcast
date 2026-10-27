@@ -357,6 +357,47 @@ describe("CommandBrackets on the subject anchor", () => {
     expect(screen.getByText("OCCLUDED MUN · 4.2 km")).toBeTruthy();
   });
 
+  it("puts the aimed box on the aim anchor while the view turns onto a moved aim", () => {
+    const locked = track({ authority: AUTHORITY, bracketHalfPx: 30 });
+    let seen: CommandBracketContext | null = null;
+    render(
+      <CommandBrackets
+        state={effectiveCommandTrack(locked, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subject={subjectAnchor()}
+        subjectFrameSize={{ width: 1024, height: 576 }}
+        aim={{ id: "aim", owner: "kerbcast", observed: true, inFrame: true, x: 700, y: 200 }}
+      />,
+    );
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy]).toEqual([700, 200]);
+    expect(g).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 30, 576, { x: 700, y: 200 }));
+  });
+
+  it("keeps the aimed box on the edge nearest an aim off the frame, with a cue toward it", () => {
+    const locked = track({ authority: AUTHORITY, bracketHalfPx: 30 });
+    let seen: CommandBracketContext | null = null;
+    const view = render(
+      <CommandBrackets
+        state={effectiveCommandTrack(locked, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subjectFrameSize={{ width: 1024, height: 576 }}
+        aim={{ id: "aim", owner: "kerbcast", inFrame: false, behind: false, x: 1500, y: 200, observed: false }}
+      />,
+    );
+    const ctx = seen as CommandBracketContext | null;
+    expect(ctx!.aimOffscreen).toBe(true);
+    expect(ctx!.geometry.bottomRight.x).toBeLessThanOrEqual(1024);
+    expect(ctx!.geometry.cy).toBe(200);
+    expect(view.container.querySelector("path[data-aim-cue]")).toBeTruthy();
+  });
+
   it("centres on the frame as before without a subject anchor", () => {
     const { ctx } = seenWith(null);
     expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);

@@ -11,5 +11,6 @@
   <ItemGroup>
     <Compile Include="../Kerbcast/CommandCameraMath.cs" />
     <Compile Include="../Kerbcast/CraftFixState.cs" />
+    <Compile Include="../Kerbcast/AimSlew.cs" />
   </ItemGroup>
 </Project>

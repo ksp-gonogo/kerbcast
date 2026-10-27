@@ -80,6 +80,9 @@ namespace Kerbcast
         public bool Occlusion;
         public double MarginM;
 
+        /* Kerbcast's own aim anchor only: it carries the aim, which the operator holds, so its result is never limited to what the picture shows. */
+        internal bool NeverObserved;
+
         public static AnchorSpec ForPart(string id, uint vessel, uint part) =>
             new AnchorSpec { Id = id, Kind = AnchorKind.Part, Vessel = vessel, Part = part };
 

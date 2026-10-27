@@ -1,4 +1,6 @@
 import {
+  COMMAND_AIM_ANCHOR_ID,
+  KERBCAST_ANCHOR_OWNER,
   anchorPoint,
   fitFrame,
   frameToScreen,
@@ -117,6 +119,11 @@ export interface AnchorOverlay {
    * e.g. `["my-mod"]`. Default: only this client's.
    */
   owners?: readonly string[];
+  /**
+   * Draw Kerbcast's own `aim` anchor too when `"kerbcast"` is among
+   * `owners`. Off by default: the brackets already mark the aim.
+   */
+  showAim?: boolean;
 }
 
 /** The marker box for an anchor at `centre` with `radiusPx` capture pixels on a `frameHeight`-tall frame. */
@@ -164,9 +171,11 @@ function markPath(corner: AnchorCorner, shape: AnchorMarkerShape, g: AnchorMarke
   }
 }
 
-/** Whether a feed shows this anchor: this client's own, or one from a listed owner. */
-function drawn(a: FrameAnchor, owners: readonly string[] | undefined): boolean {
-  return a.owner === undefined || (owners?.includes(a.owner) ?? false);
+/** Whether a feed shows this anchor: this client's own, or one from a listed owner, Kerbcast's aim only on request. */
+function drawn(a: FrameAnchor, overlay: AnchorOverlay | null | undefined): boolean {
+  if (a.owner === undefined) return true;
+  if (a.owner === KERBCAST_ANCHOR_OWNER && a.id === COMMAND_AIM_ANCHOR_ID && !overlay?.showAim) return false;
+  return overlay?.owners?.includes(a.owner) ?? false;
 }
 
 export interface AnchorMarkersProps {
@@ -194,7 +203,7 @@ export function AnchorMarkers({ frame, video, overlay, fit }: AnchorMarkersProps
   /* An observed result out of view has no position, so it has no marker. */
   const placed: PlacedAnchor[] = [];
   for (const a of frame.anchors) {
-    const point = drawn(a, overlay?.owners) ? anchorPoint(a) : null;
+    const point = drawn(a, overlay) ? anchorPoint(a) : null;
     if (point) placed.push({ anchor: a, ...frameToScreen(point, frameW, frameH, content) });
   }
   if (placed.length === 0) return null;

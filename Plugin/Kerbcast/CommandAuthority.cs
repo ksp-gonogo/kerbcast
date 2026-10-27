@@ -127,6 +127,22 @@ namespace Kerbcast
         public static CommandAim Direction(double azimuth, double elevation, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.Direction, framingMarginM, az: azimuth, el: elevation);
 
+        /* Whether two aims point the same way, field for field; null for the default matches only null. */
+        internal static bool SameAs(CommandAim a, CommandAim b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a == null || b == null) return false;
+            return a.Kind == b.Kind && a.PersistentId == b.PersistentId && a.Body == b.Body
+                && a.Inclination.Equals(b.Inclination) && a.Eccentricity.Equals(b.Eccentricity)
+                && a.SemiMajorAxis.Equals(b.SemiMajorAxis) && a.Lan.Equals(b.Lan)
+                && a.ArgumentOfPeriapsis.Equals(b.ArgumentOfPeriapsis) && a.MeanAnomalyAtEpoch.Equals(b.MeanAnomalyAtEpoch)
+                && a.Epoch.Equals(b.Epoch) && a.Latitude.Equals(b.Latitude) && a.Longitude.Equals(b.Longitude)
+                && a.Altitude.Equals(b.Altitude) && a.Ut.Equals(b.Ut)
+                && a.BodyRelativePosition.Equals(b.BodyRelativePosition) && a.BodyRelativeVelocity.Equals(b.BodyRelativeVelocity)
+                && a.Azimuth.Equals(b.Azimuth) && a.Elevation.Equals(b.Elevation) && a.Subject == b.Subject
+                && a.FramingMarginM.Equals(b.FramingMarginM) && a.AllowUncertain == b.AllowUncertain;
+        }
+
         public override string ToString()
         {
             string tail = (Subject != 0 ? $" subject={Subject}" : "") + (FramingMarginM != 0 ? $" margin={FramingMarginM:F0}m" : "")

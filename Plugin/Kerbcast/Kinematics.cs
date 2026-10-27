@@ -80,6 +80,8 @@ namespace Kerbcast
         private const double ResidualUlps = 8.0 * 2.220446049250313e-16;
         /* After the cap, the best iterate is kept if its residual is this small against its terms. */
         private const double BestResidual = 1e-10;
+        /* ...and its residual, as time, this close to the asked UT (plus 1e-9 of the span). */
+        private const double BestResidualS = 1e-3;
         /* Below this |alpha| * r0 the conic is near enough a parabola that the conic guesses mislead. */
         private const double NearParabolic = 1e-8;
 
@@ -177,7 +179,7 @@ namespace Kerbcast
             double k = 1.0 - a * r0;
             double target = sqrtMu * dt;
             double chi = Guess(dt);
-            double bestChi = chi, bestRel = double.PositiveInfinity, lastStep = double.PositiveInfinity;
+            double bestChi = chi, bestRel = double.PositiveInfinity, bestF = double.PositiveInfinity, lastStep = double.PositiveInfinity;
             bool done = false;
             for (int i = 0; i < MaxIterations; i++)
             {
@@ -200,6 +202,7 @@ namespace Kerbcast
                 {
                     bestRel = rel;
                     bestChi = chi;
+                    bestF = Math.Abs(f);
                 }
                 if (rel <= ResidualUlps)
                 {
@@ -220,7 +223,13 @@ namespace Kerbcast
             }
             if (!done)
             {
-                if (!(bestRel <= BestResidual)) return false;
+                /*
+                 * The best iterate must also be close in time, not only small
+                 * against its terms: on a very eccentric hyperbola far outside
+                 * any sphere of influence the terms are huge, and a residual
+                 * small beside them is still a wrong place.
+                 */
+                if (!(bestRel <= BestResidual) || !(bestF / sqrtMu <= BestResidualS + 1e-9 * Math.Abs(dt))) return false;
                 chi = bestChi;
             }
             double cc = chi * chi;

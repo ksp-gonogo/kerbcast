@@ -144,7 +144,7 @@ namespace Kerbcast
                 for (int i = 0; i < _anchors.Count && _results.Count < MaxAnchorsPerFrame; i++)
                 {
                     string owner = _anchors[i].Key;
-                    bool observed = AnchorRules.Observed(owner, locked, policy);
+                    bool observed = !_anchors[i].Value.NeverObserved && AnchorRules.Observed(owner, locked, policy);
                     if (TryProject(frame, owner, _anchors[i].Value, observed, out var r)) _results.Add(r);
                 }
             }

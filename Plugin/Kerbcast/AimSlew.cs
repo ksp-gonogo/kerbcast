@@ -1,0 +1,109 @@
+using System;
+
+namespace Kerbcast
+{
+    /*
+     * Turns a command camera onto a moved aim point instead of snapping to it.
+     * The caller says when the aim may have jumped (a new aim, a new subject,
+     * a new world-model publish, a new vantage); between jumps the view
+     * follows the aim exactly, however fast it moves. At a jump the view
+     * carries on with the aim's own motion from the last smooth step, and
+     * whatever separates that from the new aim becomes an offset, turned out
+     * at a speed that eases in, is capped, and eases out onto the aim. A
+     * publish that agrees with the motion leaves no offset, and one under a
+     * quarter of a pixel is taken at once. A view idle
+     * for longer than SnapAfterS starts on its aim, as a first frame does.
+     * Real time drives it, so warp does not hurry it.
+     */
+    internal sealed class AimSlew
+    {
+        public const double MaxRateDegPerS = 45.0;
+        public const double AccelDegPerS2 = 90.0;
+        public const double SnapAfterS = 1.0;
+        /* An offset under this fraction of the vertical field (about a quarter pixel at 1080 rows) is not slewed. */
+        public const double MinOffsetFieldFraction = 1.0 / 4320.0;
+        private const double Deg2Rad = Math.PI / 180.0;
+
+        private bool _has;
+        private DVec3 _lastAim, _lastView;
+        /* The aim's own turn, as a rotation vector per second, from its last step that was not a jump. */
+        private DVec3 _rate;
+        /* The view's offset from the aim, as a rotation vector, and the speed it is being turned out at. */
+        private DVec3 _offset;
+        private double _speed;
+
+        /* Radians the view is still off its aim. */
+        public double OffsetRad => _offset.Magnitude;
+        public bool Slewing => _offset.Magnitude > 0;
+
+        public void Reset()
+        {
+            _has = false;
+            _offset = _rate = default;
+            _speed = 0;
+        }
+
+        /* The direction to look along this step, given the unit direction to the aim, `dt` real seconds since the last step, whether the aim may have jumped since then, and the field in degrees. */
+        public DVec3 Step(DVec3 aim, double dt, bool jumped, double fovDeg)
+        {
+            if (!_has || !(dt >= 0) || dt > SnapAfterS)
+            {
+                Reset();
+                _has = true;
+                _lastAim = _lastView = aim;
+                return aim;
+            }
+            if (jumped)
+            {
+                /* The view carries on with the aim's own motion; only what is left over is turned out, keeping any speed already turning. */
+                var carried = Turn(_lastView, _rate * dt);
+                _offset = RotationVector(aim, carried);
+                if (_offset.Magnitude < MinOffsetFieldFraction * fovDeg * Deg2Rad) _offset = default;
+                if (_offset.Magnitude == 0) _speed = 0;
+            }
+            else if (dt > 0) _rate = RotationVector(_lastAim, aim) * (1.0 / dt);
+
+            double left = _offset.Magnitude;
+            if (left > 0)
+            {
+                double accel = AccelDegPerS2 * Deg2Rad;
+                double cap = Math.Min(MaxRateDegPerS * Deg2Rad, Math.Sqrt(2.0 * accel * left));
+                _speed = Math.Min(_speed + accel * dt, cap);
+                double after = left - _speed * dt;
+                if (after <= 0)
+                {
+                    _offset = default;
+                    _speed = 0;
+                }
+                else _offset = _offset * (after / left);
+            }
+
+            var view = Turn(aim, _offset);
+            _lastAim = aim;
+            _lastView = view;
+            return view;
+        }
+
+        /* The rotation vector taking unit `from` to unit `to`. */
+        internal static DVec3 RotationVector(DVec3 from, DVec3 to)
+        {
+            var axis = DVec3.Cross(from, to);
+            double s = axis.Magnitude, c = DVec3.Dot(from, to);
+            double angle = Math.Atan2(s, c);
+            if (angle == 0) return default;
+            if (s < 1e-12)
+            {
+                /* Opposite: any axis square to `from` will do. */
+                axis = DVec3.Cross(from, Math.Abs(from.X) < 0.9 ? new DVec3(1, 0, 0) : new DVec3(0, 1, 0));
+                s = axis.Magnitude;
+            }
+            return axis * (angle / s);
+        }
+
+        private static DVec3 Turn(DVec3 v, DVec3 rotation)
+        {
+            double angle = rotation.Magnitude;
+            return angle > 0 ? CommandCameraMath.RotateAbout(v, rotation * (1.0 / angle), angle) : v;
+        }
+    }
+}

@@ -9,6 +9,13 @@ export const KERBCAST_ANCHOR_OWNER = "kerbcast";
 /** Id of a command camera's subject anchor: a `vessel` anchor with occlusion on, owned by Kerbcast. */
 export const COMMAND_SUBJECT_ANCHOR_ID = "subject";
 
+/**
+ * Id of a command camera's aim anchor, owned by Kerbcast: where the aim point
+ * lands in the rendered frame. That is the frame centre except while the
+ * view turns onto a moved aim.
+ */
+export const COMMAND_AIM_ANCHOR_ID = "aim";
+
 /** How a video element scales its frame into its box, as CSS `object-fit`. */
 export type FrameFit = "contain" | "cover";
 

@@ -47,6 +47,7 @@ export {
 export {
   MAX_ANCHORS_PER_CAMERA,
   KERBCAST_ANCHOR_OWNER,
+  COMMAND_AIM_ANCHOR_ID,
   COMMAND_SUBJECT_ANCHOR_ID,
   fitFrame,
   frameToScreen,

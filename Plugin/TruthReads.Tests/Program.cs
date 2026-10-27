@@ -189,7 +189,6 @@ var picturePins = new[]
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnDistance", "picture field"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnOccluded", "picture field"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnSunlit", "picture field"),
-    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnOffsetRad", "picture field"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnLight", "picture field, for the log"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig._drawn", "private readonly DrawnSubject _drawn;", 1, "the rig holds its picture"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.CommandCameraRig", "DrawnSubject drawn,", 1, "the rig is handed its picture"),
@@ -234,6 +233,9 @@ var picturePins = new[]
 /* Lines in picture code that are meant to read knowledge. */
 var knowledgeInPicturePins = new[]
 {
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AddOwnAnchors", "_aimAnchor.VectorX = _poseAimToward.X;", 1, "the aim anchor carries the aim, knowledge the operator holds"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AddOwnAnchors", "_aimAnchor.VectorY = _poseAimToward.Z;", 1, "the aim anchor carries the aim, knowledge the operator holds"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AddOwnAnchors", "_aimAnchor.VectorZ = _poseAimToward.Y;", 1, "the aim anchor carries the aim, knowledge the operator holds"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject._selection", "private readonly SubjectSelection _selection;", 1, "the picture draws the craft the selection resolved to"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.DrawnSubject", "public DrawnSubject(SubjectSelection selection, SubjectTrack truth, PicturePass picture)", 1, "the picture draws the craft the selection resolved to"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.DrawnSubject", "_selection = selection;", 1, "the picture draws the craft the selection resolved to"),
@@ -384,7 +386,7 @@ static class Rules
     /* Knowledge state and the readings the rig publishes as knowledge. */
     public static Rule Knowledge() => new Rule("knowledge",
         @"\b_known\b|\bKnownRadius\b|\bIFixSource\b|\bTruthFixSource\b|\bFixSources\b|\bCraftFix\b|\b_selection\b|\bSubjectSelection\b"
-        + @"|\b(RangeM|Occluded|Sunlit|HasFix|FramingFits|_lastDistance|_lastAimPoint)\b");
+        + @"|\b(RangeM|Occluded|Sunlit|HasFix|FramingFits|_lastDistance|_lastAimPoint|_poseAimToward)\b");
 
     /* Picture state, the picture's outputs, and calls to `members` (the rig's picture members). */
     public static Rule Picture(IEnumerable<string> members)

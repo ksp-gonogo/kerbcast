@@ -1,4 +1,5 @@
 import {
+  COMMAND_AIM_ANCHOR_ID,
   COMMAND_SUBJECT_ANCHOR_ID,
   KERBCAST_ANCHOR_OWNER,
   anchorPoint,
@@ -138,6 +139,42 @@ export interface CommandBracketContext {
    * stamped frame), when the box is centred on the frame instead.
    */
   subject?: FrameAnchor | null;
+  /**
+   * True while the aim lies off the frame (the view is still turning onto
+   * it): the box then sits on the frame's edge nearest the aim, with a
+   * chevron pointing on toward it.
+   */
+  aimOffscreen?: boolean;
+}
+
+/** `g` moved so the whole box lies inside `rect`. */
+function clampToRect(g: BracketGeometry, rect: ContentRect): BracketGeometry {
+  const clamp = (v: number, lo: number, hi: number) => (lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, v)));
+  const cx = clamp(g.cx, rect.x + g.half, rect.x + rect.width - g.half);
+  const cy = clamp(g.cy, rect.y + g.half, rect.y + rect.height - g.half);
+  return {
+    ...g,
+    cx,
+    cy,
+    topLeft: { x: cx - g.half, y: cy - g.half },
+    bottomRight: { x: cx + g.half, y: cy + g.half },
+  };
+}
+
+/** A chevron just outside the box, pointing from its centre toward `toward`. */
+function edgeCue(g: BracketGeometry, toward: BracketPoint): string | null {
+  const dx = toward.x - g.cx;
+  const dy = toward.y - g.cy;
+  const len = Math.hypot(dx, dy);
+  if (!(len > 0)) return null;
+  const ux = dx / len;
+  const uy = dy / len;
+  const tipX = g.cx + ux * (g.half + g.arm);
+  const tipY = g.cy + uy * (g.half + g.arm);
+  const backX = tipX - ux * g.arm;
+  const backY = tipY - uy * g.arm;
+  const w = g.arm * 0.6;
+  return `M${backX - uy * w} ${backY + ux * w}L${tipX} ${tipY}L${backX + uy * w} ${backY - ux * w}`;
 }
 
 /**
@@ -196,6 +233,12 @@ export interface CommandBracketsProps {
   subject?: FrameAnchor | null;
   /** The capture frame size `subject` is in (the stamp's width and height). */
   subjectFrameSize?: { width: number; height: number } | null;
+  /**
+   * The aim anchor in the displayed frame. The aimed box sits on it rather
+   * than on the frame centre, so it stays on the aim while the view turns
+   * onto a moved one.
+   */
+  aim?: FrameAnchor | null;
 }
 
 /**
@@ -204,8 +247,9 @@ export interface CommandBracketsProps {
  * craft where the game saw it, so it stays on the craft when an aim points
  * elsewhere. Otherwise (the anchor out of frame or occluded, which then
  * carries no position, no anchor at all, or a command authority holding the
- * lock) the box is the 1.11 one: centred on the aim, sized from the aimed
- * range, red and dashed when the aim line is occluded. `ctx.subject` always
+ * lock) the box is the 1.11 one: on the aim (the frame centre, or the aim
+ * anchor while the view turns onto a moved aim), sized from the aimed range,
+ * red and dashed when the aim line is occluded. `ctx.subject` always
  * carries the anchor, so a consumer can draw it as a second mark. An overlay
  * can restyle either corner and draw its own marks. Without a fix, or over a
  * blanked feed, the default corners are left out but the overlay and readout
@@ -220,6 +264,7 @@ export function CommandBrackets({
   overlay,
   subject,
   subjectFrameSize,
+  aim,
 }: CommandBracketsProps) {
   const { boxW, boxH, mediaW, mediaH } = useVideoBox(video);
   const rect = containedContentRect(
@@ -234,14 +279,20 @@ export function CommandBrackets({
   const point =
     subject && !state.authority && frameW > 0 && frameH > 0 ? anchorPoint(subject) : null;
   const placed = point !== null;
-  const g = point
+  const aimPoint = !point && aim && frameW > 0 && frameH > 0 ? anchorPoint(aim) : null;
+  const aimScreen = aimPoint ? frameToScreen(aimPoint, frameW, frameH, { ...rect, scale: 1 }) : null;
+  const aimOffscreen = !!aimScreen && (!aim?.inFrame || !!aim?.behind);
+  const unclamped = point
     ? bracketGeometry(
         rect,
         subject?.apparentRadiusPx ?? null,
         frameH,
         frameToScreen(point, frameW, frameH, { ...rect, scale: 1 }),
       )
-    : bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH);
+    : bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH, aimScreen);
+  /* An aim off the frame (mid-slew) keeps the box on the edge nearest it, with a cue pointing on. */
+  const g = aimOffscreen ? clampToRect(unclamped, rect) : unclamped;
+  const cue = aimOffscreen && aimScreen ? edgeCue(g, aimScreen) : null;
   const ctx: CommandBracketContext = {
     geometry: g,
     width: boxW,
@@ -250,6 +301,7 @@ export function CommandBrackets({
     utSource: utSource ?? null,
     state,
     subject: subject ?? null,
+    aimOffscreen,
   };
   const overrides =
     typeof overlay?.corners === "function" ? overlay.corners(ctx) : overlay?.corners;
@@ -293,6 +345,15 @@ export function CommandBrackets({
               style={{ stroke: bottomRight.colour }}
             />
           )}
+          {drawCorners && cue && (
+            <path
+              data-aim-cue=""
+              d={cue}
+              fill="none"
+              strokeWidth={g.stroke}
+              style={{ stroke: camera.colour }}
+            />
+          )}
           {overlay?.render && <g data-bracket-overlay="">{overlay.render(ctx)}</g>}
         </BracketSvg>
       )}
@@ -309,7 +370,7 @@ export function CommandBrackets({
 }
 
 /**
- * CommandBrackets fed with the subject's anchor from each frame of
+ * CommandBrackets fed with the subject's and the aim's anchors from each frame of
  * `flightId` that `video` presents. Re-renders at the frame rate, which is
  * why it is its own component.
  */
@@ -319,11 +380,12 @@ export function LiveCommandBrackets({
 }: CommandBracketsProps & { flightId: number | null }) {
   const frame = useDisplayedFrame(true, flightId, props.video);
   const subject = findAnchor(frame?.anchors, COMMAND_SUBJECT_ANCHOR_ID, KERBCAST_ANCHOR_OWNER);
+  const aim = findAnchor(frame?.anchors, COMMAND_AIM_ANCHOR_ID, KERBCAST_ANCHOR_OWNER);
   const size =
     frame?.frameWidth && frame.frameHeight
       ? { width: frame.frameWidth, height: frame.frameHeight }
       : null;
-  return <CommandBrackets {...props} subject={subject} subjectFrameSize={size} />;
+  return <CommandBrackets {...props} subject={subject} subjectFrameSize={size} aim={aim} />;
 }
 
 /** Reason a command feed is blanked, centred on black over the feed. */

@@ -599,5 +599,93 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(cache.Reach(2, 1, false, same, 6.0) == 6.0, "reach: and is measured again on the next frame, once it shows");
 }
 
+// AimSlew: the view follows the aim exactly between jumps, and turns out a jump eased and rate-limited.
+{
+    const double Dt = 1.0 / 60.0, D2R = Math.PI / 180.0, Fov = 1.0;
+    DVec3 Dir(double deg) => new DVec3(Math.Cos(deg * D2R), Math.Sin(deg * D2R), 0);
+    double Deg(DVec3 a, DVec3 b) => CommandCameraMath.AngleBetween(a, b) / D2R;
+
+    /* Fast aims from a fresh start, at 60 and 30 fps: no lag at all, and never a slew. */
+    foreach (var (aimRate, dt) in new[] { (8.0, 1.0 / 60), (20.0, 1.0 / 30), (200.0, 1.0 / 30) })
+    {
+        var fresh = new AimSlew();
+        double lag = 0;
+        bool slewed = false;
+        for (int i = 0; i < 300; i++)
+        {
+            var aim = Dir(aimRate * i * dt);
+            lag = Math.Max(lag, Deg(fresh.Step(aim, dt, false, Fov), aim));
+            slewed |= fresh.Slewing;
+        }
+        Check(lag < 1e-9 && !slewed, $"slew: a {aimRate} deg/s aim at {1 / dt:F0} fps from a fresh start is followed with no lag ({lag:G2} deg)");
+    }
+
+    /* Publishes that agree with the motion, once a second at 60 and 30 fps: no offset, no slew, no lag. */
+    foreach (var (aimRate, dt, fov) in new[] { (8.0, 1.0 / 60, 1.0), (20.0, 1.0 / 30, 5.0) })
+    {
+        var held = new AimSlew();
+        double lag = 0;
+        bool slewed = false;
+        int perSecond = (int)Math.Round(1 / dt);
+        for (int i = 0; i < 10 * perSecond; i++)
+        {
+            var aim = Dir(aimRate * i * dt);
+            lag = Math.Max(lag, Deg(held.Step(aim, dt, i % perSecond == 0, fov), aim));
+            slewed |= held.Slewing;
+        }
+        Check(lag < 1e-6 && !slewed, $"slew: {aimRate} deg/s with 1 Hz publishes that agree stays on the aim with no slew ({lag:G2} deg)");
+    }
+
+    /* A 30 degree jump. */
+    var slew = new AimSlew();
+    slew.Step(Dir(0), Dt, false, Fov);
+    var first = slew.Step(Dir(30), Dt, true, Fov);
+    double firstStep = Deg(first, Dir(0));
+    Check(firstStep <= AimSlew.AccelDegPerS2 * Dt * Dt + 1e-9, $"slew: a jump starts from where the view was, easing in ({firstStep:G3} deg in the first frame)");
+    var last = first;
+    double maxRate = 0, prevOff = Deg(first, Dir(30)), lastStep = double.NaN;
+    bool monotonic = true;
+    int frames = 1;
+    while (slew.Slewing && frames < 2000)
+    {
+        var view = slew.Step(Dir(30), Dt, false, Fov);
+        double step = Deg(view, last);
+        maxRate = Math.Max(maxRate, step / Dt);
+        double off = Deg(view, Dir(30));
+        monotonic &= off <= prevOff + 1e-12;
+        prevOff = off;
+        if (slew.Slewing) lastStep = step;
+        last = view;
+        frames++;
+    }
+    double seconds = frames * Dt;
+    Check(!slew.Slewing && Deg(last, Dir(30)) < 1e-9, $"slew: a jump ends exactly on the aim ({seconds:F2} s)");
+    Check(maxRate <= AimSlew.MaxRateDegPerS + 1e-6, $"slew: never faster than the cap ({maxRate:F1} deg/s)");
+    Check(monotonic, "slew: closes on the aim without overshooting");
+    Check(lastStep < AimSlew.MaxRateDegPerS * Dt * 0.5, $"slew: eases out onto the aim ({lastStep:G3} deg in the last moving frame)");
+    double ideal = 30.0 / AimSlew.MaxRateDegPerS + AimSlew.MaxRateDegPerS / AimSlew.AccelDegPerS2;
+    Check(seconds < ideal + 0.2, $"slew: takes about the time its profile allows ({seconds:F2} s against {ideal:F2} s)");
+
+    /* From a fast aim to a slower one elsewhere: the jump is turned out, then the new aim is followed exactly. */
+    slew = new AimSlew();
+    int k = 0;
+    for (; k < 120; k++) slew.Step(Dir(20.0 * k * Dt), Dt, false, Fov);
+    DVec3 Slow(int i) => Dir(90 + 2.0 * i * Dt);
+    slew.Step(Slow(k), Dt, true, Fov);
+    bool slewedOnto = slew.Slewing;
+    for (k++; k < 2000 && slew.Slewing; k++) slew.Step(Slow(k), Dt, false, Fov);
+    double after = 0;
+    for (int j = 0; j < 120; j++, k++) after = Math.Max(after, Deg(slew.Step(Slow(k), Dt, false, Fov), Slow(k)));
+    Check(slewedOnto && !slew.Slewing && after < 1e-9, $"slew: a jump from a fast aim to a slower one turns, settles, then follows it ({after:G2} deg)");
+
+    /* Too long idle snaps; a half turn completes; no jump, no slew. */
+    slew = new AimSlew();
+    slew.Step(Dir(0), Dt, false, Fov);
+    Check(Deg(slew.Step(Dir(90), AimSlew.SnapAfterS + 0.1, true, Fov), Dir(90)) == 0 && !slew.Slewing, "slew: a view idle past SnapAfterS starts on its aim");
+    slew.Step(Dir(270), Dt, true, Fov);
+    for (int j = 0; j < 2000 && slew.Slewing; j++) slew.Step(Dir(270), Dt, false, Fov);
+    Check(Deg(slew.Step(Dir(270), Dt, false, Fov), Dir(270)) < 1e-9, "slew: a half turn completes");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

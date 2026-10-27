@@ -130,6 +130,17 @@ describe("AnchorMarkers", () => {
     expect(ids).toEqual(["port", "reticle"]);
   });
 
+  it("leaves Kerbcast's aim anchor out unless asked for", () => {
+    const subject = anchor({ id: "subject", owner: "kerbcast" });
+    const aim = anchor({ id: "aim", owner: "kerbcast" });
+    const plain = draw([subject, aim], { owners: ["kerbcast"] });
+    const ids = (c: HTMLElement) => [...c.querySelectorAll("g[data-anchor]")].map((g) => g.getAttribute("data-anchor"));
+    expect(ids(plain.container)).toEqual(["subject"]);
+    cleanup();
+    const asked = draw([subject, aim], { owners: ["kerbcast"], showAim: true });
+    expect(ids(asked.container)).toEqual(["subject", "aim"]);
+  });
+
   it("puts the consumer's readout under the marker", () => {
     draw([anchor()], { readout: (a) => `${a.distanceM} m` });
     const el = screen.getByText("30 m");

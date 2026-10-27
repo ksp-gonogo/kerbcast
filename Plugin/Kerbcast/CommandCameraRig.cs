@@ -20,6 +20,8 @@ namespace Kerbcast
     {
         /* The subject's anchor id; its owner is AnchorRegistry.KerbcastOwner. */
         public const string SubjectAnchorId = "subject";
+        /* Where the aim point lands in the rendered frame: the centre, except while the view slews onto it. */
+        public const string AimAnchorId = "aim";
 
         private const string Tag = "[Kerbcast][CMDCAM]";
         private const double FovTau = 0.4;
@@ -141,20 +143,23 @@ namespace Kerbcast
         private double _drawnDistance;
         private bool _drawnOccluded;
         private bool _drawnSunlit;
-        private double _drawnOffsetRad;
 
         /* The lens pose of the frame last rendered, for the anchor projector. */
         private bool _poseValid;
         private DVec3 _poseEye, _poseForward, _poseUp;
+        /* From the lens to the aim point the pose turns toward. */
+        private DVec3 _poseAimToward;
         private readonly AnchorSpec _subjectAnchor = new AnchorSpec { Id = SubjectAnchorId, Kind = AnchorKind.Vessel, Occlusion = true };
+        private readonly AnchorSpec _aimAnchor = new AnchorSpec { Id = AimAnchorId, Kind = AnchorKind.Direction, HasVector = true, NeverObserved = true };
 
         /* The bracket contract (see AppendCommandTrack in KerbcastCore). Kept
            for clients older than 1.12; newer ones draw the subject's anchor. */
         public double TrackUt { get; private set; }
         public double BracketHalfPx { get; private set; }
         public int FrameHeightPx => FrameRows();
-        /* Angle between the aim and the true craft as seen from the station, in
-           capture pixels; null without a true fix. */
+        /* Angle between the frame's axis (the aim, once any slew has settled)
+           and the true craft as seen from the station, in capture pixels; null
+           without a true fix. */
         public double? TrueOffsetPx { get; private set; }
         /* The true craft is in frame and not occluded: the picture shows it. */
         public bool TrueVisible { get; private set; }
@@ -443,7 +448,16 @@ namespace Kerbcast
             }
             else
             {
-                CommandCameraMath.AimBasis(station, aim, localUp, north, out _solveForward, out _solveUp);
+                /* The pose turns onto a moved aim rather than snapping; everything
+                   projected through the frame (TrueInFrame, anchors) uses it. */
+                var toward = aim - station;
+                double range = toward.Magnitude;
+                double clock = System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+                bool jumped = AimJumped(ut);
+                var view = range > 0 ? _slew.Step(toward * (1.0 / range), double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt, jumped, _fov) : toward;
+                _slewAt = clock;
+                NoteSlew(ut);
+                CommandCameraMath.AimBasis(station, station + view * range, localUp, north, out _solveForward, out _solveUp);
                 _solveEye = station;
             }
             FramingFits = !ok || CommandCameraMath.FramingFits(FramingRadius, RangeM, _fovMax);
@@ -533,6 +547,45 @@ namespace Kerbcast
 
             NoteTargetAndOcclusion(ut, distance, aimBody, DrawnOrAim(aim), occluder, occluderSource);
             return true;
+        }
+
+        private readonly AimSlew _slew = new AimSlew();
+        /* Real seconds, double, of the last slew step; NaN before the first. */
+        private double _slewAt = double.NaN;
+        private bool _slewLogged;
+        private CommandAim _jumpAim;
+        private uint _jumpSubject, _jumpVantage;
+        private long _jumpGeneration;
+
+        /*
+         * Whether the aim point jumped since the last solve, as its causes say
+         * rather than as its motion suggests: a new aim, a new subject, a new
+         * vantage, or a new world-model publish that may correct where the
+         * subject is. Between these the view follows the aim exactly.
+         */
+        private bool AimJumped(double ut)
+        {
+            uint subject = _known.SubjectPersistentId;
+            uint vantage = _mount.Site.VantagePersistentId;
+            var store = _authority != null ? _authority.WorldModel : null;
+            var snap = store != null ? store.Capture(Time.frameCount, ut).Snapshot : null;
+            long generation = snap != null ? snap.Generation : 0;
+            bool jumped = !CommandAim.SameAs(_aim, _jumpAim) || subject != _jumpSubject || vantage != _jumpVantage
+                || generation != _jumpGeneration;
+            _jumpAim = _aim;
+            _jumpSubject = subject;
+            _jumpVantage = vantage;
+            _jumpGeneration = generation;
+            return jumped;
+        }
+
+        private void NoteSlew(double ut)
+        {
+            bool slewing = _slew.Slewing;
+            if (slewing == _slewLogged) return;
+            _slewLogged = slewing;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(slewing ? "slew-start" : "slew-end")}"
+                + (slewing ? $" offsetDeg={_slew.OffsetRad * 180.0 / Math.PI:F3}" : ""));
         }
 
         /* Clears the drawn craft, so a failed solve leaves no stale picture readings. */
@@ -702,7 +755,6 @@ namespace Kerbcast
          */
         private void SolveDrawn(DVec3 station, DVec3 aim, double distance, bool aimIsDrawn, CelestialBody aimBody)
         {
-            _drawnOffsetRad = _drawnOk ? CommandCameraMath.AngleBetween(aim - station, _drawnPos - station) : 0.0;
             if (_drawnOk)
             {
                 if (aimIsDrawn || (aim - _drawnPos).Magnitude < 1e-3)
@@ -817,10 +869,12 @@ namespace Kerbcast
             UpdateDrawnOffset(fov, rows);
         }
 
-        /* Where the drawn craft sits against the aim, in the frame `fov` gives. */
+        /* Where the drawn craft sits against the frame's axis, which is the aim except while the view slews, in the frame `fov` gives. */
         private void UpdateDrawnOffset(double fov, int rows)
         {
-            TrueOffsetPx = _drawnOk ? CommandCameraMath.AngleInPixels(_drawnOffsetRad, fov, rows) : (double?)null;
+            TrueOffsetPx = _drawnOk
+                ? CommandCameraMath.AngleInPixels(CommandCameraMath.AngleBetween(_solveForward, _drawnPos - _solveEye), fov, rows)
+                : (double?)null;
             TrueVisible = _drawnOk && !_drawnOccluded && TrueInFrame(fov, rows);
         }
 
@@ -1046,12 +1100,14 @@ namespace Kerbcast
             }
             if (!solved) return RigFrame.Skip;
 
-            CommandCameraMath.AimBasis(station, aim, localUp, north, out var fwd, out var up);
+            var fwd = _solveForward;
+            var up = _solveUp;
             anchor.position = new Vector3((float)station.X, (float)station.Y, (float)station.Z);
             anchor.rotation = Quaternion.LookRotation(ToF(fwd), ToF(up));
             _poseValid = true;
             _poseEye = station;
             _poseForward = fwd;
+            _poseAimToward = aim - station;
             _poseUp = up;
             SyncScaledBodies(cam, anchor.position);
             SyncScaledPose(cam);
@@ -1174,16 +1230,30 @@ namespace Kerbcast
             return _poseValid;
         }
 
-        /* The subject as a vessel anchor with occlusion on: where the craft
-           really is in each frame, wherever the camera aims, sized by its
-           radius plus the framing margin. Kerbcast's own anchors are always
-           observed-only (AnchorRules), so it carries only what the picture
-           shows. Under a held lock the owner can withhold it. */
+        /* The aim point, as a direction from the lens, so a client can put the
+           bracket where the aim lands while the view slews onto it. While the
+           view slews it says where the aim is apart from the pose: knowledge
+           the operator holds, so it is never observed-only, and it is always
+           placed, in frame or not. Then the subject as a vessel anchor with
+           occlusion on: where the craft really is in each frame, wherever the
+           camera aims, sized by its radius plus the framing margin. Kerbcast's
+           other anchors are observed-only (AnchorRules), so they carry only
+           what the picture shows. Under a held lock the owner can withhold
+           both. */
         public void AddOwnAnchors(List<KeyValuePair<string, AnchorSpec>> into)
         {
+            bool withheld = _authority != null && _authority.Registered && !_authority.SubjectAnchorVisible;
+            if (_poseValid && !withheld)
+            {
+                /* A direction from the lens projects where the point along it does; the vector is z up. */
+                _aimAnchor.VectorX = _poseAimToward.X;
+                _aimAnchor.VectorY = _poseAimToward.Z;
+                _aimAnchor.VectorZ = _poseAimToward.Y;
+                into.Add(new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, _aimAnchor));
+            }
             uint pid = _drawn.PersistentId;
             if (pid == 0 || !_drawnOk) return;
-            if (_authority != null && _authority.Registered && !_authority.SubjectAnchorVisible) return;
+            if (withheld) return;
             _subjectAnchor.Vessel = pid;
             _subjectAnchor.MarginM = FramingMargin;
             into.Add(new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, _subjectAnchor));
