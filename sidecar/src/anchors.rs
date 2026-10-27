@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{Anchor, AnchorKind, FrameAnchor, MAX_ANCHORS_PER_CAMERA};
+use crate::protocol::{
+    Anchor, AnchorKind, AnchorKinematics, AnchorKinematicsKind, FrameAnchor, MAX_ANCHORS_PER_CAMERA,
+};
 
 /// Prefix of every browser client's owner tag.
 pub const PEER_OWNER_PREFIX: &str = "peer:";
@@ -80,6 +82,11 @@ pub fn validate_anchor(a: &Anchor) -> Result<(), String> {
             "anchor {id}: marginM must be a finite number, 0 or more"
         ));
     }
+    if a.kind != AnchorKind::Kinematic && a.kinematics.is_some() {
+        return Err(format!(
+            "anchor {id}: `kinematics` belongs on a kinematic anchor only"
+        ));
+    }
     match a.kind {
         AnchorKind::Part => {
             if a.part.unwrap_or(0) == 0 {
@@ -132,6 +139,77 @@ pub fn validate_anchor(a: &Anchor) -> Result<(), String> {
                 ))
             }
         },
+        AnchorKind::Kinematic => match &a.kinematics {
+            Some(k) => validate_kinematics(id, k)?,
+            None => {
+                return Err(format!(
+                    "anchor {id}: a kinematic anchor needs `kinematics`"
+                ))
+            }
+        },
+    }
+    Ok(())
+}
+
+fn validate_kinematics(id: &str, k: &AnchorKinematics) -> Result<(), String> {
+    let body = k.body.trim();
+    if body.is_empty() || body.chars().count() > MAX_BODY_LEN {
+        return Err(format!("anchor {id}: kinematics need `body`"));
+    }
+    let given = |v: Option<f64>| v.is_some_and(finite);
+    match k.kind {
+        AnchorKinematicsKind::Conic => {
+            let all = [
+                k.inclination,
+                k.eccentricity,
+                k.semi_major_axis,
+                k.lan,
+                k.argument_of_periapsis,
+                k.mean_anomaly_at_epoch,
+                k.epoch,
+            ];
+            if !all.iter().all(|v| given(*v)) {
+                return Err(format!("anchor {id}: a conic needs every element, finite"));
+            }
+            let (e, sma) = (k.eccentricity.unwrap(), k.semi_major_axis.unwrap());
+            if e < 0.0 || e == 1.0 {
+                return Err(format!(
+                    "anchor {id}: `eccentricity` must be 0 or more and not 1"
+                ));
+            }
+            if (e < 1.0 && sma <= 0.0) || (e > 1.0 && sma >= 0.0) {
+                return Err(format!(
+                    "anchor {id}: `semiMajorAxis` must be positive for an ellipse and negative for a hyperbola"
+                ));
+            }
+        }
+        AnchorKinematicsKind::StateVector => {
+            if !given(k.ut) || !vec3(&k.position) || !vec3(&k.velocity) {
+                return Err(format!(
+                    "anchor {id}: a state vector needs a finite `ut`, `position` and `velocity`"
+                ));
+            }
+            if k.position.as_ref().unwrap().iter().all(|x| *x == 0.0) {
+                return Err(format!(
+                    "anchor {id}: `position` must not be the body's centre"
+                ));
+            }
+        }
+        AnchorKinematicsKind::Surface => {
+            if !k
+                .latitude
+                .is_some_and(|l| finite(l) && (-90.0..=90.0).contains(&l))
+            {
+                return Err(format!(
+                    "anchor {id}: a surface point needs `latitude` within -90..90"
+                ));
+            }
+            if !given(k.longitude) || !k.altitude.is_none_or(finite) {
+                return Err(format!(
+                    "anchor {id}: a surface point needs a finite `longitude` and `altitude`"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -225,6 +303,7 @@ mod tests {
             orientation: None,
             occlusion: None,
             margin_m: None,
+            kinematics: None,
         }
     }
 
@@ -316,6 +395,78 @@ mod tests {
         assert!(
             validate_anchor(&dir).is_err(),
             "a zero vector has no direction"
+        );
+
+        let mut ghost = anchor("ghost", AnchorKind::Kinematic);
+        assert!(validate_anchor(&ghost).is_err(), "needs kinematics");
+        let state = AnchorKinematics {
+            kind: AnchorKinematicsKind::StateVector,
+            body: "Kerbin".into(),
+            inclination: None,
+            eccentricity: None,
+            semi_major_axis: None,
+            lan: None,
+            argument_of_periapsis: None,
+            mean_anomaly_at_epoch: None,
+            epoch: None,
+            ut: Some(100.0),
+            position: Some(vec![700_000.0, 0.0, 0.0]),
+            velocity: Some(vec![0.0, 2200.0, 0.0]),
+            latitude: None,
+            longitude: None,
+            altitude: None,
+        };
+        ghost.kinematics = Some(state.clone());
+        assert!(validate_anchor(&ghost).is_ok());
+        ghost.kinematics = Some(AnchorKinematics {
+            position: Some(vec![0.0, 0.0, 0.0]),
+            ..state.clone()
+        });
+        assert!(validate_anchor(&ghost).is_err(), "not the body's centre");
+        let conic = AnchorKinematics {
+            kind: AnchorKinematicsKind::Conic,
+            inclination: Some(5.0),
+            eccentricity: Some(1.4),
+            semi_major_axis: Some(-2e6),
+            lan: Some(0.0),
+            argument_of_periapsis: Some(0.0),
+            mean_anomaly_at_epoch: Some(0.0),
+            epoch: Some(0.0),
+            ..state.clone()
+        };
+        ghost.kinematics = Some(conic.clone());
+        assert!(validate_anchor(&ghost).is_ok(), "a hyperbola, sma negative");
+        ghost.kinematics = Some(AnchorKinematics {
+            semi_major_axis: Some(2e6),
+            ..conic.clone()
+        });
+        assert!(
+            validate_anchor(&ghost).is_err(),
+            "a hyperbola with sma positive"
+        );
+        ghost.kinematics = Some(AnchorKinematics {
+            eccentricity: Some(1.0),
+            ..conic
+        });
+        assert!(validate_anchor(&ghost).is_err(), "a parabola");
+        ghost.kinematics = Some(AnchorKinematics {
+            kind: AnchorKinematicsKind::Surface,
+            latitude: Some(95.0),
+            longitude: Some(1.0),
+            ..state
+        });
+        assert!(validate_anchor(&ghost).is_err(), "latitude in range");
+
+        let stray = Anchor {
+            body: Some("Kerbin".into()),
+            latitude: Some(0.0),
+            longitude: Some(0.0),
+            kinematics: ghost.kinematics.clone(),
+            ..anchor("pad", AnchorKind::Surface)
+        };
+        assert!(
+            validate_anchor(&stray).is_err(),
+            "kinematics on another kind is refused, as the plugin refuses it"
         );
 
         let mut long = anchor(&"x".repeat(65), AnchorKind::Vessel);

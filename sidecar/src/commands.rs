@@ -498,6 +498,7 @@ mod tests {
                 vector: None,
                 orientation: None,
                 occlusion: None,
+                kinematics: None,
                 margin_m: None,
             }],
         }]);

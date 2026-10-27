@@ -20,6 +20,7 @@
     <!-- The metadata fixture is written by the plugin's own encoder. -->
     <Compile Include="../Kerbcast/CommandFrameState.cs" />
     <Compile Include="../Kerbcast/Anchors.cs" />
+    <Compile Include="../Kerbcast/Kinematics.cs" />
     <Compile Include="../Kerbcast/CommandCameraMath.cs" />
     <Compile Include="../Kerbcast/CraftFixState.cs" />
     <Compile Include="../Kerbcast/CameraId.cs" />

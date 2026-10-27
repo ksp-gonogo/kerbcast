@@ -847,6 +847,78 @@ pub enum AnchorKind {
     Surface,
     /// A direction, drawn at infinity.
     Direction,
+    /// A point moving as `kinematics` says, propagated as a world model's
+    /// records are: a last-known ghost, a hypothesis, a predicted point.
+    /// Caller-supplied knowledge, so it is never refused and never `observed`.
+    /// Where an anchor would be observed, its result still withholds the
+    /// lens's pose: `x`, `y` and `apparentRadiusPx` only while `inFrame`, and
+    /// never `distanceM`, `behind` or `angleOffAxis`.
+    Kinematic,
+}
+
+/// How a `kinematic` anchor moves.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnchorKinematicsKind {
+    /// On a conic from KSP Orbit elements.
+    Conic,
+    /// Coasting ballistically from a state, under the body's gravity.
+    StateVector,
+    /// Fixed to the body's surface, carried by its rotation.
+    Surface,
+}
+
+/// A `kinematic` anchor's motion about one body. `kind` says which fields
+/// apply. With a signal speed set, the point is placed where the light
+/// reaching the lens left it.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnchorKinematics {
+    pub kind: AnchorKinematicsKind,
+    /// The body's name, e.g. `"Kerbin"`.
+    pub body: String,
+    /// `conic`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inclination: Option<f64>,
+    /// `conic`: not 1; a hyperbola has a negative `semiMajorAxis`, as KSP keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eccentricity: Option<f64>,
+    /// `conic`: metres.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semi_major_axis: Option<f64>,
+    /// `conic`: longitude of the ascending node, degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan: Option<f64>,
+    /// `conic`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_of_periapsis: Option<f64>,
+    /// `conic`: radians, at `epoch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_anomaly_at_epoch: Option<f64>,
+    /// `conic`: UT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<f64>,
+    /// `stateVector`: UT of the state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ut: Option<f64>,
+    /// `stateVector`: `[x, y, z]` metres from the body centre, z up, in KSP's
+    /// fixed inertial frame (as a `positionAt` aim takes it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Vec<f64>>,
+    /// `stateVector`: `[x, y, z]` metres per second in the same frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<Vec<f64>>,
+    /// `surface`: degrees, -90..=90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    /// `surface`: degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    /// `surface`: metres above sea level. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<f64>,
 }
 
 /// A direction a `direction` anchor follows, taken from its craft's orbit
@@ -925,6 +997,9 @@ pub struct Anchor {
     /// is worked out, to leave room around it. Default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub margin_m: Option<f64>,
+    /// `kinematic`: how the point moves. Refused on any other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinematics: Option<AnchorKinematics>,
 }
 
 /// Replace this client's anchors on one camera, or clear them with
@@ -953,7 +1028,9 @@ pub const MAX_ANCHORS_PER_CAMERA: usize = 16;
 /// anchor is in frame and not occluded, and never `distanceM`,
 /// `angleOffAxis` or `behind`. Kerbcast's own `"subject"` anchor is always
 /// observed; a browser client's anchors are observed by default while a
-/// command authority holds the lock.
+/// command authority holds the lock. A `kinematic` anchor is never observed,
+/// but where it would be its result withholds the lens's pose (see
+/// `AnchorKind::Kinematic`).
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

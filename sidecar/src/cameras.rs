@@ -4993,6 +4993,7 @@ mod tests {
             orientation: None,
             occlusion: Some(true),
             margin_m: None,
+            kinematics: None,
         }
     }
 

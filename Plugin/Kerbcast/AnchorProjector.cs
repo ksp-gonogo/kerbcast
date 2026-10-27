@@ -144,8 +144,11 @@ namespace Kerbcast
                 for (int i = 0; i < _anchors.Count && _results.Count < MaxAnchorsPerFrame; i++)
                 {
                     string owner = _anchors[i].Key;
-                    bool observed = !_anchors[i].Value.NeverObserved && AnchorRules.Observed(owner, locked, policy);
-                    if (TryProject(frame, owner, _anchors[i].Value, observed, out var r)) _results.Add(r);
+                    var kind = _anchors[i].Value.Kind;
+                    bool observed = !_anchors[i].Value.NeverObserved && AnchorRules.Observed(owner, locked, policy, kind);
+                    if (!TryProject(frame, owner, _anchors[i].Value, observed, out var r)) continue;
+                    r.PoseWithheld = AnchorRules.PoseWithheld(owner, locked, policy, kind);
+                    _results.Add(r);
                 }
             }
             catch (Exception ex)
@@ -246,6 +249,11 @@ namespace Kerbcast
                     world = ToD(body.GetWorldSurfacePosition(a.Latitude, a.Longitude, a.Altitude));
                     break;
                 }
+                case AnchorKind.Kinematic:
+                {
+                    if (!TryKinematic(a, f.Eye, out world)) return false;
+                    break;
+                }
                 case AnchorKind.Direction:
                 {
                     if (!TryDirection(a, f.Registry, out var dir)) return false;
@@ -295,6 +303,89 @@ namespace Kerbcast
                 ApparentRadiusPx = apparent,
                 AngleOffAxisDeg = p.AngleOffAxisDeg,
             };
+
+        /*
+         * A kinematic anchor's point this frame, propagated as a world model's
+         * records are. With a signal speed set, a conic or state vector is
+         * where the light arriving at the lens now left it, solved in the frame
+         * of the lens's and the point's common body as the known subject is;
+         * a surface point stays on the body as drawn (AnchorRules.PlacedAtLightInstant).
+         * Otherwise at the render UT. Placed on its body's present position, as a known craft is.
+         * Caller-supplied knowledge, so nothing about any craft is read.
+         */
+        private static bool TryKinematic(AnchorSpec a, DVec3 eye, out DVec3 world)
+        {
+            world = default;
+            var body = FlightGlobals.GetBodyByName(a.Body);
+            if (body == null) return false;
+            var kinematics = KinematicsWorld.Now();
+            var kb = kinematics.Of(body);
+            if (!kb.Known) return false;
+            if (a.Motion != AnchorMotion.Surface)
+            {
+                if (!a.PathTried)
+                {
+                    a.PathTried = true;
+                    a.PathOk = a.Motion == AnchorMotion.Conic
+                        ? KeplerPath.TryFromElements(a.Inclination, a.Eccentricity, a.SemiMajorAxis, a.Lan, a.ArgumentOfPeriapsis,
+                            a.MeanAnomalyAtEpoch, a.Epoch, kb.Mu, out a.Path)
+                        : KeplerPath.TryFromState(a.Position, a.Velocity, a.Ut, kb.Mu, out a.Path, kb.Radius);
+                }
+                if (!a.PathOk) return false;
+            }
+            var zup = kinematics.Zup;
+            double ut = Planetarium.GetUniversalTime();
+            double at = ut;
+            double? c = LightTime.SignalSpeed;
+            if (c.HasValue && AnchorRules.PlacedAtLightInstant(a.Motion))
+            {
+                var lensBody = FlightGlobals.getMainBody(new Vector3d(eye.X, eye.Y, eye.Z));
+                if (lensBody == null) return false;
+                var tree = KeplerBodyTree.World;
+                int frame = PastInstant.CommonAncestor(ref tree, lensBody.flightGlobalsIndex, body.flightGlobalsIndex);
+                var frameBody = tree.Body(frame);
+                if (frameBody == null) return false;
+                var motion = BodyMotion.OnPath(body, a.Path, zup);
+                var path = new KinematicPath { Spec = a, Body = kb, Zup = zup, Tree = tree, BodyIndex = body.flightGlobalsIndex, Frame = frame };
+                if (PastInstant.Solve(ref path, eye - ToD(frameBody.position), ut, c.Value,
+                        CommandCameraForecast.SpeedBound(motion, frameBody), double.NegativeInfinity, ut, out at) != PastStatus.Found)
+                    return false;
+            }
+            if (!KinematicAt(a, kb, at, out var rel)) return false;
+            world = ToD(body.position) + zup.ToWorld(rel);
+            return true;
+        }
+
+        /* A kinematic anchor's offset from its body's centre at `ut`, in KSP's fixed frame. */
+        private static bool KinematicAt(AnchorSpec a, in KinematicsBody kb, double ut, out DVec3 rel)
+        {
+            if (a.Motion == AnchorMotion.Surface)
+            {
+                rel = kb.SurfaceAt(a.Latitude, a.Longitude, a.Altitude, ut, out _);
+                return true;
+            }
+            return a.Path.TryAt(ut, out rel, out _);
+        }
+
+        /* A kinematic anchor back through time about the frame body, for the light-time solve. */
+        private struct KinematicPath : IPastPath
+        {
+            public AnchorSpec Spec;
+            public KinematicsBody Body;
+            public ZupFrame Zup;
+            public KeplerBodyTree Tree;
+            public int BodyIndex;
+            public int Frame;
+
+            public bool TryAt(double ut, out DVec3 position)
+            {
+                position = default;
+                if (!KinematicAt(Spec, Body, ut, out var rel)) return false;
+                if (!PastInstant.TryAbout(ref Tree, BodyIndex, Frame, ut, out var centre)) return false;
+                position = centre + Zup.ToWorld(rel);
+                return true;
+            }
+        }
 
         /* A docking port's face: its node transform, which faces out of the port. */
         private static Transform DockingFace(Part part)

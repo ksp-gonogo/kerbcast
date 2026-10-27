@@ -18,6 +18,15 @@ export enum AnchorKind {
 	Surface = "surface",
 	/** A direction, drawn at infinity. */
 	Direction = "direction",
+	/**
+	 * A point moving as `kinematics` says, propagated as a world model's
+	 * records are: a last-known ghost, a hypothesis, a predicted point.
+	 * Caller-supplied knowledge, so it is never refused and never `observed`.
+	 * Where an anchor would be observed, its result still withholds the
+	 * lens's pose: `x`, `y` and `apparentRadiusPx` only while `inFrame`, and
+	 * never `distanceM`, `behind` or `angleOffAxis`.
+	 */
+	Kinematic = "kinematic",
 }
 
 /**
@@ -39,6 +48,56 @@ export enum AnchorDirection {
 	Target = "target",
 	/** The craft's velocity relative to its target. */
 	TargetRelativeVelocity = "targetRelativeVelocity",
+}
+
+/** How a `kinematic` anchor moves. */
+export enum AnchorKinematicsKind {
+	/** On a conic from KSP Orbit elements. */
+	Conic = "conic",
+	/** Coasting ballistically from a state, under the body's gravity. */
+	StateVector = "stateVector",
+	/** Fixed to the body's surface, carried by its rotation. */
+	Surface = "surface",
+}
+
+/**
+ * A `kinematic` anchor's motion about one body. `kind` says which fields
+ * apply. With a signal speed set, the point is placed where the light
+ * reaching the lens left it.
+ */
+export interface AnchorKinematics {
+	kind: AnchorKinematicsKind;
+	/** The body's name, e.g. `"Kerbin"`. */
+	body: string;
+	/** `conic`: degrees. */
+	inclination?: number;
+	/** `conic`: not 1; a hyperbola has a negative `semiMajorAxis`, as KSP keeps it. */
+	eccentricity?: number;
+	/** `conic`: metres. */
+	semiMajorAxis?: number;
+	/** `conic`: longitude of the ascending node, degrees. */
+	lan?: number;
+	/** `conic`: degrees. */
+	argumentOfPeriapsis?: number;
+	/** `conic`: radians, at `epoch`. */
+	meanAnomalyAtEpoch?: number;
+	/** `conic`: UT. */
+	epoch?: number;
+	/** `stateVector`: UT of the state. */
+	ut?: number;
+	/**
+	 * `stateVector`: `[x, y, z]` metres from the body centre, z up, in KSP's
+	 * fixed inertial frame (as a `positionAt` aim takes it).
+	 */
+	position?: number[];
+	/** `stateVector`: `[x, y, z]` metres per second in the same frame. */
+	velocity?: number[];
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `surface`: metres above sea level. Default 0. */
+	altitude?: number;
 }
 
 /**
@@ -96,6 +155,8 @@ export interface Anchor {
 	 * is worked out, to leave room around it. Default 0.
 	 */
 	marginM?: number;
+	/** `kinematic`: how the point moves. Refused on any other kind. */
+	kinematics?: AnchorKinematics;
 }
 
 /**
@@ -852,7 +913,9 @@ export interface FlightIdPayload {
  * anchor is in frame and not occluded, and never `distanceM`,
  * `angleOffAxis` or `behind`. Kerbcast's own `"subject"` anchor is always
  * observed; a browser client's anchors are observed by default while a
- * command authority holds the lock.
+ * command authority holds the lock. A `kinematic` anchor is never observed,
+ * but where it would be its result withholds the lens's pose (see
+ * `AnchorKind::Kinematic`).
  */
 export interface FrameAnchor {
 	/** The anchor's `id` as its owner set it. */

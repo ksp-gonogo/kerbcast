@@ -486,7 +486,11 @@ await client.setAnchors(flightId, null); // clear
   part through docking), `vessel` (centre of mass; follows a craft merged
   into another), `surface` (body, latitude, longitude, altitude) and
   `direction` (a named direction of a craft, the active one by default, or
-  a fixed inertial `vector`), drawn at infinity
+  a fixed inertial `vector`), drawn at infinity, and `kinematic` (a point
+  you describe with `kinematics`: a `conic` from KSP Orbit elements, a
+  `stateVector` coasting ballistically in the same fixed frame as a
+  `positionAt` aim, or a `surface` point, each about a named `body`), for a
+  last-known ghost, a hypothesis or a predicted point
 - `orientation: true` on a part or vessel adds its `forward` and `up` axes
   in camera space (x right, y up, z forward) to every result.
   `occlusion: true` adds `occluded`, at the cost of a ray cast per frame.
@@ -532,13 +536,19 @@ A command camera adds its own anchor: `id: "subject"`, owner `"kerbcast"`
 (`COMMAND_SUBJECT_ANCHOR_ID`, `KERBCAST_ANCHOR_OWNER`), a `vessel` anchor on
 the craft it watches with occlusion on. It is always observed, so it never
 gives away a craft the picture does not show. The React brackets follow it.
+A second, `id: "aim"` (`COMMAND_AIM_ANCHOR_ID`), is where the aim point lands
+in the frame: the centre, except while the camera turns onto a moved aim.
 
 While a command authority holds the lock, every browser client's anchors
 are observed-only by default. The holder can relax that
 (`KerbcastControl.SetAnchorPolicy(AnchorPolicy.Full, owner)`, for every
 camera or one) and can withhold the subject anchor
 (`KerbcastControl.SetSubjectAnchor(false, owner)`). Both return to the
-unrestricted behaviour when the lock clears. Under the lock
+unrestricted behaviour when the lock clears. A `kinematic` anchor is never
+observed: it marks what you supplied, not what the game shows. Where it would
+be observed, though, its result still withholds the lens's pose: `x`, `y` and
+`apparentRadiusPx` only while `inFrame`, and never `distanceM`, `behind` or
+`angleOffAxis`. Under the lock
 `commandTrack.trueOffsetPx` is likewise sent only while the true craft is in
 frame and not occluded.
 

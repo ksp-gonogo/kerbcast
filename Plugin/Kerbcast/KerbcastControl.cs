@@ -270,7 +270,7 @@ namespace Kerbcast
 
         /* Replaces `owner`'s anchors on camera `flightId`, or clears them with
            null or an empty list. Each anchor marks a part, a craft, a point on
-           a body or a direction (see AnchorSpec's factories); the game projects
+           a body, a direction or a moving point (see AnchorSpec's factories); the game projects
            every one through the camera that rendered each frame and sends the
            results with that frame to every browser client that asked for
            anchors, tagged with `owner`. Anchors are display, not commands: the

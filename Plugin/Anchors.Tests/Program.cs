@@ -267,6 +267,96 @@ Check(!AnchorRules.Observed("peer:1:2", false, AnchorPolicy.ObservedOnly), "a br
 Check(AnchorRules.Observed("peer:1:2", true, AnchorPolicy.ObservedOnly), "and observed under a lock by default");
 Check(!AnchorRules.Observed("peer:1:2", true, AnchorPolicy.Full), "unless the owner relaxes it");
 Check(!AnchorRules.Observed("mission-control", true, AnchorPolicy.ObservedOnly), "anchors set in game are never limited");
+Check(!AnchorRules.Observed("peer:1:2", true, AnchorPolicy.ObservedOnly, AnchorKind.Kinematic)
+    && !AnchorRules.Observed("kerbcast", false, AnchorPolicy.Full, AnchorKind.Kinematic),
+    "a kinematic anchor is caller-supplied knowledge, never limited to what the picture shows");
+Check(AnchorRules.Observed("peer:1:2", true, AnchorPolicy.ObservedOnly, AnchorKind.Vessel), "other kinds keep the owner's rule");
+
+/* Kinematic anchors: validation mirrors the world model's records, and the wire parses into them. */
+Check(AnchorSpec.ForConic("c", "Kerbin", 5, 0.1, 700000, 0, 0, 0, 0).Invalid() == null, "kinematic: a conic is valid");
+Check(AnchorSpec.ForConic("c", "Kerbin", 5, 1.5, -2e6, 0, 0, 0, 0).Invalid() == null, "kinematic: a hyperbola with a negative semi-major axis is valid");
+Check(AnchorSpec.ForConic("c", "Kerbin", 5, 1.5, 2e6, 0, 0, 0, 0).Invalid() != null, "kinematic: a hyperbola with a positive semi-major axis is not");
+Check(AnchorSpec.ForConic("c", "Kerbin", 5, 1.0, 1e6, 0, 0, 0, 0).Invalid() != null, "kinematic: a parabola is not");
+Check(AnchorSpec.ForConic("c", "", 5, 0.1, 700000, 0, 0, 0, 0).Invalid() != null, "kinematic: a body is required");
+Check(AnchorSpec.ForConic("c", "Kerbin", double.NaN, 0.1, 700000, 0, 0, 0, 0).Invalid() != null, "kinematic: non-finite elements are not");
+Check(AnchorSpec.ForStateVector("s", "Kerbin", 100, new DVec3(7e5, 0, 0), new DVec3(0, 2200, 0)).Invalid() == null, "kinematic: a state vector is valid");
+Check(AnchorSpec.ForStateVector("s", "Kerbin", 100, new DVec3(0, 0, 0), new DVec3(0, 2200, 0)).Invalid() != null, "kinematic: a state at the body's centre is not");
+Check(AnchorSpec.ForSurfaceMotion("g", "Mun", 10, 20).Invalid() == null && AnchorSpec.ForSurfaceMotion("g", "Mun", 91, 20).Invalid() != null,
+    "kinematic: a surface point needs a latitude within -90..90");
+Check(new AnchorSpec { Id = "k", Kind = AnchorKind.Kinematic, Body = "Kerbin" }.Invalid() != null, "kinematic: an anchor with no kinematics is not");
+Check(AnchorSpec.ForSurfaceMotion("g", new string('b', AnchorSpec.MaxBodyLength + 1), 0, 0).Invalid() != null
+    && AnchorSpec.ForSurfaceMotion("g", new string('b', AnchorSpec.MaxBodyLength), 0, 0).Invalid() == null,
+    "kinematic: the body name is held to the sidecar's length");
+Check(AnchorSpec.ForStateVector("s", "Kerbin", 1, new DVec3(1e-200, 0, 0), new DVec3(0, 1, 0)).Invalid() == null,
+    "kinematic: a tiny position whose magnitude underflows is not the centre, as the sidecar compares components");
+
+/* A surface point under a signal speed stays on the body as drawn; conics and state vectors go to their light instant. */
+Check(!AnchorRules.PlacedAtLightInstant(AnchorMotion.Surface) && AnchorRules.PlacedAtLightInstant(AnchorMotion.Conic)
+    && AnchorRules.PlacedAtLightInstant(AnchorMotion.StateVector), "kinematic: only paths are placed at the light instant");
+
+/* Under ObservedOnly a kinematic anchor keeps its knowledge but not the lens's pose. */
+Check(AnchorRules.PoseWithheld("peer:1:2", true, AnchorPolicy.ObservedOnly, AnchorKind.Kinematic)
+    && !AnchorRules.PoseWithheld("peer:1:2", true, AnchorPolicy.Full, AnchorKind.Kinematic)
+    && !AnchorRules.PoseWithheld("peer:1:2", false, AnchorPolicy.ObservedOnly, AnchorKind.Kinematic)
+    && !AnchorRules.PoseWithheld("peer:1:2", true, AnchorPolicy.ObservedOnly, AnchorKind.Vessel),
+    "kinematic: the pose is withheld only where the anchor would be observed");
+{
+    string Enc(AnchorResult r)
+    {
+        var b = new StringBuilder();
+        r.AppendJson(b);
+        return b.ToString();
+    }
+    var inView = new AnchorResult { Id = "ghost", Owner = "peer:1:2", X = 100, Y = 50, InFrame = true, DistanceM = 4.2e5, ApparentRadiusPx = 3, AngleOffAxisDeg = 1.5, PoseWithheld = true };
+    var offFrame = inView;
+    offFrame.Id = "hypothesis";
+    offFrame.InFrame = false;
+    offFrame.X = 4000;
+    var back = offFrame;
+    back.Id = "impact";
+    back.Behind = true;
+    bool noPose = true;
+    foreach (var r in new[] { inView, offFrame, back })
+    {
+        var j = Enc(r);
+        noPose &= !j.Contains("distanceM") && !j.Contains("behind") && !j.Contains("angleOffAxis") && !j.Contains("observed");
+    }
+    Check(noPose, "kinematic under ObservedOnly: no range, no behind and no angle off axis on any of three results");
+    Check(Enc(inView).Contains("\"x\":100") && Enc(inView).Contains("\"apparentRadiusPx\":3"), "kinematic under ObservedOnly: in frame it is placed and sized");
+    Check(!Enc(offFrame).Contains("\"x\"") && !Enc(back).Contains("\"x\"") && !Enc(back).Contains("apparentRadiusPx"),
+        "kinematic under ObservedOnly: out of frame it gives no bearing");
+}
+
+/* The registry keeps copies, so a caller's later change can not leave a path built from the old spec. */
+{
+    var kreg = new AnchorRegistry();
+    var spec = AnchorSpec.ForConic("c", "Kerbin", 5, 0.1, 700000, 0, 0, 0, 0);
+    Check(kreg.Set("mission-control", 3, new List<AnchorSpec> { spec }, out _), "kinematic: a conic anchor is set");
+    spec.SemiMajorAxis = 900000;
+    var held = new List<KeyValuePair<string, AnchorSpec>>();
+    kreg.ForCamera(3, held);
+    Check(held.Count == 1 && !ReferenceEquals(held[0].Value, spec) && held[0].Value.SemiMajorAxis == 700000 && !held[0].Value.PathTried,
+        "kinematic: the registry holds its own copy, with no path built");
+}
+{
+    var o = MiniJson.Parse("{\"id\":\"ghost\",\"kind\":\"kinematic\",\"marginM\":50,\"kinematics\":{\"kind\":\"stateVector\",\"body\":\"Kerbin\","
+        + "\"ut\":123.5,\"position\":[700000,1,2],\"velocity\":[3,2200,4]}}") as Dictionary<string, object>;
+    var a = AnchorSpec.FromJson(o, out string why);
+    Check(a != null && a.Kind == AnchorKind.Kinematic && a.Motion == AnchorMotion.StateVector && a.Body == "Kerbin" && a.Ut == 123.5
+        && a.Position.X == 700000 && a.Position.Z == 2 && a.Velocity.Y == 2200 && a.MarginM == 50, "kinematic: a state vector parses " + why);
+    var conic = AnchorSpec.FromJson(MiniJson.Parse("{\"id\":\"hyp\",\"kind\":\"kinematic\",\"kinematics\":{\"kind\":\"conic\",\"body\":\"Mun\","
+        + "\"inclination\":5,\"eccentricity\":0.2,\"semiMajorAxis\":300000,\"lan\":10,\"argumentOfPeriapsis\":20,\"meanAnomalyAtEpoch\":1,\"epoch\":50}}")
+        as Dictionary<string, object>, out why);
+    Check(conic != null && conic.Motion == AnchorMotion.Conic && conic.Body == "Mun" && conic.SemiMajorAxis == 300000 && conic.Epoch == 50, "kinematic: a conic parses " + why);
+    var bad = AnchorSpec.FromJson(MiniJson.Parse("{\"id\":\"x\",\"kind\":\"kinematic\",\"kinematics\":{\"kind\":\"stateVector\",\"body\":\"Kerbin\",\"ut\":1}}")
+        as Dictionary<string, object>, out why);
+    Check(bad == null && why.Contains("position"), "kinematic: a state vector without its vectors is refused: " + why);
+    var none = AnchorSpec.FromJson(MiniJson.Parse("{\"id\":\"x\",\"kind\":\"kinematic\"}") as Dictionary<string, object>, out why);
+    Check(none == null && why != null, "kinematic: no kinematics is refused: " + why);
+    var stray = AnchorSpec.FromJson(MiniJson.Parse("{\"id\":\"pad\",\"kind\":\"surface\",\"body\":\"Kerbin\",\"latitude\":1,\"longitude\":2,"
+        + "\"kinematics\":{\"kind\":\"surface\",\"body\":\"Mun\",\"latitude\":3,\"longitude\":4}}") as Dictionary<string, object>, out why);
+    Check(stray == null && why.Contains("kinematic anchor only"), "kinematics on another kind is refused, as the sidecar refuses it: " + why);
+}
 
 string Json(AnchorResult r)
 {
