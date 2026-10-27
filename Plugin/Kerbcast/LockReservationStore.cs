@@ -8,7 +8,8 @@ namespace Kerbcast
     /*
      * The process's lock reservation, kept as a Reservation node in the
      * user's GameData/Kerbcast/PluginData/settings.cfg, beside the Settings
-     * node, so it outlives scenes and restarts. A player clears it by
+     * node, so it outlives scenes and restarts. A player clears it in game
+     * (KerbcastGameParameters.ReleaseCommandLock) or, with the game closed, by
      * deleting that node. The light-time history samples while one is held.
      *
      * Only the Reservation node's text is replaced, so the player's own
@@ -83,7 +84,7 @@ namespace Kerbcast
                 {
                     /* TakeLock and Reserve already refuse such text; never write a node something could break out of. */
                     string node = SettingsLayer.Node(NodeName,
-                        new[] { "Kerbcast.API lock reservation: every scene starts locked for this owner while its", "assembly is loaded. Delete this node to clear it." },
+                        new[] { "Kerbcast.API lock reservation: every scene starts locked for this owner while its", "assembly is loaded. Clear it in game (Difficulty Settings, Kerbcast, Release command lock)", "or delete this node with the game closed." },
                         "owner", r.Owner, "assembly", r.Assembly, "silentText", string.IsNullOrEmpty(r.SilentText) ? null : r.SilentText);
                     if (node == null)
                     {

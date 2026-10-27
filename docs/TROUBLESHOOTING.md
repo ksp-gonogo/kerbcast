@@ -70,6 +70,28 @@ quickest "is it up" check.
   filtered modes (B&W, CRT, night vision) render wrong, make sure
   `GameData/Kerbcast/HullcamShaders/shaders.linux` exists.
 
+## Command camera feeds stay blank and the browser can't add or remove them
+
+Another mod (a mission control mod, say) holds the lock on the command
+cameras. While it holds the lock only that mod aims, creates and removes them,
+and a feed blanks with "Authority not responding" (or the mod's own words)
+when the mod stops answering. A mod can also reserve the lock, so every scene
+starts locked for it.
+
+- KSP.log names the holder: search for `command lock taken` or
+  `scene starts locked for`
+- If a reserved scene's mod makes no call within 30 seconds, KSP.log says
+  `made no call`. The feeds stay blank, so nothing the mod should hide is
+  shown, but the browser can create and remove command cameras again (they
+  are blank too). If the mod answers later, it takes charge as usual. The
+  next scene starts locked again while the mod is installed
+- To see the scene on the feeds again, release the lock and clear the
+  reservation: Pause → Difficulty Settings → Kerbcast → tick **Release
+  command lock** and accept. It unticks itself once done. This is the only
+  way a reserved scene goes back to normal feeds. A working mod can take the
+  lock again when it next asks for it
+- Removing the mod also clears its reservation the next time KSP starts
+
 ## Choppy streams / low game fps
 
 This is the adaptive scaler doing its job: kerbcast caps its own main-thread

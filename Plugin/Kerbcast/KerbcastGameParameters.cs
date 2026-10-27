@@ -52,6 +52,18 @@ namespace Kerbcast
         )]
         public bool CommandCameraTrackingRules = true;
 
+        /* A one-shot: KerbcastCore releases the scene's command lock and clears
+           any reservation, then unticks it. The way out when a mod that locks
+           the command cameras has stopped answering. */
+        [GameParameters.CustomParameterUI(
+            "Release command lock",
+            toolTip =
+                "Release the lock another mod holds on the command cameras for this scene, and clear " +
+                "its reservation so later scenes start unlocked. Use it when a mod's command feeds stay " +
+                "blank because the mod has stopped answering."
+        )]
+        public bool ReleaseCommandLock;
+
         // Override default-init so newly-created saves pick up the
         // settings.cfg seed. Existing saves with a stored value
         // ignore this (the loaded ConfigNode wins).

@@ -48,7 +48,20 @@ namespace Kerbcast
         public bool TimedOut(float realNow) =>
             Held && realNow - _lastCall > TimeoutSeconds && !_store.HeardWithin(TimeoutSeconds);
 
-        public void Heartbeat(float realNow) => _lastCall = realNow;
+        public void Heartbeat(float realNow)
+        {
+            _lastCall = realNow;
+            Calls++;
+        }
+
+        /* Every owner call and renewal so far, the reserved take included; it only grows. */
+        public int Calls { get; private set; }
+
+        /* Kerbcast's own, not the owner's: restarts the silence clock without counting a call. */
+        public void RestartSilence(float realNow) => _lastCall = realNow;
+
+        /* The holder's world model attached or published within `seconds` of real time. */
+        public bool WorldModelHeardWithin(double seconds) => _store.HeardWithin(seconds);
 
         /* Taken starts a new tenure; Renewed keeps it, taking the new options and silence text. */
         public LockResult Take(string owner, LockOptions options, string silentText, float realNow)
@@ -62,7 +75,7 @@ namespace Kerbcast
             Owner = owner;
             Options = options;
             SilentText = silentText;
-            _lastCall = realNow;
+            Heartbeat(realNow);
             if (!renewed)
             {
                 _store.EndTenure();
@@ -98,18 +111,86 @@ namespace Kerbcast
             if (metresPerSecond.HasValue && !(Vec3d.Finite(metresPerSecond.Value) && metresPerSecond.Value > 0))
                 throw new ArgumentOutOfRangeException(nameof(metresPerSecond), metresPerSecond, "must be finite and positive, or null");
             if (!Holds(owner)) return false;
-            _lastCall = realNow;
+            Heartbeat(realNow);
             LightSpeed = metresPerSecond;
             return true;
         }
     }
 
     /*
+     * A reserved scene's lock, taken for its owner before the owner could
+     * call. If the owner never calls (installed but broken, say), the
+     * reservation lapses for the scene after LapseSeconds of real time: the
+     * lock stays held and the feeds stay blank, since a slow but healthy
+     * owner must never have its viewers shown truth, but browser clients may
+     * create and remove command cameras again. The owner's first call or
+     * publish ends the lapse. The wait starts at the scene's first frame, so
+     * a long load does not count against the owner.
+     */
+    internal sealed class ReservationWatch
+    {
+        public const float LapseSeconds = 30f;
+
+        private string _owner;
+        private bool _started;
+        private bool _lapsed;
+        private float _from;
+        private int _calls;
+
+        /* Right after Kerbcast takes the lock for `owner`, so every owner call from here counts, even one before the first frame. */
+        public void Watch(string owner, CommandLock commandLock)
+        {
+            _owner = owner;
+            _started = false;
+            _lapsed = false;
+            _calls = commandLock.Calls;
+        }
+
+        /* The scene's first frame. */
+        public void Start(float realNow)
+        {
+            if (_owner == null || _started) return;
+            _started = true;
+            _from = realNow;
+        }
+
+        /* The owner whose reservation lapses now, once; null while it may still call, once it has, or once lapsed. */
+        public string Lapse(CommandLock commandLock, float realNow)
+        {
+            if (_owner == null || !_started || _lapsed) return null;
+            if (Answered(commandLock))
+            {
+                _owner = null;
+                return null;
+            }
+            if (realNow - _from < LapseSeconds) return null;
+            _lapsed = true;
+            return _owner;
+        }
+
+        /* Whether the scene is lapsed now; an owner call, a publish or the lock leaving its owner ends it for good. */
+        public bool Lapsed(CommandLock commandLock)
+        {
+            if (!_lapsed) return false;
+            if (!Answered(commandLock)) return true;
+            _lapsed = false;
+            _owner = null;
+            return false;
+        }
+
+        private bool Answered(CommandLock commandLock) =>
+            !commandLock.Holds(_owner) || commandLock.Calls != _calls || commandLock.WorldModelHeardWithin(LapseSeconds);
+    }
+
+    /*
      * A lock holder's claim on every scene to come: each one starts locked for
      * the owner, with every craft unknown until it attaches, while the owner's
-     * assembly is loaded. It never times out into truth. It is saved with
+     * assembly is loaded. A silent holder times out into blank feeds, never
+     * truth, and a scene where the owner never calls at all lets browsers
+     * manage the blank cameras (ReservationWatch). It is saved with
      * Kerbcast's settings, keeps the silence text the owner last took the
-     * lock with, and lapses at startup when the assembly is gone.
+     * lock with, lapses at startup when the assembly is gone, and the player
+     * can clear it in game.
      */
     internal sealed class LockReservation
     {
@@ -135,6 +216,16 @@ namespace Kerbcast
         public void Clear(string owner)
         {
             if (!Holds(owner)) return;
+            Owner = null;
+            Assembly = null;
+            SilentText = null;
+            Changed?.Invoke();
+        }
+
+        /* The player's way out, whoever the owner is. */
+        public void ClearForPlayer()
+        {
+            if (!Held) return;
             Owner = null;
             Assembly = null;
             SilentText = null;

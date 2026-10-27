@@ -133,7 +133,7 @@ namespace Kerbcast
         internal static Api.LockResult TakeLockCore(string owner, Api.LockOptions options, string silentText)
         {
             var core = KerbcastCore.Instance;
-            if (core == null) return Api.LockResult.NotRunning;
+            if (core == null || core.SceneEnding) return Api.LockResult.NotRunning;
             var result = core.CommandAuthority.Lock.Take(owner, options, silentText, Time.realtimeSinceStartup);
             if (result == Api.LockResult.HeldByOther) return result;
             /* A reserved scene starts with the silence text the owner last took the lock with. */

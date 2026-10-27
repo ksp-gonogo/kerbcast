@@ -494,10 +494,85 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
         kc2.Command.ChangeScene();
         Check(kc2.Command.ReservedOwner == "modA", "lock: only once per process, as Kerbcast does");
     }
+    /* Always-loaded names are matched whole or by a dotted prefix, so a mod that merely starts the same is free to reserve. */
+    Check(ReservedAssemblies.IsReserved("System") && ReservedAssemblies.IsReserved("System.Core.dll") && ReservedAssemblies.IsReserved("UnityEngine")
+        && ReservedAssemblies.IsReserved("UnityEngine.CoreModule") && !ReservedAssemblies.IsReserved("SystemHeat")
+        && !ReservedAssemblies.IsReserved("SystemHeat.dll") && !ReservedAssemblies.IsReserved("UnityEngineering"),
+        "lock: System and UnityEngine are reserved whole or dotted, SystemHeat is not");
 
     Check(CommandLock.LostLine("modA", LockLossReason.SceneEnded) == "[Kerbcast][CMDCAM] command lock lost: modA (reason SceneEnded)"
         && CommandLock.LostLine("modB", LockLossReason.ReleasedByPlayer).EndsWith("modB (reason ReleasedByPlayer)"),
         "lock: a loss logs its owner and reason");
+
+    /* A reserved scene whose owner never calls lapses, keeping the lock held; one call or publish ends or prevents it. */
+    {
+        float t = 100f;
+        var store = new WorldModelStore(null, _ => { });
+        var lk = new CommandLock(store, null);
+        var watch = new ReservationWatch();
+        void Reserved()
+        {
+            lk.Release("modA");
+            lk.Take("modA", LockOptions.WorldModelRequired, null, t);
+            watch.Watch("modA", lk);
+        }
+
+        Reserved();
+        Check(watch.Lapse(lk, t + 1000) == null && !watch.Lapsed(lk), "lock: the lapse waits for the scene's first frame");
+        lk.RestartSilence(t + 5);
+        watch.Start(t + 5);
+        Check(watch.Lapse(lk, t + 5 + ReservationWatch.LapseSeconds - 1) == null && !watch.Lapsed(lk), "lock: a reserved owner has the full wait to call");
+        Check(watch.Lapse(lk, t + 5 + ReservationWatch.LapseSeconds) == "modA" && watch.Lapsed(lk), "lock: a reserved owner that never calls lapses");
+        Check(lk.Holds("modA") && lk.TimedOut(t + 5 + ReservationWatch.LapseSeconds), "lock: a lapse keeps the lock held and silent, so the feeds stay blank");
+        Check(watch.Lapse(lk, t + 5000) == null && watch.Lapsed(lk), "lock: a lapse is reported once and lasts");
+        lk.Heartbeat(t + 6000);
+        Check(!watch.Lapsed(lk) && watch.Lapse(lk, t + 9000) == null, "lock: the owner's later call ends the lapse for good");
+
+        Reserved();
+        lk.Take("modA", LockOptions.WorldModelRequired, null, t + 1);
+        watch.Start(t + 2);
+        Check(watch.Lapse(lk, t + 1000) == null && !watch.Lapsed(lk), "lock: an owner call before the first frame still counts");
+
+        Reserved();
+        watch.Start(t);
+        lk.Heartbeat(t + 1);
+        Check(watch.Lapse(lk, t + 1000) == null && !watch.Lapsed(lk), "lock: a reserved owner that called once never lapses for the scene");
+
+        Reserved();
+        watch.Start(t);
+        Check(watch.Lapse(lk, t + 1000) == "modA", "lock: lapsed before the player's release");
+        lk.Release("modA");
+        Check(!watch.Lapsed(lk), "lock: a released lock is no longer lapsed");
+
+        /* Last: an attach counts for LapseSeconds of real time. */
+        Reserved();
+        watch.Start(t);
+        store.Attach("modA");
+        Check(watch.Lapse(lk, t + 1000) == null && !watch.Lapsed(lk), "lock: an owner heard through its world model never lapses for the scene");
+        store.Close();
+    }
+
+    /* A closed store tells a publisher whether any scene runs Kerbcast now. */
+    {
+        bool running = true;
+        var store = new WorldModelStore(null, _ => { }) { Running = () => running };
+        var lk = new CommandLock(store, null);
+        lk.Take("modA", LockOptions.None, null, 0);
+        var pub = store.Attach("modA");
+        store.Close();
+        Check(pub.Publish(pub.Begin(1, 0, 0), out _) == PublishResult.SceneChanged, "world model: a closed store with Kerbcast running reads as a scene change");
+        running = false;
+        Check(pub.Publish(pub.Begin(2, 0, 0), out _) == PublishResult.NotRunning, "world model: a closed store with Kerbcast stopped reads as not running");
+    }
+
+    var forPlayer = new LockReservation();
+    forPlayer.Reserve("modA", "ModA.dll");
+    int playerSaves = 0;
+    forPlayer.Changed = () => playerSaves++;
+    forPlayer.ClearForPlayer();
+    forPlayer.ClearForPlayer();
+    Check(!forPlayer.Held && playerSaves == 1, "lock: the player clears anyone's reservation, saving once");
+
     var noted = new LockReservation();
     noted.Reserve("modA", "ModA.dll");
     noted.NoteSilentText("modB", "not mine");

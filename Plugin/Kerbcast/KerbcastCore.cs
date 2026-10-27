@@ -479,12 +479,27 @@ namespace Kerbcast
         {
             _captureEpoch.Bump();
             _teardown.OnSceneLoadRequested();
-            CommandAuthority.Reset();
+            EndSceneLock();
             CommandAuthority.WorldModel.Close();
             /* Restore now, before the scene tears down. Camera ScaledSpace and
                GalaxyCamera survive into the next scene, so a throttle left on
                them would keep the next scene's main view in an 8x8 corner. */
             RestoreMainScreen();
+        }
+
+        /* From now until the scene is gone every take is refused, so a LockLost
+           handler that takes the lock again does so in the next scene. */
+        internal bool SceneEnding { get; private set; }
+
+        /* The lock ends with the scene, and its holder hears so once: here on a
+           scene load, or at OnDestroy when no load was requested. */
+        private void EndSceneLock()
+        {
+            if (SceneEnding) return;
+            SceneEnding = true;
+            string holder = CommandAuthority.Owner;
+            CommandAuthority.Reset();
+            if (holder != null) RaiseLockLost(holder, Api.LockLossReason.SceneEnded);
         }
 
         /* A game-state load inside the scene also leaves the world model's
@@ -693,23 +708,73 @@ namespace Kerbcast
 
         /* A reservation starts the scene locked for its owner, with every craft
            unknown until it attaches. It lapses once per process if its
-           assembly is not loaded. */
+           assembly is not loaded, and for the scene if its owner never calls. */
         private void StartReservedLock()
         {
             LockReservationStore.CheckLapse();
+            PollPlayerRelease();
             var r = LockReservationStore.Reservation;
             if (!r.Held || !LockReservationStore.AssemblyLoaded(r.Assembly)) return;
             KerbcastControl.TakeLockCore(r.Owner, Api.LockOptions.WorldModelRequired, r.SilentText);
             _reservedHeartbeatPending = true;
+            _reservedWatch.Watch(r.Owner, CommandAuthority.Lock);
             Debug.Log($"[Kerbcast][CMDCAM] scene starts locked for {r.Owner} (reserved)");
         }
 
         private bool _reservedHeartbeatPending;
+        private readonly ReservationWatch _reservedWatch = new ReservationWatch();
+        private float _playerReleaseCheckAt;
+
+        private void WatchReservedOwner()
+        {
+            string owner = _reservedWatch.Lapse(CommandAuthority.Lock, Time.realtimeSinceStartup);
+            if (owner == null) return;
+            Debug.LogWarning($"[Kerbcast][CMDCAM] {owner} reserved the command lock but made no call within {ReservationWatch.LapseSeconds:F0} s; "
+                + "its feeds stay blank and browsers may now create and remove command cameras. To show the scene, release the lock in game: "
+                + "Difficulty Settings > Kerbcast > Release command lock");
+        }
+
+        /* Browsers manage command cameras with no lock, or while a reserved owner has never answered: its feeds are blank either way. */
+        private bool BrowserManagesCameras => CommandAuthority.Owner == null || _reservedWatch.Lapsed(CommandAuthority.Lock);
+
+        /* The Difficulty Settings one-shot, read live, once a second: release the lock and clear the reservation, whoever holds them. */
+        private void PollPlayerRelease()
+        {
+            if (Time.realtimeSinceStartup < _playerReleaseCheckAt) return;
+            _playerReleaseCheckAt = Time.realtimeSinceStartup + 1f;
+            try
+            {
+                var p = HighLogic.CurrentGame?.Parameters?.CustomParams<KerbcastGameParameters>();
+                if (p == null || !p.ReleaseCommandLock) return;
+                p.ReleaseCommandLock = false;
+                var r = LockReservationStore.Reservation;
+                string reserved = r.Owner;
+                r.ClearForPlayer();
+                string holder = CommandAuthority.Owner;
+                Debug.Log($"[Kerbcast][CMDCAM] player released the command lock (held by {holder ?? "nobody"}, reserved by {reserved ?? "nobody"})");
+                if (holder != null)
+                {
+                    KerbcastControl.ReleaseLockCore(holder, byPlayer: true);
+                    RaiseLockLost(holder, Api.LockLossReason.ReleasedByPlayer);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] release command lock: {ex.Message}");
+            }
+        }
+
+
+        private static void RaiseLockLost(string owner, Api.LockLossReason reason)
+        {
+            Debug.Log(CommandLock.LostLine(owner, reason));
+            Api.KerbcastApi.RaiseLockLost(new Api.LockLostEvent(owner, reason), Debug.LogException);
+        }
 
         private void ApplyCommandRequest(CommandCameraRequest r)
         {
             string holder = CommandAuthority.Owner;
-            if (holder != null && (r.Op == CommandRequestOp.Create || r.Op == CommandRequestOp.Destroy))
+            if (!BrowserManagesCameras && (r.Op == CommandRequestOp.Create || r.Op == CommandRequestOp.Destroy))
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: {holder} holds the command lock; command cameras are not {(r.Op == CommandRequestOp.Create ? "created" : "destroyed")} by clients");
                 return;
@@ -736,7 +801,7 @@ namespace Kerbcast
                     return;
                 }
                 case CommandRequestOp.Destroy:
-                    if (!KerbcastControl.DestroyCommandCamera(r.FlightId))
+                    if (!DestroyCommandCamera(r.FlightId))
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is not a created command camera; nothing destroyed");
                     return;
                 case CommandRequestOp.Aim:
@@ -850,8 +915,11 @@ namespace Kerbcast
             if (_reservedHeartbeatPending)
             {
                 _reservedHeartbeatPending = false;
-                CommandAuthority.Heartbeat(Time.realtimeSinceStartup);
+                CommandAuthority.Lock.RestartSilence(Time.realtimeSinceStartup);
+                _reservedWatch.Start(Time.realtimeSinceStartup);
             }
+            WatchReservedOwner();
+            PollPlayerRelease();
             UpdateFpsAverage();
             MaybeApplyCommandRequests();
             DropLostVantages();
@@ -1900,6 +1968,7 @@ namespace Kerbcast
                 Instance = null;
                 KerbcastApiImpl.Stop();
             }
+            EndSceneLock();
             CommandAuthority.WorldModel.Close();
 
             // ALWAYS restore the main flight cameras on scene exit so a
