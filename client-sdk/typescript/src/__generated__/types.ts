@@ -1113,6 +1113,20 @@ export interface FrameStampPayload {
 	 */
 	boundaryM?: number;
 	/**
+	 * Unix wall-clock milliseconds just before the sidecar hands the
+	 * frame's packets to the transport. Differences between frames show the
+	 * sidecar's own send pacing, apart from what the network adds. Absent
+	 * from sidecars older than 1.12.
+	 */
+	sentWallMs?: number;
+	/** The frame's encoded size in bytes. Absent from sidecars older than 1.12. */
+	encodedBytes?: number;
+	/**
+	 * Whether the frame is a keyframe (IDR). Absent from sidecars older than
+	 * 1.12.
+	 */
+	keyframe?: boolean;
+	/**
 	 * A command camera's state in this frame. Only for a client that asked
 	 * with `SetFrameStamps` `command: true`.
 	 */

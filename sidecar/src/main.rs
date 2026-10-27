@@ -967,6 +967,7 @@ async fn encode_and_fan_out(
     drop(encoder_guard);
 
     // Concatenate NALs into the Annex-B bytestream webrtc-rs expects.
+    let keyframe = nals.iter().any(|nal| nal.is_keyframe());
     let total_len: usize = nals.iter().map(|n| n.0.len()).sum();
     let mut combined = Vec::with_capacity(total_len);
     for nal in &nals {
@@ -989,7 +990,13 @@ async fn encode_and_fan_out(
     for weak in prev {
         if let Some(track) = weak.upgrade() {
             if let Err(e) = track
-                .write_frame(&combined, capture_time, cam.flight_id, &frame.capture)
+                .write_frame(
+                    &combined,
+                    capture_time,
+                    keyframe,
+                    cam.flight_id,
+                    &frame.capture,
+                )
                 .await
             {
                 warn!(flight_id = cam.flight_id, error = %e, "write_frame failed");

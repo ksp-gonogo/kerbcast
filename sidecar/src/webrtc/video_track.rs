@@ -7,7 +7,7 @@
 //! stamp be published under the exact RTP timestamp it carries.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 use webrtc::rtp::codecs::h264::H264Payloader;
@@ -16,7 +16,7 @@ use webrtc::rtp::sequence::new_random_sequencer;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
-use super::outbox::Outbox;
+use super::outbox::{Outbox, SentFrame};
 use crate::shared_mem::CaptureStamp;
 
 /// RTP clock for video, fixed by RFC 6184 for H.264.
@@ -63,7 +63,8 @@ impl VideoTrack {
     }
 
     /**
-     * Packetise and send one encoded frame (Annex-B NALs) captured at `time`.
+     * Packetise and send one encoded frame (Annex-B NALs) captured at `time`,
+     * `keyframe` when it is an IDR.
      * When `capture` carries a UT, its stamp is queued for the control channel
      * before the frame's packets are written. Never waits on the data channel.
      * Returns the frame's RTP timestamp, or `None` when nothing was sent.
@@ -72,6 +73,7 @@ impl VideoTrack {
         &self,
         data: &[u8],
         time: CaptureTime,
+        keyframe: bool,
         flight_id: u32,
         capture: &CaptureStamp,
     ) -> webrtc::error::Result<Option<u32>> {
@@ -88,7 +90,12 @@ impl VideoTrack {
         let rtp_timestamp = first.header.timestamp;
 
         if let Some(stamps) = &self.stamps {
-            stamps.offer_stamp(flight_id, rtp_timestamp, capture);
+            let sent = SentFrame {
+                wall_ms: unix_ms_now(),
+                bytes: data.len() as u32,
+                keyframe,
+            };
+            stamps.offer_stamp(flight_id, rtp_timestamp, capture, sent);
         }
 
         for p in &packets {
@@ -283,6 +290,13 @@ impl MediaClock {
 /// RTP clock ticks spanning `ms`.
 fn rtp_samples(ms: f64) -> u32 {
     (ms * H264_CLOCK_RATE as f64 / 1000.0) as u32
+}
+
+fn unix_ms_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -642,7 +656,10 @@ mod tests {
     async fn unbound_track_sends_nothing() {
         let t = track();
         let (time, stamp) = at(33.0, Some(1.0));
-        let got = t.write_frame(&nal(64), time, 1, &stamp).await.unwrap();
+        let got = t
+            .write_frame(&nal(64), time, false, 1, &stamp)
+            .await
+            .unwrap();
         assert_eq!(got, None);
     }
 
@@ -654,7 +671,14 @@ mod tests {
     #[tokio::test]
     async fn stamp_names_the_rtp_timestamp_the_viewer_receives() {
         let (sent, stamps, rtp_seen, extra) = loopback_stamps(true).await;
-        let (anchors, fov, width, live, subject) = extra.expect("a stamp arrived");
+        let (anchors, fov, width, live, subject, send) = extra.expect("a stamp arrived");
+        let (bytes, keyframe, sent_wall_ms) = send;
+        assert_eq!(bytes, Some(64), "the frame's encoded size rides its stamp");
+        assert_eq!(keyframe, Some(true), "and whether it is a keyframe");
+        assert!(
+            sent_wall_ms.is_some_and(|ms| ms > 0.0),
+            "and when it was sent"
+        );
         assert_eq!(fov, Some(35.0), "the frame's fov rides its stamp");
         assert_eq!(width, Some(64), "and its size");
         assert_eq!(live, Some(2.5), "and its live bound");
@@ -768,6 +792,7 @@ mod tests {
                             p.width,
                             p.live_light_time_s,
                             p.command.map(|c| c.subject_persistent_id),
+                            (p.encoded_bytes, p.keyframe, p.sent_wall_ms),
                         ),
                     ));
                 }
@@ -883,7 +908,7 @@ mod tests {
                 ..CaptureStamp::at(Some(ut), 2)
             };
             if let Some(ts) = vt
-                .write_frame(&nal(64), at(n as f64 * 33.0, None).0, 9, &stamp)
+                .write_frame(&nal(64), at(n as f64 * 33.0, None).0, true, 9, &stamp)
                 .await
                 .unwrap()
             {
@@ -923,6 +948,7 @@ mod tests {
         Option<u32>,
         Option<f64>,
         Option<u32>,
+        (Option<u32>, Option<bool>, Option<f64>),
     );
 
     fn frame_anchor(id: &str, owner: Option<&str>) -> crate::protocol::FrameAnchor {
@@ -1212,7 +1238,7 @@ mod tests {
                     }
                     for t in peers.iter().flat_map(|p| p.tracks.iter()) {
                         let time = at(n as f64 * 33.0, None).0;
-                        let _ = t.write_frame(&nal(64), time, 9, &stamp).await;
+                        let _ = t.write_frame(&nal(64), time, false, 9, &stamp).await;
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(2), tick)

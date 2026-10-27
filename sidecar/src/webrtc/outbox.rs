@@ -129,9 +129,16 @@ impl Outbox {
      * drop it when the peer did not ask for stamps or is behind. A frame
      * without a UT has no stamp. Anchor results are filtered to what this
      * peer may see, and only for a peer that asked for them; so is a command
-     * camera's state. The live bound and boundary go on every stamp.
+     * camera's state. The live bound, boundary and how the frame was sent go
+     * on every stamp.
      */
-    pub fn offer_stamp(&self, flight_id: u32, rtp_timestamp: u32, capture: &CaptureStamp) {
+    pub fn offer_stamp(
+        &self,
+        flight_id: u32,
+        rtp_timestamp: u32,
+        capture: &CaptureStamp,
+        sent: SentFrame,
+    ) {
         if !self.stamps_wanted.load(Ordering::Relaxed) {
             return;
         }
@@ -156,6 +163,9 @@ impl Outbox {
             anchors,
             live_light_time_s: capture.live_light_time_s,
             boundary_m: capture.boundary_m,
+            sent_wall_ms: Some(sent.wall_ms),
+            encoded_bytes: Some(sent.bytes),
+            keyframe: Some(sent.keyframe),
             command: if self.command_wanted.load(Ordering::Relaxed) {
                 capture.command.as_deref().cloned()
             } else {
@@ -184,6 +194,16 @@ impl Outbox {
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
+}
+
+/// How one encoded frame went out, for its stamp.
+#[derive(Debug, Clone, Copy)]
+pub struct SentFrame {
+    /// Unix wall-clock milliseconds when its packets went to the transport.
+    pub wall_ms: f64,
+    /// Its encoded size.
+    pub bytes: u32,
+    pub keyframe: bool,
 }
 
 /**

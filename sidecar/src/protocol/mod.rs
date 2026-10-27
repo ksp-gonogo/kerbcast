@@ -1494,6 +1494,19 @@ pub struct FrameStampPayload {
     /// their own past instant. Absent with no light speed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary_m: Option<f64>,
+    /// Unix wall-clock milliseconds just before the sidecar hands the
+    /// frame's packets to the transport. Differences between frames show the
+    /// sidecar's own send pacing, apart from what the network adds. Absent
+    /// from sidecars older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_wall_ms: Option<f64>,
+    /// The frame's encoded size in bytes. Absent from sidecars older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_bytes: Option<u32>,
+    /// Whether the frame is a keyframe (IDR). Absent from sidecars older than
+    /// 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyframe: Option<bool>,
     /// A command camera's state in this frame. Only for a client that asked
     /// with `SetFrameStamps` `command: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1723,6 +1736,9 @@ mod tests {
             anchors: None,
             live_light_time_s: None,
             boundary_m: None,
+            sent_wall_ms: None,
+            encoded_bytes: None,
+            keyframe: None,
             command: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
@@ -1760,6 +1776,9 @@ mod tests {
             }]),
             live_light_time_s: None,
             boundary_m: None,
+            sent_wall_ms: None,
+            encoded_bytes: None,
+            keyframe: None,
             command: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
@@ -1893,10 +1912,13 @@ mod tests {
             anchors: None,
             live_light_time_s: Some(23.25),
             boundary_m: Some(0.05),
+            sent_wall_ms: Some(1_793_122_552_368.5),
+            encoded_bytes: Some(48_213),
+            keyframe: Some(true),
             command: Some(command),
         });
         let s = serde_json::to_string(&msg).unwrap();
-        assert!(s.contains(r#""liveLightTimeS":23.25,"boundaryM":0.05,"command":{"hasFix":true,"rangeM":1500.25"#), "{s}");
+        assert!(s.contains(r#""liveLightTimeS":23.25,"boundaryM":0.05,"sentWallMs":1793122552368.5,"encodedBytes":48213,"keyframe":true,"command":{"hasFix":true,"rangeM":1500.25"#), "{s}");
         assert!(
             s.contains(r#""subjectUt":86398.123456789"#),
             "UTs keep every digit: {s}"
