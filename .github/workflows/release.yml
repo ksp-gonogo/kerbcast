@@ -43,10 +43,9 @@ name: release
 #                             a valid readback library, and uploads the zips as
 #                             the kerbcast-release-bundle artifact.
 #   publish-nuget  (~1 min)   pushes the packages nuget-pack gated, the very
-#                             files, via OIDC trusted publishing from the `nuget`
-#                             environment. Waits for the bundle so a failed
-#                             GameData build never leaves a package out with no
-#                             release behind it.
+#                             files, via OIDC trusted publishing. Waits for the
+#                             bundle so a failed GameData build never leaves a
+#                             package out with no release behind it.
 #   nuget-listed   (0-45 min) waits until nuget.org lists what was pushed, so
 #                             nobody reads the release before the package
 #                             restores, then checks nuget.org serves these files.
@@ -918,17 +917,16 @@ jobs:
           if-no-files-found: error
 
   # nuget.org's trusted-publishing policy for the ksp-gonogo organisation names
-  # this repository, this file and the `nuget` environment, so this job is the
-  # only place that can push: publish-sdk also holds id-token: write, but runs
-  # outside the environment, so its token is refused. The job exchanges its
-  # OIDC token for a one-hour key; there is no stored API key. Only a tag
-  # publishes, and it publishes before npm, so a failed push ships nothing.
+  # this repository and this file, with no environment, so any job here holding
+  # id-token: write could obtain a key; only this job and publish-sdk hold it.
+  # The job exchanges its OIDC token for a one-hour key; there is no stored API
+  # key. Only a tag publishes, and it publishes before npm, so a failed push
+  # ships nothing.
   publish-nuget:
     name: publish the Kerbcast.API packages to nuget.org
     needs: [nuget-pack, bundle]
     if: (github.event_name == 'push' || inputs.dry_run == false) && github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    environment: nuget
     permissions:
       contents: read
       id-token: write
