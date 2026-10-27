@@ -1,12 +1,12 @@
 # Kerbcast.API
 
-The public interface to [Kerbcast](https://github.com/ksp-gonogo/kerbcast), the Kerbal Space Program mod that streams camera feeds to browsers. Build your mod against this package and Kerbcast's own `Kerbcast.API.dll`, shipped in `GameData/Kerbcast/Plugins/`, answers at runtime.
+The public interface to [Kerbcast](https://github.com/ksp-gonogo/kerbcast), the Kerbal Space Program mod that streams camera feeds to browsers. Build your mod against the `KspGonogo.Kerbcast.API` package and Kerbcast's own `Kerbcast.API.dll`, shipped in `GameData/Kerbcast/Plugins/`, answers at runtime.
 
 It references nothing but the base class library: no UnityEngine, no Assembly-CSharp. The package carries a net48 build, the one KSP loads, and a netstandard2.0 build so test projects on modern .NET restore it cleanly. Vectors are its own `Vec3d` and `Quatd`, bodies are `flightGlobalsIndex`, craft and parts are persistentIds.
 
 ## Referencing it
 
-- Reference the package with `PrivateAssets="all"` (or `Private="false"` on a plain reference) and never ship a copy of `Kerbcast.API.dll` with your mod. Kerbcast ships the one KSP loads
+- Reference the package as `<PackageReference Include="KspGonogo.Kerbcast.API" Version="..." PrivateAssets="all" ExcludeAssets="runtime" />` (or `Private="false"` on a plain reference) and never ship a copy of `Kerbcast.API.dll` with your mod. Kerbcast ships the one KSP loads. `PrivateAssets` alone still copies the DLL into your build output
 - A hard dependency declares `[assembly: KSPAssemblyDependency("KerbcastAPI", 1, 0)]`
 - A soft dependency checks that `"KerbcastAPI"` is in `AssemblyLoader.loadedAssemblies` before touching any API type, and keeps API-typed calls in their own `[MethodImpl(MethodImplOptions.NoInlining)]` methods so the JIT never resolves them when Kerbcast is absent
 
@@ -39,11 +39,11 @@ if (kerbcast != null && KerbcastApi.Supports(ApiFeature.CraftIdentity))
 
 ## Versioning
 
-`AssemblyVersion` stays `1.0.0.0` for the whole 1.x line, so a mod built against any 1.x binds to any other. The minor is `KerbcastApi.ApiMinor`, the `KSPAssembly` version and the file version. Within a major, changes are additive: members and enum values are added, never removed or renumbered. Only Kerbcast implements the interfaces, so new interface members are not breaking.
+`AssemblyVersion` stays `1.0.0.0` for the whole 1.x line, so a mod built against any 1.x binds to any other. The minor is `KerbcastApi.ApiMinor`, the `KSPAssembly` version and the file version. The package version is the API's own version, not Kerbcast's: it moves only when the API does, so its minor is the `KSPAssemblyDependency` minor to declare. Within a major, changes are additive: members and enum values are added, never removed or renumbered. Only Kerbcast implements the interfaces, so new interface members are not breaking.
 
 ## Testing without Kerbcast
 
-The `Kerbcast.API.Testing` package (`Kerbcast.Api.Testing.RecordingKerbcast`) is a headless implementation for your unit tests. It needs no Kerbcast.dll, Unity or KSP, and never ships in GameData, so reference it from test projects only:
+The `KspGonogo.Kerbcast.API.Testing` package (`Kerbcast.Api.Testing.RecordingKerbcast`) is a headless implementation for your unit tests. It needs no Kerbcast.dll, Unity or KSP, and never ships in GameData, so reference it from test projects only:
 
 ```csharp
 using (var kc = RecordingKerbcast.Install())   // now KerbcastApi.Instance

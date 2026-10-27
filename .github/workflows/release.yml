@@ -2,10 +2,22 @@ name: release
 
 # Triggered on v* tags. Linked jobs:
 #
+#   version-sync   (~10 s)    on a tag, checks the tag against Cargo.toml, both
+#                             package.json files, Versions.props and the AVC
+#                             files. Everything that publishes waits for it.
+#   nuget-pack     (~2 min)   packs KspGonogo.Kerbcast.API and
+#                             KspGonogo.Kerbcast.API.Testing once, gates their
+#                             contents, builds a stand-in mod against them
+#                             outside the repo (and proves a planted gap fails
+#                             it), and decides per package whether to publish
+#                             or skip. Every publishing job below waits for it,
+#                             so a bad package stops the release before anything
+#                             ships.
 #   publish-sdk    (~1 min)   regenerates the typeshare bindings from Rust,
 #                             verifies version sync, publishes @ksp-gonogo/kerbcast
 #                             and @ksp-gonogo/kerbcast-react to public npm via
-#                             OIDC trusted publishing.
+#                             OIDC trusted publishing. Runs after publish-nuget,
+#                             so a failed NuGet push ships no npm package.
 #   build-sidecar  (matrix)   builds one sidecar per supported runtime — Linux
 #                             (tier-1 libva, glibc-floored + lib-bundled), macOS
 #                             arm64 and Windows x64 (tier-2 software encode, no
@@ -30,14 +42,26 @@ name: release
 #                             tree, refuses to continue if the release zip lacks
 #                             a valid readback library, and uploads the zips as
 #                             the kerbcast-release-bundle artifact.
+#   publish-nuget  (~1 min)   pushes the packages nuget-pack gated, the very
+#                             files, via OIDC trusted publishing from the `nuget`
+#                             environment. Waits for the bundle so a failed
+#                             GameData build never leaves a package out with no
+#                             release behind it.
+#   nuget-listed   (0-45 min) waits until nuget.org lists what was pushed, so
+#                             nobody reads the release before the package
+#                             restores, then checks nuget.org serves these files.
 #   publish        (~1 min)   creates the GitHub Release from that artifact and
 #                             mirrors it to SpaceDock and the .ckan pins. needs
-#                             publish-sdk so a Release never claims packages that
-#                             failed to publish.
+#                             publish-sdk and nuget-listed so a Release never
+#                             claims packages that failed to publish.
 #
-# Dry run: a manual dispatch defaults to dry_run=true, which skips publish-sdk
-# and publish at the job level, so no publishing step can run. Only the builds,
-# assemble and gate run, and the zips are downloadable from the run.
+# Dry run: a manual dispatch defaults to dry_run=true, which skips publish-sdk,
+# publish-nuget, nuget-listed and publish at the job level, so no publishing
+# step can run. Only the builds, assemble and gates run, nuget-pack included:
+# on any branch, `gh workflow run release.yml --ref <branch>` packs the NuGet
+# packages as <KerbcastApiVersion>-rc.<run number>, gates and probes them, and
+# says in its summary what a release would publish. The zips and packages are
+# downloadable from the run.
 #
 # "Re-run failed jobs" re-runs whichever half failed without repeating the
 # other.
@@ -56,6 +80,8 @@ name: release
 # "Resolve workspace protocol before publish" step).
 #
 # Secrets required:
+#   NUGET_USER: the nuget.org profile name that owns the ksp-gonogo
+#               trusted-publishing policy (an organisation secret)
 #   KSP_MANAGED_TOKEN — fine-grained PAT (Contents: read) for ksp-gonogo/ksp-managed
 #   UNITY_USERNAME / UNITY_PASSWORD — Unity Personal license for shader builds
 #
@@ -79,8 +105,56 @@ on:
         default: true
 
 jobs:
+  # Every manifest must carry the tag's version. First in the graph, so a
+  # mismatched tag fails before nuget-pack plans a push or npm sees anything.
+  # A run that is not on a tag has no version to check against.
+  version-sync:
+    name: versions match the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Not a tag run
+        if: github.ref_type != 'tag'
+        run: echo "${GITHUB_REF_NAME} is not a tag, so there is no release version to check"
+
+      - name: Verify version sync (tag == Cargo.toml == package.json == Versions.props == Kerbcast.version == KerbcastKos.version)
+        if: github.ref_type == 'tag'
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
+          REACT_VER="$(node -p "require('./client-sdk/react/package.json').version")"
+          CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          AVC_VER="$(python3 -c "import json; v=json.load(open('GameData/Kerbcast/Kerbcast.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          # KerbcastKos is co-versioned with the core (lockstep): the addon
+          # compile-time links the Kerbcast.dll facade, so a matching version is
+          # the compatibility contract.
+          KOS_VER="$(python3 -c "import json; v=json.load(open('GameData/KerbcastKos/KerbcastKos.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          # Plugin/Versions.props drives Kerbcast.dll's KSPAssembly version, and
+          # holds the public API's own SemVer line (Kerbcast.API NuGet packages).
+          PLUGIN_VER="$(sed -nE 's|.*<KerbcastVersion>([^<]*)</KerbcastVersion>.*|\1|p' Plugin/Versions.props)"
+          API_VER="$(sed -nE 's|.*<KerbcastApiVersion>([^<]*)</KerbcastApiVersion>.*|\1|p' Plugin/Versions.props)"
+          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER plugin=$PLUGIN_VER api=$API_VER avc=$AVC_VER kos=$KOS_VER"
+          if ! printf '%s' "$API_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::KerbcastApiVersion '$API_VER' in Plugin/Versions.props is not X.Y.Z"
+            exit 1
+          fi
+          # The AVC (.version) files are numeric MAJOR/MINOR/PATCH and cannot
+          # carry a pre-release suffix, so they are compared against the BASE
+          # version: for v1.9.1-rc.1 the tag, Cargo and packages must all read
+          # 1.9.1-rc.1 while the AVC files read 1.9.1. Comparing them against
+          # the full tag makes a pre-release impossible to cut.
+          BASE_VER="${TAG_VER%%-*}"
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$PLUGIN_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$BASE_VER" != "$AVC_VER" ] || [ "$AVC_VER" != "$KOS_VER" ]; then
+            echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
+            exit 1
+          fi
+
   publish-sdk:
     name: publish SDK packages
+    needs: [version-sync, publish-nuget]
     if: github.event_name == 'push' || inputs.dry_run == false
     runs-on: ubuntu-latest
     permissions:
@@ -132,37 +206,6 @@ jobs:
       # is older than that on the Node 22 runner image.
       - name: Upgrade npm for OIDC trusted publishing
         run: npm install -g npm@latest
-
-      - name: Verify version sync (tag == Cargo.toml == package.json == Versions.props == Kerbcast.version == KerbcastKos.version)
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#v}"
-          PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
-          REACT_VER="$(node -p "require('./client-sdk/react/package.json').version")"
-          CARGO_VER="$(grep -m1 '^version = ' sidecar/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          AVC_VER="$(python3 -c "import json; v=json.load(open('GameData/Kerbcast/Kerbcast.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
-          # KerbcastKos is co-versioned with the core (lockstep): the addon
-          # compile-time links the Kerbcast.dll facade, so a matching version is
-          # the compatibility contract.
-          KOS_VER="$(python3 -c "import json; v=json.load(open('GameData/KerbcastKos/KerbcastKos.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
-          # Plugin/Versions.props drives Kerbcast.dll's KSPAssembly version, and
-          # holds the public API's own SemVer line (Kerbcast.API NuGet packages).
-          PLUGIN_VER="$(sed -nE 's|.*<KerbcastVersion>([^<]*)</KerbcastVersion>.*|\1|p' Plugin/Versions.props)"
-          API_VER="$(sed -nE 's|.*<KerbcastApiVersion>([^<]*)</KerbcastApiVersion>.*|\1|p' Plugin/Versions.props)"
-          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER plugin=$PLUGIN_VER api=$API_VER avc=$AVC_VER kos=$KOS_VER"
-          if ! printf '%s' "$API_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::KerbcastApiVersion '$API_VER' in Plugin/Versions.props is not X.Y.Z"
-            exit 1
-          fi
-          # The AVC (.version) files are numeric MAJOR/MINOR/PATCH and cannot
-          # carry a pre-release suffix, so they are compared against the BASE
-          # version: for v1.9.1-rc.1 the tag, Cargo and packages must all read
-          # 1.9.1-rc.1 while the AVC files read 1.9.1. Comparing them against
-          # the full tag makes a pre-release impossible to cut.
-          BASE_VER="${TAG_VER%%-*}"
-          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$PLUGIN_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$BASE_VER" != "$AVC_VER" ] || [ "$AVC_VER" != "$KOS_VER" ]; then
-            echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
-            exit 1
-          fi
 
       - name: Install workspace dependencies
         run: pnpm install --no-frozen-lockfile
@@ -755,9 +798,262 @@ jobs:
             Plugin/obj/Release/Kerbcast.dll
           if-no-files-found: error
 
+  # KspGonogo.Kerbcast.API and .Testing carry KerbcastApiVersion, the API's own
+  # line, so most releases pack a version nuget.org already has. Packed once and
+  # gated here; publish-nuget pushes these files, never a re-pack, so what
+  # ships is what was gated. Needs no KSP: proving that is the probe's job.
+  nuget-pack:
+    name: pack and gate the Kerbcast.API packages
+    needs: [version-sync]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+    env:
+      STABLE: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # An exact SDK, not 8.x: a skipped version is compared with the copy
+      # published by an earlier release, and a compiler patch that emits
+      # different IL reads as a changed package. Moving this pin means the next
+      # release raises KerbcastApiVersion. setup-dotnet only installs a version;
+      # dotnet runs the newest SDK on the runner unless a global.json names one.
+      # The probe builds outside the checkout, so it uses the runner's newest
+      # SDK, as an outside mod would.
+      - name: Pin the SDK
+        run: echo '{"sdk":{"version":"8.0.427","rollForward":"disable"}}' > global.json
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: The pinned SDK is the one in use
+        run: |
+          echo "dotnet --version: $(dotnet --version)"
+          test "$(dotnet --version)" = 8.0.427
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # A stable tag packs KerbcastApiVersion itself; a pre-release tag, a dry
+      # run or a branch packs <KerbcastApiVersion>-rc.<run number>, which is
+      # never committed. The two flags keep a rebuild of the same tree
+      # comparable with what nuget.org already has.
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          API_VER="$(sed -nE 's|.*<KerbcastApiVersion>([^<]*)</KerbcastApiVersion>.*|\1|p' Plugin/Versions.props)"
+          if [ "$STABLE" = true ]; then VERSION="$API_VER"; else VERSION="$API_VER-rc.$GITHUB_RUN_NUMBER"; fi
+          echo "Packing the Kerbcast.API packages as $VERSION"
+          for p in Kerbcast.API Kerbcast.API.Testing; do
+            dotnet pack "Plugin/$p/$p.csproj" -c Release -o "$RUNNER_TEMP/nuget" --nologo -warnaserror \
+              -p:ContinuousIntegrationBuild=true -p:IncludeSourceRevisionInInformationalVersion=false \
+              -p:PackageVersion="$VERSION"
+          done
+          {
+            echo "version=$VERSION"
+            echo "api=$RUNNER_TEMP/nuget/KspGonogo.Kerbcast.API.$VERSION.nupkg"
+            echo "testing=$RUNNER_TEMP/nuget/KspGonogo.Kerbcast.API.Testing.$VERSION.nupkg"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Gate the packed files
+        env:
+          VERSION: ${{ steps.pack.outputs.version }}
+          API_NUPKG: ${{ steps.pack.outputs.api }}
+          TESTING_NUPKG: ${{ steps.pack.outputs.testing }}
+        run: |
+          if [ "$STABLE" = true ]; then
+            node scripts/nuget-package-gate.mjs "$API_NUPKG" "$TESTING_NUPKG"
+          else
+            node scripts/nuget-package-gate.mjs "$API_NUPKG" "$TESTING_NUPKG" --rc "$VERSION"
+          fi
+
+      - name: A mod builds against the packed files without KSP, and the probe can see a gap
+        env:
+          API_NUPKG: ${{ steps.pack.outputs.api }}
+          TESTING_NUPKG: ${{ steps.pack.outputs.testing }}
+        run: |
+          set -euo pipefail
+          node scripts/nuget-extraction-probe.mjs "$API_NUPKG" "$TESTING_NUPKG"
+          node scripts/nuget-extraction-probe.mjs "$API_NUPKG" "$TESTING_NUPKG" --plant
+
+      # Fails when nuget.org already has the version with different content: it
+      # never replaces a version, so the change could not ship under it.
+      - name: Publish or skip, per package
+        id: plan
+        env:
+          API_NUPKG: ${{ steps.pack.outputs.api }}
+          TESTING_NUPKG: ${{ steps.pack.outputs.testing }}
+        run: node scripts/nuget-registry.mjs plan "$API_NUPKG" "$TESTING_NUPKG"
+
+      - name: Dry run note
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: echo "Dry run, so nothing is pushed. PUBLISH above is what a release from this tree would push, as the stable version on a stable tag." >> "$GITHUB_STEP_SUMMARY"
+
+      # Here rather than in publish-nuget, so a missing secret fails before npm
+      # or anything else ships. NuGet/login would otherwise surface it as a
+      # bare 401, after the Unity bundle.
+      - name: The nuget.org account is configured
+        if: steps.plan.outputs.publish != '' && github.ref_type == 'tag' && (github.event_name == 'push' || inputs.dry_run == false)
+        env:
+          NUGET_USER: ${{ secrets.NUGET_USER }}
+        run: |
+          if [ -z "$NUGET_USER" ]; then
+            echo "::error::secrets.NUGET_USER is unset. It is the nuget.org profile name (not an email) of the account that owns the ksp-gonogo trusted-publishing policy."
+            exit 1
+          fi
+
+      # Each .snupkg travels beside its .nupkg; publish-nuget pushes both.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kerbcast-nuget-packages
+          path: |
+            ${{ runner.temp }}/nuget/*.nupkg
+            ${{ runner.temp }}/nuget/*.snupkg
+          if-no-files-found: error
+
+  # nuget.org's trusted-publishing policy for the ksp-gonogo organisation names
+  # this repository, this file and the `nuget` environment, so this job is the
+  # only place that can push: publish-sdk also holds id-token: write, but runs
+  # outside the environment, so its token is refused. The job exchanges its
+  # OIDC token for a one-hour key; there is no stored API key. Only a tag
+  # publishes, and it publishes before npm, so a failed push ships nothing.
+  publish-nuget:
+    name: publish the Kerbcast.API packages to nuget.org
+    needs: [nuget-pack, bundle]
+    if: (github.event_name == 'push' || inputs.dry_run == false) && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PUBLISH: ${{ needs.nuget-pack.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # The same SDK nuget-pack packed with, pinned the same way.
+      - name: Pin the SDK
+        run: echo '{"sdk":{"version":"8.0.427","rollForward":"disable"}}' > global.json
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: The pinned SDK is the one in use
+        run: |
+          echo "dotnet --version: $(dotnet --version)"
+          test "$(dotnet --version)" = 8.0.427
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: kerbcast-nuget-packages
+          path: ${{ runner.temp }}/nuget
+
+      - name: Nothing new to publish
+        if: env.PUBLISH == ''
+        run: |
+          echo "SKIP: nuget.org already has the Kerbcast.API packages this release would publish, and nuget-pack found them unchanged"
+          echo "Kerbcast.API packages: nothing new to publish, see nuget-pack." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: NuGet login (OIDC to a one-hour key)
+        if: env.PUBLISH != ''
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      # The API before Testing, which depends on it. --skip-duplicate makes a
+      # re-run after a partial push go through: nuget.org answers 409 for a
+      # version it accepted but has not listed yet, which the flat-container
+      # index cannot see. The symbols go as their own push, also with
+      # --skip-duplicate, so a re-run retries them when an earlier attempt
+      # stopped after the package was accepted. nuget-listed then checks that
+      # what nuget.org serves is this artifact.
+      - name: Publish to nuget.org
+        if: env.PUBLISH != ''
+        env:
+          DOTNET_CLI_UI_LANGUAGE: en
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          push() {
+            dotnet nuget push "$1" --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json --skip-duplicate "${@:2}" 2>&1 | tee "$RUNNER_TEMP/push.log"
+          }
+          for file in $PUBLISH; do
+            name="${file%.nupkg}"
+            id="$(printf '%s' "$name" | sed -E 's/\.[0-9]+\.[0-9]+\.[0-9]+(-.*)?$//')"
+            version="${name#"$id".}"
+            push "$RUNNER_TEMP/nuget/$file" --no-symbols
+            if grep -qi "already exists" "$RUNNER_TEMP/push.log"; then
+              echo "SKIP $id $version: nuget.org already had it, from an earlier attempt of this run"
+              echo "$id $version: already on nuget.org from an earlier attempt." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "PUBLISHED $id $version"
+              echo "Published [$id $version](https://www.nuget.org/packages/$id/$version)." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            push "$RUNNER_TEMP/nuget/$name.snupkg"
+            if grep -qi "already exists" "$RUNNER_TEMP/push.log"; then
+              echo "SKIP $id $version symbols: nuget.org already had them"
+            else
+              echo "PUBLISHED $id $version symbols"
+            fi
+          done
+
+  # nuget.org accepts a push at once but lists it only after validating it, at
+  # times twenty minutes later, and a restore in between fails with NU1102. The
+  # GitHub Release and SpaceDock wait here so nobody reads about a version they
+  # cannot restore yet. Once listed, each version is downloaded and compared
+  # with this run's artifact: a push skipped as a duplicate, or a second run
+  # racing this one on the same version, must still have shipped these bytes.
+  nuget-listed:
+    name: nuget.org lists the Kerbcast.API packages
+    needs: [nuget-pack, publish-nuget]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PUBLISH: ${{ needs.nuget-pack.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: kerbcast-nuget-packages
+          path: ${{ runner.temp }}/nuget
+
+      - name: Wait until nuget.org lists what was pushed, then check it is this artifact
+        run: |
+          set -euo pipefail
+          if [ -z "$PUBLISH" ]; then
+            echo "Nothing was pushed, so there is nothing to wait for"
+            exit 0
+          fi
+          specs=()
+          for file in $PUBLISH; do
+            name="${file%.nupkg}"
+            id="$(printf '%s' "$name" | sed -E 's/\.[0-9]+\.[0-9]+\.[0-9]+(-.*)?$//')"
+            specs+=("$id@${name#"$id".}")
+          done
+          node scripts/nuget-registry.mjs listed "${specs[@]}" --wait-minutes 45
+          for file in $PUBLISH; do
+            node scripts/nuget-registry.mjs matches "$RUNNER_TEMP/nuget/$file"
+          done
+
   publish:
     name: GitHub Release + SpaceDock + .ckan pins
-    needs: [publish-sdk, bundle]
+    needs: [nuget-pack, publish-sdk, bundle, nuget-listed]
     if: github.event_name == 'push' || inputs.dry_run == false
     runs-on: ubuntu-22.04
     permissions:
@@ -826,8 +1122,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CLIFF_CHANGELOG: ${{ steps.git-cliff.outputs.content }}
+          NUGET_PUBLISHED: ${{ needs.nuget-pack.outputs.publish }}
+          NUGET_PACKED: ${{ needs.nuget-pack.outputs.version }}
         run: |
           TAG="${GITHUB_REF_NAME}"
+          # What nuget.org serves for this release: the version just pushed, or
+          # when nothing was, the stable API version already out and unchanged.
+          if [ -n "${NUGET_PUBLISHED}" ]; then
+            NUGET_VER="${NUGET_PACKED}"
+          else
+            NUGET_VER="$(sed -nE 's|.*<KerbcastApiVersion>([^<]*)</KerbcastApiVersion>.*|\1|p' Plugin/Versions.props)"
+          fi
           if [ -z "${CLIFF_CHANGELOG}" ]; then
             PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
             CLIFF_CHANGELOG="$(git log --oneline ${PREV_TAG:+${PREV_TAG}..}${TAG})"
@@ -846,6 +1151,8 @@ jobs:
             echo "- \`KerbcastKos-${TAG}.zip\`: optional kOS addon (requires kOS; GPL-3.0). Install alongside kerbcast for kerboscript camera control."
             echo ""
             echo "> TypeScript SDK \`@ksp-gonogo/kerbcast@${TAG#v}\` and \`@ksp-gonogo/kerbcast-react@${TAG#v}\` published to npm."
+            echo ""
+            echo "> Mods build against \`KspGonogo.Kerbcast.API\` ${NUGET_VER} from nuget.org; tests can use \`KspGonogo.Kerbcast.API.Testing\`."
             echo ""
             echo "<details>"
             echo "<summary>Changelog</summary>"
@@ -972,41 +1279,6 @@ jobs:
           fi
           rm -f ./sd-kos-cookies sd-kos-changelog.md
           echo "SpaceDock mod ${SPACEDOCK_KERBCAST_KOS_ADDON_ID} (KerbcastKos) updated to ${VERSION} (KSP ${GAME_VERSION})"
-
-      # Kerbcast.API and Kerbcast.API.Testing on nuget.org under the
-      # ksp-gonogo organisation. Their version is the API's own line
-      # (KerbcastApiVersion in Plugin/Versions.props), so most releases push
-      # nothing new and --skip-duplicate makes that a no-op. Skips cleanly
-      # until the NUGET_API_KEY secret exists. A pack or push failure warns
-      # rather than fails, so the .ckan re-pin after it still runs.
-      - name: Set up .NET for the Kerbcast.API packages
-        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: "8.x"
-
-      - name: Publish Kerbcast.API to nuget.org
-        # NOT for pre-releases: a package version can never be replaced.
-        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NUGET_API_KEY:-}" ]; then
-            echo "::notice::nuget.org not configured (need secret NUGET_API_KEY); skipping the Kerbcast.API packages"
-            exit 0
-          fi
-          publish() {
-            dotnet pack Plugin/Kerbcast.API/Kerbcast.API.csproj -c Release -o nupkg &&
-            dotnet pack Plugin/Kerbcast.API.Testing/Kerbcast.API.Testing.csproj -c Release -o nupkg || return 1
-            for pkg in nupkg/*.nupkg; do
-              dotnet nuget push "$pkg" --api-key "$NUGET_API_KEY" \
-                --source https://api.nuget.org/v3/index.json --skip-duplicate || return 1
-            done
-          }
-          if ! publish; then
-            echo "::warning::Kerbcast.API packages were not published to nuget.org; see this step's log, then push them by hand"
-          fi
 
       # Kerbcast.ckan pins an exact version + download URL + hashes for manual
       # .ckan-file installs. The public NetKAN index resolves independently

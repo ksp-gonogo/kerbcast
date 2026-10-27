@@ -28,7 +28,7 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <PackageId>Kerbcast.API.Testing</PackageId>
+    <PackageId>KspGonogo.Kerbcast.API.Testing</PackageId>
     <Version>$(KerbcastApiVersion)</Version>
     <Authors>Jon Pepler</Authors>
     <Company>ksp-gonogo</Company>
@@ -40,6 +40,8 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>ksp;kerbal;kerbcast;testing</PackageTags>
     <IsPackable>true</IsPackable>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
   <!-- The net48 build is the one GameData ships, so it keeps bin/Release/

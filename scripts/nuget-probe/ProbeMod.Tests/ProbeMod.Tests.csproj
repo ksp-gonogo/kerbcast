@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ProbeMod's tests, reaching Kerbcast only through KspGonogo.Kerbcast.API.Testing:
+    the API itself must arrive as that package's dependency.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>Major</RollForward>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="KspGonogo.Kerbcast.API.Testing" Version="$(KerbcastApiPackageVersion)" />
+    <ProjectReference Include="../ProbeMod/ProbeMod.csproj" />
+  </ItemGroup>
+
+</Project>
