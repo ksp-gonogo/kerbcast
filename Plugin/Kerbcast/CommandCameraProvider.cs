@@ -380,6 +380,14 @@ namespace Kerbcast
                 }
             }
 
+            /* Stock fills a spawn point in only once it builds the site's surroundings, which it never
+               does while the scene is far from them. */
+            private static bool HomeSurroundingsUnbuilt()
+            {
+                var home = FlightGlobals.GetHomeBody();
+                return home != null && home.pqsController != null && !home.pqsController.isActive;
+            }
+
             /* The settings-driven site, falling back to the home station. */
             private bool ResolveDefault(Vessel vessel)
             {
@@ -434,17 +442,19 @@ namespace Kerbcast
                             /* Never build on a (0,0) anchor: come back on the retry
                                cadence until stock fills the spawn point in. */
                             if (_siteAttempts == 1)
-                                Debug.LogWarning($"[Kerbcast][CMDCAM] launch site unresolved: {pending}; retrying every {SiteRetryInterval:F0}s for up to {SiteRetrySeconds:F0}s");
+                            {
+                                string retryText = $"[Kerbcast][CMDCAM] launch site unresolved: {pending}; retrying every {SiteRetryInterval:F0}s for up to {SiteRetrySeconds:F0}s";
+                                if (HomeSurroundingsUnbuilt()) Debug.Log(retryText);
+                                else Debug.LogWarning(retryText);
+                            }
                             Retry(now);
                             return false;
                         }
                         else
                         {
                             RetryPending = false;
-                            /* Stock fills a spawn point in only once it builds the site's surroundings, which it never
-                               does while the scene is far from them: expected then, not a fault. */
-                            var home = FlightGlobals.GetHomeBody();
-                            bool unbuilt = pending != null && home != null && home.pqsController != null && !home.pqsController.isActive;
+                            /* Expected when the scene is far from the site, not a fault. */
+                            bool unbuilt = pending != null && HomeSurroundingsUnbuilt();
                             string text = pending != null
                                 ? $"[Kerbcast][CMDCAM] launch site still unresolved after {_siteAttempts} attempts ({now - _siteFirstAttemptAt:F1}s): {pending}; using the home station"
                                 : "[Kerbcast][CMDCAM] no launch site found; using the home station";
