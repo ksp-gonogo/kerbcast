@@ -1,0 +1,87 @@
+name: Install apt packages with a .deb cache
+description: >
+  Installs apt packages without --install-recommends, reusing the .deb files a
+  previous run on the same runner image downloaded. A cold run retries a stalled
+  or slow mirror and falls back from the Azure mirror to archive.ubuntu.com.
+
+# The Azure Ubuntu mirror has been slow enough to push a plain apt-get install
+# of the ffmpeg dev packages past a 10 minute step timeout. The cache key holds
+# the runner image version, so a warm run installs the exact .deb set the cold
+# run resolved against the same base system and needs no mirror at all. Callers
+# set the step timeout: allow for the cold path's three attempts.
+
+inputs:
+  packages:
+    description: Whitespace-separated package names
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compute apt cache key
+      id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -eu
+        read -r -d '' -a pkgs <<< "$PACKAGES" || true
+        sum="$(printf '%s\n' "${pkgs[@]}" | sort -u | sha256sum | cut -c1-16)"
+        echo "key=apt-debs-${ImageOS:-unknown}-${ImageVersion:-unknown}-$sum" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached .deb files
+      id: restore
+      uses: actions/cache/restore@v5
+      with:
+        path: ~/.cache/apt-debs
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Install packages
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        read -r -d '' -a pkgs <<< "$PACKAGES" || true
+        debs="$HOME/.cache/apt-debs"
+        apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+
+        if [ "$CACHE_HIT" = true ] && compgen -G "$debs/*.deb" >/dev/null; then
+          if sudo apt-get install -y --no-install-recommends "$debs"/*.deb \
+            && dpkg -s "${pkgs[@]}" >/dev/null; then
+            echo "Installed from cached .deb files"
+            exit 0
+          fi
+          echo "::warning::Cached .deb install failed, falling back to the mirror"
+        fi
+
+        mkdir -p "$debs/partial"
+        # Partial and finished downloads stay in $debs, so a retry resumes rather than restarts.
+        for attempt in 1 2 3; do
+          if sudo timeout 240 apt-get "${apt_opts[@]}" update \
+            && sudo timeout 480 apt-get "${apt_opts[@]}" -o Dir::Cache::Archives="$debs" \
+              install -y --no-install-recommends --download-only "${pkgs[@]}"; then
+            break
+          fi
+          [ "$attempt" -lt 3 ] || exit 1
+          if [ "$attempt" = 1 ]; then
+            echo "::warning::apt download failed or stalled, switching to archive.ubuntu.com"
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [ -f "$f" ]; then sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' "$f"; fi
+            done
+          fi
+          echo "apt attempt $attempt/3 failed, retrying in 15s..."
+          sleep 15
+        done
+
+        sudo apt-get -o Dir::Cache::Archives="$debs" install -y --no-install-recommends "${pkgs[@]}"
+        sudo rm -rf "$debs/partial" "$debs/lock"
+        sudo chown -R "$(id -u):$(id -g)" "$debs"
+
+    - name: Save .deb files for the next run
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ~/.cache/apt-debs
+        key: ${{ steps.key.outputs.key }}

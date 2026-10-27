@@ -264,11 +264,12 @@ jobs:
       # only on Linux (the ffmpeg-next dep is cfg(target_os="linux")-gated).
       - name: Install ffmpeg + VA-API system libs (Linux)
         if: matrix.rid == 'linux-x64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libclang-dev \
-            libavcodec-dev libavutil-dev libavformat-dev \
+        timeout-minutes: 35
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            pkg-config clang libclang-dev
+            libavcodec-dev libavutil-dev libavformat-dev
             libavfilter-dev libswscale-dev libva-dev
 
       # OpenH264's "source" feature compiles the codec's asm — provide an
@@ -514,10 +515,11 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake g++ make libgl1-mesa-dev libglu1-mesa-dev binutils \
+        timeout-minutes: 35
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            cmake g++ make libgl1-mesa-dev libglu1-mesa-dev binutils
             xvfb xauth libgl1-mesa-dri libx11-dev
 
       - name: Build and check libAsyncGPUReadbackPlugin.so
