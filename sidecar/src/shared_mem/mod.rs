@@ -14,8 +14,10 @@
 
 pub mod control;
 pub mod mmap;
+pub mod signal;
 pub use control::ControlBlock;
 pub use mmap::{CaptureStamp, FrameView, MmapFrameRing, MmapRingConfig, MmapRingError};
+pub use signal::ChangeSignal;
 
 use std::sync::Mutex;
 

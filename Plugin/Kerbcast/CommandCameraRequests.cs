@@ -259,6 +259,53 @@ namespace Kerbcast
         }
     }
 
+    /* When to re-read the request file. Every frame the sidecar's change
+       count (see ChangeSignal) is compared with the last one seen, and a move
+       is read on that frame, so an aim a client streams at 10 a second lands
+       the frame after it arrives. The file is also read every SafetySeconds
+       whatever the count says, which covers a sidecar too old to keep the
+       count, a signal not yet opened, and a signal file replaced under its
+       mapping. The file's write time cannot stand in for the count: Mono on
+       Linux reports it to the whole second. */
+    internal sealed class CommandFilePoll
+    {
+        public const float SafetySeconds = 0.25f;
+
+        private long _lastCount = long.MinValue;
+        private float _sinceRead = float.PositiveInfinity;
+        private bool _lastBySignal;
+        private bool _retryPending, _lastWasRetry;
+
+        /* `count` is the signal's value, or any fixed number while there is no signal. */
+        public bool Due(float deltaSeconds, long count)
+        {
+            _sinceRead += deltaSeconds;
+            bool moved = count != _lastCount;
+            if (!moved && !_retryPending && _sinceRead < SafetySeconds) return false;
+            _lastCount = count;
+            _sinceRead = 0f;
+            _lastBySignal = moved || _retryPending;
+            _lastWasRetry = _retryPending;
+            _retryPending = false;
+            return true;
+        }
+
+        /* The read threw, as a read racing the sidecar's rename can on
+           Windows: try again next frame. A retry that fails too waits for the
+           safety read, so a file that stays unreadable is not hit every frame. */
+        public void ReadFailed()
+        {
+            if (!_lastWasRetry) _retryPending = true;
+        }
+
+        /* After a read: true when the file had changed but only the safety
+           read noticed, so the signal is missing or stale and the caller
+           should open it afresh. A write that lands between the count and the
+           read can trip this too; reopening then costs one open and nothing
+           else. */
+        public bool SignalMissed(bool fileChanged) => fileChanged && !_lastBySignal;
+    }
+
     /* Just enough JSON for the sidecar's request file: objects, arrays,
        strings, numbers, true, false and null. Numbers come back as double. */
     internal static class MiniJson

@@ -334,6 +334,8 @@ namespace Kerbcast
                 _statusPath = Path.Combine(RingDir, "global.status.json");
                 _controlPath = Path.Combine(RingDir, "global.control.json");
                 _commandsPath = Path.Combine(RingDir, CommandsFileName);
+                _commandsSignalPath = Path.Combine(RingDir, CommandsSignalFileName);
+                ReopenCommandsSignal();
                 SeedCommandRequests();
                 Debug.Log($"[Kerbcast] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
             }
@@ -644,13 +646,15 @@ namespace Kerbcast
         }
 
         /* Requests from clients, which the sidecar appends to
-           global.commands.json. Read whole every CommandsPollSeconds; the
-           ledger applies each request once, in id order. */
+           global.commands.json. Read whole when it changes (see
+           CommandFilePoll); the ledger applies each request once, in id order. */
         private const string CommandsFileName = "global.commands.json";
-        private const float CommandsPollSeconds = 0.25f;
+        private const string CommandsSignalFileName = "global.commands.signal";
         private string _commandsPath;
+        private string _commandsSignalPath;
+        private ChangeSignal _commandsSignal;
         private string _commandsLastJson;
-        private float _commandsCooldown;
+        private readonly CommandFilePoll _commandsPoll = new CommandFilePoll();
         private readonly CommandRequestLedger _commandLedger = new CommandRequestLedger();
 
         private void SeedCommandRequests()
@@ -658,7 +662,7 @@ namespace Kerbcast
             try
             {
                 if (!File.Exists(_commandsPath)) return;
-                _commandsLastJson = File.ReadAllText(_commandsPath);
+                _commandsLastJson = ReadCommandsFile();
                 _commandLedger.SeedFrom(CommandCameraRequest.ParseFile(_commandsLastJson, null));
                 /* Anchors are state, not requests: the table on disk applies to this scene too. */
                 ApplyRemoteAnchors(_commandsLastJson);
@@ -674,14 +678,20 @@ namespace Kerbcast
         private void MaybeApplyCommandRequests()
         {
             if (_commandsPath == null) return;
-            _commandsCooldown -= Time.unscaledDeltaTime;
-            if (_commandsCooldown > 0f) return;
-            _commandsCooldown = CommandsPollSeconds;
+            if (!_commandsPoll.Due(Time.unscaledDeltaTime, _commandsSignal?.Count ?? 0)) return;
             try
             {
                 if (!File.Exists(_commandsPath)) return;
-                var json = File.ReadAllText(_commandsPath);
-                if (json == _commandsLastJson) return;
+                string json;
+                try { json = ReadCommandsFile(); }
+                catch (Exception)
+                {
+                    _commandsPoll.ReadFailed();
+                    throw;
+                }
+                bool changed = json != _commandsLastJson;
+                if (_commandsPoll.SignalMissed(changed)) ReopenCommandsSignal();
+                if (!changed) return;
                 _commandsLastJson = json;
                 ApplyRemoteAnchors(json);
                 if (_commandProvider == null) return;
@@ -696,6 +706,27 @@ namespace Kerbcast
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] client request read failed: {ex.Message}");
             }
+        }
+
+        /* Shared for writing and deleting, so the sidecar's rename over the
+           file never meets a sharing violation on Windows mid-read. */
+        private string ReadCommandsFile()
+        {
+            using (var fs = new FileStream(_commandsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(fs))
+                return reader.ReadToEnd();
+        }
+
+        /* A signal that will not open leaves the safety read, quietly: an
+           older sidecar never makes one. */
+        private void ReopenCommandsSignal()
+        {
+            _commandsSignal?.Dispose();
+            _commandsSignal = null;
+            try { _commandsSignal = ChangeSignal.Open(_commandsSignalPath); }
+            catch (Exception) { }
+            if (_commandsSignal != null)
+                Debug.Log($"[Kerbcast][CMDCAM] client requests signalled through {CommandsSignalFileName} (count {_commandsSignal.Count})");
         }
 
         /* Every browser client's anchors, from the sidecar. */
@@ -2004,6 +2035,8 @@ namespace Kerbcast
 
         private void OnDestroy()
         {
+            _commandsSignal?.Dispose();
+            _commandsSignal = null;
             if (_disabled) return;
             if (Instance == this)
             {

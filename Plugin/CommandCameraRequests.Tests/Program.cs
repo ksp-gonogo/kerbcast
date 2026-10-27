@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Kerbcast;
 
 int failures = 0;
@@ -144,6 +145,87 @@ Check((double)MiniJson.Parse(" -1.5e2 ") == -150.0, "number with exponent");
 bool threw = false;
 try { MiniJson.Parse(@"{""a"":1,}"); } catch (FormatException) { threw = true; }
 Check(threw, "trailing comma rejected");
+
+// The request file is read the frame it changes, and otherwise only every
+// SafetySeconds.
+var poll = new CommandFilePoll();
+Check(poll.Due(0.016f, 0), "the first frame reads the file");
+Check(!poll.Due(0.016f, 0), "an unchanged count is not read again");
+Check(poll.Due(0.016f, 1), "a new count is read on that frame");
+Check(!poll.SignalMissed(true), "a change the count announced is no miss");
+Check(poll.Due(0.016f, 2) && poll.Due(0.016f, 3), "counts on consecutive frames read on each frame");
+Check(!poll.Due(0.1f, 3) && !poll.Due(0.1f, 3), "still unchanged inside the safety interval");
+Check(poll.Due(0.1f, 3), "the safety read comes once the interval has passed");
+Check(!poll.SignalMissed(false), "a safety read that finds nothing new is no miss");
+Check(poll.SignalMissed(true), "a safety read that finds a change means the signal missed it");
+Check(!poll.Due(0.016f, 3), "and restarts the interval");
+
+/* Ten aims a second for five seconds at 60 fps, each write bumping the
+   count: every one is read on the frame it lands, none waits for the
+   safety read. */
+var stream = new CommandFilePoll();
+long count = 0;
+int reads = 0, readOnArrival = 0;
+for (int frame = 0; frame < 300; frame++)
+{
+    bool arrives = frame % 6 == 0;
+    if (arrives) count++;
+    if (!stream.Due(1f / 60f, count)) continue;
+    reads++;
+    if (arrives) readOnArrival++;
+}
+Check(readOnArrival == 50, $"every streamed write is read on its frame ({readOnArrival} of 50)");
+Check(reads == 50, $"and the stream causes no extra reads ({reads})");
+
+/* A read that throws is retried on the next frame, once; a second failure
+   waits for the safety read. */
+var flaky = new CommandFilePoll();
+Check(flaky.Due(0.016f, 0), "the first frame reads");
+Check(flaky.Due(0.016f, 1), "a new count is read");
+flaky.ReadFailed();
+Check(flaky.Due(0.016f, 1), "a failed read is retried on the next frame though the count has not moved");
+Check(!flaky.SignalMissed(true), "a retry finding the change is no miss");
+flaky.ReadFailed();
+Check(!flaky.Due(0.016f, 1), "a failed retry is not retried every frame");
+Check(!flaky.Due(0.1f, 1) && flaky.Due(0.2f, 1), "it waits for the safety read");
+flaky.ReadFailed();
+Check(flaky.Due(0.016f, 1), "which, failing, gets its own retry");
+Check(!flaky.Due(0.016f, 1), "and a good read leaves no retry behind");
+
+/* No signal at all (an older sidecar): the safety read alone, four a second. */
+var none = new CommandFilePoll();
+int noneReads = 0;
+for (int frame = 0; frame < 60; frame++)
+    if (none.Due(1f / 60f, 0)) noneReads++;
+Check(noneReads == 4, $"without a signal the file is read every safety interval ({noneReads} in 1 s)");
+
+/* The signal file as the sidecar lays it out: magic, then the count. */
+string signalDir = Path.Combine(Path.GetTempPath(), "kc-signal-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(signalDir);
+try
+{
+    string signalPath = Path.Combine(signalDir, "global.commands.signal");
+    Check(ChangeSignal.Open(signalPath) == null, "a missing signal file does not open");
+    File.WriteAllBytes(signalPath, new byte[16]);
+    Check(ChangeSignal.Open(signalPath) == null, "a file without the magic does not open");
+    File.WriteAllBytes(signalPath, new byte[8]);
+    Check(ChangeSignal.Open(signalPath) == null, "a short file does not open");
+    var bytes = new byte[16];
+    BitConverter.GetBytes(ChangeSignal.Magic).CopyTo(bytes, 0);
+    BitConverter.GetBytes(41L).CopyTo(bytes, 8);
+    File.WriteAllBytes(signalPath, bytes);
+    using (var signal = ChangeSignal.Open(signalPath))
+    {
+        Check(signal != null && signal.Count == 41, "the count reads through the mapping");
+        using (var fs = new FileStream(signalPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+        {
+            fs.Seek(8, SeekOrigin.Begin);
+            fs.Write(BitConverter.GetBytes(42L), 0, 8);
+        }
+        Check(signal.Count == 42, "a bump by the writer shows in the next read");
+    }
+}
+finally { Directory.Delete(signalDir, true); }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

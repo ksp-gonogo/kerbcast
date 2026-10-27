@@ -1,8 +1,9 @@
 //! Global requests a client makes of the plugin that are not about one
 //! existing camera's control block: creating, destroying and aiming command
 //! cameras. The sidecar validates each, then
-//! appends it to `global.commands.json`, which the plugin re-reads a few
-//! times a second.
+//! appends it to `global.commands.json`, which the plugin re-reads on the
+//! game frame after it changes. Each write bumps the counter in
+//! `COMMANDS_SIGNAL_FILE`, which is how the plugin knows.
 //!
 //! Every request gets an id one above the last, seeded from the file on the
 //! first write so a restarted sidecar never reuses one. The plugin applies a
@@ -28,9 +29,11 @@ use crate::protocol::{
 };
 
 pub const COMMANDS_FILE: &str = "global.commands.json";
+pub const COMMANDS_SIGNAL_FILE: &str = "global.commands.signal";
 
-/// Requests kept in the file. The plugin reads it every 0.25 s, so this only
-/// runs out if a client sends more than this many in that window.
+/// Requests kept in the file. The plugin reads it the frame after it changes,
+/// and at least every 0.25 s, so this only runs out if a client sends more
+/// than this many in that window.
 pub const MAX_KEPT: usize = 32;
 
 const MAX_TOKEN_LEN: usize = 128;

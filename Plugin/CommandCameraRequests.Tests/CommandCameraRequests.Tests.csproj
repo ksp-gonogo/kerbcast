@@ -8,10 +8,12 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../Kerbcast/CameraId.cs" />
     <Compile Include="../Kerbcast/CommandVantage.cs" />
     <Compile Include="../Kerbcast/CommandCameraRequests.cs" />
+    <Compile Include="../Kerbcast/ChangeSignal.cs" />
   </ItemGroup>
 </Project>

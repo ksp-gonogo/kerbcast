@@ -24,7 +24,9 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
-use crate::commands::{validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE};
+use crate::commands::{
+    validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
+};
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
@@ -34,7 +36,7 @@ use crate::protocol::{
     TrackMode,
 };
 use crate::rate::RateWindow;
-use crate::shared_mem::{ControlBlock, MmapFrameRing};
+use crate::shared_mem::{ChangeSignal, ControlBlock, MmapFrameRing};
 
 /// Filesystem identity for a `.ring` file: distinguishes "same path, same
 /// underlying file" from "same path, file was unlinked and a new one
@@ -1225,6 +1227,12 @@ pub struct CameraRegistry {
     /// The sidecar's copy of `global.commands.json`. Held across the whole
     /// append and file write, so two requests can never land out of order.
     command_queue: Mutex<CommandQueue>,
+    /// Bumped after every write of `global.commands.json`; the plugin
+    /// watches it to read the file on the next frame. Opened on first write.
+    command_signal: std::sync::Mutex<Option<ChangeSignal>>,
+    /// Set once an open failure has been logged, so a rings dir that stays
+    /// unwritable warns once rather than on every request.
+    command_signal_warned: AtomicBool,
     /// Every browser client's anchors, written into `global.commands.json`
     /// whole on each change. Peer-scoped like the display sizes: cleared on
     /// graceful disconnect and in the dead-peer reaper.
@@ -1364,6 +1372,8 @@ impl CameraRegistry {
             force_render: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
             command_queue: Mutex::new(CommandQueue::default()),
+            command_signal: std::sync::Mutex::new(None),
+            command_signal_warned: AtomicBool::new(false),
             anchors: Mutex::new(AnchorTable::default()),
             anchor_boot: boot_nonce(),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
@@ -2163,10 +2173,43 @@ impl CameraRegistry {
         let json = queue
             .to_json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        /* Opened before the file is first written, so the plugin, which
+         * looks for the signal when it sees the file change, finds it
+         * complete. */
+        self.open_command_signal();
         let tmp = path.with_extension("json.tmp");
         tokio::fs::write(&tmp, json.as_bytes()).await?;
         tokio::fs::rename(&tmp, &path).await?;
+        if let Some(s) = self
+            .command_signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            s.bump();
+        }
         Ok(())
+    }
+
+    fn open_command_signal(&self) {
+        let mut signal = self
+            .command_signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if signal.is_some() {
+            return;
+        }
+        match ChangeSignal::open(&self.shm_dir.join(COMMANDS_SIGNAL_FILE)) {
+            Ok(s) => {
+                *signal = Some(s);
+                self.command_signal_warned.store(false, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if !self.command_signal_warned.swap(true, Ordering::Relaxed) {
+                    warn!(error = %e, "command signal open failed; the plugin falls back to its timed read");
+                }
+            }
+        }
     }
 
     /*
@@ -4184,6 +4227,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, look + 1);
+
+        /* Every write bumped the signal, across the restart too. */
+        let signal = ChangeSignal::open(&shm.join(COMMANDS_SIGNAL_FILE)).unwrap();
+        assert_eq!(signal.count(), 3);
     }
 
     /// While the plugin reports a command authority, browser aims are refused
