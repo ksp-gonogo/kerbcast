@@ -138,10 +138,17 @@ jobs:
                   f.write("\n")
           EOF
 
+          # Plugin/Versions.props: KerbcastVersion is Kerbcast.dll's KSPAssembly
+          # version, and release.yml refuses a tag it disagrees with.
+          # KerbcastApiVersion is the public API's own line and moves by hand.
+          sed -i -E "s|<KerbcastVersion>[^<]*</KerbcastVersion>|<KerbcastVersion>${NEW}</KerbcastVersion>|" Plugin/Versions.props
+          grep -q "<KerbcastVersion>${NEW}</KerbcastVersion>" Plugin/Versions.props
+
           echo "Cargo.toml: $(grep -m1 '^version' sidecar/Cargo.toml)"
           echo "typescript: $(node -p "require('./client-sdk/typescript/package.json').version")"
           echo "react: $(node -p "require('./client-sdk/react/package.json').version")"
           echo "Kerbcast.version: $(python3 -c "import json; v=json.load(open('GameData/Kerbcast/Kerbcast.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
+          echo "Versions.props: $(grep -m1 '<KerbcastVersion>' Plugin/Versions.props)"
           echo "KerbcastKos.version: $(python3 -c "import json; v=json.load(open('GameData/KerbcastKos/KerbcastKos.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
 
       - name: Commit, tag, push
@@ -155,7 +162,8 @@ jobs:
                   client-sdk/typescript/package.json \
                   client-sdk/react/package.json \
                   GameData/Kerbcast/Kerbcast.version \
-                  GameData/KerbcastKos/KerbcastKos.version
+                  GameData/KerbcastKos/KerbcastKos.version \
+                  Plugin/Versions.props
           git commit -m "release: v${NEW}"
           git tag "${TAG}"
           git push origin HEAD:main "${TAG}"
