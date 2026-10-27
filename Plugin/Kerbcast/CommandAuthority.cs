@@ -50,8 +50,10 @@ namespace Kerbcast
         public double Altitude { get; }
 
         /* PositionAt: UT of the sample and the body-relative position and
-           velocity at it, in the body's non-rotating frame (the frame of
-           Orbit.getRelativePositionAtUT, z up). */
+           velocity at it, z up, in KSP's fixed frame, the one Orbit.OrbitFrame
+           and Orbit.UpdateFromFixedVectors work in. From an Orbit that is
+           always Planetarium.Zup.LocalToWorld(orbit.getRelativePositionAtUT(ut)),
+           and likewise for getOrbitalVelocityAtUT, orbit.pos and orbit.vel. */
         public double Ut { get; }
         public Vector3d BodyRelativePosition { get; }
         public Vector3d BodyRelativeVelocity { get; }
@@ -66,6 +68,10 @@ namespace Kerbcast
 
         public double FramingMarginM { get; }
 
+        /* Vessel: accept a craft whose world-model uncertainty is wider than
+           the view could frame, a deliberate search of a region. */
+        public bool AllowUncertain { get; }
+
         /* The craft this aim makes the subject, or 0 to keep the default. */
         public uint SubjectPersistentId => Kind == CommandAimKind.Vessel ? PersistentId : Subject;
 
@@ -73,7 +79,7 @@ namespace Kerbcast
             double inc = 0, double e = 0, double sma = 0, double lan = 0, double argPe = 0, double mEp = 0, double epoch = 0,
             double lat = 0, double lon = 0, double alt = 0,
             double ut = 0, Vector3d pos = default, Vector3d vel = default,
-            double az = 0, double el = 0, uint subject = 0)
+            double az = 0, double el = 0, uint subject = 0, bool allowUncertain = false)
         {
             Kind = kind;
             FramingMarginM = margin;
@@ -85,11 +91,16 @@ namespace Kerbcast
             Ut = ut; BodyRelativePosition = pos; BodyRelativeVelocity = vel;
             Azimuth = az; Elevation = el;
             Subject = subject;
+            AllowUncertain = allowUncertain;
         }
 
         /* Follows a craft wherever it truly is. */
         public static CommandAim Vessel(uint persistentId, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.Vessel, framingMarginM, pid: persistentId);
+
+        /* The same, accepting a craft too uncertain to frame when `allowUncertain`. */
+        public static CommandAim Vessel(uint persistentId, double framingMarginM, bool allowUncertain) =>
+            new CommandAim(CommandAimKind.Vessel, framingMarginM, pid: persistentId, allowUncertain: allowUncertain);
 
         /* Follows a conic Kerbcast propagates itself, on the same physics tick as the frame. */
         public static CommandAim Orbit(string body, double inc, double e, double sma, double lan, double argPe,
@@ -101,8 +112,9 @@ namespace Kerbcast
         public static CommandAim Surface(string body, double lat, double lon, double alt, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.Surface, framingMarginM, body: body, lat: lat, lon: lon, alt: alt);
 
-        /* Follows a position the caller propagated itself (Principia-safe),
-           extrapolated linearly from `ut` by the velocity. */
+        /* Follows a ballistic state the caller sampled at `ut`, propagated
+           under the body's gravity with no thrust. A caller that propagates
+           itself (Principia) re-aims as often as it likes. */
         public static CommandAim PositionAt(string body, double ut, Vector3d bodyRelativePos, Vector3d bodyRelativeVel,
             uint subject = 0, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.PositionAt, framingMarginM, body: body, ut: ut, pos: bodyRelativePos,
@@ -117,7 +129,8 @@ namespace Kerbcast
 
         public override string ToString()
         {
-            string tail = (Subject != 0 ? $" subject={Subject}" : "") + (FramingMarginM != 0 ? $" margin={FramingMarginM:F0}m" : "");
+            string tail = (Subject != 0 ? $" subject={Subject}" : "") + (FramingMarginM != 0 ? $" margin={FramingMarginM:F0}m" : "")
+                + (AllowUncertain ? " allowUncertain" : "");
             switch (Kind)
             {
                 case CommandAimKind.Vessel: return $"Vessel({PersistentId}{tail})";
@@ -133,10 +146,16 @@ namespace Kerbcast
     public sealed class CommandFeedView
     {
         public uint FlightId;
-        /* The CommNet home node the station stands at (or beside). */
+        /* The CommNet home node the station stands at (or beside); the same as SiteKey. */
         public string StationNodeName;
-        /* gonogo's command-centre id, "ground:<node>". */
+        [System.Obsolete("Use SiteKey and SiteKind")]
         public string StationId;
+        /* Stable key of the place the lens stands, unchanged when the craft a
+           vessel site rides docks. */
+        public string SiteKey;
+        public Api.SiteKind SiteKind;
+        /* For a vessel site, the craft the lens rides now; 0 otherwise. */
+        public uint VantagePersistentId;
         /* The station's in-game name, or StationNodeName when it has none. */
         public string DisplayName;
         /* The aim SetCommandAim last applied; null for the default. */
@@ -160,45 +179,49 @@ namespace Kerbcast
         public string Blank;
     }
 
-    /* The in-game authority (gonogo) over command feeds, for one scene: a lock
+    /* The in-game authority over command feeds, for one scene: a lock
        on every command feed's aim, held by one owner. Only the owner's
        SetCommandAim calls are accepted while it is held. The lock also fails
        closed: a holder that stops calling blanks every feed, and it can blank
        one itself. Each owner call is a heartbeat. Main thread only. */
     internal sealed class CommandAuthority
     {
-        public const float TimeoutSeconds = 5f;
+        public const float TimeoutSeconds = CommandLock.TimeoutSeconds;
 
         private readonly Dictionary<uint, CommandFeedOrders> _feeds = new Dictionary<uint, CommandFeedOrders>();
-        private float _lastCall;
 
-        public string Owner { get; private set; }
-        public bool Registered => Owner != null;
+        /* The scene's one lock, whichever API takes it. */
+        public CommandLock Lock { get; }
+
+        public string Owner => Lock.Owner;
+        public bool Registered => Lock.Held;
+
+        /* What the holder's feeds show once it falls silent; null for
+           CommandCameraMath.DefaultSilentText. Goes with the lock. */
+        public string SilentText => Lock.SilentText;
+
+        /* The scope each command site reads under the holder's world model. */
+        public SiteBindings Sites { get; } = new SiteBindings();
+
+        /* The holder's world model; its publishes are heartbeats too. Goes with the lock. */
+        public WorldModelStore WorldModel { get; }
+
+        public CommandAuthority()
+        {
+            WorldModel = new WorldModelStore(UnityEngine.Debug.Log, Sites.Replace) { Running = () => Api.KerbcastApi.Instance != null };
+            if (KerbcastSettings.EnableTelemetry) WorldModel.FillMeter = Telemetry.WorldModelFill;
+            Lock = new CommandLock(WorldModel, UnityEngine.Debug.Log);
+        }
 
         /* Real time, so it keeps counting while the game is paused or warping. */
-        public bool TimedOut(float realNow) => Registered && realNow - _lastCall > TimeoutSeconds;
+        public bool TimedOut(float realNow) => Lock.TimedOut(realNow);
 
-        /* Idempotent for the same owner; a second owner is refused. */
-        public bool Register(string owner, float realNow)
-        {
-            if (string.IsNullOrEmpty(owner)) return false;
-            if (Owner != null && !string.Equals(Owner, owner, StringComparison.Ordinal)) return false;
-            if (Owner == null) UnityEngine.Debug.Log($"[Kerbcast][CMDCAM] command authority registered: {owner}");
-            Owner = owner;
-            _lastCall = realNow;
-            return true;
-        }
-
-        public void Clear(string owner)
-        {
-            if (Owner == null || !string.Equals(Owner, owner, StringComparison.Ordinal)) return;
-            UnityEngine.Debug.Log($"[Kerbcast][CMDCAM] command authority cleared: {owner}");
-            Reset();
-        }
-
+        /* Ends the tenure and everything that goes with the lock. */
         public void Reset()
         {
-            Owner = null;
+            if (Lock.SignalSpeed.HasValue) LightHistoryHost.History.SetSignalSpeed(null);
+            Lock.Clear();
+            Sites.Clear();
             _feeds.Clear();
             SubjectAnchorVisible = true;
             _defaultAnchorPolicy = AnchorPolicy.ObservedOnly;
@@ -229,7 +252,7 @@ namespace Kerbcast
 
         public void SetAnchorPolicy(uint flightId, AnchorPolicy policy) => _anchorPolicies[flightId] = policy;
 
-        public void Heartbeat(float realNow) => _lastCall = realNow;
+        public void Heartbeat(float realNow) => Lock.Heartbeat(realNow);
 
         public CommandFeedOrders Orders(uint flightId) =>
             _feeds.TryGetValue(flightId, out var o) ? o : null;

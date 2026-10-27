@@ -18,6 +18,7 @@ import {
   CommandTargetEligibility,
   CrewLocation,
   KerbcastClient,
+  SiteKind,
 } from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
@@ -128,6 +129,8 @@ const MOCK_CAMERAS: MockCameraInit[] = [
     commandCentre: {
       stationId: "ground:KSC",
       nodeName: "KSC",
+      siteKey: "KSC",
+      siteKind: SiteKind.Station,
       displayName: "Kerbal Space Center",
       body: "Kerbin",
       latitude: -0.13,

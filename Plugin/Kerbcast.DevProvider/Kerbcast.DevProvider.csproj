@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The development world-model provider: KSP's truth, delayed, published
+    through Kerbcast.API as another mod would publish its own. A separate
+    assembly so the compiler holds it to the public API (Kerbcast.API grants
+    it no internals). It ships in no release; copy the built
+    Kerbcast.DevProvider.dll into GameData/Kerbcast/Plugins/ to use it, and
+    turn it on with the dev switch (see DevProviderAddon).
+
+    Build:
+      dotnet build Plugin/Kerbcast.DevProvider/Kerbcast.DevProvider.csproj \
+        /p:KspManaged=/path/to/KSP_Data/Managed
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <RootNamespace>Kerbcast.DevProvider</RootNamespace>
+    <AssemblyName>Kerbcast.DevProvider</AssemblyName>
+    <OutputType>Library</OutputType>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <PropertyGroup>
+    <KspManaged Condition=" '$(KspManaged)' == '' ">__pass_KspManaged__</KspManaged>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="UnityEngine" Private="false">
+      <HintPath>$(KspManaged)/UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule" Private="false">
+      <HintPath>$(KspManaged)/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="Assembly-CSharp" Private="false">
+      <HintPath>$(KspManaged)/Assembly-CSharp.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Kerbcast's public interface only, compile-time; KSP loads the copy Kerbcast ships. -->
+  <ItemGroup>
+    <ProjectReference Include="../Kerbcast.API/Kerbcast.API.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

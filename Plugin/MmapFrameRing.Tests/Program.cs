@@ -45,17 +45,35 @@ static void WriteFixture(string path)
     ring.Dispose();
 }
 
-/* Two frames, the second with fov 42.5 and one anchor result; the Rust test
+/* Two frames, the second with fov 42.5, a live bound of 2.5 s, a boundary
+   distance, a command camera's state and one anchor result; the Rust test
    reads the second back field by field. */
 static void WriteMetaFixture(string path)
 {
-    var ring = MmapFrameRing.Create(path, Slots, W, H, 512);
+    var ring = MmapFrameRing.Create(path, Slots, W, H, 1024);
     var f1 = new byte[W * H * 4];
     ring.Produce(W, H, 1234.5, 86400.0, 7, f1, 0, f1.Length);
-    var json = System.Text.Encoding.UTF8.GetBytes(
-        "[{\"id\":\"port\",\"owner\":\"peer:7:3\",\"x\":16.5,\"y\":9.25,\"inFrame\":true,\"behind\":false,"
-        + "\"distanceM\":120,\"apparentRadiusPx\":4,\"angleOffAxis\":0.5,\"forward\":[0,0,1],\"up\":[0,1,0],\"occluded\":false}]");
-    var meta = new FrameMeta { FovDeg = 42.5f, Json = json, Length = json.Length };
+    /* Every field of the command state set, through the encoder the plugin uses, so the Rust side checks each key round-trips. */
+    var command = new CommandFrameState
+    {
+        HasFix = true, RangeM = 1500.5, BracketHalfPx = 12.25, FrameHeightPx = 18, FramingFits = false,
+        TrueOffsetPx = 3.5, Occluded = true, Occluder = "Mun", Sunlit = true, Blank = "Held",
+        AuthorityOwner = "mission", SubjectPersistentId = 42, AimKind = "vessel", Refusal = "refused",
+        RefusalCode = "noSignal", RefusalText = "No signal", SubjectUt = 86398.75, WorldModel = "model",
+        WorldModelSeq = 9, KnowledgeUt = 86390, Scope = "centre",
+    };
+    var anchors = new System.Collections.Generic.List<AnchorResult>
+    {
+        new AnchorResult
+        {
+            Id = "port", Owner = "peer:7:3", X = 16.5, Y = 9.25, InFrame = true, DistanceM = 120, ApparentRadiusPx = 4,
+            AngleOffAxisDeg = 0.5, HasOrientation = true, Forward = new DVec3(0, 0, 1), Up = new DVec3(0, 1, 0),
+            HasOcclusion = true, Occluded = false,
+        },
+    };
+    byte[] json = null;
+    int len = FrameMetaJson.Encode(0.05, command, anchors, new System.Text.StringBuilder(), ref json, 1024);
+    var meta = new FrameMeta { FovDeg = 42.5f, Json = json, Length = len, LiveLightTimeS = 2.5 };
     ring.Produce(W, H, 1235.5, 86400.25, 7, meta, f1, 0, f1.Length);
     ring.Dispose();
 }
@@ -164,6 +182,18 @@ Check(a.Any(x => x != 0), "ring file is not all-zero (pixels were written)");
     Check(BitConverter.ToUInt32(bytes, 4096 + 40) == 0, "oversized metadata writes no length");
     Check(BitConverter.ToSingle(bytes, 4096 + 44) == 30f, "fov is written regardless");
     Check(bytes.Length == 4096 + (64 + W * H * 4) + 16, "the trailer follows the slots");
+    Check(BitConverter.ToDouble(bytes, 4096 + 48) == 0, "no live bound given writes 0, no delay");
+}
+
+/* The live bound rides the slot beside the capture UT, on rings with or without metadata. */
+{
+    string path = Path.Combine(dir, "light.ring");
+    var ring = MmapFrameRing.Create(path, 1, W, H);
+    ring.Produce(W, H, 1, 1, 0, new FrameMeta { LiveLightTimeS = 23.25 }, pixels, 0, pixels.Length);
+    ring.Dispose();
+    byte[] bytes = File.ReadAllBytes(path);
+    Check(BitConverter.ToDouble(bytes, 4096 + 48) == 23.25, "the live bound is written on a ring with no metadata");
+    Check(BitConverter.ToDouble(bytes, 4096 + 32) == 1, "beside the capture UT");
 }
 
 try { Directory.Delete(dir, true); } catch { /* best effort */ }

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Standalone test for the light-time history ring: the gate, Kepler and
+       Hermite reads, identity events, the horizon and memory cap, and the
+       per-craft maxima the cull reads. Unity-free. Run: `dotnet run`. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Kerbcast/LightHistory.cs" />
+    <Compile Include="../Kerbcast/LightHistorySave.cs" />
+    <Compile Include="../Kerbcast/LightHistoryMath.cs" />
+    <Compile Include="../Kerbcast/CommandCameraMath.cs" />
+    <Compile Include="../Kerbcast/CraftFixState.cs" />
+  </ItemGroup>
+</Project>

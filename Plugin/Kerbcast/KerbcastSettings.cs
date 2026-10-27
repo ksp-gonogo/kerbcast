@@ -55,6 +55,11 @@
 //                     so `cargo run` can own the sidecar process during
 //                     sidecar development. Set false in your install's
 //                     settings.cfg in that case.
+//
+//   devSignalSpeedMps a signal speed in m/s applied at startup as if a lock
+//                     holder had set it, for trying the light-time picture.
+//                     Read only when GameData/Kerbcast/PluginData/dev exists;
+//                     undocumented in the shipped settings.cfg.
 
 using System.Collections.Generic;
 using System.IO;
@@ -77,6 +82,12 @@ namespace Kerbcast
            (1280,720,6_000_000). */
         public QualityTier MaxQuality { get; private set; } = QualityTier.Sd;
         public bool AutoSpawnSidecar { get; private set; } = true;
+        /* Development only: a signal speed in m/s set at startup as if a lock
+           holder had set it, so the light-time picture can be tried without
+           one. Honoured only beside a GameData/Kerbcast/PluginData/dev marker,
+           never shipped in a release; a tester's marker survives upgrades on
+           that machine. 0 (the default) is off. */
+        public double DevSignalSpeedMps { get; private set; }
 
         // Target H.264 bitrate forwarded to the sidecar at launch, in bits
         // per second. 0 (the default) means auto: the flag is not forwarded
@@ -501,6 +512,7 @@ namespace Kerbcast
             ApplyInt(node, "BitrateBps", v => settings.BitrateBps = v);
             ApplyBool(node, "AdaptiveQuality", v => settings.AdaptiveQuality = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
+            ApplyFloat(node, "devSignalSpeedMps", v => settings.DevSignalSpeedMps = v);
             ApplyFloat(node, "MaxCaptureFps", v => settings.MaxCaptureFps = v);
             ApplyFloat(node, "BackgroundCaptureFps", v => settings.BackgroundCaptureFps = v);
             ApplyBool(node, "EnableCommandCamera", v => settings.EnableCommandCamera = v);

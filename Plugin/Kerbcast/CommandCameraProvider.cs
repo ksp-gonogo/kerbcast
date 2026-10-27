@@ -73,7 +73,7 @@ namespace Kerbcast
                 error = $"no body named '{vantage.Body}'";
                 return 0;
             }
-            if (vantage.Kind == CommandVantageKind.Vessel && !CommandCameraTargets.Exists(vantage.PersistentId))
+            if (vantage.Kind == CommandVantageKind.Vessel && !CommandCameraSite.VantageExists(vantage.PersistentId))
             {
                 error = $"no craft with persistentId={vantage.PersistentId}";
                 return 0;
@@ -120,9 +120,23 @@ namespace Kerbcast
         /* A created camera that is not built yet. */
         public bool IsPending(uint flightId) => _feeds.Any(f => f.Created && f.FlightId == flightId && !f.Built);
 
+        /* The site key a created camera that is not built yet will have: its
+           resolved site's, or what its vantage names; null when neither is known. */
+        public string PendingSiteKey(uint flightId)
+        {
+            var feed = _feeds.FirstOrDefault(f => f.Created && f.FlightId == flightId && !f.Built);
+            return feed == null ? null : feed.SiteKey;
+        }
+
         /* A token already in use by a created camera this scene. */
         public bool HasToken(string token) =>
             !string.IsNullOrEmpty(token) && _feeds.Any(f => f.Token == token);
+
+        /* What every feed's request may resolve to changed (the lock was taken or released). */
+        public void RefreshSubjects()
+        {
+            foreach (var f in _feeds) f.RefreshSubject();
+        }
 
         /* Drops every aim waiting for a created camera to be built. */
         public void ClearPendingAims()
@@ -160,6 +174,8 @@ namespace Kerbcast
             public readonly string Name;
             public readonly string Token;
             public bool Created => Vantage != null;
+
+            public string SiteKey => _site != null ? _site.NodeName : CommandCameraSite.KeyFor(Vantage);
             /* Fixed at creation for a created camera; the default's comes from its site. */
             public uint FlightId { get; private set; }
             public bool Built { get; private set; }
@@ -169,7 +185,11 @@ namespace Kerbcast
             private CommandAim _pendingAim;
             private Orbit _pendingOrbit;
 
-            private CommandCameraTarget _target;
+            /* Which craft the feed watches, resolved by _known and drawn by
+               _drawn. Under truth both read KSP's handles for it in _track. */
+            private SubjectSelection _selection;
+            private SubjectTrack _track;
+            private TruthFixSource _known;
             private CommandCameraSite _site;
             private bool _resolveFailedLogged;
             private int _siteAttempts;
@@ -204,7 +224,31 @@ namespace Kerbcast
                 _pendingAim = aim;
                 _pendingOrbit = orbit;
                 uint subject = aim?.SubjectPersistentId ?? 0;
-                if (_target != null && subject != _target.ChosenPersistentId) _target.Choose(subject);
+                if (_selection != null && subject != _selection.ChosenPersistentId) _selection.Choose(subject);
+            }
+
+            /* Under a world model, an aim set before the site was known was
+               checked against the key the vantage named; now the site is
+               known, its craft is checked again against what this site knows,
+               and dropped if it fails. Truth keeps 1.11's behaviour. */
+            private bool PendingAimStands(string siteKey)
+            {
+                uint subject = _pendingAim.SubjectPersistentId;
+                if (subject == 0) return true;
+                var result = CommandCameraTargets.AimSubject(siteKey, _site, subject, _pendingAim.Kind == CommandAimKind.Vessel,
+                    _pendingAim.AllowUncertain, _pendingAim.FramingMarginM, S.CommandCameraFovMax);
+                if (result == Api.AimResult.Ok) return true;
+                Debug.LogWarning($"[Kerbcast][CMDCAM] {Label}: aim {_pendingAim} dropped once its site resolved ({result}); the camera starts at its default");
+                return false;
+            }
+
+            /* The lock changed: the request may now resolve differently, and under the lock a default names no craft. */
+            public void RefreshSubject()
+            {
+                if (_selection == null) return;
+                _selection.Locked = _p._authority.Registered;
+                _known.LockChanged();
+                _selection.Refresh();
             }
 
             public void Reresolve(CommandAim aim, Orbit orbit)
@@ -232,16 +276,20 @@ namespace Kerbcast
 
             public void Enumerate(Vessel vessel, IReadOnlyCollection<uint> existingFlightIds, List<ICamera> result)
             {
-                if (_target == null)
+                if (_selection == null)
                 {
                     /* A vessel vantage in flight can watch a named craft other than the active one. */
                     bool named = _p._spaceCenter
                         || (!Created && S.CommandCameraAnchor == "vessel" && S.CommandCameraTargetName.Length > 0);
-                    _target = named
-                        ? CommandCameraTarget.Chosen(S.CommandCameraTargetName)
-                        : CommandCameraTarget.ActiveVessel();
+                    _selection = named
+                        ? SubjectSelection.Chosen(S.CommandCameraTargetName, Debug.Log)
+                        : SubjectSelection.ActiveVessel(Debug.Log);
+                    _track = new SubjectTrack();
+                    var store = _p._authority.WorldModel;
+                    _selection.Locked = _p._authority.Registered;
+                    _known = new TruthFixSource(_selection, _track, () => !store.Governed);
                     uint subject = _pendingAim?.SubjectPersistentId ?? 0;
-                    if (subject != 0) _target.Choose(subject);
+                    if (subject != 0) _selection.Choose(subject);
                 }
                 if (_site == null && !(Created ? ResolveCreated(vessel) : ResolveDefault(vessel))) return;
 
@@ -294,7 +342,13 @@ namespace Kerbcast
                         manifestExtraFields: ManifestFields(_site, Created, Token));
                     try
                     {
-                        var rig = new CommandCameraRig(cam, mount, _target, _p._authority,
+                        /* Each rig measures its craft afresh, as it frames it. */
+                        var drawn = new DrawnSubject(_selection, _track, cam.Picture);
+                        _known.MeasureWith(drawn);
+                        var store = _p._authority.WorldModel;
+                        var known = new FeedFixSource(_known,
+                            new ProviderFixSource(store, _p._authority.Sites, () => mount.Site, _selection, flightId), store);
+                        var rig = new CommandCameraRig(cam, mount, _selection, known, drawn, _p._authority,
                             S.CommandCameraFrameFraction,
                             _p.LensFovMin(_site),
                             S.CommandCameraFovMax,
@@ -302,7 +356,11 @@ namespace Kerbcast
                             S.CommandCameraTargetModel,
                             S.CommandCameraDebugUtStripe);
                         cam.Rig = rig;
+                        if (_pendingAim != null && store.Governed && !PendingAimStands(_site.NodeName)) SetAim(null, null);
                         if (_pendingAim != null) rig.SetAim(_pendingAim, _pendingOrbit);
+                        /* Applied once: a rebuilt camera must not bring back an aim from before a lock. */
+                        _pendingAim = null;
+                        _pendingOrbit = null;
                     }
                     catch
                     {
@@ -313,7 +371,7 @@ namespace Kerbcast
                     Built = true;
                     Debug.Log(Created
                         ? $"[Kerbcast][CMDCAM] command camera cam={flightId} created at {Vantage} as '{name}' ({_site})"
-                        : $"[Kerbcast][CMDCAM] command camera cam={flightId} created for {CameraId.CommandCentreId(_site.NodeName)}");
+                        : $"[Kerbcast][CMDCAM] command camera cam={flightId} created for site {_site.NodeName}");
                 }
                 catch (Exception ex)
                 {
@@ -357,7 +415,7 @@ namespace Kerbcast
                     if (S.CommandCameraAnchor == "launchsite")
                     {
                         string launchedFrom = _p._spaceCenter
-                            ? _target.LaunchedFrom
+                            ? _track.LaunchedFrom
                             : (FlightGlobals.ActiveVessel ?? vessel)?.launchedFrom;
                         float now = Time.realtimeSinceStartup;
                         if (_siteAttempts == 0) _siteFirstAttemptAt = now;
@@ -420,7 +478,7 @@ namespace Kerbcast
                     {
                         bool explicitSite = v.Name.Length > 0;
                         string from = explicitSite ? v.Name
-                            : _p._spaceCenter ? _target.LaunchedFrom
+                            : _p._spaceCenter ? _track.LaunchedFrom
                             : (FlightGlobals.ActiveVessel ?? vessel)?.launchedFrom;
                         _site = CommandCameraSite.ResolveLaunchSite(from, v.Distance, v.Bearing, v.Height,
                             out pending, fallbackToPad: !explicitSite);
@@ -487,13 +545,17 @@ namespace Kerbcast
                 : top;
         }
 
-        /* Station identity for /cameras. station_id is gonogo's centre id, so a
-           feed lines up with its command centre with no mapping table. A
-           created camera also carries the token its creator sent. */
+        /* Site identity for /cameras: its stable key and kind, its vantage
+           craft, and where it stands. station_id is what a 1.11 sidecar needs
+           to list the camera at all. A created camera also carries the token
+           its creator sent. */
         private static string ManifestFields(CommandCameraSite s, bool created, string token)
         {
             var inv = CultureInfo.InvariantCulture;
-            return $"  \"station_id\": \"{Esc(CameraId.CommandCentreId(s.NodeName))}\",\n"
+            return $"  \"site_key\": \"{Esc(s.NodeName)}\",\n"
+                + $"  \"site_kind\": \"{SiteKindTag(s.Kind)}\",\n"
+                + $"  \"vantage_persistent_id\": {s.VantagePersistentId},\n"
+                + $"  \"station_id\": \"{Esc(CameraId.SiteHashKey(s.NodeName))}\",\n"
                 + $"  \"station_node_name\": \"{Esc(s.NodeName)}\",\n"
                 + $"  \"station_name\": \"{Esc(string.IsNullOrEmpty(s.DisplayName) ? s.NodeName : s.DisplayName)}\",\n"
                 + $"  \"station_body\": \"{Esc(s.Body != null ? s.Body.bodyName : "")}\",\n"
@@ -502,6 +564,18 @@ namespace Kerbcast
                 + $"  \"station_altitude\": {s.Altitude.ToString("R", inv)}"
                 + (created ? ",\n  \"command_created\": true" : "")
                 + (created && !string.IsNullOrEmpty(token) ? $",\n  \"command_token\": \"{Esc(token)}\"" : "");
+        }
+
+        /* The wire's camelCase names for SiteKind. */
+        private static string SiteKindTag(Api.SiteKind kind)
+        {
+            switch (kind)
+            {
+                case Api.SiteKind.LaunchSite: return "launchSite";
+                case Api.SiteKind.Surface: return "surface";
+                case Api.SiteKind.Vessel: return "vessel";
+                default: return "station";
+            }
         }
 
         private static string Esc(string s)

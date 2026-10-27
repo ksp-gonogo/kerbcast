@@ -34,8 +34,15 @@ namespace Kerbcast
         /* Set for a lens at an arbitrary surface point, not a station or a launch site. */
         public bool IsSurfacePoint { get; private set; }
 
+        /* What kind of place NodeName, the site key, names. */
+        public Api.SiteKind Kind =>
+            HasVantage ? Api.SiteKind.Vessel
+            : IsSurfacePoint ? Api.SiteKind.Surface
+            : IsLaunchSite ? Api.SiteKind.LaunchSite
+            : Api.SiteKind.Station;
+
         /* Stock keeps a home's body and coordinates protected, so they are read
-           by reflection, the same route gonogo's CommNetHomeAccess takes. The
+           by reflection. The
            fields are declared on CommNetHome itself, which also covers the
            Extra Ground Stations and Kerbal Konstructs subclasses. */
         private static readonly FieldInfo CommField = Field("comm");
@@ -375,24 +382,67 @@ namespace Kerbcast
             var v = Vantage;
             if (v == null || v.state == Vessel.State.DEAD || v.mainBody == null) return false;
             Body = v.mainBody;
-            if (v.loaded && !v.packed)
+            return PicturePass.TryCraftPoint(v, ut, out world, out source);
+        }
+
+        /* How the lens moves from `ut` on, for the forecast: with its craft
+           (on the surface or on its conic) or fixed to its body. */
+        public bool TryStationMotion(double ut, out BodyMotion motion)
+        {
+            motion = default;
+            var v = Vantage;
+            if (HasVantage)
             {
-                world = v.CoMD;
-                source = "com";
+                if (!TryVantagePosition(ut, out var vantage, out _)) return false;
+                if (v.LandedOrSplashed) motion = BodyMotion.OnSurface(v.mainBody, vantage);
+                else if (v.orbit != null) motion = BodyMotion.OnOrbit(v.orbit);
+                else return false;
+                return true;
             }
-            else if (v.LandedOrSplashed)
-            {
-                world = v.mainBody.GetWorldSurfacePosition(v.latitude, v.longitude, v.altitude);
-                source = "surface";
-            }
-            else
-            {
-                if (v.orbit == null) return false;
-                world = v.orbit.getPositionAtUT(ut);
-                source = "orbit";
-            }
+            if (Body == null) return false;
+            motion = BodyMotion.OnSurface(Body, Body.GetWorldSurfacePosition(Latitude, Longitude, Altitude));
             return true;
         }
+
+        /* The key a site at `vantage` will have, before it resolves, only
+           where it is certain: a station's CommNet node name, an explicit
+           launch site's name (never replaced by the pad), a craft's
+           persistentId, a surface point's formatted coordinates. Null when
+           only resolving can tell (a launch site taken from the active craft,
+           or no vantage), which under a world model reads no scope. */
+        public static string KeyFor(CommandVantage vantage)
+        {
+            if (vantage == null) return null;
+            switch (vantage.Kind)
+            {
+                case CommandVantageKind.Station: return vantage.Name;
+                case CommandVantageKind.LaunchSite: return vantage.Name.Length > 0 ? vantage.Name : null;
+                case CommandVantageKind.Vessel: return "vessel:" + vantage.PersistentId;
+                case CommandVantageKind.Surface:
+                    return string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "surface:{0}:{1:F5}:{2:F5}", vantage.Body, vantage.Latitude, vantage.Longitude);
+                default: return null;
+            }
+        }
+
+        /* Whether a craft a lens could ride exists now: a live Vessel that is
+           not dead, or, in a scene that has not built it, a saved record. The
+           lens's own craft is placed by truth, whatever the camera knows. */
+        public static bool VantageExists(uint persistentId)
+        {
+            if (persistentId == 0) return false;
+            if (FlightGlobals.FindVessel(persistentId, out Vessel v) && v != null && v.state != Vessel.State.DEAD) return true;
+            var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
+            if (protos == null) return false;
+            for (int i = 0; i < protos.Count; i++)
+                if (SubjectTrack.RecordCounts(protos[i]) && protos[i].persistentId == persistentId) return true;
+            return false;
+        }
+
+        /* The body the lens stands on or orbits. */
+        public CelestialBody StationBody => HasVantage ? (Vantage != null ? Vantage.mainBody : null) : Body;
+
+        public string VantageName => Vantage != null ? Vantage.vesselName : "";
 
         /* Stock stores KSC's display name as a localisation tag. */
         private static string Localise(string text, string fallback)

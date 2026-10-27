@@ -1,0 +1,78 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../Versions.props" />
+
+  <!--
+    A headless Kerbcast for consumers' unit tests. Builds
+    Kerbcast.API.Testing.dll, packed for NuGet beside Kerbcast.API and never
+    shipped to GameData: installed in game it would let a mod replace
+    KerbcastApi.Instance. It reaches Kerbcast.API's internals through
+    InternalsVisibleTo.
+  -->
+
+  <PropertyGroup>
+    <TargetFrameworks>net48;netstandard2.0</TargetFrameworks>
+    <RootNamespace>Kerbcast.Api.Testing</RootNamespace>
+    <AssemblyName>Kerbcast.API.Testing</AssemblyName>
+    <OutputType>Library</OutputType>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>$(KerbcastApiVersion).0</FileVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Kerbcast.API.Testing</PackageId>
+    <Version>$(KerbcastApiVersion)</Version>
+    <Authors>Jon Pepler</Authors>
+    <Company>ksp-gonogo</Company>
+    <Description>A headless, recording implementation of Kerbcast.API for unit tests, so a mod's tests run without Kerbcast, Unity or KSP.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/ksp-gonogo/kerbcast</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ksp-gonogo/kerbcast</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>ksp;kerbal;kerbcast;testing</PackageTags>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <!-- The net48 build is the one GameData ships, so it keeps bin/Release/
+       to itself; netstandard2.0 serves test projects on modern .NET and only
+       ever ships in the package. -->
+  <PropertyGroup Condition=" '$(TargetFramework)' == 'net48' ">
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup Condition=" '$(TargetFramework)' == 'net48' ">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Kerbcast.API/Kerbcast.API.csproj" />
+  </ItemGroup>
+
+  <!-- This package uses Kerbcast.API's internals, so it depends on exactly
+       its own version rather than that version or later. -->
+  <Target Name="PinKerbcastApiDependency" AfterTargets="_GetProjectReferenceVersions">
+    <ItemGroup>
+      <_ProjectReferencesWithVersions>
+        <ProjectVersion>[%(ProjectVersion)]</ProjectVersion>
+      </_ProjectReferencesWithVersions>
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <None Include="../Kerbcast.API/README.md" Pack="true" PackagePath="/" />
+    <None Include="../Kerbcast.API/LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>

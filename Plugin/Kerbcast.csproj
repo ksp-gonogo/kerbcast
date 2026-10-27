@@ -1,5 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <Import Project="Versions.props" />
+
   <!--
     Kerbcast KSP plugin. Builds the Kerbcast.dll that drops into
     `GameData/Kerbcast/Plugins/`. Mirrors the pattern from the OCISLY
@@ -29,6 +31,8 @@
     <!-- MmapFrameRing.cs uses unsafe pointer arithmetic over the mmap'd
          region for atomic Interlocked operations at known offsets. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- KSPAssembly("Kerbcast") and the dependency on KerbcastAPI, from Versions.props. -->
+    <KerbcastVersionCode>$(KerbcastPluginVersionCode)</KerbcastVersionCode>
   </PropertyGroup>
 
   <!-- net48 reference assemblies (works without a Mono / Windows SDK
@@ -143,11 +147,29 @@
     <Compile Remove="TrackAim.Tests/**/*.cs" />
     <Compile Remove="CommandCameraMath.Tests/**/*.cs" />
     <Compile Remove="CommandCameraRequests.Tests/**/*.cs" />
+    <Compile Remove="TruthReads.Tests/**/*.cs" />
+    <Compile Remove="SubjectSelection.Tests/**/*.cs" />
+    <Compile Remove="WorldModel.Tests/**/*.cs" />
+    <Compile Remove="Kerbcast.DevProvider/**/*.cs" />
+    <Compile Remove="DevProvider.Tests/**/*.cs" />
     <Compile Remove="Anchors.Tests/**/*.cs" />
+    <Compile Remove="LightHistory.Tests/**/*.cs" />
+    <Compile Remove="PastInstant.Tests/**/*.cs" />
+    <Compile Remove="GameEventsHandlers.Tests/**/*.cs" />
+    <Compile Remove="Kinematics.Tests/**/*.cs" />
     <Compile Remove="NativeReadback.Tests/**/*.cs" />
     <Compile Remove="KosSpike/**/*.cs" />
     <Compile Remove="KerbcastKos/**/*.cs" />
     <Compile Remove="KerbcastKos.Tests/**/*.cs" />
+    <Compile Remove="Kerbcast.API/**/*.cs" />
+    <Compile Remove="Kerbcast.API.Testing/**/*.cs" />
+    <Compile Remove="Kerbcast.API.Tests/**/*.cs" />
+  </ItemGroup>
+
+  <!-- The public interface this DLL implements. KSP loads the shipped
+       Kerbcast.API.dll beside this one, so it is not copied here. -->
+  <ItemGroup>
+    <ProjectReference Include="Kerbcast.API/Kerbcast.API.csproj" Private="false" />
   </ItemGroup>
 
 </Project>

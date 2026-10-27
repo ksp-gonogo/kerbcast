@@ -662,6 +662,7 @@ async fn handle_client_message(
                     encoder_backend: selected_backend_name().to_owned(),
                     frame_stamps: Some(true),
                     anchors: Some(true),
+                    frame_command: Some(true),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -731,8 +732,12 @@ async fn handle_client_message(
         ClientMessage::SetZoomRate(SetZoomRatePayload { flight_id, rate }) => {
             apply_zoom_rate_change(&registry, &dc, flight_id, rate).await;
         }
-        ClientMessage::SetFrameStamps(SetFrameStampsPayload { enabled, anchors }) => {
-            dc.set_stamps_wanted(enabled, anchors.unwrap_or(false));
+        ClientMessage::SetFrameStamps(SetFrameStampsPayload {
+            enabled,
+            anchors,
+            command,
+        }) => {
+            dc.set_stamps_wanted(enabled, anchors.unwrap_or(false), command.unwrap_or(false));
         }
         // A client's own anchors on one camera. Keyed by peer_id; forgotten on
         // disconnect / peer reap (below + in the consume-loop reaper).

@@ -1,0 +1,69 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="../Versions.props" />
+
+  <!--
+    The public, MIT-licensed interface to Kerbcast. Builds Kerbcast.API.dll,
+    shipped beside Kerbcast.dll in GameData/Kerbcast/Plugins/ and packed for
+    nuget.org. It references nothing but the base class library, so a mod
+    builds against it without UnityEngine or Assembly-CSharp. Kerbcast.dll
+    implements it; nobody else bundles a copy.
+
+    Build:   dotnet build Plugin/Kerbcast.API/Kerbcast.API.csproj -c Release
+    Pack:    dotnet pack Plugin/Kerbcast.API/Kerbcast.API.csproj -c Release
+  -->
+
+  <PropertyGroup>
+    <TargetFrameworks>net48;netstandard2.0</TargetFrameworks>
+    <RootNamespace>Kerbcast.Api</RootNamespace>
+    <AssemblyName>Kerbcast.API</AssemblyName>
+    <OutputType>Library</OutputType>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <KerbcastVersionCode>$(KerbcastApiVersionCode)</KerbcastVersionCode>
+    <!-- XML docs ship for IntelliSense. Self-explanatory members (a vector's
+         X, an enum value whose name says it all) carry none. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Kerbcast.API</PackageId>
+    <Version>$(KerbcastApiVersion)</Version>
+    <Authors>Jon Pepler</Authors>
+    <Company>ksp-gonogo</Company>
+    <Description>Public interface to Kerbcast, the Kerbal Space Program camera streaming mod: camera views and controls, craft identity, the command lock and the world model. No Unity or KSP types.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/ksp-gonogo/kerbcast</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ksp-gonogo/kerbcast</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>ksp;kerbal;kerbcast;camera;mod</PackageTags>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <!-- The net48 build is the one GameData ships, so it keeps bin/Release/
+       to itself; netstandard2.0 serves test projects on modern .NET and only
+       ever ships in the package. -->
+  <PropertyGroup Condition=" '$(TargetFramework)' == 'net48' ">
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup Condition=" '$(TargetFramework)' == 'net48' ">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>

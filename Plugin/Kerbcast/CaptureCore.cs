@@ -69,6 +69,9 @@ namespace Kerbcast
         private readonly PhaseTimings _phaseTimings;
         private readonly Action<string> _logRateLimited;
         private readonly Action _resetErrorStreak;
+        /* The camera's live bound, read at render beside the UT so a frame carries the value of its own instant. */
+        private readonly Func<double> _liveLightTimeS;
+        private double _pendingLiveLightTimeS = double.NaN;
 
         // Cached per Refresh tick via BeginTick. When false every timing bracket
         // is skipped so the OFF path makes zero GetTimestamp calls. When true the
@@ -83,12 +86,14 @@ namespace Kerbcast
             MmapFrameRing ring,
             PhaseTimings phaseTimings,
             Action<string> logRateLimited,
-            Action resetErrorStreak)
+            Action resetErrorStreak,
+            Func<double> liveLightTimeS)
         {
             _ring = ring;
             _phaseTimings = phaseTimings;
             _logRateLimited = logRateLimited;
             _resetErrorStreak = resetErrorStreak;
+            _liveLightTimeS = liveLightTimeS;
         }
 
         internal RenderTexture CaptureRt => _captureRt;
@@ -176,6 +181,7 @@ namespace Kerbcast
             _pendingCaptureTsMs = captureTsMs;
             _pendingCaptureUt = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
             _pendingCaptureEpoch = KerbcastCore.Instance != null ? KerbcastCore.Instance.CaptureEpochValue : 0;
+            _pendingLiveLightTimeS = LiveLightTimeNow();
             _pendingFov = meta.FovDeg;
             _pendingMetaLength = meta.Json != null ? meta.Length : 0;
             if (_pendingMetaLength > 0)
@@ -210,6 +216,18 @@ namespace Kerbcast
 
         // Reset the in-flight flag after a throw in the capture pipeline so a new
         // readback can be issued next tick (mirrors the camera's catch block).
+        /* A read that throws is unknown, never no delay, which could release the frame early. */
+        private double LiveLightTimeNow()
+        {
+            if (_liveLightTimeS == null) return double.NaN;
+            try { return _liveLightTimeS(); }
+            catch (Exception ex)
+            {
+                _logRateLimited($"live light time threw: {ex.GetType().Name}: {ex.Message}");
+                return double.NaN;
+            }
+        }
+
         internal void AbortInFlight()
         {
             _readbackInFlight = false;
@@ -254,7 +272,13 @@ namespace Kerbcast
                     src = (byte*)NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
                     length = data.Length;
                 }
-                var meta = new FrameMeta { FovDeg = _pendingFov, Json = _pendingMetaLength > 0 ? _pendingMeta : null, Length = _pendingMetaLength };
+                var meta = new FrameMeta
+                {
+                    FovDeg = _pendingFov,
+                    Json = _pendingMetaLength > 0 ? _pendingMeta : null,
+                    Length = _pendingMetaLength,
+                    LiveLightTimeS = _pendingLiveLightTimeS,
+                };
                 _ring.Produce(_targets.PendingWidth, _targets.PendingHeight, _pendingCaptureTsMs, _pendingCaptureUt, _pendingCaptureEpoch, meta, src, length);
                 _resetErrorStreak();
             }

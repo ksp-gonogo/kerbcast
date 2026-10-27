@@ -57,6 +57,8 @@ pub struct Outbox {
     /// default for the same reason, and because a 1.11 client that asked for
     /// stamps must not start receiving game-owned anchors.
     anchors_wanted: Arc<AtomicBool>,
+    /// Whether the client asked for a command camera's per-frame state.
+    command_wanted: Arc<AtomicBool>,
     /// The owner tag this client's anchor results carry in the frame ring.
     owner: Arc<str>,
     dead: Arc<AtomicBool>,
@@ -83,6 +85,7 @@ impl Outbox {
             stamp_tx,
             stamps_wanted: Arc::new(AtomicBool::new(false)),
             anchors_wanted: Arc::new(AtomicBool::new(false)),
+            command_wanted: Arc::new(AtomicBool::new(false)),
             owner: owner.into(),
             dead,
             shutdown: Arc::new(shutdown),
@@ -114,7 +117,8 @@ impl Outbox {
      * Queue the stamp of the frame about to go out under `rtp_timestamp`, or
      * drop it when the peer did not ask for stamps or is behind. A frame
      * without a UT has no stamp. Anchor results are filtered to what this
-     * peer may see, and only for a peer that asked for them.
+     * peer may see, and only for a peer that asked for them; so is a command
+     * camera's state. The live bound and boundary go on every stamp.
      */
     pub fn offer_stamp(&self, flight_id: u32, rtp_timestamp: u32, capture: &CaptureStamp) {
         if !self.stamps_wanted.load(Ordering::Relaxed) {
@@ -139,14 +143,24 @@ impl Outbox {
             width: capture.size.map(|s| s.0),
             height: capture.size.map(|s| s.1),
             anchors,
+            live_light_time_s: capture.live_light_time_s,
+            boundary_m: capture.boundary_m,
+            command: if self.command_wanted.load(Ordering::Relaxed) {
+                capture.command.as_deref().cloned()
+            } else {
+                None
+            },
         });
     }
 
-    /// Start or stop frame stamps for this peer, and anchor results on them.
-    pub fn set_stamps_wanted(&self, wanted: bool, anchors: bool) {
+    /// Start or stop frame stamps for this peer, and anchor results and
+    /// command camera state on them.
+    pub fn set_stamps_wanted(&self, wanted: bool, anchors: bool, command: bool) {
         self.stamps_wanted.store(wanted, Ordering::Relaxed);
         self.anchors_wanted
             .store(wanted && anchors, Ordering::Relaxed);
+        self.command_wanted
+            .store(wanted && command, Ordering::Relaxed);
     }
 
     /// True once a control message could not be delivered.

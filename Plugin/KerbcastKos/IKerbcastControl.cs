@@ -2,10 +2,10 @@ using System.Collections.Generic;
 
 namespace Kerbcast.Kos
 {
-    /* Unity-free control seam the addon calls instead of the static
-       Kerbcast.KerbcastControl facade. RealKerbcastControl wraps the facade
-       in-game; headless tests inject a fake. Keeping this interface free of
-       UnityEngine/KSP types is what lets the suffix paths load headless. */
+    /* Unity-free control seam the addon calls instead of Kerbcast.API.
+       RealKerbcastControl wraps the API in-game; headless tests inject a
+       fake. Keeping this interface free of Kerbcast.API, UnityEngine and KSP
+       types is what lets the suffix paths load headless. */
     public interface IKerbcastControl
     {
         bool IsActive { get; }

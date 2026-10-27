@@ -160,5 +160,32 @@ void Warn(string msg) => warnings.Add(msg);
     Check(fallback == CameraLayers.All, "all-invalid list falls back to All");
 }
 
+// WithoutNode: replacing one node of a hand-edited settings.cfg.
+{
+    string file = "// my settings\nSettings\n{\n  Port = 9000 // mine\n}\n\n// Kerbcast.API lock reservation\n// delete to clear\nReservation\n{\n  owner = gonogo\n  assembly = Uplink\n}\n// trailing note\n";
+    string without = SettingsLayer.WithoutNode(file, "Reservation");
+    Check(!without.Contains("Reservation") && !without.Contains("owner = gonogo"), "WithoutNode drops the node");
+    Check(!without.Contains("delete to clear"), "WithoutNode drops the comments directly above it");
+    Check(without.Contains("// my settings") && without.Contains("Port = 9000 // mine") && without.Contains("Settings"),
+        "WithoutNode keeps every other node and comment as written");
+    Check(without.Contains("// trailing note"), "WithoutNode keeps comments after the node");
+    Check(SettingsLayer.WithoutNode("Reservation { owner = a }\nSettings\n{\n}\n", "Reservation").IndexOf("owner", System.StringComparison.Ordinal) < 0,
+        "WithoutNode handles a brace on the name's line");
+    Check(SettingsLayer.WithoutNode("Settings\n{\n  Reservation\n  {\n  }\n}\n", "Reservation").Contains("  Reservation"),
+        "WithoutNode leaves a nested node of the same name alone");
+    Check(SettingsLayer.WithoutNode("Settings\n{\n}\n", "Reservation") == "Settings\n{\n}\n\n", "WithoutNode changes nothing else");
+}
+
+// Node: writing one node with nothing able to break out of it.
+{
+    string ok = SettingsLayer.Node("Reservation", new[] { "a note" }, "owner", "gonogo", "assembly", "Uplink", "silentText", null);
+    Check(ok == "// a note\nReservation\n{\n  owner = gonogo\n  assembly = Uplink\n}\n", "Node writes the comment, the node and its values, leaving out null ones");
+    Check(SettingsLayer.Node("Reservation", null, "silentText", "quiet}\nSettings { BindAddress = 0.0.0.0 }") == null,
+        "Node refuses a value that would close the node and add another");
+    Check(SettingsLayer.Node("Reservation", null, "owner", "a // b") == null, "Node refuses a value KSP would cut at a comment marker");
+    Check(SettingsLayer.Node("Reservation", null, "owner", "x\ny") == null, "Node refuses a line break");
+    Check(SettingsLayer.Node("Reservation", null, "own=er", "x") == null, "Node refuses a key with an equals sign");
+}
+
 Console.WriteLine(failures == 0 ? "SettingsLayer.Tests: all passed" : $"SettingsLayer.Tests: {failures} FAILED");
 return failures == 0 ? 0 : 1;

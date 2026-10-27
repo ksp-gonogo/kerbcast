@@ -222,7 +222,8 @@ namespace Kerbcast
                 // succeeds: a throw there (e.g. RenderTexture.Create() failing)
                 // must leave _capture null so the next tick retries construction,
                 // rather than latching a half-initialized capture tail.
-                var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
+                var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0,
+                    () => LiveLightTime.For(_occupiedPart != null ? _occupiedPart.transform.position : Vector3.zero, Vessel));
                 capture.BuildTargets(_renderSide, _renderSide);
                 _capture = capture;
             }

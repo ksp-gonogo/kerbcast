@@ -1,4 +1,4 @@
-import type { FrameAnchor, FrameStampPayload } from "./__generated__/types";
+import type { FrameAnchor, FrameCommandState, FrameStampPayload } from "./__generated__/types";
 
 /**
  * Where a frame's UT came from. `"exact"`: looked up from the frame's own
@@ -37,6 +37,22 @@ export interface FrameStampExtras {
   /** The capture frame's size, the space anchor positions are in. */
   frameWidth?: number;
   frameHeight?: number;
+  /**
+   * The frame's live bound in seconds: the light time covering what of the
+   * lens's own craft and site the frame draws at `ut`. 0 with no signal
+   * speed. Other loaded craft near the lens are still drawn at `ut` and are
+   * not covered yet; once craft beyond the boundary are hidden, the bound
+   * covers everything drawn at `ut`. A delayed view releases the frame no
+   * sooner than `ut` plus this plus its own delay from the lens. Absent when
+   * the game could not read it, and from a game or sidecar older than 1.12:
+   * a view applying a signal speed treats that as unknown and holds the
+   * frame.
+   */
+  liveLightTimeS?: number;
+  /** The picture's boundary distance in metres; absent with no signal speed. */
+  boundaryM?: number;
+  /** A command camera's state as this frame shows it (1.12 and later). */
+  command?: FrameCommandState;
 }
 
 /** A frame the browser presented on a watched video element. */
@@ -100,6 +116,9 @@ function extrasOf(stamp: FrameStampPayload): FrameStampExtras | null {
   if (stamp.fov != null) extras.fov = stamp.fov;
   if (stamp.width != null) extras.frameWidth = stamp.width;
   if (stamp.height != null) extras.frameHeight = stamp.height;
+  if (stamp.liveLightTimeS != null) extras.liveLightTimeS = stamp.liveLightTimeS;
+  if (stamp.boundaryM != null) extras.boundaryM = stamp.boundaryM;
+  if (stamp.command != null) extras.command = stamp.command;
   return Object.keys(extras).length ? extras : null;
 }
 

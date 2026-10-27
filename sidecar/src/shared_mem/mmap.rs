@@ -28,19 +28,23 @@
 //!   +32  8      f64 capture_ut (KSP universal time at render; NaN = unknown)
 //!   +40  4      u32 meta_len (bytes of this frame's metadata; 0 = none)
 //!   +44  4      f32 fov_deg (vertical field of view at render; 0 = unknown)
-//!   +48  16     padding
+//!   +48  8      f64 live_light_time_s (the frame's live bound; 0 = no delay, NaN = unknown)
+//!   +56  8      padding
 //!   +64  ...    RGBA8 pixels, max_width * max_height * 4 bytes
 //!
 //! 4096 + slot_count * SLOT_SIZE + (slot_idx * meta_slot_bytes):
-//!   per-slot metadata, `meta_len` bytes of UTF-8 JSON: the frame's anchor
-//!   results, an array of `FrameAnchor` each carrying its `owner`
+//!   per-slot metadata, `meta_len` bytes of UTF-8 JSON: one object with the
+//!   frame's `boundaryM`, a command camera's `command` state and its
+//!   `anchors`, an array of `FrameAnchor` each carrying its `owner`. A bare
+//!   array of anchors (the first 1.12 builds) is read too.
 //! ```
 //!
 //! The metadata fields arrived in 1.12 without a version bump. Writers
 //! before 1.12 leave them zero (the header is zeroed and the slot padding
-//! never written), which reads as "no metadata, fov unknown". A reader
-//! before 1.12 maps only the slots, so it never sees the trailer, and
-//! ignores the two slot fields.
+//! never written), which reads as "no metadata, fov unknown, no delay": a
+//! writer that old had no signal speed, so nothing it drew was delayed. A
+//! reader before 1.12 maps only the slots, so it never sees the trailer,
+//! and ignores the three slot fields.
 //!
 //! Sync protocol (seqlock-style, one-writer / one-or-more-readers):
 //!
@@ -63,7 +67,7 @@ use std::sync::Arc;
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 
-use crate::protocol::FrameAnchor;
+use crate::protocol::{FrameAnchor, FrameCommandState};
 
 pub const MAGIC: u64 = 0x4B45_5242_4341_4D31; // "KERBCAM1" legacy ring magic; value pinned for plugin wire-format compat, not renamed
 pub const LAYOUT_VERSION: u32 = 2;
@@ -92,6 +96,7 @@ const SLOT_OFF_SEQUENCE: usize = 24;
 const SLOT_OFF_CAPTURE_UT: usize = 32;
 const SLOT_OFF_META_LEN: usize = 40;
 const SLOT_OFF_FOV: usize = 44;
+const SLOT_OFF_LIVE_LIGHT_TIME: usize = 48;
 const SLOT_OFF_PIXELS: usize = 64;
 const SLOT_PIXELS_ALIGNMENT_PAD: usize = 0; // SLOT_OFF_PIXELS is already 64, 32-aligned
 
@@ -114,6 +119,15 @@ pub struct CaptureStamp {
     /// Where each anchor landed in the frame, every owner's, each tagged
     /// with its owner. `None` when the writer reported none.
     pub anchors: Option<Arc<Vec<FrameAnchor>>>,
+    /// The frame's live bound in seconds (see `FrameStampPayload`). 0 with
+    /// no signal speed; `None` when the writer could not read it, or outside
+    /// a ring read.
+    pub live_light_time_s: Option<f64>,
+    /// How far light travels in one 60 fps frame at the signal speed: the
+    /// picture's boundary distance. `None` with no signal speed.
+    pub boundary_m: Option<f64>,
+    /// A command camera's state as this frame shows it.
+    pub command: Option<Arc<FrameCommandState>>,
 }
 
 impl CaptureStamp {
@@ -123,6 +137,9 @@ impl CaptureStamp {
         fov: None,
         size: None,
         anchors: None,
+        live_light_time_s: None,
+        boundary_m: None,
+        command: None,
     };
 
     /// A stamp with only the UT and epoch known.
@@ -135,19 +152,62 @@ impl CaptureStamp {
     }
 }
 
-/// Anchor results from a slot's metadata bytes. Unreadable metadata reads
-/// as none: a frame is never dropped over its anchors.
-fn parse_anchor_meta(bytes: &[u8]) -> Option<Arc<Vec<FrameAnchor>>> {
+/// What a slot's metadata carries beside the slot fields.
+#[derive(Debug, Default, PartialEq)]
+struct SlotMeta {
+    anchors: Option<Arc<Vec<FrameAnchor>>>,
+    boundary_m: Option<f64>,
+    command: Option<Arc<FrameCommandState>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaObject {
+    #[serde(default)]
+    anchors: Vec<FrameAnchor>,
+    #[serde(default)]
+    boundary_m: Option<f64>,
+    /// Read as a value first, so a command state this reader cannot take
+    /// (an aim kind it does not know, say) costs only itself.
+    #[serde(default)]
+    command: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum MetaShape {
+    Object(Box<MetaObject>),
+    Anchors(Vec<FrameAnchor>),
+}
+
+/// A slot's metadata bytes. Unreadable metadata reads as none: a frame is
+/// never dropped over its metadata.
+fn parse_meta(bytes: &[u8]) -> SlotMeta {
     if bytes.is_empty() {
-        return None;
+        return SlotMeta::default();
     }
-    match serde_json::from_slice::<Vec<FrameAnchor>>(bytes) {
-        Ok(v) if v.is_empty() => None,
-        Ok(v) => Some(Arc::new(v)),
+    let (anchors, boundary_m, command) = match serde_json::from_slice::<MetaShape>(bytes) {
+        Ok(MetaShape::Object(o)) => {
+            let o = *o;
+            (o.anchors, o.boundary_m, o.command)
+        }
+        Ok(MetaShape::Anchors(a)) => (a, None, None),
         Err(e) => {
-            tracing::debug!(error = %e, "frame anchor metadata unreadable; ignored");
+            tracing::debug!(error = %e, "frame metadata unreadable; ignored");
+            return SlotMeta::default();
+        }
+    };
+    let command = command.and_then(|v| match serde_json::from_value::<FrameCommandState>(v) {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            tracing::debug!(error = %e, "frame command state unreadable; ignored");
             None
         }
+    });
+    SlotMeta {
+        anchors: (!anchors.is_empty()).then(|| Arc::new(anchors)),
+        boundary_m: boundary_m.filter(|b| b.is_finite() && *b > 0.0),
+        command,
     }
 }
 
@@ -533,8 +593,8 @@ impl MmapFrameRing {
     }
 
     /// `produce_stamped` plus the frame's metadata bytes. The stamp's `fov`
-    /// is written; its `size` and `anchors` are not (`meta` carries the
-    /// anchors). Metadata beyond the ring's capacity is dropped.
+    /// and live bound are written; its `size`, `anchors`, boundary and
+    /// command state are not (`meta` carries those). Metadata beyond the ring's capacity is dropped.
     pub fn produce_with_meta(
         &mut self,
         width: u32,
@@ -598,6 +658,11 @@ impl MmapFrameRing {
         put_u32(slot, SLOT_OFF_META_LEN, meta_len as u32);
         slot[SLOT_OFF_FOV..SLOT_OFF_FOV + 4]
             .copy_from_slice(&(capture.fov.unwrap_or(0.0) as f32).to_le_bytes());
+        put_f64(
+            slot,
+            SLOT_OFF_LIVE_LIGHT_TIME,
+            capture.live_light_time_s.unwrap_or(f64::NAN),
+        );
         // Pixels.
         slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + rgba.len()].copy_from_slice(rgba);
         if meta_len > 0 {
@@ -682,6 +747,11 @@ impl MmapFrameRing {
                     .unwrap(),
             );
             let fov = f32::from_le_bytes(slot[SLOT_OFF_FOV..SLOT_OFF_FOV + 4].try_into().unwrap());
+            let live_light_time = f64::from_le_bytes(
+                slot[SLOT_OFF_LIVE_LIGHT_TIME..SLOT_OFF_LIVE_LIGHT_TIME + 8]
+                    .try_into()
+                    .unwrap(),
+            );
             let meta_len = u32::from_le_bytes(
                 slot[SLOT_OFF_META_LEN..SLOT_OFF_META_LEN + 4]
                     .try_into()
@@ -708,6 +778,7 @@ impl MmapFrameRing {
                 .slot_atomic_u64(write_index, SLOT_OFF_SEQUENCE)
                 .load(Ordering::Acquire);
             if slot_seq_after == slot_seq_before {
+                let meta = parse_meta(&meta);
                 return Ok(Some(FrameView {
                     width,
                     height,
@@ -719,7 +790,11 @@ impl MmapFrameRing {
                         epoch: capture_epoch,
                         fov: (fov.is_finite() && fov > 0.0).then_some(fov as f64),
                         size: Some((width, height)),
-                        anchors: parse_anchor_meta(&meta),
+                        anchors: meta.anchors,
+                        live_light_time_s: (live_light_time.is_finite() && live_light_time >= 0.0)
+                            .then_some(live_light_time),
+                        boundary_m: meta.boundary_m,
+                        command: meta.command,
                     },
                     pixels,
                 }));
@@ -785,6 +860,7 @@ mod tests {
         assert_eq!(frame.capture.epoch, 7);
         assert_eq!(frame.capture.fov, None, "a pre-1.12 slot reads fov unknown");
         assert_eq!(frame.capture.anchors, None, "and no anchors");
+        assert_eq!(frame.capture.live_light_time_s, Some(0.0), "and no delay");
         assert_eq!(ring.meta_slot_bytes(), 0);
         let want: Vec<u8> = (0..32usize * 18 * 4)
             .map(|i| ((i * 11 + 29) & 0xFF) as u8)
@@ -849,8 +925,8 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// The C# writer's metadata fixture: fov and anchor results ride the
-    /// slot and the trailer after the slots.
+    /// The C# writer's metadata fixture: fov and the live bound ride the
+    /// slot, the boundary, command state and anchor results the trailer.
     #[test]
     fn csharp_written_meta_fixture_reads_back_exactly() {
         let fixture = concat!(
@@ -860,11 +936,53 @@ mod tests {
         let path = tmp_path("csmetafixture");
         fs::copy(fixture, &path).unwrap();
         let ring = MmapFrameRing::open_self_describing(&path).unwrap();
-        assert_eq!(ring.meta_slot_bytes(), 512);
+        assert_eq!(ring.meta_slot_bytes(), 1024);
         let frame = ring.latest().unwrap().expect("fixture must contain frames");
         assert_eq!(frame.sequence, 2);
         assert_eq!(frame.capture.ut, Some(86400.25));
         assert_eq!(frame.capture.fov, Some(42.5));
+        assert_eq!(frame.capture.live_light_time_s, Some(2.5));
+        assert_eq!(frame.capture.boundary_m, Some(0.05));
+        let command = frame
+            .capture
+            .command
+            .clone()
+            .expect("command state in the trailer");
+        assert!(command.has_fix);
+        assert_eq!(command.range_m, Some(1500.5));
+        assert_eq!(command.subject_persistent_id, 42);
+        assert_eq!(command.world_model.as_deref(), Some("model"));
+        assert_eq!(command.world_model_seq, Some(9.0));
+        assert_eq!(command.subject_ut, Some(86398.75));
+        assert_eq!(
+            command.authority.as_ref().map(|a| a.owner.as_str()),
+            Some("mission")
+        );
+        /* The plugin's encoder sets every field: each key it writes reads
+        back and writes out again with the same value. */
+        let raw: serde_json::Value = {
+            let idx = ring
+                .header_atomic_u32(HEADER_OFF_WRITE_INDEX)
+                .load(Ordering::Acquire);
+            let slot = ring.slot_offset(idx) + SLOT_OFF_META_LEN;
+            let len = u32::from_le_bytes(ring.mmap[slot..slot + 4].try_into().unwrap()) as usize;
+            let at = ring.meta_offset(idx);
+            serde_json::from_slice(&ring.mmap[at..at + len]).unwrap()
+        };
+        let written = raw["command"].as_object().expect("command object").clone();
+        let back = serde_json::to_value(&*command).unwrap();
+        let back = back.as_object().unwrap().clone();
+        for (key, value) in &written {
+            let got = back
+                .get(key)
+                .unwrap_or_else(|| panic!("'{key}' is lost on the way through"));
+            let same = match (value.as_f64(), got.as_f64()) {
+                (Some(a), Some(b)) => a == b,
+                _ => value == got,
+            };
+            assert!(same, "'{key}': wrote {value}, read back {got}");
+        }
+        assert_eq!(written.len(), back.len(), "and nothing is added");
         let anchors = frame.capture.anchors.expect("anchors in the trailer");
         assert_eq!(anchors.len(), 1);
         let a = &anchors[0];
@@ -876,6 +994,69 @@ mod tests {
         assert_eq!(a.forward.as_deref(), Some(&[0.0, 0.0, 1.0][..]));
         assert_eq!(a.occluded, Some(false));
         drop(ring);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The first 1.12 builds wrote a bare anchor array; an object carries
+    /// any of its parts; anything else is no metadata, never a lost frame.
+    #[test]
+    fn metadata_reads_either_shape() {
+        let bare = parse_meta(br#"[{"id":"a","inFrame":true}]"#);
+        assert_eq!(bare.anchors.map(|a| a.len()), Some(1));
+        let object = parse_meta(br#"{"boundaryM":0.05,"command":{"hasFix":false,"frameHeightPx":0,"framingFits":true,"occluded":false,"occluder":"","sunlit":false,"subjectPersistentId":0}}"#);
+        assert_eq!(object.boundary_m, Some(0.05));
+        assert!(object.anchors.is_none());
+        assert!(!object.command.expect("command").has_fix);
+        assert_eq!(parse_meta(b"{\"anchors\":7}"), SlotMeta::default());
+        let odd = parse_meta(
+            br#"{"command":{"aimKind":"warp","hasFix":true},"anchors":[{"id":"a","inFrame":true}]}"#,
+        );
+        assert!(
+            odd.command.is_none(),
+            "a command state this reader cannot take is dropped"
+        );
+        assert_eq!(
+            odd.anchors.map(|a| a.len()),
+            Some(1),
+            "and costs the anchors nothing"
+        );
+        assert_eq!(parse_meta(b""), SlotMeta::default());
+    }
+
+    /// A writer older than 1.12 leaves the live bound zero: no delay. One
+    /// that could not read it writes NaN, which stays unknown.
+    #[test]
+    fn live_bound_roundtrips_and_reads_zero_when_unwritten() {
+        let path = tmp_path("light");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        let pixels = vec![0u8; 4 * 4 * 4];
+        let stamp = CaptureStamp {
+            live_light_time_s: Some(23.25),
+            ..CaptureStamp::at(Some(5.0), 1)
+        };
+        writer.produce_stamped(4, 4, 1.0, stamp, &pixels).unwrap();
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert_eq!(
+            reader.latest().unwrap().unwrap().capture.live_light_time_s,
+            Some(23.25)
+        );
+        writer.produce(4, 4, 2.0, &pixels).unwrap();
+        assert_eq!(
+            reader.latest().unwrap().unwrap().capture.live_light_time_s,
+            None,
+            "a stamp with no live bound is written as unknown"
+        );
+        let zero = CaptureStamp {
+            live_light_time_s: Some(0.0),
+            ..CaptureStamp::at(Some(6.0), 1)
+        };
+        writer.produce_stamped(4, 4, 3.0, zero, &pixels).unwrap();
+        assert_eq!(
+            reader.latest().unwrap().unwrap().capture.live_light_time_s,
+            Some(0.0)
+        );
+        drop(reader);
+        drop(writer);
         fs::remove_file(&path).ok();
     }
 

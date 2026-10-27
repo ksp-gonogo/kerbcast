@@ -120,12 +120,12 @@ describe("AnchorMarkers", () => {
   });
 
   it("draws only this client's anchors unless an owner is listed", () => {
-    const game = anchor({ id: "reticle", owner: "gonogo" });
+    const game = anchor({ id: "reticle", owner: "mission-control" });
     const subject = anchor({ id: "subject", owner: "kerbcast" });
     const mine = draw([anchor(), game, subject]);
     expect(mine.container.querySelectorAll("g[data-anchor]")).toHaveLength(1);
     cleanup();
-    const withGame = draw([anchor(), game, subject], { owners: ["gonogo"] });
+    const withGame = draw([anchor(), game, subject], { owners: ["mission-control"] });
     const ids = [...withGame.container.querySelectorAll("g[data-anchor]")].map((g) => g.getAttribute("data-anchor"));
     expect(ids).toEqual(["port", "reticle"]);
   });

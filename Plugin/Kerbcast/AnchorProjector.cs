@@ -19,8 +19,9 @@ namespace Kerbcast
 
         /* Where the rig itself places craft `pid` this frame, with its size and
            whether its own line-of-sight test finds it hidden. False to locate
-           the craft generically. */
-        bool TryLocateVessel(uint pid, out DVec3 world, out double radius, out bool occluded);
+           the craft generically, unless `unseen`: no light from it is arriving,
+           so it has no place in the frame at all. */
+        bool TryLocateVessel(uint pid, out DVec3 world, out double radius, out bool occluded, out bool unseen);
     }
 
     /*
@@ -63,18 +64,48 @@ namespace Kerbcast
             _flightId = flightId;
         }
 
-        /* The frame's metadata: its field of view, and where every anchor on
-           this camera landed in a `width` by `height` frame. */
+        /* The frame's metadata: its field of view, the boundary distance, a
+           command camera's state, and where every anchor on this camera
+           landed in a `width` by `height` frame. */
         public FrameMeta Build(KerbcastCamera cam, int width, int height)
         {
             var near = cam.NearLayer;
             var meta = new FrameMeta { FovDeg = near != null ? near.fieldOfView : cam.Fov };
+            _results.Clear();
+            Project(cam, near, width, height, meta.FovDeg);
+            return Encode(cam, meta);
+        }
+
+        /* A blanked frame's metadata: no anchors, since it shows nothing, but the state that says why. */
+        public FrameMeta BuildBlank(KerbcastCamera cam)
+        {
+            _results.Clear();
+            return Encode(cam, new FrameMeta { FovDeg = cam.Fov });
+        }
+
+        private FrameMeta Encode(KerbcastCamera cam, FrameMeta meta)
+        {
+            CommandFrameState? command = cam.Rig is CommandCameraRig rig ? rig.FrameState : (CommandFrameState?)null;
+            if (KerbcastSettings.EnableTelemetry)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                meta.Length = FrameMetaJson.Encode(LiveLightTime.BoundaryM, command, _results, _sb, ref _buffer, MetaSlotBytes);
+                Telemetry.MetaEncode.Record(Telemetry.Ms(System.Diagnostics.Stopwatch.GetTimestamp() - t0));
+                Telemetry.MetaBytes.Record(meta.Length);
+            }
+            else meta.Length = FrameMetaJson.Encode(LiveLightTime.BoundaryM, command, _results, _sb, ref _buffer, MetaSlotBytes);
+            meta.Json = meta.Length > 0 ? _buffer : null;
+            return meta;
+        }
+
+        private void Project(KerbcastCamera cam, Camera near, int width, int height, float fovDeg)
+        {
             var registry = KerbcastCore.Instance != null ? KerbcastCore.Instance.Anchors : null;
             var rig = cam.Rig as IAnchorRig;
             if (registry != null) registry.ForCamera(_flightId, _anchors);
             else _anchors.Clear();
             rig?.AddOwnAnchors(_anchors);
-            if (_anchors.Count == 0 || width <= 0 || height <= 0) return meta;
+            if (_anchors.Count == 0 || width <= 0 || height <= 0) return;
 
             try
             {
@@ -82,7 +113,7 @@ namespace Kerbcast
                 if (rig == null || !rig.TryRenderPose(out eye, out forward, out up))
                 {
                     var t = near != null ? near.transform : null;
-                    if (t == null) return meta;
+                    if (t == null) return;
                     eye = ToD(t.position);
                     forward = ToD(t.forward).Normalized;
                     up = ToD(t.up).Normalized;
@@ -95,7 +126,7 @@ namespace Kerbcast
                 }
                 else
                 {
-                    CommandCameraMath.PerspectiveTerms(meta.FovDeg, (double)width / height, out m00, out m11);
+                    CommandCameraMath.PerspectiveTerms(fovDeg, (double)width / height, out m00, out m11);
                 }
                 /* Vertical field of view as the projection actually has it. */
                 double fov = 2.0 * Math.Atan(1.0 / m11) * 180.0 / Math.PI;
@@ -105,7 +136,6 @@ namespace Kerbcast
                 bool locked = auth != null && auth.Registered;
                 var policy = locked ? auth.BrowserAnchorPolicy(_flightId) : AnchorPolicy.Full;
 
-                _results.Clear();
                 var frame = new Frame
                 {
                     Cam = cam, Rig = rig, Registry = registry, Eye = eye, Forward = forward, Up = up,
@@ -117,18 +147,16 @@ namespace Kerbcast
                     bool observed = AnchorRules.Observed(owner, locked, policy);
                     if (TryProject(frame, owner, _anchors[i].Value, observed, out var r)) _results.Add(r);
                 }
-                meta.Length = AnchorJson.Encode(_results, _sb, ref _buffer, MetaSlotBytes);
-                meta.Json = meta.Length > 0 ? _buffer : null;
             }
             catch (Exception ex)
             {
+                _results.Clear();
                 if (!_failLogged)
                 {
                     _failLogged = true;
                     Debug.LogWarning($"[Kerbcast][ANCHOR] cam={_flightId} projection threw (logged once): {ex}");
                 }
             }
-            return meta;
         }
 
         private struct Frame
@@ -181,17 +209,26 @@ namespace Kerbcast
                 case AnchorKind.Vessel:
                 {
                     uint pid = f.Registry != null ? f.Registry.Resolve(a.Vessel) : a.Vessel;
-                    if (f.Rig != null && f.Rig.TryLocateVessel(pid, out world, out radius, out occluded))
+                    bool unseen = false;
+                    if (f.Rig != null && f.Rig.TryLocateVessel(pid, out world, out radius, out occluded, out unseen))
                     {
                         occlusionKnown = true;
                         FlightGlobals.FindVessel(pid, out ignoreVessel);
                     }
                     else
                     {
-                        if (!FlightGlobals.FindVessel(pid, out var v) || v == null) return false;
-                        world = ToD(v.packed ? v.GetWorldPos3D() : v.CoMD);
-                        radius = VesselRadius(v, world);
-                        ignoreVessel = v;
+                        if (unseen) return false;
+                        /* Every camera's anchors follow its picture: a craft drawn at its past instant is marked there. */
+                        var sight = f.Cam.Picture.Locate(pid, out world, out radius);
+                        if (sight == OtherSight.Unseen) return false;
+                        if (sight == OtherSight.Past) FlightGlobals.FindVessel(pid, out ignoreVessel);
+                        else
+                        {
+                            if (!FlightGlobals.FindVessel(pid, out var v) || v == null) return false;
+                            world = ToD(v.packed ? v.GetWorldPos3D() : v.CoMD);
+                            radius = VesselRadius(v, world);
+                            ignoreVessel = v;
+                        }
                     }
                     var rt = ignoreVessel != null && ignoreVessel.loaded ? ignoreVessel.ReferenceTransform : null;
                     if (rt != null)
@@ -284,6 +321,10 @@ namespace Kerbcast
             if (a.Vessel != 0) FlightGlobals.FindVessel(registry != null ? registry.Resolve(a.Vessel) : a.Vessel, out v);
             else v = FlightGlobals.ActiveVessel;
             if (v == null) return false;
+            /* Under a signal speed an unloaded craft is drawn at its past instant,
+               and its directions read here are present truth: withheld. */
+            bool delayed = LightTime.SignalSpeed.HasValue;
+            if (delayed && !v.loaded) return false;
             var o = v.orbit;
             DVec3 at = ToD(v.packed ? v.GetWorldPos3D() : v.CoMD);
             switch (a.Direction)
@@ -332,6 +373,7 @@ namespace Kerbcast
                 {
                     var target = v.targetObject;
                     if (target == null || target.GetTransform() == null) return false;
+                    if (delayed && target.GetVessel() != null && !target.GetVessel().loaded) return false;
                     dir = ToD(target.GetTransform().position) - at;
                     break;
                 }
@@ -339,6 +381,7 @@ namespace Kerbcast
                 {
                     var target = v.targetObject;
                     if (target == null) return false;
+                    if (delayed && target.GetVessel() != null && !target.GetVessel().loaded) return false;
                     dir = ToD(v.obt_velocity) - ToD(target.GetObtVelocity());
                     break;
                 }

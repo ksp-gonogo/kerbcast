@@ -90,6 +90,10 @@ export {
 
 export {
   COMMAND_TRACK_LABELS,
+  COMMAND_CENTRE_MAX_ENTRIES,
+  COMMAND_CENTRE_MAX_LAG_UT,
+  CommandCentreHistory,
+  commandTrackFromFrame,
   effectiveCommandTrack,
   commandEventAt,
   formatCommandRange,

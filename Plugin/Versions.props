@@ -1,0 +1,47 @@
+<Project>
+
+  <!--
+    One place for the versions the plugin assemblies carry. KerbcastVersion
+    moves with every release (scripts/bump-version.sh writes it and
+    release.yml checks it against the tag). KerbcastApiVersion is the public
+    API's own line: its minor rises only when Kerbcast.API gains members, and
+    it is the NuGet package version of Kerbcast.API and Kerbcast.API.Testing.
+
+    A project sets KerbcastVersionCode to the lines it wants generated (the
+    *VersionCode properties below) and gets them compiled from obj/.
+  -->
+  <PropertyGroup>
+    <KerbcastVersion>1.11.1</KerbcastVersion>
+    <KerbcastApiVersion>1.0.0</KerbcastApiVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <_KerbcastBase>$([System.Text.RegularExpressions.Regex]::Replace('$(KerbcastVersion)', '-.*$', ''))</_KerbcastBase>
+    <KerbcastMajor>$([System.Version]::Parse('$(_KerbcastBase)').Major)</KerbcastMajor>
+    <KerbcastMinor>$([System.Version]::Parse('$(_KerbcastBase)').Minor)</KerbcastMinor>
+    <KerbcastApiMajor>$([System.Version]::Parse('$(KerbcastApiVersion)').Major)</KerbcastApiMajor>
+    <KerbcastApiMinor>$([System.Version]::Parse('$(KerbcastApiVersion)').Minor)</KerbcastApiMinor>
+
+    <KerbcastPluginVersionCode>
+      [assembly: KSPAssembly(&quot;Kerbcast&quot;, $(KerbcastMajor), $(KerbcastMinor))];
+      [assembly: KSPAssemblyDependency(&quot;KerbcastAPI&quot;, $(KerbcastApiMajor), $(KerbcastApiMinor))]
+    </KerbcastPluginVersionCode>
+    <KerbcastApiVersionCode>
+      [assembly: Kerbcast.Api.KSPAssembly(&quot;KerbcastAPI&quot;, $(KerbcastApiMajor), $(KerbcastApiMinor))];
+      [assembly: System.Reflection.AssemblyFileVersion(&quot;$(KerbcastApiVersion).0&quot;)];
+      namespace Kerbcast.Api { internal static class ApiVersion { internal const int Minor = $(KerbcastApiMinor)%3B } }
+    </KerbcastApiVersionCode>
+  </PropertyGroup>
+
+  <Target Name="KerbcastWriteVersionCode" BeforeTargets="CoreCompile" Condition=" '$(KerbcastVersionCode)' != '' ">
+    <PropertyGroup>
+      <_KerbcastVersionFile>$(IntermediateOutputPath)KerbcastVersion.g.cs</_KerbcastVersionFile>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(_KerbcastVersionFile)" Lines="$(KerbcastVersionCode)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <Compile Include="$(_KerbcastVersionFile)" />
+      <FileWrites Include="$(_KerbcastVersionFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

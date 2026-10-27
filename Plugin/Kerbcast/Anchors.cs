@@ -294,33 +294,6 @@ namespace Kerbcast
             }
             sb.Append('"');
         }
-
-        /* A frame's results as a JSON array in UTF-8, into `buffer` (grown as
-           needed). Results that would take it past `maxBytes` are left out
-           whole, so the array always parses. Returns the byte count, 0 for none. */
-        public static int Encode(List<AnchorResult> results, StringBuilder sb, ref byte[] buffer, int maxBytes)
-        {
-            if (results.Count == 0) return 0;
-            sb.Length = 0;
-            sb.Append('[');
-            int kept = 0;
-            for (int i = 0; i < results.Count; i++)
-            {
-                int mark = sb.Length;
-                if (kept > 0) sb.Append(',');
-                results[i].AppendJson(sb);
-                /* Ids and owners are near enough ASCII that chars bound bytes from below; the exact count is checked after encoding. */
-                if (sb.Length + 1 > maxBytes) { sb.Length = mark; break; }
-                kept++;
-            }
-            if (kept == 0) return 0;
-            sb.Append(']');
-            string text = sb.ToString();
-            int bytes = Encoding.UTF8.GetByteCount(text);
-            if (bytes > maxBytes) return 0;
-            if (buffer == null || buffer.Length < bytes) buffer = new byte[Math.Max(bytes, 1024)];
-            return Encoding.UTF8.GetBytes(text, 0, text.Length, buffer, 0);
-        }
     }
 
     /* Every anchor in the scene, keyed by owner then camera. Browser clients'

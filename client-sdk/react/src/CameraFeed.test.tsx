@@ -2752,6 +2752,7 @@ describe("CameraFeed - recording locks source and close", () => {
 describe("CameraFeed - command camera target brackets", () => {
   const STATION: CommandCentreInfo = {
     stationId: "ground:KSC",
+    siteKey: "KSC",
     nodeName: "KSC",
     displayName: "Kerbal Space Center",
     body: "Kerbin",
@@ -2811,7 +2812,7 @@ describe("CameraFeed - command camera target brackets", () => {
     const first = renderFeed(client, { flightId: 301 });
     fireEvent.click(screen.getByRole("button", { name: "Target brackets" }));
     expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
-    expect(localStorage.getItem("kerbcast:target-brackets:ground:KSC")).toBe("0");
+    expect(localStorage.getItem("kerbcast:target-brackets:KSC")).toBe("0");
     first.unmount();
 
     renderFeed(client, { flightId: 301 });
@@ -2821,22 +2822,32 @@ describe("CameraFeed - command camera target brackets", () => {
     ).toBe("false");
   });
 
-  it("still labels a blanked feed with the brackets toggled off", async () => {
+  it("carries a brackets-off choice saved under the 1.11 key over to the site key", async () => {
     localStorage.setItem("kerbcast:target-brackets:ground:KSC", "0");
+    const { client } = await buildConnectedSource([commandCamera()]);
+    renderFeed(client, { flightId: 301 });
+    expect(
+      screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(localStorage.getItem("kerbcast:target-brackets:KSC")).toBe("0");
+    expect(localStorage.getItem("kerbcast:target-brackets:ground:KSC")).toBeNull();
+  });
+
+  it("still labels a blanked feed with the brackets toggled off", async () => {
+    localStorage.setItem("kerbcast:target-brackets:KSC", "0");
     const { client, sidecar } = await buildConnectedSource([commandCamera()]);
     renderFeed(client, { flightId: 301 });
     expect(screen.queryByRole("status", { name: "Feed blanked" })).toBeNull();
     await act(async () => {
-      sidecar.updateCamera(301, { commandTrack: commandTrack({ blank: "Waiting for gonogo" }) });
+      sidecar.updateCamera(301, { commandTrack: commandTrack({ blank: "Waiting for mission control" }) });
     });
     expect(screen.getByRole("status", { name: "Feed blanked" }).textContent).toBe(
-      "Waiting for gonogo",
+      "Waiting for mission control",
     );
   });
 
   it("shows the transition in force at the displayed UT", async () => {
     const track = commandTrack({
-      authority: { owner: "gonogo" },
       events: [
         { ut: 990, occluded: true, occluder: "Mun", sunlit: true },
         { ut: 999, occluded: false, occluder: "", sunlit: true },
@@ -3035,7 +3046,7 @@ describe("CameraFeed - command camera target brackets", () => {
           kind: CameraKind.Command,
           cameraName: "KSC tracking",
           commandCentre: TARGETS,
-          commandTrack: commandTrack({ authority: { owner: "gonogo" } }),
+          commandTrack: commandTrack({ authority: { owner: "mission-control" } }),
         }),
       ]);
       const lockedView = renderFeed(locked.client, { flightId: 301 });

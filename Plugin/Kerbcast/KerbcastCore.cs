@@ -56,8 +56,8 @@ namespace Kerbcast
         private static readonly string RingDir = ResolveRingDir();
 
         /* Live singleton for the flight scene, set in Awake / cleared in
-           OnDestroy. The in-process KerbcastControl facade (used by the
-           kOS add-on) resolves cameras through this. */
+           OnDestroy. Kerbcast.API's implementation resolves cameras through
+           this, and is KerbcastApi.Instance exactly while it is set. */
         public static KerbcastCore Instance { get; private set; }
 
         /* Live at the Space Center: feeds are up outside flight, which the
@@ -68,8 +68,8 @@ namespace Kerbcast
         // Read-only view of the tracked cameras for the KerbcastControl facade.
         internal System.Collections.Generic.IReadOnlyList<ICamera> Cameras => _cameras;
 
-        /* gonogo's authority over the command feeds; one per scene, so a scene
-           change ends any registration. */
+        /* The command lock holder's authority over the command feeds; one per
+           scene, so a scene change ends any registration. */
         internal CommandAuthority CommandAuthority { get; } = new CommandAuthority();
 
         /* ~0.5s at 60fps: long enough that a transient scene-change hiccup
@@ -221,6 +221,7 @@ namespace Kerbcast
 
         private void Awake()
         {
+            VesselIdentity.EnsureHooked();
             _atSpaceCenter = HighLogic.LoadedScene == GameScenes.SPACECENTER;
             if (_atSpaceCenter)
             {
@@ -243,6 +244,7 @@ namespace Kerbcast
             }
 
             Instance = this;
+            KerbcastApiImpl.Start();
             Debug.Log($"[Kerbcast] KerbcastCore.Awake: initialising (scene={HighLogic.LoadedScene})");
 
             if (_settings == null) _settings = KerbcastSettings.Load();
@@ -266,6 +268,7 @@ namespace Kerbcast
                 if (_settings.EnableCommandCamera)
                     Debug.Log("[Kerbcast][CMDCAM] scene start: flight, command camera follows the active craft");
             }
+            StartReservedLock();
             _staggerController = BuildStaggerController(_settings);
             /* Only built when the operator permits background capture at all:
                with the ceiling at 0 nothing can ever background capture, so there is nothing to
@@ -477,13 +480,20 @@ namespace Kerbcast
             _captureEpoch.Bump();
             _teardown.OnSceneLoadRequested();
             CommandAuthority.Reset();
+            CommandAuthority.WorldModel.Close();
             /* Restore now, before the scene tears down. Camera ScaledSpace and
                GalaxyCamera survive into the next scene, so a throttle left on
                them would keep the next scene's main view in an 8x8 corner. */
             RestoreMainScreen();
         }
 
-        private void OnGameStatePostLoad(ConfigNode node) => _captureEpoch.Bump();
+        /* A game-state load inside the scene also leaves the world model's
+           snapshot describing a timeline that is gone. */
+        private void OnGameStatePostLoad(ConfigNode node)
+        {
+            _captureEpoch.Bump();
+            CommandAuthority.WorldModel.InvalidateForLoad();
+        }
 
         private void MarkFxDirtyForVessel(Vessel v)
         {
@@ -681,8 +691,29 @@ namespace Kerbcast
             Anchors.Merged(oldPid, newPid);
         }
 
+        /* A reservation starts the scene locked for its owner, with every craft
+           unknown until it attaches. It lapses once per process if its
+           assembly is not loaded. */
+        private void StartReservedLock()
+        {
+            LockReservationStore.CheckLapse();
+            var r = LockReservationStore.Reservation;
+            if (!r.Held || !LockReservationStore.AssemblyLoaded(r.Assembly)) return;
+            KerbcastControl.TakeLockCore(r.Owner, Api.LockOptions.WorldModelRequired, r.SilentText);
+            _reservedHeartbeatPending = true;
+            Debug.Log($"[Kerbcast][CMDCAM] scene starts locked for {r.Owner} (reserved)");
+        }
+
+        private bool _reservedHeartbeatPending;
+
         private void ApplyCommandRequest(CommandCameraRequest r)
         {
+            string holder = CommandAuthority.Owner;
+            if (holder != null && (r.Op == CommandRequestOp.Create || r.Op == CommandRequestOp.Destroy))
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: {holder} holds the command lock; command cameras are not {(r.Op == CommandRequestOp.Create ? "created" : "destroyed")} by clients");
+                return;
+            }
             switch (r.Op)
             {
                 case CommandRequestOp.Create:
@@ -803,12 +834,24 @@ namespace Kerbcast
                     Destroy(KerbcastSidecarHost.Instance.gameObject);
                 /* Cleared now rather than in the deferred OnDestroy, so
                    KerbcastControl reads as inactive from this frame on. */
-                if (Instance == this) Instance = null;
+                if (Instance == this)
+                {
+                    Instance = null;
+                    KerbcastApiImpl.Stop();
+                }
                 enabled = false;
                 Destroy(this);
                 return;
             }
 
+            /* A reserved lock is taken at Awake so nothing runs unlocked, but
+               its silence clock starts with the first frame: a long scene load
+               must not time the owner out before it can call. */
+            if (_reservedHeartbeatPending)
+            {
+                _reservedHeartbeatPending = false;
+                CommandAuthority.Heartbeat(Time.realtimeSinceStartup);
+            }
             UpdateFpsAverage();
             MaybeApplyCommandRequests();
             DropLostVantages();
@@ -1435,21 +1478,15 @@ namespace Kerbcast
            is watching the feed. */
         private static void AppendCommandFields(System.Text.StringBuilder sb, CommandCameraRig gr)
         {
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
             gr.Poll();
-            sb.Append($"      \"occluded\": {(gr.Occluded ? "true" : "false")},\n");
-            sb.Append($"      \"blocker\": \"{JsonEsc(gr.Blocker)}\",\n");
-            sb.Append($"      \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
-            sb.Append($"      \"elevationDeg\": {(gr.HasFix ? gr.ElevationDeg.ToString("F3", ci) : "null")},\n");
-            sb.Append($"      \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
-            sb.Append($"      \"subjectPersistentId\": {gr.SubjectPersistentId},\n");
-            sb.Append($"      \"subjectName\": \"{JsonEsc(gr.SubjectName)}\",\n");
+            var state = gr.StateNow();
+            CommandTrackJson.AppendCameraFields(sb, state, gr.ElevationDeg, gr.SubjectName);
             AppendCommandCentre(sb, gr);
-            AppendCommandTrack(sb, gr);
+            AppendCommandTrack(sb, gr, state);
         }
 
         /* The wire's CommandAimKind tag. */
-        private static string AimKindTag(CommandAimKind kind)
+        internal static string AimKindTag(CommandAimKind kind)
         {
             switch (kind)
             {
@@ -1469,7 +1506,7 @@ namespace Kerbcast
             var ci = System.Globalization.CultureInfo.InvariantCulture;
             double ut = Planetarium.GetUniversalTime();
             List<CommandTargetView> targets;
-            try { targets = CommandCameraTargets.List(gr.Site, ut); }
+            try { targets = CommandCameraTargets.List(gr.Site, ut, gr.FovMax); }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] target list failed: {ex.Message}");
@@ -1485,6 +1522,8 @@ namespace Kerbcast
                 : CommandCameraTargets.RoundRange(m).ToString("R", ci);
 
             sb.Append("      \"commandCentre\": {\n");
+            sb.Append($"        \"ut\": {ut.ToString("R", ci)},\n");
+            sb.Append($"        \"vantagePersistentId\": {gr.Site.VantagePersistentId},\n");
             if (gr.Aim != null) sb.Append($"        \"aimKind\": \"{AimKindTag(gr.Aim.Kind)}\",\n");
             sb.Append($"        \"subjectPersistentId\": {pid},\n");
             sb.Append($"        \"rangeM\": {Range(range)},\n");
@@ -1502,44 +1541,13 @@ namespace Kerbcast
             sb.Append("      },\n");
         }
 
-        /* The bracket contract: camera-axis state at the aimed point, the
-           registered authority, any blank, and the recent discrete transitions
-           with the exact UT of each. */
-        private static void AppendCommandTrack(System.Text.StringBuilder sb, CommandCameraRig gr)
+        /* The bracket contract for clients older than 1.12 (CommandTrackJson). Newer clients read the state from each frame. */
+        private static void AppendCommandTrack(System.Text.StringBuilder sb, CommandCameraRig gr, CommandFrameState state)
         {
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
-            sb.Append("      \"commandTrack\": {\n");
-            sb.Append($"        \"ut\": {gr.TrackUt.ToString("R", ci)},\n");
-            sb.Append($"        \"hasFix\": {(gr.HasFix ? "true" : "false")},\n");
-            sb.Append($"        \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
-            sb.Append($"        \"occluded\": {(gr.Occluded ? "true" : "false")},\n");
-            sb.Append($"        \"occluder\": \"{JsonEsc(gr.Blocker)}\",\n");
-            sb.Append($"        \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
-            sb.Append($"        \"bracketHalfPx\": {(gr.HasFix ? gr.BracketHalfPx.ToString("0.###", ci) : "null")},\n");
-            sb.Append($"        \"frameHeightPx\": {gr.FrameHeightPx},\n");
-            sb.Append($"        \"framingFits\": {(gr.FramingFits ? "true" : "false")},\n");
-            var offset = gr.ReportedTrueOffsetPx;
-            sb.Append($"        \"trueOffsetPx\": {(offset.HasValue ? offset.Value.ToString("0.###", ci) : "null")},\n");
-            sb.Append(gr.AuthorityOwner == null
-                ? "        \"authority\": null,\n"
-                : $"        \"authority\": {{ \"owner\": \"{JsonEsc(gr.AuthorityOwner)}\" }},\n");
-            sb.Append($"        \"blank\": {JsonStringOrNull(gr.Blank)},\n");
-            sb.Append("        \"events\": [");
-            var events = gr.TrackEvents();
-            for (int i = 0; i < events.Count; i++)
-            {
-                var e = events[i];
-                sb.Append(i == 0 ? "\n" : ",\n");
-                sb.Append($"          {{ \"ut\": {e.Ut.ToString("R", ci)}, \"occluded\": {(e.Occluded ? "true" : "false")}, "
-                    + $"\"occluder\": \"{JsonEsc(e.Occluder)}\", \"sunlit\": {(e.Sunlit ? "true" : "false")}, "
-                    + $"\"blank\": {JsonStringOrNull(e.Blank)}"
-                    + (e.Predicted ? ", \"predicted\": true }" : " }"));
-            }
-            sb.Append(events.Count > 0 ? "\n        ]\n" : "]\n");
-            sb.Append("      },\n");
+            sb.Append("      \"commandTrack\": ");
+            CommandTrackJson.Append(sb, gr.TrackUt, state, gr.TrackEvents());
+            sb.Append(",\n");
         }
-
-        private static string JsonStringOrNull(string s) => s == null ? "null" : $"\"{JsonEsc(s)}\"";
 
         private static string JsonEsc(string s)
         {
@@ -1656,9 +1664,71 @@ namespace Kerbcast
             // player. Informational only; lead with the collection counts above,
             // which are reliable.
             sb.Append($"      \"monoHeapBytes\": {UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong()}\n");
-            sb.Append("    }\n");
+            sb.Append("    },\n");
 
+            AppendCosts(sb, ci);
             sb.Append("  }");
+        }
+
+        /*
+         * The 1.12 costs, beside phasesMs and gc in the telemetry block. A time
+         * or size is { "ms" | "bytes": last, "emaMs" | "emaBytes": EMA,
+         * "maxMs" | "maxBytes": the largest since the previous write }, null
+         * until anything was recorded; counts and rates are plain numbers.
+         * Each interval max resets on the write, like the phases.
+         *
+         *   ringTickMs        the light-time history's sampling, per physics tick
+         *   ringEntriesPerS   history entries written per second since the previous write
+         *   ringMB            history memory, as the ring counts it
+         *   ringTracks        history tracks (craft, bodies and ghosts)
+         *   ringBodyTracks    of those, body tracks (sampled under Principia)
+         *   pictureMs         past-instant sight solves, per rendered frame, summed over lenses
+         *   pictureLenses     lenses with sights kept
+         *   liveLightMs       the live light-time bound's walk over the lens craft's parts, per camera frame
+         *   metaBytes         frame-metadata JSON written, per camera frame
+         *   metaEncodeMs      encoding it, per camera frame
+         *   worldModelFillMs  copying an accepted world-model snapshot, per publish, on the publisher's thread
+         *   worldModelRecords records in the current snapshot
+         *   saveMs, loadMs    the history's save into and load from the save file; read the last value
+         *                     (they happen at saves and loads, not every interval)
+         */
+        private static void AppendCosts(System.Text.StringBuilder sb, System.Globalization.CultureInfo ci)
+        {
+            var ring = LightHistoryHost.History;
+            int bodyTracks = 0;
+            foreach (var t in ring.Tracks) if (t.IsBody) bodyTracks++;
+            double entriesPerS = Telemetry.RingEntries.TakeInterval(ring.EntriesWritten, Time.realtimeSinceStartup);
+            var store = KerbcastCore.Instance?.CommandAuthority.WorldModel;
+            sb.Append("    \"costs\": {\n");
+            AppendCost(sb, "ringTickMs", "Ms", Telemetry.RingTick.TakeInterval(), ci);
+            sb.Append($"      \"ringEntriesPerS\": {entriesPerS.ToString("F1", ci)},\n");
+            sb.Append($"      \"ringMB\": {(ring.Bytes / (1024.0 * 1024.0)).ToString("F3", ci)},\n");
+            sb.Append($"      \"ringTracks\": {ring.TrackCount},\n");
+            sb.Append($"      \"ringBodyTracks\": {bodyTracks},\n");
+            AppendCost(sb, "pictureMs", "Ms", Telemetry.Picture.TakeInterval(), ci);
+            sb.Append($"      \"pictureLenses\": {PicturePass.LensCount},\n");
+            AppendCost(sb, "liveLightMs", "Ms", Telemetry.LiveLight.TakeInterval(), ci);
+            AppendCost(sb, "metaBytes", "Bytes", Telemetry.MetaBytes.TakeInterval(), ci);
+            AppendCost(sb, "metaEncodeMs", "Ms", Telemetry.MetaEncode.TakeInterval(), ci);
+            AppendCost(sb, "worldModelFillMs", "Ms", Telemetry.WorldModelFill.TakeInterval(), ci);
+            sb.Append($"      \"worldModelRecords\": {store?.CurrentRecords ?? 0},\n");
+            AppendCost(sb, "saveMs", "Ms", Telemetry.Save.TakeInterval(), ci);
+            AppendCost(sb, "loadMs", "Ms", Telemetry.Load.TakeInterval(), ci, lastField: true);
+            sb.Append("    }\n");
+        }
+
+        private static void AppendCost(System.Text.StringBuilder sb, string name, string unit, CostReading r,
+            System.Globalization.CultureInfo ci, bool lastField = false)
+        {
+            string end = lastField ? "\n" : ",\n";
+            string lower = unit.ToLowerInvariant();
+            if (!r.Seen)
+            {
+                sb.Append($"      \"{name}\": null{end}");
+                return;
+            }
+            sb.Append($"      \"{name}\": {{ \"{lower}\": {r.Last.ToString("F3", ci)}, \"ema{unit}\": {r.Ema.ToString("F3", ci)}, "
+                + $"\"max{unit}\": {r.Max.ToString("F3", ci)}, \"count\": {r.Count} }}{end}");
         }
 
         // One phase row: { "ms": <sum-of-last>, "emaMs": <sum-of-ema>, "maxMs":
@@ -1813,7 +1883,12 @@ namespace Kerbcast
         private void OnDestroy()
         {
             if (_disabled) return;
-            if (Instance == this) Instance = null;
+            if (Instance == this)
+            {
+                Instance = null;
+                KerbcastApiImpl.Stop();
+            }
+            CommandAuthority.WorldModel.Close();
 
             // ALWAYS restore the main flight cameras on scene exit so a
             // revert / quit-to-KSC / quit-to-main-menu doesn't leave KSP

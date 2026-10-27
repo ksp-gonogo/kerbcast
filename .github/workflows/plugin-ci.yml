@@ -50,11 +50,20 @@ jobs:
             /p:KspManaged="${{ github.workspace }}/ksp-managed/KSP_Data/Managed" \
             /p:KspGameData="${{ github.workspace }}/ksp-managed/GameData"
 
+      # The development world-model provider ships in no release, but builds
+      # here so it keeps compiling against Kerbcast.API's public surface.
+      - name: Build Kerbcast.DevProvider.dll
+        run: |
+          dotnet build Plugin/Kerbcast.DevProvider/Kerbcast.DevProvider.csproj -c Release \
+            /p:KspManaged="${{ github.workspace }}/ksp-managed/KSP_Data/Managed"
+
       - name: Upload Kerbcast.dll
         uses: actions/upload-artifact@v7
         with:
           name: kerbcast-plugin
-          path: Plugin/obj/Release/Kerbcast.dll
+          path: |
+            Plugin/obj/Release/Kerbcast.dll
+            Plugin/Kerbcast.API/bin/Release/Kerbcast.API.dll
           if-no-files-found: error
 
   # The Plugin/*.Tests projects are Unity-free harnesses (exit 0 = pass):
@@ -69,6 +78,12 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.x'
+
+      # The API assemblies need no KSP references; building them here keeps
+      # their XML docs warning-free, which the test harness below cannot see.
+      - name: Build Kerbcast.API and Kerbcast.API.Testing
+        run: |
+          dotnet build Plugin/Kerbcast.API.Testing/Kerbcast.API.Testing.csproj -c Release -warnaserror
 
       - name: Run plugin test harnesses
         run: |

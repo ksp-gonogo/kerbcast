@@ -4,12 +4,12 @@
  * which it is, and a host override beats both.
  */
 
-import { KerbcastClient, type CommandTrackEvent } from "@ksp-gonogo/kerbcast";
+import { KerbcastClient, type CommandTrackEvent, type FrameCommandState } from "@ksp-gonogo/kerbcast";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { KerbcastProvider } from "../context";
-import { crossesEvent, useCommandDisplayUt, type CommandDisplayUt } from "./useCommandDisplayUt";
+import { commandShownKey, crossesEvent, useCommandDisplayUt, type CommandDisplayUt } from "./useCommandDisplayUt";
 import { useDisplayedFrameUt } from "./useDisplayedFrameUt";
 
 async function connected() {
@@ -54,10 +54,11 @@ const event = (ut: number): CommandTrackEvent =>
 let last: CommandDisplayUt | null | undefined;
 function CommandProbe(props: {
   override?: number;
+  overrideCommand?: FrameCommandState;
   events?: CommandTrackEvent[];
   video: HTMLVideoElement | null;
 }) {
-  last = useCommandDisplayUt(true, props.override, props.events, 7, props.video);
+  last = useCommandDisplayUt(true, props.override, props.events, 7, props.video, props.overrideCommand);
   return null;
 }
 
@@ -104,6 +105,75 @@ describe("useCommandDisplayUt", () => {
     expect(last?.ut).toBe(999.8);
     present(3);
     expect(last?.ut).toBe(999.95);
+  });
+
+  it("carries the displayed frame's command state and re-renders when what it shows changes", async () => {
+    const { client, sidecar } = await connected();
+    const { video, present } = fakeVideo();
+    render(
+      <KerbcastProvider client={client}>
+        <CommandProbe video={video} />
+      </KerbcastProvider>,
+    );
+    const command = (rangeM: number, occluded = false) => ({
+      hasFix: true,
+      rangeM,
+      frameHeightPx: 720,
+      framingFits: true,
+      occluded,
+      occluder: occluded ? "Mun" : "",
+      sunlit: true,
+      subjectPersistentId: 42,
+    });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 1, captureUt: 999.8, captureEpoch: 0, command: command(1500) });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 2, captureUt: 999.85, captureEpoch: 0, command: command(1500.4) });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 3, captureUt: 999.9, captureEpoch: 0, command: command(1500.4, true) });
+    present(1);
+    expect(last).toMatchObject({ ut: 999.8, source: "exact", command: { rangeM: 1500 } });
+    /* A range change below what the readout shows keeps the frame shown. */
+    present(2);
+    expect(last?.ut).toBe(999.8);
+    present(3);
+    expect(last).toMatchObject({ ut: 999.9, command: { occluded: true, occluder: "Mun" } });
+  });
+
+  it("keeps the command state of a frame it can only estimate, which lags the picture", async () => {
+    const { client, sidecar } = await connected();
+    const { video, present } = fakeVideo();
+    render(
+      <KerbcastProvider client={client}>
+        <CommandProbe video={video} />
+      </KerbcastProvider>,
+    );
+    const command: FrameCommandState = {
+      hasFix: true, rangeM: 900, frameHeightPx: 720, framingFits: true, occluded: false, occluder: "", sunlit: true, subjectPersistentId: 42,
+    };
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 1, captureUt: 999.8, captureEpoch: 0, command });
+    present(1);
+    /* A frame the browser cannot identify falls back to the last exact one: estimated, but its state still applies. */
+    present(55555);
+    expect(last).toMatchObject({ ut: 999.8, source: "estimated", command: { rangeM: 900 } });
+  });
+
+  it("takes a delayed host's own frame state with its override", async () => {
+    const { client } = await connected();
+    const command: FrameCommandState = {
+      hasFix: true, rangeM: 1200, frameHeightPx: 720, framingFits: true, occluded: true, occluder: "Mun", sunlit: true, subjectPersistentId: 42,
+    };
+    render(
+      <KerbcastProvider client={client}>
+        <CommandProbe video={null} override={950} overrideCommand={command} />
+      </KerbcastProvider>,
+    );
+    expect(last).toEqual({ ut: 950, source: "override", command });
+  });
+
+  it("matches the command state's shown key to what a viewer sees", () => {
+    const base = { hasFix: true, frameHeightPx: 720, framingFits: true, occluded: false, occluder: "", sunlit: true, subjectPersistentId: 1 };
+    expect(commandShownKey({ ...base, rangeM: 1500 })).toBe(commandShownKey({ ...base, rangeM: 1501 }));
+    expect(commandShownKey({ ...base, rangeM: 1500 })).not.toBe(commandShownKey({ ...base, rangeM: 1600 }));
+    expect(commandShownKey({ ...base, refusal: "stale" })).not.toBe(commandShownKey(base));
+    expect(commandShownKey(undefined)).toBe("");
   });
 
   it("prefers a host override over the displayed frame", async () => {

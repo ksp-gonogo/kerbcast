@@ -86,7 +86,7 @@ describe("MockSidecar", () => {
     expect(centre()?.aimKind).toBe(CommandAimKind.Direction);
     expect(centre()?.subjectPersistentId).toBe(5);
 
-    sidecar.setCommandAuthority("gonogo");
+    sidecar.setCommandAuthority("mission-control");
     await expect(client.setCommandAim(pad.flightId, null)).rejects.toBeInstanceOf(CommandLockedError);
 
     sidecar.setCommandAuthority(null);

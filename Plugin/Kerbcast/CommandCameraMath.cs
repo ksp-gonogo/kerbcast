@@ -177,8 +177,8 @@ namespace Kerbcast
             return Math.Exp(Math.Log(current) + alpha * (Math.Log(target) - Math.Log(current)));
         }
 
-        /* True when no part of the segment a-b passes inside the sphere. Same rule
-           as gonogo's sight lines: a body blocks, nothing else does. */
+        /* True when no part of the segment a-b passes inside the sphere: a body
+           blocks a sight line, nothing else does. */
         public static bool SegmentClearOfSphere(DVec3 a, DVec3 b, DVec3 centre, double radius)
         {
             if (radius <= 0) return true;
@@ -255,6 +255,43 @@ namespace Kerbcast
             return r < min ? min : r;
         }
 
+        /* The boundary light time τ, one 60 fps frame: craft nearer to the lens than its light covers in τ are drawn at render UT. */
+        public const double BoundaryLightTimeS = 1.0 / 60.0;
+
+        /*
+         * A frame's live bound: the light time covering what of the lens's
+         * own craft and site it draws at render UT. That is the larger of τ
+         * and the light time from the lens to the farthest reach of its own
+         * craft (`farthestOwnPartM`, 0 with none). 0 with no signal speed,
+         * when nothing is delayed. Other loaded craft are still drawn at
+         * render UT and are not covered until those beyond the boundary are
+         * hidden.
+         */
+        public static double LiveLightTimeS(double? signalSpeed, double farthestOwnPartM)
+        {
+            if (!signalSpeed.HasValue || !(signalSpeed.Value > 0)) return 0;
+            double own = farthestOwnPartM > 0 && !double.IsInfinity(farthestOwnPartM) ? farthestOwnPartM / signalSpeed.Value : 0;
+            return Math.Max(BoundaryLightTimeS, own);
+        }
+
+        /* How far light travels in τ, the boundary distance; NaN with no signal speed. */
+        public static double BoundaryM(double? signalSpeed) =>
+            signalSpeed.HasValue && signalSpeed.Value > 0 ? signalSpeed.Value * BoundaryLightTimeS : double.NaN;
+
+        /* The farthest reach of a craft from `lens`: each part's origin distance plus that part's own radius. 0 for no parts. */
+        public static double FarthestPartM(DVec3 lens, IList<DVec3> origins, IList<double> radii)
+        {
+            double far = 0;
+            if (origins == null) return far;
+            for (int i = 0; i < origins.Count; i++)
+            {
+                double r = radii != null && i < radii.Count && radii[i] > 0 ? radii[i] : 0;
+                double d = (origins[i] - lens).Magnitude + r;
+                if (d > far) far = d;
+            }
+            return far;
+        }
+
         /* Float epsilon: Unity world positions are single precision. */
         public const double FloatEpsilon = 1.1920929e-7;
 
@@ -298,18 +335,29 @@ namespace Kerbcast
             return Math.Asin(radius / distance) <= fovMaxDeg * 0.5 * Deg2Rad;
         }
 
-        public const string BlankNotResponding = "gonogo not responding";
+        /* What a silent lock holder's feeds show when it gave no words of its own. */
+        public const string DefaultSilentText = "Authority not responding";
+
+        [System.Obsolete("A silent holder's feeds show its own silence text, or DefaultSilentText")]
+        public const string BlankNotResponding = DefaultSilentText;
+
         public const string BlankVantageGone = "vantage craft gone";
 
         /* Why a command feed is blanked, or null to show it. A lens whose
            vantage craft no longer exists has no position, so that blanks with
            or without a lock. Otherwise only a held lock blanks: a silent holder
-           beats everything, then the holder's own blank. */
-        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone = false)
+           beats everything, showing its silence text, then the holder's own
+           blank. */
+        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone = false) =>
+            BlankReason(governed, timedOut, explicitBlank, vantageGone, null);
+
+        /* As above, showing `silentText` (null for DefaultSilentText) for a silent holder. */
+        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone,
+            string silentText)
         {
             if (vantageGone) return BlankVantageGone;
             if (!governed) return null;
-            if (timedOut) return BlankNotResponding;
+            if (timedOut) return string.IsNullOrEmpty(silentText) ? DefaultSilentText : silentText;
             if (!string.IsNullOrEmpty(explicitBlank)) return explicitBlank;
             return null;
         }
@@ -369,6 +417,14 @@ namespace Kerbcast
         public const string EligibleTooFar = "tooFar";
         public const string EligibleLevelTooLow = "levelTooLow";
         public const string EligibleNotTrackable = "notTrackable";
+        internal const string EligibleNotPositioned = "notPositioned";
+        internal const string EligibleRefused = "refused";
+        internal const string EligibleStale = "stale";
+        internal const string EligibleTooUncertain = "tooUncertain";
+        /* The radius a craft is framed by when its source gives no size. */
+        internal const double NominalCraftRadiusM = 2.0;
+        /* The refusal code of a record outside its window, or of any record while the snapshot is invalid. */
+        internal const string RefusalStale = "stale";
 
         /* The 1-based Tracking Station level from KSP's normalised level and its
            highest level index (stock 2, three levels). A highest index below 1
@@ -398,6 +454,31 @@ namespace Kerbcast
             return EligibleOk;
         }
 
+        /*
+         * A targets-list row's code from what the fix source holds, first match
+         * wins: no row for an unknown craft (null), stale or refused for a
+         * refused record, notPositioned for a listed one (it has no range for
+         * the career rules), and `careerCode` (from Eligibility) for a
+         * positioned one, then tooUncertain when the career rules pass. With
+         * `listedTakesCareerRules` a listed craft takes the career rules with
+         * no range instead, as 1.11 listed a craft KSP could not place.
+         */
+        internal static string TargetEligibility(CraftFixState state, string refusalCode, bool listedTakesCareerRules,
+            string careerCode, bool tooUncertain = false)
+        {
+            switch (state)
+            {
+                case CraftFixState.Refused:
+                    return refusalCode == RefusalStale ? EligibleStale : EligibleRefused;
+                case CraftFixState.Listed:
+                    return listedTakesCareerRules ? careerCode : EligibleNotPositioned;
+                case CraftFixState.Positioned:
+                    return careerCode == EligibleOk && tooUncertain ? EligibleTooUncertain : careerCode;
+                default:
+                    return null;
+            }
+        }
+
         public static string EligibilityText(string code)
         {
             switch (code)
@@ -406,6 +487,10 @@ namespace Kerbcast
                 case EligibleTooFar: return "Out of tracking range";
                 case EligibleLevelTooLow: return "Upgrade the Tracking Station";
                 case EligibleNotTrackable: return "Not tracked";
+                case EligibleNotPositioned: return "Position not known";
+                case EligibleRefused: return "Refused";
+                case EligibleStale: return "Out of date";
+                case EligibleTooUncertain: return "Position too uncertain";
                 default: return "";
             }
         }
@@ -1246,6 +1331,53 @@ namespace Kerbcast
             for (int t = 0; t < TriangleCount; t++)
                 if (TriangleHit(t, a, d, 1.0)) return true;
             return false;
+        }
+    }
+
+    /*
+     * How far each part's model reaches from its origin, for the live bound.
+     * A reach only ever grows: a canopy that opens or a panel that unfolds
+     * raises it at once and it never falls back, so the bound can be late
+     * but never early. A part whose shape can move (`moves`) is measured on
+     * every frame; any other one every RefreshFrames frames. A measurement
+     * of nothing (NaN: no renderer active yet) keeps the reach so far and is
+     * tried again on the next frame, so a part is picked up once it shows.
+     */
+    internal sealed class ReachCache
+    {
+        public const int RefreshFrames = 120;
+        /* Past this many remembered parts the cache starts again, so parts long gone do not pile up. */
+        public const int Cap = 4096;
+
+        private struct Entry
+        {
+            public double Reach;
+            public long MeasuredFrame;
+            public bool Measured;
+        }
+
+        private readonly Dictionary<int, Entry> _entries = new Dictionary<int, Entry>();
+
+        public int Count => _entries.Count;
+
+        public double Reach<T>(int key, long frame, bool moves, Func<T, double> measure, T subject)
+        {
+            bool known = _entries.TryGetValue(key, out var e);
+            bool due = !known || !e.Measured || moves || frame - e.MeasuredFrame >= RefreshFrames;
+            if (!due) return e.Reach;
+            if (e.MeasuredFrame == frame && known && e.Measured) return e.Reach;
+            double m = measure(subject);
+            if (!known && _entries.Count >= Cap) _entries.Clear();
+            if (double.IsNaN(m) || double.IsInfinity(m) || m < 0)
+            {
+                _entries[key] = new Entry { Reach = e.Reach, MeasuredFrame = frame, Measured = false };
+                return e.Reach;
+            }
+            e.Reach = Math.Max(e.Reach, m);
+            e.MeasuredFrame = frame;
+            e.Measured = true;
+            _entries[key] = e;
+            return e.Reach;
         }
     }
 }

@@ -121,6 +121,21 @@ tiles. If you'd rather see them as ordinary tiles in the main grid, turn on
 "Merge crew into the camera list" in Settings. With merge off they appear only
 in the crew bar; with merge on only in the grid.
 
+## A command camera lists no craft after an upgrade
+
+The game and the sidecar ship together and must match. A sidecar older than
+1.12 running against a 1.12 game (a leftover copy staged by hand under
+`GameData/Kerbcast/Sidecar/`, say) drops a command camera's whole craft list
+as soon as a mod that publishes a world model marks one craft in a way it
+does not know. Reinstall the whole Kerbcast bundle so both are the same
+version; the sidecar logs its version as it starts.
+
+## The camera list fills in over a few updates
+
+With very many cameras the sidecar sends the list in several parts. A page
+built on an SDK older than 1.12 shows them as they arrive, so the list can
+fill in over a few updates; a 1.12 page shows it whole.
+
 ## Still stuck?
 
 1. Turn on verbose logging: uncomment `DebugCameraLogging = true` in

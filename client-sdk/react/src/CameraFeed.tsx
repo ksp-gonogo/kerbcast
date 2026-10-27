@@ -1,4 +1,4 @@
-import type { Anchor, CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { Anchor, CameraState, DisplayedFrameUt, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import {
   CameraKind,
   CommandAimKind,
@@ -320,9 +320,18 @@ export interface CameraFeedProps {
    * own delayed playout. Picks which command-track transition is in force and
    * ages the readout. Defaults to the displayed frame's own capture UT where
    * the browser reports frame RTP timestamps, else the client's capture
-   * clock interpolated to now.
+   * clock interpolated to now. While a command lock is held the brackets and
+   * readout come from the displayed frame's own state, which a UT alone does
+   * not carry: such a host passes `displayFrame` instead.
    */
   displayUt?: number;
+  /**
+   * The frame a host's own delayed playout is showing, as
+   * `watchDisplayedFrames` reported it when it arrived. Wins over
+   * `displayUt`: its `ut` picks the transition in force and its `command`
+   * draws the brackets and readout, so they never run ahead of the picture.
+   */
+  displayFrame?: DisplayedFrameUt | null;
   /**
    * Things to mark on this feed's picture: parts, craft, points on a body or
    * directions. Set for the displayed camera as this client's anchors and
@@ -379,6 +388,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enableTargetBrackets = true,
       targetBracketOverlay,
       displayUt: displayUtProp,
+      displayFrame,
       anchors,
       anchorOverlay,
     },
@@ -420,7 +430,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const effectiveShowStatic = showStatic === undefined ? !reducedMotion : showStatic;
 
     // -------------------------------------------------------------------------
-    // Selection model (mirrors gonogo's CameraFeed)
+    // Selection model
     //
     // Resolution order:
     //   1. Explicit pick, if still present in the list (destroyed or not).
@@ -600,13 +610,14 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const commandTrack = commandCamera?.commandTrack ?? null;
     const commandDisplayUt = useCommandDisplayUt(
       commandTrack !== null,
-      displayUtProp,
+      displayFrame ? displayFrame.ut : displayUtProp,
       commandTrack?.events,
       commandCamera?.flightId ?? null,
       videoEl,
+      displayFrame?.command,
     );
     const commandState = commandTrack
-      ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut)
+      ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut, commandDisplayUt?.command)
       : null;
     /* This feed's anchors go to the camera it displays, and leave with it. */
     const anchorsKey = anchors?.length ? JSON.stringify(anchors) : "";
@@ -623,7 +634,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const drawsAnchors = !!anchorsKey || !!anchorOverlay?.owners?.length;
 
     const [bracketsOn, toggleBrackets] = useTargetBracketsPreference(
-      commandCamera ? (commandCamera.commandCentre?.stationId ?? String(commandCamera.flightId)) : null,
+      commandCamera
+        ? (commandCamera.commandCentre?.siteKey || commandCamera.commandCentre?.nodeName || String(commandCamera.flightId))
+        : null,
+      // 1.11 keyed the preference by stationId; carry a saved choice over.
+      commandCamera?.commandCentre?.stationId ?? null,
     );
     const targetBracketsAvailable = enableTargetBrackets && isCommandFeed;
 
@@ -893,8 +908,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // one aims the camera at it. Hidden while a command authority holds the
     // aim lock, since only it can aim then.
     // -------------------------------------------------------------------------
-    const commandTargets = commandCamera?.commandCentre?.targets ?? [];
-    const commandTargetId = commandCamera?.commandCentre?.subjectPersistentId ?? 0;
+    /* The list as it stood at the displayed frame, so a delayed feed never offers what its picture has not reached. */
+    const shownCentre = commandCamera
+      ? client.commandCentreAt(commandCamera.flightId, commandDisplayUt?.ut)
+      : null;
+    const commandTargets = shownCentre?.targets ?? [];
+    const commandTargetId = shownCentre?.subjectPersistentId ?? 0;
     const commandLocked = commandCamera?.commandTrack?.authority != null;
     const commandTargetAvailable =
       isCommandFeed && !disableManualControls && !commandLocked && commandTargets.length > 0;
@@ -1624,7 +1643,7 @@ export const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(
 );
 
 // ---------------------------------------------------------------------------
-// Inline UI primitives (replacing @gonogo/ui dependencies)
+// Inline UI primitives
 // ---------------------------------------------------------------------------
 
 function ChevronDownIcon(props: React.SVGProps<SVGSVGElement>) {

@@ -27,16 +27,20 @@
 //     [+32..40] f64 capture_ut (KSP universal time at render; NaN = unknown)
 //     [+40..44] u32 meta_len (bytes of this frame's metadata; 0 = none)
 //     [+44..48] f32 fov_deg (vertical field of view at render; 0 = unknown)
-//     [+48..64] padding
+//     [+48..56] f64 live_light_time_s (the frame's live bound; 0 = no delay, NaN = unknown)
+//     [+56..64] padding
 //     [+64..]   RGBA8 pixels, max_width * max_height * 4 bytes
 //
 //   per-slot metadata (starting at 4096 + slot_count * slot_bytes
-//   + slot_idx * meta_slot_bytes): meta_len bytes of UTF-8 JSON, the
-//   frame's anchor results.
+//   + slot_idx * meta_slot_bytes): meta_len bytes of UTF-8 JSON, one
+//   object with the frame's boundary distance, command camera state and
+//   anchor results.
 //
 //   The metadata fields arrived in 1.12 without a version bump: a writer
 //   that reserves no metadata leaves them zero, and an older reader maps
-//   only the slots and ignores the two slot fields.
+//   only the slots and ignores the three slot fields. A writer older than
+//   1.12 leaves live_light_time_s zero, which is right for it: it had no
+//   signal speed, so nothing it drew was delayed.
 //
 // Sync protocol (writer side):
 //   1. Bump `header.sequence` atomically (Interlocked.Increment).
@@ -81,6 +85,7 @@ namespace Kerbcast
         private const int SlotOffCaptureUt = 32;
         private const int SlotOffMetaLen = 40;
         private const int SlotOffFov = 44;
+        private const int SlotOffLiveLightTime = 48;
         private const int SlotOffPixels = 64;
 
         private readonly int _slotCount;
@@ -270,6 +275,7 @@ namespace Kerbcast
             int metaLen = meta.Json != null && meta.Length > 0 && meta.Length <= _metaSlotBytes ? meta.Length : 0;
             _view.Write(slotStart + SlotOffMetaLen, (uint)metaLen);
             _view.Write(slotStart + SlotOffFov, meta.FovDeg > 0f && !float.IsNaN(meta.FovDeg) && !float.IsInfinity(meta.FovDeg) ? meta.FovDeg : 0f);
+            _view.Write(slotStart + SlotOffLiveLightTime, meta.LiveLightTimeS >= 0 && !double.IsInfinity(meta.LiveLightTimeS) ? meta.LiveLightTimeS : double.NaN);
             if (metaLen > 0)
                 _view.WriteArray(_metaStart + nextSlot * (long)_metaSlotBytes, meta.Json, 0, metaLen);
             return ((int)nextSlot, slotStart, newSeq);
@@ -321,13 +327,15 @@ namespace Kerbcast
     }
 
     /* What the game reports about one frame beside its pixels. The default
-       carries nothing: fov unknown, no metadata. */
+       carries nothing: fov unknown, no metadata, no delay. */
     public struct FrameMeta
     {
         /* Vertical field of view the frame was rendered with, degrees; 0 when unknown. */
         public float FovDeg;
-        /* The frame's anchor results as UTF-8 JSON, the first Length bytes; null for none. */
+        /* The frame's metadata object as UTF-8 JSON, the first Length bytes; null for none. */
         public byte[] Json;
         public int Length;
+        /* The frame's live bound in seconds (CommandCameraMath.LiveLightTimeS); 0 with no signal speed, NaN when it could not be read, which a reader takes as unknown and holds the frame. */
+        public double LiveLightTimeS;
     }
 }

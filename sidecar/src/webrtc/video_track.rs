@@ -189,9 +189,15 @@ mod tests {
     #[tokio::test]
     async fn stamp_names_the_rtp_timestamp_the_viewer_receives() {
         let (sent, stamps, rtp_seen, extra) = loopback_stamps(true).await;
-        let (anchors, fov, width) = extra.expect("a stamp arrived");
+        let (anchors, fov, width, live, subject) = extra.expect("a stamp arrived");
         assert_eq!(fov, Some(35.0), "the frame's fov rides its stamp");
         assert_eq!(width, Some(64), "and its size");
+        assert_eq!(live, Some(2.5), "and its live bound");
+        assert_eq!(
+            subject,
+            Some(42),
+            "and the command state the viewer asked for"
+        );
         assert_eq!(
             anchors,
             vec![
@@ -291,7 +297,13 @@ mod tests {
                     let _ = tx.send(Seen::Stamp(
                         p.rtp_timestamp,
                         p.capture_ut,
-                        (anchors, p.fov, p.width),
+                        (
+                            anchors,
+                            p.fov,
+                            p.width,
+                            p.live_light_time_s,
+                            p.command.map(|c| c.subject_persistent_id),
+                        ),
                     ));
                 }
             })
@@ -323,7 +335,7 @@ mod tests {
             "stream".to_owned(),
             Some({
                 let outbox = Outbox::spawn(control.clone(), "peer:0:1".to_owned());
-                outbox.set_stamps_wanted(wanted, wanted);
+                outbox.set_stamps_wanted(wanted, wanted, wanted);
                 outbox
             }),
         ));
@@ -396,6 +408,13 @@ mod tests {
                     frame_anchor("another-browser", Some("peer:0:2")),
                     frame_anchor("subject", Some("kerbcast")),
                 ])),
+                live_light_time_s: Some(2.5),
+                command: Some(std::sync::Arc::new(
+                    serde_json::from_str(
+                        r#"{"hasFix":true,"frameHeightPx":36,"framingFits":true,"occluded":false,"occluder":"","sunlit":true,"subjectPersistentId":42}"#,
+                    )
+                    .unwrap(),
+                )),
                 ..CaptureStamp::at(Some(ut), 2)
             };
             if let Some(ts) = vt
@@ -433,7 +452,13 @@ mod tests {
     }
 
     /// Anchor ids with owners, fov and width from one received stamp.
-    type StampExtra = (Vec<(String, Option<String>)>, Option<f64>, Option<u32>);
+    type StampExtra = (
+        Vec<(String, Option<String>)>,
+        Option<f64>,
+        Option<u32>,
+        Option<f64>,
+        Option<u32>,
+    );
 
     fn frame_anchor(id: &str, owner: Option<&str>) -> crate::protocol::FrameAnchor {
         crate::protocol::FrameAnchor {
@@ -614,7 +639,7 @@ mod tests {
             let sidecar = pc_on(sidecar_net).await;
             let control: ControlChannel = Arc::new(Mutex::new(None));
             let outbox = Outbox::spawn(control.clone(), "peer:0:1".to_owned());
-            outbox.set_stamps_wanted(true, false);
+            outbox.set_stamps_wanted(true, false, false);
             let mut tracks = Vec::new();
             for i in 0..TRACKS_PER_VIEWER {
                 let vt = Arc::new(VideoTrack::new(

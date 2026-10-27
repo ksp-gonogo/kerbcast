@@ -24,6 +24,14 @@ to them:
       @ksp-gonogo/kerbcast and @ksp-gonogo/kerbcast-react published
       before 1.6.0 were released under CC BY-NC-SA 4.0.
 
+  Plugin/Kerbcast.API            MIT       see its own LICENSE
+  Plugin/Kerbcast.API.Testing    MIT       see Plugin/Kerbcast.API/LICENSE
+      Kerbcast.API.dll, the in-game interface other mods build
+      against, for the same reason, and the test double published
+      beside it on NuGet. The API ships beside Kerbcast.dll as
+      GameData/Kerbcast/Plugins/Kerbcast.API.LICENSE.txt. The
+      implementation in Plugin/Kerbcast stays under this licence.
+
   Plugin/KerbcastKos             GPL-3.0-only
       Optional kOS addon; direct-links GPLv3 kOS.
       See Plugin/KerbcastKos/NOTICE-KOS.txt.

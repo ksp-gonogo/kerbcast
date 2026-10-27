@@ -164,6 +164,23 @@ export enum CrewLocation {
 	Eva = "eva",
 }
 
+/**
+ * What kind of place a command camera's site is.
+ * 
+ * Consumers must treat a value they do not recognise as some other kind of
+ * site: new kinds are added without a protocol bump.
+ */
+export enum SiteKind {
+	/** A CommNet ground station. */
+	Station = "station",
+	/** Beside a launch site. */
+	LaunchSite = "launchSite",
+	/** A point on a body's surface. */
+	Surface = "surface",
+	/** Riding a craft. */
+	Vessel = "vessel",
+}
+
 /** How a command camera aims. */
 export enum CommandAimKind {
 	/** Follows a craft, which is the subject. */
@@ -180,7 +197,9 @@ export enum CommandAimKind {
 
 /**
  * Whether a command camera's tracking network could watch a craft. Only
- * `NotTrackable` applies outside career (or with the tracking rules off).
+ * `NotTrackable` applies outside career (or with the tracking rules off),
+ * and the world-model codes only while a command authority's world model
+ * governs the feed.
  */
 export enum CommandTargetEligibility {
 	Ok = "ok",
@@ -190,6 +209,16 @@ export enum CommandTargetEligibility {
 	LevelTooLow = "levelTooLow",
 	/** An unowned object the player has found but not tracked. */
 	NotTrackable = "notTrackable",
+	/** The world model knows the craft but not where it is. */
+	NotPositioned = "notPositioned",
+	/** The world model refuses to position the craft. */
+	Refused = "refused",
+	/** The world model's record is outside its window, or the model is invalid. */
+	Stale = "stale",
+	/** The world model is too unsure where the craft is to frame it. */
+	TooUncertain = "tooUncertain",
+	/** A code this sidecar does not know, from a newer plugin. */
+	Unknown = "unknown",
 }
 
 /** One craft a command camera could watch. */
@@ -213,10 +242,29 @@ export interface CommandTarget {
  * Present only when `CameraState.kind == Command`.
  */
 export interface CommandCentreInfo {
-	/** gonogo's command-centre id for this station, `ground:<nodeName>`. */
+	/**
+	 * `"ground:"` followed by `node_name`.
+	 * 
+	 * @deprecated Use `site_key` and `site_kind`.
+	 */
 	stationId: string;
-	/** The CommNet home's `nodeName` (KSC's is `"KSC"`). */
+	/**
+	 * The site's node name: a CommNet home's `nodeName` (KSC's is `"KSC"`),
+	 * or the generated key of a launch site, surface point or craft site.
+	 */
 	nodeName: string;
+	/**
+	 * Stable key of the place the lens stands; the same as `node_name`, and
+	 * unchanged when the craft a vessel site rides docks.
+	 */
+	siteKey?: string;
+	/** What kind of place `site_key` names. */
+	siteKind?: SiteKind;
+	/**
+	 * For a `vessel` site, `Vessel.persistentId` of the craft the lens rides
+	 * now, which follows it through docking; 0 for every other kind.
+	 */
+	vantagePersistentId?: number;
 	/**
 	 * The station's name as the player reads it in game, or `node_name` when
 	 * it has none.
@@ -253,6 +301,13 @@ export interface CommandCentreInfo {
 	 * outside career.
 	 */
 	trackingLevel: number;
+	/**
+	 * UT the subject, range and targets list describe: the first status
+	 * write that showed them. A delayed client shows them only once the
+	 * frame it displays reaches this UT. Absent from plugins and sidecars
+	 * older than 1.12.
+	 */
+	ut?: number;
 	/**
 	 * Every craft the camera could watch, eligible first, then nearest
 	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
@@ -629,11 +684,17 @@ export interface CommandAim {
 	/** `positionAt`: UT of the sample. */
 	ut?: number;
 	/**
-	 * `positionAt`: `[x, y, z]` metres from the body centre at `ut`, in its
-	 * non-rotating frame (the frame of `Orbit.getRelativePositionAtUT`, z up).
+	 * `positionAt`: `[x, y, z]` metres from the body centre at `ut`, z up, in
+	 * KSP's fixed inertial frame, the one `Orbit.OrbitFrame` and
+	 * `Orbit.UpdateFromFixedVectors` work in: always
+	 * `Planetarium.Zup.LocalToWorld(orbit.getRelativePositionAtUT(ut))`.
+	 * Propagated ballistically under the body's gravity, no thrust.
 	 */
 	position?: number[];
-	/** `positionAt`: `[x, y, z]` metres per second in the same frame. */
+	/**
+	 * `positionAt`: `[x, y, z]` metres per second in the same frame:
+	 * `Planetarium.Zup.LocalToWorld(orbit.getOrbitalVelocityAtUT(ut))`.
+	 */
 	velocity?: number[];
 	/** `direction`: compass bearing in degrees from north, clockwise. */
 	azimuth?: number;
@@ -850,6 +911,66 @@ export interface FrameAnchor {
 }
 
 /**
+ * A command camera's state as one frame shows it, taken when the frame was
+ * rendered and sent with that frame's `FrameStamp`, so a delayed viewer
+ * never learns it before seeing the frame. The fields shared with
+ * `CommandTrackState` mean the same; the rest say what the knowledge was.
+ */
+export interface FrameCommandState {
+	hasFix: boolean;
+	/** Range to the aimed point in metres. Absent without a fix. */
+	rangeM?: number;
+	/**
+	 * Bracket half-extent in capture pixels of a `frame_height_px` frame.
+	 * Absent without a fix.
+	 */
+	bracketHalfPx?: number;
+	frameHeightPx: number;
+	framingFits: boolean;
+	/**
+	 * The drawn craft's offset from frame centre in capture pixels. Under a
+	 * lock, only while the picture shows the craft.
+	 */
+	trueOffsetPx?: number;
+	occluded: boolean;
+	/** Name of the occluding body when `occluded`, otherwise empty. */
+	occluder: string;
+	sunlit: boolean;
+	/** Why the feed is blanked; this frame is black. */
+	blank?: string;
+	/** The lock holder, absent with no lock. */
+	authority?: CommandAuthorityState;
+	/** The craft the frame is aimed at; 0 for none. */
+	subjectPersistentId: number;
+	aimKind?: CommandAimKind;
+	/**
+	 * Why the subject has no position: `unknown`, `notPositioned`,
+	 * `refused` or `stale`. Absent when it has one or there is no subject.
+	 * Treat an unrecognised value as `refused`.
+	 */
+	refusal?: string;
+	/** The world model's own code and words for a `refused` subject. */
+	refusalCode?: string;
+	refusalText?: string;
+	/**
+	 * The instant the subject's known position is taken at: the frame's
+	 * UT, or the subject's past instant under a signal speed.
+	 */
+	subjectUt?: number;
+	/** Where the knowledge came from: `truth`, `waiting`, `model` or `stale`. */
+	worldModel?: string;
+	/**
+	 * Sequence of the world model snapshot the frame read, with the UT its
+	 * knowledge describes and the scope the feed's site is bound to.
+	 * Absent under truth. The sequence is a whole number, sent as a
+	 * JSON number.
+	 */
+	worldModelSeq?: number;
+	knowledgeUt?: number;
+	scope?: string;
+}
+
+/**
  * Mission-time stamp of one video frame, sent on the control channel just
  * before the frame's RTP packets. A browser matches it to a presented frame
  * by `rtp_timestamp` (`requestVideoFrameCallback` metadata `rtpTimestamp`),
@@ -885,6 +1006,30 @@ export interface FrameStampPayload {
 	 * `SetFrameStamps`; absent when there are none.
 	 */
 	anchors?: FrameAnchor[];
+	/**
+	 * The frame's live bound in seconds: the light time covering what of
+	 * the lens's own craft and site it draws at `capture_ut`, the larger of
+	 * one 60 fps frame and the light time to the lens's own farthest part.
+	 * 0 with no signal speed. Other loaded craft near the lens are still
+	 * drawn at `capture_ut` and are not covered yet; once craft beyond the
+	 * boundary are hidden, the bound covers everything drawn at
+	 * `capture_ut`. A delayed viewer releases the frame no sooner than
+	 * `capture_ut` plus this plus its own delay from the lens. Absent when
+	 * the game could not read it, and from sidecars older than 1.12: under
+	 * a signal speed that is unknown, and the frame is held.
+	 */
+	liveLightTimeS?: number;
+	/**
+	 * How far light travels in one 60 fps frame at the signal speed: craft
+	 * nearer the lens than this are drawn at `capture_ut`, farther ones at
+	 * their own past instant. Absent with no signal speed.
+	 */
+	boundaryM?: number;
+	/**
+	 * A command camera's state in this frame. Only for a client that asked
+	 * with `SetFrameStamps` `command: true`.
+	 */
+	command?: FrameCommandState;
 }
 
 export interface HelloPayload {
@@ -901,6 +1046,13 @@ export interface HelloPayload {
 	 * `anchors: true`. Absent from sidecars older than 1.12.
 	 */
 	anchors?: boolean;
+	/**
+	 * True when this sidecar sends a command camera's per-frame state with
+	 * frame stamps to a client that asks with `SetFrameStamps`
+	 * `command: true`, and `liveLightTimeS` on every stamp. Absent from
+	 * sidecars older than 1.12.
+	 */
+	frameCommand?: boolean;
 }
 
 /**
@@ -999,6 +1151,11 @@ export interface SetFrameStampsPayload {
 	 * client that predates anchors never receives them.
 	 */
 	anchors?: boolean;
+	/**
+	 * Also send a command camera's state with each of its frames. Off
+	 * unless asked for.
+	 */
+	command?: boolean;
 }
 
 export interface SetLayersPayload {

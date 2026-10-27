@@ -3,7 +3,7 @@
  *
  * Renders ONE kerbal's face-camera stream in a fixed SQUARE frame. It is the
  * reusable building block a crew bar (kerbcast web) or a mission-control
- * surface (gonogo) composes: identity-keyed by `flightId`, it binds the live
+ * surface composes: identity-keyed by `flightId`, it binds the live
  * `MediaStream` to a persistent `<video>` and NEVER remounts that element on
  * re-layout (the "never remount a live feed" rule — the same srcObject-via-ref
  * technique `CameraFeed` uses).

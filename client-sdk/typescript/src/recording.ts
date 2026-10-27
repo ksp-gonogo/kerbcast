@@ -458,7 +458,7 @@ function mediabunnyTrimmer(mb: MediabunnyModule): GroupTrimmer {
 /**
  * Builds a {@link TrimmerLoader} around a caller-supplied module import.
  * `loadMediabunnyTrimmer` (the default, below) resolves the bare
- * `import("mediabunny")` specifier for bundler consumers (e.g. gonogo). A
+ * `import("mediabunny")` specifier for bundler consumers. A
  * consumer that can't rely on that resolution -- the sidecar's embedded web
  * page, which serves its own copy of the package locally for an offline/LAN
  * install with no CDN -- supplies a different `importModule` (e.g. a dynamic

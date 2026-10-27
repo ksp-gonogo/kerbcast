@@ -15,7 +15,7 @@ describe("mockCommandTrack", () => {
       "OCCLUDED MUN · 11,508 km",
       "IN SHADOW · 11,508 km",
       "OCCLUDED KERBIN · 11,508 km",
-      "Waiting for gonogo",
+      "Waiting for mission control",
     ]);
   });
 

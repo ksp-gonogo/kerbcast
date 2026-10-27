@@ -133,7 +133,7 @@ jobs:
       - name: Upgrade npm for OIDC trusted publishing
         run: npm install -g npm@latest
 
-      - name: Verify version sync (tag == Cargo.toml == package.json == Kerbcast.version == KerbcastKos.version)
+      - name: Verify version sync (tag == Cargo.toml == package.json == Versions.props == Kerbcast.version == KerbcastKos.version)
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
           PKG_VER="$(node -p "require('./client-sdk/typescript/package.json').version")"
@@ -144,14 +144,22 @@ jobs:
           # compile-time links the Kerbcast.dll facade, so a matching version is
           # the compatibility contract.
           KOS_VER="$(python3 -c "import json; v=json.load(open('GameData/KerbcastKos/KerbcastKos.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
-          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER avc=$AVC_VER kos=$KOS_VER"
+          # Plugin/Versions.props drives Kerbcast.dll's KSPAssembly version, and
+          # holds the public API's own SemVer line (Kerbcast.API NuGet packages).
+          PLUGIN_VER="$(sed -nE 's|.*<KerbcastVersion>([^<]*)</KerbcastVersion>.*|\1|p' Plugin/Versions.props)"
+          API_VER="$(sed -nE 's|.*<KerbcastApiVersion>([^<]*)</KerbcastApiVersion>.*|\1|p' Plugin/Versions.props)"
+          echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER plugin=$PLUGIN_VER api=$API_VER avc=$AVC_VER kos=$KOS_VER"
+          if ! printf '%s' "$API_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::KerbcastApiVersion '$API_VER' in Plugin/Versions.props is not X.Y.Z"
+            exit 1
+          fi
           # The AVC (.version) files are numeric MAJOR/MINOR/PATCH and cannot
           # carry a pre-release suffix, so they are compared against the BASE
           # version: for v1.9.1-rc.1 the tag, Cargo and packages must all read
           # 1.9.1-rc.1 while the AVC files read 1.9.1. Comparing them against
           # the full tag makes a pre-release impossible to cut.
           BASE_VER="${TAG_VER%%-*}"
-          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$BASE_VER" != "$AVC_VER" ] || [ "$AVC_VER" != "$KOS_VER" ]; then
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$PLUGIN_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$BASE_VER" != "$AVC_VER" ] || [ "$AVC_VER" != "$KOS_VER" ]; then
             echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
             exit 1
           fi
@@ -646,6 +654,11 @@ jobs:
 
           cp Plugin/obj/Release/Kerbcast.dll GameData/Kerbcast/Plugins/
 
+          # The MIT interface assembly other mods build against, with its own
+          # licence beside it (Kerbcast.dll stays CC BY-NC-SA 4.0).
+          cp Plugin/Kerbcast.API/bin/Release/Kerbcast.API.dll GameData/Kerbcast/Plugins/
+          cp Plugin/Kerbcast.API/LICENSE GameData/Kerbcast/Plugins/Kerbcast.API.LICENSE.txt
+
           # Linux OpenGL readback library. The plugin dlopens it from exactly
           # this path (ReadbackGate.NativeLibraryPath) and refuses to start on
           # Linux OpenGL without it.
@@ -690,6 +703,13 @@ jobs:
           # Hullcam-derived shader bundle and the KSP-AVC Kerbcast.version manifest
           # are committed under GameData/Kerbcast/ and travel via the checkout.
           cp LICENSE GameData/Kerbcast/LICENSE
+
+          # PluginData holds user files and the dev marker that turns on a
+          # development signal speed; neither may ever ship.
+          if [ -e GameData/Kerbcast/PluginData ]; then
+            echo "::error::GameData/Kerbcast/PluginData must never ship"
+            exit 1
+          fi
 
           echo "GameData/Kerbcast tree:"
           find GameData/Kerbcast -type f | sort
@@ -950,6 +970,41 @@ jobs:
           fi
           rm -f ./sd-kos-cookies sd-kos-changelog.md
           echo "SpaceDock mod ${SPACEDOCK_KERBCAST_KOS_ADDON_ID} (KerbcastKos) updated to ${VERSION} (KSP ${GAME_VERSION})"
+
+      # Kerbcast.API and Kerbcast.API.Testing on nuget.org under the
+      # ksp-gonogo organisation. Their version is the API's own line
+      # (KerbcastApiVersion in Plugin/Versions.props), so most releases push
+      # nothing new and --skip-duplicate makes that a no-op. Skips cleanly
+      # until the NUGET_API_KEY secret exists. A pack or push failure warns
+      # rather than fails, so the .ckan re-pin after it still runs.
+      - name: Set up .NET for the Kerbcast.API packages
+        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.x"
+
+      - name: Publish Kerbcast.API to nuget.org
+        # NOT for pre-releases: a package version can never be replaced.
+        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::notice::nuget.org not configured (need secret NUGET_API_KEY); skipping the Kerbcast.API packages"
+            exit 0
+          fi
+          publish() {
+            dotnet pack Plugin/Kerbcast.API/Kerbcast.API.csproj -c Release -o nupkg &&
+            dotnet pack Plugin/Kerbcast.API.Testing/Kerbcast.API.Testing.csproj -c Release -o nupkg || return 1
+            for pkg in nupkg/*.nupkg; do
+              dotnet nuget push "$pkg" --api-key "$NUGET_API_KEY" \
+                --source https://api.nuget.org/v3/index.json --skip-duplicate || return 1
+            done
+          }
+          if ! publish; then
+            echo "::warning::Kerbcast.API packages were not published to nuget.org; see this step's log, then push them by hand"
+          fi
 
       # Kerbcast.ckan pins an exact version + download URL + hashes for manual
       # .ckan-file installs. The public NetKAN index resolves independently

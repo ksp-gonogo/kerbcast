@@ -254,7 +254,7 @@ mod tests {
             result("mine", Some(&me)),
             result("theirs", Some(&other)),
             result("subject", Some("kerbcast")),
-            result("reticle", Some("gonogo")),
+            result("reticle", Some("mission-control")),
         ];
         let got = anchors_for(&me, &all);
         let ids: Vec<_> = got
@@ -266,7 +266,7 @@ mod tests {
             vec![
                 ("mine", None),
                 ("subject", Some("kerbcast")),
-                ("reticle", Some("gonogo"))
+                ("reticle", Some("mission-control"))
             ]
         );
     }

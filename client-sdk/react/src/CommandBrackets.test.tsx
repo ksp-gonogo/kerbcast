@@ -33,7 +33,7 @@ function track(overrides: Partial<CommandTrackState> = {}): CommandTrackState {
   };
 }
 
-const AUTHORITY = { owner: "gonogo" };
+const AUTHORITY = { owner: "mission-control" };
 
 describe("containedContentRect", () => {
   it("letterboxes wide media in a tall box", () => {
@@ -366,9 +366,9 @@ describe("CommandBrackets on the subject anchor", () => {
 
 describe("CommandBlank", () => {
   it("labels the blank with its reason", () => {
-    render(<CommandBlank reason="Waiting for gonogo" />);
+    render(<CommandBlank reason="Waiting for mission control" />);
     expect(screen.getByRole("status", { name: "Feed blanked" }).textContent).toBe(
-      "Waiting for gonogo",
+      "Waiting for mission control",
     );
   });
 });

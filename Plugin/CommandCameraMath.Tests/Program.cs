@@ -80,7 +80,7 @@ Check(CommandCameraMath.SmoothFov(0, 5, 0.01, 0.4, 1.0) == 5, "uninitialised cur
 double down = CommandCameraMath.SmoothFov(20, 0.02, 0.016, 0.4, 1.0);
 Check(down < 20 && down > 0.02, "one frame moves part of the way");
 
-// Occlusion: gonogo's sphere rule.
+// Occlusion: the sphere rule.
 var planet = new DVec3(0, 0, 0);
 var onSurface = new DVec3(0, R + 70, 0);
 Check(CommandCameraMath.SegmentClearOfSphere(onSurface, new DVec3(0, R + 80000, 0), planet, R),
@@ -196,8 +196,11 @@ Check(CommandCameraMath.FramingFits(0, 5, 30), "fit: no radius always fits");
 
 // Blank reasons: fail closed, in precedence order.
 Check(CommandCameraMath.BlankReason(false, true, "x") == null, "blank: standalone never blanks");
-Check(CommandCameraMath.BlankReason(true, true, "Custom") == CommandCameraMath.BlankNotResponding,
-    "blank: a silent authority beats everything");
+Check(CommandCameraMath.BlankReason(true, true, "Custom") == CommandCameraMath.DefaultSilentText,
+    "blank: a silent holder beats its own reason, with the default silence text");
+Check(CommandCameraMath.BlankReason(true, true, "Custom", false, "Mission control silent") == "Mission control silent",
+    "blank: a silent holder's own silence text shows");
+Check(CommandCameraMath.DefaultSilentText == "Authority not responding", "blank: the default silence text is generic");
 Check(CommandCameraMath.BlankReason(true, false, "Custom") == "Custom", "blank: the holder's reason shows");
 Check(CommandCameraMath.BlankReason(true, false, "") == null, "blank: a held lock with no reason shows the feed");
 Check(CommandCameraMath.BlankReason(false, false, null, vantageGone: true) == CommandCameraMath.BlankVantageGone,
@@ -255,6 +258,26 @@ Check(CommandCameraMath.Eligibility(true, true, false, 0, 3e9, Dsn1) == CommandC
 Check(CommandCameraMath.Eligibility(false, true, false, 0, 3e9, Dsn1) == CommandCameraMath.EligibleOk, "eligible: no range limit ungated");
 Check(CommandCameraMath.Eligibility(true, true, true, 0, 1e6, Dsn1) == CommandCameraMath.EligibleLevelTooLow, "eligible: unowned object at a level that tracks none");
 Check(CommandCameraMath.Eligibility(true, true, true, 3, 1e6, Dsn1) == CommandCameraMath.EligibleOk, "eligible: unowned object once the level tracks some");
+
+// TargetEligibility: what the fix source holds, before the career rules.
+string ok = CommandCameraMath.EligibleOk, tooFar = CommandCameraMath.EligibleTooFar;
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Unknown, null, true, ok) == null, "target: an unknown craft has no row");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Positioned, null, false, tooFar) == tooFar, "target: a positioned craft takes the career rules");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Positioned, null, false, ok, tooUncertain: true) == "tooUncertain",
+    "target: a positioned craft the career rules pass can still be too uncertain");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Positioned, null, false, tooFar, tooUncertain: true) == tooFar,
+    "target: the career rules come before tooUncertain");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Listed, null, false, ok) == CommandCameraMath.EligibleNotPositioned,
+    "target: a listed craft stops at notPositioned before the career rules");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Listed, null, true, ok) == ok,
+    "target: under truth a craft that cannot be placed lists under the career rules, as 1.11 did");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Refused, "beyond-horizon", false, ok) == CommandCameraMath.EligibleRefused,
+    "target: a refused record reads refused");
+Check(CommandCameraMath.TargetEligibility(CraftFixState.Refused, CommandCameraMath.RefusalStale, false, ok) == CommandCameraMath.EligibleStale,
+    "target: a stale record reads stale");
+Check(CommandCameraMath.EligibilityText(CommandCameraMath.EligibleNotPositioned).Length > 0
+    && CommandCameraMath.EligibilityText(CommandCameraMath.EligibleRefused).Length > 0
+    && CommandCameraMath.EligibilityText(CommandCameraMath.EligibleStale).Length > 0, "target: every new code has words");
 Check(CommandCameraMath.Eligibility(true, true, true, 0, 3e9, Dsn1) == CommandCameraMath.EligibleLevelTooLow, "eligible: level beats range");
 Check(CommandCameraMath.Eligibility(false, true, true, 0, 1e6, Dsn1) == CommandCameraMath.EligibleOk, "eligible: unowned object ungated");
 Check(CommandCameraMath.Eligibility(false, false, true, 99, 1e6, Dsn1) == CommandCameraMath.EligibleNotTrackable, "eligible: untracked object never, even ungated");
@@ -528,6 +551,52 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     // Axis-parallel segments (zero direction components).
     Check(occ.Blocks(new DVec3(0, 0, 1e7), new DVec3(0, 0, -1e7), 0), "mesh: an axis-aligned line through the centre is blocked");
     Check(!occ.Blocks(new DVec3(0, meshR * 1.01, 1e7), new DVec3(0, meshR * 1.01, -1e7), 0), "mesh: an axis-aligned line over the top is clear");
+}
+
+/* The live bound: tau, or the lens's own farthest part, at the holder's signal speed. */
+{
+    double tau = CommandCameraMath.BoundaryLightTimeS;
+    Check(CommandCameraMath.LiveLightTimeS(null, 100) == 0, "live bound: no signal speed, delay off, 0");
+    Check(CommandCameraMath.LiveLightTimeS(0, 100) == 0, "live bound: a zero signal speed is no signal speed");
+    Check(CommandCameraMath.LiveLightTimeS(299792458, 30) == tau, "live bound: at light speed a 30 m craft is inside tau");
+    Check(CommandCameraMath.LiveLightTimeS(299792458, 0) == tau, "live bound: a lens with no craft of its own is tau");
+    Check(Math.Abs(CommandCameraMath.LiveLightTimeS(3, 30) - 10) < 1e-12, "live bound: at 3 m/s a part 30 m away is 10 s");
+    Check(Math.Abs(CommandCameraMath.BoundaryM(3) - 0.05) < 1e-12 && double.IsNaN(CommandCameraMath.BoundaryM(null)),
+        "boundary: c times tau, NaN with no signal speed");
+
+    /* A partner docks: the farthest own part jumps from 30 m to 100 m, so at 3 m/s the bound steps by 23 s on that frame. */
+    var lens = new DVec3(1000, 0, 0);
+    var own = new List<DVec3> { lens + new DVec3(0, 10, 0), lens + new DVec3(0, 28, 0) };
+    var radii = new List<double> { 1, 2 };
+    double before = CommandCameraMath.LiveLightTimeS(3, CommandCameraMath.FarthestPartM(lens, own, radii));
+    own.Add(lens + new DVec3(0, -98, 0));
+    radii.Add(2);
+    double after = CommandCameraMath.LiveLightTimeS(3, CommandCameraMath.FarthestPartM(lens, own, radii));
+    Check(Math.Abs(before - 10) < 1e-9, "dock: before, the farthest reach 28 + 2 m is 10 s");
+    Check(Math.Abs(after - before - 70.0 / 3) < 1e-9, "dock: the partner's far part steps the bound by 23.3 s");
+    own.RemoveAt(2);
+    radii.RemoveAt(2);
+    Check(CommandCameraMath.LiveLightTimeS(3, CommandCameraMath.FarthestPartM(lens, own, radii)) == before, "undock: the bound steps back down");
+    Check(CommandCameraMath.FarthestPartM(lens, new List<DVec3>(), null) == 0, "no parts reach nowhere");
+}
+
+/* Part reach only grows: a canopy that opens raises it at once, and nothing lowers it. */
+{
+    var cache = new ReachCache();
+    Func<double, double> same = v => v;
+    Check(cache.Reach(1, 0, false, same, 2.0) == 2.0, "reach: first sight measures");
+    Check(cache.Reach(1, 1, false, same, 25.0) == 2.0, "reach: a still part is not measured again before its refresh");
+    Check(cache.Reach(1, 1, true, same, 25.0) == 25.0, "reach: a moving part is measured on the frame, and the canopy counts");
+    Check(cache.Reach(1, 2, true, same, 3.0) == 25.0, "reach: a packed canopy never lowers it");
+    Check(cache.Reach(1, 2 + ReachCache.RefreshFrames, false, same, 1.0) == 25.0, "reach: a refresh keeps the larger");
+    Check(cache.Reach(1, 3 + 2 * ReachCache.RefreshFrames, false, same, 40.0) == 40.0, "reach: a still part's refresh can raise it");
+    int calls = 0;
+    Func<double, double> counted = v => { calls++; return v; };
+    cache.Reach(1, 5000, true, counted, 1.0);
+    cache.Reach(1, 5000, true, counted, 1.0);
+    Check(calls == 1, "reach: measured once a frame however many cameras ask");
+    Check(cache.Reach(2, 0, false, same, double.NaN) == 0, "reach: nothing drawn yet reads as no reach");
+    Check(cache.Reach(2, 1, false, same, 6.0) == 6.0, "reach: and is measured again on the next frame, once it shows");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

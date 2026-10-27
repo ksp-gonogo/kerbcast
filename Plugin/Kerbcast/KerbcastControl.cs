@@ -1,10 +1,12 @@
 using System.Collections.Generic;
+using Kerbcast.Api;
 using UnityEngine;
 
 namespace Kerbcast
 {
     /* Immutable per-camera snapshot handed to the kOS add-on. Plain data +
        the owning Part; no kOS types (Kerbcast.dll must not link kOS). */
+    [System.Obsolete("Use Kerbcast.Api.CameraView from Kerbcast.API.dll")]
     public sealed class KerbcastCameraView
     {
         public uint FlightId;
@@ -30,107 +32,81 @@ namespace Kerbcast
         public global::Part Part;
     }
 
-    /* In-process control seam the KerbcastKos add-on calls. Resolves cameras
-       through the live KerbcastCore and applies FOV/pan; the plugin already
-       feeds resulting state back to the sidecar via global.status.json. */
+    /* The in-process control seam that predates Kerbcast.API. The members
+       Kerbcast.API covers forward to its implementation and are obsolete;
+       the rest stay until the API covers them. */
     public static class KerbcastControl
     {
-        public static bool IsActive => KerbcastCore.Instance != null;
+        [System.Obsolete("Use Kerbcast.Api.KerbcastApi.Instance != null from Kerbcast.API.dll")]
+        public static bool IsActive => KerbcastApi.Instance != null;
 
         /* Whether the video sidecar process is currently alive. False out of
            flight (no host yet) and false once the process dies, which is the
            state where every feed goes black while the mod still looks healthy. */
-        public static bool SidecarAlive => KerbcastSidecarHost.Instance?.SidecarRunning ?? false;
+        [System.Obsolete("Use Kerbcast.Api.KerbcastApi.Instance.SidecarAlive from Kerbcast.API.dll")]
+        public static bool SidecarAlive => KerbcastApiImpl.SidecarAliveNow;
 
         /* Host the feeds and the signalling endpoint listen on: what the
            running sidecar was launched with, or what settings.cfg configures
            before the first flight starts it. */
-        public static string BindAddress => BindSettings.BindAddress;
+        [System.Obsolete("Use Kerbcast.Api.KerbcastApi.Instance.BindAddress from Kerbcast.API.dll")]
+        public static string BindAddress => KerbcastApiImpl.BindAddressNow;
 
-        public static int Port => BindSettings.Port;
+        [System.Obsolete("Use Kerbcast.Api.KerbcastApi.Instance.Port from Kerbcast.API.dll")]
+        public static int Port => KerbcastApiImpl.PortNow;
 
         /* True when only this computer can reach the feeds. */
-        public static bool BindIsLoopback => KerbcastSettings.IsLoopback(BindSettings.BindAddress);
+        [System.Obsolete("Use Kerbcast.Api.KerbcastApi.Instance.BindIsLoopback from Kerbcast.API.dll")]
+        public static bool BindIsLoopback => KerbcastSettings.IsLoopback(KerbcastApiImpl.BindAddressNow);
 
-        private static KerbcastSettings _configured;
-
-        private static KerbcastSettings BindSettings =>
-            KerbcastSidecarHost.Instance?.LaunchSettings ?? (_configured ?? (_configured = KerbcastSettings.Load()));
-
+        [System.Obsolete("Use Kerbcast.Api.ICameras.CamerasFor(uint vesselPersistentId) from Kerbcast.API.dll")]
         public static IReadOnlyList<KerbcastCameraView> CamerasFor(global::Vessel vessel)
         {
             var result = new List<KerbcastCameraView>();
             var cams = KerbcastCore.Instance?.Cameras;
             if (cams == null || vessel == null) return result;
             for (int i = 0; i < cams.Count; i++)
-            {
-                // Kerbal cameras aren't exposed to kOS this stage.
-                // Nor are command cameras, whose Vessel is just the tracked craft.
-                if (cams[i] is KerbcastCamera c && c.Rig == null && c.Vessel == vessel)
+                if (KerbcastApiImpl.IsPartCamera(cams[i], out var c) && c.Vessel == vessel)
                     result.Add(ToView(c));
-            }
             return result;
         }
 
+        [System.Obsolete("Use Kerbcast.Api.ICameras.View from Kerbcast.API.dll")]
         public static KerbcastCameraView ViewOf(uint flightId)
         {
             var c = Find(flightId);
             return c == null ? null : ToView(c);
         }
 
-        public static bool SetFov(uint flightId, float fov)
-        {
-            var c = Find(flightId); if (c == null) return false; c.SetFov(fov); return true;
-        }
+        [System.Obsolete("Use Kerbcast.Api.ICameras.SetFov from Kerbcast.API.dll")]
+        public static bool SetFov(uint flightId, float fov) => KerbcastApiImpl.SetFovCore(flightId, fov);
 
-        public static bool SetPan(uint flightId, float yaw, float pitch)
-        {
-            var c = Find(flightId); if (c == null) return false; c.SetPanTarget(yaw, pitch); return true;
-        }
+        [System.Obsolete("Use Kerbcast.Api.ICameras.SetPan from Kerbcast.API.dll")]
+        public static bool SetPan(uint flightId, float yaw, float pitch) => KerbcastApiImpl.SetPanCore(flightId, yaw, pitch);
 
         /* aimPoint is a kOS-frame vector (ship-relative, e.g. TARGET:POSITION),
-           matching what KerbcastCameraView.Position reports. Convert to a Unity
-           world point via the vessel CoM before handing it to the camera, whose
-           AimAt works in world space. */
-        public static bool AimAt(uint flightId, Vector3 aimPoint)
-        {
-            var c = Find(flightId); if (c == null) return false;
-            var vessel = c.Mount.Vessel;
-            Vector3 worldPoint = vessel != null ? (Vector3)vessel.CoM + aimPoint : aimPoint;
-            c.AimAt(worldPoint);
-            return true;
-        }
+           matching what KerbcastCameraView.Position reports. */
+        [System.Obsolete("Use Kerbcast.Api.ICameras.AimAt from Kerbcast.API.dll")]
+        public static bool AimAt(uint flightId, Vector3 aimPoint) => KerbcastApiImpl.AimAtCore(flightId, aimPoint);
 
-        /* Auto-track (issue #6) as a SYNCHRONOUS kOS function: set/get the
-           camera's track mode in-process, immediate, no sidecar round-trip.
-           Set is optimistic-local (the camera aims at once) and stages an
-           up-report the sidecar adopts as authoritative (so every browser
-           reflects it); get returns the applied value now. Only pan+zoom
-           cameras honour a set (mirrors the browser gate); a non-pan+zoom or
-           unknown camera returns none (0) from get and false from set.
-           mode: 0=none, 1=active-vessel, 2=target. */
-        public static bool SetTrackMode(uint flightId, int mode)
-        {
-            var c = Find(flightId);
-            if (c == null || !(c.SupportsPan && c.SupportsZoom)) return false;
-            c.RequestTrackMode(mode);
-            return true;
-        }
+        /* mode: 0=none, 1=active-vessel, 2=target. Only pan+zoom cameras
+           honour a set; an unknown camera reads 0. */
+        [System.Obsolete("Use Kerbcast.Api.ICameras.SetTrackMode from Kerbcast.API.dll")]
+        public static bool SetTrackMode(uint flightId, int mode) => KerbcastApiImpl.SetTrackModeCore(flightId, mode);
 
-        public static int GetTrackMode(uint flightId)
-        {
-            var c = Find(flightId);
-            return c != null ? c.GetTrackMode() : 0;
-        }
+        [System.Obsolete("Use Kerbcast.Api.ICameras.GetTrackMode from Kerbcast.API.dll")]
+        public static int GetTrackMode(uint flightId) => KerbcastApiImpl.GetTrackModeCore(flightId);
 
-        /* Takes the lock on every command feed's aim in this scene for `owner`
-           (gonogo). While it is held, SetCommandAim accepts only calls that pass
-           `owner`; everyone else is refused, browser clients included. Aims
-           already set stay until the owner changes them. The lock holds until
+        /* Takes the lock on every command feed's aim in this scene for `owner`:
+           the same lock as Kerbcast.API's ICommand.TakeLock, without its
+           options. While it is held, SetCommandAim accepts only calls that pass
+           `owner`; everyone else is refused, browser clients included. Taking
+           it returns every feed to its default aim, and under the lock a
+           feed's default has no subject: it holds pose. The lock holds until
            ClearCommandAuthority or a scene change, and never times out: take
            it again on each scene load. It fails closed: if `owner` makes no
            call (this, SetCommandAim with its owner, or SetCommandBlank) for 5 s
-           of REAL time, every command feed blanks "gonogo not responding", but
+           of REAL time, every command feed blanks "Authority not responding", but
            the lock stays held and everyone else stays refused, so a stalled
            holder that delays commands can not be bypassed. Real time keeps
            counting while the game is paused or warping, so keep calling as a
@@ -140,23 +116,69 @@ namespace Kerbcast
         public static bool SetCommandAuthority(string owner)
         {
             var auth = KerbcastCore.Instance?.CommandAuthority;
-            return auth != null && auth.Register(owner, Time.realtimeSinceStartup);
+            if (auth == null || string.IsNullOrEmpty(owner) || !ReservedAssemblies.SafeValue(owner)) return false;
+            /* A renewal keeps the options the holder took the lock with. */
+            if (auth.Lock.Holds(owner))
+            {
+                auth.Heartbeat(Time.realtimeSinceStartup);
+                return true;
+            }
+            var taken = TakeLockCore(owner, Api.LockOptions.None, null);
+            return taken == Api.LockResult.Taken || taken == Api.LockResult.Renewed;
+        }
+
+        /* Takes or renews the scene's one lock. Taking it starts a new tenure,
+           returns every feed to its default aim and leaves each default with
+           no subject. */
+        internal static Api.LockResult TakeLockCore(string owner, Api.LockOptions options, string silentText)
+        {
+            var core = KerbcastCore.Instance;
+            if (core == null) return Api.LockResult.NotRunning;
+            var result = core.CommandAuthority.Lock.Take(owner, options, silentText, Time.realtimeSinceStartup);
+            if (result == Api.LockResult.HeldByOther) return result;
+            /* A reserved scene starts with the silence text the owner last took the lock with. */
+            LockReservationStore.Reservation.NoteSilentText(owner, silentText);
+            if (result == Api.LockResult.Taken) ResetFeeds(core);
+            return result;
+        }
+
+        /* Releases the lock if `owner` holds it: truth again, and every feed back to its default aim.
+           The player's release logs its own lines, so `byPlayer` skips this one. */
+        internal static bool ReleaseLockCore(string owner, bool byPlayer = false)
+        {
+            var core = KerbcastCore.Instance;
+            var auth = core?.CommandAuthority;
+            if (auth == null || !auth.Lock.Holds(owner)) return false;
+            if (!byPlayer) Debug.Log($"[Kerbcast][CMDCAM] command lock released: {owner}");
+            auth.Reset();
+            ResetFeeds(core);
+            return true;
+        }
+
+        /* The holder's signal speed, which the light-time history reads. */
+        internal static bool SetSignalSpeedCore(string owner, double? metresPerSecond)
+        {
+            var auth = KerbcastCore.Instance?.CommandAuthority;
+            if (auth == null) return false;
+            if (!auth.Lock.SetSignalSpeed(owner, metresPerSecond, Time.realtimeSinceStartup)) return false;
+            LightHistoryHost.History.SetSignalSpeed(metresPerSecond);
+            return true;
+        }
+
+        /* Every aim dropped, and every feed's request resolved again for what the lock now allows. */
+        static void ResetFeeds(KerbcastCore core)
+        {
+            var cams = core.Cameras;
+            for (int i = 0; i < cams.Count; i++)
+                if (cams[i] is KerbcastCamera c && c.Rig is CommandCameraRig gr) gr.SetAim(null, null);
+            core.CommandProvider?.ClearPendingAims();
+            core.CommandProvider?.RefreshSubjects();
         }
 
         /* Releases `owner`'s lock. Every command feed returns to its default
            aim: no aim set before or during the lock is restored. Ignored for
            any other owner. */
-        public static void ClearCommandAuthority(string owner)
-        {
-            var core = KerbcastCore.Instance;
-            var auth = core?.CommandAuthority;
-            if (auth == null || !auth.Registered || !string.Equals(auth.Owner, owner, System.StringComparison.Ordinal)) return;
-            auth.Clear(owner);
-            var cams = core.Cameras;
-            for (int i = 0; i < cams.Count; i++)
-                if (cams[i] is KerbcastCamera c && c.Rig is CommandCameraRig gr && gr.Aim != null) gr.SetAim(null, null);
-            core.CommandProvider?.ClearPendingAims();
-        }
+        public static void ClearCommandAuthority(string owner) => ReleaseLockCore(owner);
 
         /* The command feeds in this scene, empty when there are none. */
         public static IReadOnlyList<CommandFeedView> CommandFeeds()
@@ -170,11 +192,15 @@ namespace Kerbcast
             {
                 if (cams[i] is KerbcastCamera c && c.Rig is CommandCameraRig gr)
                 {
+#pragma warning disable CS0618 // StationId stays filled for callers built against 1.11
                     result.Add(new CommandFeedView
                     {
                         FlightId = c.FlightId,
                         StationNodeName = gr.StationNodeName,
-                        StationId = CameraId.CommandCentreId(gr.StationNodeName),
+                        StationId = CameraId.SiteHashKey(gr.StationNodeName),
+                        SiteKey = gr.Site.NodeName,
+                        SiteKind = gr.Site.Kind,
+                        VantagePersistentId = gr.Site.VantagePersistentId,
                         DisplayName = gr.StationDisplayName,
                         Aim = gr.Aim,
                         SubjectPersistentId = gr.SubjectPersistentId,
@@ -183,6 +209,7 @@ namespace Kerbcast
                         FramingFits = gr.FramingFits,
                         Created = KerbcastCore.Instance.CommandProvider?.IsCreated(c.FlightId) ?? false,
                     });
+#pragma warning restore CS0618
                 }
             }
             return result;
@@ -196,7 +223,7 @@ namespace Kerbcast
         {
             var c = Find(flightId);
             if (c == null || !(c.Rig is CommandCameraRig gr)) return new List<CommandTargetView>();
-            return CommandCameraTargets.List(gr.Site, Planetarium.GetUniversalTime());
+            return CommandCameraTargets.List(gr.Site, Planetarium.GetUniversalTime(), gr.FovMax);
         }
 
         /* Points command feed `flightId` by `aim`, or returns it to its default
@@ -213,23 +240,32 @@ namespace Kerbcast
            number is not finite or out of range (a negative framing margin, an
            elevation outside -90..90). */
         public static bool SetCommandAim(uint flightId, CommandAim aim, string owner = null)
+            => SetAimCore(flightId, aim, owner) == AimResult.Ok;
+
+        /* SetCommandAim with the reason it refused. */
+        internal static AimResult SetAimCore(uint flightId, CommandAim aim, string owner)
         {
             var core = KerbcastCore.Instance;
-            if (core == null) return false;
+            if (core == null) return AimResult.NotRunning;
             var auth = core.CommandAuthority;
             if (auth != null && auth.Registered)
             {
-                if (!string.Equals(owner, auth.Owner, System.StringComparison.Ordinal)) return false;
+                if (!string.Equals(owner, auth.Owner, System.StringComparison.Ordinal)) return AimResult.NotLockHolder;
                 auth.Heartbeat(Time.realtimeSinceStartup);
             }
             var gr = Find(flightId)?.Rig as CommandCameraRig;
             var provider = core.CommandProvider;
-            if (gr == null && (provider == null || !provider.IsPending(flightId))) return false;
+            if (gr == null && (provider == null || !provider.IsPending(flightId))) return AimResult.NotCommandFeed;
             Orbit orbit = null;
-            if (aim != null && !TryResolveAim(flightId, aim, out orbit)) return false;
+            if (aim != null)
+            {
+                string siteKey = gr != null ? gr.Site.NodeName : provider.PendingSiteKey(flightId);
+                var resolved = TryResolveAim(flightId, siteKey, gr, aim, out orbit);
+                if (resolved != AimResult.Ok) return resolved;
+            }
             if (gr != null) gr.SetAim(aim, orbit);
             else provider.SetPendingAim(flightId, aim, orbit);
-            return true;
+            return AimResult.Ok;
         }
 
         /* Replaces `owner`'s anchors on camera `flightId`, or clears them with
@@ -336,12 +372,34 @@ namespace Kerbcast
            it is built. */
         public static uint CreateCommandCamera(CommandVantage vantage, string name = null, CommandAim aim = null)
         {
+            string holder = CommandAuthorityOwner;
+            if (holder != null)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] command camera at {vantage?.ToString() ?? "null"} refused: {holder} holds the command lock; it creates cameras with its owner");
+                return 0;
+            }
             uint id = Create(vantage, name, aim, null, out string error);
             if (id == 0) Debug.LogWarning($"[Kerbcast][CMDCAM] command camera at {vantage?.ToString() ?? "null"} refused: {error}");
             return id;
         }
 
-        internal static uint Create(CommandVantage vantage, string name, CommandAim aim, string token, out string error)
+        /* CreateCommandCamera for the lock holder, whose aim applies; 0 for
+           anyone else while the lock is held. A heartbeat for the holder. */
+        public static uint CreateCommandCamera(CommandVantage vantage, string name, CommandAim aim, string owner)
+        {
+            var auth = KerbcastCore.Instance?.CommandAuthority;
+            if (auth != null && auth.Registered && HeldBy(owner) == null)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] command camera at {vantage?.ToString() ?? "null"} refused: {auth.Owner} holds the command lock");
+                return 0;
+            }
+            uint id = Create(vantage, name, aim, null, out string error, holderCall: true);
+            if (id == 0) Debug.LogWarning($"[Kerbcast][CMDCAM] command camera at {vantage?.ToString() ?? "null"} refused: {error}");
+            return id;
+        }
+
+        internal static uint Create(CommandVantage vantage, string name, CommandAim aim, string token, out string error,
+            bool holderCall = false)
         {
             var core = KerbcastCore.Instance;
             var provider = core?.CommandProvider;
@@ -351,13 +409,13 @@ namespace Kerbcast
                 return 0;
             }
             Orbit orbit = null;
-            if (aim != null && !TryResolveAim(0, aim, out orbit))
+            if (aim != null && TryResolveAim(0, CommandCameraSite.KeyFor(vantage), null, aim, out orbit) != AimResult.Ok)
             {
                 error = $"aim {aim} is unusable";
                 return 0;
             }
             var auth = core.CommandAuthority;
-            if (aim != null && auth != null && auth.Registered)
+            if (aim != null && auth != null && auth.Registered && !holderCall)
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] {auth.Owner} holds the command lock; new camera starts at its default, not {aim}");
                 aim = null;
@@ -371,6 +429,15 @@ namespace Kerbcast
            an unknown id, so a repeated call is harmless. */
         public static bool DestroyCommandCamera(uint flightId)
         {
+            if (CommandAuthorityOwner != null) return false;
+            return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
+        }
+
+        /* DestroyCommandCamera for the lock holder; false for anyone else while the lock is held. A heartbeat for the holder. */
+        public static bool DestroyCommandCamera(uint flightId, string owner)
+        {
+            var auth = KerbcastCore.Instance?.CommandAuthority;
+            if (auth != null && auth.Registered && HeldBy(owner) == null) return false;
             return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
         }
 
@@ -397,78 +464,99 @@ namespace Kerbcast
             return null;
         }
 
-        /* Checks an aim's numbers, craft and body, building the conic for an Orbit aim. */
-        static bool TryResolveAim(uint flightId, CommandAim aim, out Orbit orbit)
+        /* Checks an aim's numbers, craft and body, building the conic for an
+           Orbit aim. Its craft is checked against what the feed at `siteKey`
+           knows, and against what `rig` (null for a camera not built yet)
+           could frame. */
+        static AimResult TryResolveAim(uint flightId, string siteKey, CommandCameraRig rig, CommandAim aim, out Orbit orbit)
         {
             orbit = null;
-            if (!Finite(aim.FramingMarginM) || aim.FramingMarginM < 0) return false;
+            if (!Finite(aim.FramingMarginM) || aim.FramingMarginM < 0) return AimResult.BadNumber;
             uint subject = aim.SubjectPersistentId;
-            if (aim.Kind == CommandAimKind.Vessel && subject == 0) return false;
-            if (subject != 0 && !CommandCameraTargets.Exists(subject)) return false;
+            if (aim.Kind == CommandAimKind.Vessel && subject == 0) return AimResult.UnknownCraft;
+            if (subject != 0)
+            {
+                var known = CommandCameraTargets.AimSubject(siteKey, rig?.Site, subject, aim.Kind == CommandAimKind.Vessel,
+                    aim.AllowUncertain, aim.FramingMarginM, rig?.FovMax ?? 0);
+                if (known != AimResult.Ok) return known;
+            }
             switch (aim.Kind)
             {
                 case CommandAimKind.Vessel:
-                    return true;
+                    return AimResult.Ok;
                 case CommandAimKind.Direction:
-                    return Finite(aim.Azimuth) && Finite(aim.Elevation) && aim.Elevation >= -90 && aim.Elevation <= 90;
+                    return Finite(aim.Azimuth) && Finite(aim.Elevation) && aim.Elevation >= -90 && aim.Elevation <= 90
+                        ? AimResult.Ok : AimResult.BadNumber;
                 case CommandAimKind.PositionAt:
-                    if (!(Finite(aim.Ut) && Finite(aim.BodyRelativePosition) && Finite(aim.BodyRelativeVelocity))) return false;
+                    if (!(Finite(aim.Ut) && Finite(aim.BodyRelativePosition) && Finite(aim.BodyRelativeVelocity))) return AimResult.BadNumber;
                     break;
                 case CommandAimKind.Surface:
-                    if (!(Finite(aim.Latitude) && Finite(aim.Longitude) && Finite(aim.Altitude))) return false;
+                    if (!(Finite(aim.Latitude) && Finite(aim.Longitude) && Finite(aim.Altitude))) return AimResult.BadNumber;
                     break;
             }
             var body = FlightGlobals.GetBodyByName(aim.Body);
-            if (body == null) return false;
-            if (aim.Kind != CommandAimKind.Orbit) return true;
+            if (body == null) return AimResult.UnknownBody;
+            if (aim.Kind == CommandAimKind.PositionAt)
+            {
+                var p = aim.BodyRelativePosition;
+                var v = aim.BodyRelativeVelocity;
+                return KeplerPath.TryFromState(new DVec3(p.x, p.y, p.z), new DVec3(v.x, v.y, v.z), aim.Ut, body.gravParameter, out _)
+                    ? AimResult.Ok : AimResult.BadNumber;
+            }
+            if (aim.Kind != CommandAimKind.Orbit) return AimResult.Ok;
             try
             {
                 orbit = new Orbit(aim.Inclination, aim.Eccentricity, aim.SemiMajorAxis, aim.Lan,
                     aim.ArgumentOfPeriapsis, aim.MeanAnomalyAtEpoch, aim.Epoch, body);
-                return true;
+                return AimResult.Ok;
             }
             catch (System.Exception ex)
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] cam={flightId} aim {aim} rejected: {ex.Message}");
-                return false;
+                return AimResult.BadNumber;
             }
         }
 
         /* Blanks a command feed with `reason` shown on it; null or empty clears.
            A blanked feed streams black frames, never the scene. Like the
-           owner's other calls it is a heartbeat. False when no lock is held or
-           the feed is not a command feed. */
-        public static bool SetCommandBlank(uint flightId, string reason)
+           owner's other calls it is a heartbeat. False when `owner` does not
+           hold the lock or the feed is not a command feed. */
+        public static bool SetCommandBlank(uint flightId, string reason, string owner)
         {
-            var auth = Governing(flightId);
-            if (auth == null) return false;
+            var auth = HeldBy(owner);
+            if (auth == null || !IsCommandFeed(flightId)) return false;
             auth.OrdersFor(flightId).Blank = string.IsNullOrEmpty(reason) ? null : reason;
             return true;
         }
 
+        /* Without an owner nobody can be the holder, so this always refuses, and says so once per session. */
+        [System.Obsolete("Pass the lock holder's owner: SetCommandBlank(flightId, reason, owner)")]
+        public static bool SetCommandBlank(uint flightId, string reason)
+        {
+            if (!_ownerlessBlankWarned)
+            {
+                _ownerlessBlankWarned = true;
+                Debug.LogWarning("[Kerbcast][CMDCAM] SetCommandBlank without an owner is refused; call SetCommandBlank(flightId, reason, owner) as the lock holder");
+            }
+            return false;
+        }
+
+        static bool _ownerlessBlankWarned;
+
         static bool Finite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
         static bool Finite(Vector3d v) => Finite(v.x) && Finite(v.y) && Finite(v.z);
 
-        /* The registered authority after a heartbeat, when `flightId` is a command feed. */
-        static CommandAuthority Governing(uint flightId)
+        /* A built command feed, or a created one not built yet. */
+        internal static bool IsCommandFeed(uint flightId)
         {
-            var auth = KerbcastCore.Instance?.CommandAuthority;
-            if (auth == null || !auth.Registered) return null;
-            auth.Heartbeat(Time.realtimeSinceStartup);
             var c = Find(flightId);
-            if (c != null && c.Rig is CommandCameraRig) return auth;
-            return KerbcastCore.Instance.CommandProvider?.IsPending(flightId) == true ? auth : null;
+            if (c != null && c.Rig is CommandCameraRig) return true;
+            return KerbcastCore.Instance?.CommandProvider?.IsPending(flightId) == true;
         }
 
-        static KerbcastCamera Find(uint flightId)
-        {
-            var cams = KerbcastCore.Instance?.Cameras;
-            if (cams == null) return null;
-            for (int i = 0; i < cams.Count; i++)
-                if (cams[i] is KerbcastCamera kc && kc.FlightId == flightId) return kc;
-            return null;
-        }
+        static KerbcastCamera Find(uint flightId) => KerbcastApiImpl.Find(flightId);
 
+        [System.Obsolete("Builds the obsolete KerbcastCameraView")]
         static KerbcastCameraView ToView(KerbcastCamera c)
         {
             Vector3 fwd = c.BoresightWorld;

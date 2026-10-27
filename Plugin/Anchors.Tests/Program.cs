@@ -50,21 +50,21 @@ Check(AnchorRegistry.ParseRemote("not json", null).Count == 0, "an unreadable fi
 /* The registry: browser tables replace each other whole; game owners persist. */
 var reg = new AnchorRegistry();
 reg.ReplaceRemote(sets, null);
-Check(!reg.Set("gonogo", 10, new List<AnchorSpec> { AnchorSpec.ForVessel("a", 1), AnchorSpec.ForVessel("a", 2) }, out var err)
+Check(!reg.Set("mission-control", 10, new List<AnchorSpec> { AnchorSpec.ForVessel("a", 1), AnchorSpec.ForVessel("a", 2) }, out var err)
     && err.Contains("twice"), "ids are unique per owner and camera");
 var seventeen = new List<AnchorSpec>();
 for (int i = 0; i < 17; i++) seventeen.Add(AnchorSpec.ForVessel("a" + i, 1));
-Check(!reg.Set("gonogo", 10, seventeen, out _), "at most 16 per owner per camera");
+Check(!reg.Set("mission-control", 10, seventeen, out _), "at most 16 per owner per camera");
 Check(!reg.Set("peer:1:1", 10, new List<AnchorSpec>(), out _), "a game owner can not pose as a browser client");
 Check(!reg.Set("kerbcast", 10, new List<AnchorSpec>(), out _), "nor as Kerbcast");
-Check(reg.Set("gonogo", 10, new List<AnchorSpec> { AnchorSpec.ForVessel("target", 3) }, out _), "a game owner sets anchors");
+Check(reg.Set("mission-control", 10, new List<AnchorSpec> { AnchorSpec.ForVessel("target", 3) }, out _), "a game owner sets anchors");
 var onCam = new List<KeyValuePair<string, AnchorSpec>>();
 reg.ForCamera(10, onCam);
 Check(onCam.Count == 4, "the camera has the browser's three and the game's one");
 reg.ReplaceRemote(new List<RemoteAnchorSet>(), null);
 reg.ForCamera(10, onCam);
-Check(onCam.Count == 1 && onCam[0].Key == "gonogo", "an empty browser table clears only browser anchors");
-reg.Set("gonogo", 10, null, out _);
+Check(onCam.Count == 1 && onCam[0].Key == "mission-control", "an empty browser table clears only browser anchors");
+reg.Set("mission-control", 10, null, out _);
 Check(reg.Count == 0, "null clears a game owner's anchors");
 
 /* Dock merges: a craft absorbed lives on as the survivor, through chains. */
@@ -83,29 +83,190 @@ var results = new List<AnchorResult>
         ApparentRadiusPx = 12, AngleOffAxisDeg = 0.25, HasOrientation = true,
         Forward = new DVec3(0, 0, -1), Up = new DVec3(0, 1, 0), HasOcclusion = true, Occluded = false,
     },
-    new AnchorResult { Id = "pro \"q\"", Owner = "gonogo", X = 1, Y = 2, Behind = true, DistanceM = double.NaN },
+    new AnchorResult { Id = "pro \"q\"", Owner = "mission-control", X = 1, Y = 2, Behind = true, DistanceM = double.NaN },
 };
 var sb = new StringBuilder();
 byte[] buf = null;
-int len = AnchorJson.Encode(results, sb, ref buf, 4096);
+int len = FrameMetaJson.Encode(double.NaN, null, results, sb, ref buf, 4096);
 string json = Encoding.UTF8.GetString(buf, 0, len);
-Check(json.StartsWith("[{\"id\":\"port\",\"owner\":\"peer:7:1\",\"x\":640.1235,\"y\":360,\"inFrame\":true,\"behind\":false,\"distanceM\":52,"),
+Check(json.StartsWith("{\"anchors\":[{\"id\":\"port\",\"owner\":\"peer:7:1\",\"x\":640.1235,\"y\":360,\"inFrame\":true,\"behind\":false,\"distanceM\":52,"),
     "fields in wire names, rounded: " + json);
 Check(json.Contains("\"forward\":[0,0,-1],\"up\":[0,1,0],\"occluded\":false}"), "orientation and occlusion when asked for");
 Check(json.Contains("\"id\":\"pro \\\"q\\\"\"") && !json.Contains("NaN"), "strings escaped, a direction has no distance");
-var parsed = MiniJson.Parse(json) as List<object>;
-Check(parsed != null && parsed.Count == 2, "the array parses");
-int small = AnchorJson.Encode(results, sb, ref buf, 300);
-var first = MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, small)) as List<object>;
-Check(first != null && first.Count == 1, "past the capacity whole results are left out and the rest still parses");
-Check(AnchorJson.Encode(new List<AnchorResult>(), sb, ref buf, 4096) == 0, "no results, no metadata");
+var parsed = MiniJson.Parse(json) as Dictionary<string, object>;
+Check(parsed != null && (parsed["anchors"] as List<object>)?.Count == 2 && parsed.Count == 1, "the object parses, anchors only");
+int small = FrameMetaJson.Encode(double.NaN, null, results, sb, ref buf, 300);
+var first = MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, small)) as Dictionary<string, object>;
+Check(first != null && (first["anchors"] as List<object>)?.Count == 1, "past the capacity whole results are left out and the rest still parses");
+Check(FrameMetaJson.Encode(double.NaN, null, new List<AnchorResult>(), sb, ref buf, 4096) == 0, "nothing to say, no metadata");
+
+/* A command camera's frame carries its state and the boundary beside its anchors. */
+var cmd = CommandFrameState.Empty;
+cmd.HasFix = true;
+cmd.RangeM = 1500.25;
+cmd.BracketHalfPx = 12.5;
+cmd.FrameHeightPx = 720;
+cmd.Occluder = "";
+cmd.Sunlit = true;
+cmd.AuthorityOwner = "mission";
+cmd.SubjectPersistentId = 42;
+cmd.AimKind = "vessel";
+cmd.SubjectUt = 86398.123456789;
+cmd.WorldModel = "model";
+cmd.WorldModelSeq = 9;
+cmd.KnowledgeUt = 86390;
+cmd.Scope = "centre";
+len = FrameMetaJson.Encode(0.05, cmd, results, sb, ref buf, 4096);
+var meta = MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, len)) as Dictionary<string, object>;
+var c = meta?["command"] as Dictionary<string, object>;
+Check(meta != null && (double)meta["boundaryM"] == 0.05 && (meta["anchors"] as List<object>)?.Count == 2, "boundary and anchors beside the command state");
+Check(c != null && (bool)c["hasFix"] && (double)c["rangeM"] == 1500.25 && (double)c["bracketHalfPx"] == 12.5
+    && (double)c["frameHeightPx"] == 720 && (bool)c["sunlit"] && !(bool)c["occluded"], "the bracket state reads back");
+Check(c != null && (double)c["subjectUt"] == 86398.123456789, "UTs keep every digit");
+Check(c != null && ((Dictionary<string, object>)c["authority"])["owner"] as string == "mission" && (double)c["worldModelSeq"] == 9
+    && c["scope"] as string == "centre" && c["worldModel"] as string == "model", "the lock and the snapshot read");
+Check(c != null && !c.ContainsKey("trueOffsetPx") && !c.ContainsKey("blank") && !c.ContainsKey("refusal"), "what does not apply is left out");
+foreach (var key in c.Keys) Check(Array.IndexOf(CommandFrameState.Keys, key) >= 0, $"frame key '{key}' is a known one");
+small = FrameMetaJson.Encode(0.05, cmd, results, sb, ref buf, 600);
+var trimmed = MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, small)) as Dictionary<string, object>;
+Check(trimmed != null && trimmed.ContainsKey("command") && (trimmed["anchors"] as List<object>)?.Count == 1,
+    "anchors give way to the command state, which is never cut");
+
+/* A subject's refusal from its fix. */
+Check(CommandFrameState.RefusalFor(42, CraftFixState.Positioned, null) == null, "refusal: a positioned subject has none");
+Check(CommandFrameState.RefusalFor(0, CraftFixState.Unknown, null) == null, "refusal: no subject, none");
+Check(CommandFrameState.RefusalFor(42, CraftFixState.Unknown, null) == "unknown", "refusal: unknown");
+Check(CommandFrameState.RefusalFor(42, CraftFixState.Listed, null) == "notPositioned", "refusal: listed is notPositioned");
+Check(CommandFrameState.RefusalFor(42, CraftFixState.Refused, "stale") == "stale", "refusal: stale");
+Check(CommandFrameState.RefusalFor(42, CraftFixState.Refused, "noSignal") == "refused", "refusal: the provider's own code is refused");
+
+/* Every field of a frame's state set to something other than its default, by reflection, so a new field is covered without editing this test. */
+CommandFrameState Filled()
+{
+    object boxed = CommandFrameState.Empty;
+    int n = 0;
+    foreach (var f in typeof(CommandFrameState).GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+    {
+        n++;
+        if (f.FieldType == typeof(bool)) f.SetValue(boxed, !(bool)f.GetValue(boxed));
+        else if (f.FieldType == typeof(double)) f.SetValue(boxed, 1000.0 + n + 0.25);
+        else if (f.FieldType == typeof(int)) f.SetValue(boxed, 700 + n);
+        else if (f.FieldType == typeof(uint)) f.SetValue(boxed, (uint)(40 + n));
+        else if (f.FieldType == typeof(long)) f.SetValue(boxed, (long)n);
+        else if (f.FieldType == typeof(string)) f.SetValue(boxed, "v" + n);
+        else throw new InvalidOperationException($"no test value for {f.FieldType} {f.Name}");
+    }
+    return (CommandFrameState)boxed;
+}
+var filled = Filled();
+Check(filled.AuthorityOwner != null, "a filled state names an authority, so it reads as locked");
+
+/* A filled frame writes every key it knows, and no other. */
+{
+    sb.Length = 0;
+    filled.AppendJson(sb);
+    var keys = (MiniJson.Parse(sb.ToString()) as Dictionary<string, object>).Keys;
+    foreach (var key in CommandFrameState.Keys) Check(keys.Contains(key), $"a filled frame writes '{key}'");
+    Check(keys.Count == CommandFrameState.Keys.Length, "and nothing else");
+    var zeroSeq = CommandFrameState.Empty;
+    zeroSeq.WorldModelSeq = 0;
+    sb.Length = 0;
+    zeroSeq.AppendJson(sb);
+    Check(sb.ToString().Contains("\"worldModelSeq\":0"), "snapshot sequence 0 is still sent");
+    sb.Length = 0;
+    CommandFrameState.Empty.AppendJson(sb);
+    Check(!sb.ToString().Contains("worldModelSeq"), "no snapshot read, no sequence");
+    var wordy = CommandFrameState.Empty;
+    wordy.RefusalText = new string('x', 5000);
+    sb.Length = 0;
+    wordy.AppendJson(sb);
+    var text = (MiniJson.Parse(sb.ToString()) as Dictionary<string, object>)["refusalText"] as string;
+    Check(text != null && text.Length == CommandFrameState.MaxRefusalText, "refusal text is capped");
+}
+
+/* Multi-byte anchor text past the limit gives way whole, and the state still goes. */
+{
+    var wide = new List<AnchorResult> { new AnchorResult { Id = new string('\u00e9', 300), Owner = "o", X = 1, Y = 2 } };
+    int n = FrameMetaJson.Encode(0.05, CommandFrameState.Empty, wide, sb, ref buf, 500);
+    var m = n > 0 ? MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, n)) as Dictionary<string, object> : null;
+    Check(m != null && m.ContainsKey("command") && !m.ContainsKey("anchors"), "an overflow retries without anchors");
+}
+
+/*
+ * The status file's command fields are the 1.11 bracket contract, sent whole
+ * with or without a lock so an older client keeps its brackets and range.
+ * The key sets are frozen: a new field fails here, and belongs on the frames.
+ */
+{
+    var events = new List<CommandTrackEvent>
+    {
+        new CommandTrackEvent(100, false, "", true, null),
+        new CommandTrackEvent(101.5, true, "Mun", false, "Held"),
+        new CommandTrackEvent(104, false, "", true, "Held", true),
+    };
+
+    void TrackKeys(Dictionary<string, object> track, string when)
+    {
+        foreach (var key in track.Keys) Check(Array.IndexOf(CommandTrackJson.TrackKeys, key) >= 0, $"{when}: track key '{key}' is a 1.11 key");
+        foreach (var key in CommandTrackJson.TrackKeys) Check(track.ContainsKey(key), $"{when}: the 1.11 field '{key}' is sent");
+        foreach (var e in (List<object>)track["events"])
+        {
+            var ev = (Dictionary<string, object>)e;
+            Check(ev.ContainsKey("ut"), "every event carries its UT");
+            foreach (var key in ev.Keys) Check(Array.IndexOf(CommandTrackJson.EventKeys, key) >= 0, $"event key '{key}' is known");
+        }
+    }
+
+    void CameraKeys(Dictionary<string, object> cam, string when)
+    {
+        foreach (var key in cam.Keys) Check(key == "end" || Array.IndexOf(CommandTrackJson.CameraKeys, key) >= 0, $"{when}: camera key '{key}' is a 1.11 key");
+        foreach (var key in CommandTrackJson.CameraKeys) Check(cam.ContainsKey(key), $"{when}: the camera field '{key}' is sent");
+    }
+
+    sb.Length = 0;
+    CommandTrackJson.Append(sb, 101.75, filled, events);
+    var locked = MiniJson.Parse(sb.ToString()) as Dictionary<string, object>;
+    Check(locked != null, "locked track parses");
+    TrackKeys(locked, "locked");
+    Check((double)locked["ut"] == 101.75 && ((List<object>)locked["events"]).Count == 3, "the lock keeps the UT and the events");
+    Check(locked["hasFix"] is bool fix && fix && locked["rangeM"] != null && locked["bracketHalfPx"] != null,
+        "a locked track still carries the fix, range and bracket");
+    Check(locked["authority"] is Dictionary<string, object> auth && auth["owner"] as string == filled.AuthorityOwner, "a locked track names its owner");
+
+    sb.Length = 0;
+    sb.Append('{');
+    CommandTrackJson.AppendCameraFields(sb, filled, 12.5, "Probe");
+    sb.Append("\"end\": 0}");
+    CameraKeys(MiniJson.Parse(sb.ToString()) as Dictionary<string, object>, "locked");
+
+    var open = filled;
+    open.AuthorityOwner = null;
+    open.Blank = "Held";
+    sb.Length = 0;
+    CommandTrackJson.Append(sb, 101.75, open, events);
+    var unlocked = MiniJson.Parse(sb.ToString()) as Dictionary<string, object>;
+    TrackKeys(unlocked, "open");
+    Check(unlocked["authority"] == null && unlocked["blank"] as string == "Held", "with no lock, no owner");
+    sb.Length = 0;
+    sb.Append('{');
+    CommandTrackJson.AppendCameraFields(sb, open, 12.5, "Probe");
+    sb.Append("\"end\": 0}");
+    CameraKeys(MiniJson.Parse(sb.ToString()) as Dictionary<string, object>, "open");
+
+    var noFix = CommandFrameState.Empty;
+    sb.Length = 0;
+    CommandTrackJson.Append(sb, 5, noFix, null);
+    var none = MiniJson.Parse(sb.ToString()) as Dictionary<string, object>;
+    Check(none != null && none["rangeM"] == null && none["bracketHalfPx"] == null && none["authority"] == null
+        && ((List<object>)none["events"]).Count == 0, "no fix sends nulls, as 1.11 did");
+}
 
 /* Observed-only: Kerbcast's own always, browsers' under a lock unless relaxed, the game's never. */
 Check(AnchorRules.Observed("kerbcast", false, AnchorPolicy.Full), "the subject anchor is observed with no lock");
 Check(!AnchorRules.Observed("peer:1:2", false, AnchorPolicy.ObservedOnly), "a browser's anchors are full with no lock");
 Check(AnchorRules.Observed("peer:1:2", true, AnchorPolicy.ObservedOnly), "and observed under a lock by default");
 Check(!AnchorRules.Observed("peer:1:2", true, AnchorPolicy.Full), "unless the owner relaxes it");
-Check(!AnchorRules.Observed("gonogo", true, AnchorPolicy.ObservedOnly), "anchors set in game are never limited");
+Check(!AnchorRules.Observed("mission-control", true, AnchorPolicy.ObservedOnly), "anchors set in game are never limited");
 
 string Json(AnchorResult r)
 {

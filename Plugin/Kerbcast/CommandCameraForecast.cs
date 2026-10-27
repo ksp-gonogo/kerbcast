@@ -3,10 +3,10 @@ using System.Collections.Generic;
 
 namespace Kerbcast
 {
-    internal enum BodyMotionKind { Orbit, Surface, Linear }
+    internal enum BodyMotionKind { Orbit, Surface, Path }
 
-    /* How a point moves through time: on a conic, fixed to its body's
-       surface, or extrapolated linearly from a body-relative state. */
+    /* How a point moves through time: on a KSP conic, fixed to its body's
+       surface, or on a Kerbcast path in KSP's fixed frame. */
     internal struct BodyMotion
     {
         public BodyMotionKind Kind;
@@ -14,9 +14,9 @@ namespace Kerbcast
         public CelestialBody Body;
         /* Surface: offset from the body centre now, world axes. */
         public DVec3 RelNow;
-        /* Linear: body-relative z-up position at RefUt and velocity. */
-        public Vector3d Rel, Vel;
-        public double RefUt;
+        /* Path: the conic, and the planetarium's frame that turns it into world axes. */
+        public KeplerPath Path;
+        public ZupFrame Zup;
 
         public static BodyMotion OnOrbit(Orbit o) =>
             new BodyMotion { Kind = BodyMotionKind.Orbit, Orbit = o, Body = o.referenceBody };
@@ -28,8 +28,8 @@ namespace Kerbcast
                 RelNow = new DVec3(worldNow.x - body.position.x, worldNow.y - body.position.y, worldNow.z - body.position.z),
             };
 
-        public static BodyMotion Linear(CelestialBody body, Vector3d rel, Vector3d vel, double refUt) =>
-            new BodyMotion { Kind = BodyMotionKind.Linear, Body = body, Rel = rel, Vel = vel, RefUt = refUt };
+        public static BodyMotion OnPath(CelestialBody body, KeplerPath path, ZupFrame zup) =>
+            new BodyMotion { Kind = BodyMotionKind.Path, Body = body, Path = path, Zup = zup };
     }
 
     /*
@@ -39,8 +39,8 @@ namespace Kerbcast
      *
      * Every position at a future UT is taken in the current world frame:
      * body centres from getTruePositionAtUT, conics from
-     * getRelativePositionAtUT, and surface points carried round by their
-     * body's spin. Occlusion goes through CommandCameraOcclusion.Blocks,
+     * getRelativePositionAtUT or their path, and surface points carried
+     * round by their body's spin. Occlusion goes through CommandCameraOcclusion.Blocks,
      * the same test the rig records with.
      *
      * Begin drops every body that cannot reach either sight line (station
@@ -70,6 +70,9 @@ namespace Kerbcast
         /* StateAt calls since the last Begin. */
         public int LastSamples { get; private set; }
 
+        /* A point could not be placed at some sampled UT since the last Begin; the forecast then says nothing. */
+        public bool Unplaced { get; private set; }
+
         private double _aimRadius;
 
         public CommandCameraForecast(CommandCameraOcclusion occlusion)
@@ -80,6 +83,7 @@ namespace Kerbcast
         public bool Begin(double nowUt, double horizon, BodyMotion station, BodyMotion aim, double aimRadius)
         {
             LastSamples = 0;
+            Unplaced = false;
             _aimRadius = aimRadius;
             var bodies = FlightGlobals.Bodies;
             if (bodies == null || bodies.Count == 0) return false;
@@ -111,7 +115,7 @@ namespace Kerbcast
             _aimBody = _bodies.IndexOf(aim.Body);
             if (_stationBody < 0 || _aimBody < 0) return false;
             PickBodies(horizon);
-            return true;
+            return !Unplaced;
         }
 
         private void PickBodies(double horizon)
@@ -184,7 +188,10 @@ namespace Kerbcast
                 case BodyMotionKind.Surface:
                     return CommandCameraMath.CarriedByBody(m.RelNow, c, _spins[body], t - _now);
                 default:
-                    return c + ToD((m.Rel + m.Vel * (t - m.RefUt)).xzy);
+                    if (m.Path.TryAt(t, out var rel, out _)) return c + m.Zup.ToWorld(rel);
+                    /* Not placed: the body's centre stands in only until the caller sees Unplaced and drops the forecast. */
+                    Unplaced = true;
+                    return c;
             }
         }
 
@@ -200,7 +207,7 @@ namespace Kerbcast
 
         /* Fastest a point on this motion can move relative to `frame`: its
            own speed at periapsis (or spin, or drift) plus its body's. */
-        private static double SpeedBound(BodyMotion m, CelestialBody frame)
+        internal static double SpeedBound(BodyMotion m, CelestialBody frame)
         {
             double own;
             switch (m.Kind)
@@ -212,7 +219,7 @@ namespace Kerbcast
                     own = CommandCameraOcclusion.Spin(m.Body).Magnitude * m.RelNow.Magnitude;
                     break;
                 default:
-                    own = m.Vel.magnitude;
+                    own = m.Path.PeriapsisSpeed;
                     break;
             }
             return own * SpeedMargin + BodySpeedBound(m.Body, frame);

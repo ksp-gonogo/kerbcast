@@ -12,7 +12,7 @@
 #   ./scripts/bump-version.sh 1.0.0-rc.1
 #
 # After bumping:
-#   git add sidecar/Cargo.toml sidecar/Cargo.lock \
+#   git add sidecar/Cargo.toml sidecar/Cargo.lock Plugin/Versions.props \
 #           client-sdk/typescript/package.json \
 #           client-sdk/typescript/CHANGELOG.md \
 #           client-sdk/react/package.json \
@@ -105,6 +105,14 @@ PYEOF
   echo "  $AVC -> $BASE"
 done
 
+# Plugin/Versions.props -- KerbcastVersion drives Kerbcast.dll's
+# KSPAssembly("Kerbcast", major, minor). KerbcastApiVersion is the public API's
+# own line and moves by hand when Kerbcast.API gains members.
+VERSIONS_PROPS="$ROOT/Plugin/Versions.props"
+sed -i.bak -E "s|<KerbcastVersion>[^<]*</KerbcastVersion>|<KerbcastVersion>$NEW</KerbcastVersion>|" "$VERSIONS_PROPS"
+rm "$VERSIONS_PROPS.bak"
+echo "  $VERSIONS_PROPS -> $NEW"
+
 # Cargo.lock -- rerun cargo to refresh the lockfile's [[package]] entry for
 # kerbcast-sidecar.
 if command -v cargo >/dev/null 2>&1; then
@@ -142,6 +150,7 @@ bump_changelog "$REACT_CHANGELOG" "$TODAY"
 echo ""
 echo "bumped to $NEW:"
 echo "  $CARGO"
+echo "  $VERSIONS_PROPS"
 echo "  $TS_PKG"
 echo "  $REACT_PKG"
 echo "  $TS_CHANGELOG (placeholder header -- fill the body before committing)"
@@ -150,7 +159,7 @@ echo "  $ROOT/web/dist/index.html (rebuilt)"
 echo ""
 echo "next:"
 echo "  vim $TS_CHANGELOG $REACT_CHANGELOG  # describe the changes"
-echo "  git add sidecar/Cargo.toml sidecar/Cargo.lock \\"
+echo "  git add sidecar/Cargo.toml sidecar/Cargo.lock Plugin/Versions.props \\"
 echo "          client-sdk/typescript/package.json client-sdk/typescript/CHANGELOG.md \\"
 echo "          client-sdk/react/package.json client-sdk/react/CHANGELOG.md \\"
 echo "          web/dist/index.html"

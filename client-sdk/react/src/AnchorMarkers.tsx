@@ -114,7 +114,7 @@ export interface AnchorOverlay {
   readout?: (anchor: FrameAnchor, ctx: AnchorContext) => string | null;
   /**
    * Game-side owners whose anchors are drawn as well as this client's own,
-   * e.g. `["gonogo"]`. Default: only this client's.
+   * e.g. `["my-mod"]`. Default: only this client's.
    */
   owners?: readonly string[];
 }

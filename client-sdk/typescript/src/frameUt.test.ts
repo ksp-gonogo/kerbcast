@@ -23,6 +23,21 @@ describe("FrameStampStore", () => {
     expect(store.newestArrivedBy(2, 500)).toBeNull();
   });
 
+  it("carries the live bound, boundary and command state as extras", () => {
+    const store = new FrameStampStore();
+    const command = {
+      hasFix: false,
+      frameHeightPx: 720,
+      framingFits: true,
+      occluded: false,
+      occluder: "",
+      sunlit: false,
+      subjectPersistentId: 0,
+    };
+    store.record({ flightId: 1, rtpTimestamp: 5, captureUt: 1, captureEpoch: 0, liveLightTimeS: 0, boundaryM: 0.05, command });
+    expect(store.lookup(1, 5)).toEqual({ ut: 1, epoch: 0, liveLightTimeS: 0, boundaryM: 0.05, command });
+  });
+
   it("clear forgets everything", () => {
     const store = new FrameStampStore();
     store.record({ flightId: 1, rtpTimestamp: 5, captureUt: 1, captureEpoch: 0 });

@@ -4,6 +4,7 @@ import type {
   CameraState,
   ClientMessage,
   CommandAim,
+  CommandCentreInfo,
   CommandVantage,
   DisplaySizeReport,
   ErrorPayload,
@@ -31,6 +32,7 @@ import {
 } from "./noise";
 import { RecordingController, type RecordingControllerOptions } from "./recording";
 import { MAX_ANCHORS_PER_CAMERA } from "./anchors";
+import { CommandCentreHistory } from "./commandTrack";
 
 /** Cadence of estimated frames from a watcher on a browser without `requestVideoFrameCallback`. */
 const ESTIMATED_FRAME_INTERVAL_MS = 100;
@@ -262,7 +264,7 @@ export interface KerbcastClientConfig {
    * The load-bearing use is `loadTrimmer`: a consumer that can't rely on the
    * default bare `import("mediabunny")` resolving (the sidecar's embedded web
    * page serves its own copy of the package locally, offline/LAN, no CDN)
-   * supplies its own loader here. Bundler consumers (e.g. gonogo) can omit
+   * supplies its own loader here. Bundler consumers can omit
    * this and get the default.
    */
   recording?: RecordingControllerOptions;
@@ -1275,6 +1277,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _captureUtAt = 0;
   /** Per-frame capture stamps from `frame-stamp`, for exact frame UT lookup. */
   private readonly frameStamps = new FrameStampStore();
+  /** Each command camera's recent targets lists, for {@link commandCentreAt}. */
+  private readonly commandCentres = new CommandCentreHistory();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
   /** Client-side recording controller, lazily built on first `recording` access. */
@@ -1554,6 +1558,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.legacyFlightByMid.clear();
     /* RTP timestamps restart from a fresh random base on every peer. */
     this.frameStamps.clear();
+    this.commandCentres.clear();
     this._anchorsSupported = false;
 
     const peerOpts = this.peerOptions();
@@ -1790,6 +1795,24 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       type: "set-command-aim",
       content: aim ? { flightId, aim } : { flightId },
     });
+  }
+
+  /**
+   * A command camera's subject, range and targets list as they stood at
+   * `displayUt`, the UT of the frame a view shows (`DisplayedFrameUt.ut`), so
+   * a delayed view never lists what its picture has not reached. `null`
+   * while every list the game has sent is newer than that. Without a
+   * displayed UT, the newest, as `commandCentre` on the camera list, but
+   * `null` while a command lock is held: with nothing displayed there is no
+   * frame the list may run to. Lists from a game older than 1.12 carry no UT
+   * and apply at once.
+   */
+  commandCentreAt(flightId: number, displayUt?: number | null): CommandCentreInfo | null {
+    if (displayUt == null) {
+      const cam = this._cameras.find((c) => c.flightId === flightId);
+      if (cam?.commandTrack?.authority) return null;
+    }
+    return this.commandCentres.at(flightId, displayUt);
   }
 
   /**
@@ -2054,7 +2077,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         if (msg.content.frameStamps === true) {
           void this._send({
             type: "set-frame-stamps",
-            content: this._anchorsSupported ? { enabled: true, anchors: true } : { enabled: true },
+            content: {
+              enabled: true,
+              ...(this._anchorsSupported ? { anchors: true } : {}),
+              ...(msg.content.frameCommand === true ? { command: true } : {}),
+            },
           }).catch(() => {});
         }
         /* A new connection starts with no anchors on the sidecar; send ours again. */
@@ -2066,7 +2093,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         break;
       case "camera-snapshot":
         this._cameras = msg.content.cameras;
+        this.commandCentres.retain(this._cameras.map((c) => c.flightId));
         for (const cam of this._cameras) {
+          this.commandCentres.record(cam.flightId, cam.commandCentre);
           if (this.getOrCreateHandle(cam.flightId)._setState(cam)) {
             this._resourceHandle(cam.flightId);
           }
@@ -2079,6 +2108,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         );
         next.push(msg.content.state);
         next.sort((a, b) => a.flightId - b.flightId);
+        this.commandCentres.record(msg.content.state.flightId, msg.content.state.commandCentre);
         this._cameras = next;
         if (
           this.getOrCreateHandle(msg.content.state.flightId)._setState(

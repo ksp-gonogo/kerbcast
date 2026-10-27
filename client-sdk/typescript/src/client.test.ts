@@ -823,14 +823,14 @@ describe("KerbcastClient", () => {
       const { client, captured, snapshot } = await connected();
       const locked = {
         ...commandCamera(300),
-        commandTrack: { ...commandCamera(300).commandTrack, authority: { owner: "gonogo" } },
+        commandTrack: { ...commandCamera(300).commandTrack, authority: { owner: "mission-control" } },
       };
       snapshot([locked]);
       const err = await client
         .setCommandAim(300, { kind: CommandAimKind.Vessel, persistentId: 7 })
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CommandLockedError);
-      expect((err as CommandLockedError).owner).toBe("gonogo");
+      expect((err as CommandLockedError).owner).toBe("mission-control");
       expect((err as CommandLockedError).code).toBe(ErrorCode.CommandLocked);
       expect(captured.dc?.sent).toEqual([]);
 
@@ -2595,7 +2595,8 @@ describe("KerbcastClient anchors", () => {
       captured.dc?._msg(
         JSON.stringify({ type: "hello", content: { sidecarVersion: "1.12.0", encoderBackend: "x", ...hello } }),
       );
-    return { client, sent, sayHello };
+    const push = (msg: object) => captured.dc?._msg(JSON.stringify(msg));
+    return { client, sent, sayHello, push };
   }
 
   it("asks for anchor results only from a sidecar that offers anchors", async () => {
@@ -2604,6 +2605,43 @@ describe("KerbcastClient anchors", () => {
     expect(sent("set-frame-stamps")).toEqual([
       { type: "set-frame-stamps", content: { enabled: true, anchors: true } },
     ]);
+  });
+
+  it("asks for per-frame command state from a sidecar that offers it", async () => {
+    const { client, sent, sayHello } = await connectedTo({ frameStamps: true, anchors: true, frameCommand: true });
+    sayHello();
+    expect(sent("set-frame-stamps")).toEqual([
+      { type: "set-frame-stamps", content: { enabled: true, anchors: true, command: true } },
+    ]);
+    expect(client.commandCentreAt(1)).toBeNull();
+  });
+
+  it("holds a command camera's targets list to the displayed UT, and shows none undisplayed under a lock", async () => {
+    const { client, sayHello, push } = await connectedTo({ frameStamps: true, frameCommand: true });
+    sayHello();
+    const centre = (ut: number, rangeM: number) => ({
+      stationId: "ground:KSC", nodeName: "KSC", siteKey: "KSC", siteKind: "station", vantagePersistentId: 0,
+      displayName: "KSC", body: "Kerbin", latitude: 0, longitude: 0, altitude: 0,
+      subjectPersistentId: 42, rangeM, trackingLevel: 3, targets: [], created: false, ut,
+    });
+    const camera = (ut: number, rangeM: number, owner?: string) => ({
+      flightId: 9, kind: "command", partName: "", partTitle: "", cameraName: "", vesselName: "",
+      layers: [], operatorLayers: [], renderWidth: 64, renderHeight: 64, operatorWidth: 64, operatorHeight: 64,
+      supportsZoom: false, fov: 30, fovMin: 30, fovMax: 30, supportsPan: false, panYaw: 0, panPitch: 0,
+      panYawMin: 0, panYawMax: 0, panPitchMin: 0, panPitchMax: 0,
+      commandCentre: centre(ut, rangeM),
+      commandTrack: { ut, hasFix: false, occluded: false, occluder: "", sunlit: false, frameHeightPx: 0, framingFits: true, events: [], ...(owner ? { authority: { owner } } : {}) },
+    });
+    push({ type: "camera-snapshot", content: { cameras: [camera(100, 1000)] } });
+    push({ type: "camera-state-changed", content: { state: camera(200, 2000) } });
+    expect(client.commandCentreAt(9, 99)).toBeNull();
+    expect(client.commandCentreAt(9, 150)?.rangeM).toBe(1000);
+    expect(client.commandCentreAt(9)?.rangeM).toBe(2000);
+    push({ type: "camera-state-changed", content: { state: camera(300, 3000, "mission") } });
+    expect(client.commandCentreAt(9)).toBeNull();
+    expect(client.commandCentreAt(9, 250)?.rangeM).toBe(2000);
+    push({ type: "camera-snapshot", content: { cameras: [] } });
+    expect(client.commandCentreAt(9, 250)).toBeNull();
   });
 
   it("keeps anchors set before hello and sends them once the sidecar offers anchors", async () => {

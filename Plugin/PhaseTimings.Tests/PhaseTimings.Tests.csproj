@@ -21,6 +21,7 @@
     <!-- Compile the unit under test directly — no project reference to the KSP
          plugin (which can't build off-Linux / needs Unity refs). -->
     <Compile Include="../Kerbcast/PhaseTimings.cs" />
+    <Compile Include="../Kerbcast/TelemetryMeters.cs" />
   </ItemGroup>
 
 </Project>

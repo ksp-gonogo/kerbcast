@@ -63,6 +63,8 @@ namespace Kerbcast
         void AfterScaledRender(KerbcastCamera cam);
         /* The frame centre after galaxy and scaled rendered, when asked for. */
         void OnScaledProbe(KerbcastCamera cam, Color centre);
+        /* The craft the lens rides, whose parts set the frame's live bound; null for none. */
+        Vessel LensCraft { get; }
         void Dispose();
     }
 
@@ -72,6 +74,9 @@ namespace Kerbcast
 
         /* Null for part cameras. Set once, right after construction. */
         internal ICameraRig Rig { get; set; }
+        /* Where this camera draws every craft under light time. A part camera's
+           lens is its own eye on its craft; a rig places its lens itself. */
+        internal PicturePass Picture { get; }
         /* Set by the rig when the far layer must not draw this tick (the craft
            is hidden behind a body). */
         internal bool RigSkipFar { get; set; }
@@ -108,6 +113,15 @@ namespace Kerbcast
             finally { Rig.AfterScaledRender(this); }
         }
 
+        /* The frame's live bound: a rig's lens rides the rig's craft (none at a
+           ground site), a part camera's the craft its part is on. */
+        private double LiveLightTimeNow()
+        {
+            var lens = _nearCam != null ? _nearCam.transform : Mount.PartTransform;
+            if (lens == null) return LiveLightTime.For(Vector3d.zero, null);
+            return LiveLightTime.For(lens.position, Rig != null ? Rig.LensCraft : Vessel);
+        }
+
         /* A blanked feed streams black, never the scene and never a frozen
            frame. The plain blit keeps any filter or test pattern off it. */
         private void PublishBlack()
@@ -119,7 +133,7 @@ namespace Kerbcast
                 RenderTexture.active = _capture.CaptureRt;
                 GL.Clear(true, true, Color.black);
                 RenderTexture.active = prev;
-                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit, new FrameMeta { FovDeg = Fov });
+                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit, _anchors.BuildBlank(this));
             }
             catch (Exception ex)
             {
@@ -493,13 +507,14 @@ namespace Kerbcast
             // content size so the sidecar encodes at the current dim.
             _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight, AnchorProjector.MetaSlotBytes);
             _anchors = new AnchorProjector(FlightId);
+            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld);
             WriteInfoManifest();
 
             // Failure-streak (_consecutiveErrors + LogRateLimited) and the
             // PhaseTimings sink stay owned here; the tail invokes them so a
             // readback error and a render error share one rate-limit counter and
             // one telemetry object.
-            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
+            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0, LiveLightTimeNow);
 
             _capture.BuildTargets(renderWidth, renderHeight);
             SetCameras();
@@ -1253,7 +1268,7 @@ namespace Kerbcast
         public CameraLayers Layers => _layers;
         public CameraLayers OperatorLayers => _operatorLayers;
         /// <summary>Whether atmospheric-FX replication is currently requested
-        /// for this camera. Echoed in status JSON so the operator/gonogo can
+        /// for this camera. Echoed in status JSON so the operator or a client can
         /// confirm a control-file flip was received.</summary>
         public bool EnableFx => _enableFx;
 
@@ -1452,14 +1467,17 @@ namespace Kerbcast
 
         /* Resolve the current track target's WORLD position from FlightGlobals
            only (no orbit math): the active vessel's CoM, or its target's
-           transform. Null when there is no active vessel / no target this
-           frame (a no-op tick). */
+           transform. A craft is aimed at where this camera draws it: an onboard
+           tracker sees by the light it receives, so under a signal speed a
+           distant craft is followed at its past position. Null when there is
+           no active vessel / no target this frame, or no light from the craft
+           is arriving yet (a no-op tick, so the held pose stays). */
         private UnityEngine.Vector3? ResolveTrackTarget()
         {
             if (_trackMode == TrackAim.ModeActiveVessel)
             {
                 var v = FlightGlobals.ActiveVessel;
-                return v != null ? (UnityEngine.Vector3?)v.CoM : null;
+                return v != null ? Picture.Drawn(v, v.CoM) : null;
             }
             if (_trackMode == TrackAim.ModeTarget)
             {
@@ -1467,7 +1485,9 @@ namespace Kerbcast
                     ? FlightGlobals.ActiveVessel.targetObject
                     : null;
                 var tr = tgt != null ? tgt.GetTransform() : null;
-                return tr != null ? (UnityEngine.Vector3?)tr.position : null;
+                if (tr == null) return null;
+                var craft = tgt.GetVessel();
+                return craft != null ? Picture.Drawn(craft, tr.position) : tr.position;
             }
             return null;
         }
@@ -2033,6 +2053,11 @@ namespace Kerbcast
                     return;
                 }
             }
+            if (Picture.Prepare() == RigFrame.Blank)
+            {
+                PublishBlack();
+                return;
+            }
 
             // Zero this frame's per-phase Last values before recording, so a
             // phase shed this tick reads 0 rather than its last-rendered figure
@@ -2122,6 +2147,7 @@ namespace Kerbcast
                                 $"ambient={RenderSettings.ambientLight} ambientMode={RenderSettings.ambientMode} " +
                                 $"scaledSunLight={(ssl == null ? "null" : $"enabled={ssl.enabled} intensity={ssl.intensity} color={ssl.color} cullingMask={ssl.cullingMask}")}");
                         }
+                        Picture.BeforeScaledLayer();
                         _integrationHost?.PerFrame(_scaledCam, CameraLayers.Scaled, BuildIntegrationFrameState(CameraLayers.Scaled));
                         RenderScaledWithRig();
                         if (_firstRender)
@@ -2143,6 +2169,7 @@ namespace Kerbcast
                     }
                     finally
                     {
+                        Picture.AfterScaledLayer();
                         foreach (var state in _faderOverrides)
                         {
                             // Restore _FadeAltitude to ScaledSpaceFader's value in the
@@ -2162,35 +2189,44 @@ namespace Kerbcast
                     _phaseTimings.Record(RenderPhase.Scaled,
                         (System.Diagnostics.Stopwatch.GetTimestamp() - scaledStart) * _msPerTick);
 
-                if (_farCam != null && (_layers & CameraLayers.Far) != 0 && !RigSkipFar)
+                /* The picture's local-layer changes are undone whatever throws in between. */
+                try
                 {
-                    long farStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    _integrationHost?.PerFrame(_farCam, CameraLayers.Far, BuildIntegrationFrameState(CameraLayers.Far));
-                    _farCam.Render();
-                    if (_telemetry)
-                        _phaseTimings.Record(RenderPhase.Far,
-                            (System.Diagnostics.Stopwatch.GetTimestamp() - farStart) * _msPerTick);
+                    Picture.BeforeLocalLayers();
+                    if (_farCam != null && (_layers & CameraLayers.Far) != 0 && !RigSkipFar)
+                    {
+                        long farStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                        _integrationHost?.PerFrame(_farCam, CameraLayers.Far, BuildIntegrationFrameState(CameraLayers.Far));
+                        _farCam.Render();
+                        if (_telemetry)
+                            _phaseTimings.Record(RenderPhase.Far,
+                                (System.Diagnostics.Stopwatch.GetTimestamp() - farStart) * _msPerTick);
+                    }
+
+                    Rig?.RenderBetweenFarAndNear(this);
+
+                    if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
+                    {
+                        // FX effects update materials and (re)attach their command
+                        // buffers before the render; the near render then executes
+                        // those CBs (e.g. the core sheath at AfterForwardAlpha).
+                        // Time the FX build + render + near render together (the
+                        // task's "near Render() (+ FX)" phase).
+                        long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                        _integrationHost?.PerFrame(_nearCam, CameraLayers.Near, BuildIntegrationFrameState(CameraLayers.Near));
+                        _fxHost?.Render(BuildFxFrameState());
+                        _nearCam.Render();
+                        if (_telemetry)
+                            _phaseTimings.Record(RenderPhase.Near,
+                                (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
+                    }
+
+                    Rig?.AfterLayersRender(this);
                 }
-
-                Rig?.RenderBetweenFarAndNear(this);
-
-                if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
+                finally
                 {
-                    // FX effects update materials and (re)attach their command
-                    // buffers before the render; the near render then executes
-                    // those CBs (e.g. the core sheath at AfterForwardAlpha).
-                    // Time the FX build + render + near render together (the
-                    // task's "near Render() (+ FX)" phase).
-                    long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    _integrationHost?.PerFrame(_nearCam, CameraLayers.Near, BuildIntegrationFrameState(CameraLayers.Near));
-                    _fxHost?.Render(BuildFxFrameState());
-                    _nearCam.Render();
-                    if (_telemetry)
-                        _phaseTimings.Record(RenderPhase.Near,
-                            (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
+                    Picture.AfterLayers();
                 }
-
-                Rig?.AfterLayersRender(this);
 
                 // Composite done: re-attach Scatterer's sun-light shadow buffers
                 // so the main flight render this frame gets correct shadows. The

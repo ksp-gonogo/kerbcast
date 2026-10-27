@@ -10,3 +10,6 @@
 
 [assembly: KSPAssemblyDependency("kOS", 1, 6)]
 [assembly: KSPAssemblyDependency("kOS.Safe", 0, 0)]
+
+/* Kerbcast.API is a hard dependency: the addon has nothing to do without it. */
+[assembly: KSPAssemblyDependency("KerbcastAPI", 1, 0)]

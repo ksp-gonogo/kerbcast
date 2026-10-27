@@ -53,6 +53,7 @@ then browse to `http://<ksp-machine-ip>:8088` from the other device. See
 ```
 GameData/Kerbcast/
 ├── Plugins/Kerbcast.dll       the KSP plugin
+├── Plugins/Kerbcast.API.dll   the interface other mods build against (MIT)
 ├── Sidecar/<rid>/            one encoder/WebRTC sidecar binary per OS
 │   ├── linux-x64/            (+ lib/ with bundled ffmpeg shared libs)
 │   ├── osx-arm64/

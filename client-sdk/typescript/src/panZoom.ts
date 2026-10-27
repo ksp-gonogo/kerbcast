@@ -148,8 +148,7 @@ function newSettling(): Settling {
 /**
  * Headless pan/zoom state machine. Manages rate deduplication, analog
  * deadzone, optimistic accumulators, FoV slider debounce, and echo-sync
- * idle rules. Mirrors the behaviour of the CameraFeed component in gonogo
- * (CameraFeed.tsx lines 323-592) without any React or DOM coupling.
+ * idle rules, without any React or DOM coupling.
  */
 export class PanZoomController {
   private readonly sink: PanZoomCommandSink;

@@ -9,6 +9,18 @@
 #   ./scripts/ci-check.sh
 set -euo pipefail
 
+# Fleet agent branches stay local; only deleting one on the remote is allowed.
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/fleet/*)
+      if [ "${local_sha//0/}" != "" ]; then
+        echo "pre-push: refusing to push $remote_ref (fleet branches are never pushed)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
 SIDECAR="$(git rev-parse --show-toplevel)/sidecar"
 
 echo "--- pre-push: cargo fmt --check ---"

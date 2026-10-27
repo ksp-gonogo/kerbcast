@@ -30,7 +30,8 @@ use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
     CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
-    ErrorCode, Layer, QualityPreset, SetCommandAimPayload, SettingsStatePayload, TrackMode,
+    ErrorCode, Layer, QualityPreset, SetCommandAimPayload, SettingsStatePayload, SiteKind,
+    TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
@@ -161,14 +162,17 @@ struct PerCameraStatus {
         skip_serializing_if = "Option::is_none"
     )]
     command_track: Option<CommandTrackState>,
-    /// A command camera's target, range, Tracking Station level and target
-    /// list. Absent for every other kind; a malformed object is dropped.
+    /// A command camera's target, range, Tracking Station level, target list
+    /// and current vantage craft. Absent for every other kind; a malformed
+    /// object is dropped. The key stays `commandCentre` so plugins and
+    /// sidecars of either version read each other's files.
     #[serde(
         default,
-        deserialize_with = "lenient_command_centre",
+        rename = "commandCentre",
+        deserialize_with = "lenient_command_targets",
         skip_serializing_if = "Option::is_none"
     )]
-    command_centre: Option<CommandCentreStatus>,
+    command_targets: Option<CommandTargetsStatus>,
 }
 
 /// The per-write part of a command camera's `CommandCentreInfo`. The plugin
@@ -176,7 +180,7 @@ struct PerCameraStatus {
 /// equal from one write to the next and only a visible move re-broadcasts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CommandCentreStatus {
+struct CommandTargetsStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     aim_kind: Option<CommandAimKind>,
     #[serde(default)]
@@ -185,11 +189,40 @@ struct CommandCentreStatus {
     range_m: Option<f64>,
     #[serde(default)]
     tracking_level: u32,
+    /// UT of the write; not compared when deciding whether the list changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ut: Option<f64>,
     #[serde(default)]
     targets: Vec<CommandTarget>,
+    #[serde(default)]
+    vantage_persistent_id: u32,
 }
 
-fn lenient_command_centre<'de, D>(d: D) -> Result<Option<CommandCentreStatus>, D::Error>
+/// Whether a command camera's subject, range or targets moved. A later `ut`
+/// on the same content is not a change: a client keeps the UT the content
+/// first had. An earlier one is (a load or revert ran time back), so
+/// clients see the content again from the UT the game is at now.
+fn command_targets_changed(
+    a: &Option<CommandTargetsStatus>,
+    b: &Option<CommandTargetsStatus>,
+) -> bool {
+    if let (Some(x), Some(y)) = (a, b) {
+        if let (Some(before), Some(now)) = (x.ut, y.ut) {
+            if now < before {
+                return true;
+            }
+        }
+    }
+    let strip = |s: &Option<CommandTargetsStatus>| {
+        s.clone().map(|mut s| {
+            s.ut = None;
+            s
+        })
+    };
+    strip(a) != strip(b)
+}
+
+fn lenient_command_targets<'de, D>(d: D) -> Result<Option<CommandTargetsStatus>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -200,7 +233,7 @@ where
     match serde_json::from_value(value) {
         Ok(c) => Ok(Some(c)),
         Err(e) => {
-            tracing::debug!(error = %e, "command centre parse failed; dropping it");
+            tracing::debug!(error = %e, "command targets parse failed; dropping it");
             Ok(None)
         }
     }
@@ -563,9 +596,14 @@ struct InfoManifest {
     /// `"seat"` or `"eva"`. `None` for part cameras.
     #[serde(default)]
     crew_location: Option<String>,
-    /// Command camera station identity, present only on `"command"` manifests.
+    /// The command camera's site key and kind, present only on `"command"`
+    /// manifests.
     #[serde(default)]
-    station_id: Option<String>,
+    site_key: Option<String>,
+    #[serde(default)]
+    site_kind: Option<String>,
+    #[serde(default)]
+    vantage_persistent_id: Option<u32>,
     /// Set on a command camera created at runtime.
     #[serde(default)]
     command_created: Option<bool>,
@@ -694,7 +732,7 @@ pub struct CameraState {
     /// not of any one viewer, and the single shared encoder can only
     /// emit one degrade anyway — so this is a single per-camera scalar,
     /// not a per-peer reduction. Whichever subscriber wrote last owns it;
-    /// a well-behaved driver (e.g. gonogo) re-asserts every tick.
+    /// a well-behaved driver re-asserts every tick.
     /// Stored as bits-of-f32 in an AtomicU32 to keep the hot path
     /// lock-free (encode_and_fan_out runs per-frame, the f32 is
     /// already bit-pattern-stable for our levels).
@@ -1723,7 +1761,7 @@ impl CameraRegistry {
     pub async fn list(&self) -> Vec<CameraInfo> {
         let cams = self.snapshot().await;
         let primary_fps = self.primary_capture_fps().await;
-        let centres: HashMap<u32, CommandCentreStatus> = self
+        let centres: HashMap<u32, CommandTargetsStatus> = self
             .last_status
             .lock()
             .await
@@ -1731,7 +1769,7 @@ impl CameraRegistry {
             .map(|st| {
                 st.cameras
                     .iter()
-                    .filter_map(|c| c.command_centre.clone().map(|cc| (c.flight_id, cc)))
+                    .filter_map(|c| c.command_targets.clone().map(|cc| (c.flight_id, cc)))
                     .collect()
             })
             .unwrap_or_default();
@@ -1814,7 +1852,7 @@ impl CameraRegistry {
                 return StatusDelta::default();
             }
         };
-        let parsed: GlobalStatusFile = match serde_json::from_slice(&bytes) {
+        let mut parsed: GlobalStatusFile = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "status parse failed");
@@ -1877,6 +1915,24 @@ impl CameraRegistry {
         // kOS set need not move render state).
         let mut adopts: Vec<(u32, TrackMode)> = Vec::new();
 
+        /* A targets list keeps the UT it first had while its content holds,
+        so the stored snapshot and every delta name the same UT. */
+        if let Some(prev) = last.as_ref() {
+            for cam in parsed.cameras.iter_mut() {
+                let Some(p) = prev.cameras.iter().find(|c| c.flight_id == cam.flight_id) else {
+                    continue;
+                };
+                if command_targets_changed(&p.command_targets, &cam.command_targets) {
+                    continue;
+                }
+                if let (Some(now), Some(before)) =
+                    (cam.command_targets.as_mut(), p.command_targets.as_ref())
+                {
+                    now.ut = before.ut;
+                }
+            }
+        }
+
         // Per-camera diffs. Only flag cameras whose effective state moved.
         for cam_status in &parsed.cameras {
             if let Some(cam) = cameras.get(&cam_status.flight_id) {
@@ -1912,7 +1968,7 @@ impl CameraRegistry {
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
                         || command_track_changed(&p.command_track, &cam_status.command_track)
-                        || p.command_centre != cam_status.command_centre
+                        || command_targets_changed(&p.command_targets, &cam_status.command_targets)
                 }
             };
             if !changed {
@@ -1947,7 +2003,7 @@ impl CameraRegistry {
                 kerbal_persistent_id: cam.kerbal_persistent_id,
                 command_centre: command_centre_with(
                     &cam.command_centre,
-                    cam_status.command_centre.as_ref(),
+                    cam_status.command_targets.as_ref(),
                 ),
                 command_track: cam_status.command_track.clone(),
                 capture_state: cam.capture_state_with(background_capturing),
@@ -2249,14 +2305,14 @@ impl CameraRegistry {
      */
     async fn command_target_unknown(&self, flight_id: u32, pid: u32) -> bool {
         let status = self.last_status.lock().await;
-        let Some(centre) = status
+        let Some(listed) = status
             .as_ref()
             .and_then(|s| s.cameras.iter().find(|c| c.flight_id == flight_id))
-            .and_then(|c| c.command_centre.as_ref())
+            .and_then(|c| c.command_targets.as_ref())
         else {
             return false;
         };
-        !centre.targets.is_empty() && !centre.targets.iter().any(|t| t.persistent_id == pid)
+        !listed.targets.is_empty() && !listed.targets.iter().any(|t| t.persistent_id == pid)
     }
 
     /// The command authority the plugin last reported for this camera, if any.
@@ -2741,7 +2797,7 @@ impl CameraRegistry {
             kerbal_persistent_id: cam.kerbal_persistent_id,
             command_centre: command_centre_with(
                 &cam.command_centre,
-                per.as_ref().and_then(|p| p.command_centre.as_ref()),
+                per.as_ref().and_then(|p| p.command_targets.as_ref()),
             ),
             command_track: per.as_ref().and_then(|p| p.command_track.clone()),
             capture_state: cam.capture_state_with(background_capturing),
@@ -2832,7 +2888,9 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
         pan_pitch_max: 0.0,
         kind: String::new(),
         kerbal_persistent_id: None,
-        station_id: None,
+        site_key: None,
+        site_kind: None,
+        vantage_persistent_id: None,
         command_created: None,
         command_token: None,
         station_node_name: None,
@@ -2887,16 +2945,28 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
     if camera_kind_from_manifest(&m.kind) != CameraKind::Command {
         return None;
     }
-    let station_id = m.station_id.clone()?;
-    let node_name = m.station_node_name.clone().unwrap_or_default();
+    let node_name = m
+        .station_node_name
+        .clone()
+        .or_else(|| m.site_key.clone())
+        .filter(|n| !n.is_empty())?;
+    let site_key = m
+        .site_key
+        .clone()
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| node_name.clone());
     let display_name = m
         .station_name
         .clone()
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| node_name.clone());
+    let site_kind = site_kind_from_manifest(m.site_kind.as_deref(), &site_key);
     Some(CommandCentreInfo {
-        station_id,
+        station_id: format!("ground:{node_name}"),
         node_name,
+        site_key,
+        site_kind,
+        vantage_persistent_id: m.vantage_persistent_id.unwrap_or_default(),
         display_name,
         body: m.station_body.clone().unwrap_or_default(),
         latitude: m.station_latitude.unwrap_or_default(),
@@ -2906,6 +2976,7 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         subject_persistent_id: 0,
         range_m: None,
         tracking_level: 0,
+        ut: None,
         targets: Vec::new(),
         created: m.command_created.unwrap_or(false),
         token: m.command_token.clone().filter(|t| !t.is_empty()),
@@ -2916,7 +2987,7 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
 /// target, range, level and target list laid over it.
 fn command_centre_with(
     info: &Option<CommandCentreInfo>,
-    status: Option<&CommandCentreStatus>,
+    status: Option<&CommandTargetsStatus>,
 ) -> Option<CommandCentreInfo> {
     let mut out = info.clone()?;
     if let Some(s) = status {
@@ -2924,9 +2995,26 @@ fn command_centre_with(
         out.subject_persistent_id = s.subject_persistent_id;
         out.range_m = s.range_m;
         out.tracking_level = s.tracking_level;
+        out.ut = s.ut;
         out.targets = s.targets.clone();
+        out.vantage_persistent_id = s.vantage_persistent_id;
     }
     Some(out)
+}
+
+/// Manifest `site_kind` string -> protocol enum. A plugin before 1.12 writes
+/// none, so its kind comes from the key's prefix; a launch site reads as a
+/// station there, since its key carries no prefix.
+fn site_kind_from_manifest(kind: Option<&str>, site_key: &str) -> SiteKind {
+    match kind {
+        Some("station") => SiteKind::Station,
+        Some("launchSite") => SiteKind::LaunchSite,
+        Some("surface") => SiteKind::Surface,
+        Some("vessel") => SiteKind::Vessel,
+        _ if site_key.starts_with("vessel:") => SiteKind::Vessel,
+        _ if site_key.starts_with("surface:") => SiteKind::Surface,
+        _ => SiteKind::Station,
+    }
 }
 
 /// Manifest `crew_location` string -> protocol enum. Absent/unrecognised
@@ -3048,7 +3136,7 @@ mod tests {
         );
     }
 
-    const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"gonogo"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;
+    const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"mission-control"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;
 
     fn per_camera_with(command_track: Option<&str>) -> PerCameraStatus {
         let extra = command_track
@@ -3072,7 +3160,7 @@ mod tests {
         assert_eq!(track.bracket_half_px, Some(4.2));
         assert_eq!(track.frame_height_px, 576);
         let authority = track.authority.expect("authority");
-        assert_eq!(authority.owner, "gonogo");
+        assert_eq!(authority.owner, "mission-control");
         assert_eq!(track.blank, None);
         assert_eq!(track.events.len(), 2);
         assert!(track.events[1].occluded);
@@ -3117,6 +3205,74 @@ mod tests {
     /// A command track reaches the protocol camera state, re-broadcasts when
     /// it changes, and an identical re-write does not re-broadcast.
     #[tokio::test]
+    async fn poll_status_keeps_a_targets_list_first_ut_and_takes_a_revert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 5_003;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("ring");
+        std::fs::write(
+            shm.join(format!("{flight_id}.info.json")),
+            format!(
+                r#"{{"flight_id":{flight_id},"kind":"command","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center"}}"#
+            ),
+        )
+        .unwrap();
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let status_path = shm.join("global.status.json");
+        let write = |ut: f64| {
+            std::fs::write(
+                &status_path,
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{flight_id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{{"ut":{ut},"subjectPersistentId":42,"rangeM":100.0,"trackingLevel":3,"targets":[]}}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let snapshot_ut = || async {
+            registry
+                .list()
+                .await
+                .iter()
+                .find(|c| c.flight_id == flight_id)
+                .and_then(|c| c.command_centre.as_ref())
+                .and_then(|c| c.ut)
+        };
+
+        write(100.0);
+        registry.poll_status().await;
+        write(105.0);
+        assert!(
+            registry.poll_status().await.changed_cameras.is_empty(),
+            "a later UT on the same list does not re-broadcast"
+        );
+        assert_eq!(
+            snapshot_ut().await,
+            Some(100.0),
+            "and the snapshot keeps the first UT"
+        );
+
+        write(50.0);
+        let delta = registry.poll_status().await;
+        let ut = delta
+            .changed_cameras
+            .first()
+            .and_then(|c| c.command_centre.as_ref())
+            .and_then(|c| c.ut);
+        assert_eq!(
+            ut,
+            Some(50.0),
+            "a revert re-broadcasts the list at the UT the game is at"
+        );
+        assert_eq!(snapshot_ut().await, Some(50.0));
+    }
+
+    #[tokio::test]
     async fn poll_status_broadcasts_command_track_changes_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm = dir.path();
@@ -3152,7 +3308,10 @@ mod tests {
             Some("Mun")
         );
         let json = serde_json::to_value(state).unwrap();
-        assert_eq!(json["commandTrack"]["authority"]["owner"], "gonogo");
+        assert_eq!(
+            json["commandTrack"]["authority"]["owner"],
+            "mission-control"
+        );
         assert_eq!(json["commandTrack"]["bracketHalfPx"], 4.2);
 
         write(COMMAND_TRACK_JSON);
@@ -3181,7 +3340,7 @@ mod tests {
 
         write(&COMMAND_TRACK_JSON.replace(
             r#""blank":null,"events""#,
-            r#""blank":"Waiting for gonogo","events""#,
+            r#""blank":"Waiting for mission control","events""#,
         ));
         let delta = registry.poll_status().await;
         assert_eq!(
@@ -3189,7 +3348,7 @@ mod tests {
                 .command_track
                 .as_ref()
                 .and_then(|t| t.blank.as_deref()),
-            Some("Waiting for gonogo")
+            Some("Waiting for mission control")
         );
 
         let snapshot = registry.protocol_state(flight_id).await.expect("state");
@@ -4067,10 +4226,10 @@ mod tests {
         registry.poll_status().await;
         let (message, code) = registry.request_command_aim(aim()).await.unwrap_err();
         assert_eq!(code, Some(ErrorCode::CommandLocked));
-        assert!(message.contains("gonogo"), "{message}");
+        assert!(message.contains("mission-control"), "{message}");
         assert!(!shm.join(COMMANDS_FILE).exists());
 
-        write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"gonogo"},"#, ""));
+        write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"mission-control"},"#, ""));
         registry.poll_status().await;
         assert!(registry.request_command_aim(aim()).await.is_ok());
     }
@@ -4179,13 +4338,65 @@ mod tests {
 
     const COMMAND_CENTRE_JSON: &str = r#"{"aimKind":"vessel","subjectPersistentId":42,"rangeM":12300.0,"trackingLevel":2,"targets":[{"persistentId":42,"vesselName":"Kerbal X","vesselType":"Ship","rangeM":12300.0,"eligibility":"ok","eligibilityText":"Trackable"},{"persistentId":7,"vesselName":"Ast. HSJ-227","vesselType":"SpaceObject","eligibility":"levelTooLow","eligibilityText":"Upgrade the Tracking Station"}]}"#;
 
+    /// Under a held lock the plugin sends only the UT, the lock's owner and
+    /// the events; the rest takes its defaults rather than dropping the track.
+    #[test]
+    fn a_locked_command_track_parses_with_the_rest_defaulted() {
+        let track = per_camera_with(Some(
+            r#"{"ut":10.5,"authority":{"owner":"mission"},"events":[{"ut":10.0,"occluded":true,"occluder":"Mun","sunlit":false,"blank":null}]}"#,
+        ))
+        .command_track
+        .expect("command track");
+        assert_eq!(track.ut, 10.5);
+        assert!(!track.has_fix && track.range_m.is_none() && track.bracket_half_px.is_none());
+        assert!(track.framing_fits && track.true_offset_px.is_none() && track.blank.is_none());
+        assert_eq!(track.events.len(), 1);
+        assert_eq!(track.authority.map(|a| a.owner).as_deref(), Some("mission"));
+    }
+
+    /// Each write stamps the targets list with its UT; that alone is no
+    /// change, so viewers keep the UT the content first had.
+    #[test]
+    fn command_centre_ut_alone_is_no_change_and_merges_through() {
+        let parse = |ut: f64, range: f64| -> Option<CommandTargetsStatus> {
+            Some(
+                serde_json::from_str(&format!(
+                    r#"{{"ut":{ut},"subjectPersistentId":42,"rangeM":{range},"trackingLevel":2,"targets":[]}}"#
+                ))
+                .unwrap(),
+            )
+        };
+        assert!(!command_targets_changed(
+            &parse(10.0, 100.0),
+            &parse(11.0, 100.0)
+        ));
+        assert!(command_targets_changed(
+            &parse(10.0, 100.0),
+            &parse(11.0, 200.0)
+        ));
+        assert!(
+            command_targets_changed(&parse(10.0, 100.0), &parse(5.0, 100.0)),
+            "a revert's earlier UT is a change, so the list shows from the UT the game is at"
+        );
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":7,"kind":"command","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center"}"#,
+        )
+        .unwrap();
+        let merged = command_centre_with(
+            &command_centre_from_manifest(&m),
+            parse(10.0, 100.0).as_ref(),
+        )
+        .expect("merged");
+        assert_eq!(merged.ut, Some(10.0));
+    }
+
     #[test]
     fn command_centre_status_parses_and_merges_over_the_manifest() {
         let per: PerCameraStatus = serde_json::from_str(&format!(
             r#"{{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{COMMAND_CENTRE_JSON}}}"#
         ))
         .unwrap();
-        let status = per.command_centre.expect("command centre status");
+        let status = per.command_targets.expect("command targets status");
         assert_eq!(status.targets.len(), 2);
         assert_eq!(
             status.targets[1].eligibility,
@@ -4211,7 +4422,76 @@ mod tests {
             r#"{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"targets":"nope"}}"#,
         )
         .unwrap();
-        assert!(malformed.command_centre.is_none(), "malformed is dropped");
+        assert!(malformed.command_targets.is_none(), "malformed is dropped");
+    }
+
+    /// A world model's eligibility codes parse, and one this sidecar does not
+    /// know reads as unknown rather than dropping the whole target list.
+    #[test]
+    fn unknown_eligibility_keeps_the_rest_of_the_targets() {
+        let per: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"subjectPersistentId":42,"targets":[{"persistentId":42,"vesselName":"A","vesselType":"Ship","eligibility":"tooUncertain","eligibilityText":"Position too uncertain"},{"persistentId":43,"vesselName":"B","vesselType":"Ship","eligibility":"fromTheFuture","eligibilityText":"?"},{"persistentId":44,"vesselName":"C","vesselType":"Probe","eligibility":"stale","eligibilityText":"Out of date"}]}}"#,
+        )
+        .unwrap();
+        let status = per.command_targets.expect("the list survives");
+        use crate::protocol::CommandTargetEligibility as E;
+        let codes: Vec<_> = status.targets.iter().map(|t| t.eligibility).collect();
+        assert_eq!(codes, vec![E::TooUncertain, E::Unknown, E::Stale]);
+    }
+
+    /// A 1.12 manifest names its site by key, kind and vantage craft, the
+    /// status keeps the vantage current, and the deprecated station id is
+    /// still derived for older clients.
+    #[test]
+    fn command_site_key_kind_and_vantage_reach_the_camera() {
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":9,"kind":"command","site_key":"vessel:41","site_kind":"vessel","vantage_persistent_id":41,"station_id":"ground:vessel:41","station_node_name":"vessel:41","station_name":"Relay camera"}"#,
+        )
+        .unwrap();
+        let before_status = command_centre_from_manifest(&m).expect("identity");
+        assert_eq!(
+            before_status.vantage_persistent_id, 41,
+            "the manifest's vantage shows before the first status write"
+        );
+        let per: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"subjectPersistentId":0,"trackingLevel":3,"targets":[],"vantagePersistentId":77}}"#,
+        )
+        .unwrap();
+        let merged = command_centre_with(&Some(before_status), per.command_targets.as_ref())
+            .expect("merged");
+        assert_eq!(merged.site_key, "vessel:41");
+        assert_eq!(merged.site_kind, SiteKind::Vessel);
+        assert_eq!(merged.vantage_persistent_id, 77);
+        assert_eq!(merged.station_id, "ground:vessel:41");
+
+        let json = serde_json::to_value(&merged).unwrap();
+        assert_eq!(json["siteKey"], "vessel:41");
+        assert_eq!(json["siteKind"], "vessel");
+        assert_eq!(json["vantagePersistentId"], 77);
+
+        let old: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":1,"kind":"command","station_id":"ground:KSC","station_node_name":"KSC"}"#,
+        )
+        .unwrap();
+        let old = command_centre_from_manifest(&old).unwrap();
+        assert_eq!(
+            (old.site_key.as_str(), old.site_kind),
+            ("KSC", SiteKind::Station)
+        );
+        for (node, kind) in [
+            ("vessel:12", SiteKind::Vessel),
+            ("surface:Mun:1.00000:2.00000", SiteKind::Surface),
+        ] {
+            let m: InfoManifest = serde_json::from_str(&format!(
+                r#"{{"flight_id":1,"kind":"command","station_id":"ground:{node}","station_node_name":"{node}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                command_centre_from_manifest(&m).unwrap().site_kind,
+                kind,
+                "a 1.11 manifest's kind comes from its key"
+            );
+        }
     }
 
     /// Station fields on a manifest of another kind are ignored.

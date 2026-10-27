@@ -1,7 +1,7 @@
 // KSP Difficulty Settings integration for kerbcast's runtime-toggleable
 // flags. Lives in the per-save game state via KSP's
 // `GameParameters.CustomParameterNode` API, so the toggles persist with
-// each save independently — a gonogo-driven save can keep
+// each save independently, so a mission-control save can keep
 // ThrottleMainScreen on while a regular career save keeps it off.
 //
 // Default values are seeded from `settings.cfg` (KerbcastSettings) the
@@ -34,7 +34,7 @@ namespace Kerbcast
             "Throttle KSP main render",
             toolTip =
                 "Disable KSP's main flight cameras to free GPU/CPU for kerbcast streams. " +
-                "Designed for gonogo / mission-control workflows where the operator " +
+                "Designed for mission-control workflows where the operator " +
                 "watches the dashboard, not the KSP viewport. UI, staging, kOS terminal, " +
                 "and physics all still work. You can't click on parts in the world while " +
                 "throttled."

@@ -1,5 +1,5 @@
 import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, SiteKind, TrackMode } from "../__generated__/types";
 import type { CreateCommandCameraPayload } from "../__generated__/types";
 import type {
   DiscoveredCamera,
@@ -304,7 +304,7 @@ export class MockSidecar {
    */
   open(): void {
     this._openHandler?.();
-    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true, anchors: true } });
+    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true, anchors: true, frameCommand: true } });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
@@ -868,6 +868,16 @@ export class MockSidecar {
       commandCentre: {
         stationId: `ground:${place}`,
         nodeName: place,
+        siteKey: place,
+        siteKind:
+          v.kind === CommandVantageKind.Station
+            ? SiteKind.Station
+            : v.kind === CommandVantageKind.Surface
+              ? SiteKind.Surface
+              : v.kind === CommandVantageKind.Vessel
+                ? SiteKind.Vessel
+                : SiteKind.LaunchSite,
+        vantagePersistentId: v.kind === CommandVantageKind.Vessel ? (v.persistentId ?? 0) : 0,
         displayName: place,
         body: v.body ?? "Kerbin",
         latitude: v.latitude ?? 0,

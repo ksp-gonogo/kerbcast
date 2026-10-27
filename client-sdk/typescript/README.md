@@ -199,7 +199,11 @@ and watches a craft from there, the way a tracking station would. The
 game's settings give each scene one, the Launchpad camera, and a client can
 create more at any vantage. Each appears in `client.cameras` with
 `kind: "command"` and a `commandCentre` describing where it stands and what
-it watches.
+it watches. `commandCentre.siteKey` names the place the lens stands and
+`siteKind` says what it is (`station`, `launchSite`, `surface` or `vessel`);
+the key stays the same when the craft a `vessel` site rides docks, while
+`vantagePersistentId` follows the craft it rides now. `stationId` is
+deprecated.
 
 A created camera lasts for the rest of the game scene (a flight, or the
 Space Center while the game's command camera setting is on); leaving the
@@ -251,9 +255,17 @@ The aim is one of:
 - `orbit`: follows a conic (`body`, `inclination`, `eccentricity`,
   `semiMajorAxis`, `lan`, `argumentOfPeriapsis` in degrees and metres,
   `meanAnomalyAtEpoch` in radians, `epoch`)
-- `positionAt`: follows a position you propagate yourself: `position` and
-  `velocity` as `[x, y, z]` relative to `body` in its non-rotating frame at
-  `ut`, carried on linearly
+- `positionAt`: follows a craft coasting from a state you give: `position`
+  and `velocity` as `[x, y, z]` relative to `body` at `ut`, z up, in KSP's
+  fixed inertial frame, carried on ballistically under the body's gravity
+  with no thrust. From a KSP `Orbit` that frame is always
+  `Planetarium.Zup.LocalToWorld(orbit.getRelativePositionAtUT(ut))` (and the
+  same for `getOrbitalVelocityAtUT`, `orbit.pos`, `orbit.vel`); the raw
+  values are not, since KSP leaves Zup turned after a low flight. A browser
+  client has no `Orbit`, so it takes these vectors from whatever mod or model
+  hands it craft states in that frame. A velocity of zero no longer holds a
+  point still (it falls); use `surface` for a fixed point. Before 1.12 this
+  was Zup's own frame, carried on linearly
 - `surface`: holds a point on a `body` (`latitude`, `longitude`, `altitude`
   in metres above sea level), turning with the planet
 - `direction`: holds a direction from the camera's local horizon,
@@ -377,9 +389,9 @@ before or during the lock are not restored.
 
 The lock holds until its holder releases it (or the scene changes); it never
 times out. A holder that stops calling for 5 s blanks every command feed
-("gonogo not responding") but keeps the lock, so aims from anyone else are
-still refused. This is deliberate: a holder that delays commands (gonogo
-applies signal delay) can not be bypassed while it is unresponsive.
+("Authority not responding") but keeps the lock, so aims from anyone else are
+still refused. This is deliberate: a holder that delays commands (one that
+applies signal delay, say) can not be bypassed while it is unresponsive.
 
 ### In game (C#)
 
@@ -406,15 +418,15 @@ Holding the lock:
 
 ```csharp
 // Re-take it on every scene load; a different owner is refused.
-KerbcastControl.SetCommandAuthority("gonogo");
+KerbcastControl.SetCommandAuthority("mission-control");
 
 // Only calls passing the owner are accepted now, and each is a heartbeat.
 KerbcastControl.SetCommandAim(pad, CommandAim.PositionAt("Kerbin", ut, pos, vel,
-    subject: craft.persistentId, framingMarginM: uncertaintyM), "gonogo");
+    subject: craft.persistentId, framingMarginM: uncertaintyM), "mission-control");
 KerbcastControl.SetCommandAim(pad, CommandAim.Vessel(other)); // false: locked
 
 // Every command camera returns to its default.
-KerbcastControl.ClearCommandAuthority("gonogo");
+KerbcastControl.ClearCommandAuthority("mission-control");
 ```
 
 - `CommandVantage.LaunchSite(site, distance, bearing, height)`,
@@ -438,12 +450,13 @@ KerbcastControl.ClearCommandAuthority("gonogo");
 - The lock holds until `ClearCommandAuthority` or a scene change, and fails
   closed: a holder that makes no call (`SetCommandAuthority`, `SetCommandAim`
   with its owner, `SetCommandBlank`) for 5 s of real time blanks every
-  command feed "gonogo not responding" and keeps the lock, so everyone else
+  command feed "Authority not responding" and keeps the lock, so everyone else
   stays refused. `SetCommandBlank(flightId, reason)` blanks one feed
 - `DestroyCommandCamera(flightId)` returns false for the settings camera or
   an unknown id
-- `CommandFeeds()` lists every built command camera, with its `Aim`,
-  `SubjectPersistentId`, and `Created` set on the ones made at runtime;
+- `CommandFeeds()` lists every built command camera, with its `SiteKey`,
+  `SiteKind`, `VantagePersistentId`, `Aim`, `SubjectPersistentId`, and
+  `Created` set on the ones made at runtime (`StationId` is obsolete);
   `CommandTargets(flightId)` lists the craft it could follow (a craft docked
   into another drops out; the combined craft keeps the survivor's
   `persistentId`)
@@ -528,6 +541,51 @@ camera or one) and can withhold the subject anchor
 unrestricted behaviour when the lock clears. Under the lock
 `commandTrack.trueOffsetPx` is likewise sent only while the true craft is in
 frame and not occluded.
+
+### State that rides the frame
+
+From 1.12 every frame's stamp carries what that frame shows, so a view that
+delays the picture never learns it sooner:
+
+- `liveLightTimeS` on every frame of every camera: the light time covering
+  what of the lens's own craft and site the frame draws at its `ut`. It is
+  0 with no signal speed. A delayed view releases the frame no sooner than
+  its `ut` plus this plus its own delay from the lens. Absent means unknown
+  (the game could not read it, or it is older than 1.12): under a signal
+  speed, hold the frame. Other loaded craft near the lens are still drawn at
+  `ut` and are not covered yet; once craft beyond the boundary are hidden,
+  the bound covers everything drawn at `ut`
+- `boundaryM`: how far light travels in one 60 fps frame at the signal
+  speed, the picture's boundary distance. Absent with no signal speed
+- `command` on a command camera's frames: its fix, range, bracket,
+  occlusion, sunlight, blank reason, lock owner, subject, the subject's
+  refusal (`unknown`, `notPositioned`, `refused`, `stale`) and which world
+  model snapshot it read
+
+All three arrive on `DisplayedFrameUt` through `watchDisplayedFrames`.
+`effectiveCommandTrack(track, displayUt, frame.command)` uses a frame's own
+state whole; the React feed does this for its brackets and readout.
+
+A host with its own delayed playout keeps the `DisplayedFrameUt` it got for
+each frame and hands the one it is showing to the React feed as
+`displayFrame` (beside, and winning over, `displayUt`): its UT picks the
+transition in force and its `command` draws the brackets and readout. A UT
+alone carries no frame state, so under a lock `displayUt` by itself shows no
+fix. Without either, the feed uses the frame the browser presents, or the
+newest stamped frame before it, which lags the picture and so is never early.
+
+While a command lock is held, the camera list's `commandTrack` keeps only its
+`ut`, `authority` and `events` (each replayed at its own UT); the other fields
+read as their defaults, which a 1.11 client shows as no fix. The targets list
+in `commandCentre` carries the `ut` it describes:
+`client.commandCentreAt(flightId, displayUt)` gives the list as it stood at
+the displayed frame, and `null` while every list sent is newer. With no
+displayed UT it gives the newest, except under a lock, where it gives `null`.
+Lists are kept back to two hours of UT before the newest
+(`COMMAND_CENTRE_MAX_LAG_UT`), at most 600 per camera
+(`COMMAND_CENTRE_MAX_ENTRIES`; a UT older than every list kept finds none),
+and are forgotten when the camera leaves the
+list or the client reconnects.
 
 In game, `KerbcastControl.SetAnchors(flightId, anchors, owner)` does the same
 with `AnchorSpec.ForPart`, `ForVessel`, `ForSurface`, `ForDirection` and

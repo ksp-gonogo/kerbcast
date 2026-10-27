@@ -4,6 +4,7 @@ import {
   type DisplayedFrameUt,
   type FrameUtSource,
   type CommandTrackEvent,
+  type FrameCommandState,
 } from "@ksp-gonogo/kerbcast";
 import { useKerbcastClient } from "../context";
 import { nowMs } from "../timing";
@@ -40,6 +41,36 @@ export function crossesEvent(
 export interface CommandDisplayUt {
   ut: number;
   source: FrameUtSource | "override";
+  /** The command state that rode with the displayed frame (1.12 and later), or the host's own with an override. */
+  command?: FrameCommandState;
+}
+
+/**
+ * What of a frame's command state a viewer can see change: the discrete
+ * fields whole, ranges to 3 significant figures, pixel sizes to half a
+ * pixel. Frames that agree on it draw the same, so they skip a re-render.
+ */
+export function commandShownKey(c: FrameCommandState | undefined): string {
+  if (!c) return "";
+  const sig = (v: number | undefined) => (v == null ? "" : Number(v.toPrecision(3)));
+  const half = (v: number | undefined) => (v == null ? "" : Math.round(v * 2));
+  return JSON.stringify([
+    c.hasFix,
+    sig(c.rangeM),
+    half(c.bracketHalfPx),
+    c.frameHeightPx,
+    c.framingFits,
+    half(c.trueOffsetPx),
+    c.occluded,
+    c.occluder,
+    c.sunlit,
+    c.blank ?? null,
+    c.authority?.owner ?? null,
+    c.subjectPersistentId,
+    c.refusal ?? null,
+    c.refusalCode ?? null,
+    c.refusalText ?? null,
+  ]);
 }
 
 /**
@@ -50,7 +81,12 @@ export interface CommandDisplayUt {
  * interpolated to now (`"estimated"`). Re-evaluated twice a second while
  * `enabled` so readout ages keep counting, and again the moment the
  * displayed UT reaches the next of `events`, so a state change lands on its
- * frame rather than on the next tick. `null` when nothing is known.
+ * frame rather than on the next tick. The displayed frame's own command
+ * state comes back as `command`, re-rendering when what it shows changes:
+ * an exact frame's, an estimated one's (which lags the picture, so is never
+ * early; its own UT is used too, so events and lists stay on that frame),
+ * or with an override the host's own `overrideCommand`. `null` when
+ * nothing is known.
  */
 export function useCommandDisplayUt(
   enabled: boolean,
@@ -58,6 +94,7 @@ export function useCommandDisplayUt(
   events?: readonly CommandTrackEvent[],
   flightId?: number | null,
   video?: HTMLVideoElement | null,
+  overrideCommand?: FrameCommandState | null,
 ): CommandDisplayUt | null {
   const client = useKerbcastClient();
   const sample = useRef<{ captureUt: number | null; warpRate: number; at: number }>({
@@ -86,23 +123,27 @@ export function useCommandDisplayUt(
     return () => clearInterval(interval);
   }, [enabled]);
 
-  /* Exact frames re-render only when they change what is drawn: a switch of
-     source, or a step across an event. Ages catch up on the tick. */
+  /* Frames re-render only when they change what is drawn: a switch of
+     source, a step across an event, or a change the command state shows.
+     Ages catch up on the tick. An estimated frame is kept only for the
+     command state it carries. */
   const overriding = override !== undefined;
   useEffect(() => {
     frame.current = null;
     if (!enabled || overriding || flightId == null || !video) return;
     return client.watchDisplayedFrames(flightId, video, (f) => {
-      frame.current = f.source === "exact" ? f : null;
+      frame.current = f.source === "exact" || f.command ? f : null;
       const prev = shown.current;
       if (!frame.current) {
-        if (prev?.source === "exact") tick();
+        if (prev?.source === "exact" || prev?.command) tick();
         return;
       }
       if (
         prev === null ||
-        prev.source !== "exact" ||
-        crossesEvent(eventsRef.current, prev.ut, f.ut)
+        (f.source === "exact" && prev.source !== "exact") ||
+        (f.source !== "exact" && prev.source === "exact") ||
+        crossesEvent(eventsRef.current, prev.ut, f.ut) ||
+        commandShownKey(prev.command) !== commandShownKey(f.command)
       ) {
         tick();
       }
@@ -110,17 +151,21 @@ export function useCommandDisplayUt(
   }, [client, enabled, overriding, flightId, video]);
 
   const { captureUt, warpRate, at } = sample.current;
-  const exact = frame.current;
+  const seen = frame.current;
+  const withCommand = (d: CommandDisplayUt, c: FrameCommandState | null | undefined): CommandDisplayUt =>
+    c ? { ...d, command: c } : d;
   const displayUt: CommandDisplayUt | null = overriding
-    ? { ut: override, source: "override" }
-    : exact
-      ? { ut: exact.ut, source: "exact" }
-      : captureUt === null
-        ? null
-        : { ut: extrapolateCaptureUt(captureUt, warpRate, at, nowMs()), source: "estimated" };
+    ? withCommand({ ut: override, source: "override" }, overrideCommand)
+    : seen?.source === "exact"
+      ? withCommand({ ut: seen.ut, source: "exact" }, seen.command)
+      : seen
+        ? withCommand({ ut: seen.ut, source: "estimated" }, seen.command)
+        : captureUt === null
+          ? null
+          : { ut: extrapolateCaptureUt(captureUt, warpRate, at, nowMs()), source: "estimated" };
   shown.current = displayUt;
   const untilEdge =
-    enabled && displayUt?.source === "estimated"
+    enabled && displayUt?.source === "estimated" && !seen
       ? msUntilNextEvent(events, displayUt.ut, warpRate)
       : null;
 

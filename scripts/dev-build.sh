@@ -6,11 +6,14 @@
 # <main checkout>/local_docs/dev-builds/<version>/ with a `latest` symlink.
 #
 # Usage:
-#   scripts/dev-build.sh [--version X.Y.Z-dev.N] [--sidecar-from DIR]
+#   scripts/dev-build.sh [--version X.Y.Z-dev.N] [--sidecar-from DIR] [--dev-provider]
 #
 #   --version       override the default <next minor>-dev.<shortsha>
 #   --sidecar-from  reuse an already downloaded sidecar-ci artifact dir instead
 #                   of dispatching CI (its build-info.txt must match HEAD)
+#   --dev-provider  also stage Kerbcast.DevProvider.dll, the development
+#                   world-model provider (dev builds only; it still needs the
+#                   dev marker and devSignalSpeedMps on the install to run)
 
 set -euo pipefail
 
@@ -35,6 +38,7 @@ sha256() {
 
 VERSION_OVERRIDE=""
 SIDECAR_FROM=""
+DEV_PROVIDER=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version)
@@ -45,8 +49,12 @@ while [ "$#" -gt 0 ]; do
       SIDECAR_FROM="${2:?--sidecar-from needs a directory}"
       shift 2
       ;;
+    --dev-provider)
+      DEV_PROVIDER=1
+      shift
+      ;;
     -h | --help)
-      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -172,6 +180,20 @@ if ! grep -qE '^ *0 Warning\(s\)' "$PLUGIN_LOG"; then
 fi
 DLL="Plugin/obj/Release/Kerbcast.dll"
 [ -f "$DLL" ] || die "expected $DLL after the build"
+API_DLL="Plugin/Kerbcast.API/bin/Release/Kerbcast.API.dll"
+[ -f "$API_DLL" ] || die "expected $API_DLL after the build"
+
+DEV_DLL="Plugin/Kerbcast.DevProvider/bin/Release/Kerbcast.DevProvider.dll"
+if [ "$DEV_PROVIDER" = "1" ]; then
+  echo "dev-build: building Kerbcast.DevProvider.dll"
+  DEV_LOG="$WORK/dev-provider-build.log"
+  if ! dotnet build Plugin/Kerbcast.DevProvider/Kerbcast.DevProvider.csproj -c Release --no-incremental -warnaserror \
+    "/p:KspManaged=$KSP_MANAGED" >"$DEV_LOG" 2>&1; then
+    cat "$DEV_LOG" >&2
+    die "dev provider build failed"
+  fi
+  [ -f "$DEV_DLL" ] || die "expected $DEV_DLL after the build"
+fi
 
 # Readback .so: not built here, taken from the latest release and cached.
 RELEASE_TAG="$(gh release view --json tagName -q .tagName)"
@@ -190,11 +212,17 @@ fi
 STAGE="$WORK/stage"
 mkdir -p "$STAGE/Plugins/linux-x64" "$STAGE/Sidecar/linux-x64"
 cp "$DLL" "$STAGE/Plugins/Kerbcast.dll"
+cp "$API_DLL" "$STAGE/Plugins/Kerbcast.API.dll"
+cp Plugin/Kerbcast.API/LICENSE "$STAGE/Plugins/Kerbcast.API.LICENSE.txt"
+if [ "$DEV_PROVIDER" = "1" ]; then cp "$DEV_DLL" "$STAGE/Plugins/Kerbcast.DevProvider.dll"; fi
 cp "$SO_CACHE" "$STAGE/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so"
 chmod 644 "$STAGE/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so"
 cp -R "$SIDECAR_DIR"/. "$STAGE/Sidecar/linux-x64/"
 chmod +x "$STAGE/Sidecar/linux-x64/kerbcast-sidecar"
 cp Plugin/settings.cfg "$STAGE/settings.cfg.reference"
+
+# The dev marker turns on a development signal speed; it is placed by hand on a test install, never shipped.
+[ ! -e "$STAGE/PluginData" ] || die "PluginData must never ship"
 
 mkdir -p "$WORK/out"
 PLUGIN_TGZ="kerbcast-plugin-${DEV_VERSION}.tgz"
@@ -234,11 +262,17 @@ FILES_JSON="$(
 )"
 INNER_JSON="$(jq -n \
   --arg dll "$(sha256 "$STAGE/Plugins/Kerbcast.dll")" \
+  --arg apidll "$(sha256 "$STAGE/Plugins/Kerbcast.API.dll")" \
   --arg sidecar "$(sha256 "$STAGE/Sidecar/linux-x64/kerbcast-sidecar")" \
   --arg so "$(sha256 "$STAGE/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so")" \
   '{"Plugins/Kerbcast.dll": $dll,
+    "Plugins/Kerbcast.API.dll": $apidll,
     "Sidecar/linux-x64/kerbcast-sidecar": $sidecar,
     "Plugins/linux-x64/libAsyncGPUReadbackPlugin.so": $so}')"
+if [ "$DEV_PROVIDER" = "1" ]; then
+  INNER_JSON="$(jq --arg dev "$(sha256 "$STAGE/Plugins/Kerbcast.DevProvider.dll")" \
+    '. + {"Plugins/Kerbcast.DevProvider.dll": $dev}' <<<"$INNER_JSON")"
+fi
 CHANGES_JSON="$(git log --format=%s origin/main..HEAD | jq -R . | jq -s .)"
 jq -n \
   --arg version "$DEV_VERSION" \

@@ -106,5 +106,96 @@ namespace Kerbcast
             }
             return mask == CameraLayers.None ? CameraLayers.All : mask;
         }
+
+        /*
+         * `text` with every top-level `name { ... }` node removed, together
+         * with the run of comment lines directly above it, so a writer can put
+         * a fresh one in without disturbing the rest of a hand-edited file.
+         * The node's brace may be on its own line or after the name.
+         */
+        public static string WithoutNode(string text, string name)
+        {
+            var lines = (text ?? "").Replace("\r\n", "\n").Split('\n');
+            var kept = new System.Text.StringBuilder();
+            var comments = new System.Collections.Generic.List<string>();
+            int depth = 0;
+            bool skipping = false;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i];
+                string code = StripComment(line).Trim();
+                if (!skipping && depth == 0 && StartsNode(code, name, i + 1 < lines.Length ? StripComment(lines[i + 1]).Trim() : ""))
+                {
+                    comments.Clear();
+                    skipping = true;
+                }
+                if (skipping)
+                {
+                    foreach (char ch in code)
+                    {
+                        if (ch == '{') depth++;
+                        else if (ch == '}' && --depth == 0) skipping = false;
+                    }
+                    continue;
+                }
+                if (depth == 0 && code.Length == 0 && line.Trim().StartsWith("//", StringComparison.Ordinal))
+                {
+                    comments.Add(line);
+                    continue;
+                }
+                foreach (var c in comments) kept.Append(c).Append('\n');
+                comments.Clear();
+                foreach (char ch in code)
+                {
+                    if (ch == '{') depth++;
+                    else if (ch == '}' && depth > 0) depth--;
+                }
+                kept.Append(line).Append('\n');
+            }
+            foreach (var c in comments) kept.Append(c).Append('\n');
+            return kept.ToString();
+        }
+
+        /*
+         * A node `name` holding `values` (key, value pairs; a null value is
+         * left out), headed by `comment` lines. Null when any key or value
+         * could break out of its line or node (a line break, a brace, a
+         * comment marker), so nothing unsafe is ever written.
+         */
+        public static string Node(string name, string[] comment, params string[] keysAndValues)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var c in comment ?? new string[0])
+            {
+                if (!Safe(c, allowComment: true)) return null;
+                sb.Append("// ").Append(c).Append('\n');
+            }
+            if (!Safe(name, false)) return null;
+            sb.Append(name).Append("\n{\n");
+            for (int i = 0; i + 1 < keysAndValues.Length; i += 2)
+            {
+                string key = keysAndValues[i], value = keysAndValues[i + 1];
+                if (value == null) continue;
+                if (string.IsNullOrEmpty(key) || !Safe(key, false) || !Safe(value, false) || key.IndexOf('=') >= 0) return null;
+                sb.Append("  ").Append(key).Append(" = ").Append(value).Append('\n');
+            }
+            sb.Append("}\n");
+            return sb.ToString();
+        }
+
+        private static bool Safe(string s, bool allowComment) =>
+            s != null && s.IndexOfAny(new[] { '\n', '\r', '{', '}' }) < 0 && (allowComment || s.IndexOf("//", StringComparison.Ordinal) < 0);
+
+        private static bool StartsNode(string code, string name, string nextCode)
+        {
+            if (code == name) return nextCode.StartsWith("{", StringComparison.Ordinal);
+            return code.StartsWith(name, StringComparison.Ordinal) && code.Substring(name.Length).TrimStart().StartsWith("{", StringComparison.Ordinal);
+        }
+
+        private static string StripComment(string line)
+        {
+            int c = line.IndexOf("//", StringComparison.Ordinal);
+            return c >= 0 ? line.Substring(0, c) : line;
+        }
     }
 }
