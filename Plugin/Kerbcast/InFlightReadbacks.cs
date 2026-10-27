@@ -3,8 +3,11 @@
 // at. A resolution change while readbacks are in flight therefore cannot make
 // the drain write a frame at the wrong (current) size.
 //
-// Readbacks complete in the order they were issued, so they drain from the
-// front.
+// More than one readback may be in flight because on the Deck a readback takes
+// two to four game frames to land. With one at a time a camera could capture
+// on at most every third or fourth frame however few cameras were streaming,
+// which held every feed near 17fps on a 50fps game. Readbacks complete in the
+// order they were issued, so they drain from the front.
 //
 // Deliberately Unity-free so a standalone test project can exercise it (same
 // approach as ControlBlock.cs / ShedController.cs). The caller keeps the rest

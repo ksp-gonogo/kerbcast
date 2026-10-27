@@ -9,6 +9,7 @@ pub mod encoder;
 pub mod heartbeat;
 pub mod protocol;
 pub mod rate;
+pub mod send_tally;
 pub mod shared_mem;
 pub mod signalling;
 pub mod webrtc;

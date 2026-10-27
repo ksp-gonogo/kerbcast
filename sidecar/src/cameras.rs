@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use crate::webrtc::video_track::VideoTrack;
+use crate::webrtc::video_track::{CaptureTime, VideoTrack};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -36,6 +36,7 @@ use crate::protocol::{
     TrackMode,
 };
 use crate::rate::RateWindow;
+use crate::send_tally::SendTally;
 use crate::shared_mem::{ChangeSignal, ControlBlock, MmapFrameRing};
 
 /// Filesystem identity for a `.ring` file: distinguishes "same path, same
@@ -750,12 +751,10 @@ pub struct CameraState {
     /// the incoming seq differs from this, then stores it — so a level-triggered
     /// echo is adopted exactly once per kOS set (no re-adopt loop). Starts 0.
     pub last_track_report_seq: AtomicU32,
-    /// Last wall-clock instant we *encoded* (and emitted NALs to) a frame.
-    /// The consume loop uses this to pace encodes against the configured
-    /// `fps`, instead of running once per ring write at LateUpdate's
-    /// native cadence (40-60 Hz on the Deck) and tagging samples with
-    /// duration=1/fps that the receiver can't reconcile.
-    pub last_encoded_at: Mutex<Option<Instant>>,
+    /// When the last frame sent to the tracks was captured. The consume loop
+    /// skips a frame captured too soon after it, so a writer capturing faster
+    /// than the configured `fps` cannot drive the encoder past it.
+    pub last_sent: Mutex<Option<CaptureTime>>,
     pub last_sequence: AtomicU64,
     /// Count of peer-tracks currently subscribed. Encoder runs only when > 0.
     pub subscribers: AtomicUsize,
@@ -793,6 +792,8 @@ pub struct CameraState {
     pub capture_rate: RateWindow,
     /// Encoded frames handed to at least one track.
     pub sent_rate: RateWindow,
+    /// Why frames were or were not sent, for the `--telemetry` report.
+    pub send_tally: SendTally,
     pub keyframes_sent: AtomicU64,
     pub keyframe_requests_received: AtomicU64,
 }
@@ -1035,6 +1036,7 @@ impl CameraState {
     pub fn note_ring_advance_at(&self, now: Instant, prev: u64, seq: u64) {
         if prev != 0 && seq > prev {
             self.capture_rate.record_at(now, seq - prev);
+            self.send_tally.note_advance(seq - prev);
         }
     }
 
@@ -1042,8 +1044,16 @@ impl CameraState {
         self.note_ring_advance_at(Instant::now(), prev, seq);
     }
 
+    /// Start over from the ring's newest frame, as on attach. A camera nobody
+    /// watched was not read, so the frames it skipped are neither captured
+    /// for a viewer nor owed to one.
+    pub fn rebase_after_idle(&self) {
+        self.last_sequence.store(0, Ordering::Release);
+    }
+
     pub fn note_frame_sent(&self) {
         self.sent_rate.record(1);
+        self.send_tally.note_sent();
     }
 
     pub fn note_keyframe_sent(&self) {
@@ -1675,7 +1685,7 @@ impl CameraRegistry {
                             effective_degrade: AtomicU32::new(0),
                             track_mode_bits: AtomicU32::new(0),
                             last_track_report_seq: AtomicU32::new(0),
-                            last_encoded_at: Mutex::new(None),
+                            last_sent: Mutex::new(None),
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
                             ramping: AtomicBool::new(false),
@@ -1686,6 +1696,7 @@ impl CameraRegistry {
                             forced_full_res: Mutex::new(std::collections::HashSet::new()),
                             capture_rate: RateWindow::new(),
                             sent_rate: RateWindow::new(),
+                            send_tally: SendTally::default(),
                             keyframes_sent: AtomicU64::new(0),
                             keyframe_requests_received: AtomicU64::new(0),
                             control: Mutex::new(ControlState::default()),

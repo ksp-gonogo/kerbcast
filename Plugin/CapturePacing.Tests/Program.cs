@@ -339,5 +339,22 @@ const float Primary = 30f;
     }
 }
 
+// --- 12. A due camera waits for the next physics tick rather than repeating a
+//         UT, but never while paused and never past one interval. ---
+{
+    float overdueLittle = 0.004f;
+    Check(CapturePacing.WaitForTick(100.02, 100.02, true, overdueLittle, Primary),
+        "same UT as the last capture, game running: wait for a tick");
+    Check(!CapturePacing.WaitForTick(100.04, 100.02, true, overdueLittle, Primary),
+        "a tick since the last capture: capture now");
+    Check(!CapturePacing.WaitForTick(100.02, 100.02, false, overdueLittle, Primary),
+        "paused: the same UT is expected, capture now");
+    Check(!CapturePacing.WaitForTick(100.02, 100.02, true, 1f / Primary, Primary),
+        "a UT stopped for a whole interval past the deadline: capture anyway");
+    Check(!CapturePacing.WaitForTick(double.NaN, double.NaN, true, 0f, Primary),
+        "no UT at all (no planetarium, or no capture yet): never wait");
+    Check(!CapturePacing.WaitForTick(5.0, 5.0, true, 0f, 0f), "a camera not capturing never waits");
+}
+
 Console.WriteLine(failures == 0 ? "\nALL CAPTURE-PACING CHECKS PASSED" : $"\n{failures} CHECK(S) FAILED");
 return failures == 0 ? 0 : 1;

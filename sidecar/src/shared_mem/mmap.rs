@@ -67,7 +67,7 @@
 
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use memmap2::{MmapMut, MmapOptions};
@@ -77,6 +77,9 @@ use crate::protocol::{FrameAnchor, FrameCommandState};
 
 pub const MAGIC: u64 = 0x4B45_5242_4341_4D31; // "KERBCAM1" legacy ring magic; value pinned for plugin wire-format compat, not renamed
 pub const LAYOUT_VERSION: u32 = 2;
+
+/// Attempts a read makes before giving up on a writer that keeps lapping it.
+const MAX_READ_RETRIES: u32 = 4;
 
 /// Header is one page so the first slot is page-aligned. Keeps the writer's
 /// per-slot `pixels` write inside one page-aligned region per slot, which
@@ -703,8 +706,7 @@ impl MmapFrameRing {
     /// against the new write_index; pathological writers (faster than we
     /// can copy SLOT_COUNT frames) trip `ReadStarved`.
     pub fn latest(&self) -> Result<Option<FrameView>, MmapRingError> {
-        const MAX_RETRIES: u32 = 4;
-        for retry in 0..MAX_RETRIES {
+        for _ in 0..MAX_READ_RETRIES {
             let header_seq_before = self
                 .header_atomic_u64(HEADER_OFF_SEQUENCE)
                 .load(Ordering::Acquire);
@@ -721,104 +723,160 @@ impl MmapFrameRing {
                     slot_count: self.cfg.slot_count,
                 });
             }
-            let slot_start = self.slot_offset(write_index);
-            let slot_bytes = self.cfg.slot_bytes();
-            let slot = &self.mmap[slot_start..slot_start + slot_bytes];
-
-            let slot_seq_before = self
-                .slot_atomic_u64(write_index, SLOT_OFF_SEQUENCE)
-                .load(Ordering::Acquire);
-            if slot_seq_before == 0 {
-                // Writer claimed the slot via write_index but hasn't yet
-                // published a sequence — re-poll.
-                continue;
+            if let Some(frame) = self.read_slot(write_index) {
+                return Ok(Some(frame));
             }
-
-            let width =
-                u32::from_le_bytes(slot[SLOT_OFF_WIDTH..SLOT_OFF_WIDTH + 4].try_into().unwrap());
-            let height = u32::from_le_bytes(
-                slot[SLOT_OFF_HEIGHT..SLOT_OFF_HEIGHT + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            let stride_bytes = u32::from_le_bytes(
-                slot[SLOT_OFF_STRIDE..SLOT_OFF_STRIDE + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            let capture_ts_ms = f64::from_le_bytes(
-                slot[SLOT_OFF_CAPTURE_TS..SLOT_OFF_CAPTURE_TS + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let capture_epoch = u32::from_le_bytes(
-                slot[SLOT_OFF_CAPTURE_EPOCH..SLOT_OFF_CAPTURE_EPOCH + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            let capture_ut = f64::from_le_bytes(
-                slot[SLOT_OFF_CAPTURE_UT..SLOT_OFF_CAPTURE_UT + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let fov = f32::from_le_bytes(slot[SLOT_OFF_FOV..SLOT_OFF_FOV + 4].try_into().unwrap());
-            let live_light_time = f64::from_le_bytes(
-                slot[SLOT_OFF_LIVE_LIGHT_TIME..SLOT_OFF_LIVE_LIGHT_TIME + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let meta_len = u32::from_le_bytes(
-                slot[SLOT_OFF_META_LEN..SLOT_OFF_META_LEN + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let pixel_bytes = (width as usize) * (height as usize) * 4;
-            if pixel_bytes > slot_bytes - SLOT_OFF_PIXELS {
-                // Corrupt / writer wrote bigger-than-capacity. Re-poll once.
-                tracing::warn!(width, height, "slot pixel size > slot capacity; retrying");
-                continue;
-            }
-            let pixels = slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + pixel_bytes].to_vec();
-            /* Copied under the same seqlock check as the pixels; parsed after. */
-            let meta = if meta_len > 0 && meta_len <= self.meta_slot_bytes {
-                let at = self.meta_offset(write_index);
-                self.mmap[at..at + meta_len].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            // Verify the slot wasn't clobbered while we were copying. If
-            // slot.sequence changed, the writer's lapped us — retry.
-            let slot_seq_after = self
-                .slot_atomic_u64(write_index, SLOT_OFF_SEQUENCE)
-                .load(Ordering::Acquire);
-            if slot_seq_after == slot_seq_before {
-                let meta = parse_meta(&meta);
-                return Ok(Some(FrameView {
-                    width,
-                    height,
-                    stride_bytes,
-                    capture_ts_ms,
-                    sequence: slot_seq_before,
-                    capture: CaptureStamp {
-                        ut: capture_ut.is_finite().then_some(capture_ut),
-                        epoch: capture_epoch,
-                        fov: (fov.is_finite() && fov > 0.0).then_some(fov as f64),
-                        size: Some((width, height)),
-                        anchors: meta.anchors,
-                        live_light_time_s: (live_light_time.is_finite() && live_light_time >= 0.0)
-                            .then_some(live_light_time),
-                        boundary_m: meta.boundary_m,
-                        command: meta.command,
-                    },
-                    pixels,
-                }));
-            }
-            tracing::debug!(retry, "slot clobbered during read, retrying");
         }
         Err(MmapRingError::ReadStarved {
-            retries: MAX_RETRIES,
+            retries: MAX_READ_RETRIES,
         })
+    }
+
+    /**
+     * The oldest frame newer than `after` that is still in the ring, or `None`
+     * when nothing newer has been published. A reader that polls slower than
+     * the writer now and then (two readbacks can land in one game frame, a
+     * microsecond apart) takes the frames it missed in capture order instead
+     * of jumping to the newest and losing the one before it.
+     *
+     * The writer claims a sequence before filling the slot it reuses, and that
+     * slot keeps showing its old sequence until the write ends, so a slot is
+     * only a candidate while the writer has not claimed the sequence that
+     * reuses it.
+     */
+    pub fn next_after(&self, after: u64) -> Result<Option<FrameView>, MmapRingError> {
+        let slots = self.cfg.slot_count as u64;
+        for _ in 0..MAX_READ_RETRIES {
+            let claimed = self
+                .header_atomic_u64(HEADER_OFF_SEQUENCE)
+                .load(Ordering::Acquire);
+            let oldest = (0..self.cfg.slot_count)
+                .map(|idx| {
+                    let seq = self
+                        .slot_atomic_u64(idx, SLOT_OFF_SEQUENCE)
+                        .load(Ordering::Acquire);
+                    (seq, idx)
+                })
+                .filter(|&(seq, _)| seq > after && seq <= claimed && seq + slots > claimed)
+                .min();
+            let Some((_, idx)) = oldest else {
+                return Ok(None);
+            };
+            if let Some(frame) = self.read_slot(idx) {
+                return Ok(Some(frame));
+            }
+        }
+        Err(MmapRingError::ReadStarved {
+            retries: MAX_READ_RETRIES,
+        })
+    }
+
+    /// One slot's frame, or `None` when it is unpublished, implausible, or
+    /// the writer reached it while it was being copied.
+    fn read_slot(&self, idx: u32) -> Option<FrameView> {
+        let slot_start = self.slot_offset(idx);
+        let slot_bytes = self.cfg.slot_bytes();
+        let slot = &self.mmap[slot_start..slot_start + slot_bytes];
+
+        let slot_seq_before = self
+            .slot_atomic_u64(idx, SLOT_OFF_SEQUENCE)
+            .load(Ordering::Acquire);
+        /* Claimed by the writer but not yet published. */
+        if slot_seq_before == 0 {
+            return None;
+        }
+
+        let width =
+            u32::from_le_bytes(slot[SLOT_OFF_WIDTH..SLOT_OFF_WIDTH + 4].try_into().unwrap());
+        let height = u32::from_le_bytes(
+            slot[SLOT_OFF_HEIGHT..SLOT_OFF_HEIGHT + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let stride_bytes = u32::from_le_bytes(
+            slot[SLOT_OFF_STRIDE..SLOT_OFF_STRIDE + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let capture_ts_ms = f64::from_le_bytes(
+            slot[SLOT_OFF_CAPTURE_TS..SLOT_OFF_CAPTURE_TS + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let capture_epoch = u32::from_le_bytes(
+            slot[SLOT_OFF_CAPTURE_EPOCH..SLOT_OFF_CAPTURE_EPOCH + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let capture_ut = f64::from_le_bytes(
+            slot[SLOT_OFF_CAPTURE_UT..SLOT_OFF_CAPTURE_UT + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let fov = f32::from_le_bytes(slot[SLOT_OFF_FOV..SLOT_OFF_FOV + 4].try_into().unwrap());
+        let live_light_time = f64::from_le_bytes(
+            slot[SLOT_OFF_LIVE_LIGHT_TIME..SLOT_OFF_LIVE_LIGHT_TIME + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let meta_len = u32::from_le_bytes(
+            slot[SLOT_OFF_META_LEN..SLOT_OFF_META_LEN + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let pixel_bytes = (width as usize) * (height as usize) * 4;
+        if pixel_bytes > slot_bytes - SLOT_OFF_PIXELS {
+            /* Corrupt, or written bigger than capacity: the caller's retry loop
+            reads the ring again. */
+            tracing::warn!(width, height, "slot pixel size > slot capacity; retrying");
+            return None;
+        }
+        let pixels = slot[SLOT_OFF_PIXELS..SLOT_OFF_PIXELS + pixel_bytes].to_vec();
+        /* Copied under the same seqlock check as the pixels; parsed after. */
+        let meta = if meta_len > 0 && meta_len <= self.meta_slot_bytes {
+            let at = self.meta_offset(idx);
+            self.mmap[at..at + meta_len].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        /* Verify the slot wasn't clobbered while we were copying: its
+        sequence is unchanged, and the writer has not claimed the sequence
+        that reuses it (it may be filling the slot with the old sequence
+        still showing). The fence keeps the copy before both loads. */
+        fence(Ordering::Acquire);
+        let slot_seq_after = self
+            .slot_atomic_u64(idx, SLOT_OFF_SEQUENCE)
+            .load(Ordering::Acquire);
+        let claimed_after = self
+            .header_atomic_u64(HEADER_OFF_SEQUENCE)
+            .load(Ordering::Acquire);
+        if slot_seq_after == slot_seq_before
+            && claimed_after < slot_seq_before + self.cfg.slot_count as u64
+        {
+            let meta = parse_meta(&meta);
+            return Some(FrameView {
+                width,
+                height,
+                stride_bytes,
+                capture_ts_ms,
+                sequence: slot_seq_before,
+                capture: CaptureStamp {
+                    ut: capture_ut.is_finite().then_some(capture_ut),
+                    epoch: capture_epoch,
+                    fov: (fov.is_finite() && fov > 0.0).then_some(fov as f64),
+                    size: Some((width, height)),
+                    anchors: meta.anchors,
+                    live_light_time_s: (live_light_time.is_finite() && live_light_time >= 0.0)
+                        .then_some(live_light_time),
+                    boundary_m: meta.boundary_m,
+                    command: meta.command,
+                },
+                pixels,
+            });
+        }
+        tracing::debug!(slot = idx, "slot clobbered during read, retrying");
+        None
     }
 }
 
@@ -1248,6 +1306,93 @@ mod tests {
         assert_eq!(frame.sequence, 2);
         assert_eq!(frame.pixels, pixels_b);
 
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn next_after_takes_unread_frames_in_capture_order() {
+        let path = tmp_path("next-after");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert!(reader.next_after(0).unwrap().is_none(), "empty ring");
+        let pixels = vec![0u8; 4 * 4 * 4];
+        for n in 1..=3 {
+            writer.produce(4, 4, n as f64, &pixels).unwrap();
+        }
+        let first = reader.next_after(1).unwrap().unwrap();
+        assert_eq!((first.sequence, first.capture_ts_ms), (2, 2.0));
+        let second = reader.next_after(first.sequence).unwrap().unwrap();
+        assert_eq!((second.sequence, second.capture_ts_ms), (3, 3.0));
+        assert!(reader.next_after(3).unwrap().is_none(), "caught up");
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn next_after_skips_frames_the_ring_no_longer_holds() {
+        let path = tmp_path("next-after-lapped");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        let pixels = vec![0u8; 4 * 4 * 4];
+        for n in 1..=10 {
+            writer.produce(4, 4, n as f64, &pixels).unwrap();
+        }
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert_eq!(reader.next_after(2).unwrap().unwrap().sequence, 7);
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A writer that has claimed the next sequence is filling the oldest slot
+    /// while it still shows its old sequence, so that slot is passed over.
+    #[test]
+    fn next_after_never_reads_the_slot_being_refilled() {
+        let path = tmp_path("next-after-claimed");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        let pixels = vec![0u8; 4 * 4 * 4];
+        for n in 1..=4 {
+            writer.produce(4, 4, n as f64, &pixels).unwrap();
+        }
+        writer
+            .header_atomic_u64(HEADER_OFF_SEQUENCE)
+            .fetch_add(1, Ordering::Release);
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert_eq!(reader.next_after(0).unwrap().unwrap().sequence, 2);
+        assert!(
+            reader.next_after(4).unwrap().is_none(),
+            "the claimed frame is not published yet"
+        );
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The check after the copy: once the writer claims the sequence that
+    /// reuses a slot, a copy of that slot is refused even though its own
+    /// sequence has not changed yet.
+    #[test]
+    fn read_slot_refuses_a_slot_whose_reuse_is_claimed() {
+        let path = tmp_path("read-slot-claimed");
+        let mut writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        let pixels = vec![0u8; 4 * 4 * 4];
+        let mut slot_of = std::collections::HashMap::new();
+        for n in 1..=4u64 {
+            writer.produce(4, 4, n as f64, &pixels).unwrap();
+            let idx = writer
+                .header_atomic_u32(HEADER_OFF_WRITE_INDEX)
+                .load(Ordering::Acquire);
+            slot_of.insert(n, idx);
+        }
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert_eq!(reader.read_slot(slot_of[&1]).unwrap().sequence, 1);
+        writer
+            .header_atomic_u64(HEADER_OFF_SEQUENCE)
+            .fetch_add(1, Ordering::Release);
+        assert!(reader.read_slot(slot_of[&1]).is_none(), "being refilled");
+        assert_eq!(reader.read_slot(slot_of[&2]).unwrap().sequence, 2);
         drop(reader);
         drop(writer);
         fs::remove_file(&path).ok();

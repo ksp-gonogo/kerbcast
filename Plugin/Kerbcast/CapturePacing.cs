@@ -124,6 +124,27 @@ namespace Kerbcast
             _nextDueTime = anchor + interval;
         }
 
+        /// <summary>Whether a due camera should wait a frame for the next physics
+        /// tick instead of capturing now.</summary>
+        /// <remarks>
+        /// A loaded game renders more frames than it runs physics ticks, so a
+        /// camera captured on two frames in a row can show the same UT twice.
+        /// That frame repeats the last one's picture, and the sidecar can only
+        /// space it on real time, so it costs a render and puts a step out of
+        /// rhythm. Waiting keeps the deadline, so the camera captures on the
+        /// next frame that has a tick. Never while the game is paused (UT stands
+        /// still and the feed must keep moving), and never for longer than one
+        /// interval past the deadline, so a UT that stops for any other reason
+        /// costs at most half the rate rather than the feed. A NaN UT (no
+        /// planetarium, or no capture yet) never waits.
+        /// </remarks>
+        public static bool WaitForTick(double ut, double lastCaptureUt, bool gameRunning,
+            float overdue, float effectiveFps)
+        {
+            if (!gameRunning || effectiveFps <= 0f) return false;
+            return ut == lastCaptureUt && overdue < 1f / effectiveFps;
+        }
+
         /// <summary>Whether this camera is currently capturing in the background: subscribed, being
         /// captured, but below the primary rate.</summary>
         public bool IsBackground(float effectiveFps, float primaryFps)

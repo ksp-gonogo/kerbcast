@@ -1022,6 +1022,8 @@ namespace Kerbcast
                 _effectiveBackgroundCeiling = EffectiveHumCeiling();
                 float backgroundCeiling = _effectiveBackgroundCeiling;
                 float now = Time.unscaledTime;
+                double ut = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
+                bool gameRunning = Time.timeScale > 0f;
                 for (int i = 0; i < n; i++)
                 {
                     var cam = _cameras[i];
@@ -1043,6 +1045,13 @@ namespace Kerbcast
                         continue;
                     }
                     float overdue = cam.CaptureOverdue(now, eff);
+                    /* Left out, it keeps its deadline and goes on the next frame
+                       that has a physics tick. */
+                    if (CapturePacing.WaitForTick(ut, cam.LastCaptureUt, gameRunning, overdue, eff))
+                    {
+                        cam.Counters.Miss(CaptureMiss.SameUt);
+                        continue;
+                    }
                     /* Ordered most-overdue-first, because when more cameras come
                        due than the frame's concurrency bound allows the scheduler
                        grants the front of this list, and the camera furthest behind

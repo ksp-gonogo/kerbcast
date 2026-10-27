@@ -45,8 +45,14 @@ namespace Kerbcast
         private readonly System.Collections.Generic.Dictionary<long, RenderTargetSet> _rtPool =
             new System.Collections.Generic.Dictionary<long, RenderTargetSet>();
 
-        /* Readbacks a camera may have in flight at once. */
-        internal const int MaxInFlight = 1;
+        /* Readbacks a camera may have in flight at once. A second one lets the
+           camera render again while the first is still on its way back, which
+           is what lifts the rate past gameFps / latency (see InFlightReadbacks).
+           They share the readback RT: a readback copies the texture where it
+           sits in the GPU command stream, so the next blit into it cannot
+           reach a copy already queued. What a second one costs is its staging
+           buffer, one frame of pixels, held until it lands. */
+        internal const int MaxInFlight = 2;
 
         /* Each in-flight readback's size and issue frame, described
            independently of the *current* target so a resolution change

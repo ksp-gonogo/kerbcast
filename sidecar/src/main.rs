@@ -44,6 +44,10 @@ use kerbcast_sidecar::VERSION;
 /// quickly.
 const ENCODE_FAILURE_REINIT_THRESHOLD: u32 = 30;
 
+/// How often `--telemetry` logs each camera's send counts, matching the
+/// plugin's "capture over" lines.
+const SEND_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Parser, Debug)]
 #[command(name = "kerbcast-sidecar", version = VERSION, about)]
 struct Cli {
@@ -105,6 +109,17 @@ struct Cli {
     /// the heartbeat) for its whole duration.
     #[arg(long, default_value_t = 90)]
     heartbeat_timeout_secs: u64,
+}
+
+/**
+ * Whether to log, per camera every few seconds, how many frames the ring
+ * advanced and why any of them were not sent. The plugin sets
+ * `KERBCAST_TELEMETRY=1` when settings.cfg sets EnableTelemetry. An
+ * environment variable rather than a flag, because an older sidecar exits on
+ * a flag it does not know and a newer plugin would then stream nothing.
+ */
+fn telemetry_enabled() -> bool {
+    std::env::var_os("KERBCAST_TELEMETRY").is_some_and(|v| v == "1")
 }
 
 fn default_shm_dir() -> PathBuf {
@@ -214,6 +229,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(1), // rescan cadence
         cli.fps,
         bitrate_bps,
+        telemetry_enabled(),
     );
 
     // Orphan watch: the plugin owns this process for the KSP session and
@@ -298,8 +314,10 @@ async fn consume_loop(
     rescan_interval: Duration,
     fps: u32,
     bitrate_bps: u32,
+    telemetry: bool,
 ) -> Result<()> {
     let mut last_rescan = Instant::now() - rescan_interval; // rescan immediately
+    let mut last_send_report = Instant::now();
     let frame_duration = Duration::from_secs(1) / fps;
     // Cameras currently skipped for lack of subscribers, so the skip is
     // logged on the transition rather than on every tick.
@@ -468,6 +486,7 @@ async fn consume_loop(
                     debug!(flight_id = cam.flight_id, "no subscribers, not encoding");
                 } else {
                     debug!(flight_id = cam.flight_id, "subscriber present");
+                    cam.rebase_after_idle();
                 }
             }
             if idle {
@@ -475,6 +494,17 @@ async fn consume_loop(
             }
             any_active = true;
             encode_and_fan_out(cam, encoder_choice, fps, bitrate_bps, frame_duration).await;
+        }
+
+        if telemetry && last_send_report.elapsed() >= SEND_REPORT_INTERVAL {
+            let over = last_send_report.elapsed();
+            for cam in &cameras {
+                let counts = cam.send_tally.take();
+                if counts.advanced > 0 {
+                    info!("{}", counts.report(cam.flight_id, over));
+                }
+            }
+            last_send_report = Instant::now();
         }
 
         idle_cameras.retain(|id| {
@@ -648,34 +678,56 @@ fn warn_escalated(cam: &Arc<CameraState>, backend_name: &str, what_happened: &st
     );
 }
 
-/// Whether a tick sends a frame.
+/// Whether a frame read from the ring is sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameTiming {
     Skip,
     Send,
 }
 
-/* Decides a tick from the time of the last frame actually sent. The plugin
-already paces capture (MaxCaptureFps), so this is only a burst guard: it skips
-a frame less than half a frame interval after the last one, which still lets
-an irregular capture (a 40 ms median with 0 to 200 ms spread was measured on
-the Deck) through while stopping a catch-up burst after a hitch from feeding
-the encoder at more than twice its configured rate. */
+/* Decides a frame from when it was captured against the last frame actually
+sent. The plugin already paces capture (MaxCaptureFps), so this is only a rate
+guard: it skips a frame captured less than half a frame interval after the
+last one, which still lets an irregular capture (a 40 ms median with 0 to 200
+ms spread was measured on the Deck) through while stopping a writer that
+captures faster than `fps` from feeding the encoder at more than twice its
+configured rate. Capture time, not send time, because frames the sidecar
+catches up on leave the ring a moment apart however far apart they were
+captured. A writer whose clock did not advance falls back to when the frames
+were picked up. */
 fn frame_timing(
-    last_sent: Option<Instant>,
-    now: Instant,
+    last_sent: Option<CaptureTime>,
+    this: CaptureTime,
     frame_duration: Duration,
-    has_new_frame: bool,
 ) -> FrameTiming {
-    if !has_new_frame {
-        return FrameTiming::Skip;
-    }
-    match last_sent {
-        Some(prev) if now.saturating_duration_since(prev) < frame_duration / 2 => FrameTiming::Skip,
-        _ => FrameTiming::Send,
+    let Some(prev) = last_sent else {
+        return FrameTiming::Send;
+    };
+    let game_clock_ms = this.game_clock_ms - prev.game_clock_ms;
+    let elapsed = if game_clock_ms.is_finite() && game_clock_ms > 0.0 {
+        Duration::from_secs_f64(game_clock_ms / 1000.0)
+    } else {
+        this.picked_up.saturating_duration_since(prev.picked_up)
+    };
+    if elapsed < frame_duration / 2 {
+        FrameTiming::Skip
+    } else {
+        FrameTiming::Send
     }
 }
 
+/**
+ * Unread frames a camera may owe before the sidecar skips ahead. The plugin
+ * keeps at most two readbacks in flight per camera and drains every one that
+ * has landed in the same game frame, so two frames can reach the ring a
+ * microsecond apart. Reading only the newest lost the first of each such pair:
+ * on the Deck a camera read just after the loop woke sent 18 of 28 captured
+ * frames a second while the camera read 7 ms later sent 27. A backlog past
+ * two is the encoder falling behind, where the newest frames keep the feed live.
+ */
+const MAX_FRAMES_BEHIND: u64 = 2;
+
+/// Send every frame the camera has not sent yet, oldest first.
 async fn encode_and_fan_out(
     cam: &Arc<CameraState>,
     encoder_choice: EncoderChoice,
@@ -683,28 +735,57 @@ async fn encode_and_fan_out(
     bitrate_bps: u32,
     frame_duration: Duration,
 ) {
-    /* Ticks with nothing new, and frames dropped below, leave `last_encoded_at`
-    alone, so the burst guard measures from the last frame actually sent. Each
-    track spaces its RTP timestamps by the frames' capture times. */
+    let mut taken = 0;
+    while taken < MAX_FRAMES_BEHIND
+        && encode_next_frame(cam, encoder_choice, fps, bitrate_bps, frame_duration).await
+    {
+        taken += 1;
+    }
+    if taken > 1 {
+        cam.send_tally.note_caught_up();
+    }
+}
+
+/// Take the camera's next unread frame from the ring and send it. Returns
+/// whether a frame was taken, so the caller can look for another.
+async fn encode_next_frame(
+    cam: &Arc<CameraState>,
+    encoder_choice: EncoderChoice,
+    fps: u32,
+    bitrate_bps: u32,
+    frame_duration: Duration,
+) -> bool {
+    /* Frames dropped below leave `last_sent` alone, so the rate guard measures
+    from the last frame actually sent. Each track spaces its RTP timestamps by
+    the frames' capture times. */
     let now = Instant::now();
-    let last_sent = *cam.last_encoded_at.lock().await;
     let last = cam.last_sequence.load(Ordering::Acquire);
+    let claimed = cam.ring.latest_sequence();
     /* Any change, not just an advance, so a recreated ring that restarts low
     still reaches the backwards-sequence warning below. */
-    let has_new = cam.ring.latest_sequence() != last;
-    if frame_timing(last_sent, now, frame_duration, has_new) == FrameTiming::Skip {
-        return;
+    if claimed == last {
+        return false;
     }
-
-    let frame = match cam.ring.latest() {
+    /* The first frame since attach, and a ring that restarted below what was
+    sent, take the newest frame; anything else takes the oldest unread one. */
+    let after = if last == 0 || claimed < last {
+        None
+    } else {
+        Some(last.max(claimed.saturating_sub(MAX_FRAMES_BEHIND)))
+    };
+    let read = match after {
+        Some(after) => cam.ring.next_after(after),
+        None => cam.ring.latest(),
+    };
+    let frame = match read {
         Ok(Some(f)) => f,
         Ok(None) => {
             debug!(flight_id = cam.flight_id, "ring had no frame this tick");
-            return;
+            return false;
         }
         Err(e) => {
             warn!(flight_id = cam.flight_id, error = %e, "ring read failed");
-            return;
+            return false;
         }
     };
 
@@ -729,7 +810,7 @@ async fn encode_and_fan_out(
                 "no new frame this tick (sequence unchanged)"
             );
         }
-        return;
+        return false;
     }
     debug!(
         flight_id = cam.flight_id,
@@ -739,6 +820,20 @@ async fn encode_and_fan_out(
     );
     cam.last_sequence.store(frame.sequence, Ordering::Release);
     cam.note_ring_advance(last, frame.sequence);
+    if let Some(after) = after {
+        cam.send_tally
+            .note_read(after - last, frame.sequence - after - 1);
+    }
+
+    let capture_time = CaptureTime {
+        game_clock_ms: frame.capture_ts_ms,
+        picked_up: now,
+    };
+    if frame_timing(*cam.last_sent.lock().await, capture_time, frame_duration) == FrameTiming::Skip
+    {
+        cam.send_tally.note_rate_guard();
+        return true;
+    }
 
     // Apply SetDegrade. Two cheap levers:
     //
@@ -756,7 +851,8 @@ async fn encode_and_fan_out(
     if degrade > 0.001 {
         let skip_every = 1u64 + (degrade * 3.0).round() as u64; // 1..=4
         if !frame.sequence.is_multiple_of(skip_every) {
-            return;
+            cam.send_tally.note_degrade();
+            return true;
         }
     }
 
@@ -854,7 +950,7 @@ async fn encode_and_fan_out(
             backend = Box::new(Software::new());
             if let Err(e2) = backend.init(cfg) {
                 warn!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
-                return;
+                return true;
             }
         }
         info!(
@@ -880,12 +976,15 @@ async fn encode_and_fan_out(
         encoder.request_keyframe();
     }
 
-    let nals = match encoder.encode(&RawFrame {
+    let encode_started = Instant::now();
+    let encoded = encoder.encode(&RawFrame {
         width: frame.width,
         height: frame.height,
         data: &frame.pixels,
         capture_ts_ms: frame.capture_ts_ms,
-    }) {
+    });
+    cam.send_tally.note_encode(encode_started.elapsed());
+    let nals = match encoded {
         Ok(n) => {
             cam.encode_failure_streak.store(0, Ordering::Release);
             if n.iter().any(|nal| nal.is_keyframe()) {
@@ -923,7 +1022,8 @@ async fn encode_and_fan_out(
                     warn_escalated(cam, backend_name, "consecutive sessions kept failing");
                 }
             }
-            return;
+            cam.send_tally.note_encode_failed();
+            return true;
         }
     };
 
@@ -952,7 +1052,8 @@ async fn encode_and_fan_out(
                 }
             }
         }
-        return;
+        cam.send_tally.note_no_output();
+        return true;
     }
     // Only a hardware session producing real output clears strikes. A
     // software encode succeeding here (the fallback path after a hardware
@@ -977,11 +1078,7 @@ async fn encode_and_fan_out(
     // Fan-out + GC dead weak refs in one pass. Pruned weaks mean a peer
     // dropped without telling us — decrement the camera's subscriber
     // count so the encoder can idle once the last viewer leaves.
-    *cam.last_encoded_at.lock().await = Some(now);
-    let capture_time = CaptureTime {
-        game_clock_ms: frame.capture_ts_ms,
-        picked_up: now,
-    };
+    *cam.last_sent.lock().await = Some(capture_time);
     let mut tracks = cam.tracks.write().await;
     let prev = std::mem::take(&mut *tracks);
     let mut alive = Vec::with_capacity(prev.len());
@@ -1033,6 +1130,7 @@ async fn encode_and_fan_out(
     if pruned > 0 {
         cam.release(pruned);
     }
+    true
 }
 
 #[cfg(test)]
@@ -1040,29 +1138,165 @@ mod tests {
     use super::*;
     use kerbcast_sidecar::encoder::{Nvenc, Software};
 
-    /// Ticks with no new frame send nothing, and only a frame less than half
-    /// an interval after the last sent one is skipped.
+    /// Only a frame captured less than half an interval after the last sent
+    /// one is skipped, however soon after it the sidecar picks it up.
     #[test]
-    fn frame_timing_only_guards_against_bursts() {
+    fn frame_timing_guards_on_capture_time() {
         let fd = Duration::from_secs(1) / 30;
         let start = Instant::now();
-        let ms = |n: u64| start + Duration::from_millis(n);
-        assert_eq!(frame_timing(None, ms(0), fd, true), FrameTiming::Send);
-        assert_eq!(frame_timing(None, ms(0), fd, false), FrameTiming::Skip);
+        let at = |capture_ms: f64, picked_up_ms: u64| CaptureTime {
+            game_clock_ms: capture_ms,
+            picked_up: start + Duration::from_millis(picked_up_ms),
+        };
+        assert_eq!(frame_timing(None, at(0.0, 0), fd), FrameTiming::Send);
         assert_eq!(
-            frame_timing(Some(ms(0)), ms(10), fd, true),
+            frame_timing(Some(at(0.0, 0)), at(10.0, 40), fd),
             FrameTiming::Skip,
-            "a burst 10 ms after the last send"
+            "captured 10 ms after the last send"
         );
         assert_eq!(
-            frame_timing(Some(ms(0)), ms(17), fd, true),
+            frame_timing(Some(at(0.0, 40)), at(25.0, 40), fd),
             FrameTiming::Send,
-            "a frame half an interval later is sent, not dropped"
+            "caught up in the same tick but captured a game frame later"
         );
         assert_eq!(
-            frame_timing(Some(ms(0)), ms(240), fd, true),
+            frame_timing(Some(at(5.0, 0)), at(5.0, 10), fd),
+            FrameTiming::Skip,
+            "a clock that did not advance falls back to pickup time"
+        );
+        assert_eq!(
+            frame_timing(Some(at(5.0, 0)), at(5.0, 40), fd),
             FrameTiming::Send
         );
+        assert_eq!(
+            frame_timing(Some(at(500.0, 0)), at(100.0, 10), fd),
+            FrameTiming::Skip,
+            "a clock that went backwards falls back to pickup time too"
+        );
+        assert_eq!(
+            frame_timing(Some(at(500.0, 0)), at(100.0, 40), fd),
+            FrameTiming::Send
+        );
+    }
+
+    async fn camera_with_viewer(
+        dir: &std::path::Path,
+    ) -> (
+        kerbcast_sidecar::shared_mem::MmapFrameRing,
+        Arc<CameraState>,
+        Arc<kerbcast_sidecar::webrtc::video_track::VideoTrack>,
+    ) {
+        use kerbcast_sidecar::shared_mem::MmapFrameRing;
+        use kerbcast_sidecar::webrtc::video_track::VideoTrack;
+        use webrtc::api::media_engine::MIME_TYPE_H264;
+        use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let ring = MmapFrameRing::create(&dir.join("1.ring"), cfg).expect("create ring");
+        let registry = CameraRegistry::new(dir.to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(1).await.expect("camera attached from ring");
+        let track = Arc::new(VideoTrack::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            "stream".to_owned(),
+            None,
+        ));
+        cam.add_track(track.clone()).await;
+        (ring, cam, track)
+    }
+
+    async fn tick(cam: &Arc<CameraState>) {
+        encode_and_fan_out(
+            cam,
+            EncoderChoice::Software,
+            30,
+            500_000,
+            Duration::from_secs(1) / 30,
+        )
+        .await;
+    }
+
+    /// Two readbacks landing in one game frame reach the ring a moment apart.
+    /// The next tick sends both, oldest first, rather than only the newest.
+    #[tokio::test]
+    async fn a_pair_written_between_ticks_is_sent_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+
+        ring.produce(64, 64, 0.0, &pixels).unwrap();
+        tick(&cam).await;
+        assert_eq!(cam.send_tally.take().sent, 1, "the first frame");
+
+        ring.produce(64, 64, 33.0, &pixels).unwrap();
+        ring.produce(64, 64, 66.0, &pixels).unwrap();
+        tick(&cam).await;
+        let counts = cam.send_tally.take();
+        assert_eq!(counts.advanced, 2);
+        assert_eq!(counts.sent, 2, "both frames of the pair");
+        assert_eq!((counts.overwritten, counts.behind), (0, 0));
+        assert_eq!(counts.caught_up, 1);
+        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 3);
+
+        tick(&cam).await;
+        assert_eq!(cam.send_tally.take().sent, 0, "nothing new");
+    }
+
+    /// A camera nobody watched was not read. When a viewer returns it starts
+    /// from the newest frame, without counting the unwatched ones as owed.
+    #[tokio::test]
+    async fn resubscribing_starts_from_the_newest_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+
+        ring.produce(64, 64, 0.0, &pixels).unwrap();
+        tick(&cam).await;
+        cam.send_tally.take();
+
+        for n in 1..=6 {
+            ring.produce(64, 64, 33.0 * n as f64, &pixels).unwrap();
+        }
+        cam.rebase_after_idle();
+        tick(&cam).await;
+        let counts = cam.send_tally.take();
+        assert_eq!((counts.sent, counts.behind, counts.overwritten), (1, 0, 0));
+        assert_eq!(counts.advanced, 0, "the first read only sets the baseline");
+        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 7);
+    }
+
+    /// Past the catch-up allowance the oldest frames are passed over, so a
+    /// camera whose encoder fell behind stays live, and a frame captured too
+    /// soon after the last one sent is still skipped.
+    #[tokio::test]
+    async fn a_long_backlog_skips_to_the_newest_two() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+
+        ring.produce(64, 64, 0.0, &pixels).unwrap();
+        tick(&cam).await;
+        cam.send_tally.take();
+
+        for n in 1..=4 {
+            ring.produce(64, 64, 33.0 * n as f64, &pixels).unwrap();
+        }
+        tick(&cam).await;
+        let counts = cam.send_tally.take();
+        assert_eq!((counts.advanced, counts.sent, counts.behind), (4, 2, 2));
+
+        ring.produce(64, 64, 33.0 * 4.0 + 5.0, &pixels).unwrap();
+        tick(&cam).await;
+        let counts = cam.send_tally.take();
+        assert_eq!((counts.sent, counts.rate_guard), (0, 1));
     }
 
     #[test]

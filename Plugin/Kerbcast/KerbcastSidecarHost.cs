@@ -329,6 +329,15 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] LD_LIBRARY_PATH prepend: {libDir}");
                 }
 
+                /* The sidecar's per-camera send counts sit beside the plugin's
+                   capture-over lines, so a frame lost between the two shows up.
+                   An environment variable, not a flag: an older sidecar exits on
+                   a flag it does not know, and would then stream nothing. */
+                if (KerbcastSettings.EnableTelemetry)
+                {
+                    psi.EnvironmentVariables["KERBCAST_TELEMETRY"] = "1";
+                }
+
                 _sidecar = new Process { StartInfo = psi, EnableRaisingEvents = true };
                 _sidecar.OutputDataReceived += (sender, e) =>
                 {
