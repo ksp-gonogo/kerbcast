@@ -140,7 +140,7 @@ var truthPins = new[]
         "the development provider, as lock holder, aims each feed at the active craft Kerbcast's default would watch"),
     Pin.Whole("Kerbcast.DevProvider/DevProviderAddon.cs", "DevProviderAddon.LatestLaunch",
         "the development provider finds the named or latest launched craft Kerbcast's default would watch, as Kerbcast's own default does"),
-    Pin.Line("CommandCameraMount.cs", "CommandCameraMount.Vessel", "public Vessel Vessel => FlightGlobals.ActiveVessel;", 1,
+    Pin.Line("CommandCameraMount.cs", "CommandCameraMount.Vessel", "public Vessel Vessel => FlightGlobals.fetch != null ? FlightGlobals.ActiveVessel : null;", 1,
         "ICamera's owning vessel for camera bookkeeping, not a question about the subject"),
     Pin.Line("CommandCameraProvider.cs", "Feed.ResolveDefault", ": (FlightGlobals.ActiveVessel ?? vessel)?.launchedFrom;", 1,
         "the launch site the default lens is placed at"),
