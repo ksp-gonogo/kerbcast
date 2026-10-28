@@ -121,6 +121,54 @@ Check(Near(CommandCameraMath.BoundingRadius(parts, origin, 1.5, 2), 11.5, 1e-9),
 Check(CommandCameraMath.BoundingRadius(new List<DVec3>(), origin, 0.5, 2) == 2, "never below the minimum");
 Check(CommandCameraMath.BoundingRadius(null, origin, 0.5, 2) == 2, "null part list gives the minimum");
 
+/* Which chutes show a canopy, when one is unfolding, and when a craft's cached chutes are found again. */
+Check(CommandCameraMath.CanopyOpen(CommandCameraMath.ChuteState.SemiDeployed) && CommandCameraMath.CanopyOpen(CommandCameraMath.ChuteState.Deployed),
+    "canopy: semi and fully deployed chutes count");
+Check(!CommandCameraMath.CanopyOpen(CommandCameraMath.ChuteState.Stowed) && !CommandCameraMath.CanopyOpen(CommandCameraMath.ChuteState.Active)
+    && !CommandCameraMath.CanopyOpen(CommandCameraMath.ChuteState.Cut), "canopy: packed, armed and cut chutes do not");
+Check(CommandCameraMath.CanopyUnfolding(0.4f, 0.2f) && CommandCameraMath.CanopyUnfolding(0f, -1f), "canopy: a moving deploy animation is unfolding, first look included");
+Check(!CommandCameraMath.CanopyUnfolding(1f, 0.9f), "canopy: a finished animation is not");
+Check(!CommandCameraMath.CanopyUnfolding(0f, 0f) && !CommandCameraMath.CanopyUnfolding(0.5f, 0.5f),
+    "canopy: one held short of the end (in vacuum, or paused) is not, so the fast refresh stops");
+Check(!CommandCameraMath.ChutesStale(12, 12, true, false, false), "chute cache: the same parts, root and objects keep it");
+Check(CommandCameraMath.ChutesStale(12, 9, true, false, false), "chute cache: staging or docking rebuilds it");
+Check(CommandCameraMath.ChutesStale(12, 12, false, false, false), "chute cache: a reload (same id and count, new root part) rebuilds it");
+Check(CommandCameraMath.ChutesStale(12, 12, true, true, false), "chute cache: a destroyed module or renderer rebuilds it");
+Check(CommandCameraMath.ChutesStale(12, 12, true, false, true), "chute cache: a chute that just opened rebuilds it, for a kerbal's chute fitted since");
+
+/* BoxReach: a canopy's renderer bounds measured from the craft's centre of mass. */
+Check(Near(CommandCameraMath.BoxReach(new DVec3(0, 15, 0), new DVec3(4, 2, 4), origin), Math.Sqrt(16 + 289 + 16), 1e-9),
+    "a canopy 15 m above the centre of mass reaches its far corner");
+Check(Near(CommandCameraMath.BoxReach(new DVec3(0, -15, 0), new DVec3(4, 2, 4), origin), Math.Sqrt(16 + 289 + 16), 1e-9),
+    "the reach is the same on either side of the centre of mass");
+Check(Near(CommandCameraMath.BoxReach(origin, new DVec3(1, 2, 2), origin), 3, 1e-9), "a box about the point reaches its half diagonal");
+Check(Near(CommandCameraMath.BoxReach(new DVec3(10, 0, 0), new DVec3(-1, 0, 0), new DVec3(10, 0, 0)), 1, 1e-9), "negative extents count as their size");
+{
+    /* A canopy unfolding over one second from 3 m to 20 m, seen at 400 m and drawn at 60 fps. */
+    const double Distance = 400, Fraction = 0.6, Dt = 1.0 / 60;
+    double Target(double t) => 3 + 17 * Math.Min(1, Math.Max(0, t));
+    double Run(double refresh, out double settled)
+    {
+        double radius = Target(0), fov = CommandCameraMath.FovForFraction(radius, Distance, Fraction, 0.02, 60);
+        double measured = 0, worst = 0;
+        for (double t = 0; t < 3; t += Dt)
+        {
+            if (t - measured >= refresh - 1e-9) { radius = Target(t); measured = t; }
+            double next = CommandCameraMath.SmoothFov(fov, CommandCameraMath.FovForFraction(radius, Distance, Fraction, 0.02, 60), Dt, 0.4, 1.0);
+            worst = Math.Max(worst, Math.Abs(Math.Log(next / fov)));
+            fov = next;
+        }
+        settled = fov;
+        return worst;
+    }
+    double fast = Run(0.1, out double fastFov), slow = Run(0.5, out _);
+    double open = CommandCameraMath.FovForFraction(20, Distance, Fraction, 0.02, 60);
+    Check(fast < slow, $"refreshing while a canopy unfolds steps the zoom less per frame ({fast:G3} vs {slow:G3} in log fov)");
+    double every = Run(Dt, out _);
+    Check(fast < every * 1.25, $"and steps it within a quarter of measuring every frame ({fast:G3} vs {every:G3})");
+    Check(Near(fastFov, open, open * 0.01), $"the view settles framing the open canopy ({fastFov:F2} vs {open:F2} deg)");
+}
+
 // Clip plan on a split (OpenGL/Metal) stack: near 0.21..397, far 397..750 km.
 const float nN = 0.21f, nF = 397f, fN = 397f, fF = 750000f;
 var pad = CommandCameraMath.PlanClips(600, 15, false, true, false, nN, nF, fN, fF);
@@ -944,6 +992,85 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         Check(mode == SubjectAimMode.Subject && slew.Slewing && Deg(first, held) <= oneStep + 1e-9,
             $"hand-off: a new subject from a held view slews from where the view was ({Deg(first, held):G3} deg in the first frame)");
     }
+}
+
+/* CraftExtent.Enclose: a craft framed by a sphere it fits in, off its centre of mass, rather than a sphere about its centre of mass. */
+{
+    const double Pad = 1.5, Min = 2.0;
+    DVec3 Roll(DVec3 p, double deg)
+    {
+        double r = deg * Math.PI / 180, c = Math.Cos(r), s = Math.Sin(r);
+        return new DVec3(p.X * c - p.Y * s, p.X * s + p.Y * c, p.Z);
+    }
+    CraftExtent Shape(IEnumerable<DVec3> points, double deg)
+    {
+        var e = new CraftExtent();
+        foreach (var p in points) e.Add(Roll(p, deg), Pad);
+        return e;
+    }
+
+    /* A capsule and its parts, with an open canopy 20 m above the centre of mass. */
+    var chuted = new CraftExtent();
+    chuted.Add(origin, Pad);
+    chuted.Add(new DVec3(0, -2, 0), Pad);
+    chuted.AddBox(new DVec3(0, 20, 0), new DVec3(3, 2, 3));
+    chuted.Enclose(Min, out var cc, out double ch);
+    double sphereR = chuted.ReachFrom(origin);
+    Check(cc.Y > 8 && cc.Y < 11 && Near(cc.X, 0, 0.05) && Near(cc.Z, 0, 0.05), $"enclose: centred between the capsule and the canopy ({cc})");
+    Check(Near(ch, chuted.ReachFrom(cc), 1e-9) && ch < sphereR * 0.65, $"enclose: a chuted craft frames at about half today's sphere ({ch:F1} m against {sphereR:F1} m)");
+
+    /* A plain rocket, its centre of mass mid stack: today's sphere, at any attitude. */
+    var stack = new List<DVec3>();
+    for (int i = -5; i <= 5; i++) stack.Add(new DVec3(0, i, 0));
+    double today = CommandCameraMath.BoundingRadius(stack, origin, Pad, Min);
+    Shape(stack, 0).Enclose(Min, out var ec, out double eh);
+    Check(Near(eh, today, 1e-9) && VNear(ec, origin, 1e-9), "enclose: a symmetric rocket frames as today's sphere, on its centre of mass");
+    Shape(stack, 90).Enclose(Min, out _, out double eh90);
+    Shape(stack, 37).Enclose(Min, out _, out double eh37);
+    Check(Near(eh90, eh, 1e-9) && Near(eh37, eh, 1e-9), "enclose: end on, side on or pitched, it frames the same");
+
+    /* The same rocket with its centre of mass lowStack: framed by its half length about its middle. */
+    var lowStack = new List<DVec3>();
+    for (int i = -2; i <= 8; i++) lowStack.Add(new DVec3(0, i, 0));
+    Shape(lowStack, 0).Enclose(Min, out var lc, out double lh);
+    Check(Near(lh, 6.5, 0.05) && Near(lc.Y, 3, 0.05), $"enclose: a rocket heavy at one end frames by its half length about its middle ({lh:F3} m at {lc})");
+    Check(lh < CommandCameraMath.BoundingRadius(lowStack, origin, Pad, Min), "enclose: tighter than its sphere about the centre of mass");
+
+    /* A T shape (a lander, radial chutes, a plane) rolled about the view: the same centre, turned with it, and the same size. */
+    var tee = new[] { new DVec3(-10, 0, 0), new DVec3(10, 0, 0), new DVec3(0, 10, 0), origin };
+    Shape(tee, 0).Enclose(Min, out var tc0, out double th0);
+    Check(th0 <= Shape(tee, 0).ReachFrom(origin) + 1e-9, $"enclose: a T shape is never framed looser than its centre of mass sphere ({th0:F3} m)");
+    bool steady = true;
+    foreach (double deg in new[] { 15.0, 30, 45, 60, 90, 137, 200 })
+    {
+        Shape(tee, deg).Enclose(Min, out var tc, out double th);
+        steady &= Near(th, th0, 1e-6) && VNear(tc, Roll(tc0, deg), 1e-6);
+    }
+    Check(steady, "enclose: a T shape rolled through 15 to 200 deg keeps its size, its centre rolling with it");
+
+    /* An L shape, where the smallest sphere sits off the centre of mass. */
+    var ell = new[] { new DVec3(0, 0, 0), new DVec3(12, 0, 0), new DVec3(0, 12, 0) };
+    Shape(ell, 0).Enclose(Min, out var lcc, out double lhh);
+    Check(Near(lhh, 6 * Math.Sqrt(2) + Pad, 0.1) && VNear(lcc, new DVec3(6, 6, 0), 0.1), $"enclose: an L shape frames by its hypotenuse ({lhh:F3} m at {lcc})");
+
+    var onePart = new CraftExtent();
+    onePart.Add(origin, Pad);
+    onePart.Enclose(Min, out var oc, out double oh);
+    Check(Near(oh, Min, 1e-9) && VNear(oc, origin, 1e-9), "enclose: a single small part is held at the minimum size, as the sphere was");
+
+    /* The parts' own sphere off the centre of mass, with a canopy above: what the picture encloses each frame. */
+    var partsSphere = new CraftExtent();
+    partsSphere.Add(new DVec3(0, -1, 0), 2.5);
+    partsSphere.Enclose(Min, out var pc, out double ph);
+    Check(VNear(pc, new DVec3(0, -1, 0), 1e-9) && Near(ph, 2.5, 1e-9), "enclose: a single sphere off the centre of mass is its own framing");
+    partsSphere.AddBox(new DVec3(0, 20, 0), new DVec3(3, 2, 3));
+    partsSphere.Enclose(Min, out var pc2, out double ph2);
+    Check(ph2 < partsSphere.ReachFrom(origin) * 0.65 && pc2.Y > 8, $"enclose: the parts' sphere and a canopy frame together ({ph2:F1} m at {pc2})");
+
+    var a = new DVec3(0, 10, 0);
+    var eased = CommandCameraMath.EaseToward(origin, a, 0.4, 0.4, 1.0);
+    Check(Near(eased.Y, 10 * (1 - Math.Exp(-1)), 1e-9), "ease: the centre offset closes 63% of the way in one time constant");
+    Check(VNear(CommandCameraMath.EaseToward(origin, a, 2.0, 0.4, 1.0), a, 1e-12), "ease: after a gap it snaps");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

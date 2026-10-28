@@ -158,6 +158,93 @@ namespace Kerbcast
         MountForward,
     }
 
+    /* A craft's shape for framing, as offsets from its centre of mass, each point padded by a radius of its own. */
+    public sealed class CraftExtent
+    {
+        private readonly List<DVec3> _points = new List<DVec3>();
+        private readonly List<double> _pads = new List<double>();
+
+        public int Count => _points.Count;
+
+        public void Clear()
+        {
+            _points.Clear();
+            _pads.Clear();
+        }
+
+        public void Add(DVec3 offset, double pad)
+        {
+            _points.Add(offset);
+            _pads.Add(pad);
+        }
+
+        /* The corners of an axis-aligned box (a renderer's world bounds) about `centre`. */
+        public void AddBox(DVec3 centre, DVec3 extents)
+        {
+            double x = Math.Abs(extents.X), y = Math.Abs(extents.Y), z = Math.Abs(extents.Z);
+            for (int i = 0; i < 8; i++)
+                Add(centre + new DVec3((i & 1) != 0 ? x : -x, (i & 2) != 0 ? y : -y, (i & 4) != 0 ? z : -z), 0);
+        }
+
+        public void AddFrom(CraftExtent other)
+        {
+            for (int i = 0; i < other._points.Count; i++) Add(other._points[i], other._pads[i]);
+        }
+
+        public DVec3 Point(int i) => _points[i];
+        public double Pad(int i) => _pads[i];
+
+        /* The farthest the extent reaches from `from`, an offset from the centre of mass; 0 when empty. */
+        public double ReachFrom(DVec3 from)
+        {
+            double r = 0;
+            for (int i = 0; i < _points.Count; i++) r = Math.Max(r, (_points[i] - from).Magnitude + _pads[i]);
+            return r;
+        }
+
+        /*
+         * A sphere holding every padded point, close to the smallest
+         * (Badoiu and Clarkson's steps toward the farthest point, from the
+         * points' mean). It depends on the shape alone, so a craft rolling
+         * or the view turning moves neither its centre nor its size. Never
+         * larger than the sphere about the centre of mass, which it falls
+         * back to, and never below `minHalf`.
+         */
+        public void Enclose(double minHalf, out DVec3 centre, out double half)
+        {
+            centre = default;
+            double about = ReachFrom(default);
+            if (_points.Count > 0)
+            {
+                var c = default(DVec3);
+                for (int i = 0; i < _points.Count; i++) c = c + _points[i];
+                c = c * (1.0 / _points.Count);
+                for (int k = 1; k <= EncloseSteps; k++)
+                {
+                    int far = 0;
+                    double farReach = -1;
+                    for (int i = 0; i < _points.Count; i++)
+                    {
+                        double r = (_points[i] - c).Magnitude + _pads[i];
+                        if (r > farReach)
+                        {
+                            farReach = r;
+                            far = i;
+                        }
+                    }
+                    var toward = _points[far] - c;
+                    double d = toward.Magnitude;
+                    if (d < 1e-9) break;
+                    c = c + toward * ((farReach / d) / (k + 1));
+                }
+                if (ReachFrom(c) < about) centre = c;
+            }
+            half = Math.Max(minHalf, ReachFrom(centre));
+        }
+
+        private const int EncloseSteps = 256;
+    }
+
     /* Unity-free maths for the command camera: where the station
        is, where it looks, how wide it zooms, which layers carry the craft and
        whether a body is in the way. Compiled verbatim by CommandCameraMath.Tests. */
@@ -343,6 +430,42 @@ namespace Kerbcast
             }
             r += pad;
             return r < min ? min : r;
+        }
+
+        /* A parachute's deploy state as stock's ModuleParachute.deploymentStates names it. */
+        public enum ChuteState { Stowed, Active, SemiDeployed, Deployed, Cut }
+
+        /* A canopy is out while its chute is semi or fully deployed; armed, packed and cut chutes show none. */
+        public static bool CanopyOpen(ChuteState state) => state == ChuteState.SemiDeployed || state == ChuteState.Deployed;
+
+        /* Still unfolding: the deploy animation has not finished and moved since the last look. Stock holds it short of 1 in vacuum and while paused. */
+        public static bool CanopyUnfolding(float animTime, float lastAnimTime) => animTime < 1f && animTime != lastAnimTime;
+
+        /*
+         * Whether a craft's cached chutes must be found again. A reload keeps
+         * the craft's id and part count but makes every part, module and
+         * renderer anew, so a new root part or a destroyed cached object
+         * means the cache is stale. So does a chute that just opened, since
+         * a kerbal's chute model can be fitted after the cache was built.
+         */
+        public static bool ChutesStale(int cachedParts, int parts, bool sameRoot, bool anyGone, bool opened) =>
+            cachedParts != parts || !sameRoot || anyGone || opened;
+
+        /* How far an axis-aligned box (a renderer's world bounds) reaches from `from`: the distance to its farthest corner. */
+        public static double BoxReach(DVec3 centre, DVec3 extents, DVec3 from)
+        {
+            double x = Math.Abs(centre.X - from.X) + Math.Abs(extents.X);
+            double y = Math.Abs(centre.Y - from.Y) + Math.Abs(extents.Y);
+            double z = Math.Abs(centre.Z - from.Z) + Math.Abs(extents.Z);
+            return Math.Sqrt(x * x + y * y + z * z);
+        }
+
+        /* Exponential approach of a vector to `target`, at the pace SmoothFov eases with; a gap longer than `snapAfter` snaps. */
+        public static DVec3 EaseToward(DVec3 current, DVec3 target, double dt, double tau, double snapAfter)
+        {
+            if (dt <= 0 || dt > snapAfter || tau <= 0) return target;
+            double alpha = 1.0 - Math.Exp(-dt / tau);
+            return current + (target - current) * alpha;
         }
 
         /* The boundary light time τ, one 60 fps frame: craft nearer to the lens than its light covers in τ are drawn at render UT. */

@@ -411,6 +411,37 @@ describe("CommandBrackets on the subject anchor", () => {
     expect(view.container.querySelector("path[data-aim-cue]")).toBeTruthy();
   });
 
+  function renderAimed(aimAt: { x: number; y: number }, t: CommandTrackState) {
+    let seen: CommandBracketContext | null = null;
+    const view = render(
+      <CommandBrackets
+        state={effectiveCommandTrack(t, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subject={subjectAnchor()}
+        subjectFrameSize={{ width: 1024, height: 576 }}
+        aim={{ id: "aim", owner: "kerbcast", observed: false, inFrame: true, behind: false, ...aimAt }}
+      />,
+    );
+    return { ctx: seen as unknown as CommandBracketContext, view };
+  }
+
+  it("draws the aimed box when it holds the subject, so a craft and its parachute are framed whole", () => {
+    /* The view aims between a capsule and the canopy above it; the subject anchor stays on the centre of mass. */
+    const { ctx, view } = renderAimed({ x: 256, y: 100 }, track({ bracketHalfPx: 60 }));
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 60, 576, { x: 256, y: 100 }));
+    expect(ctx.subject).toMatchObject({ id: "subject", x: 256, y: 144 });
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("placed");
+  });
+
+  it("keeps the box on the subject when the aimed box does not hold it", () => {
+    const { ctx } = renderAimed({ x: 700, y: 400 }, track({ bracketHalfPx: 60 }));
+    expect([ctx.geometry.cx, ctx.geometry.cy, ctx.geometry.half]).toEqual([256, 144, 40]);
+    expect(ctx.aimOffscreen).toBe(false);
+  });
+
   it("centres on the frame as before without a subject anchor", () => {
     const { ctx } = seenWith(null);
     expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);

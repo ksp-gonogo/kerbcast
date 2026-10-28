@@ -41,6 +41,7 @@ namespace Kerbcast
         private const double MinVesselRadius = 2.0;
         private const double PartPad = 1.5;
         private const float RadiusRefreshSeconds = 0.5f;
+        private const float UnfoldingRefreshSeconds = 0.1f;
         /* Physics colliders only exist near the active craft; past this the ray
            cast would only ever find nothing. */
         private const double PhysicsRayMaxM = 5000.0;
@@ -55,6 +56,7 @@ namespace Kerbcast
         private readonly StringBuilder _sb = new StringBuilder(1024);
         private byte[] _buffer;
         private readonly Dictionary<uint, KeyValuePair<float, double>> _vesselRadii = new Dictionary<uint, KeyValuePair<float, double>>();
+        private readonly CommandCameraCanopies _canopies = new CommandCameraCanopies();
         private readonly Dictionary<uint, KeyValuePair<float, double>> _partRadii = new Dictionary<uint, KeyValuePair<float, double>>();
         private readonly List<DVec3> _partScratch = new List<DVec3>();
         private bool _failLogged;
@@ -606,11 +608,12 @@ namespace Kerbcast
         }
 
         /* The command camera's bracket size rule: the farthest part origin from
-           the centre of mass plus a pad, never below a minimum. */
+           the centre of mass plus a pad, never below a minimum, or an open
+           parachute canopy's reach when larger. Kept until it falls due. */
         private double VesselRadius(Vessel v, DVec3 com)
         {
             float now = Time.unscaledTime;
-            if (_vesselRadii.TryGetValue(v.persistentId, out var c) && now - c.Key < RadiusRefreshSeconds) return c.Value;
+            if (_vesselRadii.TryGetValue(v.persistentId, out var c) && now < c.Key) return c.Value;
             _partScratch.Clear();
             if (v.loaded && v.parts != null)
             {
@@ -623,7 +626,9 @@ namespace Kerbcast
             double r = _partScratch.Count > 0
                 ? CommandCameraMath.BoundingRadius(_partScratch, com, PartPad, MinVesselRadius)
                 : MinVesselRadius;
-            _vesselRadii[v.persistentId] = new KeyValuePair<float, double>(now, r);
+            r = Math.Max(r, _canopies.Reach(v, com));
+            float due = now + (_canopies.Unfolding ? UnfoldingRefreshSeconds : RadiusRefreshSeconds);
+            _vesselRadii[v.persistentId] = new KeyValuePair<float, double>(due, r);
             return r;
         }
 

@@ -106,6 +106,7 @@ var truthFiles = new Dictionary<string, string>
 {
     ["TruthFixSource.cs"] = "the truth fix source: knowledge read from KSP, including choosing the default subject",
     ["DrawnSubject.cs"] = "the picture's subject: where the craft is drawn",
+    ["CommandCameraCanopies.cs"] = "the picture: how far a loaded craft's open parachute canopies reach, which sizes it as drawn",
     ["CommandCameraTargetModel.cs"] = "the picture's stand-in model, built from the saved record while the craft is drawn live, or from the history's parts at its past instant",
     ["PictureHiding.cs"] = "the picture: which loaded craft a camera hides beyond the boundary, switching their renderers and lights off",
 };
@@ -207,6 +208,8 @@ var picturePins = new[]
     Pin.Line("TruthFixSource.cs", "TruthFixSource._drawn", "private DrawnSubject _drawn;", 1, "truth frames a craft by the radius the picture measured"),
     Pin.Line("TruthFixSource.cs", "TruthFixSource.SubjectRadiusM", "public double SubjectRadiusM => _drawn != null ? _drawn.Radius : double.NaN;", 1,
         "truth frames a craft by the radius the picture measured: the one read from knowledge into the picture"),
+    Pin.Line("TruthFixSource.cs", "TruthFixSource.SubjectShape", "return _drawn != null && _drawn.FramingShape(out centreOffset, out radiusM);", 1,
+        "truth frames a craft by the shape the picture measured, as it does by the radius"),
     Pin.Line("TruthFixSource.cs", "TruthFixSource.MeasureWith", "public void MeasureWith(DrawnSubject drawn) => _drawn = drawn;", 1,
         "truth frames a craft by the radius the picture measured"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.TrueOffsetPx", "public double? TrueOffsetPx { get; private set; }", 1, "the picture's output"),

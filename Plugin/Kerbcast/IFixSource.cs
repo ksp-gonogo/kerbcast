@@ -84,6 +84,8 @@ namespace Kerbcast
         bool SubjectMotion(double ut, out BodyMotion motion, out double validUntilUt);
         /* The radius the subject is framed by, in metres; NaN when the source has no size for it. */
         double SubjectRadiusM { get; }
+        /* A sphere the subject fits in that frames it closer than the radius does: its centre's offset from the subject's position, world axes, and its radius. False when the source has none. */
+        bool SubjectShape(out DVec3 centreOffset, out double radiusM);
 
         /* Whether the source knows a craft with this persistentId. */
         bool Knows(uint persistentId);
@@ -140,6 +142,7 @@ namespace Kerbcast
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validUntilUt) =>
             Now.SubjectMotion(ut, out motion, out validUntilUt);
         public double SubjectRadiusM => Now.SubjectRadiusM;
+        public bool SubjectShape(out DVec3 centreOffset, out double radiusM) => Now.SubjectShape(out centreOffset, out radiusM);
         public bool Knows(uint persistentId) => Now.Knows(persistentId);
         public CraftFix Find(uint persistentId, double ut) => Now.Find(persistentId, ut);
         public void List(double ut, uint exceptPersistentId, bool place, List<CraftFix> into) => Now.List(ut, exceptPersistentId, place, into);

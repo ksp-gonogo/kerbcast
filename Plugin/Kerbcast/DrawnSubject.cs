@@ -15,7 +15,10 @@ namespace Kerbcast
      */
     internal sealed class DrawnSubject
     {
+        private const string Tag = "[Kerbcast][CMDCAM]";
         private const float RadiusRefreshSeconds = 0.5f;
+        /* While a canopy is open, so the zoom eases out with it as it unfolds rather than in half second steps, and the framing follows it as the craft swings beneath. */
+        private const float CanopyRefreshSeconds = 0.1f;
         private const double PartPad = 1.5;
         public const double MinRadius = 2.0;
 
@@ -28,6 +31,21 @@ namespace Kerbcast
         private float _radiusAt = float.MinValue;
         private uint _radiusVesselId;
         private readonly List<DVec3> _partScratch = new List<DVec3>();
+        private readonly CommandCameraCanopies _canopies = new CommandCameraCanopies();
+        private double _partsRadius = MinRadius;
+        /* Part origins about the CoM in the vessel's own frame, and the sphere they fit in, so the framing turns with the craft between measures. */
+        private readonly CraftExtent _partsLocal = new CraftExtent();
+        private DVec3 _partsCentreLocal;
+        private double _partsHalf;
+        /* Open canopies about the CoM in world axes: they hang in the airflow rather than turn with the craft. */
+        private readonly CraftExtent _canopyExtent = new CraftExtent();
+        private readonly CraftExtent _framing = new CraftExtent();
+        private int _framingFrame = -1;
+        private DVec3 _framingCentre;
+        private double _framingHalf;
+        private float _canopyAt = float.MinValue;
+        private int _canopiesLogged;
+        private bool _unfoldingLogged;
 
         public DrawnSubject(SubjectSelection selection, SubjectTrack truth, PicturePass picture)
         {
@@ -124,10 +142,50 @@ namespace Kerbcast
            from the stand-in model that replaces it. */
         public double Radius { get; set; } = MinRadius;
 
+        /*
+         * The sphere the measured parts and open canopies fit in, as its
+         * centre's offset from the CoM in world axes and its radius, with
+         * the parts' sphere turned to the craft's attitude this frame and
+         * never larger than Radius. False unless the craft is drawn live in
+         * this camera's scene and was measured.
+         */
+        public bool FramingShape(out DVec3 centre, out double half)
+        {
+            centre = default;
+            half = 0;
+            var v = Loaded;
+            if (v == null || Hidden || ShownPast || v.persistentId != _radiusVesselId || v.transform == null) return false;
+            if (_partsLocal.Count + _canopyExtent.Count == 0) return false;
+            if (_framingFrame != Time.frameCount)
+            {
+                _framingFrame = Time.frameCount;
+                _framing.Clear();
+                if (_partsLocal.Count > 0)
+                {
+                    var l = _partsCentreLocal;
+                    var w = v.transform.rotation * new Vector3((float)l.X, (float)l.Y, (float)l.Z);
+                    _framing.Add(new DVec3(w.x, w.y, w.z), _partsHalf);
+                }
+                _framing.AddFrom(_canopyExtent);
+                _framing.Enclose(MinRadius, out _framingCentre, out _framingHalf);
+                if (_framingHalf > Radius)
+                {
+                    _framingCentre = default;
+                    _framingHalf = Radius;
+                }
+            }
+            centre = _framingCentre;
+            half = _framingHalf;
+            return true;
+        }
+
         /* Bounding radius about the CoM from part origins, refreshed twice a
-           second (staging changes it) and immediately on a vessel switch. An
-           unloaded or unlocated craft has no parts, so it gets the minimum. A
-           hidden craft is measured about its own live CoM, not where it is drawn. */
+           second (staging changes it) and immediately on a vessel switch, or
+           the farthest reach of an open parachute canopy when that is larger,
+           refreshed faster while one unfolds. An unloaded or unlocated craft
+           has no parts, so it gets the minimum. A hidden craft is measured
+           about its own live CoM, not where it is drawn. FramingShape reads
+           the same parts and canopies. */
         public void Measure(bool located, DVec3 com, float now)
         {
             var v = located ? Loaded : null;
@@ -135,27 +193,52 @@ namespace Kerbcast
             if (v == null)
             {
                 Radius = MinRadius;
+                _partsLocal.Clear();
+                _canopyExtent.Clear();
                 _radiusVesselId = 0;
+                _canopiesLogged = 0;
+                _unfoldingLogged = false;
                 return;
             }
-            if (v.persistentId == _radiusVesselId && now - _radiusAt < RadiusRefreshSeconds) return;
-            _radiusVesselId = v.persistentId;
-            _radiusAt = now;
-            _partScratch.Clear();
-            var parts = v.parts;
-            if (parts != null)
+            bool partsDue = v.persistentId != _radiusVesselId || now - _radiusAt >= RadiusRefreshSeconds;
+            if (!partsDue && !(_canopies.Open > 0 && now - _canopyAt >= CanopyRefreshSeconds)) return;
+            if (partsDue)
             {
-                for (int i = 0; i < parts.Count; i++)
+                _radiusVesselId = v.persistentId;
+                _radiusAt = now;
+                _partScratch.Clear();
+                _partsLocal.Clear();
+                var untwist = v.transform != null ? Quaternion.Inverse(v.transform.rotation) : Quaternion.identity;
+                var parts = v.parts;
+                if (parts != null)
                 {
-                    var p = parts[i];
-                    if (p != null && p.transform != null)
+                    for (int i = 0; i < parts.Count; i++)
                     {
-                        var at = p.transform.position;
-                        _partScratch.Add(new DVec3(at.x, at.y, at.z));
+                        var p = parts[i];
+                        if (p != null && p.transform != null)
+                        {
+                            var at = p.transform.position;
+                            var point = new DVec3(at.x, at.y, at.z);
+                            _partScratch.Add(point);
+                            var local = untwist * new Vector3((float)(point.X - com.X), (float)(point.Y - com.Y), (float)(point.Z - com.Z));
+                            _partsLocal.Add(new DVec3(local.x, local.y, local.z), PartPad);
+                        }
                     }
                 }
+                _partsRadius = CommandCameraMath.BoundingRadius(_partScratch, com, PartPad, MinRadius);
+                _partsLocal.Enclose(0, out _partsCentreLocal, out _partsHalf);
             }
-            Radius = CommandCameraMath.BoundingRadius(_partScratch, com, PartPad, MinRadius);
+            _canopyAt = now;
+            double canopy = _canopies.Reach(v, com, _canopyExtent);
+            Radius = Math.Max(_partsRadius, canopy);
+            _framingFrame = -1;
+            if (_canopies.Open != _canopiesLogged || _canopies.Unfolding != _unfoldingLogged)
+            {
+                _canopiesLogged = _canopies.Open;
+                _unfoldingLogged = _canopies.Unfolding;
+                Debug.Log($"{Tag} drawn pid={v.persistentId} open canopies={_canopies.Open}{(_canopies.Unfolding ? " (unfolding)" : "")} "
+                    + $"reach={canopy:F1}m parts={_partsRadius:F1}m radius={Radius:F1}m");
+            }
         }
     }
 }

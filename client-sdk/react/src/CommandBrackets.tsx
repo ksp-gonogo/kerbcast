@@ -147,6 +147,11 @@ export interface CommandBracketContext {
   aimOffscreen?: boolean;
 }
 
+/** Whether `p` lies inside the box `g`. */
+function holds(g: BracketGeometry, p: BracketPoint): boolean {
+  return p.x >= g.topLeft.x && p.x <= g.bottomRight.x && p.y >= g.topLeft.y && p.y <= g.bottomRight.y;
+}
+
 /** `g` moved so the whole box lies inside `rect`. */
 function clampToRect(g: BracketGeometry, rect: ContentRect): BracketGeometry {
   const clamp = (v: number, lo: number, hi: number) => (lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, v)));
@@ -245,7 +250,8 @@ export interface CommandBracketsProps {
  * Target brackets for a command camera feed. With no command lock held and
  * the subject's anchor visible in the displayed frame, the box sits on the
  * craft where the game saw it, so it stays on the craft when an aim points
- * elsewhere. Otherwise (the anchor out of frame or occluded, which then
+ * elsewhere; while the aimed box is in frame and holds the craft it is drawn
+ * instead, since it frames the craft's whole extent as the view does. Otherwise (the anchor out of frame or occluded, which then
  * carries no position, no anchor at all, or a command authority holding the
  * lock) the box is the 1.11 one: on the aim (the frame centre, or the aim
  * anchor while the view turns onto a moved aim), sized from the aimed range,
@@ -279,17 +285,27 @@ export function CommandBrackets({
   const point =
     subject && !state.authority && frameW > 0 && frameH > 0 ? anchorPoint(subject) : null;
   const placed = point !== null;
-  const aimPoint = !point && aim && frameW > 0 && frameH > 0 ? anchorPoint(aim) : null;
+  const aimPoint = aim && frameW > 0 && frameH > 0 ? anchorPoint(aim) : null;
   const aimScreen = aimPoint ? frameToScreen(aimPoint, frameW, frameH, { ...rect, scale: 1 }) : null;
-  const aimOffscreen = !!aimScreen && (!aim?.inFrame || !!aim?.behind);
-  const unclamped = point
-    ? bracketGeometry(
-        rect,
-        subject?.apparentRadiusPx ?? null,
-        frameH,
-        frameToScreen(point, frameW, frameH, { ...rect, scale: 1 }),
-      )
-    : bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH, aimScreen);
+  const aimOffscreen = !point && !!aimScreen && (!aim?.inFrame || !!aim?.behind);
+  const aimed = bracketGeometry(rect, state.bracketHalfPx, state.frameHeightPx || mediaH, aimScreen);
+  const subjectScreen = point ? frameToScreen(point, frameW, frameH, { ...rect, scale: 1 }) : null;
+  /*
+   * The aimed box, when it is in frame and holds the subject, frames the
+   * craft as the view does: around a craft and its open parachute rather
+   * than a sphere about its centre of mass.
+   */
+  const framed =
+    !!subjectScreen &&
+    !!aimScreen &&
+    !!aim?.inFrame &&
+    !aim?.behind &&
+    state.bracketHalfPx != null &&
+    holds(aimed, subjectScreen);
+  const unclamped =
+    subjectScreen && !framed
+      ? bracketGeometry(rect, subject?.apparentRadiusPx ?? null, frameH, subjectScreen)
+      : aimed;
   /* An aim off the frame (mid-slew) keeps the box on the edge nearest it, with a cue pointing on. */
   const g = aimOffscreen ? clampToRect(unclamped, rect) : unclamped;
   const cue = aimOffscreen && aimScreen ? edgeCue(g, aimScreen) : null;

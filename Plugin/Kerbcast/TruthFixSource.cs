@@ -12,7 +12,8 @@ namespace Kerbcast
      * 1.11's behaviour, with every craft Positioned or Listed.
      *
      * A craft is framed by the radius the picture measured for it
-     * (DrawnSubject.Radius): KSP's own size for the craft is the truth here.
+     * (DrawnSubject.Radius), or by the extent of its parts and canopies
+     * when it is drawn live: KSP's own size for the craft is the truth here.
      */
     internal sealed class TruthFixSource : IFixSource
     {
@@ -98,6 +99,13 @@ namespace Kerbcast
 
         /* Truth frames a craft by the size the picture measured: the one place knowledge reads the picture. */
         public double SubjectRadiusM => _drawn != null ? _drawn.Radius : double.NaN;
+
+        public bool SubjectShape(out DVec3 centreOffset, out double radiusM)
+        {
+            centreOffset = default;
+            radiusM = double.NaN;
+            return _drawn != null && _drawn.FramingShape(out centreOffset, out radiusM);
+        }
 
         public void MeasureWith(DrawnSubject drawn) => _drawn = drawn;
 

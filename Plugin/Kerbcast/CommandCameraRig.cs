@@ -338,6 +338,35 @@ namespace Kerbcast
         private double FramingRadius => KnownRadius + (AimIsCraft ? _knownUncertainty : 0.0) + FramingMargin;
         private double _knownUncertainty;
 
+        /* The subject's framing sphere centre from its CoM, eased; the view looks there while everything else keeps the CoM. */
+        private DVec3 _viewOffset;
+        private DVec3 ViewOffset => _mode == SubjectAimMode.Subject && AimIsCraft ? _viewOffset : default;
+        /* The framing the last rendered frame used, for the status log. */
+        private Shape _shape;
+
+        /* A craft aim's subject as its source frames it: a sphere off its CoM, when the source knows its shape. */
+        private struct Shape
+        {
+            public bool Known;
+            public DVec3 Centre;
+            public double Half;
+        }
+
+        private Shape SubjectShape()
+        {
+            var shape = new Shape();
+            if (_mode == SubjectAimMode.Subject && AimIsCraft)
+                shape.Known = _known.SubjectShape(out shape.Centre, out shape.Half);
+            return shape;
+        }
+
+        /* What the view and the bracket frame at `distance` from the CoM: the shape when known, otherwise a sphere of FramingRadius about the CoM. */
+        private void Framed(double distance, Shape shape, out double radius, out double range)
+        {
+            radius = shape.Known ? shape.Half + _knownUncertainty + FramingMargin : FramingRadius;
+            range = shape.Known ? distance + DVec3.Dot(shape.Centre, _solveForward) : distance;
+        }
+
         private bool _blankLogged;
         private string _loggedBlank;
         private string _loggedAim;
@@ -468,17 +497,24 @@ namespace Kerbcast
             {
                 /* The pose turns onto a moved aim rather than snapping; everything
                    projected through the frame (TrueInFrame, anchors) uses it. */
-                var toward = aim - station;
+                bool jumped = AimJumped(ut);
+                if (jumped)
+                {
+                    /* A new subject or aim starts on its own framing, not eased from the last one's. */
+                    var shape = SubjectShape();
+                    _viewOffset = shape.Known ? shape.Centre : default;
+                }
+                var toward = aim + ViewOffset - station;
                 double range = toward.Magnitude;
                 double clock = System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
-                bool jumped = AimJumped(ut);
                 var view = range > 0 ? _slew.Step(toward * (1.0 / range), double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt, jumped, _fov) : toward;
                 _slewAt = clock;
                 NoteSlew(ut);
                 CommandCameraMath.AimBasis(station, station + view * range, localUp, north, out _solveForward, out _solveUp);
                 _solveEye = station;
             }
-            FramingFits = !HasFix || CommandCameraMath.FramingFits(FramingRadius, RangeM, _fovMax);
+            Framed(RangeM, SubjectShape(), out double fitRadius, out double fitRange);
+            FramingFits = !HasFix || CommandCameraMath.FramingFits(fitRadius, fitRange, _fovMax);
             Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost, _authority?.SilentText);
             UpdateBracket(now);
             NoteGovernance(ut, governed);
@@ -946,17 +982,15 @@ namespace Kerbcast
                 TrueOffsetPx = null;
                 return;
             }
-            double radius = FramingRadius;
+            Framed(RangeM, SubjectShape(), out double radius, out double range);
             bool rendering = _lastPrepare >= 0 && now - _lastPrepare <= FovSnapAfter;
-            double fov = rendering
-                ? _fov
-                : CommandCameraMath.FovForFraction(radius, RangeM, _frameFraction, FovMinNow(), _fovMax);
+            double fov = rendering ? _fov : CommandCameraMath.FovForFraction(radius, range, _frameFraction, FovMinNow(), _fovMax);
             int rows = FrameRows();
-            BracketHalfPx = CommandCameraMath.BracketHalfPx(radius, RangeM, fov, rows);
+            BracketHalfPx = CommandCameraMath.BracketHalfPx(radius, range, fov, rows);
             UpdateDrawnOffset(fov, rows);
         }
 
-        /* Where the drawn craft sits against the frame's axis, which is the aim except while the view slews, in the frame `fov` gives. */
+        /* Where the drawn craft's CoM sits against the frame's axis, which is the aim but for the craft's framing centre and a slew, in the frame `fov` gives. */
         private void UpdateDrawnOffset(double fov, int rows)
         {
             TrueOffsetPx = _drawnOk
@@ -1218,7 +1252,7 @@ namespace Kerbcast
             _poseValid = true;
             _poseEye = station;
             _poseForward = fwd;
-            _poseAimToward = aim - station;
+            _poseAimToward = aim + ViewOffset - station;
             _poseUp = up;
             SyncScaledBodies(cam, anchor.position);
             SyncScaledPose(cam);
@@ -1227,14 +1261,21 @@ namespace Kerbcast
             double distance = _lastDistance;
             var drawn = PlaceDrawn(cam, ut, now, station, aim, occluder, distance);
 
+            var shape = SubjectShape();
+            Framed(distance, shape, out double framedRadius, out double framedRange);
             double fovTarget = _mode == SubjectAimMode.Hold ? _fov
                 : _placeholder == PlaceholderAim.None
-                ? CommandCameraMath.FovForFraction(FramingRadius, distance, _frameFraction, FovMinNow(), _fovMax)
+                ? CommandCameraMath.FovForFraction(framedRadius, framedRange, _frameFraction, FovMinNow(), _fovMax)
                 : _placeholder == PlaceholderAim.LaunchSite
                     ? CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, distance,
                         CommandCameraMath.PlaceholderSiteFraction, FovMinNow(), _fovMax)
                     : _fovMax;
-            _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, _frames.Next(dt), FovTau, FovSnapAfter);
+            double step = _frames.Next(dt);
+            _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, step, FovTau, FovSnapAfter);
+            _viewOffset = _mode == SubjectAimMode.Subject && AimIsCraft
+                ? CommandCameraMath.EaseToward(_viewOffset, shape.Known ? shape.Centre : default, step, FovTau, FovSnapAfter)
+                : default;
+            _shape = shape;
             cam.SetRigFov((float)_fov);
             UpdateBracket(now);
             FinishDrawn(cam, ut, station, anchor.rotation, drawn);
@@ -1945,6 +1986,7 @@ namespace Kerbcast
                 _statusAt = now;
                 double elev = CommandCameraMath.ElevationDeg(fwd, localUp);
                 Debug.Log($"{at} event=status elev={elev:F2} fov={_fov:F4} craftRadius={KnownRadius:F1} "
+                    + (_shape.Known ? $"shapeHalf={_shape.Half:F1} shapeCentreM={_shape.Centre.Magnitude:F1} viewOffsetM={_viewOffset.Magnitude:F1} " : "shape=none ")
                     + $"split={_plan.Split} occluded={Occluded} "
                     + (_hasFar ? $"far={(_plan.FarRender ? $"[{_plan.FarNear:F0},{_plan.FarFar:F0}]" : "skipped")} mid={(_plan.MidActive ? $"[{_plan.MidNear:F0},{_plan.MidFar:F0}]" : "off")} " : "")
                     + (_subpixelActive && _subpixel != null ? $"subpixelEnergy={_subpixel.LastEnergy:G3} subpixelCoverPx={_subpixel.LastCoverage:G3} subpixelPeak={_subpixel.LastPeak:G3} " : "")

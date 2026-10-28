@@ -176,6 +176,14 @@ namespace Kerbcast
             }
         }
 
+        /* A world model gives a radius, not a shape. */
+        public bool SubjectShape(out DVec3 centreOffset, out double radiusM)
+        {
+            centreOffset = default;
+            radiusM = double.NaN;
+            return false;
+        }
+
         public bool Knows(uint persistentId)
         {
             try
