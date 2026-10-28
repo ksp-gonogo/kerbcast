@@ -118,10 +118,11 @@ export interface KerbcastCameraHandle {
   /** Current {@link setShowStatic} setting. */
   readonly showStatic: boolean;
   /**
-   * The feed's physical/ceiling maximum render size (`DiscoveredCamera.maxWidth`
-   * / `maxHeight`), or `null` until known. Populated from a prior
-   * `client.discover()` call (there is no live-pushed field for it), so a
-   * consumer that never calls `discover()` sees `null` here indefinitely.
+   * The feed's physical/ceiling maximum render size, or `null` until known.
+   * Read from the live camera state's `maxWidth` / `maxHeight`, falling back
+   * to the last `client.discover()` for a sidecar that predates those fields.
+   * A camera that appears after the page's discovery still gets a ceiling
+   * from its first state.
    * Used by `RecordingController` to recognise a force-full-resolution feed
    * that has actually reached its ceiling, as opposed to one merely
    * unchanged since before the force was sent.
@@ -409,9 +410,8 @@ export interface InboundVideoStats {
  * channel after `connect()`.
  *
  * Deliberately separate from `CameraState` even though the two share several
- * field names, because the shapes differ: `DiscoveredCamera` has `maxWidth`
- * / `maxHeight` (physical sensor limits) which `CameraState` omits, while
- * `CameraState` adds runtime fields (`layers`, `renderWidth`, `panYaw`, ...).
+ * field names, because the shapes differ: `CameraState` adds runtime fields
+ * (`layers`, `renderWidth`, `panYaw`, ...).
  */
 export interface DiscoveredCamera {
   flightId: number;
@@ -1197,6 +1197,12 @@ class CameraHandle
   }
 
   get maxRenderSize(): { width: number; height: number } | null {
+    const state = this._state;
+    /* 0 or absent counts as unknown: a sidecar that predates the fields, or
+       a state sent before the camera's ring attached. */
+    if (state?.maxWidth && state.maxHeight) {
+      return { width: state.maxWidth, height: state.maxHeight };
+    }
     return this.client._maxRenderSize(this.flightId);
   }
 
@@ -1666,9 +1672,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _recording: RecordingController | null = null;
   /**
    * Physical/ceiling max render size per camera, cached from the last
-   * `discover()` call. Empty until `discover()` has been called at least
-   * once; a camera absent from the last discovery response is simply
-   * missing here (its handle's `maxRenderSize` reads `null`).
+   * `discover()` call: the fallback behind a handle's `maxRenderSize` when
+   * the camera's live state carries no ceiling. Empty until `discover()` has
+   * been called at least once; a camera absent from the last discovery
+   * response is simply missing here.
    */
   private readonly maxRenderSizeByFlight = new Map<number, { width: number; height: number }>();
 
@@ -1913,8 +1920,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Internal: backs {@link KerbcastCameraHandle.maxRenderSize}. `null` when
-   * `discover()` has never been called or never reported this camera.
+   * Internal: the discovery fallback behind
+   * {@link KerbcastCameraHandle.maxRenderSize}. `null` when `discover()` has
+   * never been called or never reported this camera.
    */
   _maxRenderSize(flightId: number): { width: number; height: number } | null {
     return this.maxRenderSizeByFlight.get(flightId) ?? null;

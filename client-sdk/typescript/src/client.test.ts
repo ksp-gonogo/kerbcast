@@ -1035,6 +1035,49 @@ describe("KerbcastClient", () => {
     expect(result[0].supportsZoom).toBe(true);
   });
 
+  it("maxRenderSize reads the live camera state for a camera discover() never saw", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ cameras: [] }), { status: 200 }),
+    );
+    await client.discover();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+    await client.connect();
+    captured.dc?._open();
+    expect(client.camera(42).maxRenderSize).toBeNull();
+
+    captured.dc?._msg(
+      JSON.stringify({
+        type: "camera-state-changed",
+        content: { state: fakeCameraState(42, { maxWidth: 1296, maxHeight: 730 }) },
+      }),
+    );
+    expect(client.camera(42).maxRenderSize).toEqual({ width: 1296, height: 730 });
+  });
+
+  it("maxRenderSize falls back to discover() when the camera state omits the ceiling", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ cameras: [{ flightId: 42, maxWidth: 1280, maxHeight: 720 }] }),
+        { status: 200 },
+      ),
+    );
+    await client.discover();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+    await client.connect();
+    captured.dc?._open();
+    captured.dc?._msg(
+      JSON.stringify({
+        type: "camera-state-changed",
+        content: { state: fakeCameraState(42) },
+      }),
+    );
+    expect(client.camera(42).maxRenderSize).toEqual({ width: 1280, height: 720 });
+  });
+
   it("discover() surfaces per-camera rates and the held display size", async () => {
     const { transport } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);

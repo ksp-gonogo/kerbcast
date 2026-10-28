@@ -372,12 +372,9 @@ export async function createMockClient(): Promise<KerbcastClient> {
   interceptMockFetch(sidecar);
 
   /*
-   * Populate maxRenderSize (client.camera(id).maxRenderSize) up front, the
-   * same way a consumer would call discover() before subscribing: without
-   * it the force-full-resolution arm-and-wait falls back to its weaker
-   * "operator size increased past baseline" check instead of recognising a
-   * feed that reaches (or already sits at) its true ceiling. See
-   * RecordingController.watchResolutionReady.
+   * Mirrors ConnectionManager's discovery before connect. Each camera's live
+   * state already carries its ceiling (client.camera(id).maxRenderSize), so
+   * this only fills the fallback an older sidecar would need.
    */
   await mockClient.discover();
 

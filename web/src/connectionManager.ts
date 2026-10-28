@@ -97,15 +97,13 @@ export class ConnectionManager {
   }
 
   /**
-   * Best-effort camera discovery (`GET /cameras`) ahead of the peer connect,
-   * so `KerbcastCameraHandle.maxRenderSize` is populated for every feed
-   * before subscriptions start. Without this, a force-full-resolution arm
-   * on a feed already at its render ceiling has no known target to check
-   * against (see `RecordingController.watchResolutionReady`) and falls back
-   * to the weaker "operator size increased" heuristic, which never fires for
-   * a feed that was already at its ceiling -- burning the full
-   * `ARM_TIMEOUT_MS` before recording starts and losing the clip's opening
-   * seconds.
+   * Best-effort camera discovery (`GET /cameras`) ahead of the peer connect.
+   * A current sidecar sends each camera's ceiling in its live state, so this
+   * only matters for an older one: without it, `KerbcastCameraHandle.maxRenderSize`
+   * stays null, and a force-full-resolution arm on a feed already at its
+   * render ceiling falls back to the "operator size increased" heuristic
+   * (see `RecordingController.watchResolutionReady`), which never fires and
+   * burns the full `ARM_TIMEOUT_MS` before recording starts.
    *
    * Failure here must never block the actual connect: discovery is a
    * nice-to-have (it only sharpens the arm-and-wait check), not a
