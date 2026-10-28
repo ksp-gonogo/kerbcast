@@ -262,21 +262,21 @@ namespace Kerbcast
          * A frame's live bound: the light time covering what of the lens's
          * own craft and site it draws at render UT. That is the larger of τ
          * and the light time from the lens to the farthest reach of its own
-         * craft (`farthestOwnPartM`, 0 with none). 0 with no signal speed,
+         * craft (`farthestOwnPartM`, 0 with none). 0 with no light speed,
          * when nothing is delayed. Other loaded craft are still drawn at
          * render UT and are not covered until those beyond the boundary are
          * hidden.
          */
-        public static double LiveLightTimeS(double? signalSpeed, double farthestOwnPartM)
+        public static double LiveLightTimeS(double? lightSpeed, double farthestOwnPartM)
         {
-            if (!signalSpeed.HasValue || !(signalSpeed.Value > 0)) return 0;
-            double own = farthestOwnPartM > 0 && !double.IsInfinity(farthestOwnPartM) ? farthestOwnPartM / signalSpeed.Value : 0;
+            if (!lightSpeed.HasValue || !(lightSpeed.Value > 0)) return 0;
+            double own = farthestOwnPartM > 0 && !double.IsInfinity(farthestOwnPartM) ? farthestOwnPartM / lightSpeed.Value : 0;
             return Math.Max(BoundaryLightTimeS, own);
         }
 
-        /* How far light travels in τ, the boundary distance; NaN with no signal speed. */
-        public static double BoundaryM(double? signalSpeed) =>
-            signalSpeed.HasValue && signalSpeed.Value > 0 ? signalSpeed.Value * BoundaryLightTimeS : double.NaN;
+        /* How far light travels in τ, the boundary distance; NaN with no light speed. */
+        public static double BoundaryM(double? lightSpeed) =>
+            lightSpeed.HasValue && lightSpeed.Value > 0 ? lightSpeed.Value * BoundaryLightTimeS : double.NaN;
 
         /* The farthest reach of a craft from `lens`: each part's origin distance plus that part's own radius. 0 for no parts. */
         public static double FarthestPartM(DVec3 lens, IList<DVec3> origins, IList<double> radii)
@@ -325,6 +325,45 @@ namespace Kerbcast
             double perPx = PixelSizeAtUnit(fovDeg, h);
             return perPx > 0 ? Math.Min(halfTan / perPx, h) : h;
         }
+
+        /* Under this many pixels across a subject is a point of light; wider, a model, as the picture's stand-ins draw it. */
+        public const double PointBelowPx = 6.0;
+        /* A subject drawn as a model goes back to the point of light only under this, so one near the line does not flip. */
+        public const double ModelLeaveBelowPx = 4.0;
+
+        /*
+         * The radius a rig judges its unloaded subject by: the model built
+         * for it, else the size the history records for the parts it shows,
+         * else `unknownM`, generous, so a craft of unknown size is tried as a
+         * model (and then judged by that model) rather than kept behind a dot.
+         */
+        public static double SubjectSizeM(double modelRadiusM, double partsSizeM, double unknownM) =>
+            modelRadiusM > 0 ? modelRadiusM : partsSizeM > 0 ? partsSizeM : unknownM;
+
+        /*
+         * Whether a rig draws its unloaded subject as a model: always with the
+         * model setting, and with the marker setting once the subject spans
+         * PointBelowPx or more, until it drops under ModelLeaveBelowPx
+         * (`wasModel` says which it was last frame).
+         */
+        public static bool SubjectAsModel(bool modelSetting, bool marker, bool wasModel, double radius, double distance, double fovDeg,
+            int rows)
+        {
+            if (modelSetting) return true;
+            if (!marker) return false;
+            double across = 2.0 * BracketHalfPx(radius, distance, fovDeg, rows);
+            return across >= (wasModel ? ModelLeaveBelowPx : PointBelowPx);
+        }
+
+        /*
+         * Whether a rig shows the model it decided on this frame: only one
+         * built for the subject it draws (`modelMatches`), and, under the
+         * marker setting, not on the frame a model was built only to learn a
+         * size the rig guessed (`sizeGuessed`): the marker stays that frame
+         * and the model's own radius decides from the next.
+         */
+        public static bool ShowsModel(bool decided, bool modelMatches, bool modelSetting, bool sizeGuessed) =>
+            decided && modelMatches && (modelSetting || !sizeGuessed);
 
         /* Whether the whole sphere fits inside the frame height at the widest
            field the camera allows. */

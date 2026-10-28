@@ -16,6 +16,10 @@ namespace Kerbcast
         /* The craft's parts at Ut, and their size in metres, 0 when unknown. */
         public Composition Parts;
         public double SizeM;
+        /* The body whose inertial frame the light time was solved in, and the
+           craft's position about it at Ut. */
+        public int Frame;
+        public DVec3 About;
 
         public bool Found => Status == PastStatus.Found;
     }
@@ -103,7 +107,7 @@ namespace Kerbcast
             seen.Generation = ring.Generation;
             double notBefore = seen.Hold.NotBefore(t, ring.Generation, c, lensBody);
             var sight = PastInstant.Craft(ring, pid, t, lensBody, lensOffset, c, ref tree, notBefore, seen.Hold.Frame, SpreadM);
-            seen.Sight = new LensSight { Status = sight.Status, Pid = pid, Ut = sight.Ut, State = sight.State, Track = sight.Track };
+            seen.Sight = new LensSight { Status = sight.Status, Pid = pid, Ut = sight.Ut, State = sight.State, Track = sight.Track, Frame = sight.Frame, About = sight.About };
             if (!sight.Found)
             {
                 seen.Hold.Reset();

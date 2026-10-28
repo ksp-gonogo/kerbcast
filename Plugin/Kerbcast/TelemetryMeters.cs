@@ -86,6 +86,20 @@ namespace Kerbcast
     {
         public static readonly CostMeter RingTick = new CostMeter();
         public static readonly CostMeter Picture = new CostMeter();
+        public static readonly CostMeter BodySolve = new CostMeter();
+        public static readonly RateMeter BodyCarries = new RateMeter();
+        public static readonly RateMeter BodyHides = new RateMeter();
+        private static long s_bodyCarries, s_bodyHides;
+
+        /* Body searches carried and bodies hidden over every lens in one frame. */
+        public static void AddBodyCounts(int carried, int hidden)
+        {
+            System.Threading.Interlocked.Add(ref s_bodyCarries, carried);
+            System.Threading.Interlocked.Add(ref s_bodyHides, hidden);
+        }
+
+        public static long BodyCarriesTotal => System.Threading.Interlocked.Read(ref s_bodyCarries);
+        public static long BodyHidesTotal => System.Threading.Interlocked.Read(ref s_bodyHides);
         public static readonly CostMeter MetaBytes = new CostMeter();
         public static readonly CostMeter MetaEncode = new CostMeter();
         public static readonly CostMeter WorldModelFill = new CostMeter();

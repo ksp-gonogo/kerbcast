@@ -170,10 +170,10 @@ namespace Kerbcast
             LockReservationStore.Reservation.Clear(owner);
         }
 
-        public bool SetSignalSpeed(string owner, double? metresPerSecond)
+        public bool SetLightSpeed(string owner, double? metresPerSecond)
         {
-            Enter(nameof(SetSignalSpeed), ApiFeature.SignalSpeed);
-            return KerbcastControl.SetSignalSpeedCore(owner, metresPerSecond);
+            Enter(nameof(SetLightSpeed), ApiFeature.LightSpeed);
+            return KerbcastControl.SetLightSpeedCore(owner, metresPerSecond);
         }
 
         /* Through the same path as the obsolete SetCommandAim, so the lock and

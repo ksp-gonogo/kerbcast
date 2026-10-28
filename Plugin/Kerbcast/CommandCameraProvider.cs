@@ -441,9 +441,15 @@ namespace Kerbcast
                         else
                         {
                             RetryPending = false;
-                            Debug.LogWarning(pending != null
+                            /* Stock fills a spawn point in only once it builds the site's surroundings, which it never
+                               does while the scene is far from them: expected then, not a fault. */
+                            var home = FlightGlobals.GetHomeBody();
+                            bool unbuilt = pending != null && home != null && home.pqsController != null && !home.pqsController.isActive;
+                            string text = pending != null
                                 ? $"[Kerbcast][CMDCAM] launch site still unresolved after {_siteAttempts} attempts ({now - _siteFirstAttemptAt:F1}s): {pending}; using the home station"
-                                : "[Kerbcast][CMDCAM] no launch site found; using the home station");
+                                : "[Kerbcast][CMDCAM] no launch site found; using the home station";
+                            if (unbuilt) Debug.Log(text + " (the scene is far from the launch site, so stock has not placed it)");
+                            else Debug.LogWarning(text);
                         }
                     }
                     if (_site == null)

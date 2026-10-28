@@ -45,11 +45,11 @@ export interface FrameStampExtras {
    * covers everything drawn at `ut`. A delayed view releases the frame no
    * sooner than `ut` plus this plus its own delay from the lens. Absent when
    * the game could not read it, and from a game or sidecar older than 1.12:
-   * a view applying a signal speed treats that as unknown and holds the
+   * a view applying a light speed treats that as unknown and holds the
    * frame.
    */
   liveLightTimeS?: number;
-  /** The picture's boundary distance in metres; absent with no signal speed. */
+  /** The picture's boundary distance in metres; absent with no light speed. */
   boundaryM?: number;
   /** A command camera's state as this frame shows it (1.12 and later). */
   command?: FrameCommandState;

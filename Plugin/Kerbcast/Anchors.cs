@@ -528,6 +528,12 @@ namespace Kerbcast
         public void ForCamera(uint flightId, List<KeyValuePair<string, AnchorSpec>> into)
         {
             into.Clear();
+            AddForCamera(flightId, into);
+        }
+
+        /* ForCamera after whatever `into` already holds, so anchors put first keep their place under a frame's cap. */
+        public void AddForCamera(uint flightId, List<KeyValuePair<string, AnchorSpec>> into)
+        {
             foreach (var kv in _byOwner)
             {
                 if (!kv.Value.TryGetValue(flightId, out var list)) continue;

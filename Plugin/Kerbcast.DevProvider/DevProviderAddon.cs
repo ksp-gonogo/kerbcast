@@ -13,13 +13,13 @@ namespace Kerbcast.DevProvider
      * test rig for the world model and an example for other mods.
      *
      * It runs only when GameData/Kerbcast/PluginData/dev exists and Kerbcast's
-     * settings set devSignalSpeedMps (read as Kerbcast reads them: the shipped
+     * settings set devLightSpeedMps (read as Kerbcast reads them: the shipped
      * settings.cfg, then PluginData's on top), and this assembly ships in no
      * release. devDelaySeconds fixes the delay instead of deriving it from
      * distance; devPublishHz sets how often it publishes (2 by default).
      *
-     * It does not set the signal speed: Kerbcast's own dev switch applies the
-     * same devSignalSpeedMps for the whole session, and a speed set through
+     * It does not set the light speed: Kerbcast's own dev switch applies the
+     * same devLightSpeedMps for the whole session, and a speed set through
      * the lock would end, and clear the light-time history, every time the
      * lock is released at a scene change.
      *
@@ -51,7 +51,7 @@ namespace Kerbcast.DevProvider
         private static DevProviderAddon _current;
         private static string _gameIdentity;
 
-        private double _signalSpeed;
+        private double _lightSpeed;
         private double? _fixedDelay;
         private float _publishInterval = 0.5f;
         private float _nextPublish;
@@ -106,7 +106,7 @@ namespace Kerbcast.DevProvider
             _running = true;
             _current = this;
             _tenure.Took();
-            Debug.Log($"{Tag} publishing truth delayed at {_signalSpeed} m/s"
+            Debug.Log($"{Tag} publishing truth delayed at {_lightSpeed} m/s"
                 + (_fixedDelay.HasValue ? $" (fixed {_fixedDelay.Value} s)" : "") + $", every {_publishInterval:F2} s");
         }
 
@@ -253,7 +253,7 @@ namespace Kerbcast.DevProvider
         }
 
         /* Light time from the home world, or the fixed delay. */
-        private double DelayOf(CraftSample s) => _fixedDelay ?? s.DistanceM / _signalSpeed;
+        private double DelayOf(CraftSample s) => _fixedDelay ?? s.DistanceM / _lightSpeed;
 
         /* From the home world's centre plus its radius to `at`: no site on the home world is farther, so no home lens hears it sooner. */
         private static double FromHome(Vector3d at)
@@ -363,19 +363,19 @@ namespace Kerbcast.DevProvider
             t != VesselType.Flag && t != VesselType.Unknown && t != VesselType.DroppedPart
             && t != VesselType.DeployedSciencePart && t != VesselType.DeployedGroundPart;
 
-        /* The dev file, and devSignalSpeedMps in Kerbcast's settings. */
+        /* The dev file, and devLightSpeedMps in Kerbcast's settings. */
         private bool ReadSwitch()
         {
             string root = Path.Combine(KSPUtil.ApplicationRootPath, "GameData", "Kerbcast");
             if (!File.Exists(Path.Combine(root, "PluginData", "dev"))) return false;
             var shipped = ConfigNode.Load(Path.Combine(root, "settings.cfg"))?.GetNode("Settings");
             var user = ConfigNode.Load(Path.Combine(root, "PluginData", "settings.cfg"))?.GetNode("Settings");
-            if (!Setting(shipped, user, "devSignalSpeedMps", out double c) || !(c > 0) || double.IsInfinity(c))
+            if (!Setting(shipped, user, "devLightSpeedMps", out double c) || !(c > 0) || double.IsInfinity(c))
             {
-                Debug.LogWarning($"{Tag} the dev file is there but Kerbcast's settings have no positive devSignalSpeedMps; not starting");
+                Debug.LogWarning($"{Tag} the dev file is there but Kerbcast's settings have no positive devLightSpeedMps; not starting");
                 return false;
             }
-            _signalSpeed = c;
+            _lightSpeed = c;
             if (Setting(shipped, user, "devDelaySeconds", out double d) && d >= 0 && !double.IsInfinity(d)) _fixedDelay = d;
             _targetName = (user?.GetValue("CommandCameraTargetName") ?? shipped?.GetValue("CommandCameraTargetName") ?? "").Trim();
             string anchor = user?.GetValue("CommandCameraAnchor") ?? shipped?.GetValue("CommandCameraAnchor") ?? "";

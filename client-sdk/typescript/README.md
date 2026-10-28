@@ -564,14 +564,14 @@ delays the picture never learns it sooner:
 
 - `liveLightTimeS` on every frame of every camera: the light time covering
   what of the lens's own craft and site the frame draws at its `ut`. It is
-  0 with no signal speed. A delayed view releases the frame no sooner than
+  0 with no light speed. A delayed view releases the frame no sooner than
   its `ut` plus this plus its own delay from the lens. Absent means unknown
   (the game could not read it, or it is older than 1.12): under a signal
   speed, hold the frame. Other loaded craft near the lens are still drawn at
   `ut` and are not covered yet; once craft beyond the boundary are hidden,
   the bound covers everything drawn at `ut`
 - `boundaryM`: how far light travels in one 60 fps frame at the signal
-  speed, the picture's boundary distance. Absent with no signal speed
+  speed, the picture's boundary distance. Absent with no light speed
 - `command` on a command camera's frames: its fix, range, bracket,
   occlusion, sunlight, blank reason, lock owner, subject, the subject's
   refusal (`unknown`, `notPositioned`, `refused`, `stale`) and which world

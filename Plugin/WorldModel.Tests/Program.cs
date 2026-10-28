@@ -374,10 +374,10 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
         Same(real.Lock.Options, fake.LockOptions, "a renewal takes the new options");
         BothThrow<ArgumentException>(() => real.TakeLock("", LockOptions.None), () => fake.TakeLock("", LockOptions.None), "an empty owner throws on both");
 
-        Same(real.SetSignalSpeed("modB", 1e6), fake.SetSignalSpeed("modB", 1e6), "a non-holder's signal speed is refused");
-        Same(real.SetSignalSpeed("modA", 1e6), fake.SetSignalSpeed("modA", 1e6), "the holder sets a signal speed");
-        Same(real.Lock.SignalSpeed, fake.SignalSpeed, "the signal speed");
-        BothThrow<ArgumentOutOfRangeException>(() => real.SetSignalSpeed("modA", -1), () => fake.SetSignalSpeed("modA", -1), "a bad signal speed throws on both");
+        Same(real.SetLightSpeed("modB", 1e6), fake.SetLightSpeed("modB", 1e6), "a non-holder's light speed is refused");
+        Same(real.SetLightSpeed("modA", 1e6), fake.SetLightSpeed("modA", 1e6), "the holder sets a light speed");
+        Same(real.Lock.LightSpeed, fake.LightSpeed, "the light speed");
+        BothThrow<ArgumentOutOfRangeException>(() => real.SetLightSpeed("modA", -1), () => fake.SetLightSpeed("modA", -1), "a bad light speed throws on both");
 
         Same(real.Attach("modB") == null, fake.AttachWorldModel("modB") == null, "a non-holder gets no publisher");
         var rp = real.Attach("modA");
@@ -395,7 +395,7 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
         real.ReleaseLock("modA");
         fake.ReleaseLock("modA");
         Same(real.Lock.Owner, fake.LockOwner, "the holder releases");
-        Same(real.Lock.SignalSpeed, fake.SignalSpeed, "releasing clears the signal speed");
+        Same(real.Lock.LightSpeed, fake.LightSpeed, "releasing clears the light speed");
         Same(real.Lock.Options, fake.LockOptions, "releasing clears the options");
         Check(real.Mode == WorldModelMode.Truth, "lock: released reads truth");
         Same(rp.Publish(One(rp, 2, 1), out _), fp.Publish(One(fp, 2, 1), out _), "the released holder's publisher is refused");
@@ -788,7 +788,7 @@ sealed class RealCommand
         return true;
     }
 
-    public bool SetSignalSpeed(string owner, double? mps) => Lock.SetSignalSpeed(owner, mps, _now());
+    public bool SetLightSpeed(string owner, double? mps) => Lock.SetLightSpeed(owner, mps, _now());
 
     public IWorldModelPublisher Attach(string owner) => Lock.Holds(owner) ? Store.Attach(owner) : null;
 

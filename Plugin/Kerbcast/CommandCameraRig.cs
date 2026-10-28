@@ -334,6 +334,8 @@ namespace Kerbcast
         /* The model wins over the marker when both are set. */
         private readonly bool _wantModel;
         private CommandCameraTargetModel _standIn;
+        /* The model stood in for the subject last frame. */
+        private bool _modelShown;
         private uint _modelFailedPid;
         private Composition _modelFailedParts;
         /* The drawn craft's body, or the aim's without one, for the scaled skew log. */
@@ -603,10 +605,11 @@ namespace Kerbcast
                 Ut = ut,
                 Point = station,
                 Body = lensBody,
+                Rides = _mount.Site.VantagePersistentId,
             };
             _cam.Picture.Place(lens);
             _drawnOk = _drawn.TryLocate(lens, out _drawnPos, out _drawnBody);
-            if (!LightTime.SignalSpeed.HasValue)
+            if (!LightTime.LightSpeed.HasValue)
             {
                 _drawnLight = -1;
                 return;
@@ -630,14 +633,14 @@ namespace Kerbcast
          * instant: the latest root of the light-time equation on the source's
          * positions, never the picture's, in the frame of the common ancestor
          * of the lens's body and the subject's, as the picture solves it. Render
-         * UT with no signal speed. The instant never steps back while the
+         * UT with no light speed. The instant never steps back while the
          * subject stays the same. A source that cannot be solved back to that
          * instant has no fix.
          */
         private CraftFix KnownSubject(double ut, DVec3 station, CelestialBody lensBody)
         {
             _subjectUt = ut;
-            double? c = LightTime.SignalSpeed;
+            double? c = LightTime.LightSpeed;
             if (!c.HasValue || lensBody == null)
             {
                 _knownHold.Reset();
@@ -751,7 +754,9 @@ namespace Kerbcast
          * How the drawn craft looks from the lens. A craft drawn at the aimed
          * point is seen as the aim's readings say: `aimIsDrawn` when the fix
          * source reads the same truth the picture draws and the aim is the
-         * craft, otherwise when the two points coincide.
+         * craft, otherwise when the two points coincide. The aim's occlusion
+         * and sunlight read the bodies as they are now, so they stand for the
+         * picture's only while the picture draws every body there too.
          */
         private void SolveDrawn(DVec3 station, DVec3 aim, double distance, bool aimIsDrawn, CelestialBody aimBody)
         {
@@ -760,14 +765,15 @@ namespace Kerbcast
                 if (aimIsDrawn || (aim - _drawnPos).Magnitude < 1e-3)
                 {
                     _drawnDistance = distance;
-                    _drawnOccluded = Occluded;
-                    _drawnSunlit = Sunlit;
+                    bool moved = _cam.Picture.MovesBodies();
+                    _drawnOccluded = moved ? _occlusion.FindDrawnOccluder(_cam.Picture, station, _drawnPos, out _, _drawn.Radius) != null : Occluded;
+                    _drawnSunlit = moved ? IsDrawnSunlit(_drawnPos) : Sunlit;
                 }
                 else
                 {
                     _drawnDistance = (_drawnPos - station).Magnitude;
-                    _drawnOccluded = _occlusion.FindOccluder(station, _drawnPos, out _, _drawn.Radius) != null;
-                    _drawnSunlit = IsSunlit(_drawnPos);
+                    _drawnOccluded = _occlusion.FindDrawnOccluder(_cam.Picture, station, _drawnPos, out _, _drawn.Radius) != null;
+                    _drawnSunlit = IsDrawnSunlit(_drawnPos);
                 }
             }
             _frameBody = _drawnOk ? _drawnBody : aimBody;
@@ -927,6 +933,23 @@ namespace Kerbcast
             return true;
         }
 
+        /* IsSunlit with each body where this camera draws it. The Sun is the root, and never moves. */
+        private bool IsDrawnSunlit(DVec3 point)
+        {
+            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (sun == null) return false;
+            var sunPos = ToD(sun.position);
+            var bodies = FlightGlobals.Bodies;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null || b == sun || _cam.Picture.HidesBody(b)) continue;
+                var centre = _cam.Picture.TryDrawnBody(b, out var drawn, out _) ? drawn : ToD(b.position);
+                if (!CommandCameraMath.SegmentClearOfSphere(point, sunPos, centre, b.Radius)) return false;
+            }
+            return true;
+        }
+
         private void UpdateSunlit(double ut, double d, DVec3 target)
         {
             bool lit = IsSunlit(target);
@@ -953,7 +976,13 @@ namespace Kerbcast
             }
             uint pid = parts != null ? _drawn.ShownPid : _drawn.PersistentId;
             if (_standIn != null && _standIn.PersistentId == pid && _standIn.Parts == parts) return;
-            if (_modelFailedPid == pid && _modelFailedParts == parts && pid != 0) return;
+            if (_modelFailedPid == pid && _modelFailedParts == parts && pid != 0)
+            {
+                /* Another craft's model must not stand in for this one. */
+                _standIn?.Dispose();
+                _standIn = null;
+                return;
+            }
             if (_standIn != null && parts != null && _standIn.PersistentId == pid && _standIn.Update(parts, out int added, out int removed))
             {
                 /* A moved centre of mass alone changes no part. */
@@ -1149,6 +1178,8 @@ namespace Kerbcast
             public bool Blocked;
             public bool Lit;
             public bool StandIn;
+            /* The stand-in is the model rather than the marker's point of light. */
+            public bool Model;
             public DVec3 Toward;
             public double PlanDistance;
             public double PlanScale;
@@ -1171,44 +1202,91 @@ namespace Kerbcast
             _drawn.Measure(drawnOk, _drawnPos, now);
 
             /* A loaded craft draws itself; the model and the marker stand in only
-               for an unloaded one, and only where a real craft would be seen. */
-            p.StandIn = drawnOk && _drawn.Loaded == null;
+               for an unloaded one, or one this camera hides beyond the boundary,
+               and only where a real craft would be seen. The rig draws its
+               subject's stand-in itself, so its clip plan covers it. */
+            p.StandIn = drawnOk && (_drawn.Loaded == null || _drawn.Hidden);
             p.Toward = ((drawnOk ? _drawnPos : aim) - station).Normalized;
             p.PlanDistance = p.Distance;
             p.PlanScale = 1.0;
-            if (_wantModel && p.StandIn)
+            /* The field is chosen before this frame decides between marker and model, so last frame's model sizes it. */
+            if (p.StandIn && (_wantModel || _modelShown))
             {
                 EnsureModel(cam);
-                if (_standIn != null)
-                {
-                    _drawn.Radius = _standIn.Radius;
-                    /* Beyond ModelProxyDistance the model stands in at that
-                       distance on the true ray, shrunk by the same ratio: the
-                       same angular size and perspective, with local-space
-                       precision and clip planes that stay simple. */
-                    p.PlanDistance = Math.Min(p.Distance, ModelProxyDistance);
-                    p.PlanScale = p.PlanDistance / p.Distance;
-                    var at = station + p.Toward * p.PlanDistance;
-                    var rotation = _drawn.SavedRotation(_drawnBody);
-                    var parts = _standIn.Parts;
-                    if (parts != null)
-                    {
-                        /* The history follows the centre of mass; the model hangs from its root part. */
-                        rotation = _drawn.ShownRotation;
-                        var com = rotation * new Vector3(parts.ComX, parts.ComY, parts.ComZ) * (float)p.PlanScale;
-                        at = at - new DVec3(com.x, com.y, com.z);
-                    }
-                    _standIn.Place(p.Lit && !p.Blocked, at, rotation, (float)p.PlanScale);
-                    NoteModelMode(ut, p.Distance, p.PlanDistance, p.PlanScale);
-                }
+                if (ModelMatches()) _drawn.Radius = _standIn.Radius;
             }
             return p;
         }
 
-        /* The sub-pixel camera, the clip plan and the marker, once the field is set. */
+        /*
+         * Marker or model, judged at the field this frame renders with, by a
+         * size the rig knows (SubjectSizeM), then the model placed.
+         */
+        private void DecideStandIn(KerbcastCamera cam, double ut, DVec3 station, ref DrawnPlan p)
+        {
+            double size = SubjectSizeM(out bool guessed);
+            p.Model = p.StandIn
+                && CommandCameraMath.SubjectAsModel(_wantModel, _marker != null, _modelShown, size, p.Distance, _fov, RenderRows(cam));
+            if (p.Model) EnsureModel(cam);
+            _modelShown = CommandCameraMath.ShowsModel(p.Model, ModelMatches(), _wantModel, guessed);
+            /* With no model to show the marker stands in, rather than nothing; the model setting has no marker. */
+            if (!_wantModel) p.Model = _modelShown;
+            if (!_modelShown && _standIn != null) _standIn.Place(false, default, Quaternion.identity, 1f);
+            if (_modelShown)
+            {
+                _drawn.Radius = _standIn.Radius;
+                /* Beyond ModelProxyDistance the model stands in at that
+                   distance on the true ray, shrunk by the same ratio: the
+                   same angular size and perspective, with local-space
+                   precision and clip planes that stay simple. */
+                p.PlanDistance = Math.Min(p.Distance, ModelProxyDistance);
+                p.PlanScale = p.PlanDistance / p.Distance;
+                var at = station + p.Toward * p.PlanDistance;
+                var rotation = _drawn.SavedRotation(_drawnBody);
+                var parts = _standIn.Parts;
+                if (parts != null)
+                {
+                    /* The history follows the centre of mass; the model hangs from its root part. */
+                    rotation = _drawn.ShownRotation;
+                    var com = rotation * new Vector3(parts.ComX, parts.ComY, parts.ComZ) * (float)p.PlanScale;
+                    at = at - new DVec3(com.x, com.y, com.z);
+                }
+                _standIn.Place(p.Lit && !p.Blocked, at, rotation, (float)p.PlanScale);
+                NoteModelMode(ut, p.Distance, p.PlanDistance, p.PlanScale);
+            }
+            /* The pass leaves the subject to the rig only when the rig has something to draw it with. */
+            if (p.StandIn && (p.Model ? _modelShown : _marker != null)) _cam.Picture.RigDraws(new RigDrawn(_drawn.PersistentId, _drawn.ShownPast ? _drawn.ShownPid : 0));
+        }
+
+        /* The model built for the parts shown, else the history's size for them, else a generous guess. */
+        private double SubjectSizeM(out bool guessed)
+        {
+            var parts = _drawn.ShownParts;
+            double model = ModelMatches() ? _standIn.Radius : 0;
+            double recorded = parts != null ? parts.SizeM : 0;
+            guessed = !(model > 0) && !(recorded > 0);
+            return CommandCameraMath.SubjectSizeM(model, recorded, PictureCull.UnknownSizeM);
+        }
+
+        /* Whether the model built is the subject's, for the parts it is drawn with. */
+        private bool ModelMatches()
+        {
+            var parts = _drawn.ShownParts;
+            uint pid = parts != null ? _drawn.ShownPid : _drawn.PersistentId;
+            return _standIn != null && _standIn.PersistentId == pid && _standIn.Parts == parts;
+        }
+
+        private static int RenderRows(KerbcastCamera cam)
+        {
+            var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+            return rt != null ? rt.height : cam.RenderHeight;
+        }
+
+        /* Marker or model, the sub-pixel camera, the clip plan and the marker, once the field is set. */
         private void FinishDrawn(KerbcastCamera cam, double ut, DVec3 station, Quaternion lensRotation, DrawnPlan p)
         {
-            UpdateSubpixel(cam, ut, p.Distance, p.PlanDistance, p.PlanScale, p.Blocked, p.Lit, p.StandIn);
+            DecideStandIn(cam, ut, station, ref p);
+            UpdateSubpixel(cam, ut, p.Distance, p.PlanDistance, p.PlanScale, p.Blocked, p.Lit, p.Model);
 
             _plan = CommandCameraMath.PlanClips(p.PlanDistance, _drawn.Radius * p.PlanScale, p.Blocked, _hasFar, _wasSplit,
                 _nearNativeNear, _nearNativeFar, _farNativeNear, _farNativeFar);
@@ -1217,7 +1295,7 @@ namespace Kerbcast
             if (_marker != null)
             {
                 var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
-                _marker.Place(p.Lit && p.StandIn && !p.Blocked, station, p.Toward, p.Distance, lensRotation,
+                _marker.Place(p.Lit && p.StandIn && !p.Model && !p.Blocked, station, p.Toward, p.Distance, lensRotation,
                     (float)_fov, rt != null ? rt.height : cam.RenderHeight);
             }
         }
@@ -1286,7 +1364,7 @@ namespace Kerbcast
             switch (_cam.Picture.Locate(pid, out world, out radius))
             {
                 case OtherSight.Past:
-                    occluded = _occlusion.FindOccluder(_poseEye, world, out _, radius) != null;
+                    occluded = _occlusion.FindDrawnOccluder(_cam.Picture, _poseEye, world, out _, radius) != null;
                     return true;
                 case OtherSight.Unseen:
                     unseen = true;

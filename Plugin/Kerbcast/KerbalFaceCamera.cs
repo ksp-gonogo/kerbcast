@@ -20,6 +20,11 @@ namespace Kerbcast
         public uint FlightId { get; }
 
         private readonly ProtoCrewMember _pcm;
+        /* The light-time picture around KSP's EVA portrait stack, which has no
+           layer hooks of its own; the seated portrait sees only the IVA. */
+        private readonly PicturePass _picture;
+        /* The kerbal on EVA this tick, whose portrait cameras are the lens; null while seated. */
+        private KerbalEVA _evaNow;
         /* Current owning part: the seat part while seated, the EVA part while on
            EVA. Re-resolved every tick by kerbal NAME (never a cached KerbalEVA
            /seat ref) so Vessel/OwnsPart stay correct across a seat<->EVA switch and
@@ -78,6 +83,7 @@ namespace Kerbcast
         private readonly PhaseTimings _phaseTimings = new PhaseTimings();
         private int _consecutiveErrors;
 
+
         // KSP nulls Canvas.willRenderCanvases (static private) around a manual
         // portrait Camera.Render so a re-entrant canvas render can't fire
         // mid-render; mirror that here. FieldInfo cached once for the process.
@@ -120,7 +126,15 @@ namespace Kerbcast
             // EVA cam that is never subscribed reports "seat" in /cameras until the
             // first subscribe re-resolves it.
             if (vessel != null && vessel.isEVA) _crewLocation = "eva";
+            _picture = new PicturePass(() => _evaNow != null ? _evaNow.vessel : null, EvaEye,
+                () => _evaNow != null ? _evaNow.kerbalCam00 : null, () => _capture?.CaptureRt);
             WriteInfoManifest();
+        }
+
+        private Vector3 EvaEye()
+        {
+            var cam = _evaNow != null ? _evaNow.kerbalPortraitCamera : null;
+            return cam != null ? cam.transform.position : Vector3.zero;
         }
 
         // Re-read live off the owning part; guard null so a torn-down part
@@ -385,11 +399,34 @@ namespace Kerbcast
         {
             if (eva == null || eva.kerbalPortraitCamera == null) return false;
             RenderLayer(eva.kerbalCamSkyBox, target);
-            RenderLayer(eva.kerbalCamAtmos, target);
-            RenderLayer(eva.kerbalCam01, target);
-            RenderLayer(eva.kerbalCam00, target);
-            RenderLayer(eva.kerbalPortraitCamera, target);
+            try
+            {
+                _picture.BeforeScaledLayer();
+                RenderLayer(eva.kerbalCamAtmos, target);
+            }
+            finally { _picture.AfterScaledLayer(); }
+            /* The picture's local-layer changes are undone whatever throws in between. */
+            try
+            {
+                _picture.BeforeLocalLayers();
+                RenderLayer(eva.kerbalCam01, target);
+                RenderLayer(eva.kerbalCam00, target);
+                RenderLayer(eva.kerbalPortraitCamera, target);
+            }
+            finally
+            {
+                _picture.AfterLayers();
+            }
             return true;
+        }
+
+        /* A blanked feed streams black, never the scene. */
+        private static void ClearBlack(RenderTexture target)
+        {
+            var prev = RenderTexture.active;
+            RenderTexture.active = target;
+            GL.Clear(true, true, Color.black);
+            RenderTexture.active = prev;
         }
 
         private static void RenderLayer(Camera cam, RenderTexture target)
@@ -433,6 +470,16 @@ namespace Kerbcast
                 // None = mid-transition (seat vacated, EVA part not spawned yet, or
                 // vice-versa): no frame this tick, but the feed stays alive.
                 if (loc == CrewLocation.None) return;
+
+                /* On EVA the picture decides first whether the frame can be drawn
+                   without showing a craft early; if not it goes out black. */
+                _evaNow = loc == CrewLocation.Eva ? eva : null;
+                if (_evaNow != null && _picture.Prepare() == RigFrame.Blank)
+                {
+                    ClearBlack(capture.CaptureRt);
+                    capture.Publish(Time.unscaledTime * 1000.0, (c, r) => Graphics.Blit(c, r));
+                    return;
+                }
 
                 // Null Canvas.willRenderCanvases around the manual render(s) (KSP's
                 // own portrait path does this), restoring it in finally. Wraps both
@@ -575,6 +622,7 @@ namespace Kerbcast
                 catch (Exception ex) { Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} destroyed manifest write failed: {ex.Message}"); }
             }
 
+            _picture.Dispose();
             // Release the capture tail's pooled RTs before the ring: the camera
             // is torn down so no further readbacks issue.
             _capture?.Dispose();

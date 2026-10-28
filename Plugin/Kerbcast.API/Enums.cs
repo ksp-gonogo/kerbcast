@@ -12,8 +12,8 @@ namespace Kerbcast.Api
         CraftIdentity = 1,
         /** <summary><see cref="ICameras.Throttle"/>.</summary> */
         Throttle = 2,
-        /** <summary><see cref="ICommand.SetSignalSpeed"/>.</summary> */
-        SignalSpeed = 3,
+        /** <summary><see cref="ICommand.SetLightSpeed"/>.</summary> */
+        LightSpeed = 3,
         /** <summary><see cref="ICommand.TakeLock"/>, <see cref="ICommand.ReleaseLock"/>, <see cref="ICommand.Reserve"/> and <see cref="KerbcastApi.LockLost"/>.</summary> */
         CommandLock = 4,
         /** <summary><see cref="ICommand.SetAim"/>.</summary> */

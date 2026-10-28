@@ -1,6 +1,6 @@
 namespace Kerbcast
 {
-    /* Carries the light-time history and the slowest signal speed in the save file. */
+    /* Carries the light-time history and the slowest light speed in the save file. */
     [KSPScenario(ScenarioCreationOptions.AddToAllGames, GameScenes.SPACECENTER, GameScenes.FLIGHT, GameScenes.TRACKSTATION)]
     internal sealed class LightHistoryScenario : ScenarioModule
     {

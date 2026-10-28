@@ -47,7 +47,7 @@ namespace Kerbcast
         /* Where the craft is drawn from `lens` at its UT. Under truth the fix
            source has already adopted the resolved craft; any other source
            leaves the track to the picture, which adopts the craft it resolved.
-           Under a signal speed an unloaded craft is drawn where its arriving
+           Under a light speed an unloaded craft is drawn where its arriving
            light left it, or not at all; so is one truth has lost (destroyed,
            recovered), by its last id, until its last light arrives. A loaded
            one is still live. */
@@ -72,8 +72,10 @@ namespace Kerbcast
             ShownUt = lens.Ut;
             ShownPast = false;
             ShownParts = null;
+            Hidden = false;
             bool located = _truth.TryLocate(lens.Ut, out world, out body);
-            if (!LightTime.SignalSpeed.HasValue || (located && Loaded != null))
+            if (LightTime.LightSpeed.HasValue && Loaded != null) Hidden = _picture.Hides(Loaded);
+            if (!LightTime.LightSpeed.HasValue || (located && Loaded != null && !Hidden))
             {
                 _lineage = _truth.PersistentId;
                 return located;
@@ -90,6 +92,9 @@ namespace Kerbcast
             PastSizeM = past.SizeM;
             return true;
         }
+
+        /* Loaded, but hidden from this camera beyond the boundary: a stand-in built from the history draws it. */
+        public bool Hidden { get; private set; }
 
         /* The craft id the picture last drew for the subject, which a merge at the present leaves in place until its light arrives. */
         private uint _lineage;
@@ -121,10 +126,12 @@ namespace Kerbcast
 
         /* Bounding radius about the CoM from part origins, refreshed twice a
            second (staging changes it) and immediately on a vessel switch. An
-           unloaded or unlocated craft has no parts, so it gets the minimum. */
+           unloaded or unlocated craft has no parts, so it gets the minimum. A
+           hidden craft is measured about its own live CoM, not where it is drawn. */
         public void Measure(bool located, DVec3 com, float now)
         {
             var v = located ? Loaded : null;
+            if (v != null && Hidden) com = new DVec3(v.CoMD.x, v.CoMD.y, v.CoMD.z);
             if (v == null)
             {
                 Radius = MinRadius;

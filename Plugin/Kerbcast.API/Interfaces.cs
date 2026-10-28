@@ -151,14 +151,14 @@ namespace Kerbcast.Api
 
         /**
          * <summary>
-         * The speed signals travel, for the past instants feeds show and the live bound: finite and
-         * positive, or null for no delay (no past instants, a live light time of 0). False, with nothing
+         * How fast light travels in the picture, which sets the past instants feeds show and the live bound:
+         * finite and positive, or null for no delay (no past instants, a live light time of 0). False, with nothing
          * changed, unless <paramref name="owner"/> holds the lock; the value lasts until the lock is
          * released or the scene changes.
          * </summary>
          * <exception cref="ArgumentOutOfRangeException">The speed is not finite, or not positive.</exception>
          */
-        bool SetSignalSpeed(string owner, double? metresPerSecond);
+        bool SetLightSpeed(string owner, double? metresPerSecond);
 
         AimResult SetAim(uint flightId, Aim aim, string owner);
 

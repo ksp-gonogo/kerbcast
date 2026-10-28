@@ -1675,15 +1675,22 @@ namespace Kerbcast
          * or size is { "ms" | "bytes": last, "emaMs" | "emaBytes": EMA,
          * "maxMs" | "maxBytes": the largest since the previous write }, null
          * until anything was recorded; counts and rates are plain numbers.
-         * Each interval max resets on the write, like the phases.
+         * Each interval max resets on the write, like the phases. A cost per
+         * rendered or camera frame is null too for an interval with no such
+         * frame (no camera subscribed), rather than its last value.
          *
          *   ringTickMs        the light-time history's sampling, per physics tick
          *   ringEntriesPerS   history entries written per second since the previous write
          *   ringMB            history memory, as the ring counts it
          *   ringTracks        history tracks (craft, bodies and ghosts)
-         *   ringBodyTracks    of those, body tracks (sampled under Principia)
+         *   ringBodyTracks    of those, body tracks (bodies seen off their Kepler paths)
          *   pictureMs         past-instant sight solves, per rendered frame, summed over lenses
          *   pictureLenses     lenses with sights kept
+         *   bodySolveMs       placing the bodies at their past instants, per rendered frame, summed over lenses
+         *   bodyCarriesPerS   body searches that ran out of reads and carried into the next frame, summed over lenses,
+         *                     per second since the previous write
+         *   bodyHidesPerS     bodies left out of a frame with no instant to draw them at, summed over lenses, per second
+         *                     since the previous write
          *   liveLightMs       the live light-time bound's walk over the lens craft's parts, per camera frame
          *   metaBytes         frame-metadata JSON written, per camera frame
          *   metaEncodeMs      encoding it, per camera frame
@@ -1705,11 +1712,16 @@ namespace Kerbcast
             sb.Append($"      \"ringMB\": {(ring.Bytes / (1024.0 * 1024.0)).ToString("F3", ci)},\n");
             sb.Append($"      \"ringTracks\": {ring.TrackCount},\n");
             sb.Append($"      \"ringBodyTracks\": {bodyTracks},\n");
-            AppendCost(sb, "pictureMs", "Ms", Telemetry.Picture.TakeInterval(), ci);
+            AppendCost(sb, "pictureMs", "Ms", Telemetry.Picture.TakeInterval(), ci, perFrame: true);
             sb.Append($"      \"pictureLenses\": {PicturePass.LensCount},\n");
-            AppendCost(sb, "liveLightMs", "Ms", Telemetry.LiveLight.TakeInterval(), ci);
-            AppendCost(sb, "metaBytes", "Bytes", Telemetry.MetaBytes.TakeInterval(), ci);
-            AppendCost(sb, "metaEncodeMs", "Ms", Telemetry.MetaEncode.TakeInterval(), ci);
+            AppendCost(sb, "bodySolveMs", "Ms", Telemetry.BodySolve.TakeInterval(), ci, perFrame: true);
+            double carriesPerS = Telemetry.BodyCarries.TakeInterval(Telemetry.BodyCarriesTotal, Time.realtimeSinceStartup);
+            double hidesPerS = Telemetry.BodyHides.TakeInterval(Telemetry.BodyHidesTotal, Time.realtimeSinceStartup);
+            sb.Append($"      \"bodyCarriesPerS\": {carriesPerS.ToString("F1", ci)},\n");
+            sb.Append($"      \"bodyHidesPerS\": {hidesPerS.ToString("F1", ci)},\n");
+            AppendCost(sb, "liveLightMs", "Ms", Telemetry.LiveLight.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "metaBytes", "Bytes", Telemetry.MetaBytes.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "metaEncodeMs", "Ms", Telemetry.MetaEncode.TakeInterval(), ci, perFrame: true);
             AppendCost(sb, "worldModelFillMs", "Ms", Telemetry.WorldModelFill.TakeInterval(), ci);
             sb.Append($"      \"worldModelRecords\": {store?.CurrentRecords ?? 0},\n");
             AppendCost(sb, "saveMs", "Ms", Telemetry.Save.TakeInterval(), ci);
@@ -1718,11 +1730,11 @@ namespace Kerbcast
         }
 
         private static void AppendCost(System.Text.StringBuilder sb, string name, string unit, CostReading r,
-            System.Globalization.CultureInfo ci, bool lastField = false)
+            System.Globalization.CultureInfo ci, bool lastField = false, bool perFrame = false)
         {
             string end = lastField ? "\n" : ",\n";
             string lower = unit.ToLowerInvariant();
-            if (!r.Seen)
+            if (!r.Seen || (perFrame && r.Count == 0))
             {
                 sb.Append($"      \"{name}\": null{end}");
                 return;

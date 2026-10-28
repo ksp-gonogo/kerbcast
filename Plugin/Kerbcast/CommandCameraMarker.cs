@@ -21,7 +21,7 @@ namespace Kerbcast
         private const int TexSize = 16;
         private const int LocalSceneryLayer = 15;
 
-        private static readonly string[] ShaderNames =
+        internal static readonly string[] ShaderNames =
         {
             "KSP/Particles/Additive",
             "Legacy Shaders/Particles/Additive",
@@ -108,7 +108,7 @@ namespace Kerbcast
             return m;
         }
 
-        private static int PickLayer(int mask)
+        internal static int PickLayer(int mask)
         {
             if ((mask & (1 << LocalSceneryLayer)) != 0) return LocalSceneryLayer;
             if ((mask & 1) != 0) return 0;
@@ -179,7 +179,7 @@ namespace Kerbcast
         }
 
         /* Bright centre with a soft edge, so a few pixels read as a point. */
-        private static Texture2D BuildDot()
+        internal static Texture2D BuildDot()
         {
             var tex = new Texture2D(TexSize, TexSize, TextureFormat.RGBA32, false)
             {

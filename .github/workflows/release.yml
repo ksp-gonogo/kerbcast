@@ -705,7 +705,7 @@ jobs:
           cp LICENSE GameData/Kerbcast/LICENSE
 
           # PluginData holds user files and the dev marker that turns on a
-          # development signal speed; neither may ever ship.
+          # development light speed; neither may ever ship.
           if [ -e GameData/Kerbcast/PluginData ]; then
             echo "::error::GameData/Kerbcast/PluginData must never ship"
             exit 1

@@ -61,6 +61,9 @@ Check(reg.Set("mission-control", 10, new List<AnchorSpec> { AnchorSpec.ForVessel
 var onCam = new List<KeyValuePair<string, AnchorSpec>>();
 reg.ForCamera(10, onCam);
 Check(onCam.Count == 4, "the camera has the browser's three and the game's one");
+var framed = new List<KeyValuePair<string, AnchorSpec>> { new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, AnchorSpec.ForVessel("subject", 7)) };
+reg.AddForCamera(10, framed);
+Check(framed.Count == 5 && framed[0].Key == AnchorRegistry.KerbcastOwner, "Kerbcast's own anchor stays first, ahead of every other owner's");
 reg.ReplaceRemote(new List<RemoteAnchorSet>(), null);
 reg.ForCamera(10, onCam);
 Check(onCam.Count == 1 && onCam[0].Key == "mission-control", "an empty browser table clears only browser anchors");
@@ -290,7 +293,7 @@ Check(AnchorSpec.ForSurfaceMotion("g", new string('b', AnchorSpec.MaxBodyLength 
 Check(AnchorSpec.ForStateVector("s", "Kerbin", 1, new DVec3(1e-200, 0, 0), new DVec3(0, 1, 0)).Invalid() == null,
     "kinematic: a tiny position whose magnitude underflows is not the centre, as the sidecar compares components");
 
-/* A surface point under a signal speed stays on the body as drawn; conics and state vectors go to their light instant. */
+/* A surface point under a light speed stays on the body as drawn; conics and state vectors go to their light instant. */
 Check(!AnchorRules.PlacedAtLightInstant(AnchorMotion.Surface) && AnchorRules.PlacedAtLightInstant(AnchorMotion.Conic)
     && AnchorRules.PlacedAtLightInstant(AnchorMotion.StateVector), "kinematic: only paths are placed at the light instant");
 

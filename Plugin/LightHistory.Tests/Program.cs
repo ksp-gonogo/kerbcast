@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using Kerbcast;
 
@@ -17,8 +18,9 @@ const double MuSun = 1.1723328e18, MuKerbin = 3.5316e12, MuMun = 6.5138398e10;
 var bodies = new[]
 {
     new HistoryBody { Index = Sun, Parent = -1, Mu = MuSun, Radius = 2.616e8, SoiRadius = double.PositiveInfinity },
-    new HistoryBody { Index = Kerbin, Parent = Sun, Mu = MuKerbin, Radius = 600000, SoiRadius = 84159286, MaxOrbitalSpeed = 9285 },
-    new HistoryBody { Index = Mun, Parent = Kerbin, Mu = MuMun, Radius = 200000, SoiRadius = 2429559, MaxOrbitalSpeed = 543 },
+    new HistoryBody { Index = Kerbin, Parent = Sun, Mu = MuKerbin, Radius = 600000, SoiRadius = 84159286, MaxOrbitalSpeed = 9285,
+        PeriapsisM = 1.36e10 },
+    new HistoryBody { Index = Mun, Parent = Kerbin, Mu = MuMun, Radius = 200000, SoiRadius = 2429559, MaxOrbitalSpeed = 543, PeriapsisM = 1.2e7 },
 };
 double[] mus = { MuSun, MuKerbin, MuMun };
 
@@ -26,7 +28,7 @@ LightHistory NewRing()
 {
     var h = new LightHistory { SystemDiameterM = 2.4e11 };
     h.SetBodies(bodies);
-    h.SetSignalSpeed(299792458.0);
+    h.SetLightSpeed(299792458.0);
     return h;
 }
 
@@ -196,7 +198,7 @@ Check(hard.rate <= 11, "a violent burn is still capped at 10 Hz");
     var b = NewRing();
     b.Sample(9, State(0, Kerbin, r, v), true, false);
     b.Sample(9, State(1, Kerbin, r2, v2, tilted), true, false);
-    Check(b.Track(9).EntryCount == 1, "a packed craft under Principia is gated on position only");
+    Check(b.Track(9).EntryCount == 1, "a craft on rails is gated on position only");
     var c = NewRing();
     c.Sample(9, State(0, Kerbin, r, v), true, true);
     c.Sample(9, State(0.05, Kerbin, r + new DVec3(0, 0, 50), v), true, true);
@@ -286,10 +288,10 @@ PartRecord[] Parts(uint first, int count)
 /* ---- Horizon and memory cap ---- */
 {
     var h = NewRing();
-    Check(Near(h.HorizonS, 2.4e11 / 299792458.0, 1e-6), $"the horizon is the system's diameter over the signal speed ({h.HorizonS:F0} s)");
-    h.SetSignalSpeed(299792458.0 * 1e-3);
-    Check(Near(h.HorizonS, 2.4e11 / 299792.458, 1e-3), "a slower signal lengthens it");
-    h.SetSignalSpeed(299792458.0);
+    Check(Near(h.HorizonS, 2.4e11 / 299792458.0, 1e-6), $"the horizon is the system's diameter over the light speed ({h.HorizonS:F0} s)");
+    h.SetLightSpeed(299792458.0 * 1e-3);
+    Check(Near(h.HorizonS, 2.4e11 / 299792.458, 1e-3), "a slower light speed lengthens it");
+    h.SetLightSpeed(299792458.0);
 
     var r = new DVec3(700000, 0, 0); var v = new DVec3(0, 2246, 0);
     h.Sample(1, State(0, Kerbin, r, v), true, true);
@@ -302,7 +304,7 @@ PartRecord[] Parts(uint first, int count)
 
     var m = NewRing();
     m.MemoryCapBytes = 1024 * 1024;
-    m.SetSignalSpeed(1);
+    m.SetLightSpeed(1);
     for (int i = 0; i <= 20000; i++)
         for (uint k = 1; k <= 5; k++)
             m.Sample(k, State(i * 0.1, Kerbin, r + new DVec3(0, 0, 5 * i), v), true, true);
@@ -365,30 +367,150 @@ PartRecord[] Parts(uint first, int count)
     Check(Near(h.Track(1).MaxSizeM, 3, 1e-6), "and shrinks once the larger craft is older than the horizon");
 }
 
-/* ---- Principia: on-rails craft through the tolerance gate, bodies in the ring ---- */
+/* ---- Departure: craft on rails through the tolerance gate, bodies off their Kepler paths ---- */
 {
-    var h = NewRing();
+    /* Checked at the on-rails rate, 10 Hz, as the host does. */
+    const double Check10 = 0.1;
     double r0 = 700000;
     var r = new DVec3(r0, 0, 0); var v = new DVec3(0, Math.Sqrt(MuKerbin / r0), 0);
+
+    var stock = NewRing();
+    for (double t = 0; t < 600; t += Check10)
+    {
+        LightHistoryMath.Kepler(r, v, MuKerbin, t, out var rt, out var vt);
+        stock.Sample(1, State(t, Kerbin, rt, vt), gated: true, checkAttitude: false);
+    }
+    Check(stock.Track(1).EntryCount == 1, "a craft on rails keeping to its conic adds no entries");
+
+    /* A mod that writes the craft's elements afresh every tick from where it is: the same path, new elements. */
+    var rewritten = NewRing();
+    var rr = r; var rv = v;
+    for (double t = 0; t < 600; t += Check10)
+    {
+        rewritten.Sample(2, State(t, Kerbin, rr, rv), gated: true, checkAttitude: false);
+        LightHistoryMath.Kepler(rr, rv, MuKerbin, Check10, out rr, out rv);
+    }
+    Check(rewritten.Track(2).EntryCount == 1, "elements rewritten every tick with no real departure add no entries");
+
+    var h = NewRing();
     long n = 0;
+    var pr = r; var pv = v;
+    double sinceCheck = 0;
+    var path = new System.Collections.Generic.List<KeyValuePair<double, DVec3>>();
     for (double t = 0; t < 600; t += Tick)
     {
-        if (h.Sample(1, State(t, Kerbin, r, v), gated: true, checkAttitude: false)) n++;
-        /* A small third-body pull, as Principia's n-body integration adds. */
-        Step(ref r, ref v, MuKerbin, 0, Tick);
-        v = v + new DVec3(0, 0, 1e-4) * Tick;
+        path.Add(new KeyValuePair<double, DVec3>(t, pr));
+        sinceCheck += Tick;
+        if (sinceCheck >= Check10 - 1e-9)
+        {
+            sinceCheck = 0;
+            if (h.Sample(1, State(t, Kerbin, pr, pv), gated: true, checkAttitude: false)) n++;
+        }
+        /* A small third-body pull, as an n-body integration adds. */
+        Step(ref pr, ref pv, MuKerbin, 0, Tick);
+        pv = pv + new DVec3(0, 0, 1e-4) * Tick;
     }
-    Console.WriteLine($"     craft under a small n-body pull, 10 min: {n} entries");
-    Check(n < 100, "a perturbed coast is sampled sparsely by the tolerance gate");
+    Console.WriteLine($"     craft on rails under a small pull, 10 min: {n} entries");
+    Check(n > 1 && n < 100, "a craft on rails drifting off its conic is sampled, sparsely, by the tolerance gate");
+    double worstM = 0;
+    double startUt = h.Track(1).StartUt;
+    for (int i = 0; i < path.Count; i += 97)
+        if (path[i].Key >= startUt) worstM = Math.Max(worstM, h.TryStateAt(1u, path[i].Key, out var at) ? (at.Position - path[i].Value).Magnitude : double.PositiveInfinity);
+    bool close = worstM < 5;
+    Console.WriteLine($"     read back off the drifting path by at most {worstM:F2} m");
+    Check(close, "and reads back within a few metres of its drifting path");
 
-    var mr = new DVec3(12000000, 0, 0); var mv = new DVec3(0, 543, 0);
-    h.SampleBody(Mun, State(0, Kerbin, mr, mv));
-    long gen = h.Generation;
-    h.Sample(1, State(700, Kerbin, r, v), true, true);
-    h.SampleBody(Mun, State(699.98, Kerbin, mr, mv));
-    Check(h.Generation == gen && h.TrackCount == 2, "a body sampled a tick back is not taken for a rewind");
-    Check(h.TryBodyStateAt(Mun, 100, out var munAt) && munAt.Body == Kerbin, "a body's track reads like a craft's, about its parent");
+    double munPull = MuKerbin / (1.2e7 * 1.2e7), kerbinPull = MuSun / (1.36e10 * 1.36e10);
+    Check(Near(h.BodyAccelBound(Mun, Kerbin), munPull, 1e-12) && Near(h.BodyAccelBound(Mun, Sun), munPull + kerbinPull, 1e-12)
+        && h.BodyAccelBound(Kerbin, Kerbin) == 0, "a body on its Kepler path is pulled by at most its parent's Mu over its periapsis squared, summed up to the frame");
+    var unknownPe = (HistoryBody[])bodies.Clone();
+    unknownPe[Mun].PeriapsisM = 0;
+    var noPe = new LightHistory { SystemDiameterM = 2.4e11 };
+    noPe.SetBodies(unknownPe);
+    Check(double.IsPositiveInfinity(noPe.BodyAccelBound(Mun, Kerbin)) && double.IsPositiveInfinity(noPe.BodyAccelBound(Mun, Sun))
+        && Near(noPe.BodyAccelBound(Kerbin, Sun), kerbinPull, 1e-12), "a body with no known periapsis has no acceleration bound");
+
+    /* Bodies: the Mun under a small pull, Kerbin on its Kepler path. */
+    var mr = new DVec3(12000000, 0, 0); var mv = new DVec3(0, Math.Sqrt(MuKerbin / 12000000), 0);
+    var kr = new DVec3(1.36e10, 0, 0); var kv = new DVec3(0, Math.Sqrt(MuSun / 1.36e10), 0);
+    var pmr = mr; var pmv = mv;
+    double latchedAt = double.NaN;
+    for (double t = 0; t < 600; t += Tick)
+    {
+        LightHistoryMath.Kepler(mr, mv, MuKerbin, t, out var munKepler, out _);
+        LightHistoryMath.Kepler(kr, kv, MuSun, t, out var kerbinAt, out var kerbinVel);
+        h.ObserveBody(Kerbin, State(t, Sun, kerbinAt, kerbinVel), 0);
+        h.ObserveBody(Mun, State(t, Kerbin, pmr, pmv), (pmr - munKepler).Magnitude);
+        if (double.IsNaN(latchedAt) && h.IsOffKepler(Mun)) latchedAt = t;
+        Step(ref pmr, ref pmv, MuKerbin, 0, Tick);
+        pmv = pmv + new DVec3(0, 0, 1e-4) * Tick;
+    }
+    var munTrack = h.Track(LightHistory.BodyKey(Mun));
+    Console.WriteLine($"     the pulled Mun left its Kepler path at {latchedAt:F1} s; {munTrack?.EntryCount ?? 0} entries in 10 min");
+    Check(h.IsOffKepler(Mun) && munTrack != null && !h.IsOffKepler(Kerbin) && h.Track(LightHistory.BodyKey(Kerbin)) == null
+        && h.BodiesOffKepler == 1, "a small pull on one body gives it a track and leaves the others without one");
+    Check(h.TryBodyStateAt(Mun, latchedAt + 100, out var munAt) && munAt.Body == Kerbin && !h.TryBodyStateAt(Kerbin, 100, out _),
+        "a body's track reads like a craft's, about its parent; a body on its Kepler path has nothing to read");
     Check(h.BodySpeedBound(Mun) >= 543 + 9285, "a body's track feeds its speed bound");
+    Check(double.IsPositiveInfinity(h.BodyAccelBound(Mun, Kerbin)) && Near(h.BodyAccelBound(Kerbin, Sun), kerbinPull, 1e-12),
+        "a body off its Kepler path has no acceleration bound; the bodies above it keep theirs");
+
+    long gen = h.Generation;
+    h.Sample(1, State(700, Kerbin, pr, pv), true, true);
+    h.SampleBody(Mun, State(699.98, Kerbin, pmr, pmv));
+    Check(h.Generation == gen, "a body sampled a tick back is not taken for a rewind");
+    h.Rewind(latchedAt - 1);
+    h.ObserveBody(Mun, State(latchedAt, Kerbin, mr, mv), 0);
+    Check(h.IsOffKepler(Mun) && h.Track(LightHistory.BodyKey(Mun)).HasEntries,
+        "once off its Kepler path a body stays latched through a rewind, so its track carries on");
+}
+
+/* ---- The frame each body's offset was written under (inverse rotation) ---- */
+{
+    /* Sun 0 orbited by Moho 6, Kerbin 1 and Duna 4, listed in that order; Mun 2 and Minmus 3 about Kerbin; Ike 5 about Duna. */
+    var walk = new Walk
+    {
+        Children = new[] { new[] { 6, 1, 4 }, new[] { 2, 3 }, new int[0], new int[0], new[] { 5 }, new int[0], new int[0] },
+        Parents = new[] { -1, 0, 1, 1, 0, 4, 0 },
+        Reversed = new bool[7],
+    };
+    var order = new List<int>();
+    BodyUpdateOrder.Walk(ref walk, 0, order);
+    Check(string.Join(",", order) == "0,6,1,2,3,4,5", $"the planetarium walks depth first from the Sun ({string.Join(",", order)})");
+    walk.Reversed[1] = walk.Reversed[2] = true;
+    BodyUpdateOrder.Walk(ref walk, 0, order);
+    Check(string.Join(",", order) == "2,1,3,0,6,4,5",
+        $"with reversed drivers it starts at the bottom of the reversed chain and climbs after each one's subtree ({string.Join(",", order)})");
+    walk.Reversed[1] = walk.Reversed[2] = false;
+    BodyUpdateOrder.Walk(ref walk, 0, order);
+
+    var prev = DQuat.FromRotationVector(new DVec3(0, 0.3, 0));
+    /* The Mun's spin over one tick, the frame's turn while the Mun is under inverse rotation. */
+    var spin = DQuat.FromRotationVector(new DVec3(0, 2 * Math.PI / 138984.0 * Tick, 0));
+    var cur = (spin * prev).Normalized;
+    var rot = new DQuat[7];
+    Check(BodyUpdateOrder.Rotations(order, -1, prev, true, cur, rot) && rot.All(q => q.Equals(cur)), "with no body under inverse rotation every offset is under the current rotation");
+    Check(BodyUpdateOrder.Rotations(order, 2, prev, true, cur, rot) && rot[0].Equals(prev) && rot[6].Equals(prev) && rot[1].Equals(prev)
+        && rot[2].Equals(cur) && rot[3].Equals(cur) && rot[4].Equals(cur) && rot[5].Equals(cur),
+        "with the Mun under inverse rotation, Moho and Kerbin were written before it turned the frame, the Mun and everything after under the new one");
+    Check(!BodyUpdateOrder.Rotations(order, 2, prev, false, cur, rot), "with no previous rotation that cannot be told");
+    Check(BodyUpdateOrder.Rotations(order, 0, prev, false, cur, rot) && rot.All(q => q.Equals(cur)), "but the root turning the frame needs none");
+    Check(!BodyUpdateOrder.Rotations(order, 9, prev, true, cur, rot), "nor can a body under inverse rotation the walk never reaches");
+
+    /* Kerbin written under last tick's frame: read under the current one it is off by the frame's turn times its distance; under its own it is exact. */
+    var kerbin = new DVec3(1.3599840256e10, 0, 0);
+    var written = prev.Rotate(kerbin);
+    BodyUpdateOrder.Rotations(order, 2, prev, true, cur, rot);
+    double naive = (cur.Conjugate.Rotate(written) - kerbin).Magnitude;
+    double chosen = (rot[1].Conjugate.Rotate(written) - kerbin).Magnitude;
+    Console.WriteLine($"     Kerbin under a Mun-turned frame: {naive:F0} m off read naively, {chosen:E1} m read under its own rotation");
+    Check(naive > LightHistoryMath.PositionToleranceM && chosen < 1e-3, "reading each body under its own rotation leaves no false departure");
+
+    var g = NewRing();
+    g.ObserveBody(Mun, State(0, Kerbin, new DVec3(1.2e7, 0, 0), new DVec3(0, 543, 0)), 5);
+    Check(g.IsOffKepler(Mun), "a latched body");
+    g.Clear();
+    Check(!g.IsOffKepler(Mun) && g.BodiesOffKepler == 0, "is forgotten when the ring is cleared for another game");
 }
 
 /* ---- Ghosts: a relaunch under an id whose craft ended ---- */
@@ -414,6 +536,20 @@ PartRecord[] Parts(uint first, int count)
     h.Rewind(100);
     Check(!h.Track(LightHistory.CraftKey(5)).IsGhost && h.Track(LightHistory.CraftKey(5)).StartUt == 80 && !h.Track(LightHistory.CraftKey(5)).Ended,
         "a rewind to before the relaunch brings the earlier life back as the live track");
+}
+
+/* ---- A recovery queued before a quickload is not stamped on the loaded timeline ---- */
+{
+    var h = NewRing();
+    var r = new DVec3(700000, 0, 0); var v = new DVec3(0, 2246, 0);
+    for (int i = 0; i <= 100; i++) h.Sample(7, State(i, Kerbin, r, v), true, true);
+    long queuedAt = h.Generation;
+    h.Rewind(40);
+    h.Recovered(7, 100, queuedAt);
+    var t = h.Track(LightHistory.CraftKey(7));
+    Check(t != null && !t.Ended && h.LatestUt <= 40, "a recovery from before the quickload neither ends the craft nor runs time ahead");
+    h.Recovered(7, 41, h.Generation);
+    Check(h.Track(LightHistory.CraftKey(7)).Ended, "one queued on the loaded timeline still ends it");
 }
 
 /* ---- A rewind across a relaunch restores the earlier life intact ---- */
@@ -551,22 +687,22 @@ PartRecord[] Parts(uint first, int count)
 {
     var h = new LightHistory { SystemDiameterM = 2.4e11 };
     h.SetBodies(bodies);
-    Check(!h.Active, "with no holder and no signal speed the ring is off");
+    Check(!h.Active, "with no holder and no light speed the ring is off");
     h.SetReservationHeld(true);
     Check(h.Active && Near(h.HorizonS, 2.4e11 / 299792458.0, 1e-6), "a reservation turns it on; with no speed ever set the horizon uses real light speed");
     var r = new DVec3(700000, 0, 0); var v = new DVec3(0, 2246, 0);
     h.Sample(1, State(0, Kerbin, r, v), true, true);
-    h.SetSignalSpeed(1e5);
-    h.SetSignalSpeed(1e6);
+    h.SetLightSpeed(1e5);
+    h.SetLightSpeed(1e6);
     Check(h.TrackCount == 1, "setting a speed while already on keeps the history");
-    h.SetSignalSpeed(null);
+    h.SetLightSpeed(null);
     Check(h.Active && Near(h.HorizonS, 2.4e11 / 1e5, 1e-6), "a reservation with no speed uses the slowest speed set in this game");
     h.SetReservationHeld(false);
     Check(!h.Active && h.TrackCount == 0, "releasing the reservation with no speed turns it off and empties it");
-    h.SetSignalSpeed(3e8);
+    h.SetLightSpeed(3e8);
     Check(h.Active && h.TrackCount == 0 && double.IsNegativeInfinity(h.LatestUt), "turning on again starts from an empty ring");
     h.Clear();
-    Check(h.SlowestSignalSpeed == 3e8, "a new game forgets the slowest speed of the last one");
+    Check(h.SlowestLightSpeed == 3e8, "a new game forgets the slowest speed of the last one");
 }
 
 /* ---- Per-tick cost ---- */
@@ -719,7 +855,43 @@ PartRecord[] Parts(uint first, int count)
     int full = src.Save(200, 1 << 20, out _).Length;
     var capped = src.Save(200, full / 2, out double cfloor);
     Check(capped != null && capped.Length <= full / 2 && cfloor > floor, $"over the cap, a save keeps less ({capped?.Length} of {full} bytes, from UT {cfloor:F1})");
-    Check(src.Save(200, 64, out _) == null, "under a cap even the newest instant cannot meet, nothing is saved");
+    Check(src.Save(200, 64, out _) == null, "under a cap not one track's newest instant can meet, nothing is saved");
+
+    /* Over the cap at every floor: as many tracks as fit, craft still flying first, the smallest first. */
+    var crowd = NewRing();
+    for (uint k = 0; k < 20; k++)
+    {
+        crowd.Record(100 + k, State(0, Kerbin, new DVec3(r0 + k * 1000, 0, 0), new DVec3(0, vc, 0)), HistoryReason.Start);
+        var ids = new uint[10 + k * 5];
+        for (int i = 0; i < ids.Length; i++) ids[i] = 100000 + k * 1000 + (uint)i;
+        crowd.SetComposition(100 + k, 0, SaveParts(ids), 0, 0, 0);
+    }
+    crowd.Record(900, State(0, Kerbin, new DVec3(0, r0, 0), new DVec3(-vc, 0, 0)), HistoryReason.Start);
+    crowd.Destroyed(900, 100, crowd.Generation);
+    crowd.Trim(100);
+    long crowdMin = crowd.SizeAt(100, new Dictionary<PartRecord[], long>());
+    int crowdCap = (int)(crowdMin / 2);
+    var part = crowd.Save(100, crowdCap, out _, out int crowdDropped);
+    var partBack = new LightHistory { SystemDiameterM = 2.4e11 };
+    partBack.SetBodies(bodies);
+    bool partLoaded = part != null && partBack.Load(part, 100, out _);
+    bool smallestKept = partLoaded;
+    int keptCraft = 0;
+    for (uint k = 0; k < 20; k++)
+    {
+        bool kept = partBack.Track(LightHistory.CraftKey(100 + k)) != null;
+        if (kept) keptCraft++;
+        if (kept && k > 0 && partBack.Track(LightHistory.CraftKey(100 + k - 1)) == null) smallestKept = false;
+    }
+    Check(partLoaded && part.Length <= crowdCap && crowdDropped > 0 && partBack.TrackCount == crowd.TrackCount - crowdDropped && keptCraft > 0,
+        $"a save over the cap at its newest instant keeps the tracks that fit ({partBack.TrackCount} of {crowd.TrackCount}, {part?.Length} of {crowdCap} bytes)");
+    Check(smallestKept, "the smallest craft are kept");
+    var allButEnded = crowd.Save(100, (int)crowdMin - 1, out _, out int endedDropped);
+    var endedBack = new LightHistory { SystemDiameterM = 2.4e11 };
+    endedBack.SetBodies(bodies);
+    Check(allButEnded != null && endedBack.Load(allButEnded, 100, out _) && endedDropped == 1 && endedBack.Track(LightHistory.CraftKey(900)) == null && crowd.Track(LightHistory.CraftKey(900)) != null
+        && endedBack.TrackFor(119, 90) != null,
+        "every craft still flying is kept ahead of a destroyed one, however small its track");
 
     /* A save from before the history was saved, and a damaged one. */
     var none = NewRing();
@@ -739,7 +911,7 @@ PartRecord[] Parts(uint first, int count)
     var idle = new LightHistory { SystemDiameterM = 2.4e11 };
     idle.SetBodies(bodies);
     idle.Load(bytes, 200, out _);
-    idle.SetSignalSpeed(3e5);
+    idle.SetLightSpeed(3e5);
     Check(idle.Active && idle.TrackCount == src.TrackCount, "turning on just after a load keeps the save's history");
     idle.Sample(1, State(200.5, Kerbin, new DVec3(r0, 0, 0), new DVec3(0, vc, 0)), gated: true, checkAttitude: false);
     Check(idle.RestoredUt == null, "the first sample makes it the ring's own");
@@ -747,7 +919,7 @@ PartRecord[] Parts(uint first, int count)
     later.SetBodies(bodies);
     later.Load(bytes, 200, out _);
     later.DropRestored();
-    later.SetSignalSpeed(3e5);
+    later.SetLightSpeed(3e5);
     Check(later.TrackCount == 0, "once game time passed with the ring off, it starts empty");
 
     /* The text a ConfigNode carries: cut at `//` as a comment, trimmed, split at the first `=`. */
@@ -778,7 +950,7 @@ PartRecord[] Parts(uint first, int count)
     holder.Save(200, 1 << 20, out double holderFloor);
     long holderGen = holder.Generation;
     Check(holder.HoldsSave(holderGen, holderFloor), "a scene change after a save finds the ring still holding it");
-    holder.SetSignalSpeed(null);
+    holder.SetLightSpeed(null);
     Check(!holder.HoldsSave(holderGen, holderFloor), "quit to the menu, which clears the ring, then resume: the save is read back");
     var flown = Built();
     flown.Save(200, 1 << 20, out double flownFloor);
@@ -826,10 +998,10 @@ PartRecord[] Parts(uint first, int count)
     Check(noBodiesFloor == noBodies.FloorUt, $"a save before the bodies are known keeps the ring's floor ({noBodiesFloor})");
 
     var slow = new LightHistory();
-    slow.SetSignalSpeed(5e5);
+    slow.SetLightSpeed(5e5);
     slow.RestoreSlowest(3e4);
     slow.RestoreSlowest(9e9);
-    Check(slow.SlowestSignalSpeed == 3e4, "the save's slowest speed comes back unless a slower one is set");
+    Check(slow.SlowestLightSpeed == 3e4, "the save's slowest speed comes back unless a slower one is set");
 
     /* Size and load time for a busy game: 500 coasting craft of 30 parts, and 10 craft burning at 1 g through the whole horizon, sampled every physics tick. */
     var busy = NewRing();
@@ -883,3 +1055,14 @@ PartRecord[] Parts(uint first, int count)
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
+
+struct Walk : IBodyWalk
+{
+    public int[][] Children;
+    public int[] Parents;
+    public bool[] Reversed;
+    public int ChildCount(int body) => Children[body].Length;
+    public int Child(int body, int i) => Children[body][i];
+    public int Parent(int body) => Parents[body];
+    bool IBodyWalk.Reversed(int body) => Reversed[body];
+}

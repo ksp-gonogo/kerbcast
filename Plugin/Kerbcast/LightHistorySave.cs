@@ -13,7 +13,9 @@ namespace Kerbcast
      * A save holds the horizon back from its UT, and less when that is over
      * the size cap: the oldest instant kept is raised a tenth of the span at a
      * time, by the size each floor would write, until it fits, and the ring is
-     * written once. A load replaces the ring with the save's history and drops
+     * written once. When even the highest floor is over the cap, the save
+     * keeps as many tracks as fit, the bodies first, then craft still flying,
+     * then those that have ended, the smallest first within each. A load replaces the ring with the save's history and drops
      * anything after the load UT; anything it cannot trust leaves the ring
      * empty instead. Pure, so the format is tested headless.
      */
@@ -39,14 +41,18 @@ namespace Kerbcast
         /* How many times a save has been serialised, for the single-pass test. */
         public int SaveWrites { get; private set; }
 
+        public byte[] Save(double nowUt, int capBytes, out double floorUt) => Save(nowUt, capBytes, out floorUt, out _);
+
         /*
-         * The ring as a save holds it at `nowUt`, at most `capBytes` long, or
-         * null when even the newest instant of every track is over the cap.
+         * The ring as a save holds it at `nowUt`, at most `capBytes` long,
+         * leaving out `dropped` tracks when every track's newest instant
+         * together is over the cap, or null when not one track fits.
          * `floorUt` is the oldest instant the save can answer for. Before the
          * bodies are known there is no horizon, and the ring's own floor stands.
          */
-        public byte[] Save(double nowUt, int capBytes, out double floorUt)
+        public byte[] Save(double nowUt, int capBytes, out double floorUt, out int dropped)
         {
+            dropped = 0;
             double latest = Math.Max(_latestUt, nowUt);
             floorUt = SystemDiameterM > 0 ? Math.Max(FloorUt, nowUt - HorizonS) : FloorUt;
             if (double.IsNaN(floorUt) || double.IsPositiveInfinity(floorUt)) floorUt = FloorUt;
@@ -60,37 +66,74 @@ namespace Kerbcast
                 floorUt = from;
                 size = SizeAt(floorUt, partBytes);
             }
-            if (size > capBytes) return null;
+            List<HistoryTrack> keep = null;
+            if (size > capBytes)
+            {
+                keep = Fitting(floorUt, capBytes, partBytes, out dropped);
+                if (keep.Count == 0) return null;
+            }
             SaveWrites++;
-            return Write(floorUt, latest);
+            return Write(floorUt, latest, keep);
         }
+
+        /* The tracks a save at `floor` keeps under `capBytes`, in the order they are worth keeping, and how many it leaves out. */
+        private List<HistoryTrack> Fitting(double floor, long capBytes, Dictionary<PartRecord[], long> partBytes, out int dropped)
+        {
+            var sized = new List<KeyValuePair<long, HistoryTrack>>();
+            foreach (var t in _tracks.Values)
+                if (t.EndUt >= floor) sized.Add(new KeyValuePair<long, HistoryTrack>(TrackSize(t, floor, partBytes), t));
+            sized.Sort((a, b) =>
+            {
+                int byRank = SaveRank(a.Value).CompareTo(SaveRank(b.Value));
+                if (byRank != 0) return byRank;
+                int bySize = a.Key.CompareTo(b.Key);
+                return bySize != 0 ? bySize : a.Value.Key.CompareTo(b.Value.Key);
+            });
+            var keep = new List<HistoryTrack>();
+            long size = HeaderBytes;
+            foreach (var kv in sized)
+            {
+                if (size + kv.Key > capBytes) continue;
+                size += kv.Key;
+                keep.Add(kv.Value);
+            }
+            dropped = sized.Count - keep.Count;
+            return keep;
+        }
+
+        /* Bodies first, every craft is drawn against them; then craft still flying; then ghosts and ended craft. */
+        private static int SaveRank(HistoryTrack t) => t.IsBody ? 0 : !t.IsGhost && !t.Ended ? 1 : 2;
 
         /* The length Write would produce at `floor`, without writing it. */
         internal long SizeAt(double floor, Dictionary<PartRecord[], long> partBytes)
         {
             long size = HeaderBytes;
             foreach (var t in _tracks.Values)
+                if (t.EndUt >= floor) size += TrackSize(t, floor, partBytes);
+            return size;
+        }
+
+        /* The bytes track `t` takes in a save at `floor`. */
+        private static long TrackSize(HistoryTrack t, double floor, Dictionary<PartRecord[], long> partBytes)
+        {
+            long size = TrackHeaderBytes + 4 + 4 + 4;
+            FirstEntry(t, floor, out int chunk, out int index);
+            for (int k = chunk; k < t.Chunks.Count; k++) size += (long)(t.Chunks[k].Count - (k == chunk ? index : 0)) * SavedEntryBytes;
+            int firstComp = FirstComposition(t, floor);
+            for (int k = firstComp; k < t.Compositions.Count; k++)
             {
-                if (!(t.EndUt >= floor)) continue;
-                size += TrackHeaderBytes + 4 + 4 + 4;
-                FirstEntry(t, floor, out int chunk, out int index);
-                for (int k = chunk; k < t.Chunks.Count; k++) size += (long)(t.Chunks[k].Count - (k == chunk ? index : 0)) * SavedEntryBytes;
-                int firstComp = FirstComposition(t, floor);
-                for (int k = firstComp; k < t.Compositions.Count; k++)
+                size += CompositionHeaderBytes;
+                var parts = t.Compositions[k].Parts;
+                if (k > firstComp && ReferenceEquals(t.Compositions[k - 1].Parts, parts)) continue;
+                if (!partBytes.TryGetValue(parts, out long bytes))
                 {
-                    size += CompositionHeaderBytes;
-                    var parts = t.Compositions[k].Parts;
-                    if (k > firstComp && ReferenceEquals(t.Compositions[k - 1].Parts, parts)) continue;
-                    if (!partBytes.TryGetValue(parts, out long bytes))
-                    {
-                        bytes = 4;
-                        foreach (var p in parts) bytes += PartFixedBytes + StringBytes(p.Name ?? "");
-                        partBytes[parts] = bytes;
-                    }
-                    size += bytes;
+                    bytes = 4;
+                    foreach (var p in parts) bytes += PartFixedBytes + StringBytes(p.Name ?? "");
+                    partBytes[parts] = bytes;
                 }
-                size += (long)(t.Events.Count - FirstEvent(t, floor)) * SavedEventBytes;
+                size += bytes;
             }
+            size += (long)(t.Events.Count - FirstEvent(t, floor)) * SavedEventBytes;
             return size;
         }
 
@@ -124,7 +167,8 @@ namespace Kerbcast
             return k;
         }
 
-        internal byte[] Write(double floor, double latest)
+        /* The ring from `floor`, or only the tracks in `keep` when it is given. */
+        internal byte[] Write(double floor, double latest, List<HistoryTrack> keep = null)
         {
             using (var ms = new MemoryStream())
             using (var w = new BinaryWriter(ms, Encoding.UTF8))
@@ -134,9 +178,13 @@ namespace Kerbcast
                 w.Write(floor);
                 w.Write(latest);
                 w.Write(_ghostSeq);
-                var keep = new List<HistoryTrack>();
-                foreach (var t in _tracks.Values)
-                    if (t.EndUt >= floor) keep.Add(t);
+                if (keep == null)
+                {
+                    keep = new List<HistoryTrack>();
+                    foreach (var t in _tracks.Values)
+                        if (t.EndUt >= floor) keep.Add(t);
+                }
+                else keep = new List<HistoryTrack>(keep);
                 keep.Sort((a, b) => a.Key.CompareTo(b.Key));
                 w.Write(keep.Count);
                 foreach (var t in keep) WriteTrack(w, t, floor);
@@ -435,7 +483,7 @@ namespace Kerbcast
         public void RestoreSlowest(double? mps)
         {
             if (!(mps > 0) || double.IsInfinity(mps.Value)) return;
-            if (!SlowestSignalSpeed.HasValue || mps.Value < SlowestSignalSpeed.Value) SlowestSignalSpeed = mps;
+            if (!SlowestLightSpeed.HasValue || mps.Value < SlowestLightSpeed.Value) SlowestLightSpeed = mps;
         }
 
         /* Game time passed while the ring was off: the save's history now has an unsampled gap after it. */

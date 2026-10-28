@@ -9,7 +9,7 @@ namespace Kerbcast
        physics tick through the gate and turns KSP's identity events into ring
        events. Lives for the whole game session on a DontDestroyOnLoad object,
        so scene changes keep the ring. Does nothing while the ring is inactive
-       (no reservation and no signal speed), so a player with no lock holder
+       (no reservation and no light speed), so a player with no lock holder
        pays nothing.
 
        The ring's frame is the world's axes with the planetarium's rotation
@@ -23,12 +23,13 @@ namespace Kerbcast
         private const float TrimIntervalS = 5f;
         private const float LogIntervalS = 60f;
         private const float WarnIntervalS = 60f;
-        /* A craft on rails is checked against its last entry this often, in real
-           time and in game time, to see orbit changes no event reports
-           (Persistent Thrust, HyperEdit, cheats). */
-        private const float PackedCheckIntervalS = 1f;
+        /* A craft on rails is checked against the Kepler prediction from its
+           last entry this often, in real time and in game time, so a path that
+           leaves its conic without any event (a mod that moves or integrates
+           craft itself, an edit, a cheat) is sampled by the tolerance gate. On
+           its conic it departs from nothing and adds no entries. */
+        private const float PackedCheckIntervalS = 0.1f;
         private const double PackedCheckIntervalUt = 60;
-        private const string PrincipiaType = "principia.ksp_plugin_adapter.ExternalInterface";
 
         internal static LightHistory History { get; } = new LightHistory();
 
@@ -45,14 +46,22 @@ namespace Kerbcast
         private readonly Dictionary<uint, Vessel> _lastSeen = new Dictionary<uint, Vessel>();
         private readonly Dictionary<uint, PackedDue> _nextPackedCheck = new Dictionary<uint, PackedDue>();
         private readonly Dictionary<int, BodyTicks> _bodyTicks = new Dictionary<int, BodyTicks>();
-        private readonly List<KeyValuePair<uint, double>> _pendingRecover = new List<KeyValuePair<uint, double>>();
+        /* Each body's orbit as first seen this session: the Kepler path a body is checked against. */
+        private readonly Dictionary<int, Orbit> _firstOrbit = new Dictionary<int, Orbit>();
+        /* The planetarium walks the bodies in this order, and each one's offset was written under this rotation. */
+        private readonly List<int> _updateOrder = new List<int>();
+        private DQuat[] _writtenUnder = new DQuat[0];
+        private DQuat _lastRotation;
+        private bool _haveLastRotation;
+        /* Entries the tolerance gate added for craft on rails: zero while every craft keeps to its conic. */
+        private long _packedDepartures;
+        private readonly List<PendingEnd> _pendingRecover = new List<PendingEnd>();
         private readonly System.Random _stagger = new System.Random();
         private readonly HashSet<uint> _dirtyComposition = new HashSet<uint>();
-        private readonly List<PendingDestroy> _pendingDestroy = new List<PendingDestroy>();
+        private readonly List<PendingEnd> _pendingDestroy = new List<PendingEnd>();
         private readonly Dictionary<string, float> _partRadius = new Dictionary<string, float>();
         private readonly HashSet<uint> _present = new HashSet<uint>();
         private int _bodyCount = -1;
-        private bool _principiaChecked;
         private bool _sceneLoading;
         private bool _reconcilePending;
         private static string s_gameIdentity;
@@ -61,7 +70,8 @@ namespace Kerbcast
         private float _nextWarn;
         private int _suppressedWarnings;
 
-        private struct PendingDestroy
+        /* A destroy or recovery waiting for a ready frame, stamped with the ring's generation when it happened. */
+        private struct PendingEnd
         {
             public uint Pid;
             public double Ut;
@@ -81,6 +91,8 @@ namespace Kerbcast
             public int Count;
             public double Ut0, Ut1;
             public DVec3 P0, P1;
+            /* How far the body at Ut1 stood from its first-seen orbit. */
+            public double OffM;
         }
 
         private void Awake()
@@ -104,23 +116,23 @@ namespace Kerbcast
             GameEvents.onVesselWillDestroy.Add(OnWillDestroy);
             GameEvents.onVesselRecovered.Add(OnRecovered);
             GameEvents.onVesselTerminated.Add(OnTerminated);
-            ApplyDevSignalSpeed();
+            ApplyDevLightSpeed();
         }
 
-        /* settings.cfg's devSignalSpeedMps, honoured only beside the dev marker
+        /* settings.cfg's devLightSpeedMps, honoured only beside the dev marker
            file, never shipped in a release; without the marker the key is not even read. */
-        private static void ApplyDevSignalSpeed()
+        private static void ApplyDevLightSpeed()
         {
             var marker = Path.Combine(KSPUtil.ApplicationRootPath, "GameData", "Kerbcast", "PluginData", "dev");
             if (!File.Exists(marker)) return;
-            double mps = KerbcastSettings.Load().DevSignalSpeedMps;
+            double mps = KerbcastSettings.Load().DevLightSpeedMps;
             if (!(mps > 0) || double.IsInfinity(mps))
             {
-                Debug.Log($"{Tag} dev marker {marker} present, devSignalSpeedMps not set: no signal speed");
+                Debug.Log($"{Tag} dev marker {marker} present, devLightSpeedMps not set: no light speed");
                 return;
             }
-            History.SetSignalSpeed(mps);
-            Debug.LogWarning($"{Tag} DEV SIGNAL SPEED ON: {mps} m/s from devSignalSpeedMps, because {marker} exists. "
+            History.SetLightSpeed(mps);
+            Debug.LogWarning($"{Tag} DEV LIGHT SPEED ON: {mps} m/s from devLightSpeedMps, because {marker} exists. "
                 + "Command cameras draw distant unloaded craft where their arriving light left them. Delete the marker for normal play.");
         }
 
@@ -169,6 +181,12 @@ namespace Kerbcast
 
         private void FixedUpdate()
         {
+            try { FixedTick(); }
+            finally { RememberRotation(); }
+        }
+
+        private void FixedTick()
+        {
             if (History.RestoredUt.HasValue && !History.Active && Planetarium.fetch != null && Ut > History.RestoredUt.Value + RestoredGraceUt)
             {
                 Debug.Log($"{Tag} game time passed with the history off: the save's history dropped");
@@ -193,7 +211,7 @@ namespace Kerbcast
             EnsureBodies();
             if (_pendingRecover.Count > 0)
             {
-                foreach (var kv in _pendingRecover) History.Recovered(kv.Key, kv.Value);
+                foreach (var r in _pendingRecover) History.Recovered(r.Pid, r.Ut, r.Generation);
                 _pendingRecover.Clear();
             }
             if (_reconcilePending) Reconcile(ut);
@@ -201,7 +219,7 @@ namespace Kerbcast
             float now = Time.realtimeSinceStartup;
 
             /* Each body is stamped a tick back. */
-            if (History.SampleEverything) SampleBodies(ut, deRot);
+            ObserveBodies(ut, deRot);
 
             var vessels = FlightGlobals.Vessels;
             for (int i = 0; i < vessels.Count; i++)
@@ -250,7 +268,8 @@ namespace Kerbcast
             {
                 _logCooldown = LogIntervalS;
                 Debug.Log($"{Tag} tracks={History.TrackCount} entries={History.EntryTotal} bytes={History.Bytes} "
-                    + $"horizon={History.HorizonS:F0}s floor={History.FloorUt:F1} principia={History.SampleEverything}");
+                    + $"horizon={History.HorizonS:F0}s floor={History.FloorUt:F1} bodiesOffKepler={History.BodiesOffKepler} "
+                    + $"onRailsDepartures={_packedDepartures}");
             }
         }
 
@@ -296,7 +315,7 @@ namespace Kerbcast
                 return;
             }
 
-            bool gated = !v.packed || History.SampleEverything;
+            bool gated = !v.packed;
             if (!gated && known)
             {
                 if (!_nextPackedCheck.TryGetValue(pid, out var due))
@@ -318,6 +337,7 @@ namespace Kerbcast
                 var com = v.localCoM;
                 History.MoveCom(pid, ut, com.x, com.y, com.z);
             }
+            if (added && v.packed && known) _packedDepartures++;
             var track = History.Track(key);
             if (track != null && track.Compositions.Count == 0) TakeComposition(v, ut);
         }
@@ -363,18 +383,30 @@ namespace Kerbcast
             return s;
         }
 
-        /* Under Principia bodies leave their Kepler orbits, and body.orbit is
-           not known to follow them, so a body's state comes from where the game
-           has put it: its position about its parent, with a centred velocity.
-           That needs the tick after, so each body is sampled one tick back; under
-           warp a tick is a long chord, and the gate then adds entries often. */
-        private void SampleBodies(double ut, DQuat deRot)
+        /*
+         * Each body where the game has put it, its position about its parent,
+         * against its orbit as first seen. A body another mod moves off that
+         * path departs and is sampled into the ring from then on; body.orbit is
+         * not trusted to follow it, so a sampled state takes a centred velocity,
+         * which needs the tick after: each body is stamped one tick back, and
+         * under warp a tick is a long chord, so the gate then adds entries often.
+         * A mod that only rewrites a body's elements, keeping its path, departs
+         * from nothing. One Kepler read per body per tick.
+         */
+        private void ObserveBodies(double ut, DQuat deRot)
         {
+            if (!WrittenUnder(deRot.Conjugate)) return;
             foreach (var b in FlightGlobals.Bodies)
             {
-                if (b == null || b.referenceBody == null || b.referenceBody == b) continue;
-                var p = deRot.Rotate(D(b.position - b.referenceBody.position));
+                if (b == null || b.orbit == null || b.referenceBody == null || b.referenceBody == b) continue;
                 int index = b.flightGlobalsIndex;
+                var written = index < _writtenUnder.Length ? _writtenUnder[index].Conjugate : deRot;
+                var p = written.Rotate(D(b.position - b.referenceBody.position));
+                if (!_firstOrbit.TryGetValue(index, out var first) || first.referenceBody != b.referenceBody)
+                    _firstOrbit[index] = first = new Orbit(b.orbit);
+                /* The orbit driver's own read, under the rotation as it stands now, so a body on its path matches to rounding. */
+                first.UpdateFromUT(ut);
+                double off = (p - deRot.Rotate(D(first.pos.xzy))).Magnitude;
                 _bodyTicks.TryGetValue(index, out var k);
                 if (k.Count > 0 && !(ut > k.Ut1)) continue;
                 if (k.Count >= 2)
@@ -388,10 +420,59 @@ namespace Kerbcast
                         Velocity = (p - k.P0) * (1.0 / (ut - k.Ut0)),
                         Attitude = DQuat.Identity,
                     };
-                    History.SampleBody(index, s);
+                    History.ObserveBody(index, s, Math.Max(off, k.OffM));
                 }
-                _bodyTicks[index] = new BodyTicks { Count = Math.Min(k.Count + 1, 2), Ut0 = k.Ut1, P0 = k.P1, Ut1 = ut, P1 = p };
+                _bodyTicks[index] = new BodyTicks { Count = Math.Min(k.Count + 1, 2), Ut0 = k.Ut1, P0 = k.P1, Ut1 = ut, P1 = p, OffM = off };
             }
+        }
+
+        /*
+         * The planetarium rotation each body's offset was written under this
+         * tick, from the order the planetarium walked the bodies in and the
+         * rotation at the end of the last tick. False when it cannot be told,
+         * and the bodies are not observed this tick.
+         */
+        private bool WrittenUnder(DQuat current)
+        {
+            var bodies = FlightGlobals.Bodies;
+            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (bodies == null || sun == null) return false;
+            int inverse = -1, max = 0;
+            foreach (var b in bodies)
+            {
+                if (b == null) continue;
+                max = Math.Max(max, b.flightGlobalsIndex + 1);
+                if (b.inverseRotation) inverse = b.flightGlobalsIndex;
+            }
+            if (_writtenUnder.Length < max) _writtenUnder = new DQuat[max];
+            var walk = new PlanetariumWalk(bodies);
+            BodyUpdateOrder.Walk(ref walk, sun.flightGlobalsIndex, _updateOrder);
+            return BodyUpdateOrder.Rotations(_updateOrder, inverse, _lastRotation, _haveLastRotation, current, _writtenUnder);
+        }
+
+        private void RememberRotation()
+        {
+            if (Planetarium.fetch == null || _sceneLoading)
+            {
+                _haveLastRotation = false;
+                return;
+            }
+            var r = Planetarium.Rotation;
+            _lastRotation = new DQuat(r.x, r.y, r.z, r.w);
+            _haveLastRotation = true;
+        }
+
+        private struct PlanetariumWalk : IBodyWalk
+        {
+            private readonly List<CelestialBody> _bodies;
+
+            public PlanetariumWalk(List<CelestialBody> bodies) { _bodies = bodies; }
+
+            private CelestialBody At(int index) => index >= 0 && index < _bodies.Count ? _bodies[index] : null;
+            public int ChildCount(int body) => At(body)?.orbitingBodies?.Count ?? 0;
+            public int Child(int body, int i) => At(body).orbitingBodies[i].flightGlobalsIndex;
+            public int Parent(int body) => At(body)?.referenceBody != null && At(body).referenceBody != At(body) ? At(body).referenceBody.flightGlobalsIndex : -1;
+            public bool Reversed(int body) => At(body)?.orbitDriver != null && At(body).orbitDriver.reverse;
         }
 
         private void EnsureBodies()
@@ -422,6 +503,7 @@ namespace Kerbcast
                     hb.MaxOrbitalSpeed = o.PeR > 0
                         ? Math.Sqrt(b.referenceBody.gravParameter * (1 + o.eccentricity) / o.PeR)
                         : o.orbitalSpeed;
+                    hb.PeriapsisM = o.PeR > 0 ? o.PeR : 0;
                     /* A planet's reach covers its moons, which stay inside its SOI. */
                     if (b.referenceBody.orbit == null && o.eccentricity < 1)
                         reach = Math.Max(reach, o.ApR + hb.SoiRadius);
@@ -430,27 +512,9 @@ namespace Kerbcast
             }
             History.SetBodies(bodies);
             History.SystemDiameterM = 2 * reach;
-
-            if (!_principiaChecked)
-            {
-                _principiaChecked = true;
-                History.SampleEverything = PrincipiaLoaded();
-            }
+            _firstOrbit.Clear();
             Debug.Log($"{Tag} {list.Count} bodies, system diameter {2 * reach / 1e9:F1} Gm, horizon {History.HorizonS:F0} s, "
-                + $"memory cap {History.MemoryCapBytes / (1024 * 1024)} MB, principia={History.SampleEverything}");
-        }
-
-        /* By its interface type, or failing that by its install folder. */
-        private static bool PrincipiaLoaded()
-        {
-            foreach (var a in AssemblyLoader.loadedAssemblies)
-            {
-                if (a == null) continue;
-                try { if (a.assembly?.GetType(PrincipiaType, false) != null) return true; }
-                catch (Exception) { /* an assembly that cannot list its types is not Principia */ }
-                if (a.url != null && a.url.StartsWith("Principia", StringComparison.OrdinalIgnoreCase)) return true;
-            }
-            return false;
+                + $"memory cap {History.MemoryCapBytes / (1024 * 1024)} MB, bodiesOffKepler={History.BodiesOffKepler}");
         }
 
         private static string NewTimeline() => Guid.NewGuid().ToString("N");
@@ -467,18 +531,21 @@ namespace Kerbcast
                 var inv = System.Globalization.CultureInfo.InvariantCulture;
                 node.AddValue("format", LightHistory.SaveFormat);
                 node.AddValue("timeline", s_timeline);
-                var slowest = History.SlowestSignalSpeed;
-                if (slowest.HasValue) node.AddValue("slowestSignalSpeed", slowest.Value.ToString("R", inv));
+                var slowest = History.SlowestLightSpeed;
+                if (slowest.HasValue) node.AddValue("slowestLightSpeed", slowest.Value.ToString("R", inv));
                 node.AddValue("generation", History.Generation);
                 if ((!History.Active && !History.RestoredUt.HasValue) || Planetarium.fetch == null) return;
                 double ut = Ut;
                 var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                var bytes = History.Save(ut, SaveCapChars / 4 * 3, out double floor);
+                var bytes = History.Save(ut, SaveCapChars / 4 * 3, out double floor, out int dropped);
                 if (bytes == null)
                 {
-                    Debug.LogWarning($"{Tag} history not saved: even its newest instant is over {SaveCapChars / 1024} KB");
+                    Debug.LogWarning($"{Tag} history not saved: no single track fits in {SaveCapChars / 1024} KB");
                     return;
                 }
+                if (dropped > 0)
+                    Debug.LogWarning($"{Tag} history saved in part: {dropped} tracks left out to fit {SaveCapChars / 1024} KB, "
+                        + "those craft are drawn once their light after the load arrives");
                 string text = LightHistory.ToSaveText(bytes);
                 node.AddValue("ut", ut.ToString("R", inv));
                 node.AddValue("floor", floor.ToString("R", inv));
@@ -524,7 +591,7 @@ namespace Kerbcast
                     History.Clear();
                     s_gameIdentity = GameIdentity(game);
                 }
-                if (double.TryParse(node.GetValue("slowestSignalSpeed"), floats, inv, out double slowest)) History.RestoreSlowest(slowest);
+                if (double.TryParse(node.GetValue("slowestLightSpeed"), floats, inv, out double slowest)) History.RestoreSlowest(slowest);
 
                 var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 byte[] bytes = null;
@@ -718,7 +785,7 @@ namespace Kerbcast
             if (v == null || !Ready()) return;
             double ut = Ut;
             CatchUp(ut);
-            _pendingDestroy.Add(new PendingDestroy { Pid = v.persistentId, Ut = ut, Frame = Time.frameCount, Generation = History.Generation });
+            _pendingDestroy.Add(new PendingEnd { Pid = v.persistentId, Ut = ut, Frame = Time.frameCount, Generation = History.Generation });
         }
 
         /* A recovery while a scene loads is kept for the first ready tick, so it
@@ -727,7 +794,8 @@ namespace Kerbcast
         {
             if (pv == null || !History.Active) return;
             if (Ready()) History.Recovered(pv.persistentId, Ut);
-            else if (Planetarium.fetch != null) _pendingRecover.Add(new KeyValuePair<uint, double>(pv.persistentId, Ut));
+            else if (Planetarium.fetch != null)
+                _pendingRecover.Add(new PendingEnd { Pid = pv.persistentId, Ut = Ut, Frame = Time.frameCount, Generation = History.Generation });
         }
 
         private void OnTerminated(ProtoVessel pv)
@@ -761,13 +829,16 @@ namespace Kerbcast
             _bodyCount = -1;
             _reconcilePending = true;
             CheckGameIdentity();
+            /* The ring reads the reservation itself, so a scene where the cameras are switched off still keeps a save's history. */
+            try { LockReservationStore.CheckLapse(); }
+            catch (Exception ex) { Debug.LogWarning($"{Tag} reservation read threw: {ex.Message}"); }
         }
     }
 
-    /* The holder's signal speed for code that needs a light time but must not
+    /* The holder's light speed for code that needs a light time but must not
        read the ring's truth. Null while delay is off. */
     internal static class LightTime
     {
-        public static double? SignalSpeed => LightHistoryHost.History.SignalSpeed;
+        public static double? LightSpeed => LightHistoryHost.History.LightSpeed;
     }
 }

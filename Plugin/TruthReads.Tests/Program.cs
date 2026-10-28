@@ -16,7 +16,8 @@ using System.Text.RegularExpressions;
  * DrawnSubject, SubjectTrack and every camera's PicturePass, and only the
  * picture pass and its shared solves (LensSights) read the light-time
  * history. Calls into the picture pass count as picture state, so knowledge
- * code cannot reach the past instants through it.
+ * code cannot reach the past instants, or which craft a camera hides,
+ * through it.
  *
  * Crossings: knowledge code never touches the picture's state (_drawn*,
  * DrawnSubject, DrawnPlan), and picture code never touches knowledge
@@ -76,16 +77,16 @@ var trackPins = new[]
 var ringRule = new Rule("the light-time history",
     @"\bLightHistory\b|\bLightHistoryHost\b|\bRingBodies\b|\bPastSight\b|\bHistoryTrack\b|\bPastInstant\s*\.\s*Craft\b"
     + @"|\busing\s+static\s+Kerbcast\s*\.\s*PastInstant\b|(?<![\w.])Craft\s*\(|\bComposition\b|\bPartRecord\b");
-var ringFiles = new[] { "PicturePass.cs", "LensSights.cs" };
-/* The lock hands the holder's signal speed to the history, which writes to it and reads nothing back; the history's parts at a craft's past instant go from the picture pass to the stand-in built from them. */
+var ringFiles = new[] { "PicturePass.cs", "LensSights.cs", "PictureCull.cs" };
+/* The lock hands the holder's light speed to the history, which writes to it and reads nothing back; the history's parts at a craft's past instant go from the picture pass to the stand-in built from them. */
 var ringPins = new[]
 {
     Pin.Line("KerbcastCore.cs", "KerbcastCore.AppendCosts", "var ring = LightHistoryHost.History;", 1,
         "telemetry reads the history's size and track counts, never a craft's state"),
-    Pin.Line("KerbcastControl.cs", "KerbcastControl.SetSignalSpeedCore", "LightHistoryHost.History.SetSignalSpeed(metresPerSecond);", 1,
-        "the holder's signal speed goes to the history; nothing is read back"),
-    Pin.Line("CommandAuthority.cs", "CommandAuthority.Reset", "if (Lock.SignalSpeed.HasValue) LightHistoryHost.History.SetSignalSpeed(null);", 1,
-        "the signal speed ends with the lock; nothing is read back"),
+    Pin.Line("KerbcastControl.cs", "KerbcastControl.SetLightSpeedCore", "LightHistoryHost.History.SetLightSpeed(metresPerSecond);", 1,
+        "the holder's light speed goes to the history; nothing is read back"),
+    Pin.Line("CommandAuthority.cs", "CommandAuthority.Reset", "if (Lock.LightSpeed.HasValue) LightHistoryHost.History.SetLightSpeed(null);", 1,
+        "the light speed ends with the lock; nothing is read back"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.ShownParts", "public Composition ShownParts { get; private set; }", 1, "the subject's parts at its past instant"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig._modelFailedParts", "private Composition _modelFailedParts;", 1, "parts a stand-in could not be built from, not retried"),
     Pin.Whole("CommandCameraTargetModel.cs", "CommandCameraTargetModel.Parts", "the parts a history-built stand-in shows"),
@@ -94,6 +95,7 @@ var ringPins = new[]
     Pin.Whole("CommandCameraTargetModel.cs", "CommandCameraTargetModel.ComOf", "the point a history-built stand-in hangs from"),
     Pin.Whole("CommandCameraTargetModel.cs", "CommandCameraTargetModel.Update", "a history-built stand-in's parts changing"),
     Pin.Whole("CommandCameraTargetModel.cs", "CommandCameraTargetModel.Build", "builds a stand-in from the history's parts"),
+    Pin.Whole("PictureStandIns.cs", "StandIns.For", "a camera's shared stand-in, shown with the history's parts at the craft's past instant"),
 };
 
 /* The picture's state, and knowledge's. */
@@ -105,6 +107,7 @@ var truthFiles = new Dictionary<string, string>
     ["TruthFixSource.cs"] = "the truth fix source: knowledge read from KSP, including choosing the default subject",
     ["DrawnSubject.cs"] = "the picture's subject: where the craft is drawn",
     ["CommandCameraTargetModel.cs"] = "the picture's stand-in model, built from the saved record while the craft is drawn live, or from the history's parts at its past instant",
+    ["PictureHiding.cs"] = "the picture: which loaded craft a camera hides beyond the boundary, switching their renderers and lights off",
 };
 
 /* Members allowed to read truth whole, and single pinned lines. */
@@ -148,6 +151,7 @@ var truthPins = new[]
     Pin.Line("CommandCameraProvider.cs", "Feed.ResolveCreated", "if (_site.HasVantage && _site.Vantage.loaded)", 1,
         "warns that a created lens sits inside its own loaded craft"),
     Pin.Line("CommandCameraMarker.cs", "CommandCameraMarker.Place", "_go.transform.position = new Vector3((float)p.X, (float)p.Y, (float)p.Z);", 1, "places the marker object, not a craft read"),
+    Pin.Line("PicturePass.cs", "PicturePass.BeforeScaledLayer", "_afgBlock.SetVector(AfgOffsetId, b.afg.transform.position);", 1, "a moved body's atmosphere shell"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SyncScaledPose", "t.position = ScaledSpace.LocalToScaledSpace(near.transform.position);", 1, "the lens's own layer cameras"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AfgInputsFor", "var lhs = afg.planet.scaledBody.transform.position - camPos;", 1, "a body's scaled mesh"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AfgInputsFor", "? Mathf.Clamp01(Vector3.Dot(lhs, camPos - sun.scaledBody.transform.position) * afg.dawnFactor)", 1, "the Sun's scaled mesh"),
@@ -165,6 +169,8 @@ var truthPins = new[]
 var picturePins = new[]
 {
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.ForgetDrawn", "picture"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.IsDrawnSunlit", "picture: sunlight on the drawn craft past the bodies where the camera draws them"),
+    Pin.Whole("CommandCameraOcclusion.cs", "CommandCameraOcclusion.FindDrawnOccluder", "picture: occlusion by the bodies where a camera draws them"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.LocateDrawn", "picture"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.SolveDrawn", "picture: the drawn craft's distance, occlusion and light"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.DrawnOrAim", "picture, for the target log"),
@@ -173,6 +179,10 @@ var picturePins = new[]
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.PlaceDrawn", "picture: radius, stand-in model"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.FinishDrawn", "picture: sub-pixel camera, clip plan, marker"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.EnsureModel", "picture: the stand-in model"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.DecideStandIn", "picture: marker or model for the drawn craft, and the model placed"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.SubjectSizeM", "picture: the drawn craft's size, from its stand-in model or recorded parts"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.ModelMatches", "picture: whether the stand-in model is the drawn craft's"),
+    Pin.Whole("CommandCameraMath.cs", "CommandCameraMath.SubjectSizeM", "picture: the size a rig judges its drawn craft's stand-in by"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.UpdateSubpixel", "picture: the stand-in drawn through the sub-pixel camera"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._standIn", "picture field: the stand-in model"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.Dispose", "_standIn?.Dispose();", 1, "teardown"),
@@ -227,6 +237,16 @@ var picturePins = new[]
         "the projector is picture: every camera marks a craft where its picture draws it"),
     Pin.Line("KerbcastCore.cs", "KerbcastCore.AppendCosts", "sb.Append($\"      \\\"pictureLenses\\\": {PicturePass.LensCount},\\n\");", 1,
         "telemetry reports how many lenses the picture keeps sights for"),
+    Pin.Line("AnchorProjector.cs", "AnchorProjector.TryProject", "if (f.Cam.Picture.TryHiddenPart(a.Part, out world, out var turned, out radius))", 1,
+        "the projector is picture: a part a hidden craft carried is marked on its stand-in"),
+    Pin.Line("AnchorProjector.cs", "AnchorProjector.TryProject", "if (f.Cam.Picture.Hides(part.vessel)) return false;", 1,
+        "the projector is picture: a part of a craft the camera hides is marked on its stand-in"),
+    Pin.Line("AnchorProjector.cs", "AnchorProjector.TryProject", "if (rt != null && !f.Cam.Picture.Hides(ignoreVessel))", 1,
+        "the projector is picture: a hidden craft's axes turn with its stand-in"),
+    Pin.Line("AnchorProjector.cs", "AnchorProjector.TryProject", "else if (rt != null && f.Cam.Picture.TryCarry(pid, ToD(ignoreVessel.CoMD), ignoreVessel.transform.rotation, out _, out var turn))", 1,
+        "the projector is picture: a hidden craft's axes turn with its stand-in"),
+    Pin.Line("AnchorProjector.cs", "AnchorProjector.Hidden", "if (f.Cam.Picture.Hides(part.vessel)) continue;", 1,
+        "the projector is picture: a craft the camera hides does not occlude where the frame does not draw it"),
     Pin.Line("CommandCameraProvider.cs", "Feed.Enumerate", "var drawn = new DrawnSubject(_selection, _track, cam.Picture);", 1, "wiring: each rig gets a fresh picture, drawn through its camera's picture pass"),
 };
 
@@ -239,8 +259,10 @@ var knowledgeInPicturePins = new[]
     Pin.Line("DrawnSubject.cs", "DrawnSubject._selection", "private readonly SubjectSelection _selection;", 1, "the picture draws the craft the selection resolved to"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.DrawnSubject", "public DrawnSubject(SubjectSelection selection, SubjectTrack truth, PicturePass picture)", 1, "the picture draws the craft the selection resolved to"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.DrawnSubject", "_selection = selection;", 1, "the picture draws the craft the selection resolved to"),
-    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SolveDrawn", "_drawnOccluded = Occluded;", 1, "a craft drawn at the aim is seen as the aim's readings say"),
-    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SolveDrawn", "_drawnSunlit = Sunlit;", 1, "a craft drawn at the aim is seen as the aim's readings say"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SolveDrawn", "_drawnOccluded = moved ? _occlusion.FindDrawnOccluder(_cam.Picture, station, _drawnPos, out _, _drawn.Radius) != null : Occluded;", 1,
+        "a craft drawn at the aim is seen as the aim's readings say, while every body is drawn where it is"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SolveDrawn", "_drawnSunlit = moved ? IsDrawnSunlit(_drawnPos) : Sunlit;", 1,
+        "a craft drawn at the aim is seen as the aim's readings say, while every body is drawn where it is"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.PlaceDrawn", "Lit = drawnOk ? _drawnSunlit : Sunlit,", 1, "with no craft drawn, the layers are planned around the aim"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.TryLocate", "bool missing = pid == _missingPid && _selection.Version == _missingVersion;", 1, "a craft the picture could not find is not looked for again until the request changes"),
     Pin.Line("DrawnSubject.cs", "DrawnSubject.TryLocate", "_missingVersion = _selection.Version;", 1, "a craft the picture could not find is not looked for again until the request changes"),
@@ -263,7 +285,7 @@ Check(Directory.Exists(pluginDir), $"plugin source found at {pluginDir}");
 var extraFiles = new[] { "KerbcastControl.cs", "KerbcastCore.cs", "AnchorProjector.cs", "KerbcastApiImpl.cs" };
 bool InScope(string file) =>
     file.StartsWith("Command", StringComparison.Ordinal) || extraFiles.Contains(file)
-    || new[] { "IFixSource.cs", "TruthFixSource.cs", "DrawnSubject.cs", "PicturePass.cs", "LensSights.cs", "SubjectTrack.cs", "SubjectSelection.cs", "CraftFixState.cs",
+    || new[] { "IFixSource.cs", "TruthFixSource.cs", "DrawnSubject.cs", "PicturePass.cs", "PictureHiding.cs", "PictureStandIns.cs", "PictureCull.cs", "LensSights.cs", "SubjectTrack.cs", "SubjectSelection.cs", "CraftFixState.cs",
         "ProviderFixSource.cs", "WorldModelStore.cs", "WorldModelSnapshot.cs", "Kinematics.cs", "KinematicsWorld.cs" }.Contains(file);
 
 var scoped = Directory.Exists(pluginDir)
@@ -326,11 +348,11 @@ var lightTime = File.Exists(hostPath)
 var lightTimeMembers = lightTime.Success
     ? Regex.Matches(lightTime.Groups["body"].Value, @"\b(public|internal)\b[^;{]*?\b(?<name>\w+)\s*(=>|\{|\(|;|=)").Select(m => m.Groups["name"].Value).ToList()
     : new List<string>();
-Check(lightTimeMembers.Count == 1 && lightTimeMembers[0] == "SignalSpeed"
-    && Regex.IsMatch(lightTime.Groups["body"].Value, @"public\s+static\s+double\?\s+SignalSpeed\s*=>"),
-    $"LightTime exposes only the signal speed ({string.Join(", ", lightTimeMembers)})");
+Check(lightTimeMembers.Count == 1 && lightTimeMembers[0] == "LightSpeed"
+    && Regex.IsMatch(lightTime.Groups["body"].Value, @"public\s+static\s+double\?\s+LightSpeed\s*=>"),
+    $"LightTime exposes only the light speed ({string.Join(", ", lightTimeMembers)})");
 
-var pictureFiles = new[] { "DrawnSubject.cs", "PicturePass.cs", "LensSights.cs", "CommandCameraTargetModel.cs" };
+var pictureFiles = new[] { "DrawnSubject.cs", "PicturePass.cs", "PictureHiding.cs", "PictureStandIns.cs", "PictureCull.cs", "LensSights.cs", "CommandCameraTargetModel.cs" };
 var pictureResult = Policy.Apply(sources.Values, new[] { pictureTokens }, pictureFiles, picturePins, _ => true);
 foreach (var u in pictureResult.Unexpected) Console.WriteLine("     picture state outside the picture: " + u);
 Check(pictureResult.Unexpected.Count == 0, $"knowledge code reads no picture state ({pictureResult.Unexpected.Count} found)");
@@ -338,9 +360,9 @@ foreach (var stale in pictureResult.Stale) Console.WriteLine("     stale picture
 Check(pictureResult.Stale.Count == 0, $"every picture pin still matches its code ({pictureResult.Stale.Count} stale)");
 
 var pictureProbe = Policy.Apply(new[] { new Source("CommandCameraRig.cs",
-        "namespace K { class C { void M() {\nvar s = _cam.Picture.Locate(1, out var w, out var r);\nPicturePass.TryCraftPoint(v, 0, out var p, out _);\n} } }") },
+        "namespace K { class C { void M() {\nvar s = _cam.Picture.Locate(1, out var w, out var r);\nPicturePass.TryCraftPoint(v, 0, out var p, out _);\nvar o = _occlusion.FindDrawnOccluder(_cam.Picture, a, b, out _);\n} } }") },
     new[] { pictureTokens }, pictureFiles, picturePins, _ => true);
-Check(pictureProbe.Unexpected.Count == 2, "self-test: knowledge code reading the picture pass is caught");
+Check(pictureProbe.Unexpected.Count == 3, "self-test: knowledge code reading the picture pass is caught");
 
 /* KerbcastCamera is not scanned for truth, but its onboard tracking reads the picture, and only there. */
 string cameraPath = Path.Combine(pluginDir, "KerbcastCamera.cs");
@@ -394,7 +416,8 @@ static class Rules
         var names = members.Concat(new[] { "TryLocateVessel", "AddOwnAnchors" }).Distinct().ToList();
         return new Rule("picture state",
             @"\b_drawn\w*\b|\bDrawnSubject\b|\bDrawnPlan\b|\b(TrueOffsetPx|TrueVisible)\b"
-            + @"|\bPicture\s*\.\s*(Locate|TrySee|TrySeeSubject|Drawn|Place)\b|\bPicturePass\s*\.|\bLensSights\b|\bPictureLens\s*\.\s*OnCraft\b|\b_standIn\b|\bCommandCameraTargetModel\b"
+            + @"|\bPicture\s*\.\s*(Locate|TrySee|TrySeeSubject|Drawn|Place|MovesBodies|TryDrawnBody|Hides|RigDraws|TryCarry|TryHiddenPart)\b|\bFindDrawnOccluder\b|\bPicturePass\s*\.|\bLensSights\b|\bPictureLens\s*\.\s*OnCraft\b|\b_standIn\b|\bCommandCameraTargetModel\b"
+            + @"|\b(CraftHider|CraftStandIns|LoadedCraft|LooseWorld|StandIns|HideCost|PictureBoundary)\b"
             + @"|\b(" + string.Join("|", names) + @")\s*\(");
     }
 }

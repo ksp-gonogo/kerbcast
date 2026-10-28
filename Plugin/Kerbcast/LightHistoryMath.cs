@@ -158,7 +158,8 @@ namespace Kerbcast
     }
 
     /* What the ring needs to know of a body. MaxOrbitalSpeed bounds its speed
-       about its parent; zero for the root. */
+       about its parent; zero for the root. PeriapsisM is the nearest its orbit
+       comes to its parent, zero where that is not known. */
     internal struct HistoryBody
     {
         public int Index;
@@ -167,6 +168,7 @@ namespace Kerbcast
         public double Radius;
         public double SoiRadius;
         public double MaxOrbitalSpeed;
+        public double PeriapsisM;
     }
 
     internal static class LightHistoryMath
@@ -372,8 +374,8 @@ namespace Kerbcast
         }
 
         /* Seconds of history a lens can need: the longest distance between two
-           points in the system over the signal speed. */
-        public static double HorizonS(double systemDiameterM, double signalSpeed) =>
-            signalSpeed > 0 ? systemDiameterM / signalSpeed : double.PositiveInfinity;
+           points in the system over the light speed. */
+        public static double HorizonS(double systemDiameterM, double lightSpeed) =>
+            lightSpeed > 0 ? systemDiameterM / lightSpeed : double.PositiveInfinity;
     }
 }

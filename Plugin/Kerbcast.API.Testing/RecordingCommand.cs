@@ -6,7 +6,7 @@ namespace Kerbcast.Api.Testing
     /**
      * <summary>
      * The command lock, aims and world model as a test sees them. It applies the API's documented
-     * rules (one lock owner, owner-only aims and signal speed, a publisher only for the holder, ordered
+     * rules (one lock owner, owner-only aims and light speed, a publisher only for the holder, ordered
      * sequences, epochs per lock tenure, fail-closed dispose) and nothing of Kerbcast's rendering.
      * Real-time silence is not simulated.
      * </summary>
@@ -43,8 +43,8 @@ namespace Kerbcast.Api.Testing
         public string ReservedOwner { get; private set; }
         public string ReservedAssembly { get; private set; }
 
-        /** <summary>The holder's signal speed; null (no delay) until set, and again after the lock is released or the scene changes.</summary> */
-        public double? SignalSpeed { get; private set; }
+        /** <summary>The holder's light speed; null (no delay) until set, and again after the lock is released or the scene changes.</summary> */
+        public double? LightSpeed { get; private set; }
 
         /** <summary>Owner calls since the lock was taken, each one a heartbeat.</summary> */
         public int Heartbeats { get; private set; }
@@ -262,15 +262,15 @@ namespace Kerbcast.Api.Testing
             ReservedAssembly = null;
         }
 
-        public bool SetSignalSpeed(string owner, double? metresPerSecond)
+        public bool SetLightSpeed(string owner, double? metresPerSecond)
         {
-            kc.Enter("SetSignalSpeed", ApiFeature.SignalSpeed);
+            kc.Enter("SetLightSpeed", ApiFeature.LightSpeed);
             if (metresPerSecond.HasValue && !(Vec3d.Finite(metresPerSecond.Value) && metresPerSecond.Value > 0))
                 throw new ArgumentOutOfRangeException(nameof(metresPerSecond), metresPerSecond, "must be finite and positive, or null");
-            kc.Record($"SetSignalSpeed {owner} {metresPerSecond?.ToString() ?? "null"}");
+            kc.Record($"SetLightSpeed {owner} {metresPerSecond?.ToString() ?? "null"}");
             if (owner == null || LockOwner != owner) return false;
             Heartbeats++;
-            SignalSpeed = metresPerSecond;
+            LightSpeed = metresPerSecond;
             return true;
         }
 
@@ -334,7 +334,7 @@ namespace Kerbcast.Api.Testing
         {
             aims.Clear();
             Heartbeats = 0;
-            SignalSpeed = null;
+            LightSpeed = null;
             LockOptions = LockOptions.None;
             SilentText = null;
             ReturnedToTruth = false;

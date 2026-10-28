@@ -58,6 +58,8 @@ namespace Kerbcast
         private readonly Dictionary<uint, KeyValuePair<float, double>> _partRadii = new Dictionary<uint, KeyValuePair<float, double>>();
         private readonly List<DVec3> _partScratch = new List<DVec3>();
         private bool _failLogged;
+        private DVec3[] _bodyCentres;
+        private double[] _bodyRadii;
 
         public AnchorProjector(uint flightId)
         {
@@ -102,9 +104,10 @@ namespace Kerbcast
         {
             var registry = KerbcastCore.Instance != null ? KerbcastCore.Instance.Anchors : null;
             var rig = cam.Rig as IAnchorRig;
-            if (registry != null) registry.ForCamera(_flightId, _anchors);
-            else _anchors.Clear();
+            /* Kerbcast's own anchors go first, so however many others a camera carries they are never cut at the frame's cap. */
+            _anchors.Clear();
             rig?.AddOwnAnchors(_anchors);
+            registry?.AddForCamera(_flightId, _anchors);
             if (_anchors.Count == 0 || width <= 0 || height <= 0) return;
 
             try
@@ -136,10 +139,12 @@ namespace Kerbcast
                 bool locked = auth != null && auth.Registered;
                 var policy = locked ? auth.BrowserAnchorPolicy(_flightId) : AnchorPolicy.Full;
 
+                int bodyCount = cam.Picture.DrawnBodies(ref _bodyCentres, ref _bodyRadii);
                 var frame = new Frame
                 {
                     Cam = cam, Rig = rig, Registry = registry, Eye = eye, Forward = forward, Up = up,
                     M00 = m00, M11 = m11, M02 = m02, M12 = m12, Width = width, Height = height, Fov = fov,
+                    BodyCentres = _bodyCentres, BodyRadii = _bodyRadii, BodyCount = bodyCount,
                 };
                 for (int i = 0; i < _anchors.Count && _results.Count < MaxAnchorsPerFrame; i++)
                 {
@@ -171,6 +176,10 @@ namespace Kerbcast
             public double M00, M11, M02, M12;
             public int Width, Height;
             public double Fov;
+            /* Each body where the picture draws it (PicturePass.DrawnBodies). */
+            public DVec3[] BodyCentres;
+            public double[] BodyRadii;
+            public int BodyCount;
         }
 
         /* An observed anchor always gets its occlusion tested: what the picture
@@ -190,11 +199,30 @@ namespace Kerbcast
             {
                 case AnchorKind.Part:
                 {
-                    if (!FlightGlobals.FindLoadedPart(a.Part, out var part) || part == null || part.transform == null) return false;
-                    var basis = DockingFace(part) ?? part.transform;
                     var offset = new Vector3((float)a.OffsetX, (float)a.OffsetY, (float)a.OffsetZ);
-                    world = ToD(basis.position) + ToD(basis.rotation * offset);
+                    /* A part a hidden craft carried as its light shows it is marked where
+                       that craft's stand-in draws it, whatever has become of it since. */
+                    if (f.Cam.Picture.TryHiddenPart(a.Part, out world, out var turned, out radius))
+                    {
+                        /* A docking port's face keeps its pose on the part, carried with it. */
+                        var face = HiddenPartFace(a.Part, out var faceAt, out var faceTurn);
+                        if (face)
+                        {
+                            world = world + ToD(turned * faceAt);
+                            turned = turned * faceTurn;
+                        }
+                        world = world + ToD(turned * offset);
+                        axisForward = ToD(turned * (face ? Vector3.forward : Vector3.up));
+                        axisUp = ToD(turned * (face ? Vector3.up : Vector3.back));
+                        hasAxes = true;
+                        break;
+                    }
+                    if (!FlightGlobals.FindLoadedPart(a.Part, out var part) || part == null || part.transform == null) return false;
+                    if (f.Cam.Picture.Hides(part.vessel)) return false;
                     radius = PartRadius(part);
+                    ignorePart = part;
+                    var basis = DockingFace(part) ?? part.transform;
+                    world = ToD(basis.position) + ToD(basis.rotation * offset);
                     if (basis != part.transform)
                     {
                         axisForward = ToD(basis.forward);
@@ -206,7 +234,6 @@ namespace Kerbcast
                         axisUp = ToD(-part.transform.forward);
                     }
                     hasAxes = true;
-                    ignorePart = part;
                     break;
                 }
                 case AnchorKind.Vessel:
@@ -234,10 +261,17 @@ namespace Kerbcast
                         }
                     }
                     var rt = ignoreVessel != null && ignoreVessel.loaded ? ignoreVessel.ReferenceTransform : null;
-                    if (rt != null)
+                    if (rt != null && !f.Cam.Picture.Hides(ignoreVessel))
                     {
                         axisForward = ToD(rt.up);
                         axisUp = ToD(-rt.forward);
+                        hasAxes = true;
+                    }
+                    else if (rt != null && f.Cam.Picture.TryCarry(pid, ToD(ignoreVessel.CoMD), ignoreVessel.transform.rotation, out _, out var turn))
+                    {
+                        /* A hidden craft's axes turn with its stand-in. */
+                        axisForward = ToD(turn * rt.up);
+                        axisUp = ToD(turn * -rt.forward);
                         hasAxes = true;
                     }
                     break;
@@ -245,18 +279,18 @@ namespace Kerbcast
                 case AnchorKind.Surface:
                 {
                     var body = FlightGlobals.GetBodyByName(a.Body);
-                    if (body == null) return false;
-                    world = ToD(body.GetWorldSurfacePosition(a.Latitude, a.Longitude, a.Altitude));
+                    if (body == null || f.Cam.Picture.HidesBody(body)) return false;
+                    world = OnDrawnBody(f.Cam.Picture, body, ToD(body.GetWorldSurfacePosition(a.Latitude, a.Longitude, a.Altitude)));
                     break;
                 }
                 case AnchorKind.Kinematic:
                 {
-                    if (!TryKinematic(a, f.Eye, out world)) return false;
+                    if (!TryKinematic(a, f.Eye, f.Cam.Picture, out world)) return false;
                     break;
                 }
                 case AnchorKind.Direction:
                 {
-                    if (!TryDirection(a, f.Registry, out var dir)) return false;
+                    if (!TryDirection(a, f.Registry, f.Cam.Picture, out var dir)) return false;
                     var dp = CommandCameraMath.ProjectCameraSpace(CommandCameraMath.ToCameraSpace(dir, f.Forward, f.Up),
                         f.M00, f.M11, f.M02, f.M12, f.Width, f.Height);
                     r = Result(owner, a, dp, double.NaN, 0);
@@ -264,7 +298,7 @@ namespace Kerbcast
                     if (a.Occlusion || observed)
                     {
                         r.HasOcclusion = true;
-                        r.Occluded = Hidden(f, f.Eye + dir * 1e13, null, null, false);
+                        r.Occluded = Hidden(f, f.Eye + dir * 1e13, null, null, true, false);
                     }
                     return true;
                 }
@@ -283,9 +317,11 @@ namespace Kerbcast
             if (a.Occlusion || observed)
             {
                 r.HasOcclusion = true;
-                /* The rig's own test covers bodies and terrain; buildings and other
-                   colliders near the lens still need the physics ray. */
-                r.Occluded = (occlusionKnown && occluded) || Hidden(f, world, ignorePart, ignoreVessel, true);
+                /* The rig's own test covers bodies, where the picture draws them, and terrain;
+                   buildings and other colliders near the lens still need the physics ray. */
+                r.Occluded = occlusionKnown
+                    ? occluded || Hidden(f, world, ignorePart, ignoreVessel, false, true)
+                    : Hidden(f, world, ignorePart, ignoreVessel, true, true);
             }
             return true;
         }
@@ -306,14 +342,16 @@ namespace Kerbcast
 
         /*
          * A kinematic anchor's point this frame, propagated as a world model's
-         * records are. With a signal speed set, a conic or state vector is
+         * records are. With a light speed set, a conic or state vector is
          * where the light arriving at the lens now left it, solved in the frame
          * of the lens's and the point's common body as the known subject is;
          * a surface point stays on the body as drawn (AnchorRules.PlacedAtLightInstant).
-         * Otherwise at the render UT. Placed on its body's present position, as a known craft is.
+         * Otherwise at the render UT. Placed as the picture draws a craft:
+         * against a body drawn at its past instant, or left out, at its own
+         * past place in the solve's frame; otherwise on the body as drawn.
          * Caller-supplied knowledge, so nothing about any craft is read.
          */
-        private static bool TryKinematic(AnchorSpec a, DVec3 eye, out DVec3 world)
+        private static bool TryKinematic(AnchorSpec a, DVec3 eye, PicturePass picture, out DVec3 world)
         {
             world = default;
             var body = FlightGlobals.GetBodyByName(a.Body);
@@ -336,7 +374,7 @@ namespace Kerbcast
             var zup = kinematics.Zup;
             double ut = Planetarium.GetUniversalTime();
             double at = ut;
-            double? c = LightTime.SignalSpeed;
+            double? c = LightTime.LightSpeed;
             if (c.HasValue && AnchorRules.PlacedAtLightInstant(a.Motion))
             {
                 var lensBody = FlightGlobals.getMainBody(new Vector3d(eye.X, eye.Y, eye.Z));
@@ -350,10 +388,24 @@ namespace Kerbcast
                 if (PastInstant.Solve(ref path, eye - ToD(frameBody.position), ut, c.Value,
                         CommandCameraForecast.SpeedBound(motion, frameBody), double.NegativeInfinity, ut, out at) != PastStatus.Found)
                     return false;
+                if (picture.HidesBody(body) || picture.TryDrawnBody(body, out _, out _))
+                {
+                    if (!path.TryAt(at, out var about)) return false;
+                    world = ToD(frameBody.position) + about;
+                    return true;
+                }
             }
+            else if (c.HasValue && picture.HidesBody(body)) return false;
             if (!KinematicAt(a, kb, at, out var rel)) return false;
-            world = ToD(body.position) + zup.ToWorld(rel);
+            world = OnDrawnBody(picture, body, ToD(body.position) + zup.ToWorld(rel));
             return true;
+        }
+
+        /* A point fixed to body `b`, carried from where it is now to where this camera draws it: on the body at its past instant, turned back by its spin. */
+        private static DVec3 OnDrawnBody(PicturePass picture, CelestialBody b, DVec3 live)
+        {
+            if (!picture.TryDrawnBody(b, out var centre, out double dt)) return live;
+            return CommandCameraMath.CarriedByBody(live - ToD(b.position), centre, CommandCameraOcclusion.Spin(b), dt);
         }
 
         /* A kinematic anchor's offset from its body's centre at `ut`, in KSP's fixed frame. */
@@ -387,6 +439,21 @@ namespace Kerbcast
             }
         }
 
+
+        /* Where a docking port's face sits on part `partPid`, in the part's frame, from the live part; false for a part with no port or none loaded. */
+        private static bool HiddenPartFace(uint partPid, out Vector3 at, out Quaternion turn)
+        {
+            at = Vector3.zero;
+            turn = Quaternion.identity;
+            if (!FlightGlobals.FindLoadedPart(partPid, out var part) || part == null || part.transform == null) return false;
+            var face = DockingFace(part);
+            if (face == null) return false;
+            var inv = Quaternion.Inverse(part.transform.rotation);
+            at = inv * (face.position - part.transform.position);
+            turn = inv * face.rotation;
+            return true;
+        }
+
         /* A docking port's face: its node transform, which faces out of the port. */
         private static Transform DockingFace(Part part)
         {
@@ -400,7 +467,7 @@ namespace Kerbcast
          * of Orbit.getRelativePositionAtUT (z up), turned to world space with
          * the same xzy swizzle Orbit.getPositionAtUT uses.
          */
-        private static bool TryDirection(AnchorSpec a, AnchorRegistry registry, out DVec3 dir)
+        private static bool TryDirection(AnchorSpec a, AnchorRegistry registry, PicturePass picture, out DVec3 dir)
         {
             dir = default;
             if (a.HasVector)
@@ -412,10 +479,11 @@ namespace Kerbcast
             if (a.Vessel != 0) FlightGlobals.FindVessel(registry != null ? registry.Resolve(a.Vessel) : a.Vessel, out v);
             else v = FlightGlobals.ActiveVessel;
             if (v == null) return false;
-            /* Under a signal speed an unloaded craft is drawn at its past instant,
+            /* Under a light speed an unloaded craft is drawn at its past instant,
                and its directions read here are present truth: withheld. */
-            bool delayed = LightTime.SignalSpeed.HasValue;
+            bool delayed = LightTime.LightSpeed.HasValue;
             if (delayed && !v.loaded) return false;
+            if (picture.Hides(v)) return false;
             var o = v.orbit;
             DVec3 at = ToD(v.packed ? v.GetWorldPos3D() : v.CoMD);
             switch (a.Direction)
@@ -465,6 +533,7 @@ namespace Kerbcast
                     var target = v.targetObject;
                     if (target == null || target.GetTransform() == null) return false;
                     if (delayed && target.GetVessel() != null && !target.GetVessel().loaded) return false;
+                    if (picture.Hides(target.GetVessel())) return false;
                     dir = ToD(target.GetTransform().position) - at;
                     break;
                 }
@@ -473,6 +542,7 @@ namespace Kerbcast
                     var target = v.targetObject;
                     if (target == null) return false;
                     if (delayed && target.GetVessel() != null && !target.GetVessel().loaded) return false;
+                    if (picture.Hides(target.GetVessel())) return false;
                     dir = ToD(v.obt_velocity) - ToD(target.GetObtVelocity());
                     break;
                 }
@@ -485,21 +555,12 @@ namespace Kerbcast
         }
 
         /* Whether a body, terrain or a collider stands between the lens and
-           `point`. Bodies count at any range, as spheres; colliders only near
-           the lens, where physics has them, never counting the thing marked or
-           the camera's own part. */
-        private static bool Hidden(Frame f, DVec3 point, Part ignorePart, Vessel ignoreVessel, bool physics)
+           `point`. Bodies count at any range, as spheres where the picture
+           draws them; colliders only near the lens, where physics has them,
+           never counting the thing marked or the camera's own part. */
+        private static bool Hidden(Frame f, DVec3 point, Part ignorePart, Vessel ignoreVessel, bool bodies, bool physics)
         {
-            var bodies = FlightGlobals.Bodies;
-            if (bodies != null)
-            {
-                for (int i = 0; i < bodies.Count; i++)
-                {
-                    var b = bodies[i];
-                    if (b == null) continue;
-                    if (!CommandCameraMath.SegmentClearOfSphere(f.Eye, point, ToD(b.position), b.Radius * (1.0 - 1e-7))) return true;
-                }
-            }
+            if (bodies && DrawnSpheres.Blocked(f.Eye, point, f.BodyCentres, f.BodyRadii, f.BodyCount)) return true;
             var d = point - f.Eye;
             double dist = d.Magnitude;
             if (!physics || dist <= RayStopShortM || dist > PhysicsRayMaxM) return false;
@@ -514,6 +575,8 @@ namespace Kerbcast
                 if (part != null)
                 {
                     if (part == ignorePart || (ignoreVessel != null && part.vessel == ignoreVessel) || f.Cam.OwnsPart(part)) continue;
+                    /* A craft this camera hides is not where the frame draws it. */
+                    if (f.Cam.Picture.Hides(part.vessel)) continue;
                 }
                 return true;
             }

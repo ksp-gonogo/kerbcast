@@ -31,7 +31,7 @@ namespace Kerbcast
         /* The world model's own code and words for a "refused" subject. */
         public string RefusalCode;
         public string RefusalText;
-        /* The instant the subject's known position is taken at: render UT, or its past instant under a signal speed. */
+        /* The instant the subject's known position is taken at: render UT, or its past instant under a light speed. */
         public double SubjectUt;
         /* Where knowledge came from: "truth", "waiting", "model" or "stale". */
         public string WorldModel;

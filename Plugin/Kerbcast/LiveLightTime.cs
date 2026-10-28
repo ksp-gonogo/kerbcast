@@ -28,10 +28,10 @@ namespace Kerbcast
             public ModuleParachute Parachute;
         }
 
-        /* The live bound of a frame from a lens at `lens` on `craft` (null for none, such as a ground site). 0 with no signal speed. */
+        /* The live bound of a frame from a lens at `lens` on `craft` (null for none, such as a ground site). 0 with no light speed. */
         public static double For(Vector3d lens, Vessel craft)
         {
-            double? c = LightTime.SignalSpeed;
+            double? c = LightTime.LightSpeed;
             if (!c.HasValue) return 0;
             if (!KerbcastSettings.EnableTelemetry) return CommandCameraMath.LiveLightTimeS(c, FarthestPartM(lens, craft));
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -40,10 +40,11 @@ namespace Kerbcast
             return bound;
         }
 
-        /* The boundary distance the picture works to; NaN with no signal speed. */
-        public static double BoundaryM => CommandCameraMath.BoundaryM(LightTime.SignalSpeed);
+        /* The boundary distance the picture works to; NaN with no light speed. */
+        public static double BoundaryM => CommandCameraMath.BoundaryM(LightTime.LightSpeed);
 
-        private static double FarthestPartM(Vector3d lens, Vessel craft)
+        /* The farthest reach of any part of `craft` from `lens`, moving parts measured as they are now. */
+        internal static double FarthestPartM(Vector3d lens, Vessel craft)
         {
             if (craft == null || !craft.loaded || craft.parts == null) return 0;
             s_origins.Clear();

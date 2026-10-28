@@ -876,7 +876,7 @@ pub enum AnchorKinematicsKind {
 }
 
 /// A `kinematic` anchor's motion about one body. `kind` says which fields
-/// apply. With a signal speed set, the point is placed where the light
+/// apply. With a light speed set, the point is placed where the light
 /// reaching the lens left it.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1138,7 +1138,7 @@ pub struct FrameCommandState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_text: Option<String>,
     /// The instant the subject's known position is taken at: the frame's
-    /// UT, or the subject's past instant under a signal speed.
+    /// UT, or the subject's past instant under a light speed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ut: Option<f64>,
     /// Where the knowledge came from: `truth`, `waiting`, `model` or `stale`.
@@ -1461,18 +1461,18 @@ pub struct FrameStampPayload {
     /// The frame's live bound in seconds: the light time covering what of
     /// the lens's own craft and site it draws at `capture_ut`, the larger of
     /// one 60 fps frame and the light time to the lens's own farthest part.
-    /// 0 with no signal speed. Other loaded craft near the lens are still
+    /// 0 with no light speed. Other loaded craft near the lens are still
     /// drawn at `capture_ut` and are not covered yet; once craft beyond the
     /// boundary are hidden, the bound covers everything drawn at
     /// `capture_ut`. A delayed viewer releases the frame no sooner than
     /// `capture_ut` plus this plus its own delay from the lens. Absent when
     /// the game could not read it, and from sidecars older than 1.12: under
-    /// a signal speed that is unknown, and the frame is held.
+    /// a light speed that is unknown, and the frame is held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_light_time_s: Option<f64>,
-    /// How far light travels in one 60 fps frame at the signal speed: craft
+    /// How far light travels in one 60 fps frame at the light speed: craft
     /// nearer the lens than this are drawn at `capture_ut`, farther ones at
-    /// their own past instant. Absent with no signal speed.
+    /// their own past instant. Absent with no light speed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary_m: Option<f64>,
     /// A command camera's state in this frame. Only for a client that asked

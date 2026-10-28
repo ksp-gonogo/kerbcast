@@ -113,6 +113,25 @@ namespace Kerbcast
             return null;
         }
 
+        /* The picture's FindOccluder: the first body hiding `target` from
+           `station` with each body where `picture` draws it, at its past
+           instant and turned back by its spin, and none the picture leaves
+           out. For what a frame shows, never for what the camera knows. */
+        public string FindDrawnOccluder(PicturePass picture, DVec3 station, DVec3 target, out string source, double targetRadius = 0)
+        {
+            source = null;
+            var bodies = FlightGlobals.Bodies;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null || picture.HidesBody(b)) continue;
+                var c = ToD(b.position);
+                var at = picture.TryDrawnBody(b, out var drawn, out double dt) ? drawn : c;
+                if (Blocks(b, station, target, at, c, Spin(b), dt, out source, targetRadius)) return b.bodyName;
+            }
+            return null;
+        }
+
         public static DVec3 Spin(CelestialBody b) => b.rotates ? ToD(b.angularVelocity) : default;
 
         /* Farthest any drawn surface of the body reaches from its centre. */

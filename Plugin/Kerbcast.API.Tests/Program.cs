@@ -38,7 +38,7 @@ Check(KerbcastApi.Instance == null, "Instance is null without Kerbcast");
 Check(KerbcastApi.ApiMinor == 0, "ApiMinor is 0 for API 1.0");
 Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(ApiFeature.CraftIdentity)
     && KerbcastApi.Supports(ApiFeature.Throttle) && KerbcastApi.Supports(ApiFeature.CommandFeeds)
-    && KerbcastApi.Supports(ApiFeature.SignalSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
+    && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
     && KerbcastApi.Supports(ApiFeature.CommandAim) && KerbcastApi.Supports(ApiFeature.WorldModel),
     "shipped: every feature of API 1.0");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
@@ -152,11 +152,11 @@ using (var kc = RecordingKerbcast.Install())
     Check(cmd.SetAim(500, Aim.Orbit(1, 0, 0.01, 700000, 0, 0, 0, 0, 42), "modA") == AimResult.Ok
         && kc.Command.Aims[500].Kind == AimKind.Orbit && kc.Command.Aims[500].SemiMajorAxis == 700000, "the holder's aim is kept");
     Check(cmd.Feeds().Single().SiteKey == "KSC" && cmd.Targets(500).Count == 0, "feeds and targets as arranged");
-    Check(Throws<ArgumentOutOfRangeException>(() => cmd.SetSignalSpeed("modA", 0)) && Throws<ArgumentOutOfRangeException>(() => cmd.SetSignalSpeed("modA", double.PositiveInfinity))
-        && kc.Command.SignalSpeed == null, "SetSignalSpeed refuses zero and infinity; no delay until set");
-    Check(!cmd.SetSignalSpeed("modB", 3e8) && kc.Command.SignalSpeed == null, "only the lock holder sets the signal speed");
-    Check(cmd.SetSignalSpeed("modA", 3e8) && kc.Command.SignalSpeed == 3e8, "the holder's signal speed is recorded");
-    Check(cmd.SetSignalSpeed("modA", null) && kc.Command.SignalSpeed == null, "null turns the delay off");
+    Check(Throws<ArgumentOutOfRangeException>(() => cmd.SetLightSpeed("modA", 0)) && Throws<ArgumentOutOfRangeException>(() => cmd.SetLightSpeed("modA", double.PositiveInfinity))
+        && kc.Command.LightSpeed == null, "SetLightSpeed refuses zero and infinity; no delay until set");
+    Check(!cmd.SetLightSpeed("modB", 3e8) && kc.Command.LightSpeed == null, "only the lock holder sets the light speed");
+    Check(cmd.SetLightSpeed("modA", 3e8) && kc.Command.LightSpeed == 3e8, "the holder's light speed is recorded");
+    Check(cmd.SetLightSpeed("modA", null) && kc.Command.LightSpeed == null, "null turns the delay off");
 
     // World model.
     Check(cmd.AttachWorldModel("modB") == null, "AttachWorldModel is null for a non-holder");
@@ -278,10 +278,10 @@ using (var kc = RecordingKerbcast.Install())
 
     var p4 = cmd.AttachWorldModel("modA");
     Check(!kc.Command.ReturnedToTruth, "attaching again after a return to truth governs feeds again");
-    cmd.SetSignalSpeed("modA", 1e6);
+    cmd.SetLightSpeed("modA", 1e6);
     kc.Command.ChangeScene();
     Check(p4.Publish(p4.Begin(1, 0, 0), out _) == PublishResult.SceneChanged && kc.Command.LockOwner == null, "a scene change resets lock and publisher");
-    Check(kc.Command.SignalSpeed == null && kc.Command.SilentText == null && kc.Command.LockOptions == LockOptions.None
+    Check(kc.Command.LightSpeed == null && kc.Command.SilentText == null && kc.Command.LockOptions == LockOptions.None
         && !kc.Command.ReturnedToTruth, "a scene change clears the tenure's state");
     p4.Detach(returnToTruth: true);
     Check(!kc.Command.ReturnedToTruth, "Detach(true) from an earlier scene's publisher changes nothing");
@@ -306,9 +306,9 @@ using (var kc = RecordingKerbcast.Install())
     cmd.ReleaseLock("modB");
     Check(kc.Command.LockOwner == "modA", "only the holder releases");
     var p5 = cmd.AttachWorldModel("modA");
-    cmd.SetSignalSpeed("modA", 1e6);
+    cmd.SetLightSpeed("modA", 1e6);
     cmd.ReleaseLock("modA");
-    Check(kc.Command.SignalSpeed == null, "releasing the lock clears the signal speed");
+    Check(kc.Command.LightSpeed == null, "releasing the lock clears the light speed");
     Check(kc.Command.LockOwner == null && !p5.Attached && p5.Publish(p5.Begin(1, 0, 0), out _) == PublishResult.NotLockHolder,
         "releasing the lock ends the publisher");
 }

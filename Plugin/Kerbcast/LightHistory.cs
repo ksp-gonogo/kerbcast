@@ -108,7 +108,7 @@ namespace Kerbcast
         }
     }
 
-    /* One craft's (or, under Principia, one body's) history. A craft whose id
+    /* One craft's (or one body's, once it leaves its Kepler path) history. A craft whose id
        comes back after its end (a relaunch from the same .craft file) keeps
        this track as a ghost under a key of its own, and a fresh track starts. */
     internal sealed class HistoryTrack
@@ -214,7 +214,7 @@ namespace Kerbcast
        outside any scene. Nothing of it is exposed through a public API; the
        picture reads it to draw what a lens's arriving light shows.
 
-       It runs only while active: a lock holder has a reservation or a signal
+       It runs only while active: a lock holder has a reservation or a light
        speed is set. A player with no holder pays nothing, and each time it
        turns on it starts empty, like a save from before the ring existed,
        unless it holds a save's history and no game time has passed since.
@@ -247,6 +247,8 @@ namespace Kerbcast
 
         private readonly Dictionary<long, HistoryTrack> _tracks = new Dictionary<long, HistoryTrack>();
         private readonly Dictionary<uint, List<HistoryTrack>> _ghosts = new Dictionary<uint, List<HistoryTrack>>();
+        /* Latched for the game, through a rewind or a load, so a body's track stays continuous once it has one. */
+        private readonly HashSet<int> _offKepler = new HashSet<int>();
         private readonly List<long> _scratch = new List<long>();
         private readonly Stack<EntryChunk> _pool = new Stack<EntryChunk>();
         private HistoryBody[] _bodies = new HistoryBody[0];
@@ -257,28 +259,28 @@ namespace Kerbcast
            second trim until the ring has grown well past it. */
         private long _capBlockedAt = -1;
         private bool _reservation;
-        private double? _signalSpeed;
+        private double? _lightSpeed;
 
         /* Raised when time went back and the ring dropped what came after. */
         public event Action<double> Rewound;
 
-        /* The holder's signal speed in m/s, or null when none is set. */
-        public double? SignalSpeed => _signalSpeed;
+        /* The holder's light speed in m/s, or null when none is set. */
+        public double? LightSpeed => _lightSpeed;
         /* The slowest speed set in this game; the horizon under a reservation
            with no speed. The save carries it across loads. */
-        public double? SlowestSignalSpeed { get; private set; }
-        public bool Active => _reservation || _signalSpeed.HasValue;
+        public double? SlowestLightSpeed { get; private set; }
+        public bool Active => _reservation || _lightSpeed.HasValue;
 
         /* The longest distance between a lens and a craft in this system. */
         public double SystemDiameterM { get; set; }
         public long MemoryCapBytes { get; set; } = DefaultMemoryCapBytes;
-        /* Under Principia every craft goes through the tolerance gate and bodies are sampled too. */
-        public bool SampleEverything { get; set; }
+        /* Bodies seen leaving their Kepler paths this session: each keeps a track from then on. */
+        public int BodiesOffKepler => _offKepler.Count;
 
-        /* Switching a slow (scaled) signal on mid-game lengthens the horizon at
+        /* Switching a slow (scaled) light speed on mid-game lengthens the horizon at
            once, but the ring only holds what it sampled since it turned on, so
            the first stretch may have less history than the new horizon. */
-        public double HorizonS => LightHistoryMath.HorizonS(SystemDiameterM, _signalSpeed ?? SlowestSignalSpeed ?? SpeedOfLight);
+        public double HorizonS => LightHistoryMath.HorizonS(SystemDiameterM, _lightSpeed ?? SlowestLightSpeed ?? SpeedOfLight);
         /* The oldest instant the ring can answer for; raised by the horizon and the memory cap. */
         public double FloorUt { get; private set; } = double.NegativeInfinity;
         public double LatestUt => _latestUt;
@@ -290,7 +292,7 @@ namespace Kerbcast
         public static bool IsBodyKey(long key) => key >= BodyKeyBase && key < GhostKeyBase;
 
         /* Every track the cull walks: live craft, ghosts and merged-away craft,
-           and under Principia the bodies (HistoryTrack.IsBody). */
+           and the bodies that left their Kepler paths (HistoryTrack.IsBody). */
         public Dictionary<long, HistoryTrack>.ValueCollection Tracks => _tracks.Values;
 
         /* For KC5: the lock holder has a reservation. */
@@ -301,14 +303,14 @@ namespace Kerbcast
             OnActiveChanged(was);
         }
 
-        /* For KC1's SetSignalSpeed: null clears it. */
-        internal void SetSignalSpeed(double? mps)
+        /* For ICommand.SetLightSpeed: null clears it. */
+        internal void SetLightSpeed(double? mps)
         {
             if (mps.HasValue && !(mps.Value > 0)) mps = null;
             bool was = Active;
-            _signalSpeed = mps;
-            if (mps.HasValue && (!SlowestSignalSpeed.HasValue || mps.Value < SlowestSignalSpeed.Value))
-                SlowestSignalSpeed = mps;
+            _lightSpeed = mps;
+            if (mps.HasValue && (!SlowestLightSpeed.HasValue || mps.Value < SlowestLightSpeed.Value))
+                SlowestLightSpeed = mps;
             OnActiveChanged(was);
         }
 
@@ -431,7 +433,7 @@ namespace Kerbcast
         }
 
         /* One tick's sample through the gate. `gated` is false for a craft on
-           rails without Principia: then only a change of body adds an entry, and
+           rails between its checks: then only a change of body adds an entry, and
            everything else comes from Record. Returns whether an entry was added. */
         public bool Sample(long key, in HistoryState now, bool gated, bool checkAttitude)
         {
@@ -439,7 +441,27 @@ namespace Kerbcast
             return SampleInto(Live(key, now.Ut), now, gated, checkAttitude);
         }
 
-        /* A body under Principia, sampled a tick back for its centred velocity.
+        /*
+         * Body `index` where the game has put it, `s`, and how far, in metres,
+         * it was last seen from where its Kepler orbit as first seen puts it. A
+         * body that departs by more than the position tolerance is latched off
+         * Kepler for the session and sampled through the gate from then on; one
+         * that never departs gets no track and is read from its orbit. Returns
+         * whether an entry was added.
+         */
+        public bool ObserveBody(int index, in HistoryState s, double offKeplerM)
+        {
+            if (!_offKepler.Contains(index))
+            {
+                if (!(offKeplerM > LightHistoryMath.PositionToleranceM)) return false;
+                _offKepler.Add(index);
+            }
+            return SampleBody(index, s);
+        }
+
+        public bool IsOffKepler(int index) => _offKepler.Contains(index);
+
+        /* A body off its Kepler path, sampled a tick back for its centred velocity.
            That UT may be older than the latest event, which is not a rewind. */
         public bool SampleBody(int index, in HistoryState s)
         {
@@ -648,6 +670,14 @@ namespace Kerbcast
             Finish(pid, ut, IdentityKind.Recovered);
         }
 
+        /* A recovery queued at `generation`, dropped when the ring has been cleared or rewound since, so it is never
+           stamped on the timeline a quickload went back to. */
+        public void Recovered(uint pid, double ut, long generation)
+        {
+            if (generation != Generation) return;
+            Recovered(pid, ut);
+        }
+
         /* After a load: every live craft the loaded game does not have ends here. */
         public int EndMissing(HashSet<uint> present, double ut)
         {
@@ -755,7 +785,7 @@ namespace Kerbcast
            starts, before the ring's floor, or after it ended. */
         public bool TryStateAt(uint pid, double ut, out HistoryState state) => TryStateAt(TrackFor(pid, ut), ut, out state);
 
-        /* Under Principia: a body about its parent. */
+        /* A body about its parent, while its track covers `ut`: false for a body on its Kepler path. */
         public bool TryBodyStateAt(int body, double ut, out HistoryState state) => TryStateAt(Track(BodyKey(body)), ut, out state);
 
         public bool TryStateAt(HistoryTrack t, double ut, out HistoryState state)
@@ -805,8 +835,8 @@ namespace Kerbcast
             return best;
         }
 
-        /* A body's speed bound relative to the root, through its parents. Under
-           Principia a body's own track replaces its Kepler bound. */
+        /* A body's speed bound relative to the root, through its parents. A
+           body's own track, once it has one, widens its Kepler bound. */
         public double BodySpeedBound(int index) => BodySpeedBound(index, -1);
 
         /* A body's speed bound relative to body `frame`: its parents' bounds up
@@ -823,6 +853,27 @@ namespace Kerbcast
                 if (bt != null)
                     foreach (var s in bt.Spheres) own = Math.Max(own, s.SpeedMs);
                 sum += own;
+                index = b.Parent;
+            }
+            return sum;
+        }
+
+        /*
+         * A body's acceleration bound relative to body `frame`, through the
+         * same parents as BodySpeedBound: each body's parent pulls it with at
+         * most Mu / periapsis squared on its Kepler path. Infinite for a body
+         * with no known periapsis or one that has left its Kepler path, whose
+         * pull is not bounded.
+         */
+        public double BodyAccelBound(int index, int frame)
+        {
+            double sum = 0;
+            for (int guard = 0; guard < 16 && index != frame; guard++)
+            {
+                if (!TryBody(index, out var b) || b.Parent < 0)
+                    return frame >= 0 ? sum + BodyAccelBound(frame, -1) : sum;
+                if (!(b.PeriapsisM > 0) || Track(BodyKey(index)) != null) return double.PositiveInfinity;
+                sum += Mu(b.Parent) / (b.PeriapsisM * b.PeriapsisM);
                 index = b.Parent;
             }
             return sum;
@@ -1056,10 +1107,12 @@ namespace Kerbcast
         }
 
         /* A different game (another save): nothing carries over, not even the slowest speed. */
+        /* For another game: what this one saw of the bodies leaving their Kepler paths goes too. */
         public void Clear()
         {
             ClearHistory();
-            SlowestSignalSpeed = _signalSpeed;
+            _offKepler.Clear();
+            SlowestLightSpeed = _lightSpeed;
         }
 
         private void ClearHistory()

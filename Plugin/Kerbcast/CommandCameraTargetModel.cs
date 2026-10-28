@@ -223,6 +223,9 @@ namespace Kerbcast
                 if (_renderers[i] != null) _renderers[i].enabled = v;
         }
 
+        /* The scene was torn down under it. */
+        public bool Gone => _root == null;
+
         public void Dispose()
         {
             foreach (var h in _hooks) if (h != null) UnityEngine.Object.Destroy(h);

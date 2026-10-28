@@ -93,11 +93,20 @@ namespace Kerbcast
         internal Renderer RigStockFaderRenderer { get; set; }
 
         /* Re-renders galaxy and scaled and reads the centre, so a rig can
-           compare backdrop variants inside OnScaledProbe. */
+           compare backdrop variants inside OnScaledProbe. The bodies are drawn
+           where the frame's own scaled render drew them. */
         internal Color RenderBackdropForProbe()
         {
             if (_galaxyCam != null) _galaxyCam.Render();
-            if (_scaledCam != null) RenderScaledWithRig();
+            if (_scaledCam != null)
+            {
+                try
+                {
+                    Picture.BeforeScaledLayer();
+                    RenderScaledWithRig();
+                }
+                finally { Picture.AfterScaledLayer(); }
+            }
             return SampleCaptureCentre();
         }
 
@@ -507,7 +516,7 @@ namespace Kerbcast
             // content size so the sidecar encodes at the current dim.
             _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight, AnchorProjector.MetaSlotBytes);
             _anchors = new AnchorProjector(FlightId);
-            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld);
+            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld, () => _nearCam);
             WriteInfoManifest();
 
             // Failure-streak (_consecutiveErrors + LogRateLimited) and the
@@ -1468,7 +1477,7 @@ namespace Kerbcast
         /* Resolve the current track target's WORLD position from FlightGlobals
            only (no orbit math): the active vessel's CoM, or its target's
            transform. A craft is aimed at where this camera draws it: an onboard
-           tracker sees by the light it receives, so under a signal speed a
+           tracker sees by the light it receives, so under a light speed a
            distant craft is followed at its past position. Null when there is
            no active vessel / no target this frame, or no light from the craft
            is arriving yet (a no-op tick, so the held pose stays). */
@@ -1899,7 +1908,14 @@ namespace Kerbcast
             // (TrackAim.FovForDistance) stay distinct — this only CALLS both.
             if (TrackAim.ShouldAim(_trackMode, SupportsPan, SupportsZoom))
             {
-                UnityEngine.Vector3? target = ResolveTrackTarget();
+                UnityEngine.Vector3? target;
+                /* The light-time reads behind the target must not take the camera down: a throw holds the last pose. */
+                try { target = ResolveTrackTarget(); }
+                catch (Exception ex)
+                {
+                    LogRateLimited($"track target threw: {ex.GetType().Name}: {ex.Message}");
+                    target = null;
+                }
                 switch (TrackAim.Decide(
                     _trackMode, SupportsPan, SupportsZoom, target.HasValue, _trackHasHeld))
                 {
@@ -2053,9 +2069,17 @@ namespace Kerbcast
                     return;
                 }
             }
-            if (Picture.Prepare() == RigFrame.Blank)
+            try
             {
-                PublishBlack();
+                if (Picture.Prepare() == RigFrame.Blank)
+                {
+                    PublishBlack();
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogRateLimited($"picture prepare threw: {ex.GetType().Name}: {ex.Message}");
                 return;
             }
 
@@ -2321,6 +2345,7 @@ namespace Kerbcast
             // destroying the camera they're attached to.
             Rig?.Dispose();
             Rig = null;
+            Picture.Dispose();
             _fxHost?.Dispose();
             _fxHost = null;
             // Detach visual-mod integrations before destroying the cameras: this

@@ -62,7 +62,7 @@ namespace Kerbcast.Api
                 case ApiFeature.CommandLock:
                 case ApiFeature.CommandAim:
                 case ApiFeature.WorldModel:
-                case ApiFeature.SignalSpeed:
+                case ApiFeature.LightSpeed:
                     return true;
                 default:
                     return false;

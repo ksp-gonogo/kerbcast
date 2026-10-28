@@ -5,7 +5,7 @@ namespace Kerbcast
 {
     /*
      * The one command lock for a scene: who holds it, with what options and
-     * silence text, and the holder's signal speed. Kerbcast.API's TakeLock
+     * silence text, and the holder's light speed. Kerbcast.API's TakeLock
      * and the obsolete KerbcastControl.SetCommandAuthority both take this
      * lock, so there is no second way in. Every owner call is a heartbeat; 5 s
      * of real time with none (and no publish) times the holder out, which
@@ -36,7 +36,7 @@ namespace Kerbcast
         /* What the holder's feeds show once it falls silent; null for CommandCameraMath.DefaultSilentText. */
         public string SilentText { get; private set; }
         /* Null for no delay. */
-        public double? SignalSpeed { get; private set; }
+        public double? LightSpeed { get; private set; }
 
         /* KSP.log's one line for each lock loss, so a loss and its reason show without a listening mod. */
         public static string LostLine(string owner, LockLossReason reason) =>
@@ -88,18 +88,18 @@ namespace Kerbcast
             Owner = null;
             Options = LockOptions.None;
             SilentText = null;
-            SignalSpeed = null;
+            LightSpeed = null;
             _store.EndTenure();
         }
 
         /* False, with nothing changed, unless `owner` holds the lock. */
-        public bool SetSignalSpeed(string owner, double? metresPerSecond, float realNow)
+        public bool SetLightSpeed(string owner, double? metresPerSecond, float realNow)
         {
             if (metresPerSecond.HasValue && !(Vec3d.Finite(metresPerSecond.Value) && metresPerSecond.Value > 0))
                 throw new ArgumentOutOfRangeException(nameof(metresPerSecond), metresPerSecond, "must be finite and positive, or null");
             if (!Holds(owner)) return false;
             _lastCall = realNow;
-            SignalSpeed = metresPerSecond;
+            LightSpeed = metresPerSecond;
             return true;
         }
     }

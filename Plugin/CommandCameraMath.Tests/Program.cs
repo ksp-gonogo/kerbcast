@@ -187,6 +187,89 @@ Check(CommandCameraMath.BracketHalfPx(10, 5, 1.0, 576) == 576, "bracket: lens in
 Check(CommandCameraMath.BracketHalfPx(0, 1000, 1.0, 576) == 0, "bracket: no radius, no box");
 Check(CommandCameraMath.BracketHalfPx(1, 1e9, 30, 576) > 0, "bracket: tiny but positive at deep range");
 
+// An unloaded subject under the marker setting: a point while point-sized, its model once it fills more.
+Check(CommandCameraMath.SubjectAsModel(false, true, false, 2.0, 447, 1.707, 406),
+    "subject: a 2 m craft 447 m away in a 1.7 degree frame is a model, not a 3 px point");
+Check(!CommandCameraMath.SubjectAsModel(false, true, false, 2.0, 268000, 1.707, 406), "subject: the same craft 268 km away stays a point");
+Check(CommandCameraMath.SubjectAsModel(true, false, false, 2.0, 268000, 1.707, 406), "subject: the model setting always draws the model");
+Check(!CommandCameraMath.SubjectAsModel(false, false, true, 2.0, 447, 1.707, 406), "subject: with neither setting there is nothing to draw");
+double onePx = CommandCameraMath.PixelSizeAtUnit(1.0, 1000) * 10000;
+Check(CommandCameraMath.SubjectAsModel(false, true, false, 3.03 * onePx, 10000, 1.0, 1000)
+    && !CommandCameraMath.SubjectAsModel(false, true, false, 2.97 * onePx, 10000, 1.0, 1000),
+    "subject: a point becomes a model at PointBelowPx across, where the picture's stand-ins switch");
+Check(CommandCameraMath.SubjectAsModel(false, true, true, 2.5 * onePx, 10000, 1.0, 1000)
+    && !CommandCameraMath.SubjectAsModel(false, true, true, 1.9 * onePx, 10000, 1.0, 1000),
+    "subject: a model goes back to a point only under ModelLeaveBelowPx");
+Check(CommandCameraMath.SubjectSizeM(20, 15, 100) == 20 && CommandCameraMath.SubjectSizeM(0, 15, 100) == 15
+    && CommandCameraMath.SubjectSizeM(0, 0, 100) == 100, "subject size: the model, else the history's parts, else the guess");
+
+/*
+ * The rig's path frame by frame, as it measures: a 20 m station whose
+ * history records its parts, closing at the field floor (1.707 degrees over
+ * 406 rows). It turns into a model where 20 m spans 6 px, not where a
+ * nominal 2 m craft would, and once built, judged by the model's own radius
+ * at a field that widens with it, it never flips back while it closes.
+ */
+{
+    double fov = 1.707, partsSize = 20, modelRadius = 0;
+    bool shown = false, flipped = false;
+    double switchedAt = double.NaN;
+    for (double d = 3e6; d > 400; d *= 0.98)
+    {
+        double size = CommandCameraMath.SubjectSizeM(modelRadius, partsSize, 100);
+        bool model = CommandCameraMath.SubjectAsModel(false, true, shown, size, d, fov, 406);
+        if (model && !shown) { if (!double.IsNaN(switchedAt)) flipped = true; switchedAt = d; modelRadius = 21; }
+        if (!model && shown) flipped = true;
+        shown = model;
+        fov = Math.Max(fov, CommandCameraMath.FovForFraction(modelRadius > 0 ? modelRadius : 2, d, 0.3, 1.707, 30));
+    }
+    double sixPxAt = 2 * 20 / (6 * CommandCameraMath.PixelSizeAtUnit(1.707, 406));
+    Check(Near(switchedAt, sixPxAt, 0.03 * sixPxAt), $"rig path: a 20 m station turns model near {sixPxAt / 1000:F0} km (got {switchedAt / 1000:F0} km)");
+    Check(!flipped, "rig path: once a model it stays one as it closes and the field widens");
+}
+{
+    /* No size known: tried as a model at the generous guess, then judged by the 2.8 m model, which is a point again far off. */
+    double modelRadius = 0;
+    bool shown = false;
+    double size = CommandCameraMath.SubjectSizeM(modelRadius, 0, 100);
+    shown = CommandCameraMath.SubjectAsModel(false, true, shown, size, 268000, 1.707, 406);
+    Check(shown, "rig path: a craft of unknown size 268 km away is tried as a model");
+    modelRadius = 2.8;
+    shown = CommandCameraMath.SubjectAsModel(false, true, shown, CommandCameraMath.SubjectSizeM(modelRadius, 0, 100), 268000, 1.707, 406);
+    Check(!shown, "rig path: its 2.8 m model is under a pixel there, so it is a point again, and stays one");
+    shown = CommandCameraMath.SubjectAsModel(false, true, shown, CommandCameraMath.SubjectSizeM(modelRadius, 0, 100), 268000, 1.707, 406);
+    Check(!shown, "rig path: no flip back once judged by the model");
+}
+
+/*
+ * Showing what was decided. B's build failed and A's model is still held:
+ * it never stands in for B. A model built only to learn a guessed size waits
+ * a frame behind the marker, then its own radius decides; the model setting
+ * has no marker to wait behind.
+ */
+Check(!CommandCameraMath.ShowsModel(true, false, false, false), "shown: another craft's model never stands in for the subject");
+Check(!CommandCameraMath.ShowsModel(true, false, true, false), "shown: not under the model setting either");
+Check(!CommandCameraMath.ShowsModel(true, true, false, true), "shown: the probe frame keeps the marker");
+Check(CommandCameraMath.ShowsModel(true, true, true, true), "shown: the model setting shows a model built on a guess at once");
+Check(CommandCameraMath.ShowsModel(true, true, false, false) && !CommandCameraMath.ShowsModel(false, true, false, false),
+    "shown: a matching model is shown exactly when decided");
+{
+    /* The probe, frame by frame: unknown size 20 km away, a 10 m model. The dot never blinks out. */
+    double modelRadius = 0;
+    bool shown = false;
+    var seen = new List<string>();
+    for (int frame = 0; frame < 3; frame++)
+    {
+        bool guessed = modelRadius == 0;
+        double size = CommandCameraMath.SubjectSizeM(modelRadius, 0, 100);
+        bool decided = CommandCameraMath.SubjectAsModel(false, true, shown, size, 20000, 1.707, 406);
+        if (decided) modelRadius = 10;
+        shown = CommandCameraMath.ShowsModel(decided, modelRadius > 0, false, guessed);
+        seen.Add(shown ? "model" : "marker");
+    }
+    Check(string.Join(",", seen) == "marker,model,model", $"probe: marker on the frame the model is built, model after ({string.Join(",", seen)})");
+}
+
 // Framing fit at the widest field.
 Check(CommandCameraMath.FramingFits(1000, 1e6, 30), "fit: 1 km at 1000 km fits a 30 degree view");
 Check(!CommandCameraMath.FramingFits(400000, 1e6, 30), "fit: 400 km at 1000 km (23.6 degrees half-angle) does not fit 30 degrees");
@@ -553,16 +636,16 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(!occ.Blocks(new DVec3(0, meshR * 1.01, 1e7), new DVec3(0, meshR * 1.01, -1e7), 0), "mesh: an axis-aligned line over the top is clear");
 }
 
-/* The live bound: tau, or the lens's own farthest part, at the holder's signal speed. */
+/* The live bound: tau, or the lens's own farthest part, at the holder's light speed. */
 {
     double tau = CommandCameraMath.BoundaryLightTimeS;
-    Check(CommandCameraMath.LiveLightTimeS(null, 100) == 0, "live bound: no signal speed, delay off, 0");
-    Check(CommandCameraMath.LiveLightTimeS(0, 100) == 0, "live bound: a zero signal speed is no signal speed");
+    Check(CommandCameraMath.LiveLightTimeS(null, 100) == 0, "live bound: no light speed, delay off, 0");
+    Check(CommandCameraMath.LiveLightTimeS(0, 100) == 0, "live bound: a zero light speed is no light speed");
     Check(CommandCameraMath.LiveLightTimeS(299792458, 30) == tau, "live bound: at light speed a 30 m craft is inside tau");
     Check(CommandCameraMath.LiveLightTimeS(299792458, 0) == tau, "live bound: a lens with no craft of its own is tau");
     Check(Math.Abs(CommandCameraMath.LiveLightTimeS(3, 30) - 10) < 1e-12, "live bound: at 3 m/s a part 30 m away is 10 s");
     Check(Math.Abs(CommandCameraMath.BoundaryM(3) - 0.05) < 1e-12 && double.IsNaN(CommandCameraMath.BoundaryM(null)),
-        "boundary: c times tau, NaN with no signal speed");
+        "boundary: c times tau, NaN with no light speed");
 
     /* A partner docks: the farthest own part jumps from 30 m to 100 m, so at 3 m/s the bound steps by 23 s on that frame. */
     var lens = new DVec3(1000, 0, 0);

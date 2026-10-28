@@ -155,6 +155,8 @@
     <Compile Remove="Anchors.Tests/**/*.cs" />
     <Compile Remove="LightHistory.Tests/**/*.cs" />
     <Compile Remove="PastInstant.Tests/**/*.cs" />
+    <Compile Remove="PictureBoundary.Tests/**/*.cs" />
+    <Compile Remove="PictureCull.Tests/**/*.cs" />
     <Compile Remove="GameEventsHandlers.Tests/**/*.cs" />
     <Compile Remove="Kinematics.Tests/**/*.cs" />
     <Compile Remove="NativeReadback.Tests/**/*.cs" />

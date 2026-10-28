@@ -155,13 +155,13 @@ namespace Kerbcast
             return true;
         }
 
-        /* The holder's signal speed, which the light-time history reads. */
-        internal static bool SetSignalSpeedCore(string owner, double? metresPerSecond)
+        /* The holder's light speed, which the light-time history reads. */
+        internal static bool SetLightSpeedCore(string owner, double? metresPerSecond)
         {
             var auth = KerbcastCore.Instance?.CommandAuthority;
             if (auth == null) return false;
-            if (!auth.Lock.SetSignalSpeed(owner, metresPerSecond, Time.realtimeSinceStartup)) return false;
-            LightHistoryHost.History.SetSignalSpeed(metresPerSecond);
+            if (!auth.Lock.SetLightSpeed(owner, metresPerSecond, Time.realtimeSinceStartup)) return false;
+            LightHistoryHost.History.SetLightSpeed(metresPerSecond);
             return true;
         }
 

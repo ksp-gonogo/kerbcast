@@ -114,7 +114,7 @@ namespace Kerbcast
 
         /* Follows a ballistic state the caller sampled at `ut`, propagated
            under the body's gravity with no thrust. A caller that propagates
-           itself (Principia) re-aims as often as it likes. */
+           its craft itself, off a Kepler path, re-aims as often as it likes. */
         public static CommandAim PositionAt(string body, double ut, Vector3d bodyRelativePos, Vector3d bodyRelativeVel,
             uint subject = 0, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.PositionAt, framingMarginM, body: body, ut: ut, pos: bodyRelativePos,
@@ -235,7 +235,7 @@ namespace Kerbcast
         /* Ends the tenure and everything that goes with the lock. */
         public void Reset()
         {
-            if (Lock.SignalSpeed.HasValue) LightHistoryHost.History.SetSignalSpeed(null);
+            if (Lock.LightSpeed.HasValue) LightHistoryHost.History.SetLightSpeed(null);
             Lock.Clear();
             Sites.Clear();
             _feeds.Clear();

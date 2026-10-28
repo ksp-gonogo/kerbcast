@@ -42,7 +42,7 @@
 //! The metadata fields arrived in 1.12 without a version bump. Writers
 //! before 1.12 leave them zero (the header is zeroed and the slot padding
 //! never written), which reads as "no metadata, fov unknown, no delay": a
-//! writer that old had no signal speed, so nothing it drew was delayed. A
+//! writer that old had no light speed, so nothing it drew was delayed. A
 //! reader before 1.12 maps only the slots, so it never sees the trailer,
 //! and ignores the three slot fields.
 //!
@@ -120,11 +120,11 @@ pub struct CaptureStamp {
     /// with its owner. `None` when the writer reported none.
     pub anchors: Option<Arc<Vec<FrameAnchor>>>,
     /// The frame's live bound in seconds (see `FrameStampPayload`). 0 with
-    /// no signal speed; `None` when the writer could not read it, or outside
+    /// no light speed; `None` when the writer could not read it, or outside
     /// a ring read.
     pub live_light_time_s: Option<f64>,
-    /// How far light travels in one 60 fps frame at the signal speed: the
-    /// picture's boundary distance. `None` with no signal speed.
+    /// How far light travels in one 60 fps frame at the light speed: the
+    /// picture's boundary distance. `None` with no light speed.
     pub boundary_m: Option<f64>,
     /// A command camera's state as this frame shows it.
     pub command: Option<Arc<FrameCommandState>>,

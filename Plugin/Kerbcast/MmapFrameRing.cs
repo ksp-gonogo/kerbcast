@@ -40,7 +40,7 @@
 //   that reserves no metadata leaves them zero, and an older reader maps
 //   only the slots and ignores the three slot fields. A writer older than
 //   1.12 leaves live_light_time_s zero, which is right for it: it had no
-//   signal speed, so nothing it drew was delayed.
+//   light speed, so nothing it drew was delayed.
 //
 // Sync protocol (writer side):
 //   1. Bump `header.sequence` atomically (Interlocked.Increment).
@@ -335,7 +335,7 @@ namespace Kerbcast
         /* The frame's metadata object as UTF-8 JSON, the first Length bytes; null for none. */
         public byte[] Json;
         public int Length;
-        /* The frame's live bound in seconds (CommandCameraMath.LiveLightTimeS); 0 with no signal speed, NaN when it could not be read, which a reader takes as unknown and holds the frame. */
+        /* The frame's live bound in seconds (CommandCameraMath.LiveLightTimeS); 0 with no light speed, NaN when it could not be read, which a reader takes as unknown and holds the frame. */
         public double LiveLightTimeS;
     }
 }

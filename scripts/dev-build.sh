@@ -13,7 +13,7 @@
 #                   of dispatching CI (its build-info.txt must match HEAD)
 #   --dev-provider  also stage Kerbcast.DevProvider.dll, the development
 #                   world-model provider (dev builds only; it still needs the
-#                   dev marker and devSignalSpeedMps on the install to run)
+#                   dev marker and devLightSpeedMps on the install to run)
 
 set -euo pipefail
 
@@ -221,7 +221,7 @@ cp -R "$SIDECAR_DIR"/. "$STAGE/Sidecar/linux-x64/"
 chmod +x "$STAGE/Sidecar/linux-x64/kerbcast-sidecar"
 cp Plugin/settings.cfg "$STAGE/settings.cfg.reference"
 
-# The dev marker turns on a development signal speed; it is placed by hand on a test install, never shipped.
+# The dev marker turns on a development light speed; it is placed by hand on a test install, never shipped.
 [ ! -e "$STAGE/PluginData" ] || die "PluginData must never ship"
 
 mkdir -p "$WORK/out"
