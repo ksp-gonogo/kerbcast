@@ -38,6 +38,7 @@ import { useCommandDisplayUt } from "./hooks/useCommandDisplayUt";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
+import { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
 import { useRecordings } from "./hooks/useRecordings";
 import { DEFAULT_FEED_ASPECT, useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
@@ -326,6 +327,13 @@ export interface CameraFeedProps {
    */
   waitingForTargetLabel?: string | null;
   /**
+   * What the feed says while its camera has no video slot on this connection
+   * (`KerbcastCameraHandle.waitingForSlot`): the pool is at its ceiling or
+   * cannot grow. The feed takes the next slot another feed gives up. Drawn
+   * over the picture; `null` or an empty string shows nothing.
+   */
+  noSlotLabel?: string | null;
+  /**
    * Mission UT the displayed video was captured at, for a host running its
    * own delayed playout. Picks which command-track transition is in force and
    * ages the readout. Defaults to the displayed frame's own capture UT where
@@ -398,6 +406,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enableTargetBrackets = true,
       targetBracketOverlay,
       waitingForTargetLabel = "Waiting for target",
+      noSlotLabel = "Not streaming: too many feeds are open. Close a feed to watch this one.",
       displayUt: displayUtProp,
       displayFrame,
       anchors,
@@ -597,6 +606,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     }, []);
 
     const isDestroyed = camera ? isCameraDestroyed(camera) : false;
+    const waitingForSlot = useKerbcastWaitingForSlot(flightId);
     /* Gating here rather than at the render sites covers the whole manual
        path at once: the controls unmount, the effects below zero any in-flight
        rate, and the imperative handle's pan/zoom methods no-op. */
@@ -1467,6 +1477,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
+              {waitingForSlot && !outOfFlight && !isDestroyed && noSlotLabel && (
+                <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
+              )}
               {drawsAnchors && !outOfFlight && !isDestroyed && !commandState?.blank && (
                 <LiveAnchorMarkers flightId={flightId} video={videoEl} overlay={anchorOverlay} />
               )}
@@ -2393,6 +2406,27 @@ const StaleScrim = styled.div`
   inset: 0;
   z-index: 1;
   background: rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+`;
+
+/* Centred in the picture, clear of the chrome along the edges, and wrapping so
+   a small tile still shows the whole sentence. */
+const NoSlotNotice = styled.div`
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  max-width: calc(100% - 32px);
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
   pointer-events: none;
 `;
 

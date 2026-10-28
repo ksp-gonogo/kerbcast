@@ -46,6 +46,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::rtp_transceiver::RTCRtpTransceiver;
 use webrtc::track::track_local::TrackLocal;
 
 use super::outbox::{ControlChannel, Outbox};
@@ -56,25 +57,69 @@ use crate::cameras::CameraState as InternalCameraState;
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
-    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, DestroyCommandCameraPayload,
-    ErrorCode, ErrorPayload, ErrorSource, FlightIdPayload, HelloPayload, Layer, QualityPreset,
-    ReportDisplaySizePayload, SceneStateChangedPayload, ServerMessage,
-    SetBackgroundCaptureFpsPayload, SetDegradePayload, SetForceFullResolutionPayload,
-    SetFovPayload, SetFrameStampsPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload,
-    SetQualityPayload, SetRenderSizePayload, SetSizeHoldPayload, SetThrottleMainScreenPayload,
-    SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
+    CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ConfirmSlotsPayload,
+    DestroyCommandCameraPayload, ErrorCode, ErrorPayload, ErrorSource, FlightIdPayload,
+    HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload, SceneStateChangedPayload,
+    ServerMessage, SetBackgroundCaptureFpsPayload, SetDegradePayload,
+    SetForceFullResolutionPayload, SetFovPayload, SetFrameStampsPayload, SetLayersPayload,
+    SetPanPayload, SetPanRatePayload, SetQualityPayload, SetRenderSizePayload, SetSizeHoldPayload,
+    SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
+
+/// An unguessable name for a peer's session: 128 bits from a CSPRNG seeded
+/// by the operating system.
+fn session_token() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+/// The most video slots one connection may hold, counting slots added by
+/// `KerbcastPeer::grow`. A safety net against a runaway client, not a viewing
+/// limit: each bound slot costs the game a camera render, and the shed ladder
+/// already sheds that load.
+pub const MAX_SLOTS_PER_PEER: usize = 32;
+
+/// A slot's send-track, named by its index in the pool.
+fn slot_track(i: usize, outbox: &Outbox) -> Arc<VideoTrack> {
+    Arc::new(VideoTrack::new(
+        /* Declare the fmtp explicitly. With only a mime type here, codec
+        matching falls back to a mime-only fuzzy search across every
+        H.264 payload type the browser offered, including
+        packetization-mode=0 ones, which permit single-NAL packets
+        only. Our encoder emits fragmented and aggregated NALs, so
+        landing on such a payload type yields RTP the browser accepts
+        and cannot decode: traffic on the wire, readyState stuck at 0,
+        and not one error anywhere in the stack. Pinning
+        packetization-mode=1 with the constrained-baseline profile
+        every browser offers makes the choice deterministic. */
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .to_owned(),
+            ..Default::default()
+        },
+        format!("video-slot{i}"),
+        format!("kerbcast-slot{i}"),
+        Some(outbox.clone()),
+    ))
+}
 
 /// One pre-negotiated video slot. The track stays on the peer connection
 /// for the connection's lifetime; `bound` records which camera currently
 /// feeds it (`None` = idle/silent) and `mid` is the transceiver mid the
 /// browser keys its `SlotMap` routing on (filled once the answer is set).
+/// Only a `ready` slot takes a camera: a slot added by `KerbcastPeer::grow`
+/// waits for the browser's `ConfirmSlots`, since until then the browser may
+/// not have applied the answer that lets it play the slot.
 struct Slot {
     track: Arc<VideoTrack>,
     mid: Option<String>,
     bound: Option<u32>,
+    ready: bool,
+    /// The transceiver `grow` added for this slot; the initial pool's slots
+    /// are always confirmed and never need it.
+    transceiver: Option<Arc<RTCRtpTransceiver>>,
 }
 
 /// How long a peer may sit in `Disconnected` before the reaper takes it.
@@ -195,6 +240,13 @@ pub struct KerbcastPeer {
     /// Stable identifier for this peer for the lifetime of the
     /// connection. Used for logging and slot bookkeeping.
     pub peer_id: u32,
+    /// Names this peer to `POST /renegotiate`. Unlike `peer_id` it is unique
+    /// across sidecar restarts, so a client still holding a peer from a
+    /// previous process can never renegotiate someone else's.
+    pub session: String,
+    registry: Arc<CameraRegistry>,
+    /// Held across a whole `grow`, so two re-offers never interleave.
+    renegotiation: Mutex<()>,
     /// The pre-negotiated slot pool. `Subscribe` binds a camera to a free
     /// slot; `Unsubscribe` frees one — no renegotiation. Dropping the peer
     /// drops the slot-track Arcs; the matching Weak refs in each camera's
@@ -274,28 +326,7 @@ impl KerbcastPeer {
         let mut slots: Vec<Slot> = Vec::with_capacity(slot_count);
         let mut senders: Vec<Arc<RTCRtpSender>> = Vec::with_capacity(slot_count);
         for i in 0..slot_count {
-            let track = Arc::new(VideoTrack::new(
-                /* Declare the fmtp explicitly. With only a mime type here, codec
-                matching falls back to a mime-only fuzzy search across every
-                H.264 payload type the browser offered — including
-                packetization-mode=0 ones, which permit single-NAL packets
-                only. Our encoder emits fragmented and aggregated NALs, so
-                landing on such a payload type yields RTP the browser accepts
-                and cannot decode: traffic on the wire, readyState stuck at 0,
-                and not one error anywhere in the stack. Pinning
-                packetization-mode=1 with the constrained-baseline profile
-                every browser offers makes the choice deterministic. */
-                RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_H264.to_owned(),
-                    sdp_fmtp_line:
-                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                            .to_owned(),
-                    ..Default::default()
-                },
-                format!("video-slot{i}"),
-                format!("kerbcast-slot{i}"),
-                Some(outbox.clone()),
-            ));
+            let track = slot_track(i, &outbox);
             let rtp_sender = pc
                 .add_track(track.rtp_track() as Arc<dyn TrackLocal + Send + Sync>)
                 .await?;
@@ -304,6 +335,8 @@ impl KerbcastPeer {
                 track,
                 mid: None,
                 bound: None,
+                ready: true,
+                transceiver: None,
             });
         }
 
@@ -343,7 +376,7 @@ impl KerbcastPeer {
                 ));
                 continue;
             }
-            let Some(slot) = slots.iter_mut().find(|s| s.bound.is_none()) else {
+            let Some(slot) = slots.iter_mut().find(|s| s.ready && s.bound.is_none()) else {
                 warn!(flight_id, "no free slot for initial subscription");
                 refusals.push(refusal(
                     flight_id,
@@ -421,6 +454,9 @@ impl KerbcastPeer {
         Ok(Self {
             pc,
             peer_id,
+            session: session_token(),
+            registry,
+            renegotiation: Mutex::new(()),
             slots,
             subscribed,
             refused,
@@ -512,6 +548,188 @@ impl KerbcastPeer {
             }
         }
         Ok(local.sdp)
+    }
+
+    /// Slots in the pool, confirmed or not.
+    pub async fn slot_count(&self) -> usize {
+        self.slots.lock().await.len()
+    }
+
+    /// Slots the browser has confirmed it can play. A re-offer must offer
+    /// more than these; slots past them are the browser's to re-offer or drop.
+    pub async fn confirmed_slot_count(&self) -> usize {
+        self.slots.lock().await.iter().filter(|s| s.ready).count()
+    }
+
+    /// Answer a re-offer that adds video transceivers, growing the slot pool
+    /// to `slot_count`. Every confirmed slot keeps its mid and binding, so
+    /// running feeds carry on untouched. The new slots take no camera until
+    /// the browser confirms it applied the answer (`confirm_slots`): a re-offer
+    /// whose answer never lands leaves them idle, never carrying a camera the
+    /// browser cannot play.
+    ///
+    /// A re-offer may follow one whose answer the browser never applied (lost
+    /// on the way, or refused), so the pool can already hold unconfirmed
+    /// slots. One whose mid the re-offer still carries is the browser's too
+    /// and is answered again as it is. Any other is unknown to the browser:
+    /// its transceiver is stopped and a fresh one takes its place, so the pool
+    /// always counts exactly the video sections offered.
+    pub async fn grow(&self, slot_count: usize, offer_sdp: String) -> Result<String> {
+        let _turn = self.renegotiation.lock().await;
+        if slot_count > MAX_SLOTS_PER_PEER {
+            return Err(GrowRefused(format!(
+                "a connection holds at most {MAX_SLOTS_PER_PEER} video slots, asked for {slot_count}"
+            ))
+            .into());
+        }
+        let offered = offered_video_mids(&offer_sdp);
+        let (current, stale, kept) = {
+            let slots = self.slots.lock().await;
+            let confirmed = slots.iter().filter(|s| s.ready).count();
+            if slot_count <= confirmed {
+                return Err(GrowRefused(format!(
+                    "a re-offer must add slots: asked for {slot_count}, the pool already has {confirmed}"
+                ))
+                .into());
+            }
+            let stale: Vec<usize> = (0..slots.len())
+                .filter(|&i| {
+                    !slots[i].ready && !slots[i].mid.as_ref().is_some_and(|m| offered.contains(m))
+                })
+                .collect();
+            let kept_beyond = (slot_count..slots.len()).any(|i| !stale.contains(&i));
+            if kept_beyond {
+                return Err(GrowRefused(format!(
+                    "a re-offer for {slot_count} slots drops slots the browser still holds"
+                ))
+                .into());
+            }
+            /* webrtc-rs matches an offered mid to a transceiver without
+            looking at whether it is stopped, so a mid that a stopped
+            transceiver holds would land on it and leave that slot dead. */
+            let live_mids: Vec<&String> = (0..slots.len())
+                .filter(|i| !stale.contains(i))
+                .filter_map(|i| slots[i].mid.as_ref())
+                .collect();
+            for t in self.pc.get_transceivers().await {
+                let Some(mid) = t.mid().map(|m| m.to_string()) else {
+                    continue;
+                };
+                if offered.contains(&mid) && !live_mids.contains(&&mid) {
+                    return Err(GrowRefused(format!(
+                        "the re-offer reuses mid {mid}, which a retired slot held"
+                    ))
+                    .into());
+                }
+            }
+            let kept = (0..slots.len())
+                .filter(|&i| !slots[i].ready && !stale.contains(&i))
+                .count();
+            (slots.len(), stale, kept)
+        };
+        for &i in &stale {
+            self.retire_slot(i).await;
+        }
+
+        /* Each new slot takes a transceiver of its own: `add_track` would hand
+        back a stopped one whose first track had the same id. */
+        let fresh: Vec<usize> = stale
+            .iter()
+            .copied()
+            .filter(|&i| i < slot_count)
+            .chain(current..slot_count)
+            .collect();
+        let mut added = Vec::with_capacity(fresh.len());
+        for &i in &fresh {
+            let track = slot_track(i, &self.outbox);
+            match self
+                .pc
+                .add_transceiver_from_track(
+                    track.rtp_track() as Arc<dyn TrackLocal + Send + Sync>,
+                    None,
+                )
+                .await
+            {
+                Ok(transceiver) => added.push((i, track, transceiver)),
+                Err(e) => {
+                    stop_transceivers(&added).await;
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let answer = async {
+            self.pc
+                .set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
+                .await?;
+            let answer = self.pc.create_answer(None).await?;
+            self.pc.set_local_description(answer).await?;
+            self.pc
+                .local_description()
+                .await
+                .ok_or_else(|| anyhow!("local description missing after set_local_description"))
+        }
+        .await;
+        let answer = match answer {
+            Ok(a) => a,
+            Err(e) => {
+                stop_transceivers(&added).await;
+                return Err(e);
+            }
+        };
+
+        /* Every added slot joins the pool, mid or not, so the pool's length
+        stays the count the browser offered. One without a mid can never be
+        confirmed, so it never takes a camera; its RTCP is drained like any
+        other sender's. */
+        let mut slots = self.slots.lock().await;
+        slots.truncate(slot_count);
+        for (slot_idx, track, transceiver) in added {
+            let mid = transceiver.mid().map(|m| m.to_string());
+            if mid.is_none() {
+                warn!(
+                    slot = slot_idx,
+                    "grown slot has NO negotiated mid and stays idle"
+                );
+            }
+            let slot = Slot {
+                track,
+                mid,
+                bound: None,
+                ready: false,
+                transceiver: Some(transceiver.clone()),
+            };
+            if slot_idx < slots.len() {
+                slots[slot_idx] = slot;
+            } else {
+                slots.push(slot);
+            }
+            let sender = transceiver.sender().await;
+            let pool = self.slots.clone();
+            let registry = self.registry.clone();
+            tokio::spawn(async move {
+                drain_rtcp_sink(sender, slot_idx, pool, registry).await;
+            });
+        }
+        info!(
+            peer_id = self.peer_id,
+            slots = slots.len(),
+            kept,
+            replaced = stale.len(),
+            "slot pool grown, awaiting confirmation"
+        );
+        Ok(answer.sdp)
+    }
+
+    /// Stop the transceiver of an unconfirmed slot the browser does not hold.
+    /// Stopping is irreversible, so nothing can pick its sender up again.
+    async fn retire_slot(&self, slot_idx: usize) {
+        let transceiver = self.slots.lock().await[slot_idx].transceiver.clone();
+        if let Some(t) = transceiver {
+            if let Err(e) = t.stop().await {
+                warn!(slot = slot_idx, error = %e, "could not stop a stale slot's transceiver");
+            }
+        }
     }
 
     /// False once the connection is terminal (`Failed`/`Closed`), or once it
@@ -666,6 +884,8 @@ async fn handle_client_message(
                     max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
                     size_hold: Some(true),
                     resume: Some(true),
+                    renegotiate: Some(true),
+                    max_slots: Some(MAX_SLOTS_PER_PEER as u32),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -861,6 +1081,9 @@ async fn handle_client_message(
         ClientMessage::Resume(payload) => {
             registry.resume_client(peer_id, &payload).await;
         }
+        ClientMessage::ConfirmSlots(ConfirmSlotsPayload { slots: count }) => {
+            confirm_slots(&slots, count as usize).await;
+        }
         // Background capture ("background capture"): this consumer asking that cameras it
         // isn't displaying keep ticking over instead of stopping. Per-peer and
         // MAX-aggregated; forgotten on disconnect / peer reap so a departed
@@ -913,6 +1136,47 @@ async fn request_keyframe_for(cam: &Arc<InternalCameraState>) {
     }
 }
 
+/// A re-offer the sidecar will not answer however often it is sent, as
+/// opposed to one that failed along the way.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct GrowRefused(String);
+
+/// Take back the transceivers a re-offer added before it failed, so the
+/// failure leaves no live send-tracks behind and none can be reused.
+async fn stop_transceivers(added: &[(usize, Arc<VideoTrack>, Arc<RTCRtpTransceiver>)]) {
+    for (slot_idx, _, t) in added {
+        if let Err(e) = t.stop().await {
+            warn!(slot = slot_idx, error = %e, "could not stop a slot transceiver after a failed re-offer");
+        }
+    }
+}
+
+/// The mids of an SDP's video sections.
+fn offered_video_mids(sdp: &str) -> Vec<String> {
+    let mut mids = Vec::new();
+    let mut in_video = false;
+    for line in sdp.lines().map(str::trim) {
+        if line.starts_with("m=") {
+            in_video = line.starts_with("m=video");
+        } else if let Some(mid) = line.strip_prefix("a=mid:").filter(|_| in_video) {
+            mids.push(mid.to_owned());
+        }
+    }
+    mids
+}
+
+/// The browser applied the answer for a pool of `count` slots, so every slot
+/// below that with a mid can now take a camera.
+async fn confirm_slots(slots: &Arc<Mutex<Vec<Slot>>>, count: usize) {
+    let mut guard = slots.lock().await;
+    for slot in guard.iter_mut().take(count) {
+        if slot.mid.is_some() {
+            slot.ready = true;
+        }
+    }
+}
+
 /// Bind a camera to a free slot (or re-announce if already bound). On a fresh
 /// bind the camera's subscriber count goes 0 -> 1, waking the plugin render;
 /// the consume loop then feeds the slot's track from the camera's encoder.
@@ -949,7 +1213,7 @@ async fn handle_subscribe(
         let mut guard = slots.lock().await;
         if let Some(slot) = guard.iter().find(|s| s.bound == Some(flight_id)) {
             (slot.track.clone(), slot.mid.clone(), false)
-        } else if let Some(slot) = guard.iter_mut().find(|s| s.bound.is_none()) {
+        } else if let Some(slot) = guard.iter_mut().find(|s| s.ready && s.bound.is_none()) {
             slot.bound = Some(flight_id);
             (slot.track.clone(), slot.mid.clone(), true)
         } else {
@@ -1757,6 +2021,310 @@ mod tests {
                 .await
                 .expect("create peer connection"),
         )
+    }
+
+    /// The browser's side of a slot pool: a client offer of `n` recv-only
+    /// video transceivers plus the control channel, as the SDK builds it.
+    async fn browser_offer(browser: &RTCPeerConnection, n: usize) -> String {
+        use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+        for _ in 0..n {
+            browser
+                .add_transceiver_from_kind(
+                    RTPCodecType::Video,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Recvonly,
+                        send_encodings: vec![],
+                    }),
+                )
+                .await
+                .expect("add transceiver");
+        }
+        let offer = browser.create_offer(None).await.expect("offer");
+        browser
+            .set_local_description(offer.clone())
+            .await
+            .expect("set local offer");
+        offer.sdp
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_grows_the_pool_and_keeps_existing_slots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        let peer = KerbcastPeer::new(registry, &[], 2).await.expect("peer");
+
+        let browser = build_pc().await;
+        browser
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let offer = browser_offer(&browser, 2).await;
+        let answer = peer.answer_to_offer(offer).await.expect("answer");
+        browser
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set answer");
+        let before: Vec<Option<String>> = peer
+            .slots
+            .lock()
+            .await
+            .iter()
+            .map(|s| s.mid.clone())
+            .collect();
+
+        let offer = browser_offer(&browser, 3).await;
+        let answer = peer.grow(5, offer).await.expect("grow");
+        browser
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set grown answer");
+
+        let mids: Vec<Option<String>> = peer
+            .slots
+            .lock()
+            .await
+            .iter()
+            .map(|s| s.mid.clone())
+            .collect();
+        assert_eq!(mids.len(), 5);
+        assert_eq!(mids[..2], before[..], "existing slots keep their mids");
+        let browser_mids: Vec<Option<String>> = browser
+            .get_transceivers()
+            .await
+            .iter()
+            .map(|t| t.mid().map(|m| m.to_string()))
+            .collect();
+        assert_eq!(
+            mids, browser_mids,
+            "every slot is addressable by the browser's mid"
+        );
+
+        let ready = |slots: &Vec<Slot>| slots.iter().map(|s| s.ready).collect::<Vec<_>>();
+        assert_eq!(
+            ready(&*peer.slots.lock().await),
+            [true, true, false, false, false],
+            "grown slots wait for the browser to confirm"
+        );
+        confirm_slots(&peer.slots, 4).await;
+        assert_eq!(
+            ready(&*peer.slots.lock().await),
+            [true, true, true, true, false]
+        );
+
+        let err = peer.grow(4, String::new()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("must add slots"),
+            "a re-offer must add to the confirmed slots: {err}"
+        );
+        assert!(
+            peer.grow(MAX_SLOTS_PER_PEER + 1, String::new())
+                .await
+                .is_err(),
+            "the pool stops at the per-connection ceiling"
+        );
+    }
+
+    /// A peer with two confirmed slots and the browser that negotiated them.
+    async fn connected_pair() -> (KerbcastPeer, Arc<RTCPeerConnection>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        let peer = KerbcastPeer::new(registry, &[], 2).await.expect("peer");
+        let browser = build_pc().await;
+        browser
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let offer = browser_offer(&browser, 2).await;
+        let answer = peer.answer_to_offer(offer).await.expect("answer");
+        browser
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set answer");
+        (peer, browser, dir)
+    }
+
+    async fn pool_transceivers(peer: &KerbcastPeer) -> Vec<Option<Arc<RTCRtpTransceiver>>> {
+        peer.slots
+            .lock()
+            .await
+            .iter()
+            .map(|s| s.transceiver.clone())
+            .collect()
+    }
+
+    fn is_stopped(t: &RTCRtpTransceiver) -> bool {
+        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+        t.direction() == RTCRtpTransceiverDirection::Inactive
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_after_a_lost_answer_reanswers_the_slots_it_still_offers() {
+        let (peer, browser, _dir) = connected_pair().await;
+        let offer = browser_offer(&browser, 2).await;
+        peer.grow(4, offer.clone()).await.expect("first grow");
+        let first = pool_transceivers(&peer).await;
+
+        /* The answer never reached the browser, which offers the same
+        sections again. */
+        let answer = peer.grow(4, offer).await.expect("retry");
+        let again = pool_transceivers(&peer).await;
+        for i in 2..4 {
+            let (a, b) = (first[i].as_ref().unwrap(), again[i].as_ref().unwrap());
+            assert!(Arc::ptr_eq(a, b), "slot {i} keeps its transceiver");
+            assert!(!is_stopped(b));
+        }
+        browser
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set answer");
+        confirm_slots(&peer.slots, 4).await;
+        let slots = peer.slots.lock().await;
+        assert!(slots.iter().all(|s| s.ready), "every slot confirmed");
+        let browser_mids: Vec<Option<String>> = browser
+            .get_transceivers()
+            .await
+            .iter()
+            .map(|t| t.mid().map(|m| m.to_string()))
+            .collect();
+        let mids: Vec<Option<String>> = slots.iter().map(|s| s.mid.clone()).collect();
+        assert_eq!(mids, browser_mids);
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_with_new_mids_replaces_the_unconfirmed_slots() {
+        let (peer, browser, _dir) = connected_pair().await;
+        let offer = browser_offer(&browser, 2).await;
+        peer.grow(4, offer.clone()).await.expect("first grow");
+        let first = pool_transceivers(&peer).await;
+        let lost: Vec<String> = peer.slots.lock().await[2..]
+            .iter()
+            .map(|s| s.mid.clone().expect("mid"))
+            .collect();
+
+        /* A browser that rolled back its offer gives the added sections new
+        mids on the next one. */
+        let mut retry = offer;
+        for (n, mid) in lost.iter().enumerate() {
+            retry = retry
+                .replace(&format!("a=mid:{mid}\r\n"), &format!("a=mid:again{n}\r\n"))
+                .replace(&format!(" {mid} "), &format!(" again{n} "))
+                .replace(&format!(" {mid}\r\n"), &format!(" again{n}\r\n"));
+        }
+        let answer = peer.grow(4, retry).await.expect("retry");
+        assert!(answer.contains("a=mid:again0") && answer.contains("a=mid:again1"));
+
+        let again = pool_transceivers(&peer).await;
+        assert_eq!(again.len(), 4, "the pool counts the sections offered");
+        for i in 2..4 {
+            let old = first[i].as_ref().unwrap();
+            let new = again[i].as_ref().unwrap();
+            assert!(is_stopped(old), "the stale slot {i} is stopped");
+            assert!(
+                !Arc::ptr_eq(old, new),
+                "slot {i} never reuses its stopped transceiver"
+            );
+            assert!(!is_stopped(new));
+        }
+        confirm_slots(&peer.slots, 4).await;
+        let slots = peer.slots.lock().await;
+        let mids: Vec<Option<String>> = slots[2..].iter().map(|s| s.mid.clone()).collect();
+        assert_eq!(mids, [Some("again0".to_owned()), Some("again1".to_owned())]);
+        assert!(slots.iter().all(|s| s.ready));
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_reusing_a_retired_mid_is_refused() {
+        let (peer, browser, _dir) = connected_pair().await;
+        let offer = browser_offer(&browser, 2).await;
+        peer.grow(4, offer.clone()).await.expect("first grow");
+        let lost: Vec<String> = peer.slots.lock().await[2..]
+            .iter()
+            .map(|s| s.mid.clone().expect("mid"))
+            .collect();
+        let mut retry = offer.clone();
+        for (n, mid) in lost.iter().enumerate() {
+            retry = retry
+                .replace(&format!("a=mid:{mid}\r\n"), &format!("a=mid:again{n}\r\n"))
+                .replace(&format!(" {mid} "), &format!(" again{n} "))
+                .replace(&format!(" {mid}\r\n"), &format!(" again{n}\r\n"));
+        }
+        peer.grow(4, retry)
+            .await
+            .expect("retry retires the first slots");
+        let before = pool_transceivers(&peer).await;
+
+        /* The first offer again: its mids now belong to stopped transceivers. */
+        let err = peer.grow(4, offer).await.unwrap_err();
+        assert!(err.is::<GrowRefused>(), "{err}");
+        let after = pool_transceivers(&peer).await;
+        for (a, b) in before.iter().zip(&after) {
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    assert!(Arc::ptr_eq(a, b));
+                    assert!(!is_stopped(b), "a refused re-offer retires nothing");
+                }
+                (None, None) => {}
+                _ => panic!("the pool changed"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_re_offer_leaves_nothing_a_later_one_reuses() {
+        let (peer, browser, _dir) = connected_pair().await;
+        assert!(peer.grow(4, "v=garbage".to_owned()).await.is_err());
+        assert_eq!(peer.slot_count().await, 2, "a failed re-offer adds nothing");
+        let stopped_before = peer
+            .pc
+            .get_transceivers()
+            .await
+            .into_iter()
+            .filter(|t| is_stopped(t))
+            .collect::<Vec<_>>();
+        assert_eq!(stopped_before.len(), 2, "its transceivers are stopped");
+
+        let offer = browser_offer(&browser, 2).await;
+        peer.grow(4, offer).await.expect("grow");
+        for t in pool_transceivers(&peer).await.into_iter().flatten() {
+            assert!(!is_stopped(&t));
+            assert!(stopped_before.iter().all(|s| !Arc::ptr_eq(s, &t)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subscribe_never_lands_on_an_unconfirmed_slot() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join("9002.ring"), cfg).expect("ring");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let dc = Outbox::spawn(Arc::new(Mutex::new(None)), registry.anchor_owner(7));
+        let slots = Arc::new(Mutex::new(vec![Slot {
+            track: slot_track(0, &dc),
+            mid: Some("0".to_owned()),
+            bound: None,
+            ready: false,
+            transceiver: None,
+        }]));
+
+        handle_subscribe(&registry, &slots, &dc, 9002).await;
+        assert_eq!(
+            slots.lock().await[0].bound,
+            None,
+            "unconfirmed slot stays idle"
+        );
+
+        confirm_slots(&slots, 1).await;
+        handle_subscribe(&registry, &slots, &dc, 9002).await;
+        assert_eq!(slots.lock().await[0].bound, Some(9002));
     }
 
     // F4 premise (deterministic, no real connection needed): `pc.close()` must

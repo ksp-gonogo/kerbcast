@@ -13,7 +13,7 @@
 
 import { KerbcastClient } from "@ksp-gonogo/kerbcast";
 import type { CameraLifecycle } from "@ksp-gonogo/kerbcast";
-import { CameraKind, CrewLocation, Layer } from "@ksp-gonogo/kerbcast";
+import { CameraKind, CrewLocation, ErrorCode, Layer } from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -1020,6 +1020,18 @@ describe("App - sidecar error notice", () => {
     await waitFor(() => {
       expect(screen.getByText(/no free slot/i)).toBeTruthy();
     });
+  });
+
+  it("leaves a no-free-slot refusal to the tile instead of a notice", async () => {
+    const { client, sidecar, openSidecar } = buildFixture([]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await act(async () => {
+      sidecar.fireError({ message: "slot refusal text", code: ErrorCode.NoFreeSlot });
+    });
+
+    expect(screen.queryByText(/slot refusal text/i)).toBeNull();
   });
 
   it("notice is dismissible", async () => {

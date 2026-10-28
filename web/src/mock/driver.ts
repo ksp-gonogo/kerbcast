@@ -292,7 +292,8 @@ export async function createMockClient(): Promise<KerbcastClient> {
    * to catch a tile's "ARMING" pill before it clears.
    */
   const sidecar = new MockSidecar({ forceBumpDelayMs: 900 });
-  sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
+  /* The page's starting pool, grown by re-offers past eight feeds as on a real sidecar. */
+  sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]).withRenegotiation();
 
   for (const cam of MOCK_CAMERAS) {
     sidecar.addCamera(cam);
@@ -361,6 +362,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
         }, 50);
         return answer;
       },
+      renegotiate: (offer) => sidecar.renegotiate(offer),
     },
     sidecar.createTransport(),
   );

@@ -2750,6 +2750,50 @@ describe("CameraFeed - recording locks source and close", () => {
 // Command camera target brackets
 // ---------------------------------------------------------------------------
 
+
+describe("CameraFeed: no video slot", () => {
+  const NOTICE = /Not streaming: too many feeds are open/;
+  const ids = [1, 2, 3, 4, 5];
+  const feeds = (client: KerbcastClient, shown: number[], label?: string | null) => (
+    <KerbcastProvider client={client}>
+      {shown.map((id) => (
+        <CameraFeed
+          key={id}
+          flightId={id}
+          {...(label !== undefined ? { noSlotLabel: label } : {})}
+        />
+      ))}
+    </KerbcastProvider>
+  );
+
+  it("says so on the feed that found every slot taken, until another feed closes", async () => {
+    const { client } = await buildConnectedSource(
+      ids.map((id) => makeCamera({ flightId: id, cameraName: `Cam ${id}` })),
+    );
+    const view = render(feeds(client, ids));
+    await act(async () => {});
+    expect(screen.getAllByText(NOTICE)).toHaveLength(1);
+    expect(client.camera(5).waitingForSlot).toBe(true);
+
+    view.rerender(feeds(client, [2, 3, 4, 5]));
+    await act(async () => {});
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(client.camera(5).waitingForSlot).toBe(false);
+  });
+
+  it("takes a host's own words, or none", async () => {
+    const { client } = await buildConnectedSource(
+      ids.map((id) => makeCamera({ flightId: id, cameraName: `Cam ${id}` })),
+    );
+    const view = render(feeds(client, ids, "No room"));
+    await act(async () => {});
+    expect(screen.getByText("No room")).toBeTruthy();
+    view.rerender(feeds(client, ids, null));
+    expect(screen.queryByText("No room")).toBeNull();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+  });
+});
+
 describe("CameraFeed - command camera target brackets", () => {
   const STATION: CommandCentreInfo = {
     stationId: "ground:KSC",

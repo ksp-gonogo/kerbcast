@@ -9,6 +9,11 @@
 //!   answer. Unknown camera IDs are dropped with a warning rather than
 //!   failing the whole request. An offer whose video has no H.264 is
 //!   refused with 422 and an `ErrorPayload` body (`code: codec-unsupported`).
+//! - `POST /renegotiate` takes `{ session, sdp, slots }`: a re-offer from
+//!   the peer the `/offer` answer named `session`, adding video transceivers
+//!   so the slot pool grows to `slots` without disturbing running feeds.
+//!   Returns `{ sdp }`. A re-offer may repeat one whose answer the browser
+//!   never applied; `slots` must exceed the slots the browser has confirmed.
 //! - `GET /` serves the bundled kerbcast web UI (web/dist/index.html,
 //!   embedded at compile time via include_str!).
 //! - `GET /assets/mediabunny.min.mjs` serves the Mediabunny remux-trim
@@ -41,7 +46,7 @@ use tracing::{info, warn};
 use crate::cameras::{CameraInfo, CameraRegistry, StatusLogEntry};
 use crate::encoder::EncoderChoice;
 use crate::protocol::{ErrorCode, ErrorPayload, ErrorSource};
-use crate::webrtc::KerbcastPeer;
+use crate::webrtc::{GrowRefused, KerbcastPeer, MAX_SLOTS_PER_PEER};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -80,6 +85,23 @@ pub struct AnswerResponse {
     /// IDs). The browser uses this to render the right number of video
     /// elements.
     pub cameras: Vec<u32>,
+    /// Names this connection to `POST /renegotiate`.
+    pub session: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenegotiateRequest {
+    /// The `session` from this connection's `/offer` answer.
+    pub session: String,
+    pub sdp: String,
+    /// The pool size after this re-offer: every recv-only video transceiver
+    /// the offer carries, old and new.
+    pub slots: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RenegotiateResponse {
+    pub sdp: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +121,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/cameras", get(cameras))
         .route("/offer", post(offer))
+        .route("/renegotiate", post(renegotiate))
         .route("/dumpLogs", get(dump_logs))
         .route("/dumpLogs/reset", post(reset_logs))
         .route("/profile", get(profile))
@@ -238,6 +261,96 @@ async fn offer(State(state): State<AppState>, Json(req): Json<OfferRequest>) -> 
     }
 }
 
+fn too_many_slots(asked: usize) -> ErrorPayload {
+    ErrorPayload {
+        message: format!(
+            "a connection holds at most {MAX_SLOTS_PER_PEER} video slots, asked for {asked}"
+        ),
+        source: ErrorSource::Sidecar,
+        flight_id: None,
+        code: Some(ErrorCode::NoFreeSlot),
+    }
+}
+
+fn unprocessable(message: String) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ErrorPayload {
+            message,
+            source: ErrorSource::Sidecar,
+            flight_id: None,
+            code: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Grows a live peer's slot pool from a re-offer. Spawned for the same reason
+/// as `/offer`: a client hanging up mid-exchange must not leave the peer
+/// connection half-renegotiated.
+async fn renegotiate(
+    State(state): State<AppState>,
+    Json(req): Json<RenegotiateRequest>,
+) -> impl IntoResponse {
+    let slots = req.slots as usize;
+    if slots > MAX_SLOTS_PER_PEER {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(too_many_slots(slots)),
+        )
+            .into_response();
+    }
+    /* A pool size that disagrees with the offer would leave the two sides
+    counting different slots, so the mismatch is refused before any change. */
+    let offered = offered_video_sections(&req.sdp);
+    if offered != slots {
+        return unprocessable(format!(
+            "the re-offer carries {offered} video sections but asks for {slots} slots"
+        ));
+    }
+    let peer = {
+        let peers = state.peers.read().await;
+        peers
+            .iter()
+            .find(|p| p.session == req.session && p.is_alive())
+            .cloned()
+    };
+    let Some(peer) = peer else {
+        return (
+            StatusCode::NOT_FOUND,
+            "no live connection with that session\n",
+        )
+            .into_response();
+    };
+    let current = peer.confirmed_slot_count().await;
+    if slots <= current {
+        return unprocessable(format!(
+            "a re-offer must add slots: asked for {slots}, the pool already has {current}"
+        ));
+    }
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(peer.grow(slots, req.sdp).await);
+    });
+    match rx.await {
+        Ok(Ok(sdp)) => (StatusCode::OK, Json(RenegotiateResponse { sdp })).into_response(),
+        Ok(Err(e)) if e.is::<GrowRefused>() => unprocessable(e.to_string()),
+        Ok(Err(e)) => {
+            warn!(error = %e, "renegotiation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("renegotiation failed: {e}"),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "renegotiation task died before answering\n",
+        )
+            .into_response(),
+    }
+}
+
 /// Runs the whole exchange on a spawned task rather than inline.
 ///
 /// Axum drops a handler's future the moment the client hangs up, and every
@@ -300,6 +413,11 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
     // Pool size = the offer's recv-only video transceiver count. Absent
     // (older clients) → one slot per initial camera (the old behaviour).
     let slot_count = req.slots.map(|s| s as usize).unwrap_or(requested.len());
+    /* Only an explicit pool is held to the ceiling: a legacy offer's size is
+    its camera list, which it has always been free to make as long as it likes. */
+    if req.slots.is_some() && slot_count > MAX_SLOTS_PER_PEER {
+        return Err(OfferRefused(too_many_slots(slot_count)).into());
+    }
 
     let peer = Arc::new(KerbcastPeer::new(state.registry.clone(), &requested, slot_count).await?);
 
@@ -334,6 +452,7 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
     Ok(AnswerResponse {
         sdp: answer_sdp,
         cameras: subscribed,
+        session: peer.session.clone(),
     })
 }
 
@@ -529,6 +648,126 @@ mod tests {
             1,
             "one video section, one camera"
         );
+    }
+
+    /// POST `body` as JSON to `uri`, returning the status and body bytes.
+    async fn post_json(
+        state: &AppState,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, axum::body::Bytes) {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+    }
+
+    /// An H.264 offer with `n` video sections, as far as the handlers read it.
+    fn offer_with_videos(n: usize) -> String {
+        let mut sdp = "v=0\r\n".to_owned();
+        for _ in 0..n {
+            sdp.push_str("m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n");
+        }
+        sdp
+    }
+
+    #[tokio::test]
+    async fn an_offer_over_the_slot_ceiling_is_refused() {
+        let state = empty_state();
+        let asked = MAX_SLOTS_PER_PEER + 1;
+        let body =
+            serde_json::json!({ "sdp": offer_with_videos(asked), "cameras": [], "slots": asked });
+        let (status, body) = post_json(&state, "/offer", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::NoFreeSlot));
+        assert!(state.peers.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_over_the_slot_ceiling_is_refused() {
+        let state = empty_state();
+        let asked = MAX_SLOTS_PER_PEER + 1;
+        let body =
+            serde_json::json!({ "session": "x", "sdp": offer_with_videos(asked), "slots": asked });
+        let (status, body) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::NoFreeSlot));
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_whose_slots_disagree_with_its_sections_is_refused() {
+        let state = empty_state();
+        let body = serde_json::json!({ "session": "x", "sdp": offer_with_videos(3), "slots": 4 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_for_an_unknown_or_dead_session_is_not_found() {
+        let state = empty_state();
+        let body =
+            serde_json::json!({ "session": "nobody", "sdp": offer_with_videos(3), "slots": 3 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let peer = Arc::new(
+            KerbcastPeer::new(state.registry.clone(), &[], 2)
+                .await
+                .expect("peer"),
+        );
+        peer.mark_dead();
+        state.peers.write().await.push(peer.clone());
+        let body =
+            serde_json::json!({ "session": peer.session, "sdp": offer_with_videos(3), "slots": 3 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a dead peer's session is stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_that_adds_no_slots_is_refused() {
+        let state = empty_state();
+        let peer = Arc::new(
+            KerbcastPeer::new(state.registry.clone(), &[], 2)
+                .await
+                .expect("peer"),
+        );
+        state.peers.write().await.push(peer.clone());
+        let body =
+            serde_json::json!({ "session": peer.session, "sdp": offer_with_videos(2), "slots": 2 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(peer.slot_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn sessions_are_distinct_and_unguessable_in_length() {
+        let state = empty_state();
+        let a = KerbcastPeer::new(state.registry.clone(), &[], 1)
+            .await
+            .unwrap();
+        let b = KerbcastPeer::new(state.registry.clone(), &[], 1)
+            .await
+            .unwrap();
+        assert_ne!(a.session, b.session);
+        assert_eq!(a.session.len(), 32);
     }
 
     /// The video section of a Firefox offer built without OpenH264.

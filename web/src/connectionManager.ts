@@ -16,6 +16,7 @@ import type { KerbcastClient, KerbcastConnectionState } from "@ksp-gonogo/kerbca
 const BACKOFF_BASE_MS = 2000;
 const BACKOFF_MAX_MS = 30000;
 const PING_WATCHDOG_MS = 15000;
+/** Video slots the page connects with; the client adds more as feeds open past them. */
 const CONNECT_SLOTS = 8;
 
 export type ManagerStatus =

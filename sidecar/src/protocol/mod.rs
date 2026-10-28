@@ -797,6 +797,18 @@ pub struct ResumePayload {
     pub held: Vec<u32>,
 }
 
+/// Sent after the browser applies a re-offer's answer, before it subscribes
+/// any camera to the new slots. A re-offer whose answer the browser never
+/// applies is never confirmed, so its slots stay idle instead of carrying a
+/// camera the browser cannot play.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmSlotsPayload {
+    /// The pool size the applied answer covers, old slots and new.
+    pub slots: u32,
+}
+
 /// Consumer's background-capture request. Global rather than
 /// per-camera: it is a statement about how much background cost this consumer
 /// wants spent, not about one camera. Zero stops asking.
@@ -1352,6 +1364,15 @@ pub struct HelloPayload {
     /// than 1.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<bool>,
+    /// True when this sidecar answers `POST /renegotiate`, so a client whose
+    /// slots are all bound can add more without reconnecting. Absent from
+    /// sidecars older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renegotiate: Option<bool>,
+    /// The most video slots one connection may hold, counting slots added by
+    /// renegotiation. Absent from sidecars older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_slots: Option<u32>,
 }
 
 #[typeshare]
@@ -1622,6 +1643,10 @@ pub enum ClientMessage {
     /// Name the client behind this connection and take over what its last
     /// connection forced and held. See `ResumePayload`.
     Resume(ResumePayload),
+    /// The browser applied the answer to a `POST /renegotiate` re-offer and
+    /// can play every slot up to `slots`; until then grown slots take no
+    /// camera. See `ConfirmSlotsPayload`.
+    ConfirmSlots(ConfirmSlotsPayload),
     /// Ask for background capture: subscribed cameras that this
     /// consumer is NOT displaying keep capturing at a low rate instead of
     /// stopping, so switching to one promotes an already-flowing stream rather
@@ -1906,8 +1931,12 @@ mod tests {
             max_anchors_per_camera: Some(16),
             size_hold: Some(true),
             resume: Some(true),
+            renegotiate: Some(true),
+            max_slots: Some(32),
         });
         let hello = serde_json::to_string(&hello).unwrap();
+        assert!(hello.contains(r#""renegotiate":true"#));
+        assert!(hello.contains(r#""maxSlots":32"#));
         assert!(hello.contains(r#""sizeHold":true"#));
         assert!(hello.contains(r#""resume":true"#));
         assert!(hello.contains(r#""maxAnchorsPerCamera":16"#));

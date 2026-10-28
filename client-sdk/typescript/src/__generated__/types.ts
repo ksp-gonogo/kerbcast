@@ -1176,6 +1176,17 @@ export interface HelloPayload {
 	 * than 1.12.
 	 */
 	resume?: boolean;
+	/**
+	 * True when this sidecar answers `POST /renegotiate`, so a client whose
+	 * slots are all bound can add more without reconnecting. Absent from
+	 * sidecars older than 1.12.
+	 */
+	renegotiate?: boolean;
+	/**
+	 * The most video slots one connection may hold, counting slots added by
+	 * renegotiation. Absent from sidecars older than 1.12.
+	 */
+	maxSlots?: number;
 }
 
 /**
@@ -1232,6 +1243,17 @@ export interface SceneStateChangedPayload {
 export interface SetAnchorsPayload {
 	flightId: number;
 	anchors?: Anchor[];
+}
+
+/**
+ * Sent after the browser applies a re-offer's answer, before it subscribes
+ * any camera to the new slots. A re-offer whose answer the browser never
+ * applies is never confirmed, so its slots stay idle instead of carrying a
+ * camera the browser cannot play.
+ */
+export interface ConfirmSlotsPayload {
+	/** The pool size the applied answer covers, old slots and new. */
+	slots: number;
 }
 
 /**
@@ -1516,6 +1538,12 @@ export type ClientMessage =
 	 * connection forced and held. See `ResumePayload`.
 	 */
 	| { type: "resume", content: ResumePayload }
+	/**
+	 * The browser applied the answer to a `POST /renegotiate` re-offer and
+	 * can play every slot up to `slots`; until then grown slots take no
+	 * camera. See `ConfirmSlotsPayload`.
+	 */
+	| { type: "confirm-slots", content: ConfirmSlotsPayload }
 	/**
 	 * Ask for background capture: subscribed cameras that this
 	 * consumer is NOT displaying keep capturing at a low rate instead of

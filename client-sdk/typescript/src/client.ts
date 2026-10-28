@@ -54,6 +54,30 @@ const LIVE_INTENSITY_FLOOR = 0.05;
  * frames resume.
  */
 const STALL_KEYFRAME_RETRY_MS = 2000;
+/**
+ * The fewest slots one re-offer adds. A page opening several feeds at once
+ * gets them in one exchange instead of one per feed.
+ */
+const SLOT_GROWTH_STEP = 4;
+/**
+ * How long a slot re-offer may wait for the sidecar's answer before it counts
+ * as failed, so a hung request cannot leave the pool stuck mid-grow.
+ */
+const RENEGOTIATE_TIMEOUT_MS = 10_000;
+/**
+ * Waits before each retry of a failed slot re-offer, the last repeating
+ * while any camera still waits for a slot.
+ */
+const GROW_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000];
+/**
+ * Failed re-offers in a row after which a connection stops growing. Each
+ * failure after the sidecar answered leaves it a few stopped transceivers it
+ * keeps for the connection's life, so the retries must end.
+ */
+const MAX_GROW_FAILURES = 6;
+
+/** The sidecar refused a re-offer outright, so sending it again cannot help. */
+class RenegotiateRefusedError extends Error {}
 
 /** Controls the digital-static noise overlay baked into `cam.mediaStream`. */
 export interface NoiseConfig {
@@ -83,6 +107,14 @@ export interface KerbcastCameraHandle {
    * while disconnected. Transitions are emitted as `source` events.
    */
   readonly hasSource: boolean;
+  /**
+   * True while this client wants the camera's video but the connection has
+   * no video slot to carry it, and cannot add one. The camera gets the next
+   * slot another camera gives up. A client that can grow its slot pool adds
+   * one instead, so this stays false. Transitions are emitted as `waiting`
+   * events.
+   */
+  readonly waitingForSlot: boolean;
   /** Current {@link setShowStatic} setting. */
   readonly showStatic: boolean;
   /**
@@ -213,6 +245,8 @@ export interface KerbcastCameraEvents {
   stall: boolean;
   /** {@link KerbcastCameraHandle.hasSource} changed. */
   source: boolean;
+  /** {@link KerbcastCameraHandle.waitingForSlot} changed. */
+  waiting: boolean;
 }
 
 /**
@@ -316,7 +350,20 @@ export interface KerbcastClientConfig {
     sdp: string;
     cameras: number[];
     slots?: number;
-  }) => Promise<{ sdp: string; cameras: number[] }>;
+  }) => Promise<{ sdp: string; cameras: number[]; session?: string }>;
+  /**
+   * Override how a re-offer that grows the slot pool is exchanged. Defaults
+   * to a POST to the sidecar's HTTP `/renegotiate`. `session` comes from the
+   * `/offer` answer, so a relay that brokers {@link negotiate} must pass it
+   * through. A client given `negotiate` but not this one cannot grow its
+   * pool: a camera that finds every slot taken reports
+   * {@link KerbcastCameraHandle.waitingForSlot} instead.
+   */
+  renegotiate?: (offer: {
+    session: string;
+    sdp: string;
+    slots: number;
+  }) => Promise<{ sdp: string }>;
   /**
    * Options for the lazily-built {@link RecordingController} (`client.recording`).
    * The load-bearing use is `loadTrimmer`: a consumer that can't rely on the
@@ -608,6 +655,12 @@ export interface KerbcastPeer {
   createOffer(): Promise<string>;
   setLocalDescription(sdp: string): Promise<void>;
   setRemoteAnswer(sdp: string): Promise<void>;
+  /**
+   * Abandon a local offer whose answer never arrived, returning to the last
+   * agreed description. Optional so older transports keep compiling; without
+   * it a failed slot re-offer is left pending.
+   */
+  rollback?(): Promise<void>;
   waitForIceComplete(): Promise<void>;
   localSdp(): string;
   close(): void;
@@ -757,6 +810,11 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
       },
       setRemoteAnswer: async (sdp) => {
         await pc.setRemoteDescription({ type: "answer", sdp });
+      },
+      rollback: async () => {
+        if (pc.signalingState === "have-local-offer") {
+          await pc.setLocalDescription({ type: "rollback" });
+        }
       },
       waitForIceComplete: () =>
         new Promise<void>((resolve) => {
@@ -1086,6 +1144,7 @@ class CameraHandle
   /** Stall state mirrored from the pipeline's onStallChange callback. */
   private _stalled = false;
   private _hasSource = false;
+  private _waitingForSlot = false;
   /** The raw stream {@link _watchSource} last subscribed to, so a re-apply of it adds no listener. */
   private _watchedStream: MediaStream | null = null;
   /** Interval that re-requests keyframes while stalled; null when not stalled. */
@@ -1120,6 +1179,17 @@ class CameraHandle
 
   get hasSource(): boolean {
     return this._hasSource;
+  }
+
+  get waitingForSlot(): boolean {
+    return this._waitingForSlot;
+  }
+
+  /** Internal: the client found no slot for this camera, or found one. */
+  _setWaitingForSlot(waiting: boolean): void {
+    if (waiting === this._waitingForSlot) return;
+    this._waitingForSlot = waiting;
+    this.emit("waiting", waiting);
   }
 
   get showStatic(): boolean {
@@ -1530,6 +1600,32 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private camerasListed = false;
   /** Whether the connected sidecar's `hello` offered size holds. */
   private _sizeHoldSupported = false;
+  /** Video slots the current connection negotiated, grown by {@link growSlots}. */
+  private slotCount = 0;
+  /** Names this connection to `/renegotiate`; from the `/offer` answer. */
+  private session: string | null = null;
+  private _renegotiateSupported = false;
+  private _maxSlots = Number.POSITIVE_INFINITY;
+  /**
+   * Recv-only transceivers on the peer. Past {@link slotCount} are the ones a
+   * rolled-back re-offer left without a mid; the next re-offer carries them again.
+   */
+  private transceiverCount = 0;
+  /** Set once the sidecar refuses a re-offer outright, or the peer cannot roll one back. */
+  private growBroken = false;
+  private growing = false;
+  /** Failed re-offers since the last that landed, picking the next retry's wait. */
+  private growFailures = 0;
+  private growRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Refused cameras waiting on the re-offer in flight. */
+  private readonly growQueue = new Set<number>();
+  /**
+   * Cameras subscribed and not since unsubscribed, across reconnects. A
+   * refusal for a camera no longer here is stale and dropped.
+   */
+  private readonly wanted = new Set<number>();
+  /** Cameras refused a slot that the pool cannot grow to carry, in the order they next get one. */
+  private readonly slotWaiters = new Set<number>();
   /** Cameras this client forces to full resolution, sent again on every connection. */
   private readonly forcedFlights = new Set<number>();
   /** Cameras this client holds at their size, sent again on every connection that takes holds. */
@@ -1847,6 +1943,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.setState("connecting");
     this.requestedOrder = [...requestedCameras];
     this.dynamicMode = opts.slots !== undefined;
+    /* Cameras asked for at connect are wanted like subscribed ones, so a
+       connect-time refusal grows the pool or reports waiting, not nothing. */
+    if (this.dynamicMode) for (const flightId of requestedCameras) this.wanted.add(flightId);
     this.trackByMid.clear();
     this.flightByMid.clear();
     this.flightByTrackId.clear();
@@ -1856,6 +1955,20 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.commandCentres.clear();
     this._anchorsSupported = false;
     this._sizeHoldSupported = false;
+    this.slotCount = 0;
+    this.session = null;
+    this._renegotiateSupported = false;
+    this._maxSlots = Number.POSITIVE_INFINITY;
+    this.transceiverCount = 0;
+    this.growBroken = false;
+    this.growing = false;
+    this.growFailures = 0;
+    this.cancelGrowRetry();
+    this.growQueue.clear();
+    for (const flightId of this.slotWaiters) {
+      this.getOrCreateHandle(flightId)._setWaitingForSlot(false);
+    }
+    this.slotWaiters.clear();
     this.anchorsSent.clear();
     this.camerasListed = false;
     this._maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
@@ -1878,6 +1991,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     for (let i = 0; i < slotCount; i++) {
       peer.addRecvOnlyTransceiver();
     }
+    this.transceiverCount = slotCount;
 
     peer.onTrack((track, idx, mid) => this.handleTrack(track, idx, mid));
 
@@ -1888,7 +2002,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this.tearDownStreams();
       }
       /* A failed peer never recovers; closing it frees its relay allocations. */
-      if (s === "failed") peer.close();
+      if (s === "failed") {
+        if (this.peer === peer) {
+          this.growBroken = true;
+          this.cancelGrowRetry();
+        }
+        peer.close();
+      }
     });
 
     const control = peer.createDataChannel("kerbcast-control");
@@ -1933,7 +2053,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     };
     if (this.dynamicMode) body.slots = slotCount;
 
-    let answer: { sdp: string; cameras: number[] };
+    let answer: { sdp: string; cameras: number[]; session?: string };
     try {
       answer = await (this.cfg.negotiate
         ? this.cfg.negotiate(body)
@@ -1944,6 +2064,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       throw err;
     }
     await peer.setRemoteAnswer(answer.sdp);
+    this.slotCount = slotCount;
+    this.session = answer.session ?? null;
     // Legacy mode routes by index → requestedOrder, so realign to what the
     // sidecar actually wired. Dynamic mode routes by mid via SlotMap (initial
     // bindings arrive on Hello), so the answer's camera list isn't used.
@@ -1957,7 +2079,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     sdp: string;
     cameras: number[];
     slots?: number;
-  }): Promise<{ sdp: string; cameras: number[] }> {
+  }): Promise<{ sdp: string; cameras: number[]; session?: string }> {
     const res = await fetch(`http://${this.cfg.host}:${this.cfg.port}/offer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1971,10 +2093,227 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       }
       throw new Error(`POST /offer returned ${res.status}`);
     }
-    return (await res.json()) as { sdp: string; cameras: number[] };
+    return (await res.json()) as { sdp: string; cameras: number[]; session?: string };
+  }
+
+  /** Default re-offer exchange: POST to the sidecar's HTTP `/renegotiate`. */
+  private async httpRenegotiate(offer: {
+    session: string;
+    sdp: string;
+    slots: number;
+  }): Promise<{ sdp: string }> {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), RENEGOTIATE_TIMEOUT_MS);
+    try {
+      const res = await fetch(`http://${this.cfg.host}:${this.cfg.port}/renegotiate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(offer),
+        signal: abort.signal,
+      });
+      if (!res.ok) {
+        const message = `POST /renegotiate returned ${res.status}`;
+        /* A 4xx is the sidecar refusing this re-offer; a timeout or a busy
+           proxy in front of it is worth another try. */
+        const refused =
+          res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+        throw refused ? new RenegotiateRefusedError(message) : new Error(message);
+      }
+      return (await res.json()) as { sdp: string };
+    } catch (err) {
+      if (abort.signal.aborted) {
+        throw new Error(`POST /renegotiate gave no answer within ${RENEGOTIATE_TIMEOUT_MS} ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Whether a camera refused a slot can be carried by growing the pool. */
+  private canGrowSlots(): boolean {
+    return (
+      this.dynamicMode &&
+      this.peer !== null &&
+      this._renegotiateSupported &&
+      !this.growBroken &&
+      this.growRetryTimer === null &&
+      this.session !== null &&
+      this.slotCount < this._maxSlots &&
+      (this.cfg.renegotiate !== undefined || this.cfg.negotiate === undefined)
+    );
+  }
+
+  /**
+   * Add video slots for the cameras in {@link growQueue} with one re-offer,
+   * then subscribe them again. Refusals that land meanwhile join the queue
+   * and go in the next round. Running feeds keep their slots throughout.
+   */
+  private async growSlots(): Promise<void> {
+    if (this.growing) return;
+    const peer = this.peer;
+    const session = this.session;
+    if (!peer || session === null) return;
+    this.growing = true;
+    let batch: number[] = [];
+    let answerRefused = false;
+    try {
+      while (this.growQueue.size > 0 && this.peer === peer) {
+        batch = [...this.growQueue];
+        this.growQueue.clear();
+        const target = Math.min(
+          this._maxSlots,
+          Math.max(this.transceiverCount, this.slotCount + Math.max(batch.length, SLOT_GROWTH_STEP)),
+        );
+        if (target <= this.slotCount) {
+          for (const flightId of batch) this.markWaitingForSlot(flightId);
+          batch = [];
+          continue;
+        }
+        for (let i = this.transceiverCount; i < target; i++) peer.addRecvOnlyTransceiver();
+        this.transceiverCount = Math.max(this.transceiverCount, target);
+        await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
+        const offer = { session, sdp: peer.localSdp(), slots: target };
+        const answer = await (this.cfg.renegotiate
+          ? this.cfg.renegotiate(offer)
+          : this.httpRenegotiate(offer));
+        if (this.peer !== peer) return;
+        await peer.setRemoteAnswer(answer.sdp).catch((err: unknown) => {
+          answerRefused = true;
+          throw err;
+        });
+        /* A reconnect during that await owns the client now; this grow belongs to a dead peer. */
+        if (this.peer !== peer) return;
+        this.slotCount = target;
+        this.growFailures = 0;
+        /* The sidecar binds no camera to the new slots until this lands, and
+           the channel is ordered, so the subscribes below can use them. */
+        void this._send({ type: "confirm-slots", content: { slots: target } }).catch(() => {});
+        for (const flightId of batch) {
+          if (this.wanted.has(flightId)) {
+            void this._send({ type: "subscribe", content: { flightId } }).catch(() => {});
+          }
+        }
+        batch = [];
+      }
+    } catch (err) {
+      if (this.peer !== peer) return;
+      /*
+       * The sidecar may have grown its side already (the answer was lost, or
+       * the browser refused it). Its new slots stay unconfirmed and idle, so
+       * running feeds carry on; rolling back returns the browser to its last
+       * agreed description, keeping the added transceivers without a mid.
+       * The retry offers those same transceivers, and the sidecar answers
+       * again whatever unconfirmed slots it holds, so the two sides line up.
+       * Meanwhile the cameras wait for a slot.
+       */
+      try {
+        await peer.rollback?.();
+      } catch {
+        // Nothing pending to roll back.
+      }
+      this.growFailures++;
+      /* The browser refusing the sidecar's answer would refuse the next one too. */
+      if (
+        err instanceof RenegotiateRefusedError ||
+        answerRefused ||
+        !peer.rollback ||
+        this.growFailures >= MAX_GROW_FAILURES
+      ) {
+        this.growBroken = true;
+      }
+      for (const flightId of [...batch, ...this.growQueue]) this.markWaitingForSlot(flightId);
+      this.growQueue.clear();
+      if (!this.growBroken) this.scheduleGrowRetry(peer);
+      /* A run of failures is said once, not on every retry. */
+      if (this.growFailures === 1 || this.growBroken) {
+        this.emit("error", {
+          message: `[kerbcast] could not add video slots: ${err instanceof Error ? err.message : String(err)}`,
+          source: ErrorSource.Sidecar,
+        });
+      }
+    } finally {
+      if (this.peer === peer) this.growing = false;
+    }
+  }
+
+  private scheduleGrowRetry(peer: KerbcastPeer): void {
+    if (this.growRetryTimer !== null) return;
+    const delay = GROW_RETRY_DELAYS_MS[Math.min(this.growFailures, GROW_RETRY_DELAYS_MS.length) - 1];
+    this.growRetryTimer = setTimeout(() => {
+      this.growRetryTimer = null;
+      if (this.peer !== peer || this.growing) return;
+      for (const flightId of this.slotWaiters) {
+        const destroyed = this.handles.get(flightId)?.state?.lifecycle === CameraLifecycle.Destroyed;
+        if (this.wanted.has(flightId) && !destroyed) this.growQueue.add(flightId);
+      }
+      if (this.growQueue.size === 0 || !this.canGrowSlots()) {
+        this.growQueue.clear();
+        this.growFailures = 0;
+        return;
+      }
+      void this.growSlots();
+    }, delay);
+  }
+
+  /** End a run of failed re-offers, so the next failure starts a fresh one. */
+  private cancelGrowRetry(): void {
+    this.growFailures = 0;
+    if (this.growRetryTimer === null) return;
+    clearTimeout(this.growRetryTimer);
+    this.growRetryTimer = null;
+  }
+
+  /**
+   * A subscribe for `flightId` found every slot taken. Grows the pool when it
+   * can and returns true (handled quietly); otherwise marks the camera
+   * waiting and returns false so the refusal still reaches `error` listeners.
+   */
+  private onNoFreeSlot(flightId: number): boolean {
+    /* A stale refusal, or a waiter refused again after a hand-off race: either way already said. */
+    if (!this.wanted.has(flightId) || this.slotWaiters.has(flightId)) return true;
+    if (this.canGrowSlots()) {
+      this.growQueue.add(flightId);
+      void this.growSlots();
+      return true;
+    }
+    this.markWaitingForSlot(flightId);
+    return false;
+  }
+
+  private markWaitingForSlot(flightId: number): void {
+    if (!this.wanted.has(flightId)) return;
+    this.slotWaiters.add(flightId);
+    this.getOrCreateHandle(flightId)._setWaitingForSlot(true);
+  }
+
+  private clearWaitingForSlot(flightId: number): void {
+    if (!this.slotWaiters.delete(flightId)) return;
+    this.getOrCreateHandle(flightId)._setWaitingForSlot(false);
+    if (this.slotWaiters.size === 0) this.cancelGrowRetry();
+  }
+
+  /**
+   * A slot came free: offer it to the camera that has waited longest. That
+   * camera moves to the back of the line, so slots freed together go to
+   * different cameras; it leaves the line once a slot-map binds it.
+   */
+  private handFreedSlotToWaiting(): void {
+    for (const flightId of [...this.slotWaiters]) {
+      const destroyed = this.handles.get(flightId)?.state?.lifecycle === CameraLifecycle.Destroyed;
+      if (!this.wanted.has(flightId) || destroyed) {
+        this.clearWaitingForSlot(flightId);
+        continue;
+      }
+      this.slotWaiters.delete(flightId);
+      this.slotWaiters.add(flightId);
+      void this._send({ type: "subscribe", content: { flightId } }).catch(() => {});
+      return;
+    }
   }
 
   disconnect(): void {
+    this.cancelGrowRetry();
     this.clearEncodedTransforms();
     this.peer?.close();
     this.peer = null;
@@ -1996,10 +2335,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /**
    * Dynamic mode only: bind a camera to a free slot on the already-connected
    * peer. The camera's stream appears on its handle once the sidecar answers
-   * with a SlotMap; the sidecar emits an `error` event if no slot is free. No
-   * renegotiation.
+   * with a SlotMap. When every slot is taken the client adds slots with a
+   * re-offer, leaving running feeds alone; where it cannot, the handle
+   * reports `waitingForSlot`, the refusal is emitted as an `error` event, and
+   * the camera takes the next slot that comes free.
    */
   async subscribe(flightId: number): Promise<void> {
+    if (this.dynamicMode) this.wanted.add(flightId);
     await this._send({ type: "subscribe", content: { flightId } });
   }
 
@@ -2008,6 +2350,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * goes null once the sidecar confirms with a SlotMap.
    */
   async unsubscribe(flightId: number): Promise<void> {
+    this.wanted.delete(flightId);
+    this.growQueue.delete(flightId);
+    this.clearWaitingForSlot(flightId);
     await this._send({ type: "unsubscribe", content: { flightId } });
   }
 
@@ -2481,6 +2826,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this._anchorsSupported = msg.content.anchors === true;
         this._maxAnchorsPerCamera = msg.content.maxAnchorsPerCamera ?? MAX_ANCHORS_PER_CAMERA;
         this._sizeHoldSupported = msg.content.sizeHold === true;
+        this._renegotiateSupported = msg.content.renegotiate === true;
+        this._maxSlots = msg.content.maxSlots ?? Number.POSITIVE_INFINITY;
         if (msg.content.resume === true) this._sendResume();
         this._sendHeldSizes();
         /* A new connection starts with no anchors on the sidecar. */
@@ -2542,7 +2889,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
             this.getOrCreateHandle(prev)._setMediaStream(null);
           }
           this.flightByMid.delete(mid);
+          this.handFreedSlotToWaiting();
         } else {
+          this.clearWaitingForSlot(flightId);
           // A switch (a different camera held this slot) clears the old one.
           if (prev !== undefined && prev !== flightId) {
             this.getOrCreateHandle(prev)._setMediaStream(null);
@@ -2567,6 +2916,14 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this.emit("adaptive-shed", msg.content);
         break;
       case "error":
+        if (
+          msg.content.code === ErrorCode.NoFreeSlot &&
+          msg.content.flightId != null &&
+          this.dynamicMode &&
+          this.onNoFreeSlot(msg.content.flightId)
+        ) {
+          break;
+        }
         this.emit("error", msg.content);
         break;
       case "ping":

@@ -11,4 +11,4 @@ pub mod outbox;
 pub mod peer;
 pub mod video_track;
 
-pub use peer::{resync_after_camera_churn, KerbcastPeer};
+pub use peer::{resync_after_camera_churn, GrowRefused, KerbcastPeer, MAX_SLOTS_PER_PEER};

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AnchorKind,
   CameraKind,
@@ -1999,6 +1999,668 @@ describe("KerbcastClient — dynamic slot subscription", () => {
     await client.subscribe(1); // takes the only slot
     await client.subscribe(2); // no free slot → sidecar error
     expect(errors.some((e) => /no free slot/.test(e.message))).toBe(true);
+  });
+
+  /** Let the client's re-offer round trip and its follow-up sends settle. */
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  function growable(sidecar: MockSidecar) {
+    const renegotiate = vi.fn((o: { session: string; sdp: string; slots: number }) =>
+      sidecar.renegotiate(o),
+    );
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+      sidecar.createTransport(),
+    );
+    return { client, renegotiate };
+  }
+
+  it("adds slots with a re-offer when every slot is taken, keeping running feeds", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const { client, renegotiate } = growable(sidecar);
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    const errors: { message: string }[] = [];
+    client.on("error", (e) => errors.push(e));
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+
+    expect(renegotiate).toHaveBeenCalledOnce();
+    expect(renegotiate.mock.calls[0][0]).toMatchObject({ session: "mock-session", slots: 5 });
+    expect(sidecar.slotMids).toHaveLength(5);
+    expect(sidecar.slotMidFor(1)).toBe("0");
+    expect(sidecar.slotMidFor(2)).toBeDefined();
+    expect(client.camera(2).waitingForSlot).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  it("marks a camera waiting when the pool cannot grow, and hands it the next freed slot", async () => {
+    const sidecar = new MockSidecar().withSlots(["only"]);
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    const waiting: boolean[] = [];
+    client.camera(2).on("waiting", (w) => waiting.push(w));
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    expect(client.camera(2).waitingForSlot).toBe(true);
+
+    await client.unsubscribe(1);
+    await settle();
+    expect(sidecar.slotMidFor(2)).toBe("only");
+    expect(client.camera(2).waitingForSlot).toBe(false);
+    expect(waiting).toEqual([true, false]);
+  });
+
+  it("does not grow through a brokered negotiate that has no renegotiate", async () => {
+    const sidecar = new MockSidecar().withSlots(["only"]).withRenegotiation();
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+    expect(sidecar.slotMids).toHaveLength(1);
+    expect(client.camera(2).waitingForSlot).toBe(true);
+  });
+
+  it("stops growing at the sidecar's slot ceiling", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation(2);
+    const { client } = growable(sidecar);
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+    await client.subscribe(3);
+    await settle();
+
+    expect(sidecar.slotMids).toHaveLength(2);
+    expect(client.camera(2).waitingForSlot).toBe(false);
+    expect(client.camera(3).waitingForSlot).toBe(true);
+  });
+
+  it("falls back to waiting when a re-offer fails", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: (o) => sidecar.negotiate(o),
+        renegotiate: () => Promise.reject(new Error("boom")),
+      },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    const errors: { message: string }[] = [];
+    client.on("error", (e) => errors.push(e));
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+
+    expect(client.camera(2).waitingForSlot).toBe(true);
+    expect(errors.some((e) => /could not add video slots/.test(e.message))).toBe(true);
+  });
+
+  function noFreeSlot(flightId: number) {
+    return {
+      message: "no free slot",
+      source: ErrorSource.Sidecar,
+      flightId,
+      code: ErrorCode.NoFreeSlot,
+    };
+  }
+
+  it("treats a camera refused at connect like a refused subscribe", async () => {
+    const fixed = new MockSidecar().withSlots(["0"]);
+    const plain = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => fixed.negotiate(o) },
+      fixed.createTransport(),
+    );
+    await plain.connect([1, 2], { slots: 1 });
+    fixed.open();
+    const errors: unknown[] = [];
+    plain.on("error", (e) => errors.push(e));
+    fixed.fireError(noFreeSlot(2));
+    expect(plain.camera(2).waitingForSlot).toBe(true);
+    expect(errors).toHaveLength(1);
+
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const { client, renegotiate } = growable(sidecar);
+    await client.connect([1, 2], { slots: 1 });
+    sidecar.open();
+    sidecar.fireError(noFreeSlot(2));
+    await settle();
+    expect(renegotiate).toHaveBeenCalledOnce();
+    expect(sidecar.slotMidFor(2)).toBeDefined();
+  });
+
+  it("batches refusals that land while a re-offer is in flight", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const renegotiate = vi.fn(async (o: { session: string; sdp: string; slots: number }) => {
+      await gate;
+      return sidecar.renegotiate(o);
+    });
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    for (const id of [1, 2, 3, 4, 5, 6, 7]) await client.subscribe(id);
+    expect(renegotiate).toHaveBeenCalledOnce();
+    release();
+    await settle();
+
+    expect(renegotiate).toHaveBeenCalledTimes(2);
+    expect(renegotiate.mock.calls.map((c) => c[0].slots)).toEqual([5, 10]);
+    for (const id of [1, 2, 3, 4, 5, 6, 7]) expect(sidecar.slotMidFor(id)).toBeDefined();
+  });
+
+  it("rolls back when a re-offer's answer is lost, and never uses the slots the sidecar grew", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: (o) => sidecar.negotiate(o),
+        renegotiate: async (o) => {
+          await sidecar.renegotiate(o);
+          throw new Error("response lost");
+        },
+      },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    const errors: { message: string; code?: ErrorCode }[] = [];
+    client.on("error", (e) => errors.push(e));
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+    await client.subscribe(3);
+    await settle();
+
+    expect(sidecar.rollbacks).toBe(1);
+    expect(sidecar.slotMids).toHaveLength(5);
+    expect(sidecar.lastCommand("confirm-slots")).toBeUndefined();
+    expect(sidecar.slotMidFor(2)).toBeUndefined();
+    expect(sidecar.slotMidFor(3)).toBeUndefined();
+    expect(client.camera(2).waitingForSlot).toBe(true);
+    expect(client.camera(3).waitingForSlot).toBe(true);
+    expect(errors.filter((e) => /could not add video slots/.test(e.message))).toHaveLength(1);
+  });
+
+  it("rolls back and confirms nothing when the browser refuses a re-offer's answer", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const base = sidecar.createTransport();
+    let answers = 0;
+    const transport = {
+      createPeer: (...args: Parameters<typeof base.createPeer>) => {
+        const peer = base.createPeer(...args);
+        return {
+          ...peer,
+          setRemoteAnswer: async (sdp: string) => {
+            if (++answers > 1) throw new Error("answer refused");
+            await peer.setRemoteAnswer(sdp);
+          },
+        };
+      },
+    };
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: (o) => sidecar.negotiate(o),
+        renegotiate: (o) => sidecar.renegotiate(o),
+      },
+      transport,
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+
+    expect(sidecar.rollbacks).toBe(1);
+    expect(sidecar.lastCommand("confirm-slots")).toBeUndefined();
+    expect(sidecar.slotMidFor(2)).toBeUndefined();
+    expect(client.camera(2).waitingForSlot).toBe(true);
+  });
+
+  it("drops a grow whose peer was replaced while its answer was applied", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const base = sidecar.createTransport();
+    let answers = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const transport = {
+      createPeer: (...args: Parameters<typeof base.createPeer>) => {
+        const peer = base.createPeer(...args);
+        return {
+          ...peer,
+          setRemoteAnswer: async (sdp: string) => {
+            if (++answers === 2) await gate;
+            await peer.setRemoteAnswer(sdp);
+          },
+        };
+      },
+    };
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: (o) => sidecar.negotiate(o),
+        renegotiate: (o) => sidecar.renegotiate(o),
+      },
+      transport,
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+    expect(answers).toBe(2);
+
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    const sent = sidecar.commands.length;
+    release();
+    await settle();
+
+    expect(sidecar.lastCommand("confirm-slots")).toBeUndefined();
+    expect(sidecar.commands.slice(sent).some((c) => c.type === "subscribe")).toBe(false);
+  });
+
+  it("treats a /renegotiate that never answers as a failed grow", async () => {
+    vi.useFakeTimers();
+    try {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
+        if (String(url).endsWith("/offer")) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ sdp: "v=0\r\n", cameras: [], session: "s" }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+          );
+        }
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        });
+      });
+      const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      const errors: { message: string }[] = [];
+      client.on("error", (e) => errors.push(e));
+
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(sidecar.rollbacks).toBe(1);
+      expect(client.camera(2).waitingForSlot).toBe(true);
+      expect(errors.some((e) => /no answer within/.test(e.message))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe("retrying a failed grow", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    /** A transport over `sidecar` that counts the transceivers the client adds. */
+    function countingTransport(sidecar: MockSidecar) {
+      const base = sidecar.createTransport();
+      const counts = { transceivers: 0 };
+      const transport = {
+        createPeer: (...args: Parameters<typeof base.createPeer>) => {
+          const peer = base.createPeer(...args);
+          return {
+            ...peer,
+            addRecvOnlyTransceiver: () => {
+              counts.transceivers++;
+              peer.addRecvOnlyTransceiver();
+            },
+          };
+        },
+      };
+      return { transport, counts };
+    }
+
+    it("recovers the waiting cameras after a 503, without reconnecting", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      let renegotiates = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        const json = (body: unknown) =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        if (String(url).endsWith("/offer")) {
+          return json({ sdp: "v=0\r\n", cameras: [], session: "s" });
+        }
+        if (++renegotiates === 1) return new Response("busy", { status: 503 });
+        return json(await sidecar.renegotiate(JSON.parse(String(init?.body))));
+      });
+      const { transport, counts } = countingTransport(sidecar);
+      const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+      const offers = vi.mocked(globalThis.fetch);
+      offers.mockClear();
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.camera(2).waitingForSlot).toBe(true);
+      expect(sidecar.slotMidFor(1)).toBe("0");
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(renegotiates).toBe(2);
+      expect(sidecar.slotMidFor(1)).toBe("0");
+      expect(sidecar.slotMidFor(2)).toBeDefined();
+      expect(client.camera(2).waitingForSlot).toBe(false);
+      expect(offers.mock.calls.filter(([u]) => String(u).endsWith("/offer"))).toHaveLength(1);
+      expect(counts.transceivers).toBe(5);
+    });
+
+    it("recovers after a lost answer, re-offering the transceivers it rolled back", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const renegotiate = vi.fn(async (o: { session: string; sdp: string; slots: number }) => {
+        const answer = await sidecar.renegotiate(o);
+        if (renegotiate.mock.calls.length === 1) throw new Error("response lost");
+        return answer;
+      });
+      const { transport, counts } = countingTransport(sidecar);
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        transport,
+      );
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sidecar.rollbacks).toBe(1);
+      expect(client.camera(2).waitingForSlot).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(renegotiate.mock.calls.map((c) => c[0].slots)).toEqual([5, 5]);
+      expect(counts.transceivers).toBe(5);
+      expect(sidecar.slotMids).toHaveLength(5);
+      expect(sidecar.lastCommand("confirm-slots")?.content).toEqual({ slots: 5 });
+      expect(sidecar.slotMidFor(1)).toBe("0");
+      expect(sidecar.slotMidFor(2)).toBeDefined();
+      expect(client.camera(2).waitingForSlot).toBe(false);
+    });
+
+    it("backs off between retries, then gives up after six failures", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const calls: number[] = [];
+      const renegotiate = vi.fn(async () => {
+        calls.push(Date.now());
+        throw new Error("down");
+      });
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        sidecar.createTransport(),
+      );
+      const errors: { message: string }[] = [];
+      client.on("error", (e) => errors.push(e));
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      const start = Date.now();
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(300_000);
+
+      expect(calls.map((t) => t - start)).toEqual([0, 2_000, 7_000, 22_000, 52_000, 82_000]);
+      /* The first failure and the giving up, nothing in between. */
+      expect(errors.filter((e) => /could not add video slots/.test(e.message))).toHaveLength(2);
+      expect(client.camera(2).waitingForSlot).toBe(true);
+    });
+
+    it("never retries an answer the browser refused", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const base = sidecar.createTransport();
+      let answers = 0;
+      const transport = {
+        createPeer: (...args: Parameters<typeof base.createPeer>) => {
+          const peer = base.createPeer(...args);
+          return {
+            ...peer,
+            setRemoteAnswer: async (sdp: string) => {
+              if (++answers > 1) throw new Error("answer refused");
+              await peer.setRemoteAnswer(sdp);
+            },
+          };
+        },
+      };
+      const renegotiate = vi.fn((o: { session: string; sdp: string; slots: number }) =>
+        sidecar.renegotiate(o),
+      );
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        transport,
+      );
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(renegotiate).toHaveBeenCalledOnce();
+      expect(client.camera(2).waitingForSlot).toBe(true);
+    });
+
+    it("starts afresh after a run of failures ends with nothing waiting", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const calls: number[] = [];
+      const renegotiate = vi.fn(async () => {
+        calls.push(Date.now());
+        throw new Error("down");
+      });
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        sidecar.createTransport(),
+      );
+      const errors: { message: string }[] = [];
+      client.on("error", (e) => {
+        if (/could not add video slots/.test(e.message)) errors.push(e);
+      });
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(calls).toHaveLength(3);
+      await client.unsubscribe(2);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls).toHaveLength(3);
+
+      const again = Date.now();
+      await client.subscribe(3);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(calls.slice(3).map((t) => t - again)).toEqual([0, 2_000]);
+      expect(errors).toHaveLength(2);
+    });
+
+    it("stops retrying once the peer fails", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const renegotiate = vi.fn(async () => {
+        throw new Error("down");
+      });
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        sidecar.createTransport(),
+      );
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(0);
+      sidecar.setConnectionState("failed");
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(renegotiate).toHaveBeenCalledOnce();
+    });
+
+    it("stops retrying once nothing waits", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const renegotiate = vi.fn(async () => {
+        throw new Error("down");
+      });
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        sidecar.createTransport(),
+      );
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(0);
+      await client.unsubscribe(2);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(renegotiate).toHaveBeenCalledOnce();
+    });
+
+    it("stops retrying on disconnect", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const renegotiate = vi.fn(async () => {
+        throw new Error("down");
+      });
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        sidecar.createTransport(),
+      );
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(0);
+      client.disconnect();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(renegotiate).toHaveBeenCalledOnce();
+    });
+
+    it("stops retrying when the sidecar refuses the re-offer", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      let renegotiates = 0;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+        if (String(url).endsWith("/offer")) {
+          return new Response(JSON.stringify({ sdp: "v=0\r\n", cameras: [], session: "s" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        renegotiates++;
+        return new Response("no", { status: 422 });
+      });
+      const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(renegotiates).toBe(1);
+      expect(client.camera(2).waitingForSlot).toBe(true);
+    });
+
+    it("never grows over a brokered negotiate without renegotiate", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+        sidecar.createTransport(),
+      );
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(sidecar.rollbacks).toBe(0);
+      expect(sidecar.slotMids).toHaveLength(1);
+      expect(client.camera(2).waitingForSlot).toBe(true);
+    });
+  });
+
+  it("confirms grown slots before subscribing into them", async () => {
+    const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+    const { client } = growable(sidecar);
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await settle();
+    const types = sidecar.commands.map((c) => c.type);
+    const confirm = types.indexOf("confirm-slots");
+    expect(confirm).toBeGreaterThan(-1);
+    expect(types.lastIndexOf("subscribe")).toBeGreaterThan(confirm);
+  });
+
+  it("skips a destroyed waiter when a slot frees, and says no-free-slot once per waiter", async () => {
+    const sidecar = new MockSidecar().withSlots(["only"]);
+    for (const id of [1, 2, 3]) sidecar.addCamera({ flightId: id });
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+    const refusals: unknown[] = [];
+    client.on("error", (e) => {
+      if (e.code === ErrorCode.NoFreeSlot) refusals.push(e);
+    });
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    await client.subscribe(3);
+    sidecar.fireError(noFreeSlot(2));
+    expect(refusals).toHaveLength(2);
+
+    sidecar.destroyCamera(2);
+    await client.unsubscribe(1);
+    await settle();
+    expect(sidecar.slotMidFor(3)).toBe("only");
+    expect(client.camera(2).waitingForSlot).toBe(false);
+    expect(client.camera(3).waitingForSlot).toBe(false);
+  });
+
+  it("clears the waiting state when the camera is unsubscribed", async () => {
+    const sidecar = new MockSidecar().withSlots(["only"]);
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 1 });
+    sidecar.open();
+
+    await client.subscribe(1);
+    await client.subscribe(2);
+    expect(client.camera(2).waitingForSlot).toBe(true);
+    await client.unsubscribe(2);
+    expect(client.camera(2).waitingForSlot).toBe(false);
   });
 
   it("uses an injected negotiate (signaling seam) instead of HTTP /offer", async () => {

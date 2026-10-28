@@ -1279,6 +1279,7 @@ dependencies = [
  "memmap2",
  "openh264",
  "pkg-config",
+ "rand",
  "serde",
  "serde_json",
  "tempfile",

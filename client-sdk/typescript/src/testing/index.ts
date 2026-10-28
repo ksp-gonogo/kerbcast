@@ -198,6 +198,12 @@ export class MockSidecar {
   private _slotMids: string[] = ["0", "1", "2", "3"];
   /** mid -> camera currently bound to that slot. */
   private readonly _slotBindings = new Map<string, number>();
+  /** Pool ceiling once {@link withRenegotiation} turns growth on; null while off. */
+  private _maxSlots: number | null = null;
+  /** How many leading mids take a camera; grown mids wait for `confirm-slots`. */
+  private _readySlots = Number.POSITIVE_INFINITY;
+  /** Times the client rolled back a pending re-offer. */
+  rollbacks = 0;
   /**
    * Per-flight inbound stats to return from the fake getStats. Set via
    * {@link setInboundStats}. Keyed by flightId.
@@ -288,6 +294,9 @@ export class MockSidecar {
           createOffer: async () => "v=0\r\n",
           setLocalDescription: async () => {},
           setRemoteAnswer: async () => {},
+          rollback: async () => {
+            self.rollbacks++;
+          },
           waitForIceComplete: async () => {},
           localSdp: () => "v=0\r\n",
           close() {},
@@ -304,7 +313,19 @@ export class MockSidecar {
    */
   open(): void {
     this._openHandler?.();
-    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true, anchors: true, frameCommand: true, maxAnchorsPerCamera: 16, sizeHold: true } });
+    this._sendToClient({
+      type: "hello",
+      content: {
+        sidecarVersion: "0.0.1-mock",
+        encoderBackend: "mock",
+        frameStamps: true,
+        anchors: true,
+        frameCommand: true,
+        maxAnchorsPerCamera: 16,
+        sizeHold: true,
+        ...(this._maxSlots !== null ? { renegotiate: true, maxSlots: this._maxSlots } : {}),
+      },
+    });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
@@ -417,6 +438,38 @@ export class MockSidecar {
   }
 
   /**
+   * Let the client grow its slot pool, up to `maxSlots`, the way a 1.12
+   * sidecar does. Pass {@link renegotiate} as the client's `renegotiate`
+   * config (or answer `POST /renegotiate` with it). Set before `open()`.
+   */
+  withRenegotiation(maxSlots = 32): this {
+    this._maxSlots = maxSlots;
+    return this;
+  }
+
+  /** Slot mids in the pool, grown ones included. */
+  get slotMids(): ReadonlyArray<string> {
+    return this._slotMids;
+  }
+
+  /**
+   * Answer a re-offer: the pool grows to `offer.slots`, new mids numbered on
+   * from the existing ones. As on the sidecar, the new mids take no camera
+   * until the client sends `confirm-slots`. Refused past the
+   * {@link withRenegotiation} ceiling.
+   */
+  renegotiate(offer: { session: string; sdp: string; slots: number }): Promise<{ sdp: string }> {
+    if (this._maxSlots === null || offer.slots > this._maxSlots) {
+      return Promise.reject(new Error("POST /renegotiate returned 422"));
+    }
+    this._readySlots = Math.min(this._readySlots, this._slotMids.length);
+    while (this._slotMids.length < offer.slots) {
+      this._slotMids.push(String(this._slotMids.length));
+    }
+    return Promise.resolve({ sdp: "v=0\r\n" });
+  }
+
+  /**
    * Deliver a track onto a slot (by mid), simulating the slot's media
    * arriving over WebRTC. The client routes it to whichever camera is bound
    * to that mid. (jsdom can't make real tracks; pass a stub in unit tests or
@@ -501,8 +554,8 @@ export class MockSidecar {
     sdp: string;
     cameras: number[];
     slots?: number;
-  }): Promise<{ sdp: string; cameras: number[] }> {
-    return Promise.resolve({ sdp: "v=0\r\n", cameras: offer.cameras });
+  }): Promise<{ sdp: string; cameras: number[]; session: string }> {
+    return Promise.resolve({ sdp: "v=0\r\n", cameras: offer.cameras, session: "mock-session" });
   }
 
   /**
@@ -752,7 +805,9 @@ export class MockSidecar {
       }
       case "subscribe": {
         const flightId = msg.content.flightId;
-        const freeMid = this._slotMids.find((m) => !this._slotBindings.has(m));
+        const freeMid = this._slotMids
+          .slice(0, this._readySlots)
+          .find((m) => !this._slotBindings.has(m));
         if (freeMid === undefined) {
           this._sendToClient({
             type: "error",
@@ -775,6 +830,9 @@ export class MockSidecar {
         }
         break;
       }
+      case "confirm-slots":
+        this._readySlots = Math.min(msg.content.slots, this._slotMids.length);
+        break;
       case "unsubscribe": {
         const flightId = msg.content.flightId;
         let bound: string | undefined;

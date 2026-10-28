@@ -1,4 +1,4 @@
-import type { ErrorPayload, KerbcastClient, RecordingEndReason } from "@ksp-gonogo/kerbcast";
+import { ErrorCode, type ErrorPayload, type KerbcastClient, type RecordingEndReason } from "@ksp-gonogo/kerbcast";
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
@@ -41,7 +41,10 @@ export function ErrorToast({ client }: ErrorToastProps): React.JSX.Element | nul
     };
     /* A REC+ set that loses its cameras together gets one notice, not one per feed. */
     const noticedGroups = new Set<string>();
-    const offError = client.on("error", (payload: ErrorPayload) => push(payload.message));
+    /* A feed with no video slot says so on its own tile, which outlasts a notice. */
+    const offError = client.on("error", (payload: ErrorPayload) => {
+      if (payload.code !== ErrorCode.NoFreeSlot) push(payload.message);
+    });
     const offEnded = client.recording.onRecordingEnded((event) => {
       const message = RECORDING_END_NOTICES[event.endedBy];
       if (!message) return;
