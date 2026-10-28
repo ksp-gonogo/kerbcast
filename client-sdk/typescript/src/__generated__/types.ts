@@ -1055,6 +1055,13 @@ export interface FrameCommandState {
 	worldModelSeq?: number;
 	knowledgeUt?: number;
 	scope?: string;
+	/**
+	 * The camera has no subject to aim at yet, so the frame shows its
+	 * placeholder framing (a launch site lens at its site, a station level
+	 * toward the horizon, a riding lens along its craft). A viewer can say
+	 * it is waiting for a target. False from a game that does not send it.
+	 */
+	waitingForTarget?: boolean;
 }
 
 /**

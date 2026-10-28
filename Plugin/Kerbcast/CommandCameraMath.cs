@@ -68,6 +68,96 @@ namespace Kerbcast
         public double Distance;
     }
 
+    /* What a craft aim's view follows this solve; see SubjectWait. */
+    public enum SubjectAimMode
+    {
+        /* The subject, where it is known to be. */
+        Subject,
+        /* The placeholder: the subject has not been positioned since it, the aim or the vantage last changed. */
+        Placeholder,
+        /* The last aim solved, held: the subject was positioned and is not now. */
+        Hold,
+    }
+
+    /*
+     * Whether a craft aim waits for its subject or holds its last aim. The
+     * placeholder stands only until the subject is first positioned; losing
+     * it after that (a refusal, a stale record, a light time that will not
+     * solve) holds the view where it was, so it never swings back to the
+     * placeholder and a flickering fix never wobbles it. A new subject, aim
+     * or vantage waits again. A new rig, as on a scene load, starts waiting.
+     */
+    public sealed class SubjectWait
+    {
+        private bool _seen;
+
+        public SubjectAimMode Step(bool changed, bool positioned)
+        {
+            if (changed) _seen = false;
+            if (positioned)
+            {
+                _seen = true;
+                return SubjectAimMode.Subject;
+            }
+            return _seen ? SubjectAimMode.Hold : SubjectAimMode.Placeholder;
+        }
+    }
+
+    /*
+     * How far one frame advances an ease (a slew, a zoom). A frame more than
+     * HitchFactor times the usual one is a hitch, as when the first fix of a
+     * subject builds its horizon mask and forecast, and advances the ease by
+     * a usual frame only; stepped by the whole gap, a short turn would finish
+     * inside that one frame and show as a snap. The usual frame follows the
+     * frame rate, a lasting slowdown included. A gap over snapAfter (a feed
+     * resumed, a scene load) is left to the ease's own snap: it passes
+     * through and is not learned.
+     */
+    public sealed class FrameStep
+    {
+        public const double HitchFactor = 2.0;
+        private const double Follow = 0.1;
+        private readonly double _snapAfter;
+        private double _usual;
+
+        public FrameStep(double snapAfter) { _snapAfter = snapAfter; }
+
+        /* Learns one frame's gap and returns how far it advances an ease. */
+        public double Next(double dt)
+        {
+            double step = Clip(dt);
+            Learn(dt);
+            return step;
+        }
+
+        /* How far a gap advances an ease, without learning from it. */
+        public double Clip(double dt)
+        {
+            if (!(dt > 0) || dt > _snapAfter || !(_usual > 0)) return dt;
+            return dt > HitchFactor * _usual ? _usual : dt;
+        }
+
+        public void Learn(double dt)
+        {
+            if (!(dt > 0) || dt > _snapAfter) return;
+            if (!(_usual > 0)) _usual = dt;
+            else _usual += Follow * (Math.Min(dt, 2 * HitchFactor * _usual) - _usual);
+        }
+    }
+
+    /* Where a command camera looks while it has no subject to aim at. */
+    public enum PlaceholderAim
+    {
+        /* It has a subject, or an aim of its own that needs none. */
+        None,
+        /* At the launch site the lens stands beside, where a craft would sit before liftoff. */
+        LaunchSite,
+        /* Level toward the horizon, due east. */
+        Horizon,
+        /* Along the forward axis of the craft the lens rides. */
+        MountForward,
+    }
+
     /* Unity-free maths for the command camera: where the station
        is, where it looks, how wide it zooms, which layers carry the craft and
        whether a body is in the way. Compiled verbatim by CommandCameraMath.Tests. */
@@ -462,6 +552,26 @@ namespace Kerbcast
         internal const string EligibleTooUncertain = "tooUncertain";
         /* The radius a craft is framed by when its source gives no size. */
         internal const double NominalCraftRadiusM = 2.0;
+
+        /*
+         * A launch site placeholder frames this much around the point, filling
+         * PlaceholderSiteFraction of the frame whatever the craft framing is
+         * set to: about 9 degrees from the default 500 m vantage, so the pad
+         * and its tower show. The radius is fixed, so a farther vantage frames
+         * the site tighter.
+         */
+        public const double PlaceholderSiteRadiusM = 20.0;
+        public const double PlaceholderSiteFraction = 0.5;
+        /* How far above a launch site's ground the placeholder looks: about where a craft's centre sits on it. */
+        public const double PlaceholderSiteHeightM = 10.0;
+        public const double PlaceholderAzimuthDeg = 90.0;
+
+        /* The placeholder a waiting camera looks at: along the craft a lens rides, at the launch site a lens stands beside, else level toward the horizon. */
+        public static PlaceholderAim PlaceholderFor(bool ridesCraft, bool besideLaunchSite)
+        {
+            if (ridesCraft) return PlaceholderAim.MountForward;
+            return besideLaunchSite ? PlaceholderAim.LaunchSite : PlaceholderAim.Horizon;
+        }
         /* The refusal code of a record outside its window, or of any record while the snapshot is invalid. */
         internal const string RefusalStale = "stale";
 

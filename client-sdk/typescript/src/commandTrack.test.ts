@@ -190,6 +190,18 @@ describe("per-frame command state", () => {
     });
   });
 
+  it("says when the camera is waiting for a target, and not otherwise", () => {
+    expect(effectiveCommandTrack(track(), 1000, frame).waitingForTarget).toBe(false);
+    const s = effectiveCommandTrack(track(), 1000, {
+      ...frame,
+      hasFix: false,
+      rangeM: undefined,
+      subjectPersistentId: 0,
+      waitingForTarget: true,
+    });
+    expect(s).toMatchObject({ waitingForTarget: true, camera: "noFix" });
+  });
+
   it("falls back to the snapshot without one", () => {
     expect(effectiveCommandTrack(track(), 1000, null).fromFrame).toBeUndefined();
   });

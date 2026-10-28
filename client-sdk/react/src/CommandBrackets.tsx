@@ -312,7 +312,8 @@ export function CommandBrackets({
   const { x: right, y: bottom } = g.bottomRight;
   const blanked = !!state.blank;
   const drawCorners = state.hasFix && !blanked;
-  const defaultReadout = blanked ? "" : commandReadout(state);
+  /* A feed waiting for its target says so itself; NO FIX would only repeat it. */
+  const defaultReadout = blanked || state.waitingForTarget ? "" : commandReadout(state);
   const readout = overlay?.readout ? overlay.readout(defaultReadout, ctx) : defaultReadout;
 
   return (

@@ -40,6 +40,8 @@ namespace Kerbcast
         public double KnowledgeUt;
         /* The world model scope the feed's site is bound to; null when unbound or under truth. */
         public string Scope;
+        /* The camera has no subject to aim at yet and shows its placeholder framing instead. */
+        public bool WaitingForTarget;
 
         public static CommandFrameState Empty => new CommandFrameState
         {
@@ -60,7 +62,7 @@ namespace Kerbcast
         {
             "hasFix", "rangeM", "bracketHalfPx", "frameHeightPx", "framingFits", "trueOffsetPx", "occluded",
             "occluder", "sunlit", "blank", "authority", "subjectPersistentId", "aimKind", "refusal", "refusalCode",
-            "refusalText", "subjectUt", "worldModel", "worldModelSeq", "knowledgeUt", "scope",
+            "refusalText", "subjectUt", "worldModel", "worldModelSeq", "knowledgeUt", "scope", "waitingForTarget",
         };
 
         public void AppendJson(StringBuilder sb)
@@ -92,6 +94,7 @@ namespace Kerbcast
             if (WorldModelSeq >= 0) sb.Append(",\"worldModelSeq\":").Append(WorldModelSeq.ToString(CultureInfo.InvariantCulture));
             Ut(sb, "knowledgeUt", KnowledgeUt);
             Text(sb, "scope", Scope);
+            sb.Append(",\"waitingForTarget\":").Append(WaitingForTarget ? "true" : "false");
             sb.Append('}');
         }
 

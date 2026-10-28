@@ -60,7 +60,7 @@ static void WriteMetaFixture(string path)
         TrueOffsetPx = 3.5, Occluded = true, Occluder = "Mun", Sunlit = true, Blank = "Held",
         AuthorityOwner = "mission", SubjectPersistentId = 42, AimKind = "vessel", Refusal = "refused",
         RefusalCode = "noSignal", RefusalText = "No signal", SubjectUt = 86398.75, WorldModel = "model",
-        WorldModelSeq = 9, KnowledgeUt = 86390, Scope = "centre",
+        WorldModelSeq = 9, KnowledgeUt = 86390, Scope = "centre", WaitingForTarget = true,
     };
     var anchors = new System.Collections.Generic.List<AnchorResult>
     {

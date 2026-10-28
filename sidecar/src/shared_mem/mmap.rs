@@ -990,6 +990,7 @@ mod tests {
         assert_eq!(command.world_model.as_deref(), Some("model"));
         assert_eq!(command.world_model_seq, Some(9.0));
         assert_eq!(command.subject_ut, Some(86398.75));
+        assert!(command.waiting_for_target);
         assert_eq!(
             command.authority.as_ref().map(|a| a.owner.as_str()),
             Some("mission")

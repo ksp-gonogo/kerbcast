@@ -33,6 +33,11 @@ namespace Kerbcast
         public bool VantageGone => HasVantage && (Vantage == null || Vantage.state == Vessel.State.DEAD);
         /* Set for a lens at an arbitrary surface point, not a station or a launch site. */
         public bool IsSurfacePoint { get; private set; }
+        /* A launch site lens's site itself: where its craft stand before liftoff. Altitude is the spawn point's. */
+        public bool HasLaunchPoint { get; private set; }
+        public double LaunchLatitude { get; private set; }
+        public double LaunchLongitude { get; private set; }
+        public double LaunchAltitude { get; private set; }
 
         /* What kind of place NodeName, the site key, names. */
         public Api.SiteKind Kind =>
@@ -149,7 +154,7 @@ namespace Kerbcast
                 if (string.IsNullOrEmpty(name)) continue;
                 try
                 {
-                    var found = SpawnPointOf(setup, name, out var body, out double lat, out double lon, out string source);
+                    var found = SpawnPointOf(setup, name, out var body, out double lat, out double lon, out double alt, out string source);
                     if (found == SpawnLookup.Missing) continue;
                     if (found == SpawnLookup.Unset)
                     {
@@ -162,6 +167,10 @@ namespace Kerbcast
                         lensLat, lensLon, height, source);
                     site.IsHome = false;
                     site.IsLaunchSite = true;
+                    site.HasLaunchPoint = !double.IsNaN(alt);
+                    site.LaunchLatitude = lat;
+                    site.LaunchLongitude = lon;
+                    site.LaunchAltitude = alt;
                     pending = null;
                     return site;
                 }
@@ -182,11 +191,10 @@ namespace Kerbcast
            (0,0); otherwise the spawn transform is converted directly and
            trusted only if it sits on the terrain at its own coordinates. */
         private static SpawnLookup SpawnPointOf(PSystemSetup setup, string name,
-            out CelestialBody body, out double lat, out double lon, out string source)
+            out CelestialBody body, out double lat, out double lon, out double alt, out string source)
         {
-            body = null; lat = lon = 0;
+            body = null; lat = lon = alt = 0;
             source = "launchsite";
-            double alt;
             bool set;
             Func<Transform> spawnTransform;
             var facility = setup.GetSpaceCenterFacility(name);
@@ -225,6 +233,7 @@ namespace Kerbcast
             if (Math.Abs(talt - Math.Max(ground, 0.0)) > MaxSpawnAboveGround) return SpawnLookup.Unset;
             lat = tlat;
             lon = tlon;
+            alt = talt;
             source = "launchsite-transform";
             return SpawnLookup.Found;
         }
@@ -383,6 +392,19 @@ namespace Kerbcast
             if (v == null || v.state == Vessel.State.DEAD || v.mainBody == null) return false;
             Body = v.mainBody;
             return PicturePass.TryCraftPoint(v, ut, out world, out source);
+        }
+
+        /* The way the lens's craft points: its control point's forward axis,
+           else the craft's own. False with no craft to read. */
+        public bool TryVantageForward(out Vector3d forward)
+        {
+            forward = default;
+            var v = Vantage;
+            if (v == null || v.state == Vessel.State.DEAD) return false;
+            var t = v.ReferenceTransform != null ? v.ReferenceTransform : v.transform;
+            if (t == null) return false;
+            forward = t.up;
+            return forward.magnitude > 0.5;
         }
 
         /* How the lens moves from `ut` on, for the forecast: with its craft

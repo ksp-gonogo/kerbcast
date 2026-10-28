@@ -154,6 +154,19 @@ describe("CommandBrackets", () => {
     expect(container.querySelector("svg")).toBeNull();
     expect(screen.getByText("NO FIX")).toBeTruthy();
   });
+
+  it("leaves NO FIX out while the feed says it is waiting for a target", () => {
+    render(
+      <CommandBrackets
+        state={{ ...effectiveCommandTrack(track({ hasFix: false, rangeM: undefined }), 1000), waitingForTarget: true }}
+        displayUt={1000}
+        utSource="override"
+        video={null}
+        fallbackSize={{ width: 1024, height: 576 }}
+      />,
+    );
+    expect(screen.queryByText("NO FIX")).toBeNull();
+  });
 });
 
 describe("CommandBrackets overlay", () => {

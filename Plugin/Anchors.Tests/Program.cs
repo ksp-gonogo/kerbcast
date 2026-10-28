@@ -130,6 +130,15 @@ Check(c != null && ((Dictionary<string, object>)c["authority"])["owner"] as stri
     && c["scope"] as string == "centre" && c["worldModel"] as string == "model", "the lock and the snapshot read");
 Check(c != null && !c.ContainsKey("trueOffsetPx") && !c.ContainsKey("blank") && !c.ContainsKey("refusal"), "what does not apply is left out");
 foreach (var key in c.Keys) Check(Array.IndexOf(CommandFrameState.Keys, key) >= 0, $"frame key '{key}' is a known one");
+Check(c != null && c.ContainsKey("waitingForTarget") && !(bool)c["waitingForTarget"], "a feed with its subject is not waiting for one");
+{
+    var waiting = CommandFrameState.Empty;
+    waiting.WaitingForTarget = true;
+    sb.Length = 0;
+    waiting.AppendJson(sb);
+    var w = MiniJson.Parse(sb.ToString()) as Dictionary<string, object>;
+    Check(w != null && (bool)w["waitingForTarget"] && !(bool)w["hasFix"], "a feed at its placeholder says it is waiting for a target, with no fix");
+}
 small = FrameMetaJson.Encode(0.05, cmd, results, sb, ref buf, 600);
 var trimmed = MiniJson.Parse(Encoding.UTF8.GetString(buf, 0, small)) as Dictionary<string, object>;
 Check(trimmed != null && trimmed.ContainsKey("command") && (trimmed["anchors"] as List<object>)?.Count == 1,

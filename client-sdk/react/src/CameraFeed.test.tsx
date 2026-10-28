@@ -36,6 +36,7 @@ import type {
   ClientMessage,
   CommandCentreInfo,
   CommandTrackState,
+  DisplayedFrameUt,
 } from "@ksp-gonogo/kerbcast";
 import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
@@ -2844,6 +2845,61 @@ describe("CameraFeed - command camera target brackets", () => {
     expect(screen.getByRole("status", { name: "Feed blanked" }).textContent).toBe(
       "Waiting for mission control",
     );
+  });
+
+  describe("waiting for a target", () => {
+    const waitingFrame = (waitingForTarget: boolean): DisplayedFrameUt => ({
+      flightId: 301,
+      ut: 1000,
+      epoch: 0,
+      source: "exact",
+      rtpTimestamp: 1,
+      presentedAt: 0,
+      command: {
+        hasFix: false,
+        frameHeightPx: 576,
+        framingFits: true,
+        occluded: false,
+        occluder: "",
+        sunlit: false,
+        subjectPersistentId: 0,
+        waitingForTarget,
+      },
+    });
+    const feed = (client: KerbcastClient, frame: DisplayedFrameUt, label?: string | null) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed
+          flightId={301}
+          displayFrame={frame}
+          {...(label !== undefined ? { waitingForTargetLabel: label } : {})}
+        />
+      </KerbcastProvider>
+    );
+
+    it("says so while the frame does, and stops once the target arrives", async () => {
+      const { client } = await buildConnectedSource([commandCamera()]);
+      const view = render(feed(client, waitingFrame(true)));
+      expect(screen.getByText("Waiting for target")).toBeTruthy();
+      view.rerender(feed(client, waitingFrame(false)));
+      expect(screen.queryByText("Waiting for target")).toBeNull();
+    });
+
+    it("takes a host's own words, or none", async () => {
+      const { client } = await buildConnectedSource([commandCamera()]);
+      const view = render(feed(client, waitingFrame(true), "Acquiring"));
+      expect(screen.getByText("Acquiring")).toBeTruthy();
+      view.rerender(feed(client, waitingFrame(true), null));
+      expect(screen.queryByText("Acquiring")).toBeNull();
+      expect(screen.queryByText("Waiting for target")).toBeNull();
+    });
+
+    it("gives way to a blank", async () => {
+      const { client } = await buildConnectedSource([commandCamera()]);
+      const frame = waitingFrame(true);
+      render(feed(client, { ...frame, command: { ...frame.command!, blank: "Held" } }));
+      expect(screen.getByRole("status", { name: "Feed blanked" })).toBeTruthy();
+      expect(screen.queryByText("Waiting for target")).toBeNull();
+    });
   });
 
   it("shows the transition in force at the displayed UT", async () => {

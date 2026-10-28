@@ -26,6 +26,8 @@ namespace Kerbcast
         private const string Tag = "[Kerbcast][CMDCAM]";
         private const double FovTau = 0.4;
         private const double FovSnapAfter = 1.0;
+        /* The usual rendered frame, for the zoom and the slew; learned in PrepareRender, or in Poll while nothing renders, never from Poll between frames. */
+        private readonly FrameStep _frames = new FrameStep(FovSnapAfter);
         private const float StatusLogSeconds = 1.0f;
         private const float SkyProbeSeconds = 10.0f;
         private const double ModelProxyDistance = 50000.0;
@@ -172,6 +174,17 @@ namespace Kerbcast
             _authority != null && _authority.Registered && !TrueVisible ? null : TrueOffsetPx;
         public bool FramingFits { get; private set; } = true;
         public string Blank { get; private set; }
+        /* No subject to aim at yet: the view holds its placeholder (see SubjectWait). */
+        public bool WaitingForTarget => _placeholder != PlaceholderAim.None;
+        private PlaceholderAim _placeholder;
+        /* What the view followed last solve, and the last subject aim, body-fixed, that a Hold keeps. */
+        private SubjectAimMode _mode;
+        private readonly SubjectWait _wait = new SubjectWait();
+        private CommandAim _waitAim;
+        private uint _waitSubject, _waitVantage;
+        private CelestialBody _heldBody;
+        private double _heldLat, _heldLon, _heldAlt;
+        private bool _waitingLogged;
         public CommandTrackEventRing Events => _events;
         public string AuthorityOwner => _authority != null ? _authority.Owner : null;
         internal CommandFeedOrders CurrentOrders => _authority != null && _authority.Registered ? _authority.Orders(_flightId) : null;
@@ -226,6 +239,7 @@ namespace Kerbcast
             s.Occluder = Blocker ?? "";
             s.Sunlit = Sunlit;
             s.Blank = Blank;
+            s.WaitingForTarget = WaitingForTarget;
             s.AuthorityOwner = AuthorityOwner;
             s.SubjectPersistentId = SubjectPersistentId;
             if (_aim != null) s.AimKind = KerbcastCore.AimKindTag(_aim.Kind);
@@ -347,6 +361,7 @@ namespace Kerbcast
             bool utStripe)
         {
             _cam = cam;
+            _slew = new AimSlew(_frames);
             _mount = mount;
             _selection = selection;
             _known = known;
@@ -440,7 +455,8 @@ namespace Kerbcast
             var orders = governed ? _authority.Orders(_flightId) : null;
 
             bool ok = SolveGeometry(ut, out station, out aim, out localUp, out north, out occluder);
-            if (!ok)
+            NoteWaiting(ut);
+            if (!ok || _mode != SubjectAimMode.Subject)
             {
                 /* Without a fix the readings at the aim describe nothing; kept, they would carry the last solve, perhaps truth from before a lock, into the reports. */
                 HasFix = false;
@@ -448,7 +464,7 @@ namespace Kerbcast
                 Blocker = "";
                 Sunlit = false;
             }
-            else
+            if (ok)
             {
                 /* The pose turns onto a moved aim rather than snapping; everything
                    projected through the frame (TrueInFrame, anchors) uses it. */
@@ -462,7 +478,7 @@ namespace Kerbcast
                 CommandCameraMath.AimBasis(station, station + view * range, localUp, north, out _solveForward, out _solveUp);
                 _solveEye = station;
             }
-            FramingFits = !ok || CommandCameraMath.FramingFits(FramingRadius, RangeM, _fovMax);
+            FramingFits = !HasFix || CommandCameraMath.FramingFits(FramingRadius, RangeM, _fovMax);
             Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost, _authority?.SilentText);
             UpdateBracket(now);
             NoteGovernance(ut, governed);
@@ -478,6 +494,8 @@ namespace Kerbcast
         {
             station = aim = localUp = north = default;
             occluder = null;
+            _placeholder = PlaceholderAim.None;
+            _mode = SubjectAimMode.Subject;
             ForgetDrawn();
             var site = _mount.Site;
             Vector3d vantage = default;
@@ -511,17 +529,45 @@ namespace Kerbcast
             bool aimed = !AimIsCraft;
             if (!aimed)
             {
-                if (!subject.Positioned)
+                _mode = _wait.Step(WaitKeyChanged(), subject.Positioned);
+                if (_mode != SubjectAimMode.Subject)
                 {
+                    /* With nothing to aim at the view renders on, at its
+                       default framing before the subject is first known and
+                       at its last aim after, so the feed shows the scene (as
+                       its light shows it) rather than freezing on a last frame
+                       it may never have had. */
                     ForgetDrawn();
-                    return false;
+                    if (_mode == SubjectAimMode.Hold)
+                    {
+                        if (_heldBody == null) return false;
+                        aim = ToD(_heldBody.GetWorldSurfacePosition(_heldLat, _heldLon, _heldAlt));
+                    }
+                    else
+                    {
+                        _placeholder = CommandCameraMath.PlaceholderFor(site.HasVantage, site.HasLaunchPoint);
+                        aim = PlaceholderPoint(_placeholder, body, station, localUp);
+                    }
+                    _lastAimPoint = aim;
+                    _lastDistance = (aim - station).Magnitude;
+                    _frameBody = body;
+                    return true;
                 }
                 aim = subject.World;
                 aimBody = subject.Body;
+                if (aimBody != null)
+                {
+                    var w = new Vector3d(aim.X, aim.Y, aim.Z);
+                    _heldBody = aimBody;
+                    _heldLat = aimBody.GetLatitude(w);
+                    _heldLon = aimBody.GetLongitude(w);
+                    _heldAlt = aimBody.GetAltitude(w);
+                }
             }
             else if (_aim.Kind == CommandAimKind.Direction)
             {
-                aim = DirectionPoint(body, station, localUp, subject);
+                double range = subject.Positioned ? (subject.World - station).Magnitude : DirectionDefaultRangeM;
+                aim = DirectionPoint(body, station, localUp, _aim.Azimuth, _aim.Elevation, range);
                 aimBody = body;
             }
             else if (!ResolveAim(_aim, _aimOrbit, ut, out aim, out aimBody))
@@ -551,19 +597,33 @@ namespace Kerbcast
             return true;
         }
 
-        private readonly AimSlew _slew = new AimSlew();
+        private readonly AimSlew _slew;
         /* Real seconds, double, of the last slew step; NaN before the first. */
         private double _slewAt = double.NaN;
         private bool _slewLogged;
         private CommandAim _jumpAim;
         private uint _jumpSubject, _jumpVantage;
         private long _jumpGeneration;
+        private SubjectAimMode _jumpMode;
+
+        /* Whether the subject, the aim or the vantage changed since the last solve, which makes a craft aim wait for its subject again. */
+        private bool WaitKeyChanged()
+        {
+            uint subject = _known.SubjectPersistentId;
+            uint vantage = _mount.Site.VantagePersistentId;
+            bool changed = !CommandAim.SameAs(_aim, _waitAim) || subject != _waitSubject || vantage != _waitVantage;
+            _waitAim = _aim;
+            _waitSubject = subject;
+            _waitVantage = vantage;
+            return changed;
+        }
 
         /*
          * Whether the aim point jumped since the last solve, as its causes say
          * rather than as its motion suggests: a new aim, a new subject, a new
-         * vantage, or a new world-model publish that may correct where the
-         * subject is. Between these the view follows the aim exactly.
+         * vantage, a new world-model publish that may correct where the
+         * subject is, or the view taking or leaving a placeholder or a held aim.
+         * Between these the view follows the aim exactly.
          */
         private bool AimJumped(double ut)
         {
@@ -573,7 +633,8 @@ namespace Kerbcast
             var snap = store != null ? store.Capture(Time.frameCount, ut).Snapshot : null;
             long generation = snap != null ? snap.Generation : 0;
             bool jumped = !CommandAim.SameAs(_aim, _jumpAim) || subject != _jumpSubject || vantage != _jumpVantage
-                || generation != _jumpGeneration;
+                || generation != _jumpGeneration || _mode != _jumpMode;
+            _jumpMode = _mode;
             _jumpAim = _aim;
             _jumpSubject = subject;
             _jumpVantage = vantage;
@@ -588,6 +649,14 @@ namespace Kerbcast
             _slewLogged = slewing;
             Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(slewing ? "slew-start" : "slew-end")}"
                 + (slewing ? $" offsetDeg={_slew.OffsetRad * 180.0 / Math.PI:F3}" : ""));
+        }
+
+        private void NoteWaiting(double ut)
+        {
+            bool waiting = WaitingForTarget;
+            if (waiting == _waitingLogged) return;
+            _waitingLogged = waiting;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(waiting ? $"waiting-for-target placeholder={_placeholder}" : "waiting-end")}");
         }
 
         /* Clears the drawn craft, so a failed solve leaves no stale picture readings. */
@@ -782,12 +851,13 @@ namespace Kerbcast
         private DVec3 DrawnOrAim(DVec3 aim) => _drawnOk ? _drawnPos : aim;
 
         /*
-         * A Direction aim's point: along the held direction at the subject's
-         * range, so the view is zoomed for the subject as it passes through.
+         * The point `range` metres along a compass direction from the lens. A
+         * Direction aim passes the subject's range, so the view is zoomed for
+         * the subject as it passes through.
          * North and east come from stepping the station's own latitude and
          * longitude, which holds for any body and any vantage.
          */
-        private DVec3 DirectionPoint(CelestialBody body, DVec3 station, DVec3 localUp, CraftFix subject)
+        private DVec3 DirectionPoint(CelestialBody body, DVec3 station, DVec3 localUp, double azimuth, double elevation, double range)
         {
             var st = new Vector3d(station.X, station.Y, station.Z);
             double lat = body.GetLatitude(st), lon = body.GetLongitude(st), alt = body.GetAltitude(st);
@@ -796,10 +866,21 @@ namespace Kerbcast
             var p0 = ToD(body.GetWorldSurfacePosition(lat, lon, alt));
             var towardNorth = (ToD(body.GetWorldSurfacePosition(lat + northSign * Step, lon, alt)) - p0) * northSign;
             var towardEast = ToD(body.GetWorldSurfacePosition(lat, lon + Step, alt)) - p0;
-            var dir = CommandCameraMath.DirectionVector(localUp, towardNorth, towardEast, _aim.Azimuth, _aim.Elevation);
-            double range = subject.Positioned ? (subject.World - station).Magnitude : DirectionDefaultRangeM;
+            var dir = CommandCameraMath.DirectionVector(localUp, towardNorth, towardEast, azimuth, elevation);
             if (!(range > 1.0)) range = DirectionDefaultRangeM;
             return station + dir * range;
+        }
+
+        /* The point a placeholder looks at. A craft's forward axis that cannot be read falls back to the horizon. */
+        private DVec3 PlaceholderPoint(PlaceholderAim placeholder, CelestialBody body, DVec3 station, DVec3 localUp)
+        {
+            var site = _mount.Site;
+            if (placeholder == PlaceholderAim.LaunchSite)
+                return ToD(body.GetWorldSurfacePosition(site.LaunchLatitude, site.LaunchLongitude,
+                    site.LaunchAltitude + CommandCameraMath.PlaceholderSiteHeightM));
+            if (placeholder == PlaceholderAim.MountForward && site.TryVantageForward(out var forward))
+                return station + ToD(forward).Normalized * DirectionDefaultRangeM;
+            return DirectionPoint(body, station, localUp, CommandCameraMath.PlaceholderAzimuthDeg, 0, DirectionDefaultRangeM);
         }
 
         /* An Orbit, Surface or PositionAt aim's point in world space, on the
@@ -1017,6 +1098,7 @@ namespace Kerbcast
         {
             float now = Time.unscaledTime;
             if (now - _solvedAt < PollStaleSeconds) return;
+            if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
             Solve(Planetarium.GetUniversalTime(), now, out _, out _, out _, out _, out _);
         }
 
@@ -1145,8 +1227,14 @@ namespace Kerbcast
             double distance = _lastDistance;
             var drawn = PlaceDrawn(cam, ut, now, station, aim, occluder, distance);
 
-            double fovTarget = CommandCameraMath.FovForFraction(FramingRadius, distance, _frameFraction, FovMinNow(), _fovMax);
-            _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, dt, FovTau, FovSnapAfter);
+            double fovTarget = _mode == SubjectAimMode.Hold ? _fov
+                : _placeholder == PlaceholderAim.None
+                ? CommandCameraMath.FovForFraction(FramingRadius, distance, _frameFraction, FovMinNow(), _fovMax)
+                : _placeholder == PlaceholderAim.LaunchSite
+                    ? CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, distance,
+                        CommandCameraMath.PlaceholderSiteFraction, FovMinNow(), _fovMax)
+                    : _fovMax;
+            _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, _frames.Next(dt), FovTau, FovSnapAfter);
             cam.SetRigFov((float)_fov);
             UpdateBracket(now);
             FinishDrawn(cam, ut, station, anchor.rotation, drawn);

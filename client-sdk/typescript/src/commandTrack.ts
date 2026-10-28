@@ -53,6 +53,11 @@ export interface EffectiveCommandTrack {
   /** The world model's own code and words for a `refused` subject. */
   refusalCode?: string | null;
   refusalText?: string | null;
+  /**
+   * The camera has no subject to aim at yet and shows its placeholder
+   * framing. Only from a frame's own state.
+   */
+  waitingForTarget?: boolean;
   /** True when every field came from the displayed frame's own state. */
   fromFrame?: boolean;
 }
@@ -90,6 +95,7 @@ export function commandTrackFromFrame(frame: FrameCommandState): EffectiveComman
     refusal: frame.refusal ?? null,
     refusalCode: frame.refusalCode ?? null,
     refusalText: frame.refusalText ?? null,
+    waitingForTarget: frame.waitingForTarget ?? false,
     fromFrame: true,
   };
 }

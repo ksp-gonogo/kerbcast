@@ -783,5 +783,168 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(Deg(slew.Step(Dir(270), Dt, false, Fov), Dir(270)) < 1e-9, "slew: a half turn completes");
 }
 
+/* The placeholder a camera holds with no subject to aim at. */
+{
+    Check(CommandCameraMath.PlaceholderFor(false, true) == PlaceholderAim.LaunchSite, "placeholder: a launch site lens looks at the site");
+    Check(CommandCameraMath.PlaceholderFor(false, false) == PlaceholderAim.Horizon, "placeholder: a station or surface lens looks at the horizon");
+    Check(CommandCameraMath.PlaceholderFor(true, false) == PlaceholderAim.MountForward, "placeholder: a riding lens looks along its craft");
+
+    var wait = new SubjectWait();
+    Check(wait.Step(false, false) == SubjectAimMode.Placeholder && wait.Step(false, false) == SubjectAimMode.Placeholder,
+        "wait: a subject never positioned waits at the placeholder");
+    Check(wait.Step(false, true) == SubjectAimMode.Subject, "wait: once positioned the view follows the subject");
+    Check(wait.Step(false, false) == SubjectAimMode.Hold && wait.Step(false, false) == SubjectAimMode.Hold,
+        "wait: a subject lost after that holds the last aim, never the placeholder");
+    Check(wait.Step(false, true) == SubjectAimMode.Subject && wait.Step(false, false) == SubjectAimMode.Hold
+        && wait.Step(false, true) == SubjectAimMode.Subject, "wait: a flickering fix holds between fixes");
+    Check(wait.Step(true, false) == SubjectAimMode.Placeholder && wait.Step(false, false) == SubjectAimMode.Placeholder,
+        "wait: a changed subject, aim or vantage waits again until positioned");
+    Check(wait.Step(true, true) == SubjectAimMode.Subject, "wait: a change to a positioned subject follows it at once");
+
+    /* Toward the site, from the default Launchpad vantage, the field takes in the pad and tower at about 9 degrees. */
+    double fov = CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, 500.0,
+        CommandCameraMath.PlaceholderSiteFraction, 0.02, 30);
+    Check(Math.Abs(fov - 9.0) < 0.5, $"placeholder: a launch site is framed at about 9 degrees from 500 m ({fov:F2} deg)");
+}
+
+/* FrameStep: a hitch advances an ease by a usual frame; a lasting slowdown becomes the usual frame; a gap past snapAfter is the ease's own. */
+{
+    var steps = new FrameStep(1.0);
+    for (int i = 0; i < 50; i++) steps.Next(1.0 / 24);
+    Check(Math.Abs(steps.Next(0.3) - 1.0 / 24) < 1e-9, "frame step: a 0.3 s hitch at 24 fps advances one usual frame");
+    Check(Math.Abs(steps.Next(1.0 / 24) - 1.0 / 24) < 1e-9, "frame step: the frame after a hitch advances as itself");
+    double usual = steps.Clip(0.3);
+    Check(usual < 0.06 && steps.Clip(0.9) == usual, $"frame step: a 0.9 s hitch, under snapAfter, still advances one usual frame ({usual:F3} s)");
+    Check(steps.Next(1.5) == 1.5 && steps.Clip(0.3) == usual, "frame step: a gap past snapAfter passes through and is not learned");
+    double last = 0;
+    for (int i = 0; i < 60; i++) last = steps.Next(0.1);
+    Check(Math.Abs(last - 0.1) < 1e-9, "frame step: a lasting drop to 10 fps is followed, not clipped");
+    Check(new FrameStep(1.0).Next(0.2) == 0.2 && steps.Next(0) == 0, "frame step: a first frame and a zero gap pass through");
+
+    var huge = new FrameStep(1.0);
+    Check(huge.Next(double.MaxValue) == double.MaxValue && huge.Next(1e6) == 1e6, "frame step: huge first gaps pass through");
+    huge.Next(1.0 / 24);
+    Check(Math.Abs(huge.Next(0.3) - 1.0 / 24) < 1e-9, "frame step: and are not learned, so the next hitch is still caught");
+
+    /* With the zoom: a hitch under snapAfter eases one usual frame, a gap past it snaps as before. */
+    var zoom = new FrameStep(1.0);
+    for (int i = 0; i < 50; i++) zoom.Next(1.0 / 24);
+    double eased = CommandCameraMath.SmoothFov(10, 30, zoom.Next(0.6), 0.4, 1.0);
+    double snapped = CommandCameraMath.SmoothFov(10, 30, zoom.Next(1.5), 0.4, 1.0);
+    Check(eased > 10 && eased < 11.5 && snapped == 30, $"frame step: a 0.6 s hitch eases the zoom ({eased:F2} deg), a 1.5 s gap snaps it ({snapped:F0} deg)");
+
+    /* The slew learns only where it is told: a shared step it only clips by. */
+    var shared = new FrameStep(1.0);
+    shared.Learn(0.1);
+    var clipped = new AimSlew(shared);
+    clipped.Step(new DVec3(1, 0, 0), double.MaxValue, false, 10);
+    for (int i = 0; i < 40; i++) clipped.Step(new DVec3(1, 0, 0), i % 2 == 0 ? 0.095 : 0.005, false, 10);
+    Check(Math.Abs(shared.Clip(0.15) - 0.15) < 1e-9, "frame step: a slew sharing the rendered frame's step does not learn polls between frames");
+}
+
+/*
+ * The hand-off from a placeholder (or a held aim) to the subject, as the rig
+ * drives it: SubjectWait picks what the view follows, and a change of that,
+ * or of the subject, is a jump for the slew. The first fix arrives on a long
+ * frame, as it did on the Deck (a 0.3 s hitch at 24 fps).
+ */
+{
+    const double Dt = 1.0 / 24, Hitch = 0.3, D2R = Math.PI / 180.0, PlaceholderFov = 9.15, SubjectFov = 30.0;
+    DVec3 At(double azDeg, double elDeg) => new DVec3(
+        Math.Cos(elDeg * D2R) * Math.Cos(azDeg * D2R), Math.Cos(elDeg * D2R) * Math.Sin(azDeg * D2R), Math.Sin(elDeg * D2R));
+    double Deg(DVec3 a, DVec3 b) => CommandCameraMath.AngleBetween(a, b) / D2R;
+    double oneStep = AimSlew.AccelDegPerS2 * Dt * Dt;
+
+    foreach (var (name, subjectAz, subjectEl) in new[] { ("the Deck's 0.56 degree drop", 0.0, 0.88), ("a 20 degree turn", 20.0, 5.0) })
+    {
+        var wait = new SubjectWait();
+        var slew = new AimSlew();
+        var fovStep = new FrameStep(1.0);
+        var placeholder = At(0, 1.44);
+        var subject = At(subjectAz, subjectEl);
+        double fov = PlaceholderFov;
+        var lastMode = SubjectAimMode.Placeholder;
+        DVec3 view = default;
+        for (int i = 0; i < 48; i++)
+        {
+            lastMode = wait.Step(i == 0, false);
+            view = slew.Step(placeholder, i == 0 ? double.MaxValue : Dt, i == 0, fov);
+            fov = CommandCameraMath.SmoothFov(fov, PlaceholderFov, fovStep.Next(Dt), 0.4, 1.0);
+        }
+        var mode = wait.Step(false, true);
+        bool jumped = mode != lastMode;
+        var first = slew.Step(subject, Hitch, jumped, fov);
+        double firstFov = CommandCameraMath.SmoothFov(fov, SubjectFov, fovStep.Next(Hitch), 0.4, 1.0);
+        double usualZoom = Math.Log(CommandCameraMath.SmoothFov(fov, SubjectFov, Dt, 0.4, 1.0) / fov);
+        Check(mode == SubjectAimMode.Subject && jumped, $"hand-off ({name}): the first fix is a jump for the slew");
+        Check(Deg(first, view) <= oneStep + 1e-9 && slew.Slewing,
+            $"hand-off ({name}): the frame of the first fix stays within one slew step of the placeholder ({Deg(first, view):G3} deg, step {oneStep:G3}) and a slew starts");
+        Check(firstFov > fov && Math.Log(firstFov / fov) <= usualZoom + 1e-9, $"hand-off ({name}): the zoom moves, one usual frame, on the hitch ({fov:F2} -> {firstFov:F2} deg)");
+
+        double maxStep = 0, prevOff = Deg(first, subject);
+        bool closes = true;
+        var last = first;
+        int frames = 0;
+        for (; frames < 2000 && slew.Slewing; frames++)
+        {
+            var next = slew.Step(subject, Dt, false, fov);
+            maxStep = Math.Max(maxStep, Deg(next, last));
+            double off = Deg(next, subject);
+            closes &= off <= prevOff + 1e-12;
+            prevOff = off;
+            last = next;
+        }
+        Check(!slew.Slewing && Deg(last, subject) < 1e-9 && closes && frames >= 2 && maxStep <= AimSlew.MaxRateDegPerS * Dt + 1e-9,
+            $"hand-off ({name}): turns onto the subject over {frames + 1} frames, never faster than the cap");
+    }
+
+    /* Onto a subject moving at 3 deg/s, on a hitch: the turn closes, then the view follows it with no lag, a hitch while following included. */
+    {
+        var wait = new SubjectWait();
+        var slew = new AimSlew();
+        var placeholder = At(0, 1.44);
+        DVec3 Moving(double t) => At(5 + 3 * t, 2);
+        var lastMode = SubjectAimMode.Placeholder;
+        for (int i = 0; i < 48; i++)
+        {
+            lastMode = wait.Step(i == 0, false);
+            slew.Step(placeholder, i == 0 ? double.MaxValue : Dt, i == 0, PlaceholderFov);
+        }
+        double t = 0;
+        var mode = wait.Step(false, true);
+        slew.Step(Moving(t += Hitch), Hitch, mode != lastMode, PlaceholderFov);
+        bool slewed = slew.Slewing;
+        for (int i = 0; i < 2000 && slew.Slewing; i++) slew.Step(Moving(t += Dt), Dt, false, PlaceholderFov);
+        double lag = 0;
+        for (int i = 0; i < 48; i++)
+        {
+            double dt = i == 24 ? Hitch : Dt;
+            var aim = Moving(t += dt);
+            lag = Math.Max(lag, Deg(slew.Step(aim, dt, i % 6 == 0, PlaceholderFov), aim));
+        }
+        Check(slewed && !slew.Slewing && lag < 1e-6, $"hand-off: onto a moving subject on a hitch, it turns, then follows with no lag ({lag:G2} deg)");
+    }
+
+    /* A held view (subject lost) keeps its aim; a new subject from there slews too. */
+    {
+        var wait = new SubjectWait();
+        var slew = new AimSlew();
+        var held = At(10, 2);
+        var mode = wait.Step(true, true);
+        slew.Step(held, double.MaxValue, true, SubjectFov);
+        for (int i = 0; i < 24; i++) slew.Step(held, Dt, false, SubjectFov);
+        var lastMode = mode;
+        mode = wait.Step(false, false);
+        var view = slew.Step(held, Dt, mode != lastMode, SubjectFov);
+        Check(mode == SubjectAimMode.Hold && Deg(view, held) < 1e-9 && !slew.Slewing, "hand-off: a lost subject holds the view where it was");
+        /* The new subject is a jump by itself, as AimJumped sees it, whatever the mode does. */
+        mode = wait.Step(true, true);
+        var next = At(-15, 4);
+        var first = slew.Step(next, Hitch, true, SubjectFov);
+        Check(mode == SubjectAimMode.Subject && slew.Slewing && Deg(first, held) <= oneStep + 1e-9,
+            $"hand-off: a new subject from a held view slews from where the view was ({Deg(first, held):G3} deg in the first frame)");
+    }
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

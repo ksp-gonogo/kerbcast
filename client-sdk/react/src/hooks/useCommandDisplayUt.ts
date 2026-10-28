@@ -70,6 +70,7 @@ export function commandShownKey(c: FrameCommandState | undefined): string {
     c.refusal ?? null,
     c.refusalCode ?? null,
     c.refusalText ?? null,
+    c.waitingForTarget ?? false,
   ]);
 }
 

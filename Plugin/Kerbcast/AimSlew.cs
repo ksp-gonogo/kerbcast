@@ -13,6 +13,7 @@ namespace Kerbcast
      * publish that agrees with the motion leaves no offset, and one under a
      * quarter of a pixel is taken at once. A view idle
      * for longer than SnapAfterS starts on its aim, as a first frame does.
+     * A long frame turns it no further than a usual one (see FrameStep).
      * Real time drives it, so warp does not hurry it.
      */
     internal sealed class AimSlew
@@ -42,6 +43,19 @@ namespace Kerbcast
         /* The view's offset from the aim, as a rotation vector, and the speed it is being turned out at. */
         private DVec3 _offset;
         private double _speed;
+        private readonly FrameStep _frames;
+        private readonly bool _learnsFrames;
+
+        public AimSlew() : this(new FrameStep(SnapAfterS), true) { }
+
+        /* A slew whose usual frame `frames` learns elsewhere, from the rendered frames only. */
+        public AimSlew(FrameStep frames) : this(frames, false) { }
+
+        private AimSlew(FrameStep frames, bool learns)
+        {
+            _frames = frames;
+            _learnsFrames = learns;
+        }
 
         /* Radians the view is still off its aim. */
         public double OffsetRad => _offset.Magnitude;
@@ -85,13 +99,15 @@ namespace Kerbcast
             }
             else if (dt > 0) Learn(moved, dt);
 
+            /* The aim's own motion is carried for the whole gap; the offset turns out by a usual frame at most, so a hitch never finishes a turn at once. */
+            double step = _learnsFrames ? _frames.Next(dt) : _frames.Clip(dt);
             double left = _offset.Magnitude;
             if (left > 0)
             {
                 double accel = AccelDegPerS2 * Deg2Rad;
                 double cap = Math.Min(MaxRateDegPerS * Deg2Rad, Math.Sqrt(2.0 * accel * left));
-                _speed = Math.Min(_speed + accel * dt, cap);
-                double after = left - _speed * dt;
+                _speed = Math.Min(_speed + accel * step, cap);
+                double after = left - _speed * step;
                 if (after <= 0)
                 {
                     _offset = default;

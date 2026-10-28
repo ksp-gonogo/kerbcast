@@ -1162,6 +1162,12 @@ pub struct FrameCommandState {
     pub knowledge_ut: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The camera has no subject to aim at yet, so the frame shows its
+    /// placeholder framing (a launch site lens at its site, a station level
+    /// toward the horizon, a riding lens along its craft). A viewer can say
+    /// it is waiting for a target. False from a game that does not send it.
+    #[serde(default)]
+    pub waiting_for_target: bool,
 }
 
 /// A consumer reporting its OWN current display size in px for one camera.
@@ -1901,6 +1907,18 @@ mod tests {
         .unwrap();
         assert_eq!(command.aim_kind, Some(CommandAimKind::Vessel));
         assert_eq!(command.world_model_seq, Some(9.0));
+        assert!(
+            !command.waiting_for_target,
+            "a game that does not send it is not waiting"
+        );
+        let waiting: FrameCommandState = serde_json::from_str(
+            r#"{"hasFix":false,"frameHeightPx":720,"framingFits":true,"occluded":false,"occluder":"","sunlit":false,"subjectPersistentId":0,"waitingForTarget":true}"#,
+        )
+        .unwrap();
+        assert!(waiting.waiting_for_target);
+        assert!(serde_json::to_string(&waiting)
+            .unwrap()
+            .contains(r#""waitingForTarget":true"#));
         let msg = ServerMessage::FrameStamp(FrameStampPayload {
             flight_id: 7,
             rtp_timestamp: 1,

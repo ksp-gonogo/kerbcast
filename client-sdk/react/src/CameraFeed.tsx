@@ -317,6 +317,14 @@ export interface CameraFeedProps {
    */
   targetBracketOverlay?: CommandBracketOverlay;
   /**
+   * What a command camera feed says while the camera has no subject to aim
+   * at yet and shows its placeholder framing (a launch site camera on its
+   * pad, a station looking at the horizon). Drawn over the picture, never
+   * into the video, so recordings stay clean. Default "Waiting for target";
+   * `null` or an empty string shows nothing.
+   */
+  waitingForTargetLabel?: string | null;
+  /**
    * Mission UT the displayed video was captured at, for a host running its
    * own delayed playout. Picks which command-track transition is in force and
    * ages the readout. Defaults to the displayed frame's own capture UT where
@@ -388,6 +396,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       useStream,
       enableTargetBrackets = true,
       targetBracketOverlay,
+      waitingForTargetLabel = "Waiting for target",
       displayUt: displayUtProp,
       displayFrame,
       anchors,
@@ -1437,6 +1446,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 (
                   <>
                     {commandState.blank && <CommandBlank reason={commandState.blank} />}
+                    {commandState.waitingForTarget && !commandState.blank && !isDestroyed && waitingForTargetLabel && (
+                      <WaitingBadge role="status">{waitingForTargetLabel}</WaitingBadge>
+                    )}
                     {targetBracketsAvailable && bracketsOn && (
                       <LiveCommandBrackets
                         flightId={commandCamera?.flightId ?? null}
@@ -2373,6 +2385,33 @@ const StaleScrim = styled.div`
   inset: 0;
   z-index: 1;
   background: rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+`;
+
+/* Bottom centre: the zoom controls take the bottom left, pan and the stale
+   badge the bottom right, the title and REC badge the top left and the
+   action bar the top right. */
+const WaitingBadge = styled.div`
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  /* Clear of the stale badge on the bottom right, even on a small tile. */
+  max-width: calc(100% - 180px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
   pointer-events: none;
 `;
 

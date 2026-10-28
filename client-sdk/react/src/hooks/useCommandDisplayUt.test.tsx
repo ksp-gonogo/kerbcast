@@ -173,6 +173,7 @@ describe("useCommandDisplayUt", () => {
     expect(commandShownKey({ ...base, rangeM: 1500 })).toBe(commandShownKey({ ...base, rangeM: 1501 }));
     expect(commandShownKey({ ...base, rangeM: 1500 })).not.toBe(commandShownKey({ ...base, rangeM: 1600 }));
     expect(commandShownKey({ ...base, refusal: "stale" })).not.toBe(commandShownKey(base));
+    expect(commandShownKey({ ...base, waitingForTarget: true })).not.toBe(commandShownKey(base));
     expect(commandShownKey(undefined)).toBe("");
   });
 
