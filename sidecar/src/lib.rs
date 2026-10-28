@@ -6,6 +6,7 @@ pub mod anchors;
 pub mod cameras;
 pub mod commands;
 pub mod encoder;
+pub mod frame_watch;
 pub mod heartbeat;
 pub mod protocol;
 pub mod rate;

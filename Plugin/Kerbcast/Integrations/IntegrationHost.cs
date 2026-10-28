@@ -95,6 +95,14 @@ namespace Kerbcast
             }
         }
 
+        /* Whether an available integration attaches to this layer, and so may draw what a plain render would not show. */
+        public bool Touches(CameraLayers layer)
+        {
+            foreach (var i in _integrations)
+                if ((i.AppliesToLayers & layer) != 0 && SafeAvailable(i)) return true;
+            return false;
+        }
+
         private static bool SafeAvailable(ICameraModIntegration i)
         {
             try { return i.IsAvailable; }

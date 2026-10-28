@@ -224,6 +224,7 @@ namespace Kerbcast
             _counters.Publish(others);
             if (_telemetry)
             {
+                Telemetry.ReadbackIssue.Record((Stopwatch.GetTimestamp() - reqStart) * _msPerTick);
                 // Readback phase = this tick's drain of the PREVIOUS frame's
                 // capture (the ring memcpy in Drain, accumulated into
                 // _readbackDrainMs) + the cheap Request() issue here. Recording
@@ -261,6 +262,9 @@ namespace Kerbcast
                 return double.NaN;
             }
         }
+
+        private static readonly unsafe MmapFrameRing.PixelCopy NativeCopy =
+            (dst, src, length) => UnsafeUtility.MemCpy(dst, src, length);
 
         private unsafe void ProcessReadback(int slot)
         {
@@ -310,7 +314,9 @@ namespace Kerbcast
                     Length = p.MetaLength,
                     LiveLightTimeS = p.LiveLightTimeS,
                 };
-                _ring.Produce(_inFlight.Width(slot), _inFlight.Height(slot), p.CaptureTsMs, p.CaptureUt, p.CaptureEpoch, meta, src, length);
+                long copyStart = _telemetry ? Stopwatch.GetTimestamp() : 0;
+                _ring.Produce(_inFlight.Width(slot), _inFlight.Height(slot), p.CaptureTsMs, p.CaptureUt, p.CaptureEpoch, meta, src, length, NativeCopy);
+                if (_telemetry) Telemetry.FrameCopy.Record((Stopwatch.GetTimestamp() - copyStart) * _msPerTick);
                 _resetErrorStreak();
             }
             catch (Exception ex)

@@ -233,12 +233,30 @@ namespace Kerbcast
 
         public unsafe ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, FrameMeta meta, byte* src, int length)
         {
+            return Produce(width, height, captureTsMs, captureUt, captureEpoch, meta, src, length, ManagedCopy);
+        }
+
+        /// <summary>
+        /// <c>Produce</c> with the pixel copy supplied by the caller. The game
+        /// passes Unity's native memcpy: Mono's <c>Buffer.MemoryCopy</c> with
+        /// long sizes copies one byte at a time, which on a 1280x720 frame is
+        /// most of the main-thread cost of landing a readback.
+        /// </summary>
+        public unsafe ulong Produce(int width, int height, double captureTsMs, double captureUt, uint captureEpoch, FrameMeta meta, byte* src, int length, PixelCopy copy)
+        {
             ValidateFrame(width, height, length);
             var (slot, slotStart, newSeq) = BeginSlot(width, height, captureTsMs, captureUt, captureEpoch, meta);
-            Buffer.MemoryCopy(src, _basePtr + slotStart + SlotOffPixels, length, length);
+            copy(_basePtr + slotStart + SlotOffPixels, src, length);
             PublishSlot(slot, slotStart, newSeq);
             return (ulong)newSeq;
         }
+
+        /// <summary>Copies <paramref name="length"/> bytes from <paramref name="src"/> to <paramref name="dst"/>; the ranges never overlap.</summary>
+        public unsafe delegate void PixelCopy(byte* dst, byte* src, int length);
+
+        /* The ulong overload, which Mono copies a word at a time; the long one copies bytes. */
+        private static readonly unsafe PixelCopy ManagedCopy =
+            (dst, src, length) => Buffer.MemoryCopy(src, dst, (ulong)length, (ulong)length);
 
         private void ValidateFrame(int width, int height, int length)
         {

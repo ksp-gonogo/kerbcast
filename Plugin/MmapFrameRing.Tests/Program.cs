@@ -130,12 +130,33 @@ unsafe
     ring.Dispose();
 }
 
+// Ring C: the same frame through a caller-supplied copy, as the game passes Unity's memcpy.
+string pathCopy = Path.Combine(dir, "copy.ring");
+int copies = 0, copiedLength = 0;
+unsafe
+{
+    var ring = MmapFrameRing.Create(pathCopy, Slots, W, H);
+    MmapFrameRing.PixelCopy copy = (dst, src, length) =>
+    {
+        copies++;
+        copiedLength = length;
+        for (int i = 0; i < length; i++) dst[i] = src[i];
+    };
+    fixed (byte* p = pixels)
+    {
+        ring.Produce(W, H, ts, 5000.5, 2, default, p, pixels.Length, copy);
+    }
+    ring.Dispose();
+}
+Check(copies == 1 && copiedLength == pixels.Length, $"the supplied copy runs once over the frame ({copies} x {copiedLength})");
+
 // Same config + same single write + same seq/slot ⇒ the two ring files must be
 // byte-for-byte identical (header + slot + pixels).
 byte[] a = File.ReadAllBytes(pathArr);
 byte[] b = File.ReadAllBytes(pathPtr);
 Check(a.Length == b.Length, $"ring files same size ({a.Length} vs {b.Length})");
 Check(a.SequenceEqual(b), "byte* Produce writes byte-for-byte identical bytes to byte[] Produce");
+Check(File.ReadAllBytes(pathCopy).SequenceEqual(a), "Produce with a supplied copy writes the same bytes");
 
 // Pixels must actually be present somewhere (guard against a no-op write).
 Check(a.Any(x => x != 0), "ring file is not all-zero (pixels were written)");

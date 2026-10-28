@@ -2136,8 +2136,23 @@ namespace Kerbcast
                 if (_galaxyCam != null && (_layers & CameraLayers.Galaxy) != 0)
                 {
                     long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    _integrationHost?.PerFrame(_galaxyCam, CameraLayers.Galaxy, BuildIntegrationFrameState(CameraLayers.Galaxy));
-                    _galaxyCam.Render();
+                    /* By day in an atmosphere KSP tints the galaxy cube black, and a
+                       black cube over a black clear is the clear: clearing gives the
+                       same frame without a camera render (see GalaxyBlackout). */
+                    if ((_integrationHost == null || !_integrationHost.Touches(CameraLayers.Galaxy))
+                        && GalaxySky.CanClear(_galaxyCam))
+                    {
+                        var previous = RenderTexture.active;
+                        RenderTexture.active = _galaxyCam.targetTexture;
+                        GL.Clear(true, true, _galaxyCam.backgroundColor);
+                        RenderTexture.active = previous;
+                        if (_telemetry) Telemetry.AddGalaxySkip();
+                    }
+                    else
+                    {
+                        _integrationHost?.PerFrame(_galaxyCam, CameraLayers.Galaxy, BuildIntegrationFrameState(CameraLayers.Galaxy));
+                        _galaxyCam.Render();
+                    }
                     if (_telemetry)
                         _phaseTimings.Record(RenderPhase.Galaxy,
                             (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);

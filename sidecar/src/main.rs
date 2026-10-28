@@ -27,6 +27,7 @@ use kerbcast_sidecar::encoder::{
     record_init_failure, resolve_bitrate_bps, select_backend, EncodeConfig, EncoderBackend,
     EncoderChoice, RawFrame, SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
 };
+use kerbcast_sidecar::frame_watch::{sleep_until_ready, FRAME_WATCH_STEP};
 use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
 use kerbcast_sidecar::protocol::{
     AdaptiveShedPayload, CameraLifecycle, CameraState as ProtocolCameraState,
@@ -476,6 +477,7 @@ async fn consume_loop(
 
         let cameras = registry.snapshot().await;
         let mut any_active = false;
+        let mut watched: Vec<(Arc<CameraState>, u64)> = Vec::new();
 
         for cam in &cameras {
             // Destroyed cameras never encode — the part is gone.
@@ -495,7 +497,15 @@ async fn consume_loop(
                 continue;
             }
             any_active = true;
-            encode_and_fan_out(cam, encoder_choice, fps, bitrate_bps, frame_duration).await;
+            let capped =
+                encode_and_fan_out(cam, encoder_choice, fps, bitrate_bps, frame_duration).await;
+            /* Capped, the camera left frames unread, so it is due again at once. */
+            let seen = if capped {
+                cam.last_sequence.load(Ordering::Acquire)
+            } else {
+                cam.ring.published_sequence()
+            };
+            watched.push((cam.clone(), seen));
         }
 
         if telemetry && last_send_report.elapsed() >= SEND_REPORT_INTERVAL {
@@ -522,7 +532,17 @@ async fn consume_loop(
         registry.refresh_idle_subscriptions(&cameras).await;
 
         if any_active {
-            sleep(poll_interval).await;
+            /* Against the frame each ring had published just after its own
+            camera's turn, so a frame written while later cameras encoded wakes
+            the loop at once, and a ring stuck on a frame it cannot send never
+            does. Published, not claimed: the plugin claims a frame before it
+            copies it in, and a wake at the claim finds nothing to read. */
+            sleep_until_ready(poll_interval, FRAME_WATCH_STEP, || {
+                watched
+                    .iter()
+                    .any(|(cam, seen)| cam.ring.published_sequence() > *seen)
+            })
+            .await;
         } else {
             sleep(idle_interval).await;
         }
@@ -729,14 +749,15 @@ fn frame_timing(
  */
 const MAX_FRAMES_BEHIND: u64 = 2;
 
-/// Send every frame the camera has not sent yet, oldest first.
+/// Send every frame the camera has not sent yet, oldest first. Returns
+/// whether it stopped at `MAX_FRAMES_BEHIND` rather than running out of frames.
 async fn encode_and_fan_out(
     cam: &Arc<CameraState>,
     encoder_choice: EncoderChoice,
     fps: u32,
     bitrate_bps: u32,
     frame_duration: Duration,
-) {
+) -> bool {
     let mut taken = 0;
     while taken < MAX_FRAMES_BEHIND
         && encode_next_frame(cam, encoder_choice, fps, bitrate_bps, frame_duration).await
@@ -746,6 +767,7 @@ async fn encode_and_fan_out(
     if taken > 1 {
         cam.send_tally.note_caught_up();
     }
+    taken == MAX_FRAMES_BEHIND
 }
 
 /// Take the camera's next unread frame from the ring and send it. Returns

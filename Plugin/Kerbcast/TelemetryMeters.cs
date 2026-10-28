@@ -107,6 +107,14 @@ namespace Kerbcast
         public static readonly CostMeter Save = new CostMeter();
         public static readonly CostMeter Load = new CostMeter();
         public static readonly RateMeter RingEntries = new RateMeter();
+        public static readonly CostMeter FrameCopy = new CostMeter();
+        public static readonly CostMeter ReadbackIssue = new CostMeter();
+        public static readonly RateMeter GalaxySkips = new RateMeter();
+        private static long s_galaxySkips;
+
+        /* A capture whose galaxy layer was cleared instead of rendered. */
+        public static void AddGalaxySkip() => System.Threading.Interlocked.Increment(ref s_galaxySkips);
+        public static long GalaxySkipsTotal => System.Threading.Interlocked.Read(ref s_galaxySkips);
 
         public static double Ms(long ticks) => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
     }

@@ -700,6 +700,41 @@ impl MmapFrameRing {
             .load(Ordering::Acquire)
     }
 
+    /// The sequence of the newest frame whose write has ended, 0 before any
+    /// frame. Unlike `latest_sequence` it does not move when the writer claims
+    /// a frame, only once the frame can be read.
+    pub fn published_sequence(&self) -> u64 {
+        let write_index = self
+            .header_atomic_u32(HEADER_OFF_WRITE_INDEX)
+            .load(Ordering::Acquire);
+        if write_index >= self.cfg.slot_count {
+            return 0;
+        }
+        self.slot_atomic_u64(write_index, SLOT_OFF_SEQUENCE)
+            .load(Ordering::Acquire)
+    }
+
+    /* The two halves of a write, apart, so a test can stand between the claim and the publish as a reader does. */
+    #[cfg(test)]
+    pub(crate) fn claim_for_test(&self) -> u64 {
+        self.header_atomic_u64(HEADER_OFF_SEQUENCE)
+            .fetch_add(1, Ordering::Release)
+            + 1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, seq: u64) {
+        let next_slot = (self
+            .header_atomic_u32(HEADER_OFF_WRITE_INDEX)
+            .load(Ordering::Acquire)
+            + 1)
+            % self.cfg.slot_count;
+        self.slot_atomic_u64(next_slot, SLOT_OFF_SEQUENCE)
+            .store(seq, Ordering::Release);
+        self.header_atomic_u32(HEADER_OFF_WRITE_INDEX)
+            .store(next_slot, Ordering::Release);
+    }
+
     /// Reader side. Returns the most-recently-published frame, or `None` if
     /// nothing has been produced yet. Implements the seqlock retry protocol
     /// — if the writer clobbers our slot mid-read we bail and re-try once

@@ -1848,6 +1848,10 @@ namespace Kerbcast
          *   worldModelRecords records in the current snapshot
          *   saveMs, loadMs    the history's save into and load from the save file; read the last value
          *                     (they happen at saves and loads, not every interval)
+         *   frameCopyMs       copying one landed readback into the camera's frame ring, per frame, on the main thread
+         *   readbackIssueMs   issuing one readback (the request and the frame's bookkeeping), per captured frame
+         *   galaxySkipsPerS   captures whose galaxy layer was cleared rather than rendered because the game had faded
+         *                     the sky to black, summed over cameras, per second since the previous write
          */
         private static void AppendCosts(System.Text.StringBuilder sb, System.Globalization.CultureInfo ci)
         {
@@ -1874,6 +1878,10 @@ namespace Kerbcast
             AppendCost(sb, "metaEncodeMs", "Ms", Telemetry.MetaEncode.TakeInterval(), ci, perFrame: true);
             AppendCost(sb, "worldModelFillMs", "Ms", Telemetry.WorldModelFill.TakeInterval(), ci);
             sb.Append($"      \"worldModelRecords\": {store?.CurrentRecords ?? 0},\n");
+            AppendCost(sb, "frameCopyMs", "Ms", Telemetry.FrameCopy.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "readbackIssueMs", "Ms", Telemetry.ReadbackIssue.TakeInterval(), ci, perFrame: true);
+            double galaxySkipsPerS = Telemetry.GalaxySkips.TakeInterval(Telemetry.GalaxySkipsTotal, Time.realtimeSinceStartup);
+            sb.Append($"      \"galaxySkipsPerS\": {galaxySkipsPerS.ToString("F1", ci)},\n");
             AppendCost(sb, "saveMs", "Ms", Telemetry.Save.TakeInterval(), ci);
             AppendCost(sb, "loadMs", "Ms", Telemetry.Load.TakeInterval(), ci, lastField: true);
             sb.Append("    }\n");
