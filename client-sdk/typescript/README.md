@@ -115,6 +115,16 @@ untransformed. A receiver the camera leaves goes back to passthrough, and
 frames the old instance still holds are dropped. `setEncodedTransform(null)`
 detaches. It works in both legacy and dynamic slot modes.
 
+On the `"script"` path every install is followed by one more factory call,
+once packets start arriving on that receiver. Chromium wires a script
+transform to its receiver only as frames reach it, so on a receiver with no
+packets coming in (a relaunch gap, a slot about to be fed) an instance built
+before it was handed over can lose to the previous transform and receive
+nothing, for good. The second instance is built while packets flow, which
+Chromium wires at once, and Kerbcast asks the sidecar for a keyframe after
+the swap. Build the transform inside the factory call rather than ahead of
+it, and expect the factory to run twice per install.
+
 It needs `encodedTransforms: true` when the client is constructed, and
 `setEncodedTransform` throws without it. The option gives every receiver a
 passthrough transform from the start, because Chrome only honours a receiver

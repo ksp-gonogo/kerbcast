@@ -4174,6 +4174,165 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
     const bare = new KerbcastClient({ host: "h", port: 1 }, makeFakeTransport().transport);
     expect(() => bare.camera(1).setEncodedTransform(countingFactory().factory)).toThrow(/unavailable/);
   });
+
+  /*
+   * Chromium can leave a script transform handed over on a receiver with no
+   * packets arriving without frames, so each install is renewed once when
+   * packets next arrive.
+   */
+  describe("heal once packets arrive", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    async function connectWithStats(path: Path = "script") {
+      const t = makeTransformTransport(() => path);
+      const packets = new Map<string, number>();
+      let statsCalls = 0;
+      const transport: KerbcastTransport = {
+        ...t.transport,
+        createPeer: (ice, opts) => ({
+          ...t.transport.createPeer(ice, opts),
+          getStats: async () => {
+            statsCalls++;
+            const report = new Map(
+              [...packets].map(([mid, n]) => [mid, { type: "inbound-rtp", kind: "video", mid, packetsReceived: n }]),
+            );
+            return report as unknown as RTCStatsReport;
+          },
+        }),
+      };
+      const client = new KerbcastClient({ host: "h", port: 1, encodedTransforms: true }, transport);
+      vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(fakeAnswer([])));
+      await client.connect([], { slots: 2 });
+      t.captured.dc?._open();
+      const keyframeRequests = () =>
+        (t.captured.dc?.sent ?? []).map((m) => JSON.parse(m)).filter((m) => m.type === "request-keyframe");
+      return { ...t, client, packets, keyframeRequests, statsCalls: () => statsCalls };
+    }
+
+    it("renews the instance once from the factory when packets start arriving, then asks for a keyframe", async () => {
+      const { client, captured, installs, packets, keyframeRequests } = await connectWithStats();
+      const { factory, made } = countingFactory();
+      client.camera(7).setEncodedTransform(factory);
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(installs).toEqual([{ mid: "0", transform: made[0] }]);
+
+      packets.set("0", 30);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(installs).toEqual([
+        { mid: "0", transform: made[0] },
+        { mid: "0", transform: made[1] },
+      ]);
+      expect(keyframeRequests()).toEqual([{ type: "request-keyframe", content: { flightId: 7 } }]);
+
+      packets.set("0", 300);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(factory).toHaveBeenCalledTimes(2);
+      expect(keyframeRequests()).toHaveLength(1);
+    });
+
+    it("heals an instance installed while packets were already arriving, once", async () => {
+      const { client, captured, installs, packets } = await connectWithStats();
+      packets.set("0", 500);
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory);
+      slotMap(captured, "0", 7);
+      for (let n = 530; n < 1000; n += 30) {
+        packets.set("0", n);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+      expect(factory).toHaveBeenCalledTimes(2);
+      expect(installs).toHaveLength(2);
+    });
+
+    it("does not renew while no packets arrive, and stops watching after a minute", async () => {
+      const { client, captured, installs, packets, statsCalls } = await connectWithStats();
+      packets.set("0", 12);
+      client.camera(7).setEncodedTransform(countingFactory().factory);
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(installs).toHaveLength(1);
+      const calls = statsCalls();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(statsCalls()).toBe(calls);
+    });
+
+    it("drops the heal when the camera leaves the receiver or its factory is removed first", async () => {
+      const { client, captured, installs, packets, statsCalls } = await connectWithStats();
+      const a = countingFactory();
+      client.camera(7).setEncodedTransform(a.factory);
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(captured, "0", null);
+      const b = countingFactory();
+      client.camera(8).setEncodedTransform(b.factory);
+      slotMap(captured, "1", 8);
+      await vi.advanceTimersByTimeAsync(300);
+      client.camera(8).setEncodedTransform(null);
+      packets.set("0", 30);
+      packets.set("1", 30);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(a.factory).toHaveBeenCalledOnce();
+      expect(b.factory).toHaveBeenCalledOnce();
+      expect(installs.filter((i) => i.transform !== null)).toHaveLength(2);
+      const calls = statsCalls();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(statsCalls()).toBe(calls);
+    });
+
+    it("heals a renewed instance again, since a renewal is a new install", async () => {
+      const { client, captured, packets } = await connectWithStats();
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory);
+      snapshot(captured, [fakeCameraState(7)]);
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      packets.set("0", 30);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(factory).toHaveBeenCalledTimes(2);
+
+      snapshot(captured, []);
+      snapshot(captured, [fakeCameraState(7)]);
+      expect(factory).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(300);
+      packets.set("0", 60);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(factory).toHaveBeenCalledTimes(4);
+    });
+
+    it("leaves the streams path alone", async () => {
+      const { client, captured, packets, statsCalls } = await connectWithStats("streams");
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory);
+      slotMap(captured, "0", 7);
+      packets.set("0", 30);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(factory).toHaveBeenCalledOnce();
+      expect(statsCalls()).toBe(0);
+    });
+
+    it("costs a host with no factory nothing", async () => {
+      const { captured, packets, statsCalls } = await connectWithStats();
+      slotMap(captured, "0", 7);
+      packets.set("0", 30);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(statsCalls()).toBe(0);
+    });
+
+    it("stops watching at disconnect", async () => {
+      const { client, captured, installs, packets, statsCalls } = await connectWithStats();
+      client.camera(7).setEncodedTransform(countingFactory().factory);
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      client.disconnect();
+      const calls = statsCalls();
+      packets.set("0", 30);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(statsCalls()).toBe(calls);
+      expect(installs.filter((i) => i.transform !== null)).toHaveLength(1);
+    });
+  });
 });
 
 describe("KerbcastCameraHandle.tapEncodedFrames", () => {

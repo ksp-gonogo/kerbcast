@@ -70,6 +70,13 @@ const RENEGOTIATE_TIMEOUT_MS = 10_000;
  */
 const GROW_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000];
 /**
+ * How often a receiver whose encoded transform is waiting for its heal is
+ * checked for arriving packets, and how long it is watched before the heal
+ * is given up. See {@link KerbcastClient._syncEncodedTransforms}.
+ */
+const TRANSFORM_HEAL_POLL_MS = 250;
+const TRANSFORM_HEAL_GIVE_UP_MS = 60_000;
+/**
  * Failed re-offers in a row after which a connection stops growing. Each
  * failure after the sidecar answered leaves it a few stopped transceivers it
  * keeps for the connection's life, so the retries must end.
@@ -206,7 +213,11 @@ export interface KerbcastCameraHandle {
    * has (back in the list after a scene change, back from destroyed, or a new
    * {@link CameraState.attach} from a reattach in place), and removes it from a
    * receiver the camera leaves; frames the old instance still holds are
-   * discarded. The setting persists across reconnects. `null` detaches.
+   * discarded. On the `"script"` path each install is also renewed once, from
+   * the factory, when packets next arrive on its receiver: Chromium can leave
+   * an instance handed to an idle receiver without frames, and one built while
+   * packets flow is wired at once. Build the instance inside the factory call.
+   * The setting persists across reconnects. `null` detaches.
    *
    * Needs {@link KerbcastClientConfig.encodedTransforms}; throws without it,
    * or when the browser has no install path. Failures while installing
@@ -278,6 +289,12 @@ export interface EncodedTransformContext {
  * stream starts over.
  */
 export type EncodedTransformFactory = (ctx: EncodedTransformContext) => EncodedTransform;
+
+/** A factory's instance on one receiver, as {@link KerbcastClient} tracks it. */
+interface TransformInstall {
+  flightId: number;
+  factory: EncodedTransformFactory;
+}
 
 /** Configuration for {@link KerbcastClient} construction. */
 export interface KerbcastClientConfig {
@@ -1609,10 +1626,16 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /** The encoded-transform path the current peer was created with. */
   private peerTransformPath: EncodedTransformPath | null = null;
   /** Receivers holding a camera's encoded transform, by mid, with the factory that built it. */
-  private readonly transformInstalls = new Map<
+  private readonly transformInstalls = new Map<string, TransformInstall>();
+  /** Script-path installs still owed their one renewal, by mid; see {@link _syncEncodedTransforms}. */
+  private readonly pendingHeals = new Map<
     string,
-    { flightId: number; factory: EncodedTransformFactory }
+    { install: TransformInstall; packets: number | null; since: number }
   >();
+  /** Receivers whose next install is a heal's renewal, which is not healed again. */
+  private readonly healingMids = new Set<string>();
+  private healTimer: ReturnType<typeof setInterval> | null = null;
+  private healPolling = false;
   /** Receivers copying frames for a camera's taps, by mid. */
   private readonly tapInstalls = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
@@ -3165,6 +3188,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * Internal: bring each receiver's installed transform in line with the
    * camera now bound to it. A receiver whose camera or factory changed loses
    * its instance; a bound camera with a factory gets a fresh one.
+   *
+   * On the script path each install is renewed once more, from the factory,
+   * when packets next arrive on its receiver. Chromium wires a script transform
+   * to its receiver only as frames reach it, so on a receiver with no packets
+   * coming in (a relaunch gap, a slot about to be fed) an instance the host
+   * built before handing it over can lose to the previous one's late wiring,
+   * and then receives nothing. One built while packets flow is wired at once.
    */
   _syncEncodedTransforms(): void {
     this.syncFrameTaps();
@@ -3183,6 +3213,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       if (this.transformInstalls.has(mid)) continue;
       const factory = this.handles.get(flightId)?._encodedTransform;
       if (!factory) continue;
+      const healed = this.healingMids.delete(mid);
       let transform: EncodedTransform;
       try {
         transform = factory({ flightId, path });
@@ -3191,8 +3222,72 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         continue;
       }
       if (this.setReceiverTransform(peer, mid, flightId, transform)) {
-        this.transformInstalls.set(mid, { flightId, factory });
+        const install = { flightId, factory };
+        this.transformInstalls.set(mid, install);
+        if (path === "script" && !healed) this.awaitHeal(mid, install);
       }
+    }
+  }
+
+  /** Watch `mid` for arriving packets, to renew `install` once when they come. */
+  private awaitHeal(mid: string, install: TransformInstall): void {
+    if (!this.peer?.getStats) return;
+    this.pendingHeals.set(mid, { install, packets: null, since: monotonicNowMs() });
+    this.healTimer ??= setInterval(() => void this.pollHeals(), TRANSFORM_HEAL_POLL_MS);
+    void this.pollHeals();
+  }
+
+  private async pollHeals(): Promise<void> {
+    if (this.healPolling) return;
+    const peer = this.peer;
+    for (const [mid, pending] of this.pendingHeals) {
+      const stale = this.transformInstalls.get(mid) !== pending.install;
+      if (stale || monotonicNowMs() - pending.since > TRANSFORM_HEAL_GIVE_UP_MS) {
+        this.pendingHeals.delete(mid);
+      }
+    }
+    if (this.pendingHeals.size === 0 || !peer?.getStats) {
+      this.stopHeals();
+      return;
+    }
+    this.healPolling = true;
+    let report: RTCStatsReport;
+    try {
+      report = await peer.getStats();
+    } catch {
+      return;
+    } finally {
+      this.healPolling = false;
+    }
+    if (this.peer !== peer) return;
+    const packetsByMid = new Map<string, number>();
+    report.forEach((raw) => {
+      const entry = raw as { type?: string; kind?: string; mid?: string; packetsReceived?: number };
+      if (entry.type !== "inbound-rtp" || entry.kind !== "video" || entry.mid === undefined) return;
+      packetsByMid.set(entry.mid, entry.packetsReceived ?? 0);
+    });
+    for (const [mid, pending] of this.pendingHeals) {
+      if (this.transformInstalls.get(mid) !== pending.install) continue;
+      const packets = packetsByMid.get(mid) ?? 0;
+      if (pending.packets === null || packets <= pending.packets) {
+        pending.packets ??= packets;
+        continue;
+      }
+      this.pendingHeals.delete(mid);
+      this.healingMids.add(mid);
+      this.transformInstalls.delete(mid);
+      this._syncEncodedTransforms();
+      /* The instance it replaced may have taken the keyframe with it. */
+      this.handles.get(pending.install.flightId)?.requestKeyframe().catch(() => {});
+    }
+    if (this.pendingHeals.size === 0) this.stopHeals();
+  }
+
+  private stopHeals(): void {
+    this.pendingHeals.clear();
+    if (this.healTimer !== null) {
+      clearInterval(this.healTimer);
+      this.healTimer = null;
     }
   }
 
@@ -3253,6 +3348,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   private clearEncodedTransforms(): void {
+    this.stopHeals();
+    this.healingMids.clear();
     this.tapInstalls.clear();
     const peer = this.peer;
     for (const [mid, installed] of this.transformInstalls) {
