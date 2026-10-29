@@ -47,13 +47,13 @@ export interface UtSample {
  * Why a recording ended. `"user"`: stopped by a call (a Stop button, a
  * grouped stop). `"max-duration"`: its `maxDurationMs` ran out.
  * `"camera-gone"`: its camera went away (destroyed, as in a scene change, or
- * dropped from the camera list). `"feed-closed"`: the camera is still there
- * but its feed left this client (its tile removed or switched to another
- * camera, its track ended) and did not come back within
- * {@link SOURCE_LOST_GRACE_MS}. `"disconnected"`: the client
- * lost the sidecar and did not get the camera back within
- * {@link RECONNECT_GRACE_MS}. Whatever the reason, the clip keeps everything
- * recorded up to then.
+ * dropped from the camera list), or the game went back in time under it (a
+ * revert or quickload, which starts a new capture epoch). `"feed-closed"`:
+ * the camera is still there but its feed left this client (its tile removed
+ * or switched to another camera, its track ended) and did not come back
+ * within {@link SOURCE_LOST_GRACE_MS}. `"disconnected"`: the client lost the
+ * sidecar and did not get the camera back within {@link RECONNECT_GRACE_MS}.
+ * Whatever the reason, the clip keeps everything recorded up to then.
  */
 export type RecordingEndReason =
   | "user"
@@ -326,7 +326,12 @@ export interface RecordingClientCamera {
  */
 export interface RecordingClient {
   camera(flightId: number): RecordingClientCamera;
-  readonly clock: { readonly captureUt: number | null };
+  /**
+   * The capture clock. A change of `epoch` (a revert or quickload) ends a
+   * recording, since its UT would run backwards; without it only a camera
+   * going away does.
+   */
+  readonly clock: { readonly captureUt: number | null; readonly epoch?: number };
   /** The connection state; a recording losing its feed while not `"connected"` waits for a reconnect. */
   readonly state?: string;
   /**
@@ -349,7 +354,7 @@ export interface RecordingClient {
   frameUt?(
     flightId: number,
     rtpTimestamp: number,
-  ): { ut: number; source: "exact" | "estimated" } | null;
+  ): { ut: number; epoch?: number; source: "exact" | "estimated" } | null;
 }
 
 /* MediaRecorder is a DOM lib global; keep a minimal structural view so this
@@ -861,6 +866,8 @@ interface ActiveRecording {
   utSamples: UtSample[];
   /** Most recent UT seen (for the grouped coverage guarantee); undefined until first UT. */
   latestUt?: number;
+  /** The capture epoch its UT belongs to, set once a clock is known. */
+  epoch?: number;
   /** Detach from the client's settings-change clock feed. */
   unsubscribeClock: () => void;
   maxDurationTimer?: ReturnType<typeof setTimeout>;
@@ -1417,7 +1424,7 @@ export class RecordingController {
       throw new Error(`camera ${flightId} has no live track to record`);
     }
 
-    const recorder = this.createClipRecorder(flightId, stream, opts?.mimeType);
+    const recorder = this.createClipRecorder(flightId, stream, opts?.mimeType, () => rec.epoch);
     const mimeType = recorder.mimeType;
 
     const recordingId = mintId("rec");
@@ -1433,6 +1440,7 @@ export class RecordingController {
       utStart,
       utSamples: [{ t: 0, ut: utStart }],
       latestUt: utStart,
+      epoch: utStart != null ? this.client.clock.epoch : undefined,
       unsubscribeClock: () => {},
       unwatchCamera: () => {},
     };
@@ -1442,6 +1450,16 @@ export class RecordingController {
        to present automatically once out-of-flight becomes in-flight. */
     rec.unsubscribeClock = this.client.on("settings-change", () => {
       const ut = this.client.clock.captureUt ?? undefined;
+      if (ut != null) rec.epoch ??= this.client.clock.epoch;
+      if (this.leftEpoch(rec)) {
+        /*
+         * A revert can keep the camera's flight id and bring it back within
+         * one rescan, so the list may never show it destroyed. Its UT now
+         * runs from an earlier point, which a clip's timeline cannot hold.
+         */
+        this.endOnItsOwn(recordingId, "camera-gone");
+        return;
+      }
       rec.utSamples.push({ t: now() - rec.startedAt, ut });
       if (ut != null) rec.latestUt = ut;
     });
@@ -1507,15 +1525,23 @@ export class RecordingController {
     return recordingId;
   }
 
-  /** A capture-timed recorder when the feed's frames can be copied, else MediaRecorder. */
+  /**
+   * A capture-timed recorder when the feed's frames can be copied, else
+   * MediaRecorder. A frame's stamp counts only in the recording's own
+   * epoch: frames after a revert can arrive before the clock push that ends
+   * the recording.
+   */
   private createClipRecorder(
     flightId: number,
     stream: MediaStream,
     preferredMime: string | undefined,
+    epoch: () => number | undefined,
   ): ClipRecorder {
     const capture = captureClipRecorder(this.client.camera(flightId), (rtp) => {
       const frame = this.client.frameUt?.(flightId, rtp);
-      return frame?.source === "exact" ? { ut: frame.ut } : null;
+      if (frame?.source !== "exact") return null;
+      const own = epoch();
+      return own == null || frame.epoch == null || frame.epoch === own ? { ut: frame.ut } : null;
     });
     if (capture) return capture;
     const mimeType = negotiateMimeType(preferredMime);
@@ -1628,6 +1654,17 @@ export class RecordingController {
     return this.stopWith(recordingId, "user");
   }
 
+  /** True once the capture clock has moved on from the epoch the recording's UT belongs to. */
+  private leftEpoch(rec: ActiveRecording): boolean {
+    const epoch = this.client.clock.epoch;
+    return rec.epoch != null && epoch != null && epoch !== rec.epoch;
+  }
+
+  /** The clock's UT at a stop, or the last one in the recording's own epoch once the clock has left it. */
+  private utEndOf(rec: ActiveRecording): number | undefined {
+    return this.leftEpoch(rec) ? rec.latestUt : (this.client.clock.captureUt ?? undefined);
+  }
+
   private stopWith(recordingId: string, reason: RecordingEndReason): Promise<RecordingHandle> {
     const rec = this.active.get(recordingId);
     if (!rec) {
@@ -1652,7 +1689,7 @@ export class RecordingController {
          unconditionally. */
       rec.recorder.cancel();
       if (rec.forced) this.releaseForce(rec.flightId);
-      const utEnd = this.client.clock.captureUt ?? undefined;
+      const utEnd = this.utEndOf(rec);
       const handle: RecordingHandle = {
         recordingId,
         flightId: rec.flightId,
@@ -1679,7 +1716,7 @@ export class RecordingController {
       return rec.stopPromise;
     }
 
-    const utEnd = this.client.clock.captureUt ?? undefined;
+    const utEnd = this.utEndOf(rec);
     rec.utSamples.push({ t: now() - rec.startedAt, ut: utEnd });
     this.releaseHold(rec);
 

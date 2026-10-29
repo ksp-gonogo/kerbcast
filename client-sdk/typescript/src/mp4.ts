@@ -9,6 +9,7 @@
  */
 
 /** NAL unit types the muxer cares about. */
+export const NAL_SLICE = 1;
 export const NAL_IDR = 5;
 export const NAL_SPS = 7;
 export const NAL_PPS = 8;
@@ -83,6 +84,12 @@ export interface SpsInfo {
   bitDepthChromaMinus8: number;
   width: number;
   height: number;
+  /** Bits in a slice header's `frame_num`. */
+  log2MaxFrameNum: number;
+  /** True when a slice header carries `colour_plane_id` ahead of `frame_num`. */
+  separateColourPlane: boolean;
+  /** True when the encoder may skip `frame_num` values on purpose. */
+  frameNumGapsAllowed: boolean;
 }
 
 /** Exp-Golomb bit reader over an RBSP (emulation prevention already removed). */
@@ -94,7 +101,7 @@ class BitReader {
     let v = 0;
     for (let i = 0; i < count; i++) {
       const byte = this.bytes[this.bit >> 3];
-      if (byte === undefined) throw new Error("SPS ended early");
+      if (byte === undefined) throw new Error("NAL unit ended early");
       v = v * 2 + ((byte >> (7 - (this.bit & 7))) & 1);
       this.bit++;
     }
@@ -104,7 +111,7 @@ class BitReader {
   ue(): number {
     let zeros = 0;
     while (this.u(1) === 0) {
-      if (++zeros > 31) throw new Error("bad exp-Golomb code in SPS");
+      if (++zeros > 31) throw new Error("bad exp-Golomb code");
     }
     return 2 ** zeros - 1 + this.u(zeros);
   }
@@ -167,7 +174,7 @@ export function parseSps(nal: Uint8Array): SpsInfo {
       }
     }
   }
-  r.ue();
+  const log2MaxFrameNum = r.ue() + 4;
   const pocType = r.ue();
   if (pocType === 0) {
     r.ue();
@@ -179,7 +186,7 @@ export function parseSps(nal: Uint8Array): SpsInfo {
     for (let i = 0; i < cycle; i++) r.se();
   }
   r.ue();
-  r.u(1);
+  const frameNumGapsAllowed = r.u(1) === 1;
   const widthMbs = r.ue() + 1;
   const heightMapUnits = r.ue() + 1;
   const frameMbsOnly = r.u(1);
@@ -199,7 +206,28 @@ export function parseSps(nal: Uint8Array): SpsInfo {
     bitDepthChromaMinus8,
     width: widthMbs * 16 - cropUnitX * (crop[0] + crop[1]),
     height: (2 - frameMbsOnly) * heightMapUnits * 16 - cropUnitY * (crop[2] + crop[3]),
+    log2MaxFrameNum,
+    separateColourPlane: separateColourPlane === 1,
+    frameNumGapsAllowed,
   };
+}
+
+/** Raw bytes of a slice NAL unit read for its header: enough to reach `frame_num` at any picture size. */
+const SLICE_HEADER_PEEK_BYTES = 32;
+
+/** The `frame_num` of a slice NAL unit, read from its header with the SPS it refers to. */
+export function sliceFrameNum(nal: Uint8Array, sps: SpsInfo): number {
+  const r = new BitReader(unescapeRbsp(nal.subarray(1, 1 + SLICE_HEADER_PEEK_BYTES)));
+  r.ue();
+  r.ue();
+  r.ue();
+  if (sps.separateColourPlane) r.u(2);
+  return r.u(sps.log2MaxFrameNum);
+}
+
+/** True when a NAL unit is used for reference (`nal_ref_idc` set). */
+export function isReferenceNal(nal: Uint8Array): boolean {
+  return (nal[0] & 0x60) !== 0;
 }
 
 /** RFC 6381 codec string for an SPS, e.g. `avc1.42e01f`. */
@@ -324,6 +352,14 @@ function table(count: number, words: number, row: (i: number, put: (v: number) =
   return out;
 }
 
+/** Version 0 holds a 32-bit duration, which wraps after about 13 hours on the 90 kHz clock; version 1 holds 64 bits. */
+function mdhd(totalTicks: number): Uint8Array {
+  const tail = [u16(0x55c4), u16(0)];
+  return totalTicks > 0xffffffff
+    ? fullBox("mdhd", 1, 0, u64(0), u64(0), u32(RTP_VIDEO_CLOCK_HZ), u64(totalTicks), ...tail)
+    : fullBox("mdhd", 0, 0, u32(0), u32(0), u32(RTP_VIDEO_CLOCK_HZ), u32(totalTicks), ...tail);
+}
+
 function stts(durations: number[]): Uint8Array {
   const runs: [number, number][] = [];
   for (const d of durations) {
@@ -355,6 +391,9 @@ function inBandParameterSets(entry: SampleEntry): Uint8Array<ArrayBuffer> {
 
 /** Sample bytes held in memory before they are rolled into a Blob part. */
 export const MP4_PART_BYTES = 4 * 1024 * 1024;
+
+/** Gaps the last sample's duration is the median of. */
+const LAST_DURATION_WINDOW = 15;
 
 /** One run of consecutive samples sharing a sample entry: one chunk in the file. */
 interface Chunk {
@@ -420,11 +459,19 @@ export class Mp4Writer {
     if (this.pendingBytes >= MP4_PART_BYTES) this.roll();
   }
 
-  /** Each sample's duration: the gap to the next, the last repeating the one before it. */
+  /**
+   * Each sample's duration: the gap to the next. The last sample has no
+   * next, so it takes the median of the gaps just before it; repeating the
+   * one before would turn a stop just after a dropout into a frozen tail as
+   * long as the dropout.
+   */
   durations(fallback = RTP_VIDEO_CLOCK_HZ / 30): number[] {
     const out: number[] = [];
     for (let i = 0; i < this.dts.length - 1; i++) out.push(this.dts[i + 1] - this.dts[i]);
-    if (this.dts.length > 0) out.push(out.length > 0 ? out[out.length - 1] : fallback);
+    if (this.dts.length > 0) {
+      const recent = out.slice(-LAST_DURATION_WINDOW).sort((a, b) => a - b);
+      out.push(recent.length > 0 ? recent[(recent.length - 1) >> 1] : fallback);
+    }
     return out;
   }
 
@@ -573,17 +620,7 @@ export class Mp4Writer {
           ),
           box(
             "mdia",
-            fullBox(
-              "mdhd",
-              0,
-              0,
-              u32(0),
-              u32(0),
-              u32(RTP_VIDEO_CLOCK_HZ),
-              u32(totalTicks),
-              u16(0x55c4),
-              u16(0),
-            ),
+            mdhd(totalTicks),
             fullBox("hdlr", 0, 0, u32(0), ascii("vide"), new Uint8Array(12), ascii("VideoHandler\0")),
             box(
               "minf",

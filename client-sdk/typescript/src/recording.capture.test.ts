@@ -62,10 +62,14 @@ class TapCamera implements RecordingClientCamera {
 
 class TapClient implements RecordingClient {
   captureUt: number | null = 50;
+  epoch = 0;
   private camerasChange: ((cameras: CameraState[]) => void) | null = null;
+  private settingsChange: (() => void) | null = null;
   readonly cams = new Map<number, TapCamera>();
   /** rtpTimestamp -> UT for frames with a capture stamp. */
   readonly stamps = new Map<number, number>();
+  /** rtpTimestamp -> the epoch of a stamp not in {@link epoch}. */
+  readonly stampEpochs = new Map<number, number>();
 
   camera(flightId: number): TapCamera {
     let cam = this.cams.get(flightId);
@@ -75,20 +79,31 @@ class TapClient implements RecordingClient {
     }
     return cam;
   }
-  get clock(): { captureUt: number | null } {
-    return { captureUt: this.captureUt };
+  get clock(): { captureUt: number | null; epoch: number } {
+    return { captureUt: this.captureUt, epoch: this.epoch };
   }
   on(event: string, handler: (data: never) => void): () => void {
     if (event === "cameras-change") this.camerasChange = handler as (cameras: CameraState[]) => void;
+    if (event === "settings-change") this.settingsChange = handler as () => void;
     return () => {};
+  }
+  /** Test hook: the ~1 Hz clock push. */
+  tick(ut: number, epoch = this.epoch): void {
+    this.captureUt = ut;
+    this.epoch = epoch;
+    this.settingsChange?.();
   }
   /** Test hook: a new camera list arrives. */
   emitCameras(cameras: CameraState[]): void {
     this.camerasChange?.(cameras);
   }
-  frameUt(_flightId: number, rtp: number): { ut: number; source: "exact" | "estimated" } | null {
+  frameUt(
+    _flightId: number,
+    rtp: number,
+  ): { ut: number; epoch: number; source: "exact" | "estimated" } | null {
     const ut = this.stamps.get(rtp);
-    return ut == null ? { ut: 0, source: "estimated" } : { ut, source: "exact" };
+    const epoch = this.stampEpochs.get(rtp) ?? this.epoch;
+    return ut == null ? { ut: 0, epoch, source: "estimated" } : { ut, epoch, source: "exact" };
   }
 }
 
@@ -145,6 +160,32 @@ describe("capture-timed recording", () => {
     expect(handle.durationMs).toBeGreaterThan(0);
     expect(cam.tap).toBeNull();
     expect(controller.isRecording(1)).toBe(false);
+  });
+
+  it("ends on a revert, keeping no frame UT from after it", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const client = new TapClient();
+    const controller = new RecordingController(client);
+    const cam = client.camera(1);
+    const aus = accessUnits();
+    const id = controller.startRecording(1);
+    for (let i = 0; i < 6; i++) {
+      client.stamps.set(i * 3000, 100 + i / 30);
+      cam.send(aus[i], i * 3000);
+    }
+    /* The reverted flight's frames, stamped earlier, arrive ahead of the clock push that says so. */
+    for (let i = 6; i < 9; i++) {
+      client.stamps.set(i * 3000, 20 + i / 30);
+      client.stampEpochs.set(i * 3000, 1);
+      cam.send(aus[i], i * 3000);
+    }
+    client.tick(20.3, 1);
+    await vi.waitFor(() => expect(controller.fetchRecording(id)).toBeDefined());
+
+    const handle = controller.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utSamples.map((s) => s.ut)).toEqual(Array.from({ length: 6 }, (_, i) => 100 + i / 30));
+    expect(handle.utEnd).toBeCloseTo(100 + 5 / 30);
   });
 
   it("falls back to the clock UT track when frames carry no stamps", async () => {

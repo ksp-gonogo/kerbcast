@@ -10,11 +10,16 @@ import {
   Mp4Writer,
   NAL_IDR,
   NAL_PPS,
+  NAL_SLICE,
   NAL_SPS,
   RTP_VIDEO_CLOCK_HZ,
+  isReferenceNal,
   nalType,
+  parseSps,
+  sliceFrameNum,
   splitAnnexB,
   toAvccSample,
+  type SpsInfo,
 } from "./mp4";
 import type { UtSample } from "./recording";
 
@@ -102,6 +107,26 @@ export class RtpTimeline {
   }
 }
 
+/**
+ * True when a picture's `frame_num` shows a reference picture before it went
+ * missing. Each reference picture steps `frame_num` by one (modulo
+ * `2 ** log2MaxFrameNum`) and a non-reference one does not, so a picture
+ * carries the last reference's number or the one after it; anything else
+ * means the frames from here on predict from a picture the clip never had.
+ * A memory management op 5 would reset the count without an IDR; it is not
+ * handled because none of Kerbcast's encoders emit one.
+ */
+export function missesReference(prevRefFrameNum: number, frameNum: number, log2MaxFrameNum: number): boolean {
+  return frameNum !== prevRefFrameNum && frameNum !== (prevRefFrameNum + 1) % 2 ** log2MaxFrameNum;
+}
+
+/**
+ * Frames back from the newest whose missed UT lookups are retried on each
+ * push: about 4 s at 60 fps, for stamps trailing their frames. Older misses
+ * wait for {@link CaptureClip.finish}.
+ */
+export const UT_RETRY_FRAMES = 256;
+
 /** A frame's mission time, from its capture stamp. */
 export type FrameUtLookup = (rtpTimestamp: number) => { ut: number } | null;
 
@@ -150,10 +175,15 @@ export class CaptureClip {
   private readonly frames: FrameMeta[] = [];
   private readonly timeline = new RtpTimeline();
   private sps: Uint8Array | null = null;
+  private spsInfo: SpsInfo | null = null;
   private pps: Uint8Array | null = null;
+  /** `frame_num` of the last reference picture, or null when unknown. */
+  private prevRefFrameNum: number | null = null;
+  /** Indices into {@link frames} whose UT lookup has missed so far, oldest first. */
+  private utMisses: number[] = [];
   private firstFrameAt: number | null = null;
   private lastSsrc: number | undefined;
-  /** False until a keyframe opens the clip, and again after a source change until the next one. */
+  /** False until a keyframe opens the clip, and again after a source change, a break or a lost reference picture until the next one. */
   private decodable = false;
 
   constructor(private readonly lookupUt?: FrameUtLookup) {}
@@ -173,34 +203,95 @@ export class CaptureClip {
       /* A new source restarts its reference chain at a keyframe. */
       this.decodable = false;
       this.timeline.markBreak();
+      this.prevRefFrameNum = null;
     }
     if (frame.ssrc !== undefined) this.lastSsrc = frame.ssrc;
 
     const nals = splitAnnexB(new Uint8Array(frame.data));
     let idr = false;
+    let slice: Uint8Array | null = null;
     for (const nal of nals) {
       const type = nalType(nal);
-      if (type === NAL_SPS) this.sps = nal.slice();
+      if (type === NAL_SPS) this.setSps(nal);
       else if (type === NAL_PPS) this.pps = nal.slice();
       else if (type === NAL_IDR) idr = true;
+      if ((type === NAL_SLICE || type === NAL_IDR) && !slice) slice = nal;
     }
     const sps = this.sps;
+    const info = this.spsInfo;
     const pps = this.pps;
-    if (!sps || !pps) return;
+    if (!sps || !info || !pps) return;
     if (this.decodable && !idr && this.timeline.breaks(frame.rtpTimestamp, frame.ssrc)) {
       /* After a jump or a step back the frames refer to pictures from before it, so the clip waits for a keyframe as a new source does. */
       this.decodable = false;
       this.timeline.markBreak();
     }
+    const frameNum = slice ? this.frameNumOf(slice, info) : null;
+    const prevRef = this.prevRefFrameNum;
+    if (
+      this.decodable &&
+      !idr &&
+      frameNum !== null &&
+      prevRef !== null &&
+      !info.frameNumGapsAllowed &&
+      missesReference(prevRef, frameNum, info.log2MaxFrameNum)
+    ) {
+      /*
+       * A reference picture went missing on an unbroken timeline (a packet
+       * the network never recovered, or frames the tap never saw). The
+       * stamps still hold, so the wait is timed by them, but the frames up
+       * to the next keyframe would decode as a smear.
+       */
+      this.decodable = false;
+    }
+    if (slice && isReferenceNal(slice)) this.prevRefFrameNum = frameNum;
     if (!this.decodable && !idr) return;
-    this.decodable = true;
-    this.firstFrameAt ??= frame.receivedAt;
 
     const data = toAvccSample(nals);
     if (data.length === 0) return;
     const dts = this.timeline.next(frame.rtpTimestamp, frame.ssrc, frame.receivedAt);
     this.writer.add(data, dts, idr, sps, pps);
-    this.frames.push({ rtp: frame.rtpTimestamp, dts, ut: this.lookupUt?.(frame.rtpTimestamp)?.ut });
+    this.decodable = true;
+    this.firstFrameAt ??= frame.receivedAt;
+    this.retryUtMisses();
+    const ut = this.lookupUt?.(frame.rtpTimestamp)?.ut;
+    if (ut == null && this.lookupUt) this.utMisses.push(this.frames.length);
+    this.frames.push({ rtp: frame.rtpTimestamp, dts, ut });
+  }
+
+  /** Keeps an SPS only when it parses: one that cannot be read cannot be muxed, so the clip waits for a good one. */
+  private setSps(nal: Uint8Array): void {
+    try {
+      this.spsInfo = parseSps(nal);
+      this.sps = nal.slice();
+    } catch {
+      this.sps = null;
+      this.spsInfo = null;
+      this.decodable = false;
+    }
+  }
+
+  private frameNumOf(slice: Uint8Array, info: SpsInfo): number | null {
+    try {
+      return sliceFrameNum(slice, info);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Looks up the recent frames whose stamps had not arrived yet. */
+  private retryUtMisses(): void {
+    const lookup = this.lookupUt;
+    if (!lookup || this.utMisses.length === 0) return;
+    const oldest = this.frames.length - UT_RETRY_FRAMES;
+    const still: number[] = [];
+    for (const i of this.utMisses) {
+      if (i < oldest) continue;
+      const f = this.frames[i];
+      f.ut = lookup(f.rtp)?.ut;
+      if (f.ut == null) still.push(i);
+    }
+    this.utMisses = still;
   }
 
   /** Muxes everything collected so far. */

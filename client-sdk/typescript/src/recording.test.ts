@@ -228,6 +228,8 @@ class FakeCamera implements RecordingClientCamera {
  */
 class FakeRecordingClient implements RecordingClient {
   captureUt: number | null = null;
+  /** Undefined models a client whose clock reports no epoch. */
+  epoch: number | undefined = 0;
   state = "connected";
   lastContactAt: number | null = null;
   private readonly streams = new Map<number, MediaStream | null>();
@@ -252,8 +254,8 @@ class FakeRecordingClient implements RecordingClient {
     return cam;
   }
 
-  get clock(): { readonly captureUt: number | null } {
-    return { captureUt: this.captureUt };
+  get clock(): { readonly captureUt: number | null; readonly epoch?: number } {
+    return this.epoch === undefined ? { captureUt: this.captureUt } : { captureUt: this.captureUt, epoch: this.epoch };
   }
 
   on(event: "settings-change", handler: (data: unknown) => void): () => void;
@@ -294,9 +296,10 @@ class FakeRecordingClient implements RecordingClient {
     for (const l of [...this.cameraListeners]) l(cameras);
   }
 
-  /** Advance the shared capture clock and fire a settings-change push. */
-  tick(ut: number | null): void {
+  /** Advance the shared capture clock and fire a settings-change push; a new `epoch` models a revert. */
+  tick(ut: number | null, epoch = this.epoch): void {
     this.captureUt = ut;
+    this.epoch = epoch;
     for (const h of [...this.listeners]) h(undefined);
   }
 
@@ -1684,6 +1687,50 @@ describe("RecordingController when the camera goes away", () => {
     expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
   });
 
+  it("saves the clip as camera-gone when a revert starts a new capture epoch", async () => {
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    client.tick(102);
+    client.tick(104);
+    /* The camera stays listed: a revert keeps its flight id. */
+    client.tick(40, 1);
+    await flush();
+
+    expect(ctrl.isRecording(1)).toBe(false);
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utEnd).toBe(104);
+    expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 102, 104, 104]);
+    expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
+  });
+
+  it("takes the epoch of the first clock when it started without one", async () => {
+    const id = ctrl.startRecording(1);
+    client.tick(100, 3);
+    client.tick(101);
+    expect(ctrl.isRecording(1)).toBe(true);
+    client.tick(20, 4);
+    await flush();
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("keeps recording across pushes from a clock that reports no epoch", async () => {
+    client.epoch = undefined;
+    client.captureUt = 100;
+    const never = ctrl.startRecording(1);
+    client.epoch = 0;
+    const known = ctrl.startRecording(2);
+    /* A clock that stops reporting its epoch has not changed it. */
+    client.epoch = undefined;
+    client.tick(101);
+    client.tick(102);
+    await flush();
+    expect(ctrl.isRecording(1)).toBe(true);
+    expect(ctrl.isRecording(2)).toBe(true);
+    expect((await ctrl.stopRecording(never)).endedBy).toBe("user");
+    expect((await ctrl.stopRecording(known)).endedBy).toBe("user");
+  });
+
   it("saves the clip when the camera drops out of the camera list", async () => {
     const id = ctrl.startRecording(1);
     client.emitCameras(listed(1, 2));
@@ -1891,6 +1938,44 @@ describe("RecordingController when the camera goes away", () => {
     expect(ended.map((e) => e.groupId)).toEqual([groupId, groupId]);
     /* A user stop that arrives afterwards gets the same set. */
     await expect(ctrl.stopGroupedRecording(groupId)).resolves.toBe(group);
+  });
+
+  it("finishes a REC+ group on a revert, every member on the old epoch's window", async () => {
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.tick(105);
+    client.tick(30, 1);
+    await flush();
+    await flush();
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => [r.recordingId, r.endedBy])).toEqual([
+      [recordingIds[0], "camera-gone"],
+      [recordingIds[1], "camera-gone"],
+    ]);
+    expect(group.commonUtWindow).toEqual([100, 105]);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+  });
+
+  it("finishes a REC+ group on a revert after one member already went", async () => {
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.tick(105);
+    client.emitCameras(listed(2));
+    await flush();
+    client.tick(110);
+    client.tick(30, 1);
+    await flush();
+    await flush();
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => [r.recordingId, r.endedBy, r.utEnd])).toEqual([
+      [recordingIds[0], "camera-gone", 105],
+      [recordingIds[1], "camera-gone", 110],
+    ]);
+    /* Neither ran to a stop, so the window is the span both cover, all of it before the revert. */
+    expect(group.commonUtWindow).toEqual([100, 105]);
+    expect(ctrl.getSnapshot().active).toEqual([]);
   });
 
   it("keeps a REC+ group recording when one camera goes, and does not cut the others to its end", async () => {

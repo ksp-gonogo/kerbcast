@@ -5,12 +5,20 @@ import os from "os";
 import path from "path";
 import { describe, expect, it } from "vitest";
 import { accessUnits, TWO_SIZES_H264 } from "../fixtures/h264";
-import { CaptureClip, RtpTimeline, type EncodedFrameCopy } from "./captureClip";
 import {
+  CaptureClip,
+  RtpTimeline,
+  UT_RETRY_FRAMES,
+  missesReference,
+  type EncodedFrameCopy,
+} from "./captureClip";
+import {
+  NAL_PPS,
   NAL_SPS,
   avcCodecString,
   nalType,
   parseSps,
+  sliceFrameNum,
   splitAnnexB,
   toAvccSample,
   Mp4Writer,
@@ -89,6 +97,51 @@ describe("Mp4Writer", () => {
     const frames = 60 * 60 * 60;
     for (let i = 0; i < frames; i++) writer.add(sample, i * 1500, i % 120 === 0, spsNal, new Uint8Array([0x68, 1]));
     expect(writer.finish().size).toBeGreaterThan(frames * 4 * 2);
+  });
+
+  it("gives the last sample the median recent duration, not a dropout before it", () => {
+    const writer = new Mp4Writer();
+    const au = splitAnnexB(accessUnits()[0]);
+    const sps = au.find((n) => nalType(n) === NAL_SPS)!;
+    const pps = au.find((n) => nalType(n) === NAL_PPS)!;
+    const sample = toAvccSample(au);
+    for (const dts of [0, 3000, 6000, 9000, 12_000, 12_000 + 450_000]) writer.add(sample, dts, true, sps, pps);
+    expect(writer.durations()).toEqual([3000, 3000, 3000, 3000, 450_000, 3000]);
+
+    /* With only two gaps to choose from, the lower one: the dropout still does not set the tail. */
+    const short = new Mp4Writer();
+    for (const dts of [0, 3000, 453_000]) short.add(sample, dts, true, sps, pps);
+    expect(short.durations()).toEqual([3000, 450_000, 3000]);
+  });
+
+  it.skipIf(!hasTool("ffprobe"))("writes a 64-bit media duration once it outgrows 32 bits", async () => {
+    const aus = accessUnits().slice(0, 6);
+    const writer = new Mp4Writer();
+    const step = 0xc000_0000;
+    aus.forEach((au, i) => {
+      const nals = splitAnnexB(au);
+      const sps = splitAnnexB(aus[0]).find((n) => nalType(n) === NAL_SPS)!;
+      const pps = splitAnnexB(aus[0]).find((n) => nalType(n) === NAL_PPS)!;
+      writer.add(toAvccSample(nals), i * step, i === 0, sps, pps);
+    });
+    const file = new Uint8Array(await writer.finish().arrayBuffer());
+    const mdhd = findBox(file, "mdhd");
+    expect(file[mdhd + 8]).toBe(1);
+    const total = 6 * step;
+    /* Version 1: 64-bit creation and modification times, the timescale, then a 64-bit duration. */
+    expect(u32(file, mdhd + 28)).toBe(90_000);
+    expect(u32(file, mdhd + 32) * 2 ** 32 + u32(file, mdhd + 36)).toBe(total);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kerbcast-mdhd-"));
+    const out = path.join(dir, "long.mp4");
+    fs.writeFileSync(out, file);
+    try {
+      const durationTs = execFileSync("ffprobe", [
+        "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration_ts", "-of", "csv=p=0", out,
+      ]).toString().trim();
+      expect(Number(durationTs)).toBe(total);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -184,6 +237,96 @@ describe("CaptureClip", () => {
     clip.push(frame(aus[7], 14_000, 2033));
     const writer = (clip as unknown as { writer: Mp4Writer }).writer;
     expect(writer.times()).toEqual([0, 3000, 6000, 9000, 9000 + (2000 - 99) * 90, 9000 + (2000 - 99) * 90 + 3000]);
+  });
+
+  it("waits for a keyframe after a reference frame goes missing on a continuous timeline", () => {
+    const aus = accessUnits();
+    const clip = new CaptureClip();
+    /* Frame 2 never arrives, but the stamps run on unbroken: 3 to 5 predict from a picture the clip lacks. */
+    for (const i of [0, 1, 3]) clip.push(frame(aus[i], i * 3000, i * 33));
+    expect(clip.waitingForKeyframe).toBe(true);
+    for (const i of [4, 5, 6, 7]) clip.push(frame(aus[i], i * 3000, i * 33));
+    expect(clip.waitingForKeyframe).toBe(false);
+    const writer = (clip as unknown as { writer: Mp4Writer }).writer;
+    /* Timed by the stamps, not by arrival: the wait holds the last good picture. */
+    expect(writer.times()).toEqual([0, 3000, 18_000, 21_000]);
+  });
+
+  it("reads a missing reference picture from frame_num, allowing non-reference pictures and the wrap", () => {
+    expect(missesReference(4, 5, 4)).toBe(false);
+    /* A non-reference picture, or one following it, carries the next number without stepping it. */
+    expect(missesReference(4, 4, 4)).toBe(false);
+    expect(missesReference(15, 0, 4)).toBe(false);
+    expect(missesReference(4, 6, 4)).toBe(true);
+    expect(missesReference(15, 1, 4)).toBe(true);
+    expect(missesReference(4, 3, 4)).toBe(true);
+  });
+
+  it("keeps going across a frame_num gap when the SPS allows gaps", () => {
+    const aus = accessUnits();
+    /* Baseline, log2_max_frame_num 4 like the fixture, gaps_in_frame_num_value_allowed_flag set. */
+    const gapsAllowed = rbsp(0x67, "01000010 11000000 00001010 1 1 011 010 1 00101 00100 1 1 0 0");
+    expect(parseSps(gapsAllowed)).toMatchObject({ log2MaxFrameNum: 4, frameNumGapsAllowed: true });
+    const first = splitAnnexB(aus[0]).map((n) => (nalType(n) === NAL_SPS ? gapsAllowed : n));
+    const clip = new CaptureClip();
+    clip.push(frame(annexB(first), 0, 0));
+    for (const i of [1, 3]) clip.push(frame(aus[i], i * 3000, i * 33));
+    expect(clip.waitingForKeyframe).toBe(false);
+    expect(clip.finish().frameCount).toBe(3);
+  });
+
+  it("reads frame_num past a colour plane id", () => {
+    /* High 4:4:4 with separate colour planes, log2_max_frame_num 6. */
+    const sps = parseSps(
+      rbsp(0x67, "11110100 00000000 00001010 1 00100 1 1 1 0 0 011 011 010 0 00100 00100 1 1 0 0"),
+    );
+    expect(sps).toMatchObject({ separateColourPlane: true, log2MaxFrameNum: 6 });
+    /* first_mb 0, slice_type 5, pps 0, colour_plane_id 2, frame_num 37. */
+    expect(sliceFrameNum(rbsp(0x41, "1 00110 1 10 100101"), sps)).toBe(37);
+  });
+
+  it("waits for a parameter set it can read instead of opening on one it cannot", () => {
+    const aus = accessUnits();
+    const nals = splitAnnexB(aus[0]);
+    /* An SPS cut off after its level byte. */
+    const broken = nals.map((n) => (nalType(n) === NAL_SPS ? n.subarray(0, 4) : n));
+    const clip = new CaptureClip();
+    expect(() => clip.push(frame(annexB(broken), 0, 0))).not.toThrow();
+    clip.push(frame(aus[1], 3000, 33));
+    expect(clip.started).toBe(false);
+    expect(clip.waitingForKeyframe).toBe(true);
+    for (let i = 6; i < 8; i++) clip.push(frame(aus[i], i * 3000, i * 33));
+    expect(clip.finish().frameCount).toBe(2);
+  });
+
+  it("retries a missed UT lookup on later pushes, while its stamp may still arrive", () => {
+    const aus = accessUnits();
+    const stamps = new Map<number, number>();
+    const clip = new CaptureClip((rtp) => (stamps.has(rtp) ? { ut: stamps.get(rtp)! } : null));
+    clip.push(frame(aus[0], 0, 0));
+    /* The data channel trails: frame 0's stamp lands after the frame, then leaves the store's window. */
+    stamps.set(0, 100);
+    stamps.set(3000, 100.05);
+    clip.push(frame(aus[1], 3000, 33));
+    stamps.delete(0);
+    expect(clip.finish().frameUtSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 100 / 3, ut: 100.05 },
+    ]);
+  });
+
+  it("bounds the UT retries per push", () => {
+    const aus = accessUnits();
+    let lookups = 0;
+    const clip = new CaptureClip(() => {
+      lookups++;
+      return null;
+    });
+    const frames = UT_RETRY_FRAMES * 3;
+    for (let i = 0; i < frames; i++) clip.push(frame(aus[i % aus.length], i * 3000, i));
+    lookups = 0;
+    clip.push(frame(aus[frames % aus.length], frames * 3000, frames));
+    expect(lookups).toBeLessThanOrEqual(UT_RETRY_FRAMES + 1);
   });
 
   it("collects a per-frame UT track from capture stamps", () => {
@@ -377,6 +520,26 @@ describe("CaptureClip", () => {
   );
 });
 
+/** A NAL unit from its header byte and its fields as a bit string, with the stop bit and padding added. */
+function rbsp(header: number, fields: string): Uint8Array {
+  const bits = fields.replace(/ /g, "") + "1";
+  const out = new Uint8Array(1 + Math.ceil(bits.length / 8));
+  out[0] = header;
+  for (let i = 0; i < bits.length; i++) if (bits[i] === "1") out[1 + (i >> 3)] |= 0x80 >> (i & 7);
+  return out;
+}
+
+/** NAL units joined back into one Annex B access unit. */
+function annexB(nals: Uint8Array[]): Uint8Array {
+  const parts = nals.flatMap((n) => [new Uint8Array([0, 0, 0, 1]), n]);
+  const out = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
 
 /** NAL unit types of the length-prefixed units of a sample starting at `at`, up to the first slice. */
 function nalTypesAt(file: Uint8Array, at: number): number[] {
