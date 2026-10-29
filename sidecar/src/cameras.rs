@@ -810,9 +810,16 @@ pub struct CameraState {
 impl CameraState {
     /// Add a track to this camera and bump the subscriber count. Returns
     /// the count after the increment so the caller can request a keyframe
-    /// on the 0→1 transition.
+    /// on the 0→1 transition. Adding a track the camera already feeds is a
+    /// no-op: a Subscribe can race the rescan's own resync and bind it twice.
     pub async fn add_track(&self, track: Arc<VideoTrack>) -> usize {
         let mut tracks = self.tracks.write().await;
+        if tracks
+            .iter()
+            .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, &track)))
+        {
+            return self.subscribers.load(Ordering::Acquire);
+        }
         tracks.push(Arc::downgrade(&track));
         self.subscribers.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -4999,6 +5006,11 @@ mod tests {
             cam.add_track(b.clone()).await,
             2,
             "second slot, same camera"
+        );
+        assert_eq!(
+            cam.add_track(b.clone()).await,
+            2,
+            "binding the same slot again is a no-op"
         );
         assert_eq!(cam.remove_track(&a).await, 1, "unsubscribe one slot");
         assert_eq!(cam.remove_track(&b).await, 0, "last viewer leaves");

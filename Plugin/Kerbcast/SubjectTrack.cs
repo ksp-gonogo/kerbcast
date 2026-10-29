@@ -142,7 +142,7 @@ namespace Kerbcast
         {
             Vessel live = null;
             ProtoVessel proto = null;
-            var vessels = FlightGlobals.Vessels;
+            var vessels = FlightGlobals.fetch != null ? FlightGlobals.Vessels : null;
             if (vessels != null)
                 foreach (var v in vessels)
                     if (v != null && v.persistentId == persistentId) { live = v; break; }
@@ -178,7 +178,7 @@ namespace Kerbcast
             body = null;
             if (_following)
             {
-                var v = FlightGlobals.ActiveVessel;
+                var v = FlightGlobals.fetch != null ? FlightGlobals.ActiveVessel : null;
                 Loaded = v;
                 if (v == null) return false;
                 PersistentId = v.persistentId;
@@ -222,7 +222,7 @@ namespace Kerbcast
             onSurface = false;
             if (_following)
             {
-                var v = FlightGlobals.ActiveVessel;
+                var v = FlightGlobals.fetch != null ? FlightGlobals.ActiveVessel : null;
                 if (v == null || v.mainBody == null) return false;
                 if (IsSurface(v.situation)) onSurface = true;
                 else orbit = v.orbit;
@@ -249,7 +249,7 @@ namespace Kerbcast
         public static bool RecordCounts(ProtoVessel pv)
         {
             if (pv == null) return false;
-            var vessels = FlightGlobals.Vessels;
+            var vessels = FlightGlobals.fetch != null ? FlightGlobals.Vessels : null;
             bool authoritative = HighLogic.LoadedSceneIsFlight && vessels != null && vessels.Count > 0;
             bool built = !ReferenceEquals(pv.vesselRef, null);
             return CommandCameraMath.SavedRecordCounts(authoritative, built, built && pv.vesselRef == null);

@@ -210,6 +210,13 @@ const FOLLOW_GAIN: f64 = 0.05;
 const MAX_BEHIND_MS: f64 = 80.0;
 
 /**
+ * Longest real-time step between two frames. RTP timestamps wrap, so a
+ * receiver reads a step past half their range (about 6.6 h at 90 kHz) as a
+ * step backwards; a feed idle longer than this resumes one hour on.
+ */
+const MAX_STEP_MS: f64 = 3_600_000.0;
+
+/**
  * Real time the pace is smoothed over. Long enough that a frame's uneven
  * ticks do not move it far, short enough that entering 2x warp is caught
  * within a few frames, and the cap bounds what those frames can owe.
@@ -245,7 +252,8 @@ impl MediaClock {
                 .saturating_duration_since(last.time.picked_up)
                 .as_secs_f64()
                 * 1000.0
-        };
+        }
+        .min(MAX_STEP_MS);
         let game = match (ut, last.ut) {
             (Some(now), Some(then)) if epoch == last.epoch => (now - then) * 1000.0,
             _ => f64::NAN,
@@ -402,6 +410,20 @@ mod tests {
             "a new epoch"
         );
         assert!(c.behind_ms.abs() < 1e-6, "real-time steps owe nothing");
+    }
+
+    /// A feed idle for hours resumes with a step under half the RTP range,
+    /// and owes nothing for the time it skipped.
+    #[test]
+    fn a_long_idle_step_is_clamped() {
+        let mut c = MediaClock::default();
+        let (t0, _) = at(0.0, None);
+        c.step(t0, None, 0);
+        let (t1, _) = at(14.0 * 3_600_000.0, None);
+        let ticks = c.step(t1, None, 0);
+        assert!(ticks < 1 << 31, "under half the range: {ticks}");
+        assert!((ticks as f64 * 1000.0 / H264_CLOCK_RATE as f64 - MAX_STEP_MS).abs() < 1.0);
+        assert!(c.behind_ms.abs() < 1.0, "owes nothing: {}", c.behind_ms);
     }
 
     /**

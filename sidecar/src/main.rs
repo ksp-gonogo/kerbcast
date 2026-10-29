@@ -336,7 +336,11 @@ async fn consume_loop(
                 let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
                 resync_after_camera_churn(&registry, &snapshot, &churn.attached).await;
             }
-            let newly_destroyed = churn.newly_destroyed;
+            /* A camera destroyed and respawned under the same flight id in one
+            tick is already live again: announcing Destroyed after its Active
+            snapshot would leave tiles showing SIGNAL LOST, and acknowledging it
+            would delete the new camera's info.json. */
+            let newly_destroyed = still_destroyed(churn.newly_destroyed, &churn.attached);
             // Status poll piggybacks on the rescan cadence — both are
             // ~1Hz and the plugin's status writer matches that rate.
             let delta = registry.poll_status().await;
@@ -607,6 +611,14 @@ async fn broadcast_status_delta(
         let msg = ServerMessage::SettingsState(settings);
         broadcast(&snapshot, &msg).await;
     }
+}
+
+/// The tick's destroyed cameras less any the same rescan attached again.
+fn still_destroyed(newly_destroyed: Vec<u32>, attached: &[u32]) -> Vec<u32> {
+    newly_destroyed
+        .into_iter()
+        .filter(|id| !attached.contains(id))
+        .collect()
 }
 
 /// Broadcast `camera-state-changed` with `lifecycle: "destroyed"` for
@@ -1158,6 +1170,13 @@ async fn encode_next_frame(
 mod tests {
     use super::*;
     use kerbcast_sidecar::encoder::{Nvenc, Software};
+
+    /// A flight id destroyed and attached again in one rescan is not announced
+    /// as destroyed; the others still are.
+    #[test]
+    fn a_same_tick_respawn_is_not_destroyed() {
+        assert_eq!(still_destroyed(vec![3, 7, 9], &[7, 12]), vec![3, 9]);
+    }
 
     /// Only a frame captured less than half an interval after the last sent
     /// one is skipped, however soon after it the sidecar picks it up.

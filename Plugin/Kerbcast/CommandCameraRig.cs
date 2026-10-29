@@ -356,7 +356,8 @@ namespace Kerbcast
         {
             var shape = new Shape();
             if (_mode == SubjectAimMode.Subject && AimIsCraft)
-                shape.Known = _known.SubjectShape(out shape.Centre, out shape.Half);
+                shape.Known = _known.SubjectShape(out shape.Centre, out shape.Half)
+                    && CommandCameraMath.Finite(shape.Centre) && CommandCameraMath.Finite(shape.Half);
             return shape;
         }
 

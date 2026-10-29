@@ -77,6 +77,8 @@ double expected = Math.Exp(Math.Log(10) + (1 - Math.Exp(-1)) * (Math.Log(1) - Ma
 Check(Near(s, expected, 1e-12), "one tau covers 63% of the way in log space");
 Check(CommandCameraMath.SmoothFov(10, 1, 2.0, 0.4, 1.0) == 1, "a gap past snapAfter snaps to target");
 Check(CommandCameraMath.SmoothFov(0, 5, 0.01, 0.4, 1.0) == 5, "uninitialised current snaps");
+Check(CommandCameraMath.SmoothFov(10, double.NaN, 0.016, 0.4, 1.0) == 10, "a NaN target holds the current field");
+Check(CommandCameraMath.SmoothFov(10, double.PositiveInfinity, 0.016, 0.4, 1.0) == 10, "an infinite target holds the current field");
 double down = CommandCameraMath.SmoothFov(20, 0.02, 0.016, 0.4, 1.0);
 Check(down < 20 && down > 0.02, "one frame moves part of the way");
 
@@ -1154,6 +1156,9 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     var eased = CommandCameraMath.EaseToward(origin, a, 0.4, 0.4, 1.0);
     Check(Near(eased.Y, 10 * (1 - Math.Exp(-1)), 1e-9), "ease: the centre offset closes 63% of the way in one time constant");
     Check(VNear(CommandCameraMath.EaseToward(origin, a, 2.0, 0.4, 1.0), a, 1e-12), "ease: after a gap it snaps");
+    var nanTarget = new DVec3(double.NaN, 1, 0);
+    Check(VNear(CommandCameraMath.EaseToward(a, nanTarget, 0.4, 0.4, 1.0), a, 0), "ease: a NaN target holds the current offset");
+    Check(VNear(CommandCameraMath.EaseToward(a, nanTarget, 2.0, 0.4, 1.0), a, 0), "ease: a NaN target holds even after a gap");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

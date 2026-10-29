@@ -108,12 +108,6 @@ namespace Kerbcast
         private int _fpsIdx;
         private int _fpsCount; // up to FpsSamples; growing-average until full
         private float _fpsAvg;
-        /* Mission-time capture-clock epoch stamped into global.status.json.
-           Bumped on a UT discontinuity (scene load / quickload) so a consumer
-           flushes and resyncs. See CaptureEpoch. */
-        private readonly CaptureEpoch _captureEpoch = new CaptureEpoch();
-        // Read by CaptureCore so every ring frame carries the epoch its UT belongs to.
-        internal uint CaptureEpochValue => _captureEpoch.Value;
         /* The real-time clock every ring frame is stamped with, read once per
            frame so all of a frame's captures share it. A Stopwatch in double
            ms, because Time.unscaledTime is a float that coarsens to whole
@@ -491,7 +485,7 @@ namespace Kerbcast
            destroyed tombstones behind. */
         private void OnGameSceneLoadRequested(GameScenes scene)
         {
-            _captureEpoch.Bump();
+            CaptureEpoch.Game.Bump();
             _teardown.OnSceneLoadRequested();
             EndSceneLock();
             CommandAuthority.WorldModel.Close();
@@ -520,7 +514,7 @@ namespace Kerbcast
            snapshot describing a timeline that is gone. */
         private void OnGameStatePostLoad(ConfigNode node)
         {
-            _captureEpoch.Bump();
+            CaptureEpoch.Game.Bump();
             CommandAuthority.WorldModel.InvalidateForLoad();
         }
 
@@ -1545,7 +1539,7 @@ namespace Kerbcast
                    discontinuity epoch. Round-trip ("R") + InvariantCulture so
                    the double/float never localises to a comma. */
                 sb.Append($"  \"captureUt\": {Planetarium.GetUniversalTime().ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\n");
-                sb.Append($"  \"captureEpoch\": {_captureEpoch.Value},\n");
+                sb.Append($"  \"captureEpoch\": {CaptureEpoch.Game.Value},\n");
                 sb.Append($"  \"timeWarpRate\": {TimeWarp.CurrentRate.ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 /* Wall clock at the UT sample, so the sidecar on this machine can age captureUt to the moment it sends. */
                 sb.Append($"  \"captureWallMs\": {(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)},\n");

@@ -210,7 +210,7 @@ namespace Kerbcast
             p.Request = request;
             p.CaptureTsMs = captureTsMs;
             p.CaptureUt = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
-            p.CaptureEpoch = KerbcastCore.Instance != null ? KerbcastCore.Instance.CaptureEpochValue : 0;
+            p.CaptureEpoch = CaptureEpoch.Game.Value;
             p.LiveLightTimeS = LiveLightTimeNow();
             p.Fov = meta.FovDeg;
             p.MetaLength = meta.Json != null ? meta.Length : 0;

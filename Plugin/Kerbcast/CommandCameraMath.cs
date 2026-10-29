@@ -346,9 +346,11 @@ namespace Kerbcast
         /* Exponential approach to `target` in log space, so a zoom from 20° to
            0.02° takes the same time per factor of ten instead of crawling at the
            narrow end. A gap longer than `snapAfter` (resubscribe, scene load)
-           snaps rather than replaying a stale ease. */
+           snaps rather than replaying a stale ease. A target that is not a
+           finite number holds the current field. */
         public static double SmoothFov(double current, double target, double dt, double tau, double snapAfter)
         {
+            if (!Finite(target)) return current;
             if (current <= 0 || target <= 0 || dt <= 0 || dt > snapAfter || tau <= 0) return target;
             double alpha = 1.0 - Math.Exp(-dt / tau);
             return Math.Exp(Math.Log(current) + alpha * (Math.Log(target) - Math.Log(current)));
@@ -460,9 +462,15 @@ namespace Kerbcast
             return Math.Sqrt(x * x + y * y + z * z);
         }
 
+        /* Every component is a finite number: a NaN eased in never leaves. */
+        public static bool Finite(DVec3 v) => Finite(v.X) && Finite(v.Y) && Finite(v.Z);
+
+        public static bool Finite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
+
         /* Exponential approach of a vector to `target`, at the pace SmoothFov eases with; a gap longer than `snapAfter` snaps. */
         public static DVec3 EaseToward(DVec3 current, DVec3 target, double dt, double tau, double snapAfter)
         {
+            if (!Finite(target)) return current;
             if (dt <= 0 || dt > snapAfter || tau <= 0) return target;
             double alpha = 1.0 - Math.Exp(-dt / tau);
             return current + (target - current) * alpha;

@@ -92,8 +92,9 @@ namespace Kerbcast
                         craft.Gone = true;
                         continue;
                     }
-                    /* An inactive renderer reports empty bounds at the world origin. */
-                    if (!rend.gameObject.activeInHierarchy) continue;
+                    /* An inactive or disabled renderer is not drawn, and an inactive
+                       one reports empty bounds at the world origin. */
+                    if (!rend.enabled || !rend.gameObject.activeInHierarchy) continue;
                     var b = rend.bounds;
                     if (b.extents == Vector3.zero) continue;
                     shown = true;
