@@ -11,7 +11,7 @@
     *VersionCode properties below) and gets them compiled from obj/.
   -->
   <PropertyGroup>
-    <KerbcastVersion>1.11.1</KerbcastVersion>
+    <KerbcastVersion>1.12.0-rc.2</KerbcastVersion>
     <KerbcastApiVersion>1.0.0</KerbcastApiVersion>
   </PropertyGroup>
 
