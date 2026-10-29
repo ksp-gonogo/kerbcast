@@ -30,8 +30,7 @@ use kerbcast_sidecar::encoder::{
 use kerbcast_sidecar::frame_watch::{sleep_until_ready, FRAME_WATCH_STEP};
 use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
 use kerbcast_sidecar::protocol::{
-    AdaptiveShedPayload, CameraLifecycle, CameraState as ProtocolCameraState,
-    CameraStateChangedPayload, CaptureState, SceneStateChangedPayload, ServerMessage,
+    AdaptiveShedPayload, CameraStateChangedPayload, SceneStateChangedPayload, ServerMessage,
 };
 use kerbcast_sidecar::shared_mem::MmapRingConfig;
 use kerbcast_sidecar::signalling::{router, AppState};
@@ -634,49 +633,8 @@ async fn broadcast_destroyed_cameras(
         return;
     }
     for &flight_id in flight_ids {
-        let Some(cam) = registry.get(flight_id).await else {
+        let Some(state) = registry.destroyed_state(flight_id).await else {
             continue;
-        };
-        let state = ProtocolCameraState {
-            flight_id,
-            lifecycle: CameraLifecycle::Destroyed,
-            // Destroyed: nothing is being captured, whatever subscribers linger.
-            capture_state: CaptureState::Off,
-            kind: cam.kind,
-            kerbal_persistent_id: cam.kerbal_persistent_id,
-            command_centre: cam.command_centre.clone(),
-            crew_location: cam.crew_location(),
-            track_mode: cam.track_mode(),
-            part_name: cam.part_name.clone(),
-            part_title: cam.part_title.clone(),
-            camera_name: cam.camera_name.clone(),
-            vessel_name: cam.vessel_name.clone(),
-            layers: Vec::new(),
-            operator_layers: Vec::new(),
-            render_width: 0,
-            render_height: 0,
-            operator_width: 0,
-            operator_height: 0,
-            max_width: Some(cam.max_width),
-            max_height: Some(cam.max_height),
-            supports_zoom: cam.supports_zoom,
-            fov: 0.0,
-            fov_min: cam.fov_min,
-            fov_max: cam.fov_max,
-            supports_pan: cam.supports_pan,
-            pan_yaw: 0.0,
-            pan_pitch: 0.0,
-            pan_yaw_min: cam.pan_yaw_min,
-            pan_yaw_max: cam.pan_yaw_max,
-            pan_pitch_min: cam.pan_pitch_min,
-            pan_pitch_max: cam.pan_pitch_max,
-            encoder_bitrate_bps: 0,
-            target_bitrate_bps: 0,
-            degrade_level: 0.0,
-            viewer_quality: None,
-            quality_limited_by: None,
-            // Nothing is captured or sent for a destroyed camera.
-            ..Default::default()
         };
         let msg = ServerMessage::CameraStateChanged(CameraStateChangedPayload { state });
         broadcast(&snapshot, &msg).await;

@@ -645,6 +645,9 @@ pub struct CameraState {
     /// the file underneath changed and reattach instead of leaving the mmap
     /// pointed at the unlinked original.
     pub ring_identity: u64,
+    /// Which attach of this flight id this entry is, from 1. See the protocol
+    /// `CameraState::attach`.
+    pub attach: u32,
     pub max_width: u32,
     pub max_height: u32,
     /// Whether this is a Hullcam part camera or a per-kerbal face camera.
@@ -1329,6 +1332,10 @@ pub struct CameraRegistry {
     /// whole on each change. Peer-scoped like the display sizes: cleared on
     /// graceful disconnect and in the dead-peer reaper.
     anchors: Mutex<AnchorTable>,
+    /// How many times each flight id has been attached this session. Outlives
+    /// the camera's entry, so a camera that leaves and comes back still gets
+    /// an attach number it never had before.
+    attach_counts: std::sync::Mutex<HashMap<u32, u32>>,
     /// Drawn once per process and folded into each client's anchor owner, so
     /// a restarted sidecar's peer 1 is never taken for the last one's.
     anchor_boot: u32,
@@ -1481,6 +1488,7 @@ impl CameraRegistry {
             command_signal: std::sync::Mutex::new(None),
             command_signal_warned: AtomicBool::new(false),
             anchors: Mutex::new(AnchorTable::default()),
+            attach_counts: std::sync::Mutex::new(HashMap::new()),
             anchor_boot: boot_nonce(),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
             peer_clients: Mutex::new(HashMap::new()),
@@ -1748,6 +1756,13 @@ impl CameraRegistry {
                     let ring_dims = ring.config();
                     let manifest = read_manifest(&self.shm_dir, *id).await;
                     attached.push(*id);
+                    let attach = {
+                        let mut counts =
+                            self.attach_counts.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = counts.entry(*id).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
                     info!(
                         flight_id = id,
                         path = %path.display(),
@@ -1755,6 +1770,7 @@ impl CameraRegistry {
                         part_title = %manifest.part_title,
                         vessel = %manifest.vessel_name,
                         resurrected = resurrecting,
+                        attach,
                         "camera ring attached",
                     );
                     cameras.insert(
@@ -1763,6 +1779,7 @@ impl CameraRegistry {
                             flight_id: *id,
                             ring,
                             ring_identity: found_identity,
+                            attach,
                             max_width: ring_dims.max_width,
                             max_height: ring_dims.max_height,
                             kind: camera_kind_from_manifest(&manifest.kind),
@@ -2131,6 +2148,7 @@ impl CameraRegistry {
             };
             delta.changed_cameras.push(ProtocolCameraState {
                 flight_id: cam_status.flight_id,
+                attach: cam.attach,
                 lifecycle: if cam.destroyed.load(Ordering::Acquire) {
                     CameraLifecycle::Destroyed
                 } else {
@@ -3016,6 +3034,54 @@ impl CameraRegistry {
         dirty.drain().collect()
     }
 
+    /// The `camera-state-changed` state announcing a destroyed camera: its
+    /// identity and limits, with nothing captured, rendered or sent.
+    pub async fn destroyed_state(&self, flight_id: u32) -> Option<ProtocolCameraState> {
+        let cam = self.get(flight_id).await?;
+        Some(ProtocolCameraState {
+            flight_id,
+            attach: cam.attach,
+            lifecycle: CameraLifecycle::Destroyed,
+            // Destroyed: nothing is being captured, whatever subscribers linger.
+            capture_state: CaptureState::Off,
+            kind: cam.kind,
+            kerbal_persistent_id: cam.kerbal_persistent_id,
+            command_centre: cam.command_centre.clone(),
+            crew_location: cam.crew_location(),
+            track_mode: cam.track_mode(),
+            part_name: cam.part_name.clone(),
+            part_title: cam.part_title.clone(),
+            camera_name: cam.camera_name.clone(),
+            vessel_name: cam.vessel_name.clone(),
+            layers: Vec::new(),
+            operator_layers: Vec::new(),
+            render_width: 0,
+            render_height: 0,
+            operator_width: 0,
+            operator_height: 0,
+            max_width: Some(cam.max_width),
+            max_height: Some(cam.max_height),
+            supports_zoom: cam.supports_zoom,
+            fov: 0.0,
+            fov_min: cam.fov_min,
+            fov_max: cam.fov_max,
+            supports_pan: cam.supports_pan,
+            pan_yaw: 0.0,
+            pan_pitch: 0.0,
+            pan_yaw_min: cam.pan_yaw_min,
+            pan_yaw_max: cam.pan_yaw_max,
+            pan_pitch_min: cam.pan_pitch_min,
+            pan_pitch_max: cam.pan_pitch_max,
+            encoder_bitrate_bps: 0,
+            target_bitrate_bps: 0,
+            degrade_level: 0.0,
+            viewer_quality: None,
+            quality_limited_by: None,
+            // Nothing is captured or sent for a destroyed camera.
+            ..Default::default()
+        })
+    }
+
     /// Authoritative protocol-shape snapshot of one camera, merging the
     /// last plugin-reported effective state (render dims, layers, fov,
     /// pan, when the status file has been seen) with the sidecar-owned
@@ -3084,6 +3150,7 @@ impl CameraRegistry {
 
         Some(ProtocolCameraState {
             flight_id,
+            attach: cam.attach,
             lifecycle: if cam.destroyed.load(Ordering::Acquire) {
                 CameraLifecycle::Destroyed
             } else {
@@ -5203,6 +5270,83 @@ mod tests {
         registry.forget_forced_all(4).await;
         assert!(second.display_sizes.lock().await.is_empty());
         assert!(!second.forced_or_held_by(4).await);
+    }
+
+    /// An in-place reattach is invisible in the camera list, so the attach
+    /// number is what tells a client its stream started over. The rescan
+    /// reports it as attached, which pushes every peer a snapshot built from
+    /// `protocol_state`, and that carries the new number. So do the status
+    /// delta and the destroyed state, since a 0 from either would leave a
+    /// client with no baseline for the next change. Rescans that find the same
+    /// ring keep it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_place_reattach_bumps_the_attach_number_and_is_announced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        assert_eq!(registry.protocol_state(7).await.unwrap().attach, 1);
+
+        let quiet = registry.rescan().await;
+        assert!(quiet.attached.is_empty() && quiet.removed.is_empty());
+        assert_eq!(
+            registry.protocol_state(7).await.unwrap().attach,
+            1,
+            "same ring, same attach"
+        );
+
+        std::fs::remove_file(&ring_path).unwrap();
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        let outcome = registry.rescan().await;
+        assert_eq!(outcome.attached, vec![7]);
+        assert!(outcome.removed.is_empty(), "the camera never left the list");
+        assert_eq!(registry.protocol_state(7).await.unwrap().attach, 2);
+
+        std::fs::write(
+            shm.join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64}]}"#,
+        )
+        .unwrap();
+        let delta = registry.poll_status().await;
+        assert_eq!(delta.changed_cameras.len(), 1);
+        assert_eq!(delta.changed_cameras[0].attach, 2, "the status delta");
+        assert_eq!(
+            registry.destroyed_state(7).await.unwrap().attach,
+            2,
+            "the destroyed state"
+        );
+    }
+
+    /// A camera that leaves and returns, or comes back from destroyed, gets an
+    /// attach number it never had, so a client that saw the old one cannot
+    /// mistake the new stream for it.
+    #[tokio::test]
+    async fn the_attach_number_keeps_rising_across_a_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        std::fs::remove_file(&ring_path).unwrap();
+        registry.rescan().await;
+        assert!(registry.get(7).await.is_none());
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        registry.rescan().await;
+        assert_eq!(registry.get(7).await.expect("camera back").attach, 2);
     }
 
     /// A camera that was gone and comes back is a new camera: nothing carries.

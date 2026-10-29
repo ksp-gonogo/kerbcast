@@ -4043,6 +4043,57 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
     expect(installs).toHaveLength(1);
   });
 
+  it("gives a camera reattached in place a fresh instance when its attach changes", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    captured.dc?._open();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    snapshot(captured, [fakeCameraState(7, { attach: 1 })]);
+    slotMap(captured, "0", 7);
+    snapshot(captured, [fakeCameraState(7, { attach: 2 })]);
+    captured.dc?._msg(
+      JSON.stringify({ type: "camera-state-changed", content: { state: fakeCameraState(7, { attach: 3 }) } }),
+    );
+    expect(installs).toEqual([
+      { mid: "0", transform: made[0] },
+      { mid: "0", transform: made[1] },
+      { mid: "0", transform: made[2] },
+    ]);
+  });
+
+  it("keeps the instance while the attach stays the same or is missing", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    captured.dc?._open();
+    const { factory } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    snapshot(captured, [fakeCameraState(7, { attach: 1 })]);
+    slotMap(captured, "0", 7);
+    snapshot(captured, [fakeCameraState(7, { attach: 1 })]);
+    captured.dc?._msg(
+      JSON.stringify({ type: "camera-state-changed", content: { state: fakeCameraState(7, { attach: 1 }) } }),
+    );
+    snapshot(captured, [fakeCameraState(7)]);
+    snapshot(captured, [fakeCameraState(7, { attach: 1 })]);
+    snapshot(captured, [fakeCameraState(7)]);
+    expect(factory).toHaveBeenCalledOnce();
+    expect(installs).toHaveLength(1);
+  });
+
+  it("renews once when a camera comes back to the list with a new attach", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    captured.dc?._open();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    snapshot(captured, [fakeCameraState(7, { attach: 1 })]);
+    slotMap(captured, "0", 7);
+    snapshot(captured, []);
+    snapshot(captured, [fakeCameraState(7, { attach: 2 })]);
+    expect(installs).toEqual([
+      { mid: "0", transform: made[0] },
+      { mid: "0", transform: made[1] },
+    ]);
+  });
+
   it("removes the instance at disconnect and reinstalls after reconnect", async () => {
     const { client, captured, installs } = await connectDynamic();
     const { factory, made } = countingFactory();

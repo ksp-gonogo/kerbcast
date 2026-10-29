@@ -560,6 +560,15 @@ pub enum CrewLocation {
 #[serde(rename_all = "camelCase")]
 pub struct CameraState {
     pub flight_id: u32,
+    /// Which attach of this flight id the sidecar is streaming, from 1. It
+    /// changes whenever the sidecar starts the camera over on a new ring (the
+    /// camera reattached in place, came back from destroyed, or returned after
+    /// leaving the list), even when nothing else about the camera does. A
+    /// change means the stream starts again on a new encoder and capture
+    /// timeline. Compare for change only. Absent (0) from a sidecar that
+    /// predates the field.
+    #[serde(default)]
+    pub attach: u32,
     /// Part-destruction lifecycle. `Active` for live cameras. `Destroyed`
     /// when the plugin reports the Hullcam part was destroyed in-flight
     /// (collision, overheating, decoupling beyond physics range). Once
@@ -2399,6 +2408,22 @@ mod tests {
             none.get("displaySize").is_none(),
             "nothing held -> omitted, matching the optional TS binding"
         );
+    }
+
+    /// The attach number goes out under its own key, and a payload from a
+    /// sidecar predating it parses as 0, which a client reads as no change.
+    #[test]
+    fn camera_state_attach_round_trips_and_defaults_to_zero() {
+        let state = CameraState {
+            flight_id: 1,
+            attach: 3,
+            ..Default::default()
+        };
+        let mut v = serde_json::to_value(&state).unwrap();
+        assert_eq!(v["attach"], 3);
+        v.as_object_mut().unwrap().remove("attach");
+        let old: CameraState = serde_json::from_value(v).unwrap();
+        assert_eq!(old.attach, 0);
     }
 
     /// A payload from a sidecar predating the rate fields still parses.

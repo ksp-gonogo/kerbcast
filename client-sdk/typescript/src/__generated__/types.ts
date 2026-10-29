@@ -526,6 +526,16 @@ export interface DisplaySizeReport {
 export interface CameraState {
 	flightId: number;
 	/**
+	 * Which attach of this flight id the sidecar is streaming, from 1. It
+	 * changes whenever the sidecar starts the camera over on a new ring (the
+	 * camera reattached in place, came back from destroyed, or returned after
+	 * leaving the list), even when nothing else about the camera does. A
+	 * change means the stream starts again on a new encoder and capture
+	 * timeline. Compare for change only. Absent (0) from a sidecar that
+	 * predates the field.
+	 */
+	attach?: number;
+	/**
 	 * Part-destruction lifecycle. `Active` for live cameras. `Destroyed`
 	 * when the plugin reports the Hullcam part was destroyed in-flight
 	 * (collision, overheating, decoupling beyond physics range). Once

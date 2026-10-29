@@ -203,10 +203,10 @@ export interface KerbcastCameraHandle {
    * and so before Kerbcast's static and frame lock see them. Kerbcast calls
    * `factory` for a fresh instance each time the camera lands on a receiver
    * (connect, slot rebind, reconnect) or its stream starts over on the one it
-   * has (back in the list after a scene change, or back from destroyed), and
-   * removes it from a receiver the camera leaves; frames the old instance
-   * still holds are discarded. The setting persists across reconnects. `null`
-   * detaches.
+   * has (back in the list after a scene change, back from destroyed, or a new
+   * {@link CameraState.attach} from a reattach in place), and removes it from a
+   * receiver the camera leaves; frames the old instance still holds are
+   * discarded. The setting persists across reconnects. `null` detaches.
    *
    * Needs {@link KerbcastClientConfig.encodedTransforms}; throws without it,
    * or when the browser has no install path. Failures while installing
@@ -941,6 +941,16 @@ type ReceiverWithEncodedStreams = RTCRtpReceiver & {
 /* Metadata fields not every lib.dom version declares. */
 type EncodedFrameWithTimestamp = RTCEncodedVideoFrame & { timestamp?: number };
 type EncodedMetadataWithRtp = RTCEncodedVideoFrameMetadata & { rtpTimestamp?: number };
+
+/**
+ * Whether the sidecar started a camera over on a new ring since `prev`, which
+ * an in-place reattach shows in nothing but `attach`. A missing or zero value
+ * on either side (a sidecar predating the field, or a camera not seen before)
+ * is never a change.
+ */
+function attachChanged(prev: CameraState | null, next: CameraState): boolean {
+  return !!prev?.attach && !!next.attach && prev.attach !== next.attach;
+}
 
 function copyEncodedFrame(frame: RTCEncodedVideoFrame): EncodedFrameCopy {
   const meta = frame.getMetadata() as EncodedMetadataWithRtp;
@@ -2815,9 +2825,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.commandCentres.retain(cameras.map((c) => c.flightId));
     for (const cam of cameras) {
       this.commandCentres.record(cam.flightId, cam.commandCentre);
-      const resurrected = this.getOrCreateHandle(cam.flightId)._setState(cam);
+      const handle = this.getOrCreateHandle(cam.flightId);
+      const reattached = attachChanged(handle.state, cam);
+      const resurrected = handle._setState(cam);
       if (resurrected) this._resourceHandle(cam.flightId);
-      if (resurrected || (listed && !listed.has(cam.flightId))) this._renewEncodedTransform(cam.flightId);
+      if (resurrected || reattached || (listed && !listed.has(cam.flightId))) {
+        this._renewEncodedTransform(cam.flightId);
+      }
     }
     this.emit("cameras-change", cameras);
     this._sendHeldAnchors();
@@ -2923,14 +2937,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         next.sort((a, b) => a.flightId - b.flightId);
         this.commandCentres.record(msg.content.state.flightId, msg.content.state.commandCentre);
         this._cameras = next;
-        if (
-          this.getOrCreateHandle(msg.content.state.flightId)._setState(
-            msg.content.state,
-          )
-        ) {
-          this._resourceHandle(msg.content.state.flightId);
-          this._renewEncodedTransform(msg.content.state.flightId);
-        }
+        const handle = this.getOrCreateHandle(msg.content.state.flightId);
+        const reattached = attachChanged(handle.state, msg.content.state);
+        const resurrected = handle._setState(msg.content.state);
+        if (resurrected) this._resourceHandle(msg.content.state.flightId);
+        if (resurrected || reattached) this._renewEncodedTransform(msg.content.state.flightId);
         this.emit("cameras-change", this._cameras);
         this._sendHeldAnchors();
         break;
@@ -3046,10 +3057,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
 
   /**
    * Give a camera whose source restarted (back in the list after a scene
-   * change, or back from destroyed) a fresh encoded transform on the receiver
-   * it kept. Its frames now come from a new encoder on a new capture timeline,
-   * and an instance built for the old one can hold them back for good. The new
-   * instance replaces the old in one step, so no frame skips the transform.
+   * change, back from destroyed, or reattached in place) a fresh encoded
+   * transform on the receiver it kept. Its frames now come from a new encoder
+   * on a new capture timeline, and an instance built for the old one can hold
+   * them back for good. The new instance replaces the old in one step, so no
+   * frame skips the transform.
    */
   private _renewEncodedTransform(flightId: number): void {
     for (const [mid, installed] of this.transformInstalls) {
