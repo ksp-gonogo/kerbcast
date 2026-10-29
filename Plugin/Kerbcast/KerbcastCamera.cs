@@ -2360,6 +2360,15 @@ namespace Kerbcast
             if (_disposed) return;
             _disposed = true;
 
+            /* The files go whatever the teardown before them throws. A ring left
+               behind keeps a camera that is gone listed to every viewer, and is
+               taken over by the next camera with this id. */
+            try { DisposeRendering(partDestroyed); }
+            finally { ReleaseRingFiles(partDestroyed); }
+        }
+
+        private void DisposeRendering(bool partDestroyed)
+        {
             // The Material is owned by the static KerbcastNightVisionFilter cache;
             // only null the ref, not Destroy it.
             _nvMaterial = null;
@@ -2407,11 +2416,18 @@ namespace Kerbcast
             // Release the capture tail's pooled render-target sets (its current
             // capture/readback pair are members of one of these, so this covers
             // them). Safe here because the camera is being torn down — no further
-            // readbacks will be issued. The ring is owned here, disposed below.
+            // readbacks will be issued. The ring is owned here, disposed in ReleaseRingFiles.
             _capture?.Dispose();
+        }
 
-            _ring?.Dispose();
-            _controlBlock?.Dispose();
+        private void ReleaseRingFiles(bool partDestroyed)
+        {
+            /* Each step runs whatever the one before threw, and none of them
+               replaces an exception already leaving DisposeRendering. */
+            try { _ring?.Dispose(); }
+            catch (Exception ex) { Debug.LogWarning($"[Kerbcast] cam={FlightId} ring dispose failed: {ex.Message}"); }
+            try { _controlBlock?.Dispose(); }
+            catch (Exception ex) { Debug.LogWarning($"[Kerbcast] cam={FlightId} control block dispose failed: {ex.Message}"); }
             try
             {
                 if (File.Exists(_ringPath)) File.Delete(_ringPath);

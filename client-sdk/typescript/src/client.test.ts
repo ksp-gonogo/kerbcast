@@ -1953,6 +1953,109 @@ describe("KerbcastClient — dynamic slot subscription", () => {
     expect(client.camera(42).mediaStream).toBeNull();
   });
 
+  it("sends a camera's force, hold and display size again when it returns to the list", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    await client.camera(42).setForceFullResolution(true);
+    await client.camera(42).setSizeHold(true);
+    await client.reportDisplaySize(42, 640, 360);
+    const sentSince = (n: number) => sidecar.commands.slice(n).map((m) => JSON.stringify(m));
+
+    sidecar.setCameras([]);
+    const gone = sidecar.commands.length;
+    sidecar.setCameras([{ flightId: 42 }]);
+    await vi.waitFor(() =>
+      expect(sentSince(gone)).toEqual([
+        JSON.stringify({ type: "set-force-full-resolution", content: { flightId: 42, force: true } }),
+        JSON.stringify({ type: "set-size-hold", content: { flightId: 42, hold: true } }),
+        JSON.stringify({ type: "report-display-size", content: { flightId: 42, width: 640, height: 360 } }),
+      ]),
+    );
+
+    const listed = sidecar.commands.length;
+    sidecar.setCameras([{ flightId: 42 }]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sentSince(listed)).toEqual([]);
+  });
+
+  it("sends nothing again for a camera this client unsubscribed before it left the list", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    await client.camera(42).setForceFullResolution(true);
+    await client.reportDisplaySize(42, 1280, 720);
+    await client.unsubscribe(42);
+
+    sidecar.setCameras([]);
+    const gone = sidecar.commands.length;
+    sidecar.setCameras([{ flightId: 42 }]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sidecar.commands.slice(gone)).toEqual([]);
+
+    await client.subscribe(42);
+    sidecar.setCameras([]);
+    const again = sidecar.commands.length;
+    sidecar.setCameras([{ flightId: 42 }]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sidecar.commands.slice(again).map((m) => m.type)).toEqual(["set-force-full-resolution"]);
+  });
+
+  it("keeps every feed's stream through a disconnect the peer recovers from", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+    const cam = client.camera(42);
+    const stream = cam.mediaStream;
+    expect(stream).not.toBeNull();
+    const streams: (MediaStream | null)[] = [];
+    cam.on("stream", (s) => streams.push(s));
+
+    sidecar.setConnectionState("disconnected");
+    expect(client.state).toBe("disconnected");
+    sidecar.setConnectionState("connected");
+
+    expect(cam.mediaStream).toBe(stream);
+    expect(cam.hasSource).toBe(true);
+    expect(streams).toEqual([]);
+  });
+
+  it("drops every feed's stream when the peer fails", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+
+    sidecar.setConnectionState("disconnected");
+    sidecar.setConnectionState("failed");
+
+    expect(client.camera(42).mediaStream).toBeNull();
+    expect(client.camera(42).hasSource).toBe(false);
+  });
+
   it("reports whether the camera has a live source as its slot binds, frees, ends and disconnects", async () => {
     const sidecar = new MockSidecar();
     const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());

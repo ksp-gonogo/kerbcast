@@ -1719,6 +1719,20 @@ impl CameraRegistry {
                 Some(_) => continue,
                 None => false,
             };
+            /* An in-place reattach is the same camera to its viewers, who are
+            still connected and will not ask again, so what they asked of it
+            carries over. Their departure clears it from the new entry as it
+            would have from the old. A destroyed camera coming back is new. */
+            let (display_sizes, forced_full_res, size_holds, manual_render_cap) =
+                match cameras.get(id) {
+                    Some(old) if !old.destroyed.load(Ordering::Acquire) => (
+                        old.display_sizes.lock().await.clone(),
+                        old.forced_full_res.lock().await.clone(),
+                        old.size_holds.lock().await.clone(),
+                        *old.manual_render_cap.lock().await,
+                    ),
+                    _ => Default::default(),
+                };
             match MmapFrameRing::open_self_describing(path) {
                 Ok(ring) => {
                     // Each ring self-describes its geometry; a kerbal face ring
@@ -1782,10 +1796,10 @@ impl CameraRegistry {
                             ramping: AtomicBool::new(false),
                             keyframe_wanted: AtomicBool::new(false),
                             tracks: RwLock::new(Vec::new()),
-                            display_sizes: Mutex::new(std::collections::HashMap::new()),
-                            manual_render_cap: Mutex::new(None),
-                            forced_full_res: Mutex::new(std::collections::HashSet::new()),
-                            size_holds: Mutex::new(std::collections::HashSet::new()),
+                            display_sizes: Mutex::new(display_sizes),
+                            manual_render_cap: Mutex::new(manual_render_cap),
+                            forced_full_res: Mutex::new(forced_full_res),
+                            size_holds: Mutex::new(size_holds),
                             capture_rate: RateWindow::new(),
                             sent_rate: RateWindow::new(),
                             send_tally: SendTally::default(),
@@ -5127,6 +5141,81 @@ mod tests {
             !std::sync::Arc::ptr_eq(&first, &second),
             "the registry entry must be replaced, not left pointing at the unlinked ring"
         );
+    }
+
+    /// The viewers of a camera reattached in place are still connected and do
+    /// not report again, so what they asked of it carries over to the new
+    /// entry, and leaves with them as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_place_reattach_keeps_what_viewers_asked_of_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        let first = registry.get(7).await.expect("camera attached");
+        registry.record_display_size(7, 3, 640, 360).await;
+        registry.set_forced_full_res(7, 4, true).await;
+        registry.set_size_hold(7, 5, true).await;
+        registry
+            .set_manual_render_size(7, Some((320, 180)))
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&ring_path).unwrap();
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        registry.rescan().await;
+        let second = registry.get(7).await.expect("camera still present");
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            second
+                .display_sizes
+                .lock()
+                .await
+                .get(&3)
+                .map(|&(w, h, _)| (w, h)),
+            Some((640, 360))
+        );
+        assert!(second.forced_or_held_by(4).await, "the force");
+        assert!(second.forced_or_held_by(5).await, "the hold");
+        assert_eq!(*second.manual_render_cap.lock().await, Some((320, 180)));
+
+        registry.forget_display_size_all(3).await;
+        registry.forget_forced_all(4).await;
+        assert!(second.display_sizes.lock().await.is_empty());
+        assert!(!second.forced_or_held_by(4).await);
+    }
+
+    /// A camera that was gone and comes back is a new camera: nothing carries.
+    #[tokio::test]
+    async fn a_camera_back_after_a_gap_starts_with_no_viewer_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        registry.record_display_size(7, 3, 640, 360).await;
+
+        std::fs::remove_file(&ring_path).unwrap();
+        registry.rescan().await;
+        assert!(registry.get(7).await.is_none());
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        registry.rescan().await;
+        let back = registry.get(7).await.expect("camera back");
+        assert!(back.display_sizes.lock().await.is_empty());
     }
 
     // The force-render profiling override keeps a peerless camera subscribed

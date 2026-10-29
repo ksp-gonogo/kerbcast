@@ -123,7 +123,17 @@ namespace Kerbcast
             int slotBytes = SlotOffPixels + maxWidth * maxHeight * 4;
             long total = HeaderSize + (long)slotCount * slotBytes + (long)slotCount * metaSlotBytes;
 
-            // Create or truncate the regular file. Using FileShare.ReadWrite
+            /* A ring left at this path by a camera that failed to clean up may
+               still be mapped by the sidecar. Truncating it in place would pull
+               the file out from under that mapping and restart its sequence
+               under the same file; removing it first makes this a new file the
+               sidecar attaches afresh. A delete that fails is left to the
+               create below, which reports it as it always has. */
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+
+            // Create the regular file. Using FileShare.ReadWrite
             // so the sidecar can map it concurrently from another process.
             using (var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
             {

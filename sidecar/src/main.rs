@@ -783,16 +783,28 @@ async fn encode_next_frame(
     from the last frame actually sent. Each track spaces its RTP timestamps by
     the frames' capture times. */
     let now = Instant::now();
-    let last = cam.last_sequence.load(Ordering::Acquire);
+    let mut last = cam.last_sequence.load(Ordering::Acquire);
     let claimed = cam.ring.latest_sequence();
-    /* Any change, not just an advance, so a recreated ring that restarts low
-    still reaches the backwards-sequence warning below. */
     if claimed == last {
         return false;
     }
-    /* The first frame since attach, and a ring that restarted below what was
-    sent, take the newest frame; anything else takes the oldest unread one. */
-    let after = if last == 0 || claimed < last {
+    /* Defensive: the plugin replaces a ring with a new file, which attaches
+    as a new entry, but a ring ever rewritten in place would restart its
+    sequence from one under this entry. Nothing it holds has been sent, so it
+    is read as if just attached. */
+    if claimed < last {
+        info!(
+            flight_id = cam.flight_id,
+            ring_sequence = claimed,
+            last_sequence = last,
+            "ring restarted its sequence, reading it afresh"
+        );
+        last = 0;
+        cam.last_sequence.store(0, Ordering::Release);
+    }
+    /* The first frame since attach takes the newest frame; anything else
+    takes the oldest unread one. */
+    let after = if last == 0 {
         None
     } else {
         Some(last.max(claimed.saturating_sub(MAX_FRAMES_BEHIND)))
@@ -814,26 +826,11 @@ async fn encode_next_frame(
     };
 
     if frame.sequence <= last {
-        /* Stale-or-equal frame. Equal is the normal idle case (we already
-        sent it). BEHIND is not normal and is unrecoverable on its own: a
-        recreated ring restarts its sequence low while last_sequence keeps
-        the old high value, so every future frame fails this check and the
-        camera goes permanently silent with no error anywhere. Warn (not
-        debug) on that case so it is visible without raising the log level. */
-        if frame.sequence < last {
-            warn!(
-                flight_id = cam.flight_id,
-                ring_sequence = frame.sequence,
-                last_sequence = last,
-                "ring sequence went BACKWARDS — camera will stay silent until this resets"
-            );
-        } else {
-            debug!(
-                flight_id = cam.flight_id,
-                sequence = frame.sequence,
-                "no new frame this tick (sequence unchanged)"
-            );
-        }
+        debug!(
+            flight_id = cam.flight_id,
+            sequence = frame.sequence,
+            "no new frame this tick (sequence unchanged)"
+        );
         return false;
     }
     debug!(
@@ -1309,6 +1306,42 @@ mod tests {
             Some(9_000.0),
             "the first frame sent is the fresh one"
         );
+    }
+
+    /// A ring recreated in place keeps its file, so the camera keeps its entry,
+    /// but its sequence starts again from one. Its frames still go out.
+    /// Unix only: Windows refuses to truncate a file another handle has mapped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_ring_recreated_in_place_keeps_sending() {
+        use kerbcast_sidecar::shared_mem::MmapFrameRing;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+        for n in 0..5 {
+            ring.produce(64, 64, 33.0 * n as f64, &pixels).unwrap();
+            tick(&cam).await;
+        }
+        cam.send_tally.take();
+        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 5);
+
+        drop(ring);
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let mut ring = MmapFrameRing::create(&dir.path().join("1.ring"), cfg).unwrap();
+        ring.produce(64, 64, 60_000.0, &pixels).unwrap();
+        tick(&cam).await;
+        assert_eq!(cam.send_tally.take().sent, 1, "the restarted ring's frame");
+        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 1);
+
+        ring.produce(64, 64, 60_033.0, &pixels).unwrap();
+        tick(&cam).await;
+        assert_eq!(cam.send_tally.take().sent, 1, "and the one after");
+        assert_eq!(cam.last_sequence.load(Ordering::Acquire), 2);
     }
 
     /// Past the catch-up allowance the oldest frames are passed over, so a

@@ -1636,6 +1636,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private readonly forcedFlights = new Set<number>();
   /** Cameras this client holds at their size, sent again on every connection that takes holds. */
   private readonly heldFlights = new Set<number>();
+  /** This client's last display size report for each camera. */
+  private readonly displaySizes = new Map<number, { width: number; height: number }>();
   /**
    * Names this client to the sidecar across its connections, so a reconnect
    * takes over the force and holds the last connection left behind instead
@@ -2005,8 +2007,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
 
     peer.onStateChange((s) => {
       this.setState(s);
-      if (s === "disconnected" || s === "failed") {
-        if (this.peer === peer) this.clearEncodedTransforms();
+      /* Disconnected is a pause the peer comes back from on its own, with the
+         same tracks and slots, so the feeds keep their streams and the stall
+         static covers the gap. Only a failed peer is gone for good. */
+      if (s === "failed" && this.peer === peer) {
+        this.clearEncodedTransforms();
         this.tearDownStreams();
       }
       /* A failed peer never recovers; closing it frees its relay allocations. */
@@ -2361,6 +2366,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.wanted.delete(flightId);
     this.growQueue.delete(flightId);
     this.clearWaitingForSlot(flightId);
+    /* The sidecar forgets this client's size with the subscription. */
+    this.displaySizes.delete(flightId);
     await this._send({ type: "unsubscribe", content: { flightId } });
   }
 
@@ -2373,6 +2380,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * feed primitives self-measure and call this; consumers do not report by hand.
    */
   async reportDisplaySize(flightId: number, width: number, height: number): Promise<void> {
+    this.displaySizes.set(flightId, { width, height });
     await this._send({ type: "report-display-size", content: { flightId, width, height } });
   }
 
@@ -2790,6 +2798,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   private _applySnapshot(cameras: CameraState[]): void {
+    const listed = this.camerasListed ? new Set(this._cameras.map((c) => c.flightId)) : null;
     this._cameras = cameras;
     this.camerasListed = true;
     this.commandCentres.retain(cameras.map((c) => c.flightId));
@@ -2801,6 +2810,32 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     }
     this.emit("cameras-change", cameras);
     this._sendHeldAnchors();
+    /* A camera back in the list after a scene change is a new camera to the
+       sidecar, which has forgotten what this client asked of the old one.
+       Only cameras this client still subscribes to, so a size from a feed it
+       has since closed cannot pin the camera for everyone. */
+    if (listed) {
+      for (const cam of cameras) {
+        if (!listed.has(cam.flightId) && this._subscribes(cam.flightId)) this._sendHeldFor(cam.flightId);
+      }
+    }
+  }
+
+  private _subscribes(flightId: number): boolean {
+    return this.dynamicMode ? this.wanted.has(flightId) : this.requestedOrder.includes(flightId);
+  }
+
+  private _sendHeldFor(flightId: number): void {
+    if (this.forcedFlights.has(flightId)) {
+      void this._send({ type: "set-force-full-resolution", content: { flightId, force: true } }).catch(() => {});
+    }
+    if (this._sizeHoldSupported && this.heldFlights.has(flightId)) {
+      void this._send({ type: "set-size-hold", content: { flightId, hold: true } }).catch(() => {});
+    }
+    const size = this.displaySizes.get(flightId);
+    if (size) {
+      void this._send({ type: "report-display-size", content: { flightId, ...size } }).catch(() => {});
+    }
   }
 
   private handleServerMessage(raw: string): void {

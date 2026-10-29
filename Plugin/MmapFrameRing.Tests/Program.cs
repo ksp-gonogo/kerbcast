@@ -217,6 +217,34 @@ Check(a.Any(x => x != 0), "ring file is not all-zero (pixels were written)");
     Check(BitConverter.ToDouble(bytes, 4096 + 32) == 1, "beside the capture UT");
 }
 
+/* A ring left behind by a camera that failed to clean up is replaced with a
+   new file, not truncated, so a reader still holding the old one never sees
+   it shrink or its sequence run backwards. */
+{
+    string path = Path.Combine(dir, "left.ring");
+    var old = MmapFrameRing.Create(path, Slots, W, H);
+    old.Produce(W, H, 1, 1, 0, pixels, 0, pixels.Length);
+    old.Produce(W, H, 2, 2, 0, pixels, 0, pixels.Length);
+    old.Dispose();
+    byte[] before = File.ReadAllBytes(path);
+    using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+    {
+        var fresh = MmapFrameRing.Create(path, Slots, W, H);
+        ulong seq = fresh.Produce(W, H, 3, 3, 0, pixels, 0, pixels.Length);
+        fresh.Dispose();
+        var held = new byte[before.Length];
+        int read = 0;
+        while (read < held.Length)
+        {
+            int n = reader.Read(held, read, held.Length - read);
+            if (n == 0) break;
+            read += n;
+        }
+        Check(read == before.Length && held.SequenceEqual(before), "a reader of the old ring still sees it whole");
+        Check(seq == 1, "the new ring starts its own sequence");
+    }
+}
+
 try { Directory.Delete(dir, true); } catch { /* best effort */ }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");

@@ -1384,6 +1384,11 @@ pub async fn resync_after_camera_churn(
         }
         if rebound > 0 {
             registry.set_subscribed(flight_id, true).await;
+            /* A camera reattached in place kept its viewers' sizes, which its
+            new control block has yet to carry. */
+            if let Err(e) = registry.flush_effective_render_size(flight_id).await {
+                warn!(flight_id, error = %e, "render size flush after rebind failed");
+            }
             info!(
                 flight_id,
                 tracks = rebound,
@@ -2521,6 +2526,43 @@ mod tests {
             cam2.control.lock().await.subscribed,
             "plugin is told to resume rendering"
         );
+    }
+
+    /// A ring recreated in place within one rescan keeps its viewers' sizes on
+    /// the new entry, and the rebind passes them to the plugin's new control
+    /// block along with the subscription.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_place_reattach_tells_the_plugin_the_viewers_size() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let ring_path = dir.path().join("1.ring");
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let peer = Arc::new(
+            KerbcastPeer::new(registry.clone(), &[1], 2)
+                .await
+                .expect("peer"),
+        );
+        registry.record_display_size(1, peer.peer_id, 32, 32).await;
+
+        std::fs::remove_file(&ring_path).expect("delete ring");
+        std::fs::remove_file(dir.path().join("1.control.bin")).expect("delete control");
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        let outcome = registry.rescan().await;
+        resync_after_camera_churn(&registry, std::slice::from_ref(&peer), &outcome.attached).await;
+
+        let bytes = std::fs::read(dir.path().join("1.control.bin")).expect("control written");
+        let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
+        assert!(snap.subscribed);
+        assert_eq!((snap.width, snap.height), (Some(32), Some(32)));
     }
 
     /// A browser PLI is the signal that a feed is wedged on a broken reference
