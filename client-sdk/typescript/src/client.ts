@@ -70,12 +70,24 @@ const RENEGOTIATE_TIMEOUT_MS = 10_000;
  */
 const GROW_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000];
 /**
- * How often a receiver whose encoded transform is waiting for its heal is
- * checked for arriving packets, and how long it is watched before the heal
- * is given up. See {@link KerbcastClient._syncEncodedTransforms}.
+ * How often a receiver waiting for its transform's renewal is checked for
+ * arriving packets: quickly for its first minute, then slowly for as long as
+ * it stays idle. A freed slot that is never fed again is so polled every 2 s
+ * until disconnect. A stats call taking longer than the timeout is abandoned
+ * so the next check can ask again.
+ *
+ * After a renewal of the passthrough, or of a camera's transform whose host
+ * gave its hold, the receiver is checked for decoded frames. Packets arriving
+ * with none decoded for the hold plus the stall window (doubling with each
+ * renewal) earn another renewal, up to the retry limit. See
+ * {@link KerbcastClient._syncEncodedTransforms}.
  */
 const TRANSFORM_HEAL_POLL_MS = 250;
-const TRANSFORM_HEAL_GIVE_UP_MS = 60_000;
+const TRANSFORM_HEAL_FAST_FOR_MS = 60_000;
+const TRANSFORM_HEAL_SLOW_POLL_MS = 2_000;
+const TRANSFORM_HEAL_STATS_TIMEOUT_MS = 5_000;
+const TRANSFORM_HEAL_STALL_MS = 2_000;
+const TRANSFORM_HEAL_RETRIES = 3;
 /**
  * Failed re-offers in a row after which a connection stops growing. Each
  * failure after the sidecar answered leaves it a few stopped transceivers it
@@ -213,18 +225,21 @@ export interface KerbcastCameraHandle {
    * has (back in the list after a scene change, back from destroyed, or a new
    * {@link CameraState.attach} from a reattach in place), and removes it from a
    * receiver the camera leaves; frames the old instance still holds are
-   * discarded. On the `"script"` path each install is also renewed once, from
-   * the factory, when packets next arrive on its receiver: Chromium can leave
+   * discarded. On the `"script"` path each install is also renewed from the
+   * factory when packets next arrive on its receiver: Chromium can leave
    * an instance handed to an idle receiver without frames, and one built while
-   * packets flow is wired at once. Build the instance inside the factory call.
-   * The setting persists across reconnects. `null` detaches.
+   * packets flow is wired at once. With {@link EncodedTransformOptions.holdMs}
+   * given, it is renewed again while packets keep arriving with no frame
+   * decoded.
+   * Build the instance inside the factory call. The setting persists across
+   * reconnects. `null` detaches.
    *
    * Needs {@link KerbcastClientConfig.encodedTransforms}; throws without it,
    * or when the browser has no install path. Failures while installing
    * (the factory throws, or returns the wrong kind for the path) surface as
    * client `error` events.
    */
-  setEncodedTransform(factory: EncodedTransformFactory | null): void;
+  setEncodedTransform(factory: EncodedTransformFactory | null, opts?: EncodedTransformOptions): void;
 
   /**
    * Copy this camera's encoded frames, as received and before decode, to
@@ -283,6 +298,22 @@ export interface EncodedTransformContext {
   path: EncodedTransformPath;
 }
 
+/** Options for {@link KerbcastCameraHandle.setEncodedTransform}. */
+export interface EncodedTransformOptions {
+  /**
+   * How long the transform holds frames back before passing them on, in ms,
+   * or a function returning it, called at each check so the hold can change
+   * as it runs. Given, Kerbcast also renews the transform on the `"script"`
+   * path when packets keep arriving with no frame decoded for longer than the
+   * hold plus 2 s (doubling with each retry, at most three), since Chromium
+   * may have left the instance without frames. Leave it out when the hold is
+   * unknown: a transform still filling its hold would be restarted. A value
+   * that is not a finite number of 0 or more, or a function that throws,
+   * counts as left out.
+   */
+  holdMs?: number | (() => number);
+}
+
 /**
  * Builds a transform instance for one receiver. An instance is single-use,
  * so Kerbcast asks for a new one whenever the camera moves receiver or its
@@ -294,6 +325,30 @@ export type EncodedTransformFactory = (ctx: EncodedTransformContext) => EncodedT
 interface TransformInstall {
   flightId: number;
   factory: EncodedTransformFactory;
+}
+
+/** A receiver's inbound-rtp counters, for one stats entry. */
+interface ReceiverCounts {
+  packets: number;
+  frames: number;
+}
+
+/** A script-path receiver whose transform is renewed once packets arrive on it, and again while none decode. */
+interface PendingHeal {
+  /** The camera's install to renew from its factory, or null for the passthrough left when one was removed. */
+  install: TransformInstall | null;
+  /** The camera named when the renewal fails and nothing is bound to the receiver. */
+  flightId: number;
+  /** Orders this watch against stats requests, so it is sampled only from a report asked for after its transform was handed over. */
+  seq: number;
+  /** Each inbound-rtp stats entry's counters on the receiver at the latest sample, by stats id. */
+  last: Map<string, ReceiverCounts> | null;
+  /** Renewals made so far. */
+  renewals: number;
+  /** Since when every poll has seen packets arrive with no frame decoded, after a renewal. */
+  stalledSince: number | null;
+  /** When the watch started or last renewed, which sets how fast it is polled. */
+  since: number;
 }
 
 /** Configuration for {@link KerbcastClient} construction. */
@@ -1185,6 +1240,8 @@ class CameraHandle
   private _clear = false;
   /** Set by {@link setEncodedTransform}; the client installs it on whichever receiver carries this camera. */
   _encodedTransform: EncodedTransformFactory | null = null;
+  /** Set by {@link setEncodedTransform} alongside {@link _encodedTransform}. */
+  _encodedTransformHoldMs: EncodedTransformOptions["holdMs"];
   /** Listeners from {@link tapEncodedFrames}; the client taps whichever receiver carries this camera while any are set. */
   readonly _frameTaps = new Set<(frame: EncodedFrameCopy) => void>();
   private readonly client: KerbcastClient;
@@ -1248,12 +1305,13 @@ class CameraHandle
     if (!this._clear) this._noisePipeline?.setShowStatic(enabled);
   }
 
-  setEncodedTransform(factory: EncodedTransformFactory | null): void {
+  setEncodedTransform(factory: EncodedTransformFactory | null, opts?: EncodedTransformOptions): void {
     if (factory) this.client._assertEncodedTransforms();
     if (factory && !this._encodedTransform && this._frameTaps.size > 0) {
       this.client._warnTapsDisplaced(this.flightId);
     }
     this._encodedTransform = factory;
+    this._encodedTransformHoldMs = factory ? opts?.holdMs : undefined;
     this.client._syncEncodedTransforms();
   }
 
@@ -1627,15 +1685,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private peerTransformPath: EncodedTransformPath | null = null;
   /** Receivers holding a camera's encoded transform, by mid, with the factory that built it. */
   private readonly transformInstalls = new Map<string, TransformInstall>();
-  /** Script-path installs still owed their one renewal, by mid; see {@link _syncEncodedTransforms}. */
-  private readonly pendingHeals = new Map<
-    string,
-    { install: TransformInstall; packets: number | null; since: number }
-  >();
-  /** Receivers whose next install is a heal's renewal, which is not healed again. */
-  private readonly healingMids = new Set<string>();
+  /** Script-path receivers awaiting a renewal or watched after one, by mid; see {@link _syncEncodedTransforms}. */
+  private readonly pendingHeals = new Map<string, PendingHeal>();
   private healTimer: ReturnType<typeof setInterval> | null = null;
-  private healPolling = false;
+  private healTimerMs = 0;
+  private healSeq = 0;
+  /** The peer whose stats call a heal poll is awaiting, so another poll of it does not overlap. */
+  private healPolling: KerbcastPeer | null = null;
   /** Receivers copying frames for a camera's taps, by mid. */
   private readonly tapInstalls = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
@@ -3189,12 +3245,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * camera now bound to it. A receiver whose camera or factory changed loses
    * its instance; a bound camera with a factory gets a fresh one.
    *
-   * On the script path each install is renewed once more, from the factory,
-   * when packets next arrive on its receiver. Chromium wires a script transform
-   * to its receiver only as frames reach it, so on a receiver with no packets
-   * coming in (a relaunch gap, a slot about to be fed) an instance the host
-   * built before handing it over can lose to the previous one's late wiring,
-   * and then receives nothing. One built while packets flow is wired at once.
+   * On the script path every transform handed to a receiver, a camera's or
+   * the passthrough it goes back to, is renewed when packets next arrive on
+   * that receiver, and checked after that; see {@link TRANSFORM_HEAL_POLL_MS}. Chromium wires a script transform to its
+   * receiver only as frames reach it, so on a receiver with no packets coming
+   * in (a relaunch gap, a slot about to be fed) an instance built before it
+   * was handed over can lose to the previous one's late wiring, and then
+   * receives nothing. One built while packets flow is wired at once.
    */
   _syncEncodedTransforms(): void {
     this.syncFrameTaps();
@@ -3207,80 +3264,192 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       const factory = flightId === undefined ? null : (this.handles.get(flightId)?._encodedTransform ?? null);
       if (flightId === installed.flightId && factory === installed.factory) continue;
       this.transformInstalls.delete(mid);
-      this.setReceiverTransform(peer, mid, installed.flightId, null);
+      if (this.setReceiverTransform(peer, mid, installed.flightId, null) && path === "script") {
+        this.awaitHeal(mid, null, installed.flightId);
+      }
     }
     for (const [mid, flightId] of bindings) {
       if (this.transformInstalls.has(mid)) continue;
       const factory = this.handles.get(flightId)?._encodedTransform;
       if (!factory) continue;
-      const healed = this.healingMids.delete(mid);
-      let transform: EncodedTransform;
-      try {
-        transform = factory({ flightId, path });
-      } catch (err) {
-        this.emitTransformError(flightId, err);
-        continue;
-      }
-      if (this.setReceiverTransform(peer, mid, flightId, transform)) {
-        const install = { flightId, factory };
-        this.transformInstalls.set(mid, install);
-        if (path === "script" && !healed) this.awaitHeal(mid, install);
+      const install = { flightId, factory };
+      if (this.installTransform(peer, mid, install, path) && path === "script") {
+        this.awaitHeal(mid, install, flightId);
       }
     }
   }
 
-  /** Watch `mid` for arriving packets, to renew `install` once when they come. */
-  private awaitHeal(mid: string, install: TransformInstall): void {
+  /** Builds `install`'s instance and hands it to `mid`, recording it there only once it is in place. */
+  private installTransform(
+    peer: KerbcastPeer,
+    mid: string,
+    install: TransformInstall,
+    path: EncodedTransformPath,
+  ): boolean {
+    let transform: EncodedTransform;
+    try {
+      transform = install.factory({ flightId: install.flightId, path });
+    } catch (err) {
+      this.emitTransformError(install.flightId, err);
+      return false;
+    }
+    if (!this.setReceiverTransform(peer, mid, install.flightId, transform)) return false;
+    this.transformInstalls.set(mid, install);
+    return true;
+  }
+
+  /** Watch `mid` for arriving packets, to renew its transform when they come. */
+  private awaitHeal(mid: string, install: TransformInstall | null, flightId: number): void {
     if (!this.peer?.getStats) return;
-    this.pendingHeals.set(mid, { install, packets: null, since: monotonicNowMs() });
-    this.healTimer ??= setInterval(() => void this.pollHeals(), TRANSFORM_HEAL_POLL_MS);
+    this.pendingHeals.set(mid, {
+      install,
+      flightId,
+      seq: ++this.healSeq,
+      last: null,
+      renewals: 0,
+      stalledSince: null,
+      since: monotonicNowMs(),
+    });
+    this.armHealTimer();
     void this.pollHeals();
   }
 
+  /** Whether `pending`'s transform is still the one on `mid`. */
+  private healStillOwed(mid: string, pending: PendingHeal): boolean {
+    return pending.install
+      ? this.transformInstalls.get(mid) === pending.install
+      : !this.transformInstalls.has(mid);
+  }
+
+  /** Polls quickly while any receiver is in its first minute of waiting, slowly once all have waited longer. */
+  private armHealTimer(): void {
+    const now = monotonicNowMs();
+    let fast = false;
+    for (const pending of this.pendingHeals.values()) {
+      if (now - pending.since < TRANSFORM_HEAL_FAST_FOR_MS) fast = true;
+    }
+    const ms = fast ? TRANSFORM_HEAL_POLL_MS : TRANSFORM_HEAL_SLOW_POLL_MS;
+    if (this.healTimer !== null) {
+      if (this.healTimerMs === ms) return;
+      clearInterval(this.healTimer);
+    }
+    this.healTimerMs = ms;
+    this.healTimer = setInterval(() => void this.pollHeals(), ms);
+  }
+
   private async pollHeals(): Promise<void> {
-    if (this.healPolling) return;
     const peer = this.peer;
     for (const [mid, pending] of this.pendingHeals) {
-      const stale = this.transformInstalls.get(mid) !== pending.install;
-      if (stale || monotonicNowMs() - pending.since > TRANSFORM_HEAL_GIVE_UP_MS) {
-        this.pendingHeals.delete(mid);
-      }
+      if (!this.healStillOwed(mid, pending)) this.pendingHeals.delete(mid);
     }
     if (this.pendingHeals.size === 0 || !peer?.getStats) {
       this.stopHeals();
       return;
     }
-    this.healPolling = true;
+    this.armHealTimer();
+    if (this.healPolling === peer) return;
+    this.healPolling = peer;
+    const requested = this.healSeq;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     let report: RTCStatsReport;
     try {
-      report = await peer.getStats();
+      report = await Promise.race([
+        peer.getStats(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("stats timed out")), TRANSFORM_HEAL_STATS_TIMEOUT_MS);
+        }),
+      ]);
     } catch {
       return;
     } finally {
-      this.healPolling = false;
+      clearTimeout(timeout);
+      if (this.healPolling === peer) this.healPolling = null;
     }
     if (this.peer !== peer) return;
-    const packetsByMid = new Map<string, number>();
+    /* Keyed by stats id, so an old stream's entry lingering on the same mid cannot mask the new one's counts. */
+    const countsByMid = new Map<string, Map<string, ReceiverCounts>>();
     report.forEach((raw) => {
-      const entry = raw as { type?: string; kind?: string; mid?: string; packetsReceived?: number };
+      const entry = raw as {
+        id?: string;
+        type?: string;
+        kind?: string;
+        mid?: string;
+        packetsReceived?: number;
+        framesDecoded?: number;
+      };
       if (entry.type !== "inbound-rtp" || entry.kind !== "video" || entry.mid === undefined) return;
-      packetsByMid.set(entry.mid, entry.packetsReceived ?? 0);
+      let byId = countsByMid.get(entry.mid);
+      if (!byId) countsByMid.set(entry.mid, (byId = new Map()));
+      byId.set(entry.id ?? "", { packets: entry.packetsReceived ?? 0, frames: entry.framesDecoded ?? 0 });
     });
+    const now = monotonicNowMs();
     for (const [mid, pending] of this.pendingHeals) {
-      if (this.transformInstalls.get(mid) !== pending.install) continue;
-      const packets = packetsByMid.get(mid) ?? 0;
-      if (pending.packets === null || packets <= pending.packets) {
-        pending.packets ??= packets;
+      if (pending.seq > requested || !this.healStillOwed(mid, pending)) continue;
+      const counts = countsByMid.get(mid) ?? new Map<string, ReceiverCounts>();
+      const last = pending.last;
+      pending.last = counts;
+      if (last === null) continue;
+      /* Against the previous sample, so a stall is counted only while packets are still arriving. */
+      const rose = (key: keyof ReceiverCounts): boolean =>
+        [...counts].some(([id, c]) => c[key] > (last.get(id)?.[key] ?? 0));
+      if (pending.renewals > 0 && rose("frames")) {
+        this.pendingHeals.delete(mid);
         continue;
       }
-      this.pendingHeals.delete(mid);
-      this.healingMids.add(mid);
-      this.transformInstalls.delete(mid);
-      this._syncEncodedTransforms();
-      /* The instance it replaced may have taken the keyframe with it. */
-      this.handles.get(pending.install.flightId)?.requestKeyframe().catch(() => {});
+      if (!rose("packets")) {
+        pending.stalledSince = null;
+        continue;
+      }
+      if (pending.renewals > 0) {
+        const holdMs = this.healHoldMs(pending);
+        if (holdMs === null) {
+          this.pendingHeals.delete(mid);
+          continue;
+        }
+        pending.stalledSince ??= now;
+        if (now - pending.stalledSince < holdMs + TRANSFORM_HEAL_STALL_MS * 2 ** (pending.renewals - 1)) continue;
+      }
+      this.renewForHeal(peer, mid, pending);
     }
     if (this.pendingHeals.size === 0) this.stopHeals();
+    else this.armHealTimer();
+  }
+
+  /**
+   * How long `pending`'s transform may hold frames before a lack of decoded
+   * ones means it lost them, read now: 0 for the passthrough, null for a
+   * camera's transform whose host gave no usable hold, which is not checked.
+   */
+  private healHoldMs(pending: PendingHeal): number | null {
+    if (!pending.install) return 0;
+    const hold = this.handles.get(pending.install.flightId)?._encodedTransformHoldMs;
+    if (hold === undefined) return null;
+    let ms: number;
+    try {
+      ms = typeof hold === "function" ? hold() : hold;
+    } catch {
+      return null;
+    }
+    return Number.isFinite(ms) && ms >= 0 ? ms : null;
+  }
+
+  /** Renews `pending`'s transform on `mid` and asks for a keyframe, then watches for frames decoding unless out of retries. */
+  private renewForHeal(peer: KerbcastPeer, mid: string, pending: PendingHeal): void {
+    const bindings = this.dynamicMode ? this.flightByMid : this.legacyFlightByMid;
+    const bound = bindings.get(mid);
+    const renewed = pending.install
+      ? this.installTransform(peer, mid, pending.install, "script")
+      : this.setReceiverTransform(peer, mid, bound ?? pending.flightId, null);
+    if (!renewed || ++pending.renewals > TRANSFORM_HEAL_RETRIES || this.healHoldMs(pending) === null) {
+      this.pendingHeals.delete(mid);
+    } else {
+      pending.seq = ++this.healSeq;
+      pending.last = null;
+      pending.stalledSince = null;
+      pending.since = monotonicNowMs();
+    }
+    /* The instance it replaced may have taken the keyframe with it. */
+    if (renewed && bound !== undefined) this.handles.get(bound)?.requestKeyframe().catch(() => {});
   }
 
   private stopHeals(): void {
@@ -3349,7 +3518,6 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
 
   private clearEncodedTransforms(): void {
     this.stopHeals();
-    this.healingMids.clear();
     this.tapInstalls.clear();
     const peer = this.peer;
     for (const [mid, installed] of this.transformInstalls) {

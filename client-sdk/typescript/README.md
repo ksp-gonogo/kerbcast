@@ -116,14 +116,31 @@ frames the old instance still holds are dropped. `setEncodedTransform(null)`
 detaches. It works in both legacy and dynamic slot modes.
 
 On the `"script"` path every install is followed by one more factory call,
-once packets start arriving on that receiver. Chromium wires a script
-transform to its receiver only as frames reach it, so on a receiver with no
-packets coming in (a relaunch gap, a slot about to be fed) an instance built
-before it was handed over can lose to the previous transform and receive
-nothing, for good. The second instance is built while packets flow, which
-Chromium wires at once, and Kerbcast asks the sidecar for a keyframe after
-the swap. Build the transform inside the factory call rather than ahead of
-it, and expect the factory to run twice per install.
+once packets start arriving on that receiver, however long it stays idle
+first. Chromium wires a script transform to its receiver only as frames
+reach it, so on a receiver with no packets coming in (a relaunch gap, a slot
+about to be fed) an instance built before it was handed over can lose to the
+previous transform and receive nothing, for good. The second instance is
+built while packets flow, which Chromium wires at once, and Kerbcast asks the
+sidecar for a keyframe after the swap. The passthrough a receiver goes back
+to is renewed the same way, and again, up to three more times, while packets
+keep arriving with no frame decoded for 2 s, then 4 s, then 8 s. Build the
+transform inside the factory call rather than ahead of it, and expect the
+factory to run at least twice per install. A factory that throws on a
+renewal leaves the previous instance in place.
+
+A transform that holds frames back, such as a delay, decodes nothing until
+its hold has passed, so Kerbcast cannot tell it from one left without
+frames. Give the hold to have your transform checked the same way:
+
+```ts
+cam.setEncodedTransform(factory, { holdMs: () => currentDelayMs() });
+```
+
+`holdMs` is a number or a function, read at each check, so it can follow a
+changing delay. With it, the transform is renewed again when packets keep
+arriving undecoded for the hold plus 2 s (then plus 4 s, then plus 8 s, at
+most three more times). Without it, the transform gets only the one renewal.
 
 It needs `encodedTransforms: true` when the client is constructed, and
 `setEncodedTransform` throws without it. The option gives every receiver a

@@ -30,6 +30,7 @@ export {
   type EncodedTransform,
   type EncodedTransformContext,
   type EncodedTransformFactory,
+  type EncodedTransformOptions,
   type EncodedTransformPath,
   type DiscoveredCamera,
   type NoiseConfig,
