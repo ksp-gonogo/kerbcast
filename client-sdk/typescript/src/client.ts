@@ -70,23 +70,39 @@ const RENEGOTIATE_TIMEOUT_MS = 10_000;
  */
 const GROW_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000];
 /**
- * How often a receiver waiting for its transform's renewal is checked for
- * arriving packets: quickly for its first minute, then slowly for as long as
- * it stays idle. A freed slot that is never fed again is so polled every 2 s
- * until disconnect. A stats call taking longer than the timeout is abandoned
- * so the next check can ask again.
+ * How often a receiver whose transform is watched is checked for arriving
+ * packets: quickly for its first minute, then slowly for as long as it stays
+ * idle. A freed slot that is never fed again is so polled every 2 s until
+ * disconnect. A stats call taking longer than the timeout is abandoned so the
+ * next check can ask again.
  *
- * After a renewal of the passthrough, or of a camera's transform whose host
- * gave its hold, the receiver is checked for decoded frames. Packets arriving
- * with none decoded for the hold plus the stall window (doubling with each
- * renewal) earn another renewal, up to the retry limit. See
- * {@link KerbcastClient._syncEncodedTransforms}.
+ * The passthrough, or a camera's transform whose host gave its hold, is
+ * checked for decoded frames once packets arrive. An instance replaced on
+ * the receiver may go on decoding what it held for up to its hold after the
+ * handover. A frame decoded once that drain is over, and once packets have
+ * arrived for the transform's own hold, ends the watch. A receiver where a
+ * camera's transform with no hold given was replaced, whose drain has no
+ * bound, is renewed once when packets first arrive and checked after.
+ * Packets arriving with none decoded for the longer of the hold and the
+ * drain left, plus the stall window (doubling with each renewal after the
+ * first), earn a renewal, up to the retry limit.
+ * A gap in packets restarts that count only when longer than the idle
+ * window, so a camera at a few frames a second still builds one. A camera's
+ * transform with no hold given is renewed once when packets first arrive.
+ * See {@link KerbcastClient._syncEncodedTransforms}.
  */
 const TRANSFORM_HEAL_POLL_MS = 250;
 const TRANSFORM_HEAL_FAST_FOR_MS = 60_000;
 const TRANSFORM_HEAL_SLOW_POLL_MS = 2_000;
 const TRANSFORM_HEAL_STATS_TIMEOUT_MS = 5_000;
 const TRANSFORM_HEAL_STALL_MS = 2_000;
+const TRANSFORM_HEAL_IDLE_MS = 1_000;
+/**
+ * How often a hold given as a function is read while its transform is
+ * installed, checked or not, so the longest it reached is known when the
+ * instance is replaced and may drain for that long.
+ */
+const TRANSFORM_HOLD_SAMPLE_MS = 2_000;
 const TRANSFORM_HEAL_RETRIES = 3;
 /**
  * Failed re-offers in a row after which a connection stops growing. Each
@@ -225,12 +241,13 @@ export interface KerbcastCameraHandle {
    * has (back in the list after a scene change, back from destroyed, or a new
    * {@link CameraState.attach} from a reattach in place), and removes it from a
    * receiver the camera leaves; frames the old instance still holds are
-   * discarded. On the `"script"` path each install is also renewed from the
-   * factory when packets next arrive on its receiver: Chromium can leave
-   * an instance handed to an idle receiver without frames, and one built while
-   * packets flow is wired at once. With {@link EncodedTransformOptions.holdMs}
-   * given, it is renewed again while packets keep arriving with no frame
-   * decoded.
+   * discarded. On the `"script"` path Chromium can leave an instance handed
+   * to an idle receiver without frames, and one built while packets flow is
+   * wired at once. With {@link EncodedTransformOptions.holdMs} given, an
+   * install is renewed from the factory only when packets keep arriving with
+   * no frame decoded past the hold; one whose frames decode is left alone.
+   * Without it, each install is renewed once when packets next arrive on its
+   * receiver, which drops whatever the first instance held.
    * Build the instance inside the factory call. The setting persists across
    * reconnects. `null` detaches.
    *
@@ -301,15 +318,22 @@ export interface EncodedTransformContext {
 /** Options for {@link KerbcastCameraHandle.setEncodedTransform}. */
 export interface EncodedTransformOptions {
   /**
-   * How long the transform holds frames back before passing them on, in ms,
-   * or a function returning it, called at each check so the hold can change
-   * as it runs. Given, Kerbcast also renews the transform on the `"script"`
-   * path when packets keep arriving with no frame decoded for longer than the
-   * hold plus 2 s (doubling with each retry, at most three), since Chromium
-   * may have left the instance without frames. Leave it out when the hold is
-   * unknown: a transform still filling its hold would be restarted. A value
-   * that is not a finite number of 0 or more, or a function that throws,
-   * counts as left out.
+   * The longest a frame can be held inside the transform, including any
+   * pacing buffer, in ms, or a function returning it, called at each check so
+   * the hold can change as it runs. Given, Kerbcast renews the transform on
+   * the `"script"` path only when packets keep arriving with no frame decoded
+   * for longer than the hold plus 2 s (doubling with each retry after the
+   * first, at most three), since Chromium may have left the instance without
+   * frames. An instance whose frames decode once packets have reached it for
+   * the hold is never renewed, so its held frames survive. The longest hold
+   * read (a function is read every 2 s while the transform is installed)
+   * also bounds how long the instance may go on decoding what it held after
+   * it is replaced on its receiver, relaunch included, which the check of the
+   * one replacing it waits out before trusting or renewing it. Left out,
+   * Kerbcast cannot tell a hold from a lost instance and renews each install
+   * once when packets first arrive, restarting the hold, and does the same
+   * for whatever replaces it on that receiver. A value that is not a finite
+   * number of 0 or more, or a function that throws, counts as left out.
    */
   holdMs?: number | (() => number);
 }
@@ -325,6 +349,10 @@ export type EncodedTransformFactory = (ctx: EncodedTransformContext) => EncodedT
 interface TransformInstall {
   flightId: number;
   factory: EncodedTransformFactory;
+  /** The hold the host gave with the factory when it was installed. */
+  holdMs: EncodedTransformOptions["holdMs"];
+  /** The longest hold read for this install, which bounds what it can still be holding after a shorter one is given. */
+  maxHoldMs: number;
 }
 
 /** A receiver's inbound-rtp counters, for one stats entry. */
@@ -333,7 +361,7 @@ interface ReceiverCounts {
   frames: number;
 }
 
-/** A script-path receiver whose transform is renewed once packets arrive on it, and again while none decode. */
+/** A script-path receiver whose transform is watched once packets arrive on it, and renewed only while none decode. */
 interface PendingHeal {
   /** The camera's install to renew from its factory, or null for the passthrough left when one was removed. */
   install: TransformInstall | null;
@@ -343,10 +371,16 @@ interface PendingHeal {
   seq: number;
   /** Each inbound-rtp stats entry's counters on the receiver at the latest sample, by stats id. */
   last: Map<string, ReceiverCounts> | null;
+  /** When the latest sample was taken. */
+  lastAt: number;
   /** Renewals made so far. */
   renewals: number;
-  /** Since when every poll has seen packets arrive with no frame decoded, after a renewal. */
+  /** Since when packets have kept arriving with no frame decoded, through gaps no longer than {@link TRANSFORM_HEAL_IDLE_MS}. */
   stalledSince: number | null;
+  /** The first poll since the watch started or last renewed that saw packets arrive. */
+  packetsSince: number | null;
+  /** The latest poll that saw packets arrive. */
+  packetsAt: number | null;
   /** When the watch started or last renewed, which sets how fast it is polled. */
   since: number;
 }
@@ -1685,13 +1719,20 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private peerTransformPath: EncodedTransformPath | null = null;
   /** Receivers holding a camera's encoded transform, by mid, with the factory that built it. */
   private readonly transformInstalls = new Map<string, TransformInstall>();
-  /** Script-path receivers awaiting a renewal or watched after one, by mid; see {@link _syncEncodedTransforms}. */
+  /**
+   * Until when, by mid, an instance replaced on a script-path receiver may go
+   * on decoding what it held: Infinity after a camera's transform with no
+   * hold given, whose drain has no bound.
+   */
+  private readonly drainUntil = new Map<string, number>();
+  /** Script-path receivers whose transform is watched for frames or awaits its renewal, by mid; see {@link _syncEncodedTransforms}. */
   private readonly pendingHeals = new Map<string, PendingHeal>();
   private healTimer: ReturnType<typeof setInterval> | null = null;
   private healTimerMs = 0;
   private healSeq = 0;
   /** The peer whose stats call a heal poll is awaiting, so another poll of it does not overlap. */
   private healPolling: KerbcastPeer | null = null;
+  private holdSampler: ReturnType<typeof setInterval> | null = null;
   /** Receivers copying frames for a camera's taps, by mid. */
   private readonly tapInstalls = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
@@ -3126,9 +3167,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       if (boundFlightId !== flightId) continue;
       const track = this.trackByMid.get(mid);
       if (track) {
-        this.getOrCreateHandle(flightId)._setMediaStream(
-          new MediaStream([track]),
-        );
+        /* A feed already playing that track keeps its source: swapping it would drop the held frame and flash static. */
+        const handle = this.getOrCreateHandle(flightId);
+        if (!handle._isSourcedFrom(track)) handle._setMediaStream(new MediaStream([track]));
       }
       return;
     }
@@ -3144,7 +3185,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    */
   private _renewEncodedTransform(flightId: number): void {
     for (const [mid, installed] of this.transformInstalls) {
-      if (installed.flightId === flightId) this.transformInstalls.delete(mid);
+      if (installed.flightId !== flightId) continue;
+      this.noteDrain(mid, installed);
+      this.transformInstalls.delete(mid);
     }
     this._syncEncodedTransforms();
   }
@@ -3246,15 +3289,20 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * its instance; a bound camera with a factory gets a fresh one.
    *
    * On the script path every transform handed to a receiver, a camera's or
-   * the passthrough it goes back to, is renewed when packets next arrive on
-   * that receiver, and checked after that; see {@link TRANSFORM_HEAL_POLL_MS}. Chromium wires a script transform to its
+   * the passthrough it goes back to, is watched once packets arrive on that
+   * receiver, and renewed only if no frame decodes; see
+   * {@link TRANSFORM_HEAL_POLL_MS}. Chromium wires a script transform to its
    * receiver only as frames reach it, so on a receiver with no packets coming
    * in (a relaunch gap, a slot about to be fed) an instance built before it
    * was handed over can lose to the previous one's late wiring, and then
-   * receives nothing. One built while packets flow is wired at once.
+   * receives nothing. One built while packets flow is wired at once. Renewing
+   * a wired instance would drop the frames it holds, which for a delay is
+   * seconds of picture.
    */
   _syncEncodedTransforms(): void {
     this.syncFrameTaps();
+    /* Every setEncodedTransform syncs, so each hold a host gives is read here before it can change again. */
+    for (const install of this.transformInstalls.values()) this.installHoldMs(install);
     const peer = this.peer;
     const path = this.peerTransformPath;
     if (!peer?.setReceiverTransform || !path) return;
@@ -3263,6 +3311,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       const flightId = bindings.get(mid);
       const factory = flightId === undefined ? null : (this.handles.get(flightId)?._encodedTransform ?? null);
       if (flightId === installed.flightId && factory === installed.factory) continue;
+      this.noteDrain(mid, installed);
       this.transformInstalls.delete(mid);
       if (this.setReceiverTransform(peer, mid, installed.flightId, null) && path === "script") {
         this.awaitHeal(mid, null, installed.flightId);
@@ -3272,10 +3321,27 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       if (this.transformInstalls.has(mid)) continue;
       const factory = this.handles.get(flightId)?._encodedTransform;
       if (!factory) continue;
-      const install = { flightId, factory };
+      const install = { flightId, factory, holdMs: this.handles.get(flightId)?._encodedTransformHoldMs, maxHoldMs: 0 };
+      this.installHoldMs(install);
       if (this.installTransform(peer, mid, install, path) && path === "script") {
         this.awaitHeal(mid, install, flightId);
       }
+    }
+    this.syncHoldSampler();
+  }
+
+  /** Reads every install's hold on a timer while any script-path install has its hold as a function; see {@link TRANSFORM_HOLD_SAMPLE_MS}. */
+  private syncHoldSampler(): void {
+    const sampled =
+      this.peerTransformPath === "script" &&
+      [...this.transformInstalls.values()].some((install) => typeof this.installHold(install) === "function");
+    if (sampled && this.holdSampler === null) {
+      this.holdSampler = setInterval(() => {
+        for (const install of this.transformInstalls.values()) this.installHoldMs(install);
+      }, TRANSFORM_HOLD_SAMPLE_MS);
+    } else if (!sampled && this.holdSampler !== null) {
+      clearInterval(this.holdSampler);
+      this.holdSampler = null;
     }
   }
 
@@ -3298,7 +3364,19 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     return true;
   }
 
-  /** Watch `mid` for arriving packets, to renew its transform when they come. */
+  /**
+   * Records that `install`'s instance is leaving `mid`, where it can stay
+   * wired and go on decoding what it held for up to its hold. Read before the
+   * install is dropped, while its hold can still be read.
+   */
+  private noteDrain(mid: string, install: TransformInstall): void {
+    if (this.peerTransformPath !== "script") return;
+    const holdMs = this.installHoldMs(install);
+    const until = holdMs === null ? Infinity : monotonicNowMs() + Math.max(holdMs, install.maxHoldMs);
+    this.drainUntil.set(mid, Math.max(this.drainUntil.get(mid) ?? 0, until));
+  }
+
+  /** Watch `mid` for arriving packets, to renew its transform if they come with no frame decoded. */
   private awaitHeal(mid: string, install: TransformInstall | null, flightId: number): void {
     if (!this.peer?.getStats) return;
     this.pendingHeals.set(mid, {
@@ -3306,8 +3384,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       flightId,
       seq: ++this.healSeq,
       last: null,
+      lastAt: 0,
       renewals: 0,
       stalledSince: null,
+      packetsSince: null,
+      packetsAt: null,
       since: monotonicNowMs(),
     });
     this.armHealTimer();
@@ -3387,28 +3468,53 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       if (pending.seq > requested || !this.healStillOwed(mid, pending)) continue;
       const counts = countsByMid.get(mid) ?? new Map<string, ReceiverCounts>();
       const last = pending.last;
+      const lastAt = pending.lastAt;
       pending.last = counts;
+      pending.lastAt = now;
       if (last === null) continue;
-      /* Against the previous sample, so a stall is counted only while packets are still arriving. */
+      /* Against the previous sample, so each rise is what arrived or decoded since the last poll. */
       const rose = (key: keyof ReceiverCounts): boolean =>
         [...counts].some(([id, c]) => c[key] > (last.get(id)?.[key] ?? 0));
-      if (pending.renewals > 0 && rose("frames")) {
+      const packetsRose = rose("packets");
+      const holdMs = this.healHoldMs(pending);
+      const drainUntil = this.drainUntil.get(mid) ?? 0;
+      if (holdMs === null || drainUntil === Infinity) {
+        /*
+         * With no hold given, a transform still filling its hold looks the
+         * same as one left without frames. And an instance with no hold given
+         * that this one replaced may drain decoded frames for any length of
+         * time. Either way it is renewed once when packets first arrive,
+         * unchecked, then watched only if its own hold is known.
+         */
+        if (!packetsRose) continue;
+        if (pending.renewals > 0) this.pendingHeals.delete(mid);
+        else this.renewForHeal(peer, mid, pending);
+        continue;
+      }
+      /*
+       * An instance replaced here can stay wired and drain what it held after
+       * the handover, so decoded frames show this one is wired only once that
+       * drain was over before the previous sample, since a rise counts every
+       * frame decoded since it, and packets have reached this one for its own
+       * hold. Renewing a wired one would only drop the frames it holds.
+       */
+      const packetsSince = pending.packetsSince;
+      if (lastAt >= drainUntil && packetsSince !== null && now - packetsSince >= holdMs && rose("frames")) {
         this.pendingHeals.delete(mid);
         continue;
       }
-      if (!rose("packets")) {
-        pending.stalledSince = null;
+      if (!packetsRose) {
+        /* A camera at a few frames a second leaves polls with no packet between those with one. */
+        if (pending.packetsAt === null || now - pending.packetsAt > TRANSFORM_HEAL_IDLE_MS) pending.stalledSince = null;
         continue;
       }
-      if (pending.renewals > 0) {
-        const holdMs = this.healHoldMs(pending);
-        if (holdMs === null) {
-          this.pendingHeals.delete(mid);
-          continue;
-        }
-        pending.stalledSince ??= now;
-        if (now - pending.stalledSince < holdMs + TRANSFORM_HEAL_STALL_MS * 2 ** (pending.renewals - 1)) continue;
-      }
+      pending.packetsSince ??= now;
+      pending.packetsAt = now;
+      pending.stalledSince ??= now;
+      /* Frames cannot count until the drain is over, so the stall runs at least that long. */
+      const stallMs = TRANSFORM_HEAL_STALL_MS * 2 ** Math.max(0, pending.renewals - 1);
+      const waitMs = Math.max(drainUntil - pending.stalledSince, holdMs) + stallMs;
+      if (now - pending.stalledSince < waitMs) continue;
       this.renewForHeal(peer, mid, pending);
     }
     if (this.pendingHeals.size === 0) this.stopHeals();
@@ -3418,11 +3524,22 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /**
    * How long `pending`'s transform may hold frames before a lack of decoded
    * ones means it lost them, read now: 0 for the passthrough, null for a
-   * camera's transform whose host gave no usable hold, which is not checked.
+   * camera's transform whose host gave no usable hold, which is renewed once
+   * unchecked.
    */
   private healHoldMs(pending: PendingHeal): number | null {
-    if (!pending.install) return 0;
-    const hold = this.handles.get(pending.install.flightId)?._encodedTransformHoldMs;
+    return pending.install ? this.installHoldMs(pending.install) : 0;
+  }
+
+  /** The host's current hold for `install` while its factory is still the camera's, else the one it was installed with. */
+  private installHold(install: TransformInstall): EncodedTransformOptions["holdMs"] {
+    const handle = this.handles.get(install.flightId);
+    return handle?._encodedTransform === install.factory ? handle._encodedTransformHoldMs : install.holdMs;
+  }
+
+  /** `install`'s hold read now, in ms, also kept as its longest when it is. */
+  private installHoldMs(install: TransformInstall): number | null {
+    const hold = this.installHold(install);
     if (hold === undefined) return null;
     let ms: number;
     try {
@@ -3430,7 +3547,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     } catch {
       return null;
     }
-    return Number.isFinite(ms) && ms >= 0 ? ms : null;
+    if (!Number.isFinite(ms) || ms < 0) return null;
+    install.maxHoldMs = Math.max(install.maxHoldMs, ms);
+    return ms;
   }
 
   /** Renews `pending`'s transform on `mid` and asks for a keyframe, then watches for frames decoding unless out of retries. */
@@ -3440,12 +3559,27 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     const renewed = pending.install
       ? this.installTransform(peer, mid, pending.install, "script")
       : this.setReceiverTransform(peer, mid, bound ?? pending.flightId, null);
-    if (!renewed || ++pending.renewals > TRANSFORM_HEAL_RETRIES || this.healHoldMs(pending) === null) {
+    /*
+     * A renewal hands over from this transform's own instance, after any
+     * bounded drain was waited out, so its own longest hold bounds the drain
+     * from here. That also ends an unbounded one: built while packets flow,
+     * the new instance is wired at once, so a drain still running can only
+     * end a watch it no longer needs. A renewal that failed leaves the
+     * instance it would have replaced, bounded the same way, and the receiver
+     * goes unchecked from here, so an unbounded drain would only force a
+     * renewal of whatever is wired at the next handover.
+     */
+    const holdMs = this.healHoldMs(pending);
+    const drainMs = pending.install ? Math.max(holdMs ?? 0, pending.install.maxHoldMs) : 0;
+    this.drainUntil.set(mid, monotonicNowMs() + drainMs);
+    if (!renewed || ++pending.renewals > TRANSFORM_HEAL_RETRIES || holdMs === null) {
       this.pendingHeals.delete(mid);
     } else {
       pending.seq = ++this.healSeq;
       pending.last = null;
       pending.stalledSince = null;
+      pending.packetsSince = null;
+      pending.packetsAt = null;
       pending.since = monotonicNowMs();
     }
     /* The instance it replaced may have taken the keyframe with it. */
@@ -3518,12 +3652,14 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
 
   private clearEncodedTransforms(): void {
     this.stopHeals();
+    this.drainUntil.clear();
     this.tapInstalls.clear();
     const peer = this.peer;
     for (const [mid, installed] of this.transformInstalls) {
       if (peer) this.setReceiverTransform(peer, mid, installed.flightId, null);
     }
     this.transformInstalls.clear();
+    this.syncHoldSampler();
   }
 
   private setReceiverTransform(

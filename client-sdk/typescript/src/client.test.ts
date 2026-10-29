@@ -1593,6 +1593,41 @@ describe("KerbcastClient", () => {
       }
     });
 
+    it("keeps the source of a resurrected camera already playing its track", async () => {
+      const setSource = vi.fn();
+      const createSpy = vi.spyOn(noise, "tryCreateNoisePipeline").mockReturnValue({
+        processedStream: new MediaStream(),
+        setIntensity: vi.fn(),
+        setSource,
+        setShowStatic: vi.fn(),
+        setPassthrough: vi.fn(),
+        destroy: vi.fn(),
+      });
+      try {
+        const sidecar = new MockSidecar().withSlots(["a"]);
+        sidecar.addCamera({ flightId: 42 });
+        const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([])),
+        );
+        await client.connect([], { slots: 1 });
+        sidecar.open();
+        await client.subscribe(42);
+        const track = {} as MediaStreamTrack;
+        sidecar.deliverTrack("a", track);
+        sidecar.destroyCamera(42);
+
+        /* The same track lands again before the camera comes back, so the feed is already playing it. */
+        sidecar.deliverTrack("a", track);
+        expect(client.camera(42)._isSourcedFrom(track)).toBe(true);
+        setSource.mockClear();
+        sidecar.updateCamera(42, { lifecycle: CameraLifecycle.Active });
+        expect(setSource).not.toHaveBeenCalled();
+      } finally {
+        createSpy.mockRestore();
+      }
+    });
+
     it("drives static to full intensity on signal loss", async () => {
       const setIntensity = vi.fn();
       const setSource = vi.fn();
@@ -4227,8 +4262,9 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
 
   /*
    * Chromium can leave a script transform handed over on a receiver with no
-   * packets arriving without frames, so each install is renewed once when
-   * packets next arrive, and again while packets arrive with none decoded.
+   * packets arriving without frames, so an install is renewed while packets
+   * arrive with none decoded, and one with no hold given once when packets
+   * next arrive.
    */
   describe("heal once packets arrive", () => {
     beforeEach(() => vi.useFakeTimers());
@@ -4304,6 +4340,14 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       };
     }
 
+    /* Raises `mid`'s packet count at every poll for `ms`, with no frame decoded. */
+    async function flowPackets(packets: Map<string, number>, mid: string, ms: number) {
+      for (let t = 0; t < ms; t += 250) {
+        packets.set(mid, (packets.get(mid) ?? 0) + 30);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+    }
+
     it("renews the instance once from the factory when packets start arriving, then asks for a keyframe", async () => {
       const { client, captured, installs, packets, keyframeRequests } = await connectWithStats();
       const { factory, made } = countingFactory();
@@ -4326,18 +4370,380 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       expect(keyframeRequests()).toHaveLength(1);
     });
 
-    it("heals an instance installed while packets were already arriving, once", async () => {
+    it("never renews a passthrough whose frames decode", async () => {
+      const { client, captured, installs, packets, frames, statsCalls, keyframeRequests } =
+        await connectWithStats();
+      client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 0 });
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(captured, "0", 8);
+      await vi.advanceTimersByTimeAsync(300);
+      /* Packets lead the first decoded frame by a poll, as they do on a receiver starting up. */
+      for (let n = 1; n <= 40; n++) {
+        packets.set("0", n * 30);
+        frames.set("0", n - 1);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+      expect(installs.map((i) => i.transform === null)).toEqual([false, true]);
+      expect(keyframeRequests()).toHaveLength(0);
+      const calls = statsCalls();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(statsCalls()).toBe(calls);
+    });
+
+    it("never renews a transform with a hold whose frames decode once the hold has passed", async () => {
+      const { client, captured, installs, packets, frames, statsCalls, keyframeRequests } =
+        await connectWithStats();
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(packets, "0", 1500);
+      for (let n = 1; n <= 40; n++) {
+        packets.set("0", (packets.get("0") ?? 0) + 30);
+        frames.set("0", n);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+      expect(factory).toHaveBeenCalledOnce();
+      expect(installs).toHaveLength(1);
+      expect(keyframeRequests()).toHaveLength(0);
+      const calls = statsCalls();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(statsCalls()).toBe(calls);
+    });
+
+    /* Raises `mid`'s decoded frames at every poll for `polls` polls, and its packets too from `packetsFrom` on. */
+    async function drainFrames(
+      t: { packets: Map<string, number>; frames: Map<string, number> },
+      mid: string,
+      polls: number,
+      packetsFrom: number,
+    ) {
+      for (let n = 1; n <= polls; n++) {
+        if (n >= packetsFrom) t.packets.set(mid, (t.packets.get(mid) ?? 0) + 30);
+        t.frames.set(mid, (t.frames.get(mid) ?? 0) + 7);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+    }
+
+    it("renews a passthrough left without frames while the transform with a hold it replaced drains", async () => {
+      const t = await connectWithStats();
+      t.packets.set("0", 900);
+      t.frames.set("0", 80);
+      t.client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 1500 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(t.captured, "0", 8);
+      /* The old instance drains for most of its hold, the last half second of it into packets reaching the passthrough. */
+      await drainFrames(t, "0", 5, 3);
+      await flowPackets(t.packets, "0", 3000);
+      expect(t.installs.map((i) => i.transform === null)).toEqual([false, true, true]);
+    });
+
+    it("renews a passthrough at the first packets when the transform it replaced gave no hold", async () => {
+      const t = await connectWithStats();
+      t.packets.set("0", 900);
+      t.frames.set("0", 80);
+      t.client.camera(7).setEncodedTransform(countingFactory().factory);
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(t.captured, "0", 8);
+      await drainFrames(t, "0", 5, 5);
+      expect(t.installs.map((i) => i.transform === null)).toEqual([false, true, true]);
+      expect(t.keyframeRequests()).toEqual([{ type: "request-keyframe", content: { flightId: 8 } }]);
+
+      /* The renewed passthrough is still checked, as the passthrough always is. */
+      await flowPackets(t.packets, "0", 3000);
+      expect(t.installs.map((i) => i.transform === null)).toEqual([false, true, true, true]);
+    });
+
+    it("renews a transform holding nothing left without frames while the one with a hold it replaced drains", async () => {
+      const t = await connectWithStats();
+      t.packets.set("0", 900);
+      t.frames.set("0", 80);
+      t.client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 1500 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      const near = countingFactory();
+      t.client.camera(8).setEncodedTransform(near.factory, { holdMs: 0 });
+      slotMap(t.captured, "0", 8);
+      await drainFrames(t, "0", 5, 3);
+      await flowPackets(t.packets, "0", 3000);
+      expect(near.factory).toHaveBeenCalledTimes(2);
+    });
+
+    /* Stands in for a relaunch, which gives the camera a fresh instance on the receiver it kept. */
+    function relaunch(client: KerbcastClient, flightId: number) {
+      (client as unknown as { _renewEncodedTransform(id: number): void })._renewEncodedTransform(flightId);
+    }
+
+    it("renews a relaunched transform left without frames while the old instance drains a hold since shortened", async () => {
+      const t = await connectWithStats();
+      let hold = 10_000;
+      const { factory } = countingFactory();
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: () => hold });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(t.packets, "0", 10_500);
+      await drainFrames(t, "0", 8, 1);
+      expect(factory).toHaveBeenCalledOnce();
+      hold = 1500;
+      relaunch(t.client, 7);
+      /* The old instance drains 8 s more, the last 6 s into packets reaching the detached new one. */
+      await drainFrames(t, "0", 32, 9);
+      await flowPackets(t.packets, "0", 8000);
+      expect(factory.mock.calls.length).toBeGreaterThan(2);
+    });
+
+    it("renews a relaunched transform left without frames while a camera with a longer hold, replaced just before, drains", async () => {
+      const t = await connectWithStats();
+      t.client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 10_000 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(t.packets, "0", 10_500);
+      await drainFrames(t, "0", 4, 1);
+      const b = countingFactory();
+      t.client.camera(8).setEncodedTransform(b.factory, { holdMs: 1500 });
+      slotMap(t.captured, "0", 8);
+      /* The new camera sees packets for a second while camera 7 drains. */
+      await drainFrames(t, "0", 4, 1);
+      relaunch(t.client, 8);
+      /* Camera 7 drains on, the last 6 s into packets reaching the detached relaunched instance. */
+      await drainFrames(t, "0", 28, 5);
+      await flowPackets(t.packets, "0", 8000);
+      expect(b.factory.mock.calls.length).toBeGreaterThan(2);
+    });
+
+    it("never renews a wired transform with a short hold while the long-held one it replaced drains", async () => {
+      const t = await connectWithStats();
+      t.client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 10_000 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      const near = countingFactory();
+      t.client.camera(8).setEncodedTransform(near.factory, { holdMs: 1500 });
+      slotMap(t.captured, "0", 8);
+      /* The old instance drains, then the new one decodes, with frames rising at every poll throughout. */
+      await drainFrames(t, "0", 60, 1);
+      expect(near.factory).toHaveBeenCalledOnce();
+      expect(t.keyframeRequests()).toHaveLength(0);
+    });
+
+    it("never renews a wired passthrough while the long-held transform it replaced drains", async () => {
+      const t = await connectWithStats();
+      t.client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 10_000 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(t.captured, "0", 8);
+      await drainFrames(t, "0", 60, 1);
+      expect(t.installs.map((i) => i.transform === null)).toEqual([false, true]);
+      expect(t.keyframeRequests()).toHaveLength(0);
+    });
+
+    it("renews a relaunched transform left without frames when its hold grew after its check ended and shrank at relaunch", async () => {
+      const t = await connectWithStats();
+      let hold = 1500;
+      const { factory } = countingFactory();
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: () => hold });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      /* Launch: packets, then frames once the short hold has passed, ending the check. */
+      await flowPackets(t.packets, "0", 1500);
+      await drainFrames(t, "0", 8, 1);
+      expect(factory).toHaveBeenCalledOnce();
+      /* The flight goes far and the hold grows to 10 s, with no check running. */
+      hold = 10_000;
+      await drainFrames(t, "0", 240, 1);
+      /* A revert to launch: the vessel is near again, so the hold reads short. */
+      hold = 1500;
+      relaunch(t.client, 7);
+      /* The old instance drains its 10 s, the last 8 s into packets reaching the detached new one. */
+      await drainFrames(t, "0", 40, 9);
+      await flowPackets(t.packets, "0", 10_000);
+      expect(factory.mock.calls.length).toBeGreaterThan(2);
+    });
+
+    it("renews a relaunched transform left without frames when a longer hold was given and taken back after its check ended", async () => {
+      const t = await connectWithStats();
+      const { factory } = countingFactory();
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(t.packets, "0", 1500);
+      await drainFrames(t, "0", 8, 1);
+      expect(factory).toHaveBeenCalledOnce();
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 10_000 });
+      await drainFrames(t, "0", 240, 1);
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      relaunch(t.client, 7);
+      /* The old instance drains its 10 s, the last 8 s into packets reaching the detached new one. */
+      await drainFrames(t, "0", 40, 9);
+      await flowPackets(t.packets, "0", 10_000);
+      expect(factory.mock.calls.length).toBeGreaterThan(2);
+    });
+
+    it("counts a hold given at install and changed before any check read it", async () => {
+      const t = await connectWithStats();
+      const { factory } = countingFactory();
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 10_000 });
+      slotMap(t.captured, "0", 7);
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(t.packets, "0", 1500);
+      await drainFrames(t, "0", 8, 1);
+      expect(factory).toHaveBeenCalledOnce();
+      relaunch(t.client, 7);
+      await drainFrames(t, "0", 40, 9);
+      await flowPackets(t.packets, "0", 10_000);
+      expect(factory.mock.calls.length).toBeGreaterThan(2);
+    });
+
+    it("bounds the drain again after a failed renewal, so a later relaunch leaves a wired transform alone", async () => {
+      const t = await connectWithStats();
+      t.packets.set("0", 900);
+      t.client.camera(7).setEncodedTransform(countingFactory().factory);
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      let fail = false;
+      const factory = vi.fn(() => {
+        if (fail) throw new Error("busy");
+        return {} as unknown as TransformStream<RTCEncodedVideoFrame, RTCEncodedVideoFrame>;
+      });
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      fail = true;
+      await drainFrames(t, "0", 4, 1);
+      fail = false;
+      await drainFrames(t, "0", 40, 1);
+      const before = factory.mock.calls.length;
+      for (let r = 0; r < 2; r++) {
+        relaunch(t.client, 7);
+        await vi.advanceTimersByTimeAsync(3000);
+        await drainFrames(t, "0", 40, 1);
+      }
+      /* One instance per relaunch: a second would mean the wired one was renewed. */
+      expect(factory.mock.calls.length - before).toBe(2);
+    });
+
+    it("reads a hold given as a function on a timer only while a camera's transform has one", async () => {
+      const t = await connectWithStats();
+      const { factory } = countingFactory();
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 0 });
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      const timers = vi.getTimerCount();
+      const holdMs = vi.fn(() => 0);
+      t.client.camera(7).setEncodedTransform(factory, { holdMs });
+      expect(vi.getTimerCount()).toBe(timers + 1);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(holdMs.mock.calls.length).toBeGreaterThan(3);
+      t.client.camera(7).setEncodedTransform(factory, { holdMs: 0 });
+      expect(vi.getTimerCount()).toBe(timers);
+
+      /* The same reconnect twice, the second with the hold as a function, leaves the same timers. */
+      const reconnect = async (hold: number | (() => number)) => {
+        t.client.disconnect();
+        await t.client.connect([], { slots: 2 });
+        slotMap(t.captured, "0", 7);
+        t.client.camera(7).setEncodedTransform(factory, { holdMs: hold });
+        t.client.disconnect();
+        return vi.getTimerCount();
+      };
+      expect(await reconnect(holdMs)).toBe(await reconnect(0));
+    });
+    it("forgets a drain at disconnect, so the next peer's receivers start without one", async () => {
+      const t = await connectWithStats();
+      t.client.camera(7).setEncodedTransform(countingFactory().factory);
+      slotMap(t.captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(t.captured, "0", null);
+      t.client.disconnect();
+      await t.client.connect([], { slots: 2 });
+      const { factory } = countingFactory();
+      t.client.camera(8).setEncodedTransform(factory, { holdMs: 0 });
+      slotMap(t.captured, "0", 8);
+      await vi.advanceTimersByTimeAsync(300);
+      for (let n = 1; n <= 20; n++) {
+        t.packets.set("0", n * 30);
+        t.frames.set("0", n - 1);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+      expect(factory).toHaveBeenCalledOnce();
+    });
+
+    it("never renews a transform holding nothing whose frames decode, handed over after the passthrough", async () => {
+      const { client, captured, installs, packets, frames, keyframeRequests } = await connectWithStats();
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory, { holdMs: 0 });
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      for (let n = 1; n <= 40; n++) {
+        packets.set("0", n * 30);
+        frames.set("0", n - 1);
+        await vi.advanceTimersByTimeAsync(250);
+      }
+      expect(factory).toHaveBeenCalledOnce();
+      expect(installs).toHaveLength(1);
+      expect(keyframeRequests()).toHaveLength(0);
+    });
+
+    it("renews a passthrough left without frames only after 2 s of packets with none decoded", async () => {
+      const { client, captured, installs, packets, keyframeRequests } = await connectWithStats();
+      client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 0 });
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      slotMap(captured, "0", 8);
+      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(packets, "0", 1750);
+      expect(installs).toHaveLength(2);
+      await flowPackets(packets, "0", 750);
+      expect(installs.map((i) => i.transform === null)).toEqual([false, true, true]);
+      expect(keyframeRequests()).toEqual([{ type: "request-keyframe", content: { flightId: 8 } }]);
+    });
+
+    it("renews an instance with no hold given once, though the previous one's frames decode as packets first arrive", async () => {
       const { client, captured, installs, packets, frames } = await connectWithStats();
-      packets.set("0", 500);
+      packets.set("0", 900);
+      frames.set("0", 80);
       const { factory } = countingFactory();
       client.camera(7).setEncodedTransform(factory);
       slotMap(captured, "0", 7);
-      for (let n = 530; n < 1000; n += 30) {
-        packets.set("0", n);
-        frames.set("0", n / 10);
+      await vi.advanceTimersByTimeAsync(300);
+      packets.set("0", 930);
+      frames.set("0", 85);
+      await vi.advanceTimersByTimeAsync(250);
+      await flowPackets(packets, "0", 5000);
+      expect(factory).toHaveBeenCalledTimes(2);
+      expect(installs).toHaveLength(2);
+    });
+
+    it("renews a transform with a hold left without frames while the previous instance drains what it held", async () => {
+      const { client, captured, installs, packets, frames } = await connectWithStats();
+      packets.set("0", 900);
+      frames.set("0", 80);
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      /* The drain runs before packets reach the new instance and on into their first second. */
+      for (let n = 1; n <= 8; n++) {
+        if (n > 4) packets.set("0", (packets.get("0") ?? 0) + 30);
+        frames.set("0", 80 + n * 7);
         await vi.advanceTimersByTimeAsync(250);
       }
+      await flowPackets(packets, "0", 5000);
       expect(factory).toHaveBeenCalledTimes(2);
+      expect(installs).toHaveLength(2);
+    });
+
+    it("renews a transform with a hold left without frames on a camera sending 2 frames a second", async () => {
+      const { client, captured, installs, packets } = await connectWithStats();
+      const { factory } = countingFactory();
+      client.camera(7).setEncodedTransform(factory, { holdMs: 1500 });
+      slotMap(captured, "0", 7);
+      await vi.advanceTimersByTimeAsync(300);
+      for (let n = 0; n < 18; n++) {
+        if (n % 2 === 0) packets.set("0", (packets.get("0") ?? 0) + 3);
+        await vi.advanceTimersByTimeAsync(250);
+      }
       expect(installs).toHaveLength(2);
     });
 
@@ -4361,18 +4767,14 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       client.camera(7).setEncodedTransform(factory, { holdMs: 0 });
       slotMap(captured, "0", 7);
       await vi.advanceTimersByTimeAsync(300);
-      let n = 0;
-      const flow = async (ms: number) => {
-        for (let t = 0; t < ms; t += 250) {
-          packets.set("0", (n += 30));
-          await vi.advanceTimersByTimeAsync(250);
-        }
-      };
+      const flow = (ms: number) => flowPackets(packets, "0", ms);
+      await flow(1750);
+      expect(factory).toHaveBeenCalledOnce();
       await flow(500);
       expect(factory).toHaveBeenCalledTimes(2);
-      await flow(1500);
+      await flow(2000);
       expect(factory).toHaveBeenCalledTimes(2);
-      await flow(1500);
+      await flow(1000);
       expect(factory).toHaveBeenCalledTimes(3);
       expect(keyframeRequests()).toHaveLength(2);
 
@@ -4401,34 +4803,34 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       expect(statsCalls()).toBe(calls);
     });
 
-    /* Flows packets with none decoded, returning the ms after the first renewal at which each later one came. */
+    /* Flows packets with none decoded, returning the ms into the flow at which each renewal made in it came. */
     async function flowUndecoded(
       t: Awaited<ReturnType<typeof connectWithStats>>,
       factory: { mock: { calls: unknown[] } },
       ms: number,
     ): Promise<number[]> {
-      let healedAt: number | null = null;
-      const later: number[] = [];
+      const before = factory.mock.calls.length;
+      const renewedAt: number[] = [];
       for (let n = 1; n * 250 <= ms; n++) {
         t.packets.set("0", (t.packets.get("0") ?? 0) + 30);
         await vi.advanceTimersByTimeAsync(250);
-        const renewals = factory.mock.calls.length - 1;
-        if (renewals >= 1) healedAt ??= n * 250;
-        if (healedAt !== null) while (later.length < renewals - 1) later.push(n * 250 - healedAt);
+        while (renewedAt.length < factory.mock.calls.length - before) renewedAt.push(n * 250);
       }
-      return later;
+      return renewedAt;
     }
 
-    it("renews a transform holding 5 s again only after 7 s of packets with none decoded", async () => {
+    it("renews a transform holding 5 s only after 7 s of packets with none decoded, each time", async () => {
       const t = await connectWithStats();
       const { factory } = countingFactory();
       t.client.camera(7).setEncodedTransform(factory, { holdMs: 5000 });
       slotMap(t.captured, "0", 7);
       await vi.advanceTimersByTimeAsync(300);
-      const later = await flowUndecoded(t, factory, 10_000);
-      expect(later).toHaveLength(1);
-      expect(later[0]).toBeGreaterThanOrEqual(7000);
-      expect(later[0]).toBeLessThan(8000);
+      const renewedAt = await flowUndecoded(t, factory, 16_000);
+      expect(renewedAt).toHaveLength(2);
+      expect(renewedAt[0]).toBeGreaterThanOrEqual(7000);
+      expect(renewedAt[0]).toBeLessThan(8000);
+      expect(renewedAt[1] - renewedAt[0]).toBeGreaterThanOrEqual(7000);
+      expect(renewedAt[1] - renewedAt[0]).toBeLessThan(8000);
     });
 
     it("reads a hold given as a function at each check", async () => {
@@ -4447,14 +4849,11 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
 
     it("renews the passthrough again while packets arrive with none decoded", async () => {
       const t = await connectWithStats();
-      t.client.camera(7).setEncodedTransform(countingFactory().factory);
+      t.client.camera(7).setEncodedTransform(countingFactory().factory, { holdMs: 0 });
       slotMap(t.captured, "0", 7);
       await vi.advanceTimersByTimeAsync(300);
       slotMap(t.captured, "0", 8);
-      for (let n = 1; n <= 16; n++) {
-        t.packets.set("0", n * 30);
-        await vi.advanceTimersByTimeAsync(250);
-      }
+      await flowPackets(t.packets, "0", 8000);
       expect(t.installs.map((i) => i.transform === null)).toEqual([false, true, true, true]);
     });
 
@@ -4463,7 +4862,7 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
         const t = await connectWithStats();
         const { factory } = countingFactory();
         if (kind === "passthrough") {
-          t.client.camera(7).setEncodedTransform(factory);
+          t.client.camera(7).setEncodedTransform(factory, { holdMs: 0 });
           slotMap(t.captured, "0", 7);
           await vi.advanceTimersByTimeAsync(300);
           slotMap(t.captured, "0", 8);
@@ -4472,21 +4871,17 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
           slotMap(t.captured, "0", 7);
         }
         const renewals = () => t.installs.length - 1;
+        const before = renewals();
         await vi.advanceTimersByTimeAsync(300);
-        t.packets.set("0", 30);
-        await vi.advanceTimersByTimeAsync(250);
-        const healed = renewals();
-        expect(healed).toBeGreaterThanOrEqual(1);
-        await vi.advanceTimersByTimeAsync(300);
-        t.packets.set("0", 33);
-        await vi.advanceTimersByTimeAsync(30_000);
-        expect(renewals()).toBe(healed);
-
-        for (let n = 1; n <= 24; n++) {
-          t.packets.set("0", 33 + n * 30);
-          await vi.advanceTimersByTimeAsync(250);
+        /* 9 s of packets in all, but never 2 s of them without a gap of more than 1 s. */
+        for (let burst = 0; burst < 12; burst++) {
+          await flowPackets(t.packets, "0", 750);
+          await vi.advanceTimersByTimeAsync(1500);
         }
-        expect(renewals()).toBe(healed + 1);
+        expect(renewals()).toBe(before);
+
+        await flowPackets(t.packets, "0", 3500);
+        expect(renewals()).toBe(before + 1);
         t.client.disconnect();
         vi.restoreAllMocks();
       }
@@ -4515,7 +4910,7 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       expect(statsCalls()).toBe(calls);
     });
 
-    it("renews again when packets resume undecoded after a burst spent the first renewal", async () => {
+    it("renews when packets resume undecoded after a burst too short to judge", async () => {
       const { client, captured, packets } = await connectWithStats();
       const { factory } = countingFactory();
       client.camera(7).setEncodedTransform(factory, { holdMs: 0 });
@@ -4523,14 +4918,10 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       await vi.advanceTimersByTimeAsync(300);
       packets.set("0", 30);
       await vi.advanceTimersByTimeAsync(300);
-      expect(factory).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(10_000);
+      expect(factory).toHaveBeenCalledOnce();
+      await flowPackets(packets, "0", 3000);
       expect(factory).toHaveBeenCalledTimes(2);
-      for (let n = 60; n < 600; n += 30) {
-        packets.set("0", n);
-        await vi.advanceTimersByTimeAsync(250);
-      }
-      expect(factory).toHaveBeenCalledTimes(3);
     });
 
     it("names the camera bound to the receiver when renewing its passthrough fails", async () => {
@@ -4543,8 +4934,7 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       slotMap(captured, "0", 8);
       await vi.advanceTimersByTimeAsync(300);
       stats.failNull = true;
-      packets.set("0", 30);
-      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(packets, "0", 3000);
       expect(errors.map((e) => e.flightId)).toEqual([8]);
     });
 
@@ -4609,8 +4999,7 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       await vi.advanceTimersByTimeAsync(300);
       expect(installs.map((i) => i.transform === null)).toEqual([false, true]);
 
-      packets.set("0", 30);
-      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(packets, "0", 2500);
       expect(installs.map((i) => i.transform === null)).toEqual([false, true, true]);
       expect(installs.at(-1)?.mid).toBe("0");
       expect(keyframeRequests()).toEqual([{ type: "request-keyframe", content: { flightId: 8 } }]);
@@ -4626,8 +5015,7 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       slotMap(captured, "0", 7);
       await vi.advanceTimersByTimeAsync(300);
       client.camera(7).setEncodedTransform(null);
-      packets.set("0", 30);
-      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(packets, "0", 2500);
       expect(installs.map((i) => i.transform === null)).toEqual([false, true, true]);
     });
 
@@ -4643,8 +5031,7 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       client.camera(8).tapEncodedFrames((f) => got.push(f.rtpTimestamp));
       slotMap(captured, "0", 8);
       await vi.advanceTimersByTimeAsync(300);
-      packets.set("0", 30);
-      await vi.advanceTimersByTimeAsync(300);
+      await flowPackets(packets, "0", 2500);
       expect(installs.map((i) => i.transform === null)).toEqual([false, true, true]);
       taps.get("0")?.({ data: new ArrayBuffer(4), rtpTimestamp: 9, receivedAt: 0 });
       expect(got).toEqual([9]);
@@ -4715,9 +5102,13 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
       expect(a.factory).toHaveBeenCalledOnce();
       expect(b.factory).toHaveBeenCalledOnce();
       expect(installs.filter((i) => i.transform !== null)).toHaveLength(2);
-      frames.set("0", 3);
-      frames.set("1", 3);
-      await vi.advanceTimersByTimeAsync(1000);
+      for (let n = 1; n <= 4; n++) {
+        for (const mid of ["0", "1"]) {
+          packets.set(mid, 30 + n * 30);
+          frames.set(mid, n);
+        }
+        await vi.advanceTimersByTimeAsync(250);
+      }
       const calls = statsCalls();
       await vi.advanceTimersByTimeAsync(2000);
       expect(statsCalls()).toBe(calls);

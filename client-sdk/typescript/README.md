@@ -115,32 +115,45 @@ untransformed. A receiver the camera leaves goes back to passthrough, and
 frames the old instance still holds are dropped. `setEncodedTransform(null)`
 detaches. It works in both legacy and dynamic slot modes.
 
-On the `"script"` path every install is followed by one more factory call,
-once packets start arriving on that receiver, however long it stays idle
-first. Chromium wires a script transform to its receiver only as frames
-reach it, so on a receiver with no packets coming in (a relaunch gap, a slot
-about to be fed) an instance built before it was handed over can lose to the
-previous transform and receive nothing, for good. The second instance is
-built while packets flow, which Chromium wires at once, and Kerbcast asks the
-sidecar for a keyframe after the swap. The passthrough a receiver goes back
-to is renewed the same way, and again, up to three more times, while packets
-keep arriving with no frame decoded for 2 s, then 4 s, then 8 s. Build the
-transform inside the factory call rather than ahead of it, and expect the
-factory to run at least twice per install. A factory that throws on a
-renewal leaves the previous instance in place.
+On the `"script"` path Chromium wires a script transform to its receiver
+only as frames reach it, so on a receiver with no packets coming in (a
+relaunch gap, a slot about to be fed) an instance built before it was handed
+over can lose to the previous transform and receive nothing, for good.
+The passthrough a receiver goes back to, or a transform given `holdMs` (see
+below), is watched once packets arrive. One whose frames decode is left
+alone. One that sees packets arrive with no frame decoded for 2 s past its
+hold is renewed from the factory, which Chromium wires at once since packets
+are flowing, and Kerbcast asks the sidecar for a keyframe after the swap. It
+is renewed again, up to three more times, while packets keep arriving with no
+frame decoded for 2 s, then 4 s, then 8 s past the hold. A transform with no
+`holdMs` is renewed once when packets first arrive, and not checked after.
+Build the transform inside the factory call
+rather than ahead of it, and be ready for the factory to run again for the
+same install. A factory that throws on a renewal leaves the previous instance in
+place.
 
 A transform that holds frames back, such as a delay, decodes nothing until
 its hold has passed, so Kerbcast cannot tell it from one left without
-frames. Give the hold to have your transform checked the same way:
+frames. Give the hold, the longest a frame can sit inside the transform
+including any pacing buffer, to have your transform checked the same way:
 
 ```ts
 cam.setEncodedTransform(factory, { holdMs: () => currentDelayMs() });
 ```
 
 `holdMs` is a number or a function, read at each check, so it can follow a
-changing delay. With it, the transform is renewed again when packets keep
+changing delay. With it, the transform is renewed only when packets keep
 arriving undecoded for the hold plus 2 s (then plus 4 s, then plus 8 s, at
-most three more times). Without it, the transform gets only the one renewal.
+most three more times), so a delay that is working keeps the frames it
+holds. The longest hold read (a function is read every 2 s while the
+transform is installed) also tells Kerbcast how long a replaced instance may
+go on decoding what it held, so the check of whatever replaces it on that
+receiver, after a relaunch too, waits that out before it trusts decoded
+frames or renews. Without it, every install is renewed once when
+packets first arrive on its receiver, and that renewal drops whatever the
+first instance was holding and waits for a keyframe. Whatever replaces it on
+that receiver, the passthrough included, is also renewed once when packets
+first arrive.
 
 It needs `encodedTransforms: true` when the client is constructed, and
 `setEncodedTransform` throws without it. The option gives every receiver a
