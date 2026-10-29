@@ -3992,6 +3992,57 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
     ]);
   });
 
+  function snapshot(captured: { dc?: FakeChannel }, cameras: unknown[]) {
+    captured.dc?._msg(JSON.stringify({ type: "camera-snapshot", content: { cameras } }));
+  }
+
+  it("gives a camera back after a scene change a fresh instance on the slot it kept", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    captured.dc?._open();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    snapshot(captured, [fakeCameraState(7)]);
+    slotMap(captured, "0", 7);
+    snapshot(captured, []);
+    snapshot(captured, [fakeCameraState(7)]);
+    expect(installs).toEqual([
+      { mid: "0", transform: made[0] },
+      { mid: "0", transform: made[1] },
+    ]);
+  });
+
+  it("gives a camera back from destroyed a fresh instance", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    captured.dc?._open();
+    const { factory, made } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    snapshot(captured, [fakeCameraState(7)]);
+    slotMap(captured, "0", 7);
+    const changed = (lifecycle: string) =>
+      captured.dc?._msg(
+        JSON.stringify({ type: "camera-state-changed", content: { state: fakeCameraState(7, { lifecycle }) } }),
+      );
+    changed("destroyed");
+    changed("active");
+    expect(installs).toEqual([
+      { mid: "0", transform: made[0] },
+      { mid: "0", transform: made[1] },
+    ]);
+  });
+
+  it("keeps the instance while the camera stays listed", async () => {
+    const { client, captured, installs } = await connectDynamic();
+    captured.dc?._open();
+    const { factory } = countingFactory();
+    client.camera(7).setEncodedTransform(factory);
+    snapshot(captured, [fakeCameraState(7)]);
+    slotMap(captured, "0", 7);
+    snapshot(captured, [fakeCameraState(7), fakeCameraState(8)]);
+    snapshot(captured, [fakeCameraState(7)]);
+    expect(factory).toHaveBeenCalledOnce();
+    expect(installs).toHaveLength(1);
+  });
+
   it("removes the instance at disconnect and reinstalls after reconnect", async () => {
     const { client, captured, installs } = await connectDynamic();
     const { factory, made } = countingFactory();
@@ -4199,6 +4250,26 @@ describe("KerbcastCameraHandle.tapEncodedFrames", () => {
     const cam = client.camera(7);
     cam.setEncodedTransform(() => new TransformStream());
     expect(cam.tapEncodedFrames(() => {})).not.toBeNull();
+  });
+
+  it("keeps the tap when a camera back after a scene change gets a fresh transform", async () => {
+    const { client, captured, taps, tapCalls } = await connect("streams", { encodedTransforms: true });
+    captured.dc?._open();
+    const cam = client.camera(7);
+    const factory = vi.fn(() => new TransformStream());
+    cam.setEncodedTransform(factory);
+    const got: number[] = [];
+    cam.tapEncodedFrames((f) => got.push(f.rtpTimestamp));
+    const snapshot = (cameras: unknown[]) =>
+      captured.dc?._msg(JSON.stringify({ type: "camera-snapshot", content: { cameras } }));
+    snapshot([fakeCameraState(7)]);
+    slotMap(captured, "0", 7);
+    snapshot([]);
+    snapshot([fakeCameraState(7)]);
+    taps.get("0")?.(frame(1));
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(tapCalls).toEqual([{ mid: "0", on: true }]);
+    expect(got).toEqual([1]);
   });
 
   it("drops the receiver's tap on disconnect and taps again after reconnect", async () => {

@@ -202,9 +202,11 @@ export interface KerbcastCameraHandle {
    * Run a transform on this camera's encoded frames before they are decoded,
    * and so before Kerbcast's static and frame lock see them. Kerbcast calls
    * `factory` for a fresh instance each time the camera lands on a receiver
-   * (connect, slot rebind, reconnect) and removes it from a receiver the
-   * camera leaves; frames the old instance still holds are discarded. The
-   * setting persists across reconnects. `null` detaches.
+   * (connect, slot rebind, reconnect) or its stream starts over on the one it
+   * has (back in the list after a scene change, or back from destroyed), and
+   * removes it from a receiver the camera leaves; frames the old instance
+   * still holds are discarded. The setting persists across reconnects. `null`
+   * detaches.
    *
    * Needs {@link KerbcastClientConfig.encodedTransforms}; throws without it,
    * or when the browser has no install path. Failures while installing
@@ -272,7 +274,8 @@ export interface EncodedTransformContext {
 
 /**
  * Builds a transform instance for one receiver. An instance is single-use,
- * so Kerbcast asks for a new one whenever the camera moves receiver.
+ * so Kerbcast asks for a new one whenever the camera moves receiver or its
+ * stream starts over.
  */
 export type EncodedTransformFactory = (ctx: EncodedTransformContext) => EncodedTransform;
 
@@ -2812,9 +2815,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.commandCentres.retain(cameras.map((c) => c.flightId));
     for (const cam of cameras) {
       this.commandCentres.record(cam.flightId, cam.commandCentre);
-      if (this.getOrCreateHandle(cam.flightId)._setState(cam)) {
-        this._resourceHandle(cam.flightId);
-      }
+      const resurrected = this.getOrCreateHandle(cam.flightId)._setState(cam);
+      if (resurrected) this._resourceHandle(cam.flightId);
+      if (resurrected || (listed && !listed.has(cam.flightId))) this._renewEncodedTransform(cam.flightId);
     }
     this.emit("cameras-change", cameras);
     this._sendHeldAnchors();
@@ -2926,6 +2929,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           )
         ) {
           this._resourceHandle(msg.content.state.flightId);
+          this._renewEncodedTransform(msg.content.state.flightId);
         }
         this.emit("cameras-change", this._cameras);
         this._sendHeldAnchors();
@@ -3038,6 +3042,20 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       }
       return;
     }
+  }
+
+  /**
+   * Give a camera whose source restarted (back in the list after a scene
+   * change, or back from destroyed) a fresh encoded transform on the receiver
+   * it kept. Its frames now come from a new encoder on a new capture timeline,
+   * and an instance built for the old one can hold them back for good. The new
+   * instance replaces the old in one step, so no frame skips the transform.
+   */
+  private _renewEncodedTransform(flightId: number): void {
+    for (const [mid, installed] of this.transformInstalls) {
+      if (installed.flightId === flightId) this.transformInstalls.delete(mid);
+    }
+    this._syncEncodedTransforms();
   }
 
   private setState(state: KerbcastConnectionState): void {

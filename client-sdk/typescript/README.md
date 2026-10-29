@@ -105,7 +105,11 @@ Kerbcast installs the transform on whichever receiver carries the camera. A
 transform instance works on one receiver only, so you pass a factory:
 Kerbcast calls it for a fresh instance when the camera is bound, again when a
 slot rebind moves the camera to another receiver, and again after a
-reconnect. A receiver the camera leaves goes back to passthrough, and frames
+reconnect. It also calls it again when the camera's stream starts over on the
+receiver it kept: back in the list after a scene change (a relaunch, say), or
+back from destroyed. The new frames come from a new encoder on a new capture
+timeline, so an instance holding state from the old one is replaced, in one
+step with no frames passing untransformed. A receiver the camera leaves goes back to passthrough, and frames
 the old instance still holds are dropped. `setEncodedTransform(null)`
 detaches. It works in both legacy and dynamic slot modes.
 
