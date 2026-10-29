@@ -85,10 +85,13 @@ outside that window always report.
 The feed frame (the element fullscreen targets) carries two attributes for
 hosts and tests:
 
-- `data-kc-signal`: `live`, `stalled` (no decoded frame for half a second,
-  or none yet since the source attached) or `none` (no source). The video
-  keeps presenting frames while it shows static, so its frame counts cannot
-  tell a picture from static; this can
+- `data-kc-signal`: `live`, `stalled` (no frame has left the decoder for
+  half a second, or none yet since the source attached) or `none` (no
+  source). It is measured after any encoded transform the host installs, so
+  a transform that holds frames back shows as `stalled` while it holds them.
+  The video keeps presenting frames while it shows static, so its frame
+  counts cannot tell a picture from static, and inbound-rtp `framesDecoded`
+  averaged over seconds misses gaps this short; this attribute can
 - `data-fullscreen`: present while the feed is fullscreen
 
 An imperative `CameraFeedHandle` (via `ref`) exposes `stepCamera`,
