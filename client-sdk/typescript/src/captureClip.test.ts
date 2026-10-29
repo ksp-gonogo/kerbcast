@@ -329,6 +329,52 @@ describe("CaptureClip", () => {
     expect(lookups).toBeLessThanOrEqual(UT_RETRY_FRAMES + 1);
   });
 
+  it("cuts the clip before the first frame stamped from a later epoch", () => {
+    const aus = accessUnits();
+    const clip = new CaptureClip((rtp) => (rtp >= 12_000 ? { laterEpoch: true } : { ut: 100 + rtp / 90_000 }));
+    for (let i = 0; i < 6; i++) clip.push(frame(aus[i], i * 3000, i * 33));
+    const result = clip.finish();
+    expect(result.frameCount).toBe(4);
+    expect(result.frameUtSamples).toHaveLength(4);
+    /* The new last frame takes the median of the gaps before it, not the gap to the dropped frame. */
+    expect(result.mediaDurationMs).toBeCloseTo((4 * 3000 * 1000) / 90_000);
+    expect(clip.cut(0, 1000)?.mediaDurationMs).toBeCloseTo((4 * 3000 * 1000) / 90_000);
+  });
+
+  it("cuts at a later epoch whose stamp arrives after the frame", () => {
+    const aus = accessUnits();
+    const stamps = new Map<number, { ut: number } | { laterEpoch: true }>();
+    const clip = new CaptureClip((rtp) => stamps.get(rtp) ?? null);
+    for (let i = 0; i < 4; i++) clip.push(frame(aus[i], i * 3000, i * 33));
+    for (let i = 0; i < 4; i++) stamps.set(i * 3000, i < 2 ? { ut: 100 + i } : { laterEpoch: true });
+    const result = clip.finish();
+    expect(result.frameCount).toBe(2);
+    expect(result.frameUtSamples.map((s) => s.ut)).toEqual([100, 101]);
+  });
+
+  it("keeps frames whose stamps arrive late in the same epoch", () => {
+    const aus = accessUnits();
+    const stamps = new Map<number, { ut: number }>();
+    const clip = new CaptureClip((rtp) => stamps.get(rtp) ?? null);
+    for (let i = 0; i < 4; i++) clip.push(frame(aus[i], i * 3000, i * 33));
+    stamps.set(0, { ut: 100 });
+    stamps.set(3000, { ut: 101 });
+    const result = clip.finish();
+    expect(result.frameCount).toBe(4);
+    expect(result.frameUtSamples.map((s) => s.ut)).toEqual([100, 101]);
+  });
+
+  it("leaves a clip with no epoch information as it was", () => {
+    const aus = accessUnits();
+    const clip = new CaptureClip((rtp) => ({ ut: 100 + rtp / 90_000 }));
+    for (let i = 0; i < 4; i++) clip.push(frame(aus[i], i * 3000, i * 33));
+    const plain = new CaptureClip();
+    for (let i = 0; i < 4; i++) plain.push(frame(aus[i], i * 3000, i * 33));
+    const result = clip.finish();
+    expect(result.frameCount).toBe(4);
+    expect(result.mediaDurationMs).toBe(plain.finish().mediaDurationMs);
+  });
+
   it("collects a per-frame UT track from capture stamps", () => {
     const aus = accessUnits();
     const clip = new CaptureClip((rtp) => (rtp === 6000 ? null : { ut: 100 + rtp / 90_000 }));

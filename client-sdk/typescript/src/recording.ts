@@ -21,7 +21,7 @@
  */
 
 import { CameraLifecycle, type CameraState } from "./__generated__/types";
-import { CaptureClip, type CaptureClipCut, type EncodedFrameCopy } from "./captureClip";
+import { CaptureClip, type CaptureClipCut, type EncodedFrameCopy, type FrameUtLookup } from "./captureClip";
 import type { ContactGap } from "./client";
 
 /**
@@ -503,7 +503,7 @@ function muxAfterPaint<T>(mux: () => T): Promise<T> {
  */
 function captureClipRecorder(
   cam: RecordingClientCamera,
-  lookupUt: (rtpTimestamp: number) => { ut: number } | null,
+  lookupUt: FrameUtLookup,
 ): ClipRecorder | null {
   if (!cam.tapEncodedFrames || !cam.canTapEncodedFrames?.()) return null;
   let clip: CaptureClip | null = null;
@@ -1541,7 +1541,8 @@ export class RecordingController {
       const frame = this.client.frameUt?.(flightId, rtp);
       if (frame?.source !== "exact") return null;
       const own = epoch();
-      return own == null || frame.epoch == null || frame.epoch === own ? { ut: frame.ut } : null;
+      if (own == null || frame.epoch == null || frame.epoch === own) return { ut: frame.ut };
+      return frame.epoch > own ? { laterEpoch: true as const } : null;
     });
     if (capture) return capture;
     const mimeType = negotiateMimeType(preferredMime);

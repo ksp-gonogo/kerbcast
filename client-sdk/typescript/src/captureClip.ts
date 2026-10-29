@@ -127,8 +127,12 @@ export function missesReference(prevRefFrameNum: number, frameNum: number, log2M
  */
 export const UT_RETRY_FRAMES = 256;
 
-/** A frame's mission time, from its capture stamp. */
-export type FrameUtLookup = (rtpTimestamp: number) => { ut: number } | null;
+/**
+ * A frame's mission time, from its capture stamp. `laterEpoch` marks a stamp
+ * from a capture epoch after the recording's own (a revert or quickload);
+ * null means no stamp has arrived yet.
+ */
+export type FrameUtLookup = (rtpTimestamp: number) => { ut: number } | { ut?: undefined; laterEpoch: true } | null;
 
 /** The finished clip from {@link CaptureClip.finish}. */
 export interface CaptureClipResult {
@@ -162,6 +166,8 @@ interface FrameMeta {
   rtp: number;
   dts: number;
   ut?: number;
+  /** The frame's stamp is from a later epoch than the clip's. */
+  later?: boolean;
 }
 
 /**
@@ -254,9 +260,10 @@ export class CaptureClip {
     this.decodable = true;
     this.firstFrameAt ??= frame.receivedAt;
     this.retryUtMisses();
-    const ut = this.lookupUt?.(frame.rtpTimestamp)?.ut;
-    if (ut == null && this.lookupUt) this.utMisses.push(this.frames.length);
-    this.frames.push({ rtp: frame.rtpTimestamp, dts, ut });
+    const stamp = this.lookupUt?.(frame.rtpTimestamp);
+    const later = stamp?.ut == null && stamp != null;
+    if (stamp == null && this.lookupUt) this.utMisses.push(this.frames.length);
+    this.frames.push({ rtp: frame.rtpTimestamp, dts, ut: stamp?.ut, later });
   }
 
   /** Keeps an SPS only when it parses: one that cannot be read cannot be muxed, so the clip waits for a good one. */
@@ -288,8 +295,10 @@ export class CaptureClip {
     for (const i of this.utMisses) {
       if (i < oldest) continue;
       const f = this.frames[i];
-      f.ut = lookup(f.rtp)?.ut;
-      if (f.ut == null) still.push(i);
+      const stamp = lookup(f.rtp);
+      f.ut = stamp?.ut;
+      if (stamp?.ut == null && stamp != null) f.later = true;
+      if (stamp == null) still.push(i);
     }
     this.utMisses = still;
   }
@@ -299,7 +308,23 @@ export class CaptureClip {
     const frameUtSamples: UtSample[] = [];
     for (const f of this.frames) {
       /* A stamp can trail its frame; the client keeps seconds of them, so retry the misses. */
-      f.ut ??= this.lookupUt?.(f.rtp)?.ut;
+      if (f.ut == null && !f.later) {
+        const stamp = this.lookupUt?.(f.rtp);
+        f.ut = stamp?.ut;
+        if (stamp?.ut == null && stamp != null) f.later = true;
+      }
+    }
+    /*
+     * Frames captured after a revert can reach the clip before the clock
+     * push that ends the recording; the clip stops at the first of them.
+     */
+    const firstLater = this.frames.findIndex((f) => f.later);
+    if (firstLater >= 0) {
+      this.frames.length = firstLater;
+      this.writer.truncate(firstLater);
+      if (firstLater === 0) this.firstFrameAt = null;
+    }
+    for (const f of this.frames) {
       if (f.ut != null) frameUtSamples.push({ t: (f.dts * 1000) / RTP_VIDEO_CLOCK_HZ, ut: f.ut });
     }
     const durations = this.writer.durations();

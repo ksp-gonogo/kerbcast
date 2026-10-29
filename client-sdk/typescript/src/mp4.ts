@@ -475,6 +475,20 @@ export class Mp4Writer {
     return out;
   }
 
+  /**
+   * Drops every sample from index `count` on, so the new last sample takes
+   * the median-gap duration as if the clip had ended there. The dropped
+   * bytes stay in the payload, unreferenced.
+   */
+  truncate(count: number): void {
+    if (count >= this.sizes.length) return;
+    this.entryOf.length = count;
+    this.sizes.length = count;
+    this.offsets.length = count;
+    this.dts.length = count;
+    this.key.length = count;
+  }
+
   /** Each sample's time in ticks, as given to {@link add}. */
   times(): readonly number[] {
     return this.dts;
