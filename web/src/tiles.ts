@@ -27,6 +27,11 @@ export interface Tile {
    * Absent on tiles created before this field was added; treated as null.
    */
   key?: string | null;
+  /**
+   * Stable key of the camera this tile showed before it was repurposed onto
+   * another live camera. When that camera returns the tile goes back to it.
+   */
+  homeKey?: string | null;
 }
 
 const STORAGE_KEY = "kerbcast:tiles";
@@ -49,6 +54,10 @@ export function loadTiles(): Tile[] | null {
       key:
         typeof (item as { key?: unknown }).key === "string"
           ? (item as { key: string }).key
+          : null,
+      homeKey:
+        typeof (item as { homeKey?: unknown }).homeKey === "string"
+          ? (item as { homeKey: string }).homeKey
           : null,
     }));
   } catch {
@@ -134,6 +143,26 @@ export function reconcileTiles(
     if (!keyToLive.has(k)) keyToLive.set(k, cam);
   }
 
+  // Restore pass: a tile repurposed onto another camera while its own was away
+  // goes back once that camera is live again, unless another tile shows it.
+  const shownNow = new Set<number>();
+  for (const t of tiles) {
+    if (t.flightId !== null) shownNow.add(t.flightId);
+  }
+  let restored = false;
+  const settled = tiles.map((tile) => {
+    if (tile.homeKey == null) return tile;
+    const home = keyToLive.get(tile.homeKey);
+    if (home === undefined || shownNow.has(home.flightId)) return tile;
+    shownNow.add(home.flightId);
+    restored = true;
+    return { ...tile, flightId: home.flightId, key: tile.homeKey, homeKey: null };
+  });
+  if (restored) {
+    const rest = reconcileTiles(settled, liveCameras);
+    return rest;
+  }
+
   // Track which live flightIds have already been claimed by a tile rebind in
   // this pass, so two stale tiles with the same key don't both rebind to the
   // same new camera.
@@ -176,7 +205,12 @@ export function reconcileTiles(
       if (tile.key != null && keyToLive.has(tile.key)) continue;
 
       const cam = unshownLive[cursor++];
-      next[i] = { ...tile, flightId: cam.flightId, key: cameraKey(cam) };
+      next[i] = {
+        ...tile,
+        flightId: cam.flightId,
+        key: cameraKey(cam),
+        homeKey: tile.homeKey ?? tile.key ?? null,
+      };
       changed = true;
     }
   }
@@ -260,7 +294,7 @@ export function updateTile(
 ): Tile[] {
   return tiles.map((t, i) =>
     i === index
-      ? { ...t, flightId, key: key !== undefined ? key : t.key }
+      ? { ...t, flightId, key: key !== undefined ? key : t.key, homeKey: null }
       : t,
   );
 }

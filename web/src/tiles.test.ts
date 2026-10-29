@@ -98,6 +98,31 @@ describe("seedTiles", () => {
 // ---------------------------------------------------------------------------
 
 describe("reconcileTiles", () => {
+  it("puts a repurposed tile back on its own camera when that camera returns", () => {
+    const fwd = cameraKey(cam(1, "Kerbal X", "hull.cam", "FwdCam"));
+    const tiles = [tile(1, true, fwd)];
+    // Another vessel's camera is the only one live while the tile's own is away.
+    const other = cam(9, "Probe", "p.cam", "Eye");
+    const repurposed = reconcileTiles(tiles, [other]);
+    expect(repurposed[0].flightId).toBe(9);
+    // Its camera comes back (new flightId after a scene change).
+    const back = reconcileTiles(repurposed, [other, cam(4, "Kerbal X", "hull.cam", "FwdCam")]);
+    expect(back[0].flightId).toBe(4);
+    expect(back[0].key).toBe(fwd);
+    expect(back[0].spotlit).toBe(true);
+    expect(back[0].homeKey).toBeNull();
+  });
+
+  it("does not restore onto a camera another tile already shows", () => {
+    const fwd = cameraKey(cam(1, "Kerbal X", "hull.cam", "FwdCam"));
+    const other = cam(9, "Probe", "p.cam", "Eye");
+    const repurposed = reconcileTiles([tile(1, false, fwd)], [other]);
+    const home = cam(4, "Kerbal X", "hull.cam", "FwdCam");
+    const withManual = [...repurposed, tile(4, false, fwd)];
+    const result = reconcileTiles(withManual, [other, home]);
+    expect(result[0].flightId).toBe(9);
+  });
+
   it("returns the same array reference when nothing needs rebinding", () => {
     const tiles = [tile(1, false, "Ship|part|Cam"), tile(2, false, "Ship|part|Cam2")];
     const liveCameras = [cam(1), cam(2)];
