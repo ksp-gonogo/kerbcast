@@ -169,14 +169,20 @@ impl PeerLiveness {
         }
     }
 
-    fn observe(&mut self, state: RTCPeerConnectionState, now: Instant) {
+    /// Track `state`, returning true when it is a recovery from
+    /// `Disconnected`.
+    fn observe(&mut self, state: RTCPeerConnectionState, now: Instant) -> bool {
         /* Dead is sticky: the reaper may already have closed this peer, and a
         late callback must not resurrect one whose cameras are released. */
         if self.state == Liveness::Dead {
-            return;
+            return false;
         }
+        let recovered = matches!(self.state, Liveness::Disconnected { .. });
         match state {
-            RTCPeerConnectionState::Connected => self.state = Liveness::Connected,
+            RTCPeerConnectionState::Connected => {
+                self.state = Liveness::Connected;
+                return recovered;
+            }
             /* Only the first Disconnected records a timestamp: repeat
             notifications must not keep pushing the deadline out. */
             RTCPeerConnectionState::Disconnected
@@ -189,6 +195,7 @@ impl PeerLiveness {
             }
             _ => {}
         }
+        false
     }
 
     fn is_alive(&self, now: Instant) -> bool {
@@ -222,8 +229,8 @@ impl LivenessHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn observe(&self, state: RTCPeerConnectionState, now: Instant) {
-        self.guard().observe(state, now);
+    fn observe(&self, state: RTCPeerConnectionState, now: Instant) -> bool {
+        self.guard().observe(state, now)
     }
 
     fn kill(&self) {
@@ -442,13 +449,29 @@ impl KerbcastPeer {
         let liveness = LivenessHandle::new(Instant::now());
         let connected_for_handler = connected.clone();
         let liveness_for_handler = liveness.clone();
+        let slots_for_state = slots.clone();
+        let outbox_for_state = outbox.clone();
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             info!(?state, "peer connection state");
             if state == RTCPeerConnectionState::Connected {
                 connected_for_handler.notify_waiters();
             }
-            liveness_for_handler.observe(state, Instant::now());
-            Box::pin(async {})
+            if !liveness_for_handler.observe(state, Instant::now()) {
+                return Box::pin(async {});
+            }
+            /* A 1.11 client drops every feed's stream when its connection
+            reports disconnected and never takes it back on reconnect, so its
+            feeds stay static. It still holds each slot's track and re-sources a
+            feed from a slot map naming the slot, so announce every binding
+            again. This keys on the sidecar seeing Disconnected, which ICE
+            raises after 5 s of silence, so a shorter blip that only the
+            browser notices still leaves a 1.11 client static. */
+            let slots = slots_for_state.clone();
+            let outbox = outbox_for_state.clone();
+            Box::pin(async move {
+                info!("peer reconnected, announcing its slot bindings again");
+                send_slot_maps(&slots, &outbox).await;
+            })
         }));
 
         Ok(Self {
@@ -906,7 +929,7 @@ async fn handle_client_message(
             // Announce the initial slot bindings so the client maps its
             // initial cameras to slots by mid — uniform with dynamic
             // Subscribe, no reliance on the answer's camera order.
-            send_initial_slot_maps(&slots, &dc).await;
+            send_slot_maps(&slots, &dc).await;
             // Initial cameras that could not be bound (see `KerbcastPeer::new`).
             for payload in refusals.iter() {
                 send_server_message(&dc, &ServerMessage::Error(payload.clone()));
@@ -1401,30 +1424,32 @@ pub async fn resync_after_camera_churn(
     }
 }
 
-/// Announce the currently-bound slots to a freshly-opened control channel so
-/// the client maps its initial cameras to slots by mid (the same mechanism
-/// dynamic Subscribe uses). Idle slots and slots without a negotiated mid are
-/// skipped.
-async fn send_initial_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Outbox) {
-    let bindings: Vec<(String, u32)> = {
-        let guard = slots.lock().await;
-        guard
-            .iter()
-            .filter_map(|s| match (&s.mid, s.bound) {
-                (Some(mid), Some(flight_id)) => Some((mid.clone(), flight_id)),
-                _ => None,
-            })
-            .collect()
-    };
-    for (mid, flight_id) in bindings {
-        send_server_message(
-            dc,
-            &ServerMessage::SlotMap(SlotMapPayload {
-                mid,
+/// Announce the currently-bound slots, so the client maps its cameras to slots
+/// by mid (the same mechanism dynamic Subscribe uses): on a freshly opened
+/// control channel, and again when the connection recovers. Idle slots and
+/// slots without a negotiated mid are skipped.
+async fn send_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Outbox) {
+    /* Queued under the lock: an unsubscribe that frees a slot between reading
+    its binding and announcing it would leave the client mapping the camera
+    onto the freed slot. */
+    let guard = slots.lock().await;
+    for payload in slot_maps(&guard) {
+        send_server_message(dc, &ServerMessage::SlotMap(payload));
+    }
+}
+
+/// The slot map of every bound slot that has a negotiated mid.
+fn slot_maps(slots: &[Slot]) -> Vec<SlotMapPayload> {
+    slots
+        .iter()
+        .filter_map(|s| match (&s.mid, s.bound) {
+            (Some(mid), Some(flight_id)) => Some(SlotMapPayload {
+                mid: mid.clone(),
                 flight_id: Some(flight_id),
             }),
-        );
-    }
+            _ => None,
+        })
+        .collect()
 }
 
 async fn apply_layer_change(
@@ -2298,6 +2323,34 @@ mod tests {
         }
     }
 
+    /// What a recovered peer is sent again: one map per bound slot with a mid,
+    /// none for an idle slot or one the browser has not negotiated yet.
+    #[tokio::test]
+    async fn slot_maps_name_only_bound_slots_with_a_mid() {
+        let dc = Outbox::spawn(Arc::new(Mutex::new(None)), "test".to_owned());
+        let slot = |i: usize, mid: Option<&str>, bound: Option<u32>| Slot {
+            track: slot_track(i, &dc),
+            mid: mid.map(str::to_owned),
+            bound,
+            ready: true,
+            transceiver: None,
+        };
+        let slots = [
+            slot(0, Some("0"), Some(101)),
+            slot(1, Some("1"), None),
+            slot(2, None, Some(103)),
+            slot(3, Some("3"), Some(104)),
+        ];
+        let maps: Vec<(String, Option<u32>)> = slot_maps(&slots)
+            .into_iter()
+            .map(|p| (p.mid, p.flight_id))
+            .collect();
+        assert_eq!(
+            maps,
+            vec![("0".to_owned(), Some(101)), ("3".to_owned(), Some(104))]
+        );
+    }
+
     #[tokio::test]
     async fn a_subscribe_never_lands_on_an_unconfirmed_slot() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
@@ -2689,6 +2742,42 @@ mod tests {
         live.observe(RTCPeerConnectionState::Disconnected, t0);
 
         assert!(!live.is_alive(t0 + DISCONNECTED_GRACE + Duration::from_secs(1)));
+    }
+
+    /// A recovery from `Disconnected` is what re-announces the slot bindings
+    /// (a 1.11 client needs them to take its feeds back). The first connect
+    /// and repeat `Connected` notifications are not recoveries, so a client
+    /// that never lost its feeds is not sent them again.
+    #[test]
+    fn only_a_return_from_disconnected_is_a_recovery() {
+        let t0 = Instant::now();
+        let mut live = PeerLiveness::new(t0);
+        assert!(!live.observe(RTCPeerConnectionState::Connecting, t0));
+        assert!(
+            !live.observe(RTCPeerConnectionState::Connected, t0),
+            "first connect"
+        );
+        assert!(
+            !live.observe(RTCPeerConnectionState::Connected, t0),
+            "repeat"
+        );
+        assert!(!live.observe(RTCPeerConnectionState::Disconnected, t0));
+        assert!(!live.observe(RTCPeerConnectionState::Disconnected, t0));
+        assert!(
+            live.observe(RTCPeerConnectionState::Connected, t0),
+            "recovered"
+        );
+        assert!(
+            !live.observe(RTCPeerConnectionState::Connected, t0),
+            "only once"
+        );
+
+        live.observe(RTCPeerConnectionState::Disconnected, t0);
+        live.observe(RTCPeerConnectionState::Failed, t0);
+        assert!(
+            !live.observe(RTCPeerConnectionState::Connected, t0),
+            "a dead peer never recovers"
+        );
     }
 
     /// The grace window is measured from the FIRST `Disconnected`. webrtc-rs

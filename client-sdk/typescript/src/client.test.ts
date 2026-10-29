@@ -2013,6 +2013,8 @@ describe("KerbcastClient — dynamic slot subscription", () => {
     expect(sidecar.commands.slice(again).map((m) => m.type)).toEqual(["set-force-full-resolution"]);
   });
 
+  /* The mock announces every bound slot again on recovery, as the sidecar does,
+  so this also proves a repeated slot map for the playing track changes nothing. */
   it("keeps every feed's stream through a disconnect the peer recovers from", async () => {
     const sidecar = new MockSidecar();
     const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
@@ -2036,6 +2038,55 @@ describe("KerbcastClient — dynamic slot subscription", () => {
     expect(cam.mediaStream).toBe(stream);
     expect(cam.hasSource).toBe(true);
     expect(streams).toEqual([]);
+  });
+
+  it("re-sources a feed that lost its stream when the sidecar announces its slot again on recovery", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    const track = {} as MediaStreamTrack;
+    sidecar.deliverTrack(sidecar.slotMidFor(42) as string, track);
+    const cam = client.camera(42);
+    /* What a client that tears down on disconnect is left with. */
+    cam._setMediaStream(null);
+    expect(cam.mediaStream).toBeNull();
+
+    sidecar.setConnectionState("disconnected");
+    sidecar.setConnectionState("connected");
+
+    expect(cam.mediaStream?.getTracks()).toEqual([track]);
+    expect(cam.hasSource).toBe(true);
+  });
+
+  it("re-sources a feed whose track ended when its slot is announced again", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    const track = { readyState: "live" } as { readyState: MediaStreamTrackState };
+    sidecar.deliverTrack(sidecar.slotMidFor(42) as string, track as MediaStreamTrack);
+    const cam = client.camera(42);
+    const streams: (MediaStream | null)[] = [];
+    cam.on("stream", (s) => streams.push(s));
+
+    sidecar.setConnectionState("disconnected");
+    sidecar.setConnectionState("connected");
+    expect(streams).toEqual([]);
+
+    track.readyState = "ended";
+    sidecar.setConnectionState("disconnected");
+    sidecar.setConnectionState("connected");
+    expect(streams).toHaveLength(1);
+    expect(streams[0]?.getTracks()).toEqual([track]);
   });
 
   it("drops every feed's stream when the peer fails", async () => {

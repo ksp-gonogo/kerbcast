@@ -186,6 +186,7 @@ export class MockSidecar {
   private _openHandler: (() => void) | undefined;
   private _clientMsgHandler: ((raw: string) => void) | undefined;
   private _stateHandler: ((s: KerbcastConnectionState) => void) | undefined;
+  private _lastConnectionState: KerbcastConnectionState | undefined;
   private _onTrackHandler:
     | ((track: MediaStreamTrack, idx: number, mid: string) => void)
     | undefined;
@@ -330,9 +331,18 @@ export class MockSidecar {
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
 
-  /** Drive the underlying peer's connection-state handler. */
+  /**
+   * Drive the underlying peer's connection-state handler. Like the sidecar,
+   * a return to connected from disconnected announces every bound slot again.
+   */
   setConnectionState(state: KerbcastConnectionState): void {
+    const recovered = this._lastConnectionState === "disconnected" && state === "connected";
+    this._lastConnectionState = state;
     this._stateHandler?.(state);
+    if (!recovered) return;
+    for (const [mid, flightId] of this._slotBindings) {
+      this._sendToClient({ type: "slot-map", content: { mid, flightId } });
+    }
   }
 
   /**

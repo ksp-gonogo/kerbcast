@@ -1293,6 +1293,14 @@ class CameraHandle
     this._applySource(stream);
   }
 
+  /** Internal: whether the handle's source is a stream carrying `track`, still live. */
+  _isSourcedFrom(track: MediaStreamTrack): boolean {
+    return (
+      track.readyState !== "ended" &&
+      (this._rawStream?.getTracks().includes(track) ?? false)
+    );
+  }
+
   /**
    * Drive the persistent pipeline to a given source (or sourceless static when
    * `raw` is null). Creates the pipeline lazily on first need and reuses it
@@ -2942,9 +2950,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           this.flightByMid.set(mid, flightId);
           const track = this.trackByMid.get(mid);
           if (track) {
-            this.getOrCreateHandle(flightId)._setMediaStream(
-              new MediaStream([track]),
-            );
+            /* The sidecar announces every binding again when the connection
+            recovers. A feed already playing that track keeps its source:
+            swapping it would drop the held frame and flash static. */
+            const handle = this.getOrCreateHandle(flightId);
+            if (!handle._isSourcedFrom(track)) {
+              handle._setMediaStream(new MediaStream([track]));
+            }
           } else {
             // Bound to a slot but the track hasn't arrived yet (the
             // camera-switch gap). Drive the incoming handle sourceless so it
