@@ -758,6 +758,16 @@ impl MmapFrameRing {
                     slot_count: self.cfg.slot_count,
                 });
             }
+            /* The first frame is claimed but not yet published, as on a fresh
+            ring at a camera's first stream or a vessel switch. Nothing to
+            read yet, which is not the writer lapping the reader. */
+            if self
+                .slot_atomic_u64(write_index, SLOT_OFF_SEQUENCE)
+                .load(Ordering::Acquire)
+                == 0
+            {
+                return Ok(None);
+            }
             if let Some(frame) = self.read_slot(write_index) {
                 return Ok(Some(frame));
             }
@@ -1400,6 +1410,20 @@ mod tests {
             reader.next_after(4).unwrap().is_none(),
             "the claimed frame is not published yet"
         );
+        drop(reader);
+        drop(writer);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A first frame that is claimed but not yet published reads as nothing
+    /// yet, not as a writer lapping the reader.
+    #[test]
+    fn latest_is_none_while_the_first_frame_is_unpublished() {
+        let path = tmp_path("latest-first-claim");
+        let writer = MmapFrameRing::create(&path, small_cfg()).unwrap();
+        writer.claim_for_test();
+        let reader = MmapFrameRing::open(&path, small_cfg()).unwrap();
+        assert!(reader.latest().unwrap().is_none());
         drop(reader);
         drop(writer);
         fs::remove_file(&path).ok();
