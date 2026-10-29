@@ -3230,3 +3230,366 @@ describe("CameraFeed - anchors", () => {
     warn.mockRestore();
   });
 });
+
+describe("CameraFeed - fullscreen exit without a mouse", () => {
+  type FsDoc = Document & {
+    fullscreenEnabled?: boolean;
+    fullscreenElement?: Element | null;
+    exitFullscreen?: () => Promise<void>;
+  };
+  const fsDoc = document as FsDoc;
+  let fsElement: Element | null = null;
+  const exitSpy = vi.fn(async () => {
+    fsElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+  });
+
+  beforeEach(() => {
+    fsElement = null;
+    exitSpy.mockClear();
+    Object.defineProperty(fsDoc, "fullscreenEnabled", { value: true, configurable: true });
+    Object.defineProperty(fsDoc, "fullscreenElement", {
+      get: () => fsElement,
+      configurable: true,
+    });
+    Object.defineProperty(fsDoc, "exitFullscreen", { value: exitSpy, configurable: true });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      value: async function (this: HTMLElement) {
+        fsElement = this;
+        document.dispatchEvent(new Event("fullscreenchange"));
+      },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    delete (fsDoc as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+    delete (fsDoc as { fullscreenElement?: Element | null }).fullscreenElement;
+    delete (fsDoc as { exitFullscreen?: unknown }).exitFullscreen;
+    delete (HTMLElement.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+    delete (document as { pictureInPictureEnabled?: boolean }).pictureInPictureEnabled;
+  });
+
+  async function enterFullscreen() {
+    const pipDoc = document as Document & { pictureInPictureEnabled?: boolean };
+    Object.defineProperty(pipDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+    const { client } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        cameraName: "Launchpad Cam",
+        supportsPan: true,
+        supportsZoom: true,
+        panPitchMin: -90,
+        panPitchMax: 90,
+      }),
+    ]);
+    /* Crowded enough (REC + tracking + PiP + fullscreen) that fullscreen
+       starts out in the ⋮ overflow. */
+    const utils = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      enableTracking: true,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+    });
+    fireEvent.click(utils.getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(utils.getByLabelText("Enter fullscreen"));
+    });
+    return utils;
+  }
+
+  it("keeps the exit inline and marked as the always-visible control", async () => {
+    const { getByLabelText } = await enterFullscreen();
+    const exit = getByLabelText("Exit fullscreen");
+    expect(exit.hasAttribute("data-kc-fullscreen-exit")).toBe(true);
+    expect(exit.closest("[role=menu]")).toBeNull();
+    expect(exit.closest("[data-fullscreen]")).toBe(fsElement);
+    expect(exit.tabIndex).toBe(0);
+    /* The ⋮ menu hands focus back to its trigger, which reveals the whole
+       bar by focus-within; at rest only the exit shows. */
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(getComputedStyle(exit).opacity).not.toBe("0");
+    expect(getComputedStyle(exit).pointerEvents).not.toBe("none");
+    expect(getComputedStyle(getByLabelText("Auto-track")).opacity).toBe("0");
+
+    await act(async () => {
+      fireEvent.click(exit);
+    });
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(document.querySelector("[data-kc-fullscreen-exit]")).toBeNull();
+    expect(document.querySelector("[data-fullscreen]")).toBeNull();
+  });
+
+  it("entering fullscreen adds the exit without moving the rest of the bar", async () => {
+    const barLabels = () => {
+      const row = screen.getByLabelText("More actions").parentElement as HTMLElement;
+      return Array.from(row.children).map((c) => c.getAttribute("aria-label") ?? "steps");
+    };
+    const pipDoc = document as Document & { pictureInPictureEnabled?: boolean };
+    Object.defineProperty(pipDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+    const { client } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        cameraName: "Launchpad Cam",
+        supportsPan: true,
+        supportsZoom: true,
+        panPitchMin: -90,
+        panPitchMax: 90,
+      }),
+    ]);
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      enableTracking: true,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      trailingActions: [{ id: "x", label: "Close", icon: null, onClick: () => {} }],
+    });
+    const before = barLabels();
+    expect(before).toContain("More actions");
+    expect(before).not.toContain("Picture in picture");
+
+    fireEvent.click(getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Enter fullscreen"));
+    });
+    const after = barLabels();
+    expect(after.filter((l) => l !== "Exit fullscreen")).toEqual(before);
+    expect(after.indexOf("Exit fullscreen")).toBe(after.indexOf("More actions") - 1);
+  });
+
+  it("leaves an Escape another handler already consumed alone", async () => {
+    await enterFullscreen();
+    const consumed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    consumed.preventDefault();
+    await act(async () => {
+      document.dispatchEvent(consumed);
+    });
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it("a tap on the video reveals the rest of the bar", async () => {
+    const { getByLabelText } = await enterFullscreen();
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(getComputedStyle(getByLabelText("Auto-track")).opacity).toBe("0");
+    const video = document.querySelector("video") as HTMLVideoElement;
+    fireEvent.click(video);
+    expect(getComputedStyle(getByLabelText("Auto-track")).opacity).not.toBe("0");
+  });
+
+  it("Escape leaves fullscreen", async () => {
+    const { queryByLabelText } = await enterFullscreen();
+    await act(async () => {
+      fireEvent.keyDown(document, { key: "Escape" });
+    });
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(queryByLabelText("Exit fullscreen")).toBeNull();
+  });
+});
+
+describe("CameraFeed - video source on camera switch", () => {
+  const TWO_CAMERAS = [
+    makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+    makeCamera({ flightId: 43, cameraName: "Nose Cam" }),
+  ];
+
+  it("clears the previous frame when the new camera has no stream yet", async () => {
+    const { client } = await buildConnectedSource(TWO_CAMERAS);
+    const sentinel = {} as MediaStream;
+    const useCustom: CameraStreamHook = (id) => (id === 42 ? sentinel : null);
+    const view = (flightId: number) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={flightId} useStream={useCustom} />
+      </KerbcastProvider>
+    );
+    const { rerender } = render(view(42));
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.srcObject).toBe(sentinel);
+
+    rerender(view(43));
+    expect(document.querySelector("video")).toBe(video);
+    expect(video.srcObject).toBeNull();
+  });
+
+  it("keeps the element bound when a rebind wraps the same track in a new stream", async () => {
+    const { client } = await buildConnectedSource(TWO_CAMERAS);
+    const track = { id: "track-1", kind: "video" } as MediaStreamTrack;
+    const wrap = () =>
+      ({ getVideoTracks: () => [track] }) as unknown as MediaStream;
+    const first = wrap();
+    const second = wrap();
+    const view = (stream: MediaStream) => {
+      const useFixed: CameraStreamHook = () => stream;
+      return (
+        <KerbcastProvider client={client}>
+          <CameraFeed flightId={42} useStream={useFixed} />
+        </KerbcastProvider>
+      );
+    };
+    const { rerender } = render(view(first));
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.srcObject).toBe(first);
+
+    rerender(view(second));
+    expect(video.srcObject).toBe(first);
+
+    const other = { getVideoTracks: () => [{ id: "track-2" }] } as unknown as MediaStream;
+    rerender(view(other));
+    expect(video.srcObject).toBe(other);
+  });
+
+  it("never reassigns a live stream on a re-render", async () => {
+    const { client } = await buildConnectedSource(TWO_CAMERAS);
+    const sentinel = {} as MediaStream;
+    const useCustom: CameraStreamHook = () => sentinel;
+    const view = (debug: boolean) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={42} useStream={useCustom} showDebugInfo={debug} />
+      </KerbcastProvider>
+    );
+    const { rerender } = render(view(false));
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.srcObject).toBe(sentinel);
+
+    let current: MediaProvider | null = sentinel;
+    const sets: (MediaProvider | null)[] = [];
+    Object.defineProperty(video, "srcObject", {
+      get: () => current,
+      set: (v: MediaProvider | null) => {
+        sets.push(v);
+        current = v;
+      },
+      configurable: true,
+    });
+    rerender(view(true));
+    rerender(view(false));
+    expect(sets).toEqual([]);
+    expect(video.srcObject).toBe(sentinel);
+  });
+});
+
+describe("CameraFeed - menus in fullscreen", () => {
+  type FsDoc = Document & {
+    fullscreenEnabled?: boolean;
+    fullscreenElement?: Element | null;
+    pictureInPictureEnabled?: boolean;
+  };
+  const fsDoc = document as FsDoc;
+  let fsElement: Element | null = null;
+
+  beforeEach(() => {
+    fsElement = null;
+    Object.defineProperty(fsDoc, "fullscreenEnabled", { value: true, configurable: true });
+    Object.defineProperty(fsDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+    Object.defineProperty(fsDoc, "fullscreenElement", {
+      get: () => fsElement,
+      configurable: true,
+    });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      value: async function (this: HTMLElement) {
+        fsElement = this;
+        document.dispatchEvent(new Event("fullscreenchange"));
+      },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    delete (fsDoc as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+    delete (fsDoc as { pictureInPictureEnabled?: boolean }).pictureInPictureEnabled;
+    delete (fsDoc as { fullscreenElement?: Element | null }).fullscreenElement;
+    delete (HTMLElement.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+  });
+
+  it("opens the more actions menu inside the fullscreen feed on the first tap", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      actions: [
+        { id: "a", label: "Spotlight", icon: null, onClick: () => {} },
+        { id: "b", label: "Snapshot", icon: null, onClick: () => {} },
+      ],
+      trailingActions: [{ id: "x", label: "Close", icon: null, onClick: () => {} }],
+    });
+    /* Crowded enough that ⋮ stays even once fullscreen pins its exit inline. */
+    fireEvent.click(getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Enter fullscreen"));
+    });
+    expect(fsElement).not.toBeNull();
+
+    const trigger = getByLabelText("More actions");
+    fireEvent.pointerDown(trigger);
+    fireEvent.click(trigger);
+    const menu = getByRole("menu", { name: "More actions" });
+    expect(fsElement?.contains(menu)).toBe(true);
+
+    fireEvent.pointerDown(menu);
+    expect(getByRole("menu", { name: "More actions" })).toBe(menu);
+  });
+
+  async function openMenuInFullscreen() {
+    const { client } = await buildConnectedSource();
+    const utils = renderFeed(client, {
+      flightId: 42,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      actions: [
+        { id: "a", label: "Spotlight", icon: null, onClick: () => {} },
+        { id: "b", label: "Snapshot", icon: null, onClick: () => {} },
+      ],
+    });
+    fireEvent.click(utils.getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(utils.getByLabelText("Enter fullscreen"));
+    });
+    fireEvent.click(utils.getByLabelText("More actions"));
+    expect(utils.getByRole("menu", { name: "More actions" })).toBeTruthy();
+    return utils;
+  }
+
+  it("Escape with a menu open closes the menu and stays fullscreen", async () => {
+    const exitSpy = vi.fn();
+    Object.defineProperty(fsDoc, "exitFullscreen", { value: exitSpy, configurable: true });
+    try {
+      const { queryByRole, getByLabelText, getByRole } = await openMenuInFullscreen();
+      await act(async () => {
+        fireEvent.keyDown(getByRole("button", { name: "More actions" }), { key: "Escape" });
+      });
+      expect(queryByRole("menu", { name: "More actions" })).toBeNull();
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(getByLabelText("More actions"));
+    } finally {
+      delete (fsDoc as { exitFullscreen?: unknown }).exitFullscreen;
+    }
+  });
+
+  it("closes an open menu when fullscreen ends", async () => {
+    const { queryByRole, getByLabelText } = await openMenuInFullscreen();
+    await act(async () => {
+      fsElement = null;
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
+    expect(queryByRole("menu", { name: "More actions" })).toBeNull();
+    expect(document.activeElement).toBe(getByLabelText("More actions"));
+  });
+
+  it("still portals menus to the body when not fullscreen", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      actions: [
+        { id: "a", label: "Spotlight", icon: null, onClick: () => {} },
+        { id: "b", label: "Snapshot", icon: null, onClick: () => {} },
+      ],
+    });
+    fireEvent.click(getByLabelText("More actions"));
+    const menu = getByRole("menu", { name: "More actions" });
+    expect(menu.parentElement).toBe(document.body);
+  });
+});

@@ -45,7 +45,7 @@ import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
 import { claimAnchors } from "./sharedAnchors";
-import { usePortalMenu } from "./menuPositioning";
+import { menuPortalRoot, usePortalMenu } from "./menuPositioning";
 import { formatElapsed, nowMs } from "./timing";
 
 // ---------------------------------------------------------------------------
@@ -76,6 +76,16 @@ const QUALITY_PRESETS: ReadonlyArray<{
 function presetDim(operatorDim: number, scale: number): number {
   const v = Math.trunc(operatorDim * scale) & ~1;
   return v < 2 ? 2 : v;
+}
+
+function videoTrackId(source: MediaProvider | null): string | undefined {
+  if (!source || !("getVideoTracks" in source)) return undefined;
+  return source.getVideoTracks()[0]?.id;
+}
+
+function sameVideoTrack(a: MediaProvider | null, b: MediaStream | null): boolean {
+  const id = videoTrackId(a);
+  return id !== undefined && id === videoTrackId(b);
 }
 
 /*
@@ -520,10 +530,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     }, []);
     // The feed frame; fullscreen targets this and ResizeObserver measures it.
     const wrapRef = useRef<HTMLDivElement>(null);
+    /* Clearing to null on a switch to a camera with no stream yet stops the
+       previous camera's last frame lingering. A rebind can hand over a new
+       MediaStream around the same track; reassigning that would reset the
+       element and flash black, so it is skipped. */
     useEffect(() => {
-      if (videoRef.current && stream) {
-        videoRef.current.srcObject = stream;
-      }
+      const video = videoRef.current;
+      if (!video || video.srcObject === stream) return;
+      if (sameVideoTrack(video.srcObject, stream)) return;
+      video.srcObject = stream;
     }, [stream]);
 
     // -------------------------------------------------------------------------
@@ -587,6 +602,23 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         v.removeEventListener("leavepictureinpicture", onLeave);
       };
     }, [pipAvailable, flightId]);
+
+    /* Browsers usually consume Escape to leave fullscreen themselves; this
+       covers hosts and embedded views that hand the key to the page instead. */
+    useEffect(() => {
+      if (!isFullscreen) return;
+      const onKey = (e: KeyboardEvent) => {
+        if (
+          e.key === "Escape" &&
+          !e.defaultPrevented &&
+          currentFullscreenElement() === wrapRef.current
+        ) {
+          exitFullscreen();
+        }
+      };
+      document.addEventListener("keydown", onKey);
+      return () => document.removeEventListener("keydown", onKey);
+    }, [isFullscreen]);
 
     const toggleFullscreen = useCallback(() => {
       const el = wrapRef.current;
@@ -1053,7 +1085,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 </CameraMenuItem>
               ))}
             </CameraMenu>,
-            document.body,
+            menuPortalRoot(),
           )}
 
         {showDebugInfo &&
@@ -1243,10 +1275,14 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             {
               id: "fullscreen",
               label: fullscreenLabel,
+              /* While fullscreen the exit stays inline, never in the ⋮ menu,
+                 so it can be the one control the Stage keeps visible. */
               stateful: false,
+              inline: isFullscreen,
               render: () => (
                 <OverlayIconButton
                   type="button"
+                  data-kc-fullscreen-exit={isFullscreen || undefined}
                   aria-label={fullscreenLabel}
                   aria-pressed={isFullscreen}
                   title={fullscreenLabel}
@@ -1327,7 +1363,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     return (
       <FeedBox style={feedShape}>
-        <Stage ref={wrapRef} $pinned={chromePinned}>
+        <Stage
+          ref={wrapRef}
+          $pinned={chromePinned}
+          $fullscreen={isFullscreen}
+          data-fullscreen={isFullscreen || undefined}
+        >
           {flightId === null ? (
             <>
               <Empty>{emptyMessage}</Empty>
@@ -1385,7 +1426,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       {qualityThrottled ? " · throttled" : ""}
                     </QualityMeta>
                   </QualityMenu>,
-                  document.body,
+                  menuPortalRoot(),
                 )}
               {trackingAvailable &&
                 trackingMenu.open &&
@@ -1418,7 +1459,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       Track target
                     </CameraMenuItem>
                   </QualityMenu>,
-                  document.body,
+                  menuPortalRoot(),
                 )}
               {commandTargetAvailable &&
                 commandTargetMenu.open &&
@@ -1452,7 +1493,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       );
                     })}
                   </CameraMenu>,
-                  document.body,
+                  menuPortalRoot(),
                 )}
               {commandState &&
                 !outOfFlight &&
@@ -2027,8 +2068,9 @@ const StepButtons = styled.div`
 `;
 
 const CameraMenu = styled.div`
-  /* Portaled to document.body: fixed position (set inline from the trigger
-     rect) keeps it clear of the tile's overflow clipping. */
+  /* Portaled to document.body (the fullscreen element while fullscreen):
+     fixed position (set inline from the trigger rect) keeps it clear of the
+     tile's overflow clipping. */
   position: fixed;
   z-index: 1000;
   max-width: min(260px, calc(100vw - 16px));
@@ -2088,7 +2130,7 @@ const TopMeta = styled.div`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
-/* The quality picker: portaled to document.body like CameraMenu, hung from
+/* The quality picker: portaled like CameraMenu, hung from
    its action-bar trigger (fixed position set inline from the trigger rect)
    so tile clipping cannot cut it off and it survives the hover-revealed
    chrome fading while the pointer is over the menu. */
@@ -2274,7 +2316,7 @@ const FeedBox = styled.div`
   justify-content: center;
 `;
 
-const Stage = styled(Panel)<{ $pinned: boolean }>`
+const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean }>`
   width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
   height: auto;
   aspect-ratio: var(--kc-feed-w) / var(--kc-feed-h);
@@ -2317,6 +2359,31 @@ const Stage = styled(Panel)<{ $pinned: boolean }>`
       ${ZoomControlsWrap},
       ${PanControl} {
         opacity: 1;
+      }
+    `}
+
+  /* Fullscreen has no hover on touch and may have no pointer at all, so the
+     exit button stays visible in its usual slot while the rest of the bar
+     keeps its hover/focus/tap reveal. */
+  ${(p) =>
+    p.$fullscreen &&
+    !p.$pinned &&
+    css`
+      ${ActionBarRow} {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      ${ActionBarRow} > * {
+        transition: opacity 0.15s;
+      }
+      &:not(:hover):not(:focus-within) ${ActionBarRow} > :not([data-kc-fullscreen-exit]) {
+        opacity: 0;
+        pointer-events: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        ${ActionBarRow} > * {
+          transition: none;
+        }
       }
     `}
 `;

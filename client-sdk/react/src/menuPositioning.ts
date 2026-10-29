@@ -1,6 +1,6 @@
 /**
- * Shared geometry + behaviour for a dropdown portaled to document.body.
- * Used by CameraFeed's camera / quality / tracking menus and by
+ * Shared geometry + behaviour for a portaled dropdown (document.body, or the
+ * fullscreen element while one is fullscreen). Used by CameraFeed's camera / quality / tracking menus and by
  * FeedActionBar's overflow menu, so the anchoring, dismissal, and Escape
  * handling live in exactly one place.
  */
@@ -55,8 +55,19 @@ export function computeMenuPosition(
   return { ...inline, top };
 }
 
+/**
+ * Where a dropdown portals to. Only the fullscreen element and its
+ * descendants render while something is fullscreen, so a menu portaled to
+ * document.body then would open invisibly behind it.
+ */
+export function menuPortalRoot(): Element {
+  const d = document as Document & { webkitFullscreenElement?: Element | null };
+  return d.fullscreenElement ?? d.webkitFullscreenElement ?? document.body;
+}
+
 /*
- * Shared behaviour for a dropdown portaled to document.body: fixed position
+ * Shared behaviour for a dropdown portaled to document.body (or the
+ * fullscreen element, see menuPortalRoot): fixed position
  * computed from the trigger's rect (so tile overflow cannot clip it),
  * re-anchored on window resize/scroll while open, Escape to close with focus
  * returned to the trigger, and portal-aware outside-pointer-down dismissal
@@ -92,12 +103,23 @@ export function usePortalMenu({ maxWidth, maxHeight, align }: MenuAnchor) {
 
   useEffect(() => {
     if (!open) return;
+    /* Capture phase and preventDefault so document-level Escape handlers
+       registered earlier (CameraFeed's exit-fullscreen key) see the press
+       as already consumed by the menu. */
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        e.preventDefault();
         e.stopPropagation();
         setOpen(false);
         triggerRef.current?.focus();
       }
+    };
+    /* The portal root changes with fullscreen and no resize may fire (kiosk,
+       F11), so a menu left open would remount elsewhere with stale
+       coordinates. */
+    const onFullscreenChange = () => {
+      setOpen(false);
+      triggerRef.current?.focus();
     };
     const onPointerDown = (e: PointerEvent) => {
       if (
@@ -107,11 +129,15 @@ export function usePortalMenu({ maxWidth, maxHeight, align }: MenuAnchor) {
         setOpen(false);
       }
     };
-    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
     document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", onFullscreenChange);
     return () => {
-      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onKeyDown, true);
       document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", onFullscreenChange);
     };
   }, [open]);
 

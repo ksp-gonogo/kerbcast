@@ -13,6 +13,7 @@ import { partitionActionBarEntries } from "./FeedActionBar";
 interface Entry {
   id: string;
   stateful?: boolean;
+  inline?: boolean;
   order?: number;
   pinnedTrailing?: boolean;
 }
@@ -39,6 +40,27 @@ describe("partitionActionBarEntries", () => {
     const { primary, overflow } = partitionActionBarEntries(entries);
     expect(ids(primary)).toEqual(["tracking"]);
     expect(ids(overflow)).toEqual(["quality", "pip", "fullscreen"]);
+  });
+
+  it("keeps an inline entry out of overflow without changing the split", () => {
+    const base: Entry[] = [
+      { id: "tracking", stateful: true },
+      { id: "quality" },
+      { id: "pip" },
+      { id: "fullscreen" },
+    ];
+    const pinned = base.map((e) => (e.id === "fullscreen" ? { ...e, inline: true } : e));
+    const { primary, overflow } = partitionActionBarEntries(pinned);
+    expect(ids(primary)).toEqual(["tracking", "fullscreen"]);
+    expect(ids(overflow)).toEqual(["quality", "pip"]);
+
+    const twoNonStateful: Entry[] = [
+      { id: "tracking", stateful: true },
+      { id: "rec", stateful: true },
+      { id: "pip" },
+      { id: "fullscreen", inline: true },
+    ];
+    expect(ids(partitionActionBarEntries(twoNonStateful).overflow)).toEqual(["pip"]);
   });
 
   it("never collapses a single non-stateful item, even with total >= 4", () => {
