@@ -507,9 +507,13 @@ namespace Kerbcast
                 var toward = aim + ViewOffset - station;
                 double range = toward.Magnitude;
                 double clock = System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
-                var view = range > 0 ? _slew.Step(toward * (1.0 / range), double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt, jumped, _fov) : toward;
+                var view = range > 0
+                    ? _slew.Step(toward * (1.0 / range), double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt,
+                        double.IsNaN(_slewUt) ? 0 : ut - _slewUt, jumped, _fov)
+                    : toward;
                 _slewAt = clock;
-                NoteSlew(ut);
+                _slewUt = ut;
+                NoteSlew(ut, now);
                 CommandCameraMath.AimBasis(station, station + view * range, localUp, north, out _solveForward, out _solveUp);
                 _solveEye = station;
             }
@@ -636,7 +640,15 @@ namespace Kerbcast
         private readonly AimSlew _slew;
         /* Real seconds, double, of the last slew step; NaN before the first. */
         private double _slewAt = double.NaN;
+        /* UT of the last slew step; NaN before the first. */
+        private double _slewUt = double.NaN;
         private bool _slewLogged;
+        /* A world model publishing at physics rate can start a slew on every tick, so lines come at most once per SlewLogSeconds and the rest are counted into the next. */
+        private const float SlewLogSeconds = 5f;
+        private float _slewLogAt = float.NegativeInfinity;
+        private bool _slewPending;
+        private int _slewQuiet;
+        private double _slewQuietMaxDeg;
         private CommandAim _jumpAim;
         private uint _jumpSubject, _jumpVantage;
         private long _jumpGeneration;
@@ -678,13 +690,34 @@ namespace Kerbcast
             return jumped;
         }
 
-        private void NoteSlew(double ut)
+        private void NoteSlew(double ut, float now)
         {
             bool slewing = _slew.Slewing;
-            if (slewing == _slewLogged) return;
+            bool changed = slewing != _slewLogged;
             _slewLogged = slewing;
-            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(slewing ? "slew-start" : "slew-end")}"
-                + (slewing ? $" offsetDeg={_slew.OffsetRad * 180.0 / Math.PI:F3}" : ""));
+            double offsetDeg = _slew.OffsetRad * 180.0 / Math.PI;
+            bool due = now - _slewLogAt >= SlewLogSeconds;
+            if (changed && !due)
+            {
+                _slewPending = true;
+                if (slewing)
+                {
+                    _slewQuiet++;
+                    _slewQuietMaxDeg = Math.Max(_slewQuietMaxDeg, offsetDeg);
+                }
+                return;
+            }
+            if (!changed && !(due && _slewPending)) return;
+            _slewLogAt = now;
+            _slewPending = false;
+            string quiet = _slewQuiet > 0 ? $" unloggedStarts={_slewQuiet} unloggedMaxOffsetDeg={_slewQuietMaxDeg:F3}" : "";
+            _slewQuiet = 0;
+            _slewQuietMaxDeg = 0;
+            if (changed)
+                Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(slewing ? "slew-start" : "slew-end")}"
+                    + (slewing ? $" offsetDeg={offsetDeg:F3}" : "") + quiet);
+            else
+                Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=slews slewing={slewing}{quiet}");
         }
 
         private void NoteWaiting(double ut)
@@ -1272,6 +1305,7 @@ namespace Kerbcast
                     : _fovMax;
             double step = _frames.Next(dt);
             _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, step, FovTau, FovSnapAfter);
+            /* This eases on real time, between physics ticks too, so it is the one part of the aim the slew's per UT rate does not describe exactly. */
             _viewOffset = _mode == SubjectAimMode.Subject && AimIsCraft
                 ? CommandCameraMath.EaseToward(_viewOffset, shape.Known ? shape.Centre : default, step, FovTau, FovSnapAfter)
                 : default;

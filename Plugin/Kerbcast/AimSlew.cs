@@ -14,7 +14,13 @@ namespace Kerbcast
      * quarter of a pixel is taken at once. A view idle
      * for longer than SnapAfterS starts on its aim, as a first frame does.
      * A long frame turns it no further than a usual one (see FrameStep).
-     * Real time drives it, so warp does not hurry it.
+     * Real time drives the turn, so warp does not hurry it. The aim's own
+     * motion is learned and carried per UT instead: the subject moves only
+     * on a physics tick, so a rendered frame between ticks would learn it as
+     * stopped, and one after a tick as too fast. The rig's framing offset is
+     * the exception: it eases on every rendered frame, so a carried rate can
+     * miss its ease since the last tick. That miss is small against the
+     * field and is turned out like any other offset, never snapped to.
      */
     internal sealed class AimSlew
     {
@@ -37,7 +43,7 @@ namespace Kerbcast
 
         private bool _has;
         private DVec3 _lastAim, _lastView;
-        /* The aim's own turn, as a rotation vector per second, from its last step that was not a jump or was one close to the motion. */
+        /* The aim's own turn, as a rotation vector per UT second, from its last step that was not a jump or was one close to the motion. */
         private DVec3 _rate;
         private bool _rateKnown;
         /* The view's offset from the aim, as a rotation vector, and the speed it is being turned out at. */
@@ -69,8 +75,8 @@ namespace Kerbcast
             _speed = 0;
         }
 
-        /* The direction to look along this step, given the unit direction to the aim, `dt` real seconds since the last step, whether the aim may have jumped since then, and the field in degrees. */
-        public DVec3 Step(DVec3 aim, double dt, bool jumped, double fovDeg)
+        /* The direction to look along this step, given the unit direction to the aim, `dt` real seconds and `dut` UT seconds since the last step, whether the aim may have jumped since then, and the field in degrees. */
+        public DVec3 Step(DVec3 aim, double dt, double dut, bool jumped, double fovDeg)
         {
             if (!_has || !(dt >= 0) || dt > SnapAfterS)
             {
@@ -81,23 +87,30 @@ namespace Kerbcast
             }
             double field = fovDeg * Deg2Rad;
             var moved = RotationVector(_lastAim, aim);
-            if (jumped && !_rateKnown && dt > 0 && moved.Magnitude <= FirstLearnFields * field)
+            /* UT that stood still or went back carries nothing and teaches nothing. */
+            bool ticked = dut > 0;
+            if (jumped && !_rateKnown && moved.Magnitude <= FirstLearnFields * field)
             {
-                /* Nothing to carry the view on with yet: a step the size of motion is learned from and followed. */
-                Learn(moved, dt);
+                /*
+                 * Nothing to carry the view on with yet: a step the size of
+                 * motion is learned from and followed. One made while UT
+                 * stands, as in a pause, is still followed at once, as it was
+                 * when this went by real time; it just teaches nothing.
+                 */
+                if (ticked) Learn(moved, dut);
                 _offset = default;
                 _speed = 0;
             }
             else if (jumped)
             {
                 /* The view carries on with the aim's own motion; only what is left over is turned out, keeping any speed already turning. */
-                var carried = Turn(_lastView, _rate * dt);
+                var carried = ticked ? Turn(_lastView, _rate * dut) : _lastView;
                 _offset = RotationVector(aim, carried);
-                if (dt > 0 && _offset.Magnitude < LearnFieldFraction * field) Learn(moved, dt);
+                if (ticked && _offset.Magnitude < LearnFieldFraction * field) Learn(moved, dut);
                 if (_offset.Magnitude < MinOffsetFieldFraction * field) _offset = default;
                 if (_offset.Magnitude == 0) _speed = 0;
             }
-            else if (dt > 0) Learn(moved, dt);
+            else if (ticked) Learn(moved, dut);
 
             /* The aim's own motion is carried for the whole gap; the offset turns out by a usual frame at most, so a hitch never finishes a turn at once. */
             double step = _learnsFrames ? _frames.Next(dt) : _frames.Clip(dt);
@@ -122,9 +135,9 @@ namespace Kerbcast
             return view;
         }
 
-        private void Learn(DVec3 moved, double dt)
+        private void Learn(DVec3 moved, double dut)
         {
-            _rate = moved * (1.0 / dt);
+            _rate = moved * (1.0 / dut);
             _rateKnown = true;
         }
 

@@ -745,7 +745,7 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         for (int i = 0; i < 300; i++)
         {
             var aim = Dir(aimRate * i * dt);
-            lag = Math.Max(lag, Deg(fresh.Step(aim, dt, false, Fov), aim));
+            lag = Math.Max(lag, Deg(fresh.Step(aim, dt, dt, false, Fov), aim));
             slewed |= fresh.Slewing;
         }
         Check(lag < 1e-9 && !slewed, $"slew: a {aimRate} deg/s aim at {1 / dt:F0} fps from a fresh start is followed with no lag ({lag:G2} deg)");
@@ -761,7 +761,7 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         for (int i = 0; i < 10 * perSecond; i++)
         {
             var aim = Dir(aimRate * i * dt);
-            lag = Math.Max(lag, Deg(held.Step(aim, dt, i % perSecond == 0, fov), aim));
+            lag = Math.Max(lag, Deg(held.Step(aim, dt, dt, i % perSecond == 0, fov), aim));
             slewed |= held.Slewing;
         }
         Check(lag < 1e-6 && !slewed, $"slew: {aimRate} deg/s with 1 Hz publishes that agree stays on the aim with no slew ({lag:G2} deg)");
@@ -775,15 +775,15 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         for (int i = 0; i < 600; i++)
         {
             var aim = Dir(at(i * Dt));
-            lag = Math.Max(lag, Deg(every.Step(aim, Dt, true, 1.0), aim));
+            lag = Math.Max(lag, Deg(every.Step(aim, Dt, Dt, true, 1.0), aim));
         }
         Check(lag < 0.02, $"slew: {name} with a publish every frame stays within 2% of a 1 degree field ({lag:G2} deg)");
     }
 
     /* A 30 degree jump. */
     var slew = new AimSlew();
-    slew.Step(Dir(0), Dt, false, Fov);
-    var first = slew.Step(Dir(30), Dt, true, Fov);
+    slew.Step(Dir(0), Dt, Dt, false, Fov);
+    var first = slew.Step(Dir(30), Dt, Dt, true, Fov);
     double firstStep = Deg(first, Dir(0));
     Check(firstStep <= AimSlew.AccelDegPerS2 * Dt * Dt + 1e-9, $"slew: a jump starts from where the view was, easing in ({firstStep:G3} deg in the first frame)");
     var last = first;
@@ -792,7 +792,7 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     int frames = 1;
     while (slew.Slewing && frames < 2000)
     {
-        var view = slew.Step(Dir(30), Dt, false, Fov);
+        var view = slew.Step(Dir(30), Dt, Dt, false, Fov);
         double step = Deg(view, last);
         maxRate = Math.Max(maxRate, step / Dt);
         double off = Deg(view, Dir(30));
@@ -813,22 +813,105 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     /* From a fast aim to a slower one elsewhere: the jump is turned out, then the new aim is followed exactly. */
     slew = new AimSlew();
     int k = 0;
-    for (; k < 120; k++) slew.Step(Dir(20.0 * k * Dt), Dt, false, Fov);
+    for (; k < 120; k++) slew.Step(Dir(20.0 * k * Dt), Dt, Dt, false, Fov);
     DVec3 Slow(int i) => Dir(90 + 2.0 * i * Dt);
-    slew.Step(Slow(k), Dt, true, Fov);
+    slew.Step(Slow(k), Dt, Dt, true, Fov);
     bool slewedOnto = slew.Slewing;
-    for (k++; k < 2000 && slew.Slewing; k++) slew.Step(Slow(k), Dt, false, Fov);
+    for (k++; k < 2000 && slew.Slewing; k++) slew.Step(Slow(k), Dt, Dt, false, Fov);
     double after = 0;
-    for (int j = 0; j < 120; j++, k++) after = Math.Max(after, Deg(slew.Step(Slow(k), Dt, false, Fov), Slow(k)));
+    for (int j = 0; j < 120; j++, k++) after = Math.Max(after, Deg(slew.Step(Slow(k), Dt, Dt, false, Fov), Slow(k)));
     Check(slewedOnto && !slew.Slewing && after < 1e-9, $"slew: a jump from a fast aim to a slower one turns, settles, then follows it ({after:G2} deg)");
 
     /* Too long idle snaps; a half turn completes; no jump, no slew. */
     slew = new AimSlew();
-    slew.Step(Dir(0), Dt, false, Fov);
-    Check(Deg(slew.Step(Dir(90), AimSlew.SnapAfterS + 0.1, true, Fov), Dir(90)) == 0 && !slew.Slewing, "slew: a view idle past SnapAfterS starts on its aim");
-    slew.Step(Dir(270), Dt, true, Fov);
-    for (int j = 0; j < 2000 && slew.Slewing; j++) slew.Step(Dir(270), Dt, false, Fov);
-    Check(Deg(slew.Step(Dir(270), Dt, false, Fov), Dir(270)) < 1e-9, "slew: a half turn completes");
+    slew.Step(Dir(0), Dt, Dt, false, Fov);
+    Check(Deg(slew.Step(Dir(90), AimSlew.SnapAfterS + 0.1, AimSlew.SnapAfterS + 0.1, true, Fov), Dir(90)) == 0 && !slew.Slewing, "slew: a view idle past SnapAfterS starts on its aim");
+    slew.Step(Dir(270), Dt, Dt, true, Fov);
+    for (int j = 0; j < 2000 && slew.Slewing; j++) slew.Step(Dir(270), Dt, Dt, false, Fov);
+    Check(Deg(slew.Step(Dir(270), Dt, Dt, false, Fov), Dir(270)) < 1e-9, "slew: a half turn completes");
+}
+
+/*
+ * As the rig drives it: UT moves only on a 50 Hz physics tick, frames render
+ * at 60 or 144 fps, so some frames see no tick and some see two, and a world
+ * model publishes every few ticks. A narrow field on a subject crossing it
+ * at 2 deg/s shows any jump at a publish; the view stays on the aim.
+ */
+{
+    const double Tick = 0.02, D2R = Math.PI / 180.0, Fov = 0.1, AimRate = 2.0;
+    DVec3 Dir(double deg) => new DVec3(Math.Cos(deg * D2R), Math.Sin(deg * D2R), 0);
+    double Deg(DVec3 a, DVec3 b) => CommandCameraMath.AngleBetween(a, b) / D2R;
+
+    /*
+     * The worst the view strays from the aim over 10 s, as a fraction of the
+     * field. `pausedFrom` stops UT for a second there, with a publish halfway
+     * through the pause and another on the first tick after it.
+     */
+    double Worst(double fps, int ticksPerPublish, double pausedFrom = double.NaN)
+    {
+        var slew = new AimSlew();
+        double dt = 1.0 / fps, real = 0, ut = 0, lastUt = 0, worst = 0, paused = 0;
+        int ticks = 0, published = 0;
+        bool awaitTick = false;
+        for (int i = 0; i < 10 * fps; i++)
+        {
+            real += dt;
+            bool forced = false;
+            if (real >= pausedFrom && paused < 1.0)
+            {
+                forced = paused < 0.5 && paused + dt >= 0.5;
+                paused += dt;
+                awaitTick = true;
+            }
+            else
+            {
+                int before = ticks;
+                while ((ticks + 1) * Tick <= real - paused) ticks++;
+                ut = ticks * Tick;
+                forced = awaitTick && ticks > before;
+                awaitTick &= !forced;
+            }
+            int publish = ticks / ticksPerPublish;
+            var aim = Dir(AimRate * ut);
+            var view = slew.Step(aim, i == 0 ? double.MaxValue : dt, ut - lastUt, i == 0 || forced || publish != published, Fov);
+            published = publish;
+            lastUt = ut;
+            if (i > 0) worst = Math.Max(worst, Deg(view, aim) / Fov);
+        }
+        return worst;
+    }
+
+    foreach (double fps in new[] { 60.0, 144.0 })
+        foreach (int every in new[] { 1, 5, 12, 25 })
+        {
+            double worst = Worst(fps, every);
+            Check(worst < 0.01, $"slew on ticks: {fps:F0} fps, 50 Hz physics, a publish every {every} ticks stays within 1% of the field ({worst:P2})");
+        }
+    foreach (double fps in new[] { 60.0, 144.0 })
+    {
+        double worst = Worst(fps, 12, 4.0);
+        Check(worst < 0.01, $"slew on ticks: {fps:F0} fps through a 1 s pause, publishing in it and on the tick after, stays within 1% of the field ({worst:P2})");
+    }
+
+    /* UT stepping back (a revert, a quickload) while the aim moves on teaches no reversed rate: the publish on the next tick is carried as before. */
+    {
+        var slew = new AimSlew();
+        double ut = 0, worst = 0;
+        slew.Step(Dir(0), double.MaxValue, 0, true, Fov);
+        for (int i = 0; i < 50; i++)
+        {
+            ut += Tick;
+            slew.Step(Dir(AimRate * ut), Tick, Tick, false, Fov);
+        }
+        double deg = AimRate * (ut + Tick);
+        slew.Step(Dir(deg), Tick, -Tick, false, Fov);
+        for (int i = 0; i < 10; i++)
+        {
+            deg += AimRate * Tick;
+            worst = Math.Max(worst, Deg(slew.Step(Dir(deg), Tick, Tick, i == 0, Fov), Dir(deg)) / Fov);
+        }
+        Check(worst < 0.01, $"slew on ticks: a step back in UT is not learned from, so the next publish stays within 1% of the field ({worst:P2})");
+    }
 }
 
 /* The placeholder a camera holds with no subject to aim at. */
@@ -885,8 +968,8 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     var shared = new FrameStep(1.0);
     shared.Learn(0.1);
     var clipped = new AimSlew(shared);
-    clipped.Step(new DVec3(1, 0, 0), double.MaxValue, false, 10);
-    for (int i = 0; i < 40; i++) clipped.Step(new DVec3(1, 0, 0), i % 2 == 0 ? 0.095 : 0.005, false, 10);
+    clipped.Step(new DVec3(1, 0, 0), double.MaxValue, double.MaxValue, false, 10);
+    for (int i = 0; i < 40; i++) clipped.Step(new DVec3(1, 0, 0), i % 2 == 0 ? 0.095 : 0.005, i % 2 == 0 ? 0.095 : 0.005, false, 10);
     Check(Math.Abs(shared.Clip(0.15) - 0.15) < 1e-9, "frame step: a slew sharing the rendered frame's step does not learn polls between frames");
 }
 
@@ -916,12 +999,12 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         for (int i = 0; i < 48; i++)
         {
             lastMode = wait.Step(i == 0, false);
-            view = slew.Step(placeholder, i == 0 ? double.MaxValue : Dt, i == 0, fov);
+            view = slew.Step(placeholder, i == 0 ? double.MaxValue : Dt, i == 0 ? double.MaxValue : Dt, i == 0, fov);
             fov = CommandCameraMath.SmoothFov(fov, PlaceholderFov, fovStep.Next(Dt), 0.4, 1.0);
         }
         var mode = wait.Step(false, true);
         bool jumped = mode != lastMode;
-        var first = slew.Step(subject, Hitch, jumped, fov);
+        var first = slew.Step(subject, Hitch, Hitch, jumped, fov);
         double firstFov = CommandCameraMath.SmoothFov(fov, SubjectFov, fovStep.Next(Hitch), 0.4, 1.0);
         double usualZoom = Math.Log(CommandCameraMath.SmoothFov(fov, SubjectFov, Dt, 0.4, 1.0) / fov);
         Check(mode == SubjectAimMode.Subject && jumped, $"hand-off ({name}): the first fix is a jump for the slew");
@@ -935,7 +1018,7 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         int frames = 0;
         for (; frames < 2000 && slew.Slewing; frames++)
         {
-            var next = slew.Step(subject, Dt, false, fov);
+            var next = slew.Step(subject, Dt, Dt, false, fov);
             maxStep = Math.Max(maxStep, Deg(next, last));
             double off = Deg(next, subject);
             closes &= off <= prevOff + 1e-12;
@@ -956,19 +1039,19 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         for (int i = 0; i < 48; i++)
         {
             lastMode = wait.Step(i == 0, false);
-            slew.Step(placeholder, i == 0 ? double.MaxValue : Dt, i == 0, PlaceholderFov);
+            slew.Step(placeholder, i == 0 ? double.MaxValue : Dt, i == 0 ? double.MaxValue : Dt, i == 0, PlaceholderFov);
         }
         double t = 0;
         var mode = wait.Step(false, true);
-        slew.Step(Moving(t += Hitch), Hitch, mode != lastMode, PlaceholderFov);
+        slew.Step(Moving(t += Hitch), Hitch, Hitch, mode != lastMode, PlaceholderFov);
         bool slewed = slew.Slewing;
-        for (int i = 0; i < 2000 && slew.Slewing; i++) slew.Step(Moving(t += Dt), Dt, false, PlaceholderFov);
+        for (int i = 0; i < 2000 && slew.Slewing; i++) slew.Step(Moving(t += Dt), Dt, Dt, false, PlaceholderFov);
         double lag = 0;
         for (int i = 0; i < 48; i++)
         {
             double dt = i == 24 ? Hitch : Dt;
             var aim = Moving(t += dt);
-            lag = Math.Max(lag, Deg(slew.Step(aim, dt, i % 6 == 0, PlaceholderFov), aim));
+            lag = Math.Max(lag, Deg(slew.Step(aim, dt, dt, i % 6 == 0, PlaceholderFov), aim));
         }
         Check(slewed && !slew.Slewing && lag < 1e-6, $"hand-off: onto a moving subject on a hitch, it turns, then follows with no lag ({lag:G2} deg)");
     }
@@ -979,16 +1062,16 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         var slew = new AimSlew();
         var held = At(10, 2);
         var mode = wait.Step(true, true);
-        slew.Step(held, double.MaxValue, true, SubjectFov);
-        for (int i = 0; i < 24; i++) slew.Step(held, Dt, false, SubjectFov);
+        slew.Step(held, double.MaxValue, double.MaxValue, true, SubjectFov);
+        for (int i = 0; i < 24; i++) slew.Step(held, Dt, Dt, false, SubjectFov);
         var lastMode = mode;
         mode = wait.Step(false, false);
-        var view = slew.Step(held, Dt, mode != lastMode, SubjectFov);
+        var view = slew.Step(held, Dt, Dt, mode != lastMode, SubjectFov);
         Check(mode == SubjectAimMode.Hold && Deg(view, held) < 1e-9 && !slew.Slewing, "hand-off: a lost subject holds the view where it was");
         /* The new subject is a jump by itself, as AimJumped sees it, whatever the mode does. */
         mode = wait.Step(true, true);
         var next = At(-15, 4);
-        var first = slew.Step(next, Hitch, true, SubjectFov);
+        var first = slew.Step(next, Hitch, Hitch, true, SubjectFov);
         Check(mode == SubjectAimMode.Subject && slew.Slewing && Deg(first, held) <= oneStep + 1e-9,
             $"hand-off: a new subject from a held view slews from where the view was ({Deg(first, held):G3} deg in the first frame)");
     }
