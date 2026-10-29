@@ -2139,7 +2139,8 @@ namespace Kerbcast
                     /* By day in an atmosphere KSP tints the galaxy cube black, and a
                        black cube over a black clear is the clear: clearing gives the
                        same frame without a camera render (see GalaxyBlackout). */
-                    if ((_integrationHost == null || !_integrationHost.Touches(CameraLayers.Galaxy))
+                    if (KerbcastSettings.EnableGalaxySkip
+                        && (_integrationHost == null || !_integrationHost.Touches(CameraLayers.Galaxy))
                         && GalaxySky.CanClear(_galaxyCam))
                     {
                         var previous = RenderTexture.active;

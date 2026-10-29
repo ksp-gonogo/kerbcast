@@ -74,6 +74,18 @@ void Warn(string msg) => warnings.Add(msg);
     Check(port == 9000, "empty user file leaves defaults-file values intact");
 }
 
+// --- Layering: a user file turns off a switch the shipped file has on. ---
+{
+    warnings.Clear();
+    bool galaxySkip = true;
+    var defaultsFile = Node(("EnableGalaxySkip", "true"));
+    var userFile = Node(("EnableGalaxySkip", "False"));
+    foreach (var file in new[] { defaultsFile, userFile })
+        SettingsLayer.ApplyBool(file, "EnableGalaxySkip", v => galaxySkip = v, Warn);
+    Check(!galaxySkip, "user file's false overrides the shipped file's true");
+    Check(warnings.Count == 0, "capitalised False parses without a warning");
+}
+
 // --- Parse failures: warn, keep the current (already-layered) value. ---
 {
     warnings.Clear();

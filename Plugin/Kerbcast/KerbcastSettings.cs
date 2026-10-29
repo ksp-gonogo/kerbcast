@@ -286,6 +286,11 @@ namespace Kerbcast
         // instance) can read it without a back-ref.
         public static bool EnableHullcamLinuxShaderSwap { get; private set; } = true;
 
+        /* By day in an atmosphere, clear a camera's galaxy layer instead of
+           rendering the black sky (see GalaxyBlackout). Off renders it every
+           frame, an escape hatch should a visual mod ever expect the render. */
+        public static bool EnableGalaxySkip { get; private set; } = true;
+
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
         // (atmospheric FX missing from streams, layer mismatches
@@ -474,6 +479,8 @@ namespace Kerbcast
                     : $"{defaultsPath} + user overrides ({userPath})";
             var camCount = settings._initialLayers.Count;
             Debug.Log($"[Kerbcast] settings loaded from {sources}: bind={settings.HttpBind} tier={settings.MaxQuality} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
+            if (!EnableGalaxySkip)
+                Debug.Log("[Kerbcast] EnableGalaxySkip=false: every camera renders its galaxy layer, even when the sky is black");
             if (!IsLoopback(settings.BindAddress))
             {
                 Debug.LogWarning($"[Kerbcast] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
@@ -554,6 +561,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableDeferred", v => EnableDeferred = v);
             ApplyBool(node, "EnableFirefly", v => EnableFirefly = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
+            ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
