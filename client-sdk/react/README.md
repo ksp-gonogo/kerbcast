@@ -82,6 +82,15 @@ cannot loop with the request. A resize within about a second of the stream
 changing that matches its new shape counts as following it. Layout changes
 outside that window always report.
 
+The feed frame (the element fullscreen targets) carries two attributes for
+hosts and tests:
+
+- `data-kc-signal`: `live`, `stalled` (no decoded frame for half a second,
+  or none yet since the source attached) or `none` (no source). The video
+  keeps presenting frames while it shows static, so its frame counts cannot
+  tell a picture from static; this can
+- `data-fullscreen`: present while the feed is fullscreen
+
 An imperative `CameraFeedHandle` (via `ref`) exposes `stepCamera`,
 `setPanAxis`, `setZoomRate`, `nudgePan`, and `nudgeZoom` for wiring feeds
 to a gamepad or keyboard.

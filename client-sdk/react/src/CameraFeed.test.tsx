@@ -998,6 +998,107 @@ describe("CameraFeed - stall presentation (showStatic)", () => {
     }
   });
 
+  it("data-kc-signal follows a feed into and out of a stall without remounting its video", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      const { container } = renderFeed(client, { flightId: 42 });
+      const signal = () => container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+      expect(signal()).toBe("none");
+
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+      const video = container.querySelector("video");
+
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+      expect(container.querySelector("video")).toBe(video);
+
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+      expect(container.querySelector("video")).toBe(video);
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("data-kc-signal reads stalled for a source that never delivers a frame", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      const { container } = renderFeed(client, { flightId: 42 });
+      const signal = () => container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+
+      env.setNow(1000);
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+        env.drawOnce();
+      });
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("data-kc-signal reads stalled after a camera switch until the new camera's first frame", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource([
+        makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+        makeCamera({ flightId: 43, cameraName: "Port Cam" }),
+      ]);
+      const view = renderFeed(client, { flightId: 42 });
+      const signal = () => view.container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+
+      /* The freed slot passes straight to the new camera, so there is a
+         source at once but no frame of it yet. */
+      view.rerender(
+        <KerbcastProvider client={client}>
+          <CameraFeed flightId={43} />
+        </KerbcastProvider>,
+      );
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+    } finally {
+      env.restore();
+    }
+  });
+
   it("SIGNAL LOST supersedes the stale badge when the camera is destroyed", async () => {
     const env = installStallEnv();
     try {

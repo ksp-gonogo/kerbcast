@@ -562,6 +562,20 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       return cam.on("stall", setIsStale);
     }, [client, flightId]);
 
+    const [hasSource, setHasSource] = useState(false);
+    useEffect(() => {
+      if (flightId === null) {
+        setHasSource(false);
+        return;
+      }
+      const cam = client.camera(flightId);
+      setHasSource(cam.hasSource);
+      return cam.on("source", setHasSource);
+    }, [client, flightId]);
+    /* The in-stream static keeps the video element presenting frames, so a
+       frame count cannot tell a picture from static; this attribute can. */
+    const signal = flightId === null ? undefined : !hasSource ? "none" : isStale ? "stalled" : "live";
+
     // -------------------------------------------------------------------------
     // Fullscreen + Picture-in-Picture (opt-in, feature-detected)
     // -------------------------------------------------------------------------
@@ -1368,6 +1382,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
           $pinned={chromePinned}
           $fullscreen={isFullscreen}
           data-fullscreen={isFullscreen || undefined}
+          data-kc-signal={signal}
         >
           {flightId === null ? (
             <>
