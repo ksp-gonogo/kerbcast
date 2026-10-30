@@ -136,6 +136,17 @@ namespace Kerbcast
             return PastStatus.Found;
         }
 
+        /*
+         * The instant a place fixed to a body, `distance` from the lens now,
+         * stands for: its light time back from t, no earlier than `lo`. The
+         * place is the same on its body at every instant, so it is drawn where
+         * it is now; solving its inertial path instead fails wherever the
+         * ground outruns light, as it does at Kerbin's equator at a heavily
+         * scaled light speed.
+         */
+        public static double BodyFixedInstant(double distance, double t, double c, double lo) =>
+            Math.Min(t, Math.Max(lo, t - distance / c));
+
         /* Whether light from `path` at `ut` has reached the lens by t: the test every solved instant passes. */
         public static bool Arrived<T>(ref T path, DVec3 lens, double t, double c, double ut) where T : IPastPath =>
             G(ref path, lens, t, c, ut, out double g) && g <= 0;

@@ -1485,6 +1485,61 @@ bool IsLatest<T>(ref T path, DVec3 lens, double tt, double c, double k, double t
         $"once its root passes the record's start the craft is drawn at the root, whose light has arrived, without a jump ({firstPast:F3} s past the start)");
 }
 
+/* ---- a place on a turning body whose ground outruns light ---- */
+{
+    /* Kerbin's equator turns at about 175 m/s; a lens and a craft on the pad 500 m apart, c = 60. */
+    const double c = 60, radius = 600000, t0 = 1000;
+    double w = 175 / radius;
+    double lo = t0 - 7.45;
+    DVec3 OnGround(double angle, double ut) => new DVec3(radius * Math.Cos(angle + w * ut), radius * Math.Sin(angle + w * ut), 0);
+    DVec3 ToBody(DVec3 v, double ut) => new DVec3(
+        v.X * Math.Cos(-w * ut) - v.Y * Math.Sin(-w * ut), v.X * Math.Sin(-w * ut) + v.Y * Math.Cos(-w * ut), v.Z);
+    double craftAngle = 500 / radius;
+
+    /* As the rig solved it before, on the inertial path. Behind the lens in the turn there is no root after the
+       record's start, so the craft stays at its inertial place then; ahead, the root is 128 m off, not 500. */
+    foreach (double side in new[] { -1.0, 1.0 })
+    {
+        var inertial = new Spun { Radius = radius, Angle = side * craftAngle, W = w, From = lo };
+        double firstOld = double.NaN, lastOld = double.NaN;
+        for (double t = t0; t <= t0 + 300; t += 1)
+        {
+            var lensAt = OnGround(0, t);
+            var st = PastInstant.SolveFrom(ref inertial, lensAt, t, c, 175, lo, t, out double tr);
+            inertial.TryAt(tr, out var drawn);
+            double range = (drawn - lensAt).Magnitude;
+            if (double.IsNaN(firstOld)) firstOld = range;
+            lastOld = st == PastStatus.Found ? range : double.NaN;
+        }
+        Check(side < 0 ? firstOld > 1500 && lastOld > 50000 : Math.Abs(lastOld - 500) > 300,
+            $"solved on its inertial path, a craft {(side < 0 ? "behind" : "ahead of")} the lens is drawn wrong ({firstOld:F0} m at once, {lastOld:F0} m after 5 minutes)");
+    }
+
+    /* Placed where the source puts it now, at the instant of its light time. */
+    bool steady = true, instants = true;
+    double prev = double.NegativeInfinity;
+    DVec3 firstDir = default;
+    double worstDir = 0;
+    for (double t = t0; t <= t0 + 300; t += 1)
+    {
+        var lensAt = OnGround(0, t);
+        var drawn = OnGround(craftAngle, t);
+        double d = (drawn - lensAt).Magnitude;
+        double at = PastInstant.BodyFixedInstant(d, t, c, lo);
+        if (Math.Abs(d - 500) > 0.01) steady = false;
+        if (at < lo || at > t || at < prev || Math.Abs(at - Math.Max(lo, t - d / c)) > 1e-9) instants = false;
+        prev = at;
+        var dir = ToBody(drawn - lensAt, t) * (1 / d);
+        if (t == t0) firstDir = dir;
+        worstDir = Math.Max(worstDir, (dir - firstDir).Magnitude);
+    }
+    Check(steady && worstDir < 1e-9, $"placed on its ground, the craft stays 500 m off in one direction on the body over 5 minutes ({worstDir:E1})");
+    Check(instants, "its instant is its light time back from now, never before the record's start nor after now, never stepping back");
+    Check(PastInstant.BodyFixedInstant(500, t0, c, lo) == lo && PastInstant.BodyFixedInstant(500, t0, c, t0 - 9) == t0 - 500 / c,
+        "the record's start bounds the instant while the light time reaches past it");
+    Check(PastInstant.BodyFixedInstant(500, t0, c, t0 + 1) == t0, "a record that starts after now takes the present");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
@@ -1542,6 +1597,17 @@ struct FromUt : IPastPath
     {
         position = default;
         return ut >= From && Inner.TryAt(ut, out position);
+    }
+}
+
+/* A point fixed on the equator of a body turning at W about z, seen inertially, placed only from From on. */
+struct Spun : IPastPath
+{
+    public double Radius, Angle, W, From;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = new DVec3(Radius * Math.Cos(Angle + W * ut), Radius * Math.Sin(Angle + W * ut), 0);
+        return ut >= From;
     }
 }
 
