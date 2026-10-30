@@ -1416,6 +1416,12 @@ pub struct PerCameraStatusExport {
     pub pan_pitch: f32,
 }
 
+/* The plugin's live FoV when it reported a usable one, else the manifest default. */
+fn effective_fov(live: Option<f32>, default: f32) -> f32 {
+    live.filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(default)
+}
+
 impl From<&GlobalStatusFile> for GlobalStatusFileExport {
     fn from(s: &GlobalStatusFile) -> Self {
         Self {
@@ -1912,16 +1918,19 @@ impl CameraRegistry {
     pub async fn list(&self) -> Vec<CameraInfo> {
         let cams = self.snapshot().await;
         let primary_fps = self.primary_capture_fps().await;
-        let centres: HashMap<u32, CommandTargetsStatus> = self
+        let (centres, live_fovs): (HashMap<u32, CommandTargetsStatus>, HashMap<u32, f32>) = self
             .last_status
             .lock()
             .await
             .as_ref()
             .map(|st| {
-                st.cameras
+                let centres = st
+                    .cameras
                     .iter()
                     .filter_map(|c| c.command_targets.clone().map(|cc| (c.flight_id, cc)))
-                    .collect()
+                    .collect();
+                let fovs = st.cameras.iter().map(|c| (c.flight_id, c.fov)).collect();
+                (centres, fovs)
             })
             .unwrap_or_default();
         let mut out = Vec::with_capacity(cams.len());
@@ -1947,7 +1956,7 @@ impl CameraRegistry {
                 camera_name: s.camera_name.clone(),
                 vessel_name: s.vessel_name.clone(),
                 supports_zoom: s.supports_zoom,
-                fov: s.fov_default,
+                fov: effective_fov(live_fovs.get(&s.flight_id).copied(), s.fov_default),
                 fov_min: s.fov_min,
                 fov_max: s.fov_max,
                 supports_pan: s.supports_pan,
@@ -3131,7 +3140,7 @@ impl CameraRegistry {
         let fov = per
             .as_ref()
             .map(|p| p.fov)
-            .filter(|f| *f != 0.0)
+            .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or_else(|| ctrl.fov.unwrap_or(cam.fov_default));
         let pan_yaw = per
             .as_ref()
@@ -6119,6 +6128,30 @@ mod tests {
             r#"{{"kspFps":60.0,"shedLevel":0{extra},"cameras":[{{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64}}]}}"#
         );
         std::fs::write(dir.join("global.status.json"), body).unwrap();
+    }
+
+    #[test]
+    fn effective_fov_prefers_a_usable_live_value() {
+        assert_eq!(effective_fov(Some(25.0), 60.0), 25.0);
+        assert_eq!(effective_fov(None, 60.0), 60.0);
+        assert_eq!(effective_fov(Some(0.0), 60.0), 60.0);
+        assert_eq!(effective_fov(Some(f32::NAN), 60.0), 60.0);
+        assert_eq!(effective_fov(Some(-5.0), 60.0), 60.0);
+    }
+
+    #[tokio::test]
+    async fn list_reports_the_live_status_fov() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let default = info_for(&registry, 1).await.fov;
+        std::fs::write(
+            dir.path().join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":23.5}]}"#,
+        )
+        .unwrap();
+        registry.poll_status().await;
+        assert_eq!(info_for(&registry, 1).await.fov, 23.5);
+        assert_ne!(default, 23.5);
     }
 
     async fn info_for(registry: &CameraRegistry, flight_id: u32) -> CameraInfo {
