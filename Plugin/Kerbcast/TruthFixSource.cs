@@ -79,9 +79,10 @@ namespace Kerbcast
             return fix;
         }
 
-        public bool SubjectMotion(double ut, out BodyMotion motion, out double validUntilUt)
+        public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt)
         {
             motion = default;
+            validFromUt = double.NegativeInfinity;
             validUntilUt = double.PositiveInfinity;
             if (_selection == null) return false;
             _gate.BeforeRead();

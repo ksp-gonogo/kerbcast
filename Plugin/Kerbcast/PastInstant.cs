@@ -18,7 +18,8 @@ namespace Kerbcast
 
     internal enum PastStatus
     {
-        /* The light arriving now left the craft at the solved instant. */
+        /* The light arriving now left the craft at the solved instant; from
+           SolveFrom, possibly instead the instant its source first vouches for. */
         Found,
         /* No light from the craft has arrived yet: its past instant is before
            its history starts, or before the ring's floor. */
@@ -66,7 +67,9 @@ namespace Kerbcast
      * path itself, so its light has arrived and nothing shows early whatever
      * the path does: a bound the craft breaks, or a position that jumps
      * between ring entries (the 1 m gate, a centre of mass against an orbit
-     * at load), costs only freshness or which root is taken.
+     * at load), costs only freshness or which root is taken. The exception
+     * is SolveFrom's held instant: the source vouches for the craft from
+     * then, though no light from it has arrived.
      *
      * Below c, g is strictly increasing, so the root is unique; it is
      * bracketed and narrowed, and the instant returned is within the
@@ -112,6 +115,25 @@ namespace Kerbcast
             return v < c
                 ? Bracket(ref path, lens, t, c, v, lo, b, gb, tol, out tr)
                 : Trace(ref path, lens, t, c, v, lo, b, gb, tol, out tr);
+        }
+
+        /*
+         * Solve for a path known only from `lo`, such as a world model's
+         * record that vouches for nothing before its ValidFromUt. Where the
+         * root lies before `lo` the craft is taken at `lo`, as the source
+         * first knows it, rather than not at all: the source's knowledge
+         * arrived by its own route, not by light from the craft to this lens.
+         * An unbounded `lo` is plain Solve, where Unseen means the craft did
+         * not exist yet.
+         */
+        public static PastStatus SolveFrom<T>(ref T path, DVec3 lens, double t, double c, double speedBound,
+            double lo, double hi, out double tr) where T : IPastPath
+        {
+            var status = Solve(ref path, lens, t, c, speedBound, lo, hi, out tr);
+            if (status != PastStatus.Unseen || double.IsInfinity(lo) || !(lo <= Math.Min(hi, t))) return status;
+            if (!path.TryAt(lo, out _)) return PastStatus.Unsolved;
+            tr = lo;
+            return PastStatus.Found;
         }
 
         /* Whether light from `path` at `ut` has reached the lens by t: the test every solved instant passes. */

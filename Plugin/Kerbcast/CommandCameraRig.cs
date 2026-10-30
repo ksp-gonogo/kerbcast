@@ -772,9 +772,13 @@ namespace Kerbcast
          * instant: the latest root of the light-time equation on the source's
          * positions, never the picture's, in the frame of the common ancestor
          * of the lens's body and the subject's, as the picture solves it. Render
-         * UT with no light speed. The instant never steps back while the
-         * subject stays the same. A source that cannot be solved back to that
-         * instant has no fix.
+         * UT with no light speed. A source that places the subject only from
+         * a later UT (a world model's record from its ValidFromUt) gives it as
+         * it places it then; otherwise a source that cannot be solved back to
+         * that instant has no fix. The instant never steps back while the
+         * subject stays the same, except from a record's start to the root
+         * when a republished record starts earlier: that start's light never
+         * arrived, so nothing holds it.
          */
         private CraftFix KnownSubject(double ut, DVec3 station, CelestialBody lensBody)
         {
@@ -794,7 +798,7 @@ namespace Kerbcast
             }
             var tree = KeplerBodyTree.World;
             int lensIndex = lensBody.flightGlobalsIndex;
-            bool moves = _known.SubjectMotion(ut, out var motion, out _) && motion.Body != null;
+            bool moves = _known.SubjectMotion(ut, out var motion, out double validFrom, out _) && motion.Body != null;
             /* The frame from the body the subject is at by now, then again from
                its body at the solved instant, as the picture chooses it. */
             int frame = PastInstant.CommonAncestor(ref tree, lensIndex, now.Body.flightGlobalsIndex);
@@ -807,7 +811,7 @@ namespace Kerbcast
                 var path = new KnownPath { Source = _known, Tree = tree, Frame = frame };
                 double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody) : 0;
                 var lens = station - ToD(frameBody.position);
-                if (PastInstant.Solve(ref path, lens, ut, c.Value, bound, double.NegativeInfinity, ut, out double tr) != PastStatus.Found)
+                if (PastInstant.SolveFrom(ref path, lens, ut, c.Value, bound, validFrom, ut, out double tr) != PastStatus.Found)
                 {
                     if (pass == 0) break;
                     /* The second frame would not solve: keep the first frame's instant. */
@@ -1222,7 +1226,7 @@ namespace Kerbcast
             if (!site.TryStationMotion(ut, out station)) return false;
 
             var a = _aim;
-            if (a == null || a.Kind == CommandAimKind.Vessel) return _known.SubjectMotion(ut, out aim, out validUntilUt);
+            if (a == null || a.Kind == CommandAimKind.Vessel) return _known.SubjectMotion(ut, out aim, out _, out validUntilUt);
             switch (a.Kind)
             {
                 case CommandAimKind.Direction:

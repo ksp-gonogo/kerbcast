@@ -121,9 +121,10 @@ namespace Kerbcast
             return fix;
         }
 
-        public bool SubjectMotion(double ut, out BodyMotion motion, out double validUntilUt)
+        public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt)
         {
             motion = default;
+            validFromUt = double.NegativeInfinity;
             validUntilUt = double.NegativeInfinity;
             if (_subjectPid == 0) return false;
             try
@@ -132,6 +133,7 @@ namespace Kerbcast
                 var fix = ModelLookup.Find(view, ScopeIndex(view), _subjectPid, ut, BodyKnownFn);
                 if (fix.State != CraftFixState.Positioned) return false;
                 var r = fix.Record;
+                validFromUt = r.ValidFromUt;
                 var world = KinematicsWorld.Now();
                 var body = world.Body(r.BodyIndex);
                 if (body == null) return false;

@@ -78,10 +78,11 @@ namespace Kerbcast
 
         /* The subject at `ut`. */
         CraftFix Subject(double ut);
-        /* How the subject moves on from `ut`, for the forecast, and the UT that
-           motion holds until (infinity for truth). False when the source
-           cannot carry it forward. */
-        bool SubjectMotion(double ut, out BodyMotion motion, out double validUntilUt);
+        /* How the subject moves on from `ut`, for the forecast, the earliest UT
+           the source places it at (minus infinity for truth, which has its
+           whole past) and the UT that motion holds until (infinity for truth).
+           False when the source cannot carry it forward. */
+        bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt);
         /* The radius the subject is framed by, in metres; NaN when the source has no size for it. */
         double SubjectRadiusM { get; }
         /* A sphere the subject fits in that frames it closer than the radius does: its centre's offset from the subject's position, world axes, and its radius. False when the source has none. */
@@ -139,8 +140,8 @@ namespace Kerbcast
         public uint SubjectPersistentId => Now.SubjectPersistentId;
         public string SubjectName => Now.SubjectName;
         public CraftFix Subject(double ut) => Now.Subject(ut);
-        public bool SubjectMotion(double ut, out BodyMotion motion, out double validUntilUt) =>
-            Now.SubjectMotion(ut, out motion, out validUntilUt);
+        public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt) =>
+            Now.SubjectMotion(ut, out motion, out validFromUt, out validUntilUt);
         public double SubjectRadiusM => Now.SubjectRadiusM;
         public bool SubjectShape(out DVec3 centreOffset, out double radiusM) => Now.SubjectShape(out centreOffset, out radiusM);
         public bool Knows(uint persistentId) => Now.Knows(persistentId);

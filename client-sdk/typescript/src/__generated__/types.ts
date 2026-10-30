@@ -1051,7 +1051,8 @@ export interface FrameCommandState {
 	refusalText?: string;
 	/**
 	 * The instant the subject's known position is taken at: the frame's
-	 * UT, or the subject's past instant under a light speed.
+	 * UT, the subject's past instant under a light speed, or the start of
+	 * the world model's record for it when that is later.
 	 */
 	subjectUt?: number;
 	/** Where the knowledge came from: `truth`, `waiting`, `model` or `stale`. */

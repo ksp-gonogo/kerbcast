@@ -1436,6 +1436,55 @@ bool IsLatest<T>(ref T path, DVec3 lens, double tt, double c, double k, double t
     Check(s.Found && s.Pid == 6 && drawn == 6, "a subject picked anew is drawn at once, at its own past instant");
 }
 
+/* ---- a source that places the craft only from its record's start ---- */
+{
+    /* A world model's record from the scope's station 447 m out, read by a lens 500 m out: about 7.45 s against 8.33 s. */
+    const double c = 60, t = 1000;
+    var lens = new DVec3(0, 0, 0);
+    double root = t - 500 / c;
+
+    var late = new FromUt { Inner = new Line { X0 = 500 }, From = t - 7.45 };
+    var st = PastInstant.SolveFrom(ref late, lens, t, c, 0, late.From, t, out double tr);
+    Check(st == PastStatus.Found && tr == late.From,
+        $"a record starting after the light-time root places the craft at the record's start ({st}, {tr - t:F3} s)");
+
+    var early = new FromUt { Inner = new Line { X0 = 500 }, From = t - 9 };
+    st = PastInstant.SolveFrom(ref early, lens, t, c, 0, early.From, t, out tr);
+    Check(st == PastStatus.Found && tr <= root && root - tr <= PastInstant.ToleranceS * 2,
+        $"a record starting before the root places the craft at the root ({st}, {tr - t:F3} s)");
+
+    st = PastInstant.SolveFrom(ref late, lens, t, c, 0, double.NegativeInfinity, t, out _);
+    Check(st == PastStatus.Unsolved, $"with no start given, a path that refuses the root still has no instant ({st})");
+    var line = new Line { X0 = 500 };
+    st = PastInstant.SolveFrom(ref line, lens, t, c, 0, t - 7.45, t, out _);
+    Check(st == PastStatus.Found, "a whole path with a start after its root is held at the start too");
+    st = PastInstant.Solve(ref line, lens, t, c, 0, t - 7.45, t, out _);
+    Check(st == PastStatus.Unseen, "plain Solve keeps Unseen for a craft whose history starts after its root");
+
+    var future = new FromUt { Inner = new Line { X0 = 500 }, From = t + 1 };
+    st = PastInstant.SolveFrom(ref future, lens, t, c, 0, future.From, t, out _);
+    Check(st == PastStatus.Unseen, $"a record that starts after the present places nothing ({st})");
+
+    /* Just launched: the record froze at the last sample on the pad, and the craft climbs away from the lens at up to 80 m/s. */
+    double frozen = t - 7.45;
+    var climb = new FromUt { Inner = new Line { X0 = 500 - 40 * frozen, V = 40 }, From = frozen };
+    const double step = 0.5;
+    bool held = true, arrived = true;
+    double last = double.NegativeInfinity, firstPast = double.NaN;
+    for (double now = t; now < t + 30; now += step)
+    {
+        st = PastInstant.SolveFrom(ref climb, lens, now, c, 80, frozen, now, out tr);
+        if (st != PastStatus.Found || tr < frozen || !(tr >= last)) held = false;
+        if (tr > frozen && !PastInstant.Arrived(ref climb, lens, now, c, tr)) arrived = false;
+        if (tr > frozen && double.IsNaN(firstPast)) firstPast = tr - frozen;
+        last = tr;
+    }
+    Check(held && last > frozen + 1, $"a craft that just launched is placed from its record's start on, never refused ({last - frozen:F2} s past it at the end)");
+    /* The root moves on at c / (c + v) = 0.6 s a second, so the first frame past the start is within a step of it. */
+    Check(arrived && firstPast <= step,
+        $"once its root passes the record's start the craft is drawn at the root, whose light has arrived, without a jump ({firstPast:F3} s past the start)");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
@@ -1481,6 +1530,18 @@ struct Line : IPastPath
     {
         position = new DVec3(X0 + V * ut, 0, 0);
         return true;
+    }
+}
+
+/* Inner, but placed only from From on, as a world model's record before its ValidFromUt. */
+struct FromUt : IPastPath
+{
+    public Line Inner;
+    public double From;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = default;
+        return ut >= From && Inner.TryAt(ut, out position);
     }
 }
 

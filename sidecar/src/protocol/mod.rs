@@ -1204,7 +1204,8 @@ pub struct FrameCommandState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_text: Option<String>,
     /// The instant the subject's known position is taken at: the frame's
-    /// UT, or the subject's past instant under a light speed.
+    /// UT, the subject's past instant under a light speed, or the start of
+    /// the world model's record for it when that is later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ut: Option<f64>,
     /// Where the knowledge came from: `truth`, `waiting`, `model` or `stale`.
