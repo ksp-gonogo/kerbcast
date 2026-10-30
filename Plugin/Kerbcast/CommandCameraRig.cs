@@ -775,12 +775,13 @@ namespace Kerbcast
          * UT with no light speed. A source that places the subject only from
          * a later UT (a world model's record from its ValidFromUt) gives it as
          * it places it then; otherwise a source that cannot be solved back to
-         * that instant has no fix. A world model's place on the ground stands
-         * where the source puts it now, at the instant of its light time from
-         * there. The instant never steps back while the subject stays the
-         * same, except from a record's start to the root when a republished
-         * record starts earlier: that start's light never arrived, so nothing
-         * holds it.
+         * that instant has no fix. A world model's place on the lens's own
+         * ground stands where the source puts it now, at the instant of its
+         * light time from there; that instant steps back whenever the range
+         * grows faster than light. Otherwise the instant never steps back while
+         * the subject stays the same, except from a record's start to the root
+         * when a republished record starts earlier: that start's light never
+         * arrived, so nothing holds it.
          */
         private CraftFix KnownSubject(double ut, DVec3 station, CelestialBody lensBody)
         {
@@ -801,11 +802,13 @@ namespace Kerbcast
             var tree = KeplerBodyTree.World;
             int lensIndex = lensBody.flightGlobalsIndex;
             bool moves = _known.SubjectMotion(ut, out var motion, out double validFrom, out _) && motion.Body != null;
-            if (moves && motion.Kind == BodyMotionKind.Surface && !double.IsInfinity(validFrom))
+            if (moves && motion.Kind == BodyMotionKind.Surface && motion.Body == lensBody && !double.IsInfinity(validFrom))
             {
-                /* A world model's place on the ground does not move on its body,
-                   so the light time changes only the instant and its uncertainty,
-                   never where the subject stands: placed as the source puts it now. */
+                /* A world model's place on the lens's own ground does not move
+                   against the lens, so the light time changes only the instant and
+                   its uncertainty, never where the subject stands: placed as the
+                   source puts it now. On another body the picture draws the craft
+                   at its past inertial place, so the solve below matches that. */
                 _knownHold.Reset();
                 double fixedAt = PastInstant.BodyFixedInstant((station - now.World).Magnitude, ut, c.Value, validFrom);
                 var then = _known.Subject(fixedAt);
