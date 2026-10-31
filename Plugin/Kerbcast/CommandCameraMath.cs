@@ -145,6 +145,65 @@ namespace Kerbcast
         }
     }
 
+    /*
+     * A subject's framing as the picture eases onto it, as tangents of the
+     * subject's half-angle. The field and the bracket are both taken from
+     * these eased values, never from the raw framing, so the bracket frames
+     * what the view frames on every frame: while the field is free it holds
+     * the framing fraction. The raw framing jumps whenever a world model's
+     * uncertainty resets on a new record, and a bracket sized from it over
+     * the eased field pumped in and out at the publish rate. The view eases
+     * toward the framing clamped to the fields the lens has, so it settles
+     * gently onto a limit; the box eases toward the framing itself, so it
+     * shrinks below the fraction once the field can narrow no further. The
+     * box starts on the framing itself, not the view's, so on acquisition it
+     * shows the craft at its size while the view zooms onto it, and it never
+     * draws smaller than the craft without its uncertainty, which moves
+     * smoothly, so a fast pass cannot leave the box inside the craft.
+     */
+    public sealed class SubjectFraming
+    {
+        private double _view = double.NaN;
+        private double _box = double.NaN;
+        private double _craft = double.NaN;
+
+        public bool Started => !double.IsNaN(_view);
+
+        public void Reset()
+        {
+            _view = double.NaN;
+            _box = double.NaN;
+            _craft = double.NaN;
+        }
+
+        /*
+         * Eases onto `rawTan` over `dt` and returns the field to render;
+         * `craftTan` is the craft's own framing without its uncertainty. The
+         * first step after a reset starts the view from `fovNow`, so a view
+         * coming off a placeholder or a hold zooms on from where it was.
+         */
+        public double Step(double rawTan, double craftTan, double fovNow, double fraction, double fovMin, double fovMax,
+            double dt, double tau, double snapAfter)
+        {
+            if (!Started)
+            {
+                _view = CommandCameraMath.FramingTanAt(fovNow, fraction);
+                _box = double.IsNaN(rawTan) ? _view : rawTan;
+            }
+            _craft = craftTan;
+            double lo = CommandCameraMath.FramingTanAt(fovMin, fraction);
+            double hi = CommandCameraMath.FramingTanAt(fovMax, fraction);
+            double clamped = rawTan < lo ? lo : rawTan > hi ? hi : rawTan;
+            _view = CommandCameraMath.EaseFraming(_view, clamped, dt, tau, snapAfter);
+            _box = CommandCameraMath.EaseFraming(_box, rawTan, dt, tau, snapAfter);
+            return CommandCameraMath.FovForTan(_view, fraction, fovMin, fovMax);
+        }
+
+        /* The bracket's half-extent in a `rows`-high frame at `fovDeg`; NaN before the first step. */
+        public double BracketHalfPx(double fovDeg, int rows) =>
+            Started ? CommandCameraMath.BracketHalfPxForTan(_craft > _box ? _craft : _box, fovDeg, rows) : double.NaN;
+    }
+
     /* Where a command camera looks while it has no subject to aim at. */
     public enum PlaceholderAim
     {
@@ -336,11 +395,36 @@ namespace Kerbcast
             double fovMin, double fovMax)
         {
             if (fraction <= 0 || distance <= radius) return fovMax;
-            double half = AngularDiameterDeg(radius, distance) * 0.5 * Deg2Rad;
-            double fov = 2.0 * Math.Atan(Math.Tan(half) / fraction) * Rad2Deg;
+            return FovForTan(FramingTan(radius, distance), fraction, fovMin, fovMax);
+        }
+
+        /* Tangent of the half-angle a sphere of `radius` subtends at `distance`; infinite with the lens inside it. */
+        public static double FramingTan(double radius, double distance)
+        {
+            if (radius <= 0) return 0;
+            if (distance <= radius) return double.PositiveInfinity;
+            return radius / Math.Sqrt(distance * distance - radius * radius);
+        }
+
+        /* The half-angle tangent a field of `fovDeg` frames at `fraction` of its height. */
+        public static double FramingTanAt(double fovDeg, double fraction) =>
+            fraction * Math.Tan(fovDeg * 0.5 * Deg2Rad);
+
+        /* The field that frames a half-angle tangent at `fraction` of the frame height, clamped to [fovMin, fovMax]. */
+        public static double FovForTan(double halfTan, double fraction, double fovMin, double fovMax)
+        {
+            if (fraction <= 0 || !Finite(halfTan)) return fovMax;
+            double fov = 2.0 * Math.Atan(Math.Max(0, halfTan) / fraction) * Rad2Deg;
             if (fov < fovMin) return fovMin;
             if (fov > fovMax) return fovMax;
             return fov;
+        }
+
+        /* A framing tangent eased as SmoothFov eases a field. A NaN target holds the current one; an infinite one (the lens inside the sphere) is taken at once, as is any target from a current that is not finite. */
+        public static double EaseFraming(double current, double target, double dt, double tau, double snapAfter)
+        {
+            if (double.IsNaN(target)) return current;
+            return Finite(current) && Finite(target) ? SmoothFov(current, target, dt, tau, snapAfter) : target;
         }
 
         /* Exponential approach to `target` in log space, so a zoom from 20° to
@@ -539,10 +623,16 @@ namespace Kerbcast
            Capped at the frame height so a lens inside the sphere stays finite. */
         public static double BracketHalfPx(double radius, double distance, double fovDeg, int rows)
         {
-            int h = Math.Max(1, rows);
             if (radius <= 0) return 0;
-            if (distance <= radius) return h;
-            double halfTan = radius / Math.Sqrt(distance * distance - radius * radius);
+            return BracketHalfPxForTan(FramingTan(radius, distance), fovDeg, rows);
+        }
+
+        /* BracketHalfPx for a sphere given by its half-angle tangent. */
+        public static double BracketHalfPxForTan(double halfTan, double fovDeg, int rows)
+        {
+            int h = Math.Max(1, rows);
+            if (!(halfTan > 0)) return 0;
+            if (double.IsInfinity(halfTan)) return h;
             double perPx = PixelSizeAtUnit(fovDeg, h);
             return perPx > 0 ? Math.Min(halfTan / perPx, h) : h;
         }

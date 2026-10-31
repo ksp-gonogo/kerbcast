@@ -171,6 +171,143 @@ Check(Near(CommandCameraMath.BoxReach(new DVec3(10, 0, 0), new DVec3(-1, 0, 0), 
     Check(Near(fastFov, open, open * 0.01), $"the view settles framing the open canopy ({fastFov:F2} vs {open:F2} deg)");
 }
 
+{
+    /*
+     * A craft 12 km out framed with a world model's uncertainty, which starts
+     * over at each record (every 0.53 s) and runs high for the last 0.1 s of
+     * it, drawn at 60 fps into 576 rows. Sizing the bracket from the raw
+     * framing over the eased field pumps it in and out with every record;
+     * sized from the framing the field was eased to, it holds the fraction.
+     */
+    const double Distance = 12000, Fraction = 0.3, Dt = 1.0 / 60, FovMin = 0.02, FovMax = 60, Period = 0.53;
+    const int Rows = 576;
+    double Radius(double t)
+    {
+        double age = t % Period;
+        return 5 + 40 * age + (age > Period - 0.1 ? 150 : 0);
+    }
+    (double lo, double hi) Old()
+    {
+        double fov = CommandCameraMath.FovForFraction(Radius(0), Distance, Fraction, FovMin, FovMax);
+        double lo = double.MaxValue, hi = 0;
+        for (double t = 0; t < 5; t += Dt)
+        {
+            fov = CommandCameraMath.SmoothFov(fov, CommandCameraMath.FovForFraction(Radius(t), Distance, Fraction, FovMin, FovMax), Dt, 0.4, 1.0);
+            double b = CommandCameraMath.BracketHalfPx(Radius(t), Distance, fov, Rows);
+            if (t > 2) { lo = Math.Min(lo, b); hi = Math.Max(hi, b); }
+        }
+        return (lo, hi);
+    }
+    (double lo, double hi, double worstStep) New(Func<double, double> radius, double fovMin)
+    {
+        var framing = new SubjectFraming();
+        double fov = 30, lo = double.MaxValue, hi = 0, prev = double.NaN, worst = 0;
+        for (double t = 0; t < 7; t += Dt)
+        {
+            fov = framing.Step(CommandCameraMath.FramingTan(radius(t), Distance), CommandCameraMath.FramingTan(5, Distance), fov,
+                Fraction, fovMin, FovMax, Dt, 0.4, 1.0);
+            double b = framing.BracketHalfPx(fov, Rows);
+            if (!double.IsNaN(prev)) worst = Math.Max(worst, Math.Abs(Math.Log(b / prev)));
+            prev = b;
+            if (t > 4) { lo = Math.Min(lo, b); hi = Math.Max(hi, b); }
+        }
+        return (lo, hi, worst);
+    }
+    var (oldLo, oldHi) = Old();
+    Check(oldHi / oldLo > 1.5, $"raw framing over the eased field: the bracket pumps with each record ({oldLo:F1} to {oldHi:F1} px)");
+    var (newLo, newHi, _) = New(Radius, FovMin);
+    double held = Fraction * Rows / 2;
+    Check(Near(newLo, held, 0.05) && Near(newHi, held, 0.05),
+        $"eased framing: once the zoom has settled the bracket holds the framing fraction through every record ({newLo:F2} to {newHi:F2} px, want {held:F1})");
+
+    /* At the field's floor the box follows the craft below the fraction, eased rather than snapping. */
+    double floor = 10.0;
+    var (fLo, fHi, fWorst) = New(Radius, floor);
+    double rawLo = CommandCameraMath.BracketHalfPx(5, Distance, floor, Rows);
+    Check(fHi < held && fLo > rawLo, $"at the floor the box sits below the fraction and above the smallest raw size ({fLo:F1} to {fHi:F1} px)");
+    double calm = 5 + 40 * (Period - 0.1);
+    double rawStep = Math.Log(CommandCameraMath.BracketHalfPx(calm + 150, Distance, floor, Rows)
+        / CommandCameraMath.BracketHalfPx(calm, Distance, floor, Rows));
+    Check(fWorst < rawStep / 10, $"and steps far less per frame than the raw size jumps ({fWorst:G3} vs {rawStep:G3} in log px)");
+
+    /* The first step starts from the field already shown, so a view off a placeholder zooms on rather than snapping. */
+    var start = new SubjectFraming();
+    double tan5 = CommandCameraMath.FramingTan(5, Distance);
+    double first = start.Step(tan5, tan5, 30, Fraction, FovMin, FovMax, Dt, 0.4, 1.0);
+    double wantFirst = CommandCameraMath.FovForTan(
+        CommandCameraMath.SmoothFov(CommandCameraMath.FramingTanAt(30, Fraction), tan5, Dt, 0.4, 1.0), Fraction, FovMin, FovMax);
+    Check(first < 30 && Near(first, wantFirst, 1e-9), $"the first step eases from the field shown ({first:F4} deg, want {wantFirst:F4})");
+    Check(double.IsNaN(new SubjectFraming().BracketHalfPx(30, Rows)), "no bracket before the first step");
+    var inside = new SubjectFraming();
+    double insideFov = inside.Step(CommandCameraMath.FramingTan(50, 10), CommandCameraMath.FramingTan(50, 10), 10, Fraction, FovMin, FovMax, Dt, 0.4, 1.0);
+    Check(Near(inside.BracketHalfPx(insideFov, Rows), Rows, 1e-9), "a lens inside the framing sphere fills the frame with the box");
+
+    /* Acquired from a placeholder at the widest field, a 25 m craft 12 km out is boxed at its own size while the view zooms onto it. */
+    {
+        var acquire = new SubjectFraming();
+        double tan25 = CommandCameraMath.FramingTan(25, Distance), fov = FovMax, worst = 0;
+        for (int i = 0; i <= 120; i++)
+        {
+            double shown = fov;
+            fov = acquire.Step(tan25, tan25, shown, Fraction, FovMin, FovMax, Dt, 0.4, 1.0);
+            double ratio = acquire.BracketHalfPx(fov, Rows) / CommandCameraMath.BracketHalfPx(25, Distance, fov, Rows);
+            worst = Math.Max(worst, Math.Abs(Math.Log(ratio)));
+        }
+        Check(worst < 1e-9, $"on acquisition the box is the craft's own size on every frame of the zoom (worst log ratio {worst:G3})");
+        Check(fov < 10, $"while the view zooms in ({fov:F2} deg after 2 s)");
+
+        /* A retarget resets the framing: the new craft is boxed at its size at once, and the view zooms on from where it was. */
+        acquire.Reset();
+        double tan80 = CommandCameraMath.FramingTan(80, 3000);
+        double next = acquire.Step(tan80, tan80, fov, Fraction, FovMin, FovMax, Dt, 0.4, 1.0);
+        Check(Near(acquire.BracketHalfPx(next, Rows), CommandCameraMath.BracketHalfPx(80, 3000, next, Rows), 1e-9),
+            "a retarget boxes the new craft at its own size on its first frame");
+        Check(next > fov * 1.01 && next < fov * 2, $"and the view eases out from the field shown ({fov:F2} to {next:F2} deg)");
+    }
+
+    /* One frame with no framing (a NaN radius) holds the view and the box rather than throwing the field wide open. */
+    {
+        var held2 = new SubjectFraming();
+        double fov = 30;
+        for (int i = 0; i < 300; i++) fov = held2.Step(tan5, tan5, fov, Fraction, FovMin, FovMax, Dt, 0.4, 1.0);
+        double box = held2.BracketHalfPx(fov, Rows);
+        double after = held2.Step(double.NaN, double.NaN, fov, Fraction, FovMin, FovMax, Dt, 0.4, 1.0);
+        Check(held2.Started && Near(after, fov, 1e-12) && Near(held2.BracketHalfPx(after, Rows), box, 1e-9),
+            $"a NaN framing holds the field and the box ({fov:F4} to {after:F4} deg)");
+        Check(double.IsPositiveInfinity(CommandCameraMath.EaseFraming(0.01, double.PositiveInfinity, Dt, 0.4, 1.0)),
+            "an infinite framing (the lens inside it) is still taken at once");
+    }
+
+    /* A 10 m craft passing at 300 m/s from 2 km to 200 m with the field on its floor: the box never draws inside the craft. */
+    {
+        var pass = new SubjectFraming();
+        double fov = 10, worst = double.MaxValue;
+        for (double t = 0; t < 6; t += Dt)
+        {
+            double range = 2000 - 300 * t, tan = CommandCameraMath.FramingTan(10, range);
+            fov = pass.Step(tan, tan, fov, Fraction, 10, FovMax, Dt, 0.4, 1.0);
+            worst = Math.Min(worst, pass.BracketHalfPx(fov, Rows) / CommandCameraMath.BracketHalfPx(10, range, fov, Rows));
+        }
+        Check(worst >= 1 - 1e-9, $"a fast pass at the floor keeps the box at least the craft's size (worst box over craft {worst:F3})");
+    }
+
+    /* The ease runs on time, not frames: 30 and 144 fps reach the same field and box at 0.5 s. */
+    {
+        double Field(double fps, out double box)
+        {
+            var f = new SubjectFraming();
+            double fov = 30;
+            int n = (int)Math.Round(0.5 * fps);
+            for (int i = 0; i < n; i++) fov = f.Step(tan5, tan5, fov, Fraction, FovMin, FovMax, 1.0 / fps, 0.4, 1.0);
+            box = f.BracketHalfPx(fov, Rows);
+            return fov;
+        }
+        double at30 = Field(30, out double box30), at144 = Field(144, out double box144);
+        Check(Near(at30, at144, at144 * 1e-9) && Near(box30, box144, box144 * 1e-9),
+            $"the framing is frame-rate independent ({at30:F6} vs {at144:F6} deg, {box30:F4} vs {box144:F4} px)");
+    }
+}
+
 // Clip plan on a split (OpenGL/Metal) stack: near 0.21..397, far 397..750 km.
 const float nN = 0.21f, nF = 397f, fN = 397f, fF = 750000f;
 var pad = CommandCameraMath.PlanClips(600, 15, false, true, false, nN, nF, fN, fF);

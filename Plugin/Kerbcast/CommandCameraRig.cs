@@ -91,6 +91,11 @@ namespace Kerbcast
 
         private CommandClipPlan _plan;
         private double _fov;
+        /* The subject's framing the zoom and the bracket share; reset while the view frames no subject, and for a new subject, aim or vantage. */
+        private readonly SubjectFraming _framing = new SubjectFraming();
+        private CommandAim _framingAim;
+        private uint _framingSubject;
+        private uint _framingVantage;
         private float _lastPrepare = -1f;
 
         private bool _first = true;
@@ -1027,8 +1032,9 @@ namespace Kerbcast
         private KeplerPath _aimPath;
         private bool _aimPathOk;
 
-        /* In pixels of the delivered frame: the field just rendered, or, with
-           nothing rendering, the field the next frame would snap to. */
+        /* In pixels of the delivered frame: the field just rendered and the
+           framing it was eased to, or, with nothing rendering, the field the
+           next frame would snap to. */
         private void UpdateBracket(float now)
         {
             if (!HasFix)
@@ -1041,7 +1047,9 @@ namespace Kerbcast
             bool rendering = _lastPrepare >= 0 && now - _lastPrepare <= FovSnapAfter;
             double fov = rendering ? _fov : CommandCameraMath.FovForFraction(radius, range, _frameFraction, FovMinNow(), _fovMax);
             int rows = FrameRows();
-            BracketHalfPx = CommandCameraMath.BracketHalfPx(radius, range, fov, rows);
+            BracketHalfPx = rendering && _framing.Started
+                ? _framing.BracketHalfPx(fov, rows)
+                : CommandCameraMath.BracketHalfPx(radius, range, fov, rows);
             UpdateDrawnOffset(fov, rows);
         }
 
@@ -1318,15 +1326,31 @@ namespace Kerbcast
 
             var shape = SubjectShape();
             Framed(distance, shape, out double framedRadius, out double framedRange);
-            double fovTarget = _mode == SubjectAimMode.Hold ? _fov
-                : _placeholder == PlaceholderAim.None
-                ? CommandCameraMath.FovForFraction(framedRadius, framedRange, _frameFraction, FovMinNow(), _fovMax)
-                : _placeholder == PlaceholderAim.LaunchSite
-                    ? CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, distance,
-                        CommandCameraMath.PlaceholderSiteFraction, FovMinNow(), _fovMax)
-                    : _fovMax;
             double step = _frames.Next(dt);
-            _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, step, FovTau, FovSnapAfter);
+            if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None)
+            {
+                /* Not AimJumped, which also fires on every world model publish: the box would start over on each record and pump again. */
+                uint subject = _known.SubjectPersistentId, vantage = site.VantagePersistentId;
+                if (!CommandAim.SameAs(_aim, _framingAim) || subject != _framingSubject || vantage != _framingVantage)
+                    _framing.Reset();
+                _framingAim = _aim;
+                _framingSubject = subject;
+                _framingVantage = vantage;
+                double certain = framedRadius - (AimIsCraft ? _knownUncertainty : 0.0);
+                _fov = _framing.Step(CommandCameraMath.FramingTan(framedRadius, framedRange),
+                    CommandCameraMath.FramingTan(certain, framedRange), _fov, _frameFraction,
+                    FovMinNow(), _fovMax, step, FovTau, FovSnapAfter);
+            }
+            else
+            {
+                _framing.Reset();
+                double fovTarget = _mode == SubjectAimMode.Hold ? _fov
+                    : _placeholder == PlaceholderAim.LaunchSite
+                        ? CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, distance,
+                            CommandCameraMath.PlaceholderSiteFraction, FovMinNow(), _fovMax)
+                        : _fovMax;
+                _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, step, FovTau, FovSnapAfter);
+            }
             /* This eases on real time, between physics ticks too, so it is the one part of the aim the slew's per UT rate does not describe exactly. */
             _viewOffset = _mode == SubjectAimMode.Subject && AimIsCraft
                 ? CommandCameraMath.EaseToward(_viewOffset, shape.Known ? shape.Centre : default, step, FovTau, FovSnapAfter)
