@@ -23,7 +23,7 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
-import { KerbcastProvider, useKerbcastClient } from "./context";
+import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider, useKerbcastClient } from "./context";
 import {
   ActionBarRow,
   FeedActionBar,
@@ -155,7 +155,10 @@ export interface CameraFeedProps {
   client?: KerbcastClient;
   /**
    * KSP `Part.flightID` of the camera to display. `null` triggers
-   * auto-selection: the first live camera in the registry is latched.
+   * auto-selection: the first live camera in the registry is latched. A
+   * displayed camera that drops out of the list stays on screen, with its
+   * last known state, for `KERBCAST_RELEASE_GRACE_MS` before the feed falls
+   * back, so a momentary gap does not restart its stream.
    */
   flightId: number | null;
   /**
@@ -467,24 +470,48 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     //
     // Resolution order:
     //   1. Explicit pick, if still present in the list (destroyed or not).
-    //   2. Auto: latch the currently-displayed camera. Keep showing it even if
+    //   2. Hold: the displayed camera, briefly missing from the list.
+    //   3. Auto: latch the currently-displayed camera. Keep showing it even if
     //      destroyed, but only while no other live camera exists (destroyed
     //      tombstones never leave the list on their own, so a destroyed latch
     //      would otherwise never release). Once a live camera is available,
     //      release the latch and auto-pick it.
-    //   3. Fresh auto-pick: prefer the first live camera; fall back to first
+    //   4. Fresh auto-pick: prefer the first live camera; fall back to first
     //      overall only when every camera is destroyed.
     // -------------------------------------------------------------------------
     const displayedRef = useRef<number | null>(null);
+    const requestedRef = useRef<number | null>(requestedFlightId);
+    const lastCameraRef = useRef<CameraState | null>(null);
+    /* The camera whose hold ran out, so it is let go until it is listed again. */
+    const [expiredHold, setExpiredHold] = useState<number | null>(null);
+
+    /*
+     * The displayed camera dropping out of the list for an update or two (an
+     * empty snapshot at launch or revert, a host filter that skips it once)
+     * would otherwise switch the feed away and back, restarting the stream
+     * both times. Keep showing it, with its last known state, for
+     * KERBCAST_RELEASE_GRACE_MS. A new `flightId` prop is a real choice and
+     * switches at once, and a requested camera that is listed wins over a
+     * held one.
+     */
     const requestedStillPresent =
       requestedFlightId !== null &&
       cameras.some((c) => c.flightId === requestedFlightId);
+    const displayed = displayedRef.current;
+    const holding =
+      !requestedStillPresent &&
+      displayed !== null &&
+      expiredHold !== displayed &&
+      requestedFlightId === requestedRef.current &&
+      !cameras.some((c) => c.flightId === displayed);
 
     let flightId: number | null;
     if (requestedStillPresent) {
       flightId = requestedFlightId;
+    } else if (holding) {
+      flightId = displayed;
     } else {
-      const latched = displayedRef.current;
+      const latched = displayed;
       const latchedCamera =
         latched !== null ? cameras.find((c) => c.flightId === latched) : undefined;
       const anyLive = cameras.some((c) => !isCameraDestroyed(c));
@@ -498,10 +525,35 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
           null);
     }
 
-    const camera =
+    const listedCamera =
       flightId !== null
         ? (cameras.find((c) => c.flightId === flightId) ?? null)
         : null;
+    const camera =
+      holding && lastCameraRef.current?.flightId === flightId
+        ? lastCameraRef.current
+        : listedCamera;
+
+    useEffect(() => {
+      if (listedCamera) lastCameraRef.current = listedCamera;
+    }, [listedCamera]);
+
+    useEffect(() => {
+      if (!holding || displayed === null) return;
+      const timer = setTimeout(() => setExpiredHold(displayed), KERBCAST_RELEASE_GRACE_MS);
+      return () => clearTimeout(timer);
+    }, [holding, displayed]);
+
+    /* Listed again, so a later gap gets a hold of its own. */
+    useEffect(() => {
+      if (expiredHold !== null && cameras.some((c) => c.flightId === expiredHold)) {
+        setExpiredHold(null);
+      }
+    }, [expiredHold, cameras]);
+
+    useEffect(() => {
+      requestedRef.current = requestedFlightId;
+    }, [requestedFlightId]);
 
     // Latest onDisplayedCameraChange, held in a ref so the commit effect below
     // fires only on a resolved-flightId change, not on every render when the

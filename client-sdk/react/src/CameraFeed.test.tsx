@@ -47,7 +47,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { createRef, useEffect } from "react";
+import { StrictMode, createRef, useEffect } from "react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -573,16 +573,24 @@ describe("CameraFeed - camera selection", () => {
   it("falls back to the first camera when the configured one disappears", async () => {
     const { client, sidecar } = await buildConnectedSource(THREE_CAMERAS);
 
-    renderFeed(client, { flightId: 44 });
-    expect(screen.getByRole("heading", { name: "Tail Cam" })).toBeTruthy();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      renderFeed(client, { flightId: 44 });
+      expect(screen.getByRole("heading", { name: "Tail Cam" })).toBeTruthy();
 
-    await act(async () => {
-      sidecar.setCameras([
-        toInit(makeCamera({ flightId: 42, cameraName: "Starboard Cam" })),
-      ]);
-    });
+      await act(async () => {
+        sidecar.setCameras([
+          toInit(makeCamera({ flightId: 42, cameraName: "Starboard Cam" })),
+        ]);
+      });
+      act(() => {
+        vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
+      });
 
-    expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("step buttons are disabled when only one camera is available", async () => {
@@ -3906,5 +3914,175 @@ describe("CameraFeed - remount inside the release grace", () => {
     });
     expect(countFor(a.sidecar, "unsubscribe", 42)).toBe(1);
     expect(countFor(b.sidecar, "unsubscribe", 42)).toBe(0);
+  });
+});
+
+describe("CameraFeed - camera briefly missing from the list", () => {
+  const A = makeCamera({ flightId: 42, cameraName: "Starboard Cam" });
+  const B = makeCamera({ flightId: 43, cameraName: "Nose Cam" });
+
+  function countFor(sidecar: MockSidecar, type: string, flightId: number): number {
+    return sidecar.commands.filter(
+      (c) => c.type === type && (c.content as { flightId?: number }).flightId === flightId,
+    ).length;
+  }
+
+  function feed(client: KerbcastClient, flightId: number | null, onShown: (id: number | null) => void) {
+    return (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={flightId} onDisplayedCameraChange={onShown} />
+      </KerbcastProvider>
+    );
+  }
+
+  async function setup() {
+    const src = await buildConnectedSource([A, B]);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    return src;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stays on the requested camera through a gap shorter than the hold", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS / 2);
+    });
+    expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+
+    expect(shown).toEqual([42]);
+    expect(countFor(sidecar, "subscribe", 42)).toBe(1);
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+    expect(countFor(sidecar, "subscribe", 43)).toBe(0);
+  });
+
+  it("keeps the tile and its last state through an empty snapshot", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([]);
+    });
+    expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    expect(shown).toEqual([42]);
+  });
+
+  it("falls back once when the gap outlasts the hold", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS - 1);
+    });
+    expect(shown).toEqual([42]);
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(shown).toEqual([42, 43]);
+    expect(screen.getByRole("heading", { name: "Nose Cam" })).toBeTruthy();
+  });
+
+  it("switches at once when the requested camera changes", async () => {
+    const { client } = await setup();
+    const shown: Array<number | null> = [];
+    const view = render(feed(client, 42, (id) => shown.push(id)));
+
+    view.rerender(feed(client, 43, (id) => shown.push(id)));
+    expect(shown).toEqual([42, 43]);
+    expect(screen.getByRole("heading", { name: "Nose Cam" })).toBeTruthy();
+  });
+
+  it("switches at once to a newly requested camera that is not listed yet", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    const view = render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    view.rerender(feed(client, 99, (id) => shown.push(id)));
+    expect(shown).toEqual([42, 43]);
+  });
+
+  it("holds an auto-latched camera through a gap", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, null, (id) => shown.push(id)));
+    expect(shown).toEqual([42]);
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(shown).toEqual([42]);
+  });
+
+  it("holds a second gap after the camera came back from an expired one", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
+    });
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    expect(shown).toEqual([42, 43, 42]);
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    expect(shown).toEqual([42, 43, 42]);
+  });
+
+  it("holds under StrictMode", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(<StrictMode>{feed(client, 42, (id) => shown.push(id))}</StrictMode>);
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(new Set(shown)).toEqual(new Set([42]));
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
   });
 });
