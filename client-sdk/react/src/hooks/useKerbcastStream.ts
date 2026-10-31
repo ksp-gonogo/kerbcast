@@ -8,7 +8,9 @@ import { useKerbcastClient, useKerbcastSubscriptions } from "../context";
  *
  * While mounted with a non-null `flightId`, acquires a subscription slot via
  * the context `KerbcastSubscriptions`. Releases the slot when the component
- * unmounts or the `flightId` changes.
+ * unmounts or the `flightId` changes; the default subscriptions keep it for
+ * `KERBCAST_RELEASE_GRACE_MS`, so a remount in that time starts on the
+ * stream already flowing.
  */
 export function useKerbcastStream(flightId: number | null): MediaStream | null {
   const client = useKerbcastClient();

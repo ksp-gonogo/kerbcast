@@ -57,7 +57,7 @@ import {
   type CameraStreamHook,
   type FeedAction,
 } from "./CameraFeed";
-import { KerbcastProvider } from "./context";
+import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider } from "./context";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 
 /*
@@ -1076,13 +1076,16 @@ describe("CameraFeed - stall presentation (showStatic)", () => {
       });
       expect(signal()).toBe("live");
 
-      /* The freed slot passes straight to the new camera, so there is a
-         source at once but no frame of it yet. */
+      /* The old camera keeps its slot through the release grace, so the new
+         one binds a slot of its own: a source at once but no frame of it yet. */
       view.rerender(
         <KerbcastProvider client={client}>
           <CameraFeed flightId={43} />
         </KerbcastProvider>,
       );
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(43) as string, {} as MediaStreamTrack);
+      });
       env.setNow(1601);
       await act(async () => {
         env.drawOnce();
@@ -3825,5 +3828,83 @@ describe("CameraFeed - menus in fullscreen", () => {
     fireEvent.click(getByLabelText("More actions"));
     const menu = getByRole("menu", { name: "More actions" });
     expect(menu.parentElement).toBe(document.body);
+  });
+});
+
+describe("CameraFeed - remount inside the release grace", () => {
+  function countFor(sidecar: MockSidecar, type: string, flightId: number): number {
+    return sidecar.commands.filter(
+      (c) => c.type === type && (c.content as { flightId?: number }).flightId === flightId,
+    ).length;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps the slot and binds the flowing stream at once on remount", async () => {
+    const { client, sidecar } = await buildConnectedSource();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const first = renderFeed(client, { flightId: 42 });
+    const mid = sidecar.slotMidFor(42);
+    expect(mid).toBeDefined();
+    await act(async () => {
+      sidecar.deliverTrack(mid as string, {} as MediaStreamTrack);
+    });
+    const stream = client.camera(42).mediaStream;
+    expect(stream).not.toBeNull();
+    act(() => {
+      first.unmount();
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS / 2);
+    });
+
+    renderFeed(client, { flightId: 42 });
+    expect(document.querySelector("video")?.srcObject).toBe(stream);
+
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(sidecar.slotMidFor(42)).toBe(mid);
+    expect(countFor(sidecar, "subscribe", 42)).toBe(1);
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+  });
+
+  it("frees the slot with one unsubscribe once the grace runs out", async () => {
+    const { client, sidecar } = await buildConnectedSource();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const feed = renderFeed(client, { flightId: 42 });
+    act(() => {
+      feed.unmount();
+    });
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS + 50);
+    });
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(1);
+    expect(sidecar.slotMidFor(42)).toBeUndefined();
+  });
+
+  it("subscribes on the new client when the provider is handed one", async () => {
+    const a = await buildConnectedSource();
+    const b = await buildConnectedSource();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const feed = renderFeed(a.client, { flightId: 42 });
+    expect(a.sidecar.slotMidFor(42)).toBeDefined();
+    feed.rerender(
+      <KerbcastProvider client={b.client}>
+        <CameraFeed flightId={42} />
+      </KerbcastProvider>,
+    );
+    expect(b.sidecar.slotMidFor(42)).toBeDefined();
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS + 50);
+    });
+    expect(countFor(a.sidecar, "unsubscribe", 42)).toBe(1);
+    expect(countFor(b.sidecar, "unsubscribe", 42)).toBe(0);
   });
 });

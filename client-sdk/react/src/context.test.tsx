@@ -1,6 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
-import { createClientDisplaySizes, createClientSubscriptions } from "./context";
+import {
+  KERBCAST_RELEASE_GRACE_MS,
+  createClientDisplaySizes,
+  createClientSubscriptions,
+} from "./context";
 
 /**
  * A client stub that only records reportDisplaySize calls. The registry is the
@@ -169,6 +173,7 @@ describe("createClientSubscriptions reconnect", () => {
       unsubscribe: vi.fn(async (id: number) => {
         calls.push(`unsubscribe:${id}`);
       }),
+      camera: () => ({ waitingForSlot: false, on: () => () => {} }),
       reportDisplaySize: vi.fn(async (id: number) => {
         calls.push(`size:${id}`);
       }),
@@ -186,7 +191,8 @@ describe("createClientSubscriptions reconnect", () => {
     subs.release(3);
     calls.length = 0;
     openControl();
-    expect(calls).toEqual(["subscribe:1", "subscribe:2"]);
+    /* 3 was only waiting out its release grace, so it is dropped, not bound again. */
+    expect(calls).toEqual(["unsubscribe:3", "subscribe:1", "subscribe:2"]);
   });
 
   it("does not throw when a re-subscribe is rejected", async () => {
@@ -207,5 +213,155 @@ describe("createClientSubscriptions reconnect", () => {
     calls.length = 0;
     openControl();
     expect(calls).toEqual(["subscribe:1", "size:1"]);
+  });
+});
+
+describe("createClientSubscriptions release grace", () => {
+  function graceClient() {
+    const calls: string[] = [];
+    const waiting = new Set<number>();
+    const waitingHandlers = new Map<number, (w: boolean) => void>();
+    const handlers = new Map<string, Array<(arg?: unknown) => void>>();
+    const client = {
+      on: (event: string, h: (arg?: unknown) => void) => {
+        handlers.set(event, [...(handlers.get(event) ?? []), h]);
+        return () => {};
+      },
+      subscribe: vi.fn(async (id: number) => {
+        calls.push(`subscribe:${id}`);
+      }),
+      unsubscribe: vi.fn(async (id: number) => {
+        calls.push(`unsubscribe:${id}`);
+      }),
+      camera: (id: number) => ({
+        get waitingForSlot() {
+          return waiting.has(id);
+        },
+        on: (_event: string, h: (w: boolean) => void) => {
+          waitingHandlers.set(id, h);
+          return () => waitingHandlers.delete(id);
+        },
+      }),
+    } as unknown as KerbcastClient;
+    const setWaiting = (id: number, w: boolean) => {
+      if (w) waiting.add(id);
+      else waiting.delete(id);
+      waitingHandlers.get(id)?.(w);
+    };
+    const emit = (event: string, arg?: unknown) => handlers.get(event)?.forEach((h) => h(arg));
+    return { client, calls, emit, setWaiting };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("sends nothing when a camera is reacquired inside the grace", () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS - 1);
+    subs.acquire(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
+    expect(calls).toEqual(["subscribe:1"]);
+  });
+
+  it("unsubscribes once when the grace runs out", () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS - 1);
+    expect(calls).toEqual(["subscribe:1"]);
+    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+  });
+
+  it("keeps A through a flip to B and back, and lets B go", () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    subs.acquire(2);
+    vi.advanceTimersByTime(500);
+    subs.release(2);
+    subs.acquire(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
+    expect(calls).toEqual(["subscribe:1", "subscribe:2", "unsubscribe:2"]);
+  });
+
+  it("survives many rapid remounts with one subscribe and no unsubscribe", () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    for (let i = 0; i < 50; i++) {
+      subs.release(1);
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS / 2);
+      subs.acquire(1);
+    }
+    expect(calls).toEqual(["subscribe:1"]);
+    subs.release(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+  });
+
+  it("unsubscribes at once with a zero grace", () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client, { releaseGraceMs: 0 });
+    subs.acquire(1);
+    subs.release(1);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+  });
+
+  it("drops a pending release when the connection ends", () => {
+    const { client, calls, emit } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    emit("state-change", "disconnected");
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 2);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+    subs.acquire(1);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1", "subscribe:1"]);
+  });
+
+  it("subscribes afresh after a reconnect dropped a pending release", () => {
+    const { client, calls, emit } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    emit("control-open");
+    subs.acquire(1);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 2);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1", "subscribe:1"]);
+  });
+
+  it("skips the grace while a held camera waits for a slot", () => {
+    const { client, calls, setWaiting } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.acquire(2);
+    setWaiting(2, true);
+    subs.release(1);
+    expect(calls).toEqual(["subscribe:1", "subscribe:2", "unsubscribe:1"]);
+  });
+
+  it("ends a grace under way when a held camera starts waiting for a slot", () => {
+    const { client, calls, setWaiting } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    subs.acquire(2);
+    expect(calls).toEqual(["subscribe:1", "subscribe:2"]);
+    setWaiting(2, true);
+    expect(calls).toEqual(["subscribe:1", "subscribe:2", "unsubscribe:1"]);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 2);
+    expect(calls).toHaveLength(3);
   });
 });

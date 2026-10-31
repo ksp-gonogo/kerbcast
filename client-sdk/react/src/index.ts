@@ -11,6 +11,7 @@ export {
   KerbcastProvider,
   createClientSubscriptions,
   createClientDisplaySizes,
+  KERBCAST_RELEASE_GRACE_MS,
   useKerbcastClient,
   useKerbcastSubscriptions,
   useKerbcastDisplaySizes,
@@ -18,6 +19,7 @@ export {
 export type {
   KerbcastProviderProps,
   KerbcastSubscriptions,
+  ClientSubscriptionsOptions,
   KerbcastDisplaySizes,
 } from "./context";
 

@@ -1,11 +1,5 @@
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
-import {
-  createContext,
-  useContext,
-  useMemo,
-  useRef,
-  type ReactNode,
-} from "react";
+import { createContext, useContext, useMemo, type ReactNode } from "react";
 
 // ---------------------------------------------------------------------------
 // Subscriptions seam
@@ -21,11 +15,79 @@ export interface KerbcastSubscriptions {
   release(flightId: number): void;
 }
 
-/** Build the default refcounted subscriptions implementation for a client. */
+/**
+ * How long a camera's slot is kept after its last holder releases it, in
+ * milliseconds. A feed that remounts inside this window (a layout change, a
+ * scene switch re-rendering the tree) takes the slot back with its stream
+ * still flowing, instead of freeing it and waiting for a fresh keyframe.
+ */
+export const KERBCAST_RELEASE_GRACE_MS = 2000;
+
+export interface ClientSubscriptionsOptions {
+  /**
+   * Delay before a released camera is unsubscribed. Defaults to
+   * {@link KERBCAST_RELEASE_GRACE_MS}; 0 unsubscribes at once.
+   */
+  releaseGraceMs?: number;
+}
+
+/**
+ * Build the default refcounted subscriptions implementation for a client.
+ * When the last holder of a camera releases it the unsubscribe waits
+ * `releaseGraceMs`, and an acquire inside that window keeps the slot with no
+ * message sent either way.
+ */
 export function createClientSubscriptions(
   client: KerbcastClient,
+  options: ClientSubscriptionsOptions = {},
 ): KerbcastSubscriptions {
+  const graceMs = options.releaseGraceMs ?? KERBCAST_RELEASE_GRACE_MS;
   const refcounts = new Map<number, number>();
+  const pendingRelease = new Map<number, ReturnType<typeof setTimeout>>();
+  const stopWatchingSlot = new Map<number, () => void>();
+
+  function unsubscribeNow(flightId: number): void {
+    stopWatchingSlot.get(flightId)?.();
+    stopWatchingSlot.delete(flightId);
+    client.unsubscribe(flightId).catch(() => {});
+  }
+
+  /*
+   * A slot kept for a feed that might come back is worth less than one a
+   * mounted feed is waiting for. While any held camera waits for a slot,
+   * releases skip the grace, and a camera that starts waiting ends every
+   * grace under way so the slots it frees can carry it.
+   */
+  function slotWanted(): boolean {
+    for (const flightId of refcounts.keys()) {
+      if (client.camera(flightId).waitingForSlot) return true;
+    }
+    return false;
+  }
+
+  function watchSlot(flightId: number): void {
+    if (stopWatchingSlot.has(flightId)) return;
+    stopWatchingSlot.set(
+      flightId,
+      client.camera(flightId).on("waiting", (waiting) => {
+        if (waiting) flushPendingReleases();
+      }),
+    );
+  }
+
+  /*
+   * A connection that ends takes this client's slots with it, so a camera
+   * waiting out its grace has nothing left to keep. Unsubscribe it now, which
+   * also clears the client's own record that it wants the camera.
+   */
+  function flushPendingReleases(): void {
+    for (const [flightId, timer] of pendingRelease) {
+      clearTimeout(timer);
+      unsubscribeNow(flightId);
+    }
+    pendingRelease.clear();
+  }
+
   /*
    * A reconnect clears every slot binding on the client and the sidecar starts
    * the new peer empty, so re-subscribe each camera still held. Listeners fire
@@ -33,28 +95,53 @@ export function createClientSubscriptions(
    * registry, so subscriptions go out first. The sidecar treats a repeat
    * subscribe for a bound camera as a re-announce, and a rejection (for
    * example a full slot pool) is swallowed like every other subscribe here.
+   * A camera only waiting out its grace is not held, so it is dropped rather
+   * than bound again on the new peer.
    */
   client.on("control-open", () => {
+    flushPendingReleases();
     for (const flightId of refcounts.keys()) {
       client.subscribe(flightId).catch(() => {});
     }
   });
+  client.on("state-change", (state) => {
+    if (state === "disconnected" || state === "failed") flushPendingReleases();
+  });
+
   return {
     acquire(flightId: number): void {
       const count = (refcounts.get(flightId) ?? 0) + 1;
       refcounts.set(flightId, count);
+      const pending = pendingRelease.get(flightId);
+      if (pending !== undefined) {
+        clearTimeout(pending);
+        pendingRelease.delete(flightId);
+        return;
+      }
       if (count === 1) {
+        watchSlot(flightId);
         client.subscribe(flightId).catch(() => {});
       }
     },
     release(flightId: number): void {
       const count = (refcounts.get(flightId) ?? 1) - 1;
-      if (count <= 0) {
-        refcounts.delete(flightId);
-        client.unsubscribe(flightId).catch(() => {});
-      } else {
+      if (count > 0) {
         refcounts.set(flightId, count);
+        return;
       }
+      refcounts.delete(flightId);
+      if (pendingRelease.has(flightId)) return;
+      if (graceMs <= 0 || slotWanted()) {
+        unsubscribeNow(flightId);
+        return;
+      }
+      pendingRelease.set(
+        flightId,
+        setTimeout(() => {
+          pendingRelease.delete(flightId);
+          unsubscribeNow(flightId);
+        }, graceMs),
+      );
     },
   };
 }
@@ -167,6 +254,35 @@ export interface KerbcastProviderProps {
   children: ReactNode;
 }
 
+/*
+ * One default subscriptions manager and display-size registry per client, kept
+ * for the client's lifetime rather than a provider's. A provider that remounts
+ * with the same client then finds the camera releases its feeds just made
+ * still in their grace, and two providers sharing a client share one refcount
+ * instead of each unsubscribing the other's cameras. A provider handed a new
+ * client gets that client's own pair; the old client's pending releases run
+ * out on it as they would have.
+ */
+const clientDefaults = new WeakMap<
+  KerbcastClient,
+  { subscriptions: KerbcastSubscriptions; displaySizes: KerbcastDisplaySizes }
+>();
+
+function defaultsFor(client: KerbcastClient): {
+  subscriptions: KerbcastSubscriptions;
+  displaySizes: KerbcastDisplaySizes;
+} {
+  let defaults = clientDefaults.get(client);
+  if (!defaults) {
+    defaults = {
+      subscriptions: createClientSubscriptions(client),
+      displaySizes: createClientDisplaySizes(client),
+    };
+    clientDefaults.set(client, defaults);
+  }
+  return defaults;
+}
+
 /**
  * Provide a `KerbcastClient` (and optional subscriptions override) to the
  * component subtree. Hooks and `CameraFeed` read both from this context.
@@ -177,27 +293,14 @@ export function KerbcastProvider({
   displaySizes: displaySizesProp,
   children,
 }: KerbcastProviderProps): React.JSX.Element {
-  // Create default subscriptions once per client. A ref so the object is
-  // stable across renders even if the parent re-renders.
-  const defaultSubsRef = useRef<KerbcastSubscriptions | null>(null);
-  if (defaultSubsRef.current === null) {
-    defaultSubsRef.current = createClientSubscriptions(client);
-  }
-
-  // Same for the display-size registry: one per client, stable across renders.
-  const defaultSizesRef = useRef<KerbcastDisplaySizes | null>(null);
-  if (defaultSizesRef.current === null) {
-    defaultSizesRef.current = createClientDisplaySizes(client);
-  }
-
+  const defaults = defaultsFor(client);
   const value = useMemo(
     () => ({
       client,
-      subscriptions: subscriptionsProp ?? defaultSubsRef.current!,
-      displaySizes: displaySizesProp ?? defaultSizesRef.current!,
+      subscriptions: subscriptionsProp ?? defaults.subscriptions,
+      displaySizes: displaySizesProp ?? defaults.displaySizes,
     }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [client, subscriptionsProp, displaySizesProp],
+    [client, defaults, subscriptionsProp, displaySizesProp],
   );
 
   return (
