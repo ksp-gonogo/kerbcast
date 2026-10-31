@@ -158,7 +158,8 @@ export interface CameraFeedProps {
    * auto-selection: the first live camera in the registry is latched. A
    * displayed camera that drops out of the list stays on screen, with its
    * last known state, for `KERBCAST_RELEASE_GRACE_MS` before the feed falls
-   * back, so a momentary gap does not restart its stream.
+   * back, so a momentary gap does not restart its stream. A recording of
+   * that camera still ends at once (`camera-gone`).
    */
   flightId: number | null;
   /**
@@ -492,7 +493,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
      * both times. Keep showing it, with its last known state, for
      * KERBCAST_RELEASE_GRACE_MS. A new `flightId` prop is a real choice and
      * switches at once, and a requested camera that is listed wins over a
-     * held one.
+     * held one. The hold is the feed's alone: a recording of the camera
+     * still ends at once as camera-gone.
      */
     const requestedStillPresent =
       requestedFlightId !== null &&

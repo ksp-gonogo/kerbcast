@@ -41,7 +41,23 @@ export function createClientSubscriptions(
   client: KerbcastClient,
   options: ClientSubscriptionsOptions = {},
 ): KerbcastSubscriptions {
-  const graceMs = options.releaseGraceMs ?? KERBCAST_RELEASE_GRACE_MS;
+  return withGrace(createSubscriptionsCore(client), options.releaseGraceMs ?? KERBCAST_RELEASE_GRACE_MS);
+}
+
+/** One client's refcounts and pending releases, with the grace given per release. */
+interface SubscriptionsCore {
+  acquire(flightId: number): void;
+  release(flightId: number, graceMs: number): void;
+}
+
+function withGrace(core: SubscriptionsCore, graceMs: number): KerbcastSubscriptions {
+  return {
+    acquire: (flightId) => core.acquire(flightId),
+    release: (flightId) => core.release(flightId, graceMs),
+  };
+}
+
+function createSubscriptionsCore(client: KerbcastClient): SubscriptionsCore {
   const refcounts = new Map<number, number>();
   const pendingRelease = new Map<number, ReturnType<typeof setTimeout>>();
   const stopWatchingSlot = new Map<number, () => void>();
@@ -147,7 +163,7 @@ export function createClientSubscriptions(
         toSubscribe.add(flightId);
       }
     },
-    release(flightId: number): void {
+    release(flightId: number, graceMs: number): void {
       const count = (refcounts.get(flightId) ?? 1) - 1;
       if (count > 0) {
         refcounts.set(flightId, count);
@@ -290,17 +306,17 @@ export interface KerbcastProviderProps {
 }
 
 /*
- * The default subscriptions managers and display-size registry, per client,
- * kept for the client's lifetime rather than a provider's. A provider that
- * remounts with the same client then finds the camera releases its feeds just
- * made still in their grace, and two providers sharing a client share one
- * refcount instead of each unsubscribing the other's cameras. A provider
- * handed a new client gets that client's own; the old client's pending
- * releases run out on it as they would have. Each is built only when a
- * provider needs it, and providers asking for different graces get separate
- * managers.
+ * The default subscriptions and display-size registry, per client, kept for
+ * the client's lifetime rather than a provider's. A provider that remounts
+ * with the same client then finds the camera releases its feeds just made
+ * still in their grace, and every provider on a client shares one refcount,
+ * whatever grace each asks for, so none can unsubscribe a camera another
+ * still shows. A provider handed a new client gets that client's own; the old
+ * client's pending releases run out on it as they would have. Each is built
+ * only when a provider needs it.
  */
 interface ClientDefaults {
+  core: SubscriptionsCore | null;
   subscriptions: Map<number, KerbcastSubscriptions>;
   displaySizes: KerbcastDisplaySizes | null;
 }
@@ -310,18 +326,19 @@ const clientDefaults = new WeakMap<KerbcastClient, ClientDefaults>();
 function defaultsOf(client: KerbcastClient): ClientDefaults {
   let defaults = clientDefaults.get(client);
   if (!defaults) {
-    defaults = { subscriptions: new Map(), displaySizes: null };
+    defaults = { core: null, subscriptions: new Map(), displaySizes: null };
     clientDefaults.set(client, defaults);
   }
   return defaults;
 }
 
 function defaultSubscriptions(client: KerbcastClient, releaseGraceMs: number): KerbcastSubscriptions {
-  const byGrace = defaultsOf(client).subscriptions;
-  let subscriptions = byGrace.get(releaseGraceMs);
+  const defaults = defaultsOf(client);
+  let subscriptions = defaults.subscriptions.get(releaseGraceMs);
   if (!subscriptions) {
-    subscriptions = createClientSubscriptions(client, { releaseGraceMs });
-    byGrace.set(releaseGraceMs, subscriptions);
+    defaults.core ??= createSubscriptionsCore(client);
+    subscriptions = withGrace(defaults.core, releaseGraceMs);
+    defaults.subscriptions.set(releaseGraceMs, subscriptions);
   }
   return subscriptions;
 }

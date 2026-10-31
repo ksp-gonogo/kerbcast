@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
-import { render } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
+import { useEffect } from "react";
 import {
   KERBCAST_RELEASE_GRACE_MS,
   KerbcastProvider,
@@ -483,5 +484,74 @@ describe("KerbcastProvider defaults", () => {
       </>,
     );
     expect(seen[0]).toBe(seen[1]);
+  });
+
+  function Holder({ flightId }: { flightId: number }): null {
+    const subs = useKerbcastSubscriptions();
+    useEffect(() => {
+      subs.acquire(flightId);
+      return () => subs.release(flightId);
+    }, [subs, flightId]);
+    return null;
+  }
+
+  it("keeps a camera through a change of the provider's grace", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = stubClient();
+      const view = render(
+        <KerbcastProvider client={client}>
+          <Holder flightId={5} />
+        </KerbcastProvider>,
+      );
+      view.rerender(
+        <KerbcastProvider client={client} releaseGraceMs={500}>
+          <Holder flightId={5} />
+        </KerbcastProvider>,
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+      });
+      expect(calls).toEqual(["subscribe:5"]);
+      view.unmount();
+      await act(async () => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(calls).toEqual(["subscribe:5", "unsubscribe:5"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not unsubscribe a camera another provider with a different grace still shows", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, calls } = stubClient();
+      const both = (withZero: boolean) => (
+        <>
+          <KerbcastProvider client={client}>
+            <Holder flightId={5} />
+          </KerbcastProvider>
+          {withZero && (
+            <KerbcastProvider client={client} releaseGraceMs={0}>
+              <Holder flightId={5} />
+            </KerbcastProvider>
+          )}
+        </>
+      );
+      const view = render(both(true));
+      view.rerender(both(false));
+      await act(async () => {
+        vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+      });
+      expect(calls).toEqual(["subscribe:5"]);
+      view.unmount();
+      await act(async () => {
+        vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
+      });
+      expect(calls).toEqual(["subscribe:5", "unsubscribe:5"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

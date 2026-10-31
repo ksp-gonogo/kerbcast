@@ -52,7 +52,10 @@ Commonly used props (`CameraFeedProps` has the full set with doc
 comments):
 
 - `flightId: number | null`. The camera to show. `null` latches the
-  first live camera and re-picks if it dies.
+  first live camera and re-picks if it dies. A shown camera that drops
+  out of the camera list stays on screen for `KERBCAST_RELEASE_GRACE_MS`
+  before the feed falls back. A recording of it still ends at once
+  (`camera-gone`)
 - `onSelectCamera` / `onDisplayedCameraChange`. The user picked a
   camera, or the resolved camera changed (including auto-latch).
 - `enableFullscreen`, `enablePictureInPicture`, `enableQualityControl`.
