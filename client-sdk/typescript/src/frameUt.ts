@@ -3,11 +3,15 @@ import type { FrameAnchor, FrameCommandState, FrameStampPayload } from "./__gene
 /**
  * Where a frame's UT came from. `"exact"`: looked up from the frame's own
  * capture stamp, matched by RTP timestamp. `"estimated"`: either the stamp
- * of a nearby older frame, when a displayed frame through the noise pipeline
- * can't be identified exactly (it lags the picture, never leads it), or,
- * with no stamp at all, the ~1 Hz capture clock extrapolated to now, which
- * runs ahead of the picture by the pipeline latency (typically 0.15 to
- * 0.2 s).
+ * of a nearby older frame, when a displayed frame can't be identified
+ * exactly, or, with no stamp at all, the ~1 Hz capture clock extrapolated
+ * to now, which runs ahead of the picture by the pipeline latency
+ * (typically 0.15 to 0.2 s). An older frame's stamp lags the picture only
+ * while the element plays the stream as it arrives. A host that holds
+ * frames back on its own delay (a decoded or encoded frame transform) hides
+ * which frame is shown, so an estimate then runs ahead of the picture by
+ * that delay; such a host gives the feed the UT it shows instead (see
+ * `KerbcastClient.frameAt`).
  */
 export type FrameUtSource = "exact" | "estimated";
 
@@ -182,6 +186,107 @@ export class FrameStampStore {
 
   clear(): void {
     this.byFlight.clear();
+  }
+}
+
+/** How far back, in UT, frames are kept for a delayed view by default: 15 minutes, past any light delay a view should need. */
+export const FRAME_HISTORY_MAX_LAG_UT = 900;
+
+/** Most frames kept per camera by default, whatever the window, so a long warp cannot grow it unbounded. */
+export const FRAME_HISTORY_MAX_ENTRIES = 20_000;
+
+interface HistoryEntry {
+  ut: number;
+  epoch: number;
+  extras: FrameStampExtras | null;
+  /** Built on first lookup and kept, so repeated lookups of one frame return the same object. */
+  frame?: DisplayedFrameUt;
+}
+
+/**
+ * Recent frames per camera keyed by their UT, so a host playing the video
+ * out on its own delay can find the frame it is showing from its UT alone.
+ * Unlike {@link FrameStampStore} this survives a reconnect: a UT means the
+ * same thing on any connection. A frame at an earlier UT than the newest
+ * (a revert or quickload) drops what came after it, and a new capture epoch
+ * starts afresh. Frames are kept back to `maxLagUt` before the newest,
+ * always with one at or before that, and never more than `maxEntries`:
+ * past that the oldest go.
+ */
+export class FrameHistory {
+  private readonly byFlight = new Map<number, { list: HistoryEntry[]; start: number }>();
+
+  constructor(
+    private readonly maxLagUt: number = FRAME_HISTORY_MAX_LAG_UT,
+    private readonly maxEntries: number = FRAME_HISTORY_MAX_ENTRIES,
+  ) {}
+
+  record(stamp: FrameStampPayload): void {
+    let kept = this.byFlight.get(stamp.flightId);
+    if (!kept) {
+      kept = { list: [], start: 0 };
+      this.byFlight.set(stamp.flightId, kept);
+    }
+    const { list } = kept;
+    const ut = stamp.captureUt;
+    if (list.length > kept.start && list[list.length - 1].epoch !== stamp.captureEpoch) {
+      list.length = 0;
+      kept.start = 0;
+    }
+    while (list.length > kept.start && list[list.length - 1].ut >= ut) list.pop();
+    list.push({ ut, epoch: stamp.captureEpoch, extras: extrasOf(stamp) });
+    /* Dropping by a moving start keeps a push cheap; the array is compacted once half of it is dropped. */
+    const cutoff = ut - this.maxLagUt;
+    let start = kept.start;
+    while (start + 1 < list.length && list[start + 1].ut <= cutoff) start++;
+    start = Math.max(start, list.length - Math.max(1, this.maxEntries));
+    if (start * 2 >= list.length) {
+      list.splice(0, start);
+      start = 0;
+    }
+    kept.start = start;
+  }
+
+  /**
+   * The newest frame of `flightId` at or before `ut`, as a displayed frame
+   * with `source: "exact"` and no RTP timestamp, or `null` when every frame
+   * kept is newer.
+   */
+  at(flightId: number, ut: number): DisplayedFrameUt | null {
+    const kept = this.byFlight.get(flightId);
+    if (!kept) return null;
+    const { list } = kept;
+    let lo = kept.start;
+    let hi = list.length - 1;
+    let found = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid].ut <= ut) {
+        found = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (found < 0) return null;
+    const e = list[found];
+    e.frame ??= withExtras(
+      { ut: e.ut, epoch: e.epoch, source: "exact" as const, flightId, rtpTimestamp: null, presentedAt: 0 },
+      e.extras,
+    );
+    return e.frame;
+  }
+
+  /** Frames kept for `flightId`. */
+  size(flightId: number): number {
+    const kept = this.byFlight.get(flightId);
+    return kept ? kept.list.length - kept.start : 0;
+  }
+
+  /** Forget every camera except those in `keep`. */
+  retain(keep: Iterable<number>): void {
+    const kept = new Set(keep);
+    for (const flightId of [...this.byFlight.keys()]) if (!kept.has(flightId)) this.byFlight.delete(flightId);
   }
 }
 

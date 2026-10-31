@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FRAME_STAMP_HISTORY, FrameStampStore, extrapolateCaptureUt } from "./frameUt";
+import { FRAME_STAMP_HISTORY, FrameHistory, FrameStampStore, extrapolateCaptureUt } from "./frameUt";
 
 describe("FrameStampStore", () => {
   it("keeps the newest stamps per camera and evicts the oldest", () => {
@@ -51,5 +51,61 @@ describe("extrapolateCaptureUt", () => {
     expect(extrapolateCaptureUt(100, 4, 0, 500)).toBe(102);
     expect(extrapolateCaptureUt(100, 1, 0, 60_000)).toBe(102);
     expect(extrapolateCaptureUt(100, 1, 1000, 0)).toBe(100);
+  });
+});
+
+describe("FrameHistory", () => {
+  const stamp = (ut: number, extra: object = {}, epoch = 0) => ({
+    flightId: 1,
+    rtpTimestamp: Math.round(ut * 1000),
+    captureUt: ut,
+    captureEpoch: epoch,
+    ...extra,
+  });
+
+  it("finds the newest frame at or before a UT, with its extras", () => {
+    const history = new FrameHistory();
+    history.record(stamp(10, { fov: 30 }));
+    history.record(stamp(11, { fov: 20 }));
+    history.record(stamp(12, { fov: 10 }));
+    expect(history.at(1, 9.9)).toBeNull();
+    expect(history.at(1, 11.5)).toEqual({
+      ut: 11,
+      epoch: 0,
+      source: "exact",
+      flightId: 1,
+      rtpTimestamp: null,
+      presentedAt: 0,
+      fov: 20,
+    });
+    expect(history.at(1, 100)?.fov).toBe(10);
+    expect(history.at(1, 11)).toBe(history.at(1, 11.9));
+    expect(history.at(2, 11)).toBeNull();
+  });
+
+  it("keeps frames back to the UT span, with one at or before its start", () => {
+    const history = new FrameHistory(10, 1000);
+    for (let ut = 0; ut <= 30; ut++) history.record(stamp(ut));
+    expect(history.at(1, 19)).toBeNull();
+    expect(history.at(1, 20.5)?.ut).toBe(20);
+    expect(history.size(1)).toBe(11);
+  });
+
+  it("keeps at most its entry cap, dropping the oldest", () => {
+    const history = new FrameHistory(1e9, 5);
+    for (let ut = 0; ut < 100; ut++) history.record(stamp(ut));
+    expect(history.size(1)).toBe(5);
+    expect(history.at(1, 94.5)).toBeNull();
+    expect(history.at(1, 95)?.ut).toBe(95);
+  });
+
+  it("drops what came after a frame at an earlier UT, and starts afresh on a new epoch", () => {
+    const history = new FrameHistory();
+    for (let ut = 0; ut < 10; ut++) history.record(stamp(ut));
+    history.record(stamp(5.5));
+    expect(history.at(1, 9)?.ut).toBe(5.5);
+    history.record(stamp(50, {}, 1));
+    expect(history.at(1, 49)).toBeNull();
+    expect(history.size(1)).toBe(1);
   });
 });

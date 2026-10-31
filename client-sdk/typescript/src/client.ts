@@ -18,6 +18,7 @@ import { CameraKind, CameraLifecycle, CommandAimKind, ErrorCode, ErrorSource } f
 import {
   type DisplayedFrameUt,
   type FrameUt,
+  FrameHistory,
   FrameStampStore,
   STAMP_TO_DISPLAY_MAX_MS,
   type VideoWithFrameCallback,
@@ -1806,6 +1807,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _captureUtAt = 0;
   /** Per-frame capture stamps from `frame-stamp`, for exact frame UT lookup. */
   private readonly frameStamps = new FrameStampStore();
+  /** The same frames keyed by UT, for {@link frameAt}. */
+  private readonly frameHistory = new FrameHistory();
   /** Each command camera's recent targets lists, for {@link commandCentreAt}. */
   private readonly commandCentres = new CommandCentreHistory();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
@@ -1915,7 +1918,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * frame (within the last second), or the newest stamp that arrived more
    * than {@link STAMP_TO_DISPLAY_MAX_MS} before the frame was shown. Only
    * with no stamp at all does it fall back to the capture clock, which
-   * leads.
+   * leads. All this assumes `video` plays the stream as it arrives: a host
+   * that holds frames back on its own delay hides which frame is shown, so
+   * the estimate runs ahead by that delay. Such a host looks its frame up
+   * with {@link frameAt} instead.
    * Without `requestVideoFrameCallback` estimated frames arrive every 100 ms
    * instead. Frames with neither a stamp nor a clock are skipped. Returns a
    * function that stops watching.
@@ -2626,6 +2632,19 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * The frame of `flightId` a view showing `displayUt` has on screen: the
+   * newest stamped frame at or before that UT, with its command state and
+   * anchors. For a host that plays the video out on its own delay, where
+   * the browser can no longer say which frame it presents. `null` when no
+   * frame that old is kept: frames go 15 minutes of UT behind the newest,
+   * at most 20,000 per camera, and on a new capture epoch or when the
+   * camera leaves the list. Kept across reconnects.
+   */
+  frameAt(flightId: number, displayUt: number): DisplayedFrameUt | null {
+    return this.frameHistory.at(flightId, displayUt);
+  }
+
+  /**
    * Mark things in the game on `flightId`'s picture: a part, a craft, a
    * point on a body or a direction. Replaces this client's anchors on that
    * camera; `null` or an empty list clears them. The game projects each
@@ -2943,6 +2962,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this._cameras = cameras;
     this.camerasListed = true;
     this.commandCentres.retain(cameras.map((c) => c.flightId));
+    this.frameHistory.retain(cameras.map((c) => c.flightId));
     for (const cam of cameras) {
       this.commandCentres.record(cam.flightId, cam.commandCentre);
       const handle = this.getOrCreateHandle(cam.flightId);
@@ -3141,6 +3161,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         break;
       case "frame-stamp":
         this.frameStamps.record(msg.content);
+        this.frameHistory.record(msg.content);
         break;
       case "scene-state-changed":
         this._inFlight = msg.content.inFlight;

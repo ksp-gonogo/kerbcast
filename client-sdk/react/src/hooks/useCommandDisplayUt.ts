@@ -84,8 +84,9 @@ export function commandShownKey(c: FrameCommandState | undefined): string {
  * displayed UT reaches the next of `events`, so a state change lands on its
  * frame rather than on the next tick. The displayed frame's own command
  * state comes back as `command`, re-rendering when what it shows changes:
- * an exact frame's, an estimated one's (which lags the picture, so is never
- * early; its own UT is used too, so events and lists stay on that frame),
+ * an exact frame's, an estimated one's (which lags the picture while the
+ * element plays the stream as it arrives; its own UT is used too, so events
+ * and lists stay on that frame),
  * or with an override the host's own `overrideCommand`. `null` when
  * nothing is known.
  */

@@ -3127,6 +3127,139 @@ describe("CameraFeed - command camera target brackets", () => {
     await waitFor(() => expect(subjects).toContain("kerbcast/subject"), { timeout: 2000 });
   });
 
+  describe("under a host's own delay", () => {
+    const anchorAt = (id: string, x: number, owner?: string) => ({
+      id,
+      ...(owner ? { owner } : {}),
+      x,
+      y: 100,
+      inFrame: true,
+      behind: false,
+      distanceM: 1000,
+      apparentRadiusPx: 4,
+      angleOffAxis: 3,
+      occluded: false,
+    });
+    const frameState = (rangeM: number, bracketHalfPx: number) => ({
+      hasFix: true,
+      rangeM,
+      bracketHalfPx,
+      frameHeightPx: 576,
+      framingFits: true,
+      occluded: false,
+      occluder: "",
+      sunlit: true,
+      subjectPersistentId: 11,
+    });
+
+    /*
+     * The picture shows UT 995, the frame stamped at 990. The game has moved
+     * on: the newest stamp (1000) and the snapshot each give another range,
+     * bracket and subject position.
+     */
+    async function delayedSource() {
+      const source = await buildConnectedSource([commandCamera()]);
+      await act(async () => {
+        source.sidecar.fireFrameStamp({
+          flightId: 301,
+          rtpTimestamp: 1,
+          captureUt: 990,
+          captureEpoch: 0,
+          width: 1024,
+          height: 576,
+          command: frameState(2_000_000, 40),
+          anchors: [anchorAt("subject", 100, "kerbcast"), anchorAt("pad", 111)],
+        });
+        source.sidecar.fireFrameStamp({
+          flightId: 301,
+          rtpTimestamp: 2,
+          captureUt: 1000,
+          captureEpoch: 0,
+          width: 1024,
+          height: 576,
+          command: frameState(8_000_000, 4),
+          anchors: [anchorAt("subject", 500, "kerbcast"), anchorAt("pad", 555)],
+        });
+      });
+      return source;
+    }
+
+    function DelayedFeed({ client, displayUt, seen }: { client: KerbcastClient; displayUt: number; seen: Map<string, unknown> }) {
+      return (
+        <KerbcastProvider client={client}>
+          <CameraFeed
+            flightId={301}
+            displayUt={displayUt}
+            anchors={[{ id: "pad", kind: AnchorKind.Vessel, vessel: 11 }]}
+            anchorOverlay={{
+              render: (a) => {
+                seen.set(`anchor:${a.id}`, a.x);
+                return null;
+              },
+            }}
+            targetBracketOverlay={{
+              render: (ctx) => {
+                seen.set("bracketHalfPx", ctx.state.bracketHalfPx);
+                seen.set("subjectX", ctx.subject?.x);
+                return null;
+              },
+            }}
+          />
+        </KerbcastProvider>
+      );
+    }
+
+    it("draws the brackets, readout and markers of the frame at the displayed UT", async () => {
+      /* Markers need a laid-out box, which jsdom never gives. */
+      const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1024);
+      const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(576);
+      try {
+        const { client } = await delayedSource();
+        const seen = new Map<string, unknown>();
+        render(<DelayedFeed client={client} displayUt={995} seen={seen} />);
+        expect(screen.getByText("IN VIEW · 2,000 km")).toBeTruthy();
+        expect(seen.get("bracketHalfPx")).toBe(40);
+        expect(seen.get("subjectX")).toBe(100);
+        expect(seen.get("anchor:pad")).toBe(111);
+      } finally {
+        width.mockRestore();
+        height.mockRestore();
+      }
+    });
+
+    it("keeps the subject box on a host's displayFrame rather than the newest stamp", async () => {
+      const { client } = await delayedSource();
+      const shown = client.frameAt(301, 995)!;
+      const subjects: (number | undefined)[] = [];
+      render(
+        <KerbcastProvider client={client}>
+          <CameraFeed
+            flightId={301}
+            displayFrame={shown}
+            targetBracketOverlay={{
+              render: (ctx) => {
+                subjects.push(ctx.subject?.x);
+                return null;
+              },
+            }}
+          />
+        </KerbcastProvider>,
+      );
+      /* Long enough for the newest stamp to count as on screen, had the video been watched. */
+      await act(() => new Promise((r) => setTimeout(r, 400)));
+      expect(subjects.length).toBeGreaterThan(0);
+      expect(new Set(subjects)).toEqual(new Set([100]));
+    });
+
+    it("behaves as without a frame before any frame that old is known", async () => {
+      const { client } = await delayedSource();
+      const seen = new Map<string, unknown>();
+      render(<DelayedFeed client={client} displayUt={985} seen={seen} />);
+      expect(screen.getByText("IN VIEW · 11,508 km")).toBeTruthy();
+      expect(seen.get("bracketHalfPx")).toBe(4);
+    });
+  });
+
   describe("target picker", () => {
     const TARGETS: CommandCentreInfo = {
       ...STATION,

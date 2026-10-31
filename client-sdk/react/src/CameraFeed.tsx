@@ -345,19 +345,22 @@ export interface CameraFeedProps {
   noSlotLabel?: string | null;
   /**
    * Mission UT the displayed video was captured at, for a host running its
-   * own delayed playout. Picks which command-track transition is in force and
-   * ages the readout. Defaults to the displayed frame's own capture UT where
-   * the browser reports frame RTP timestamps, else the client's capture
-   * clock interpolated to now. While a command lock is held the brackets and
-   * readout come from the displayed frame's own state, which a UT alone does
-   * not carry: such a host passes `displayFrame` instead.
+   * own delayed playout: the capture UT of the frame its buffer last
+   * released. Picks which command-track transition is in force and ages the
+   * readout, and the brackets, readout and anchor markers come from the
+   * newest frame at or before it (`KerbcastClient.frameAt`), so they never
+   * run ahead of the picture. Before any frame that old is known they behave
+   * as without it. Defaults to the displayed frame's own capture UT where the
+   * browser reports frame RTP timestamps, else the client's capture clock
+   * interpolated to now.
    */
   displayUt?: number;
   /**
    * The frame a host's own delayed playout is showing, as
    * `watchDisplayedFrames` reported it when it arrived. Wins over
-   * `displayUt`: its `ut` picks the transition in force and its `command`
-   * draws the brackets and readout, so they never run ahead of the picture.
+   * `displayUt`: its `ut` picks the transition in force, its `command`
+   * draws the brackets and readout and its `anchors` the markers, so they
+   * never run ahead of the picture.
    */
   displayFrame?: DisplayedFrameUt | null;
   /**
@@ -675,13 +678,17 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       camera?.kind === CameraKind.Command && !isDestroyed ? camera : null;
     const isCommandFeed = commandCamera !== null;
     const commandTrack = commandCamera?.commandTrack ?? null;
+    /* A host on its own delay names the frame it shows, or its UT for the client to look the frame up by. */
+    const hostFrame =
+      displayFrame ??
+      (displayUtProp !== undefined && flightId !== null ? client.frameAt(flightId, displayUtProp) : null);
     const commandDisplayUt = useCommandDisplayUt(
       commandTrack !== null,
       displayFrame ? displayFrame.ut : displayUtProp,
       commandTrack?.events,
       commandCamera?.flightId ?? null,
       videoEl,
-      displayFrame?.command,
+      hostFrame?.command,
     );
     const commandState = commandTrack
       ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut, commandDisplayUt?.command)
@@ -1521,6 +1528,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     {targetBracketsAvailable && bracketsOn && (
                       <LiveCommandBrackets
                         flightId={commandCamera?.flightId ?? null}
+                        frame={hostFrame}
                         state={commandState}
                         displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
                         utSource={commandDisplayUt?.source ?? null}
@@ -1537,7 +1545,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
               )}
               {drawsAnchors && !outOfFlight && !isDestroyed && !commandState?.blank && (
-                <LiveAnchorMarkers flightId={flightId} video={videoEl} overlay={anchorOverlay} />
+                <LiveAnchorMarkers flightId={flightId} video={videoEl} overlay={anchorOverlay} frame={hostFrame} />
               )}
               {outOfFlight ? (
                 showStandbyIcon && (

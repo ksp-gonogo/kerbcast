@@ -302,19 +302,26 @@ export function useDisplayedFrame(
   return frame;
 }
 
-/** Self-subscribing markers for a feed: watches its displayed frames and draws their anchors. */
+/**
+ * Self-subscribing markers for a feed: watches its displayed frames and
+ * draws their anchors, or draws `frame`'s while a host's own delayed
+ * playout gives it.
+ */
 export function LiveAnchorMarkers({
   flightId,
   video,
   overlay,
   fit,
+  frame: given,
 }: {
   flightId: number | null;
   video: HTMLVideoElement | null;
   overlay?: AnchorOverlay | null;
   fit?: FrameFit;
+  frame?: DisplayedFrameUt | null;
 }) {
-  const frame = useDisplayedFrame(true, flightId, video);
+  const watched = useDisplayedFrame(!given, flightId, video);
+  const frame = given ?? watched;
   return <AnchorMarkers frame={frame} video={video} overlay={overlay} fit={fit} />;
 }
 

@@ -3506,6 +3506,27 @@ describe("KerbcastClient frame UT", () => {
     expect(client.frameUt(7, 1)).toBeNull();
   });
 
+  it("frameAt finds a frame by UT with its command state, across a reconnect", async () => {
+    const { sidecar, client } = await connected();
+    const command = (rangeM: number) => ({
+      hasFix: true,
+      rangeM,
+      bracketHalfPx: 4,
+      frameHeightPx: 576,
+      framingFits: true,
+      occluded: false,
+      occluder: "",
+      sunlit: true,
+      subjectPersistentId: 11,
+    });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 1, captureUt: 100, captureEpoch: 0, command: command(5000) });
+    sidecar.fireFrameStamp({ flightId: 7, rtpTimestamp: 2, captureUt: 110, captureEpoch: 0, command: command(9000) });
+    expect(client.frameAt(7, 99)).toBeNull();
+    expect(client.frameAt(7, 105)?.command?.rangeM).toBe(5000);
+    await client.connect();
+    expect(client.frameAt(7, 105)?.command?.rangeM).toBe(5000);
+  });
+
   it("watchDisplayedFrames reports each presented frame with its source", async () => {
     const { sidecar, client } = await connected();
     sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 500 });

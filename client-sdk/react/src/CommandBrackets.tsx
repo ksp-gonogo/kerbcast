@@ -6,6 +6,7 @@ import {
   commandReadout,
   findAnchor,
   frameToScreen,
+  type DisplayedFrameUt,
   type EffectiveCommandTrack,
   type FrameAnchor,
   type FrameUtSource,
@@ -393,9 +394,15 @@ export function CommandBrackets({
  */
 export function LiveCommandBrackets({
   flightId,
+  frame: given,
   ...props
-}: CommandBracketsProps & { flightId: number | null }) {
-  const frame = useDisplayedFrame(true, flightId, props.video);
+}: CommandBracketsProps & {
+  flightId: number | null;
+  /** The frame a host's own delayed playout shows; while set, the video's own frames are not watched. */
+  frame?: DisplayedFrameUt | null;
+}) {
+  const watched = useDisplayedFrame(!given, flightId, props.video);
+  const frame = given ?? watched;
   const subject = findAnchor(frame?.anchors, COMMAND_SUBJECT_ANCHOR_ID, KERBCAST_ANCHOR_OWNER);
   const aim = findAnchor(frame?.anchors, COMMAND_AIM_ANCHOR_ID, KERBCAST_ANCHOR_OWNER);
   const size =

@@ -634,13 +634,26 @@ All three arrive on `DisplayedFrameUt` through `watchDisplayedFrames`.
 `effectiveCommandTrack(track, displayUt, frame.command)` uses a frame's own
 state whole; the React feed does this for its brackets and readout.
 
-A host with its own delayed playout keeps the `DisplayedFrameUt` it got for
-each frame and hands the one it is showing to the React feed as
-`displayFrame` (beside, and winning over, `displayUt`): its UT picks the
-transition in force and its `command` draws the brackets and readout. A UT
-alone carries no frame state, so under a lock `displayUt` by itself shows no
-fix. Without either, the feed uses the frame the browser presents, or the
-newest stamped frame before it, which lags the picture and so is never early.
+Without help, the feed uses the frame the browser presents, or the newest
+stamped frame before it. That lags the picture only while the video element
+plays the stream as it arrives. A host that holds frames back on its own
+delay (a decoded or encoded frame transform) hides which frame is shown, so
+the feed would draw the brackets, readout and markers of a frame the picture
+has not reached yet. Such a host tells the feed what it shows:
+
+- `displayUt` on the React feed: the capture UT of the frame its buffer last
+  released, updated as it releases frames. The feed looks the frame up with
+  `client.frameAt(flightId, displayUt)`, the newest stamped frame at or
+  before that UT, and draws that frame's brackets, readout and anchor
+  markers; the UT also picks the transition in force. Before any frame that
+  old is known the feed behaves as without it
+- `displayFrame` instead, when the host kept the `DisplayedFrameUt` for each
+  frame itself. It wins over `displayUt`
+
+`frameAt` keeps frames back to 15 minutes of UT before the newest, at most
+20,000 per camera (`FRAME_HISTORY_MAX_LAG_UT`, `FRAME_HISTORY_MAX_ENTRIES`).
+It keeps them across a reconnect, and forgets a camera's frames on a new
+capture epoch or when the camera leaves the list.
 
 While a command lock is held, the camera list's `commandTrack` keeps only its
 `ut`, `authority` and `events` (each replayed at its own UT); the other fields
