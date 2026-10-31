@@ -827,8 +827,120 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     Check(snap2.TryStateAt(conic2, kerbin, 1234, out var q, out _) && (q - wantPos2).Magnitude < 1e-6, "snapshot: a new fill reads its own elements, not the last fill's path");
 }
 
+/*
+ * A command camera's framing radius across world model handovers, read as
+ * CommandCameraRig.KnownSubject reads it off the orbit branch: the light-time
+ * solve on the record's own positions from its ValidFromUt, the held instant,
+ * then the uncertainty at that instant from the same frame's record. A craft
+ * climbs at 300 m/s from 2 km to about 10 km from the lens; a record is
+ * published every 0.53 s, late by `lag`, its radius and rate meeting the
+ * last one's at its start. Sampled at 60 fps, the radius must never rise
+ * above the trend at render UT (a spike) nor jump by more than the trend can
+ * move in the gap a clamp to ValidFromUt skips.
+ */
+{
+    const double Mu = 3.5316e12;
+    const double T0 = 10000, Period = 0.53, Climb = 300, CraftRadius = 10;
+    const double U0 = 30, URate = 2;
+    var kerbin = new KinematicsBody { Known = true, Mu = Mu, Radius = 600000, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1), SpinDegPerS = 360.0 / 21549.425 };
+    var launch = kerbin.SurfaceAt(0, 0.19, 0, T0, out var launchVel);
+    var up = launch.Normalized;
+    DVec3 Truth(double t) => launch + launchVel * (t - T0) + up * (Climb * (t - T0));
+    DVec3 TruthVel() => launchVel + up * Climb;
+    double Trend(double t) => U0 + URate * (t - T0);
+
+    foreach (double? c in new double?[] { null, 3e8, 1e5, 2e4 })
+    foreach (double lag in new[] { 0.0, 0.12, 0.3 })
+    {
+        var store = NewStore();
+        var pub = store.Attach("modA");
+        int published = 0;
+        void PublishUpTo(double ut)
+        {
+            while (T0 + published * Period + lag <= ut)
+            {
+                double from = T0 + published * Period;
+                var b = pub.Begin(published + 1, 1, from);
+                b.Scope("ksc");
+                var p = Truth(from);
+                var v = TruthVel();
+                b.StateVector(7, 1, from, new Vec3d(p.X, p.Y, p.Z), new Vec3d(v.X, v.Y, v.Z), from, from + 2.0);
+                b.Uncertainty(Trend(from), URate, 0, 0);
+                b.Radius(CraftRadius);
+                b.BindSite("KSC", "ksc");
+                pub.Publish(b, out _);
+                published++;
+            }
+        }
+
+        var hold = new InstantHold();
+        double last = double.NaN, maxAbove = double.NegativeInfinity, maxJump = 0, maxJumpAt = 0;
+        int unpositioned = 0, samples = 0;
+        for (int n = 0; n < 60 * 30; n++)
+        {
+            double ut = T0 + lag + n / 60.0;
+            PublishUpTo(ut);
+            var view = Frame(store, ut);
+            int scope = ModelLookup.ScopeFor(view, "KSC", out _);
+            var station = kerbin.SurfaceAt(0, 0, 70, ut, out _);
+            var path = new HandoverPath { View = view, Scope = scope, Body = kerbin };
+            double tr = ut;
+            if (c.HasValue)
+            {
+                var motion = ModelLookup.Find(view, scope, 7, ut, i => i == 1);
+                double validFrom = motion.State == CraftFixState.Positioned ? motion.Record.ValidFromUt : double.NegativeInfinity;
+                if (PastInstant.SolveFrom(ref path, station, ut, c.Value, 400, validFrom, ut, out tr) != PastStatus.Found)
+                {
+                    unpositioned++;
+                    continue;
+                }
+                double held = hold.NotBefore(ut, 0, c.Value, 1);
+                if (held > tr && PastInstant.Arrived(ref path, station, ut, c.Value, held)) tr = held;
+                hold.Shown(ut, tr, 0, c.Value, 1, 1);
+            }
+            var fix = ModelLookup.Find(view, scope, 7, tr, i => i == 1);
+            if (fix.State != CraftFixState.Positioned)
+            {
+                unpositioned++;
+                continue;
+            }
+            double radius = fix.RadiusM + ModelRules.UncertaintyAt(fix.Record, tr);
+            samples++;
+            maxAbove = Math.Max(maxAbove, radius - (CraftRadius + Trend(ut)));
+            if (!double.IsNaN(last) && Math.Abs(radius - last) > maxJump)
+            {
+                maxJump = Math.Abs(radius - last);
+                maxJumpAt = ut;
+            }
+            last = radius;
+        }
+        /* Off the clamp the radius moves at the trend's rate; a clamp to the new record's start skips at most the publish lag plus a light time. */
+        double light = c.HasValue ? 10500 / c.Value : 0;
+        double allowed = URate * (1 / 60.0 + Math.Min(Period, lag + light)) + 1e-6;
+        string name = $"handover c={(c.HasValue ? c.Value.ToString("G3") : "inf")} lag={lag}";
+        Check(unpositioned == 0 && samples == 60 * 30, $"{name}: every frame has a fix ({unpositioned} without)");
+        Check(maxAbove <= 1e-6, $"{name}: the framing radius never rises above the trend at render UT (most {maxAbove:G3} m)");
+        Check(maxJump <= allowed, $"{name}: the framing radius steps at most {allowed:G3} m a frame (most {maxJump:G3} m at {maxJumpAt - T0:F3} s)");
+    }
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
+
+/* A record's positions about its body as the rig's KnownPath reads them: none outside the record's window. */
+sealed class HandoverPath : IPastPath
+{
+    public WorldModelView View;
+    public int Scope;
+    public KinematicsBody Body;
+
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = default;
+        var fix = ModelLookup.Find(View, Scope, 7, ut, i => i == 1);
+        return fix.State == CraftFixState.Positioned && View.Snapshot.TryStateAt(fix.Record, Body, ut, out position, out _);
+    }
+}
 
 /* Kerbcast.dll's lock as KerbcastControl composes it: one CommandLock and
    store per scene, the bindings cleared with the tenure, and a reservation
