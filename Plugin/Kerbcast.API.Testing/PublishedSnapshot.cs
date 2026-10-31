@@ -75,6 +75,9 @@ namespace Kerbcast.Api.Testing
         public double StateUt { get; }
         public Vec3d Position { get; }
         public Vec3d Velocity { get; }
+        /** <summary>Whether <see cref="WorldModelBuilder.Acceleration"/> gave the record a net acceleration.</summary> */
+        public bool HasAcceleration { get; }
+        public Vec3d Acceleration { get; }
 
         public double Latitude { get; }
         public double Longitude { get; }
@@ -116,6 +119,8 @@ namespace Kerbcast.Api.Testing
             StateUt = r.StateUt;
             Position = r.Position;
             Velocity = r.Velocity;
+            HasAcceleration = r.HasAcceleration;
+            Acceleration = r.Acceleration;
             Latitude = r.Latitude;
             Longitude = r.Longitude;
             Altitude = r.Altitude;

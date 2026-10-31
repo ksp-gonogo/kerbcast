@@ -924,6 +924,152 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     }
 }
 
+/* A state-vector record with a net acceleration, gravity included, propagates under it in place of the body's gravity. */
+{
+    const double Mu = 3.5316e12;
+    var kerbin = new KinematicsBody { Known = true, Mu = Mu, Radius = 600000, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1), SpinDegPerS = 360.0 / 21549.425 };
+    var store = NewStore();
+    var pub = store.Attach("modA");
+    var b = pub.Begin(1, 1, 0);
+    b.Scope("ksc");
+    /* A straight-line case: falling at 6 m/s with net acceleration zero (a real chute descent also carries the body's centripetal term). */
+    b.StateVector(1, 1, 100, new Vec3d(602000, 0, 0), new Vec3d(-6, 0, 0), 100, 200);
+    b.Acceleration(new Vec3d(0, 0, 0));
+    b.StateVector(2, 1, 100, new Vec3d(602000, 0, 0), new Vec3d(-6, 0, 0), 100, 200);
+    b.StateVector(3, 1, 100, new Vec3d(602000, 0, 0), new Vec3d(-6, 3, 1), 100, 200);
+    b.Acceleration(new Vec3d(-2, 0.5, 0.25));
+    Check(pub.Publish(b, out var error) == PublishResult.Accepted, $"acceleration: a record with one is accepted ({error})");
+    var snap = Frame(store).Snapshot;
+    int ksc = snap.ScopeOf("ksc");
+    snap.TryFind(ksc, 1, out var chute);
+    snap.TryFind(ksc, 2, out var ballistic);
+    snap.TryFind(ksc, 3, out var pushed);
+
+    bool line = true;
+    for (double d = 0; d <= 100; d += 0.25)
+    {
+        line &= snap.TryStateAt(chute, kerbin, 100 + d, out var p, out var v)
+            && (p - new DVec3(602000 - 6 * d, 0, 0)).Magnitude < 1e-9 && (v - new DVec3(-6, 0, 0)).Magnitude < 1e-12;
+    }
+    Check(line, "acceleration: zero net acceleration under gravity propagates in a straight line at constant speed");
+    snap.TryStateAt(chute, kerbin, 102, out var c2, out _);
+    bool fell = snap.TryStateAt(ballistic, kerbin, 102, out var b2, out _);
+    Check(fell && Math.Abs((c2 - b2).Magnitude - 0.5 * Mu / (602000.0 * 602000.0) * 4) < 0.05,
+        $"acceleration: without it the same state falls about g d^2 / 2 below (19.5 m at 2 s, got {(c2 - b2).Magnitude:F2})");
+
+    KeplerPath.TryFromState(new DVec3(602000, 0, 0), new DVec3(-6, 0, 0), 100, Mu, out var old, 600000);
+    bool exact = true;
+    foreach (double ut in new[] { 100.0, 100.5, 101, 117.25, 150, 199.9 })
+    {
+        exact &= snap.TryStateAt(ballistic, kerbin, ut, out var p, out var v) && old.TryAt(ut, out var op, out var ov)
+            && p.X == op.X && p.Y == op.Y && p.Z == op.Z && v.X == ov.X && v.Y == ov.Y && v.Z == ov.Z;
+    }
+    Check(exact && !ballistic.HasAcceleration, "acceleration: a record without one matches the old ballistic propagation exactly");
+
+    var a = new DVec3(-2, 0.5, 0.25);
+    var v0 = new DVec3(-6, 3, 1);
+    Check(snap.TryStateAt(pushed, kerbin, 104, out var pp, out var pv)
+        && (pp - (new DVec3(602000, 0, 0) + v0 * 4 + a * 8)).Magnitude < 1e-9 && (pv - (v0 + a * 4)).Magnitude < 1e-12
+        && snap.TryStateAt(pushed, kerbin, 99, out var back, out _) && (back - (new DVec3(602000, 0, 0) - v0 + a * 0.5)).Magnitude < 1e-9,
+        "acceleration: position is x0 + v d + a d^2 / 2 and velocity v + a d, either side of the state's UT");
+    Check(snap.TryPath(pushed, kerbin, out var pushedPath) && Math.Abs(pushedPath.PeriapsisSpeed - (v0 + a * 100).Magnitude) < 1e-9
+        && Math.Abs(pushedPath.SpeedOver(100, 104) - (v0 + a * 4).Magnitude) < 1e-12
+        && Math.Abs(pushedPath.SpeedOver(98, 100) - v0.Magnitude) < 1e-12 && (v0 - a * 2).Magnitude < v0.Magnitude,
+        "acceleration: the speed bound is the faster end of the window asked, the record's window by default");
+
+    /* The storage a publisher reuses must not carry an acceleration into the next record in its slot. */
+    var b3 = pub.Begin(2, 1, 0);
+    b3.Scope("ksc");
+    b3.StateVector(1, 1, 100, new Vec3d(602000, 0, 0), new Vec3d(-6, 0, 0), 100, 200);
+    b3.StateVector(3, 1, 100, new Vec3d(602000, 0, 0), new Vec3d(-6, 3, 1), 100, 200);
+    pub.Publish(b3, out _);
+    for (int i = 0; i < 3; i++) Frame(store);
+    var snap3 = Frame(store).Snapshot;
+    snap3.TryFind(snap3.ScopeOf("ksc"), 1, out var reused);
+    Check(!reused.HasAcceleration && snap3.TryStateAt(reused, kerbin, 102, out var rp, out _) && (rp - b2).Magnitude < 1e-9,
+        "acceleration: a reused record slot starts without one");
+}
+
+/* The light-time solve on an accelerated record: the root satisfies the equation on the record's own path, below and above c. */
+{
+    const double Mu = 3.5316e12;
+    var kerbin = new KinematicsBody { Known = true, Mu = Mu, Radius = 600000, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1), SpinDegPerS = 360.0 / 21549.425 };
+    var x0 = new DVec3(610000, 0, 0);
+    var station = new DVec3(607000, -2000, 0);
+    foreach (var (v0, a, c) in new[]
+    {
+        (new DVec3(-6, 0, 0), new DVec3(0, 0, 0), 3e3),
+        (new DVec3(0, 200, 0), new DVec3(0, 30, 0), 2e4),
+        (new DVec3(0, -400, 0), new DVec3(0, -40, 0), 300.0),
+    })
+    {
+        var store = NewStore();
+        var pub = store.Attach("modA");
+        var b = pub.Begin(1, 1, 0);
+        b.Scope("ksc");
+        b.StateVector(7, 1, 100, new Vec3d(x0.X, x0.Y, x0.Z), new Vec3d(v0.X, v0.Y, v0.Z), 90, 140);
+        b.Acceleration(new Vec3d(a.X, a.Y, a.Z));
+        pub.Publish(b, out _);
+        double ut = 130;
+        var view = Frame(store, ut);
+        int scope = view.Snapshot.ScopeOf("ksc");
+        view.Snapshot.TryFind(scope, 7, out var r);
+        view.Snapshot.TryPath(r, kerbin, out var kp);
+        double bound = kp.SpeedOver(90, ut);
+        var path = new HandoverPath { View = view, Scope = scope, Body = kerbin };
+        var status = PastInstant.SolveFrom(ref path, station, ut, c, bound, 90, ut, out double tr);
+        double d = tr - 100;
+        var at = x0 + v0 * d + a * (0.5 * d * d);
+        double g = tr + (station - at).Magnitude / c - ut;
+        string name = $"acceleration light time c={c:G3} bound={bound:F0}";
+        Check(status == PastStatus.Found && g <= 0 && g > -1e-5, $"{name}: the root is on the accelerated path (g {g:G3}, tr {tr:F4})");
+    }
+}
+
+/* Acceleration through the builder: kept on a state vector, refused elsewhere, the same on the recorder. */
+{
+    using (var kc = RecordingKerbcast.Install())
+    {
+        kc.Command.TakeLock("modA", LockOptions.WorldModelRequired);
+        var fake = kc.Command.AttachWorldModel("modA");
+        var b = fake.Begin(1, 1, 0);
+        b.Scope("home");
+        b.StateVector(1, 1, 5, new Vec3d(610000, 0, 0), new Vec3d(0, 1, 0), 5, 50);
+        b.Acceleration(new Vec3d(0.5, -1.25, 2));
+        b.StateVector(2, 1, 5, new Vec3d(610000, 0, 0), new Vec3d(0, 1, 0), 5, 50);
+        Check(fake.Publish(b, out _) == PublishResult.Accepted, "acceleration: the recorder accepts it");
+        var one = kc.Command.Published[0].Find("home", 1);
+        var two = kc.Command.Published[0].Find("home", 2);
+        Check(one.HasAcceleration && one.Acceleration == new Vec3d(0.5, -1.25, 2) && !two.HasAcceleration && two.Acceleration == default(Vec3d),
+            "acceleration: the builder round-trips it, and a record without one reads none");
+    }
+    var store = NewStore();
+    var pub = store.Attach("modA");
+    PublishResult With(long seq, Action<WorldModelBuilder> add, out string error)
+    {
+        var bb = pub.Begin(seq, 1, 0);
+        bb.Scope("home");
+        add(bb);
+        return pub.Publish(bb, out error);
+    }
+    Check(With(1, bb => { bb.Conic(1, 1, 0, 0.1, 700000, 0, 0, 0, 0, 0, 10); bb.Acceleration(new Vec3d(0, 0, 0)); }, out var e1) == PublishResult.Invalid
+        && e1.Contains("without a state vector"), $"acceleration: on a conic it is invalid ({e1})");
+    Check(With(2, bb => { bb.Surface(1, 1, 0, 0, 0, 0, 10); bb.Acceleration(new Vec3d(0, 0, 0)); }, out _) == PublishResult.Invalid,
+        "acceleration: on a surface record it is invalid");
+    Check(With(3, bb => { bb.StateVector(1, 1, 5, new Vec3d(610000, 0, 0), new Vec3d(0, 1, 0), 5, 50); bb.Acceleration(new Vec3d(double.NaN, 0, 0)); }, out var e3)
+        == PublishResult.Invalid && e3.Contains("non-finite acceleration"), $"acceleration: a non-finite one is invalid ({e3})");
+    Check(Throws<InvalidOperationException>(() => { var bb = pub.Begin(4, 1, 0); bb.Scope("home"); bb.Acceleration(new Vec3d(0, 0, 0)); }),
+        "acceleration: before any record it throws, like every modifier");
+    var b4 = pub.Begin(5, 1, 0);
+    b4.Scope("home");
+    b4.StateVector(1, 1, 5, new Vec3d(610000, 0, 0), new Vec3d(0, 1, 0), 5, 50);
+    b4.Acceleration(new Vec3d(1, 2, 3));
+    Check(pub.Publish(b4, out _) == PublishResult.Accepted, "acceleration: Kerbcast accepts it on a state vector");
+    var snap = Frame(store).Snapshot;
+    snap.TryFind(snap.ScopeOf("home"), 1, out var rec);
+    Check(rec.HasAcceleration && rec.Acceleration == new Vec3d(1, 2, 3), "acceleration: the snapshot copies it");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 

@@ -30,6 +30,9 @@ namespace Kerbcast
         public double StateUt;
         public Vec3d Position;
         public Vec3d Velocity;
+        /* Net, gravity included; when HasAcceleration it replaces the body's gravity in propagation. */
+        public bool HasAcceleration;
+        public Vec3d Acceleration;
 
         public double Latitude;
         public double Longitude;
@@ -186,10 +189,10 @@ namespace Kerbcast
 
         /*
          * A positioned record's state at `ut` about its body's centre, in KSP's
-         * fixed frame (see ZupFrame): a conic or a ballistic state vector on
-         * its path, a surface point carried by `body`'s rotation. False when
-         * it cannot be placed. Main thread only, since the first read of a
-         * record builds its path.
+         * fixed frame (see ZupFrame): a conic or a state vector on its path
+         * (ballistic, or under its net acceleration), a surface point carried
+         * by `body`'s rotation. False when it cannot be placed. Main thread
+         * only, since the first read of a record builds its path.
          */
         public bool TryStateAt(in ModelRecord r, in KinematicsBody body, double ut, out DVec3 position, out DVec3 velocity)
         {
@@ -217,6 +220,10 @@ namespace Kerbcast
                 if (r.Kinematics == KinematicsKind.Conic)
                     built = KeplerPath.TryFromElements(r.Inclination, r.Eccentricity, r.SemiMajorAxis, r.Lan,
                         r.ArgumentOfPeriapsis, r.MeanAnomalyAtEpoch, r.Epoch, body.Mu, out _paths[i]);
+                else if (r.Kinematics == KinematicsKind.StateVector && r.HasAcceleration)
+                    built = KeplerPath.TryAccelerated(new DVec3(r.Position.X, r.Position.Y, r.Position.Z),
+                        new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z),
+                        new DVec3(r.Acceleration.X, r.Acceleration.Y, r.Acceleration.Z), r.StateUt, r.ValidFromUt, r.ValidUntilUt, out _paths[i]);
                 else if (r.Kinematics == KinematicsKind.StateVector)
                     built = KeplerPath.TryFromState(new DVec3(r.Position.X, r.Position.Y, r.Position.Z),
                         new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z), r.StateUt, body.Mu, out _paths[i], body.Radius);
@@ -253,6 +260,8 @@ namespace Kerbcast
             StateUt = r.StateUt,
             Position = r.Position,
             Velocity = r.Velocity,
+            HasAcceleration = r.HasAcceleration,
+            Acceleration = r.Acceleration,
             Latitude = r.Latitude,
             Longitude = r.Longitude,
             Altitude = r.Altitude,

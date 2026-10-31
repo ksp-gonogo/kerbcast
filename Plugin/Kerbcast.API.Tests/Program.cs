@@ -35,7 +35,7 @@ var guidB = Guid.NewGuid();
 
 // Entry point with nothing installed.
 Check(KerbcastApi.Instance == null, "Instance is null without Kerbcast");
-Check(KerbcastApi.ApiMinor == 0, "ApiMinor is 0 for API 1.0");
+Check(KerbcastApi.ApiMinor == 1, "ApiMinor is 1 for API 1.1");
 Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(ApiFeature.CraftIdentity)
     && KerbcastApi.Supports(ApiFeature.Throttle) && KerbcastApi.Supports(ApiFeature.CommandFeeds)
     && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)

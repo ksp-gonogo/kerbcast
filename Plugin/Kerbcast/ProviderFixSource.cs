@@ -317,7 +317,8 @@ namespace Kerbcast
          * Logs how far one placement is from where KSP's own maths put the same
          * record, at most once a minute, as the rig's evidence that the frames
          * agree: a conic through new Orbit, a state vector through
-         * UpdateFromFixedVectors (the fixed frame the record is in), a surface
+         * UpdateFromFixedVectors (the fixed frame the record is in; an
+         * accelerated one carried to `ut` first), a surface
          * point through GetWorldSurfacePosition at the present UT only.
          */
         private static void CheckAgainstKsp(in ModelRecord r, CelestialBody body, double ut, DVec3 world)
@@ -331,6 +332,19 @@ namespace Kerbcast
                     kind = "conic";
                     ksp = new Orbit(r.Inclination, r.Eccentricity, r.SemiMajorAxis, r.Lan, r.ArgumentOfPeriapsis,
                         r.MeanAnomalyAtEpoch, r.Epoch, body).getPositionAtUT(ut);
+                }
+                else if (r.Kinematics == Api.KinematicsKind.StateVector && r.HasAcceleration)
+                {
+                    /* KSP has no constant-acceleration path, so the state is carried to `ut` here and only its frame is checked. */
+                    kind = "stateVectorAccel";
+                    double d = ut - r.StateUt;
+                    var a = new DVec3(r.Acceleration.X, r.Acceleration.Y, r.Acceleration.Z);
+                    var v0 = new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z);
+                    var p = new DVec3(r.Position.X, r.Position.Y, r.Position.Z) + v0 * d + a * (0.5 * d * d);
+                    var v = v0 + a * d;
+                    var o = new Orbit();
+                    o.UpdateFromFixedVectors(new Vector3d(p.X, p.Y, p.Z), new Vector3d(v.X, v.Y, v.Z), body, ut);
+                    ksp = o.getPositionAtUT(ut);
                 }
                 else if (r.Kinematics == Api.KinematicsKind.StateVector)
                 {

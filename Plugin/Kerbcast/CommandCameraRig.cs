@@ -831,7 +831,7 @@ namespace Kerbcast
                 var frameBody = tree.Body(frame);
                 if (frameBody == null) break;
                 var path = new KnownPath { Source = _known, Tree = tree, Frame = frame };
-                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody) : 0;
+                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, validFrom, ut) : 0;
                 var lens = station - ToD(frameBody.position);
                 if (PastInstant.SolveFrom(ref path, lens, ut, c.Value, bound, validFrom, ut, out double tr) != PastStatus.Found)
                 {

@@ -128,7 +128,7 @@ namespace Kerbcast
             var s1 = PositionAt(_station, _stationBody, t1);
             var a1 = PositionAt(_aim, _aimBody, t1);
             var frame = _bodies[_stationBody];
-            double vs = SpeedBound(_station, frame), va = SpeedBound(_aim, frame);
+            double vs = SpeedBound(_station, frame, _now, t1), va = SpeedBound(_aim, frame, _now, t1);
             bool lightKnown = _sun >= 0;
             DVec3 sun0 = default, sun1 = default;
             double vSun = 0;
@@ -205,9 +205,13 @@ namespace Kerbcast
             return _centres[i];
         }
 
-        /* Fastest a point on this motion can move relative to `frame`: its
-           own speed at periapsis (or spin, or drift) plus its body's. */
-        internal static double SpeedBound(BodyMotion m, CelestialBody frame)
+        /*
+         * Fastest a point on this motion can move relative to `frame`: its
+         * own speed at periapsis (or spin, or drift) plus its body's. An
+         * accelerated path is bounded between `fromUt` and `toUt` when both
+         * are given, and across its record's window otherwise.
+         */
+        internal static double SpeedBound(BodyMotion m, CelestialBody frame, double fromUt = double.NaN, double toUt = double.NaN)
         {
             double own;
             switch (m.Kind)
@@ -219,7 +223,7 @@ namespace Kerbcast
                     own = CommandCameraOcclusion.Spin(m.Body).Magnitude * m.RelNow.Magnitude;
                     break;
                 default:
-                    own = m.Path.PeriapsisSpeed;
+                    own = m.Path.SpeedOver(fromUt, toUt);
                     break;
             }
             return own * SpeedMargin + BodySpeedBound(m.Body, frame);

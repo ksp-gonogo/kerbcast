@@ -12,10 +12,10 @@ namespace Kerbcast.Api
      * </summary>
      * <remarks>
      * Records follow the last <see cref="Scope"/> call, at most one per craft per scope. Name, Kind,
-     * Uncertainty, Attitude and Radius apply to the record added last. Calling a record method before
-     * any Scope, a modifier before any record, or anything after the builder was published or
-     * abandoned throws InvalidOperationException; a bad value instead makes Publish return Invalid
-     * with the first problem in its error.
+     * Uncertainty, Attitude, Radius and Acceleration apply to the record added last. Calling a record
+     * method before any Scope, a modifier before any record, or anything after the builder was
+     * published or abandoned throws InvalidOperationException; a bad value instead makes Publish
+     * return Invalid with the first problem in its error.
      * </remarks>
      */
     public sealed class WorldModelBuilder
@@ -150,7 +150,8 @@ namespace Kerbcast.Api
         /**
          * <summary>
          * A positioned craft by body-relative position and velocity at <paramref name="ut"/>, propagated
-         * ballistically under the body's gravity with no thrust.
+         * ballistically under the body's gravity with no thrust, or under the net acceleration
+         * <see cref="Acceleration"/> gives it.
          * </summary>
          * <remarks>
          * Vectors are z-up in KSP's fixed inertial frame, the one Orbit.OrbitFrame and
@@ -220,6 +221,33 @@ namespace Kerbcast.Api
             r.AngularVelocity = angularVelocity;
             if (!Vec3d.Finite(ut) || !bodyInertialRotation.IsFinite || !angularVelocity.IsFinite)
                 Fail($"craft {r.PersistentId} has a non-finite attitude");
+        }
+
+        /**
+         * <summary>
+         * The state-vector record's net acceleration in metres per second squared, gravity included: the
+         * craft's total acceleration, held constant from the state's UT over the record's life, so it is
+         * placed at position + velocity*d + acceleration*d*d/2 and moves at velocity + acceleration*d,
+         * with d the time since the state's UT. Measure it in the inertial frame, not from surface
+         * velocity: a craft under an open parachute moves with the air, which turns with the body, so its
+         * net acceleration is close to the body's centripetal acceleration w x (w x r), not zero. Keep
+         * such records short, since the held vector drifts from the truth as the craft moves. Without it
+         * the record is propagated under the body's gravity alone, as before.
+         * </summary>
+         * <remarks>
+         * Call it after <see cref="StateVector"/>; on any other record it makes Publish return Invalid.
+         * The vector is in the state vector's frame: body-relative, z-up, KSP's fixed inertial frame. It
+         * replaces the body's gravity rather than adding to it and does not turn or grow as the craft
+         * moves, so a coasting craft is better left without one, to follow its conic. Added in API 1.1.
+         * </remarks>
+         */
+        public void Acceleration(Vec3d netAccelMps2)
+        {
+            var r = Last();
+            r.HasAcceleration = true;
+            r.Acceleration = netAccelMps2;
+            if (r.Kinematics != KinematicsKind.StateVector) Fail($"craft {r.PersistentId} has an acceleration without a state vector");
+            else if (!netAccelMps2.IsFinite) Fail($"craft {r.PersistentId} has a non-finite acceleration");
         }
 
         /** <summary>The craft's size for framing, in metres. Without it, a nominal radius.</summary> */
@@ -345,6 +373,8 @@ namespace Kerbcast.Api
         public double StateUt;
         public Vec3d Position;
         public Vec3d Velocity;
+        public bool HasAcceleration;
+        public Vec3d Acceleration;
 
         public double Latitude;
         public double Longitude;
@@ -381,6 +411,8 @@ namespace Kerbcast.Api
             Inclination = Eccentricity = SemiMajorAxis = Lan = ArgumentOfPeriapsis = MeanAnomalyAtEpoch = Epoch = 0;
             StateUt = 0;
             Position = Velocity = default(Vec3d);
+            HasAcceleration = false;
+            Acceleration = default(Vec3d);
             Latitude = Longitude = Altitude = 0;
             HasUncertainty = false;
             UncertaintyRadiusM = RateMps = AccelMps2 = SpeedCapMps = 0;

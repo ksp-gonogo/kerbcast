@@ -35,6 +35,7 @@ if (kerbcast != null && KerbcastApi.Supports(ApiFeature.CraftIdentity))
 - `TakeLock`, `SetAim` and `Publish` return `NotRunning` when Kerbcast is not running in the scene, as through an object kept from an earlier one
 - Every result enum (`LockResult`, `AimResult`, `PublishResult`) has `Unknown = 0`, which Kerbcast never returns, so a result nobody set never reads as success
 - A member whose `ApiFeature` is unsupported still exists and throws `NotSupportedException`. Check `Supports` when you were built against a newer minor than the Kerbcast you run with
+- A member added without its own `ApiFeature` (such as `WorldModelBuilder.Acceleration` in 1.1) is guarded by `KerbcastApi.ApiMinor`, not `Supports`
 - Built against a newer minor, keep each call to a member that minor added in its own `[MethodImpl(MethodImplOptions.NoInlining)]` method too. The JIT resolves every member a method names when it compiles that method, so an older Kerbcast throws `MissingMethodException` even when the call sits behind a `Supports` check that returns false
 
 ## Versioning

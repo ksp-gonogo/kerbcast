@@ -72,6 +72,11 @@ namespace Kerbcast
      * ballistic arcs share one solver. A conic from elements starts at its
      * periapsis passage. Built once per record per snapshot; a read allocates
      * nothing.
+     *
+     * An accelerated path instead holds one net acceleration, gravity
+     * included, constant from its state: x0 + v0 d + a d^2 / 2. It is a
+     * provider's word for a craft whose forces gravity alone does not
+     * describe, such as one hanging under a parachute.
      */
     internal struct KeplerPath
     {
@@ -90,8 +95,11 @@ namespace Kerbcast
         public double Mu;
         /* 1/a: positive for an ellipse, negative for a hyperbola. */
         public double Alpha;
-        /* The fastest point of the conic, for the forecast's speed bounds. */
+        /* The fastest point of the conic, for the forecast's speed bounds; an accelerated path's fastest across the window it was built for. */
         public double PeriapsisSpeed;
+        /* The net acceleration of an accelerated path; zero and unused on a conic. */
+        public DVec3 A0;
+        public bool Accelerated;
 
         private double _r0, _sigma0, _sqrtMu, _period;
 
@@ -114,6 +122,33 @@ namespace Kerbcast
             double fastest = lowest > 0 ? Math.Sqrt(Math.Max(v2, v2 + 2.0 * mu * (1.0 / lowest - 1.0 / r0))) : Math.Sqrt(v2);
             path = Make(position, velocity, ut, mu, alpha, fastest);
             return path.PeriapsisSpeed >= 0 && Kinematics.Finite(path.PeriapsisSpeed);
+        }
+
+        /*
+         * Under a constant net acceleration `accel` (gravity included) from a
+         * fixed-frame state at `ut`, in place of the body's gravity. Its speed
+         * bound covers `fromUt` to `untilUt`, the window its record vouches for.
+         */
+        public static bool TryAccelerated(DVec3 position, DVec3 velocity, DVec3 accel, double ut, double fromUt, double untilUt,
+            out KeplerPath path)
+        {
+            path = default;
+            if (!(position.Magnitude > 0) || !Finite(position) || !Finite(velocity) || !Finite(accel) || !Kinematics.Finite(ut))
+                return false;
+            path = new KeplerPath { R0 = position, V0 = velocity, A0 = accel, T0 = ut, Accelerated = true, _r0 = position.Magnitude };
+            path.PeriapsisSpeed = path.SpeedOver(fromUt, untilUt);
+            return Kinematics.Finite(path.PeriapsisSpeed);
+        }
+
+        /*
+         * The fastest the path goes between the two UTs: the conic's periapsis
+         * speed, or, accelerated, the faster end, since |v0 + a d| has no
+         * interior maximum. A NaN end gives the whole path's bound.
+         */
+        public double SpeedOver(double fromUt, double toUt)
+        {
+            if (!Accelerated || double.IsNaN(fromUt) || double.IsNaN(toUt)) return PeriapsisSpeed;
+            return Math.Max((V0 + A0 * (fromUt - T0)).Magnitude, (V0 + A0 * (toUt - T0)).Magnitude);
         }
 
         /*
@@ -163,6 +198,12 @@ namespace Kerbcast
             position = velocity = default;
             if (!(_r0 > 0) || !Kinematics.Finite(ut)) return false;
             double dt = ut - T0;
+            if (Accelerated)
+            {
+                position = R0 + V0 * dt + A0 * (0.5 * dt * dt);
+                velocity = V0 + A0 * dt;
+                return Finite(position) && Finite(velocity);
+            }
             if (Alpha > 0)
             {
                 dt %= _period;
