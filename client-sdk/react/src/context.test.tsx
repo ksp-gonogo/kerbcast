@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { render } from "@testing-library/react";
 import {
   KERBCAST_RELEASE_GRACE_MS,
+  KerbcastProvider,
   createClientDisplaySizes,
   createClientSubscriptions,
+  useKerbcastSubscriptions,
 } from "./context";
 
 /**
@@ -282,17 +285,57 @@ describe("createClientSubscriptions release grace", () => {
     expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
   });
 
-  it("keeps A through a flip to B and back, and lets B go", () => {
+  it("sends nothing for a flip to B and back inside one task", async () => {
     const { client, calls } = graceClient();
     const subs = createClientSubscriptions(client);
     subs.acquire(1);
     subs.release(1);
     subs.acquire(2);
-    vi.advanceTimersByTime(500);
     subs.release(2);
     subs.acquire(1);
+    await Promise.resolve();
     vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
-    expect(calls).toEqual(["subscribe:1", "subscribe:2", "unsubscribe:2"]);
+    expect(calls).toEqual(["subscribe:1"]);
+  });
+
+  it("frees the old camera before subscribing the new one on a switch", async () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    subs.acquire(2);
+    expect(calls).toEqual(["subscribe:1"]);
+    await Promise.resolve();
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1", "subscribe:2"]);
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("keeps a remount's grace when a switch lands in the same commit", async () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.acquire(3);
+    /* All cleanups, then all effects: 3 remounts, 1 switches to 2. */
+    subs.release(1);
+    subs.release(3);
+    subs.acquire(2);
+    subs.acquire(3);
+    await Promise.resolve();
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
+    expect(calls).toEqual(["subscribe:1", "subscribe:3", "unsubscribe:1", "subscribe:2"]);
+  });
+
+  it("sends nothing for a camera released before its queued subscribe went out", async () => {
+    const { client, calls } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    subs.release(1);
+    subs.acquire(2);
+    subs.release(2);
+    await Promise.resolve();
+    vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 5);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
   });
 
   it("survives many rapid remounts with one subscribe and no unsubscribe", () => {
@@ -355,13 +398,90 @@ describe("createClientSubscriptions release grace", () => {
   it("ends a grace under way when a held camera starts waiting for a slot", () => {
     const { client, calls, setWaiting } = graceClient();
     const subs = createClientSubscriptions(client);
+    subs.acquire(2);
     subs.acquire(1);
     subs.release(1);
-    subs.acquire(2);
-    expect(calls).toEqual(["subscribe:1", "subscribe:2"]);
+    expect(calls).toEqual(["subscribe:2", "subscribe:1"]);
     setWaiting(2, true);
-    expect(calls).toEqual(["subscribe:1", "subscribe:2", "unsubscribe:1"]);
+    expect(calls).toEqual(["subscribe:2", "subscribe:1", "unsubscribe:1"]);
     vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 2);
     expect(calls).toHaveLength(3);
+  });
+
+  it("skips the grace for a camera that was itself waiting for a slot", () => {
+    const { client, calls, setWaiting } = graceClient();
+    const subs = createClientSubscriptions(client);
+    subs.acquire(1);
+    setWaiting(1, true);
+    subs.release(1);
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+  });
+});
+
+describe("KerbcastProvider defaults", () => {
+  function stubClient() {
+    const calls: string[] = [];
+    const on = vi.fn(() => () => {});
+    const client = {
+      on,
+      subscribe: vi.fn(async (id: number) => {
+        calls.push(`subscribe:${id}`);
+      }),
+      unsubscribe: vi.fn(async (id: number) => {
+        calls.push(`unsubscribe:${id}`);
+      }),
+      camera: () => ({ waitingForSlot: false, on: () => () => {} }),
+    } as unknown as KerbcastClient;
+    return { client, calls, on };
+  }
+
+  it("builds nothing when both seams are supplied", () => {
+    const { client, on } = stubClient();
+    render(
+      <KerbcastProvider
+        client={client}
+        subscriptions={{ acquire() {}, release() {} }}
+        displaySizes={{ report() {}, clear() {} }}
+      >
+        {null}
+      </KerbcastProvider>,
+    );
+    expect(on).not.toHaveBeenCalled();
+  });
+
+  it("takes a release grace for its default subscriptions", () => {
+    const { client, calls } = stubClient();
+    function Probe(): null {
+      const subs = useKerbcastSubscriptions();
+      subs.acquire(1);
+      subs.release(1);
+      return null;
+    }
+    render(
+      <KerbcastProvider client={client} releaseGraceMs={0}>
+        <Probe />
+      </KerbcastProvider>,
+    );
+    expect(calls).toEqual(["subscribe:1", "unsubscribe:1"]);
+  });
+
+  it("shares one default manager between providers on the same client", () => {
+    const { client } = stubClient();
+    const seen: unknown[] = [];
+    function Probe(): null {
+      seen.push(useKerbcastSubscriptions());
+      return null;
+    }
+    render(
+      <>
+        <KerbcastProvider client={client}>
+          <Probe />
+        </KerbcastProvider>
+        <KerbcastProvider client={client}>
+          <Probe />
+        </KerbcastProvider>
+      </>,
+    );
+    expect(seen[0]).toBe(seen[1]);
   });
 });

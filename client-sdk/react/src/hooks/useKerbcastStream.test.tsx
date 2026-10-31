@@ -103,17 +103,17 @@ describe("useKerbcastStream - slot subscription lifecycle", () => {
     const { rerender, unmount } = render(
       <Wrapper client={client} flightId={42} />,
     );
-    expect(sidecar.slotMidFor(42)).toBeDefined();
+    const mid = sidecar.slotMidFor(42);
+    expect(mid).toBeDefined();
 
-    act(() => {
+    /* A switch frees the old camera's slot at once, without waiting out the
+       grace, so the new camera takes it over. */
+    await act(async () => {
       rerender(<Wrapper client={client} flightId={43} />);
-    });
-    act(() => {
-      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
     });
 
     expect(sidecar.slotMidFor(42)).toBeUndefined();
-    expect(sidecar.slotMidFor(43)).toBeDefined();
+    expect(sidecar.slotMidFor(43)).toBe(mid);
 
     act(() => {
       unmount();

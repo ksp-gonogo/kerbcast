@@ -3896,6 +3896,79 @@ describe("CameraFeed - remount inside the release grace", () => {
     expect(sidecar.slotMidFor(42)).toBeUndefined();
   });
 
+  async function fullPool(growable: boolean) {
+    const sidecar = new MockSidecar().withSlots(["0", "1"]);
+    if (growable) sidecar.withRenegotiation();
+    for (const id of [1, 2, 3]) sidecar.addCamera(toInit(makeCamera({ flightId: id, cameraName: `Cam ${id}` })));
+    const renegotiate = vi.fn((o: { session: string; sdp: string; slots: number }) => sidecar.renegotiate(o));
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+      sidecar.createTransport(),
+    );
+    createdClients.push(client);
+    await act(async () => {
+      await client.connect([], { slots: 2 });
+    });
+    await act(async () => {
+      sidecar.open();
+      sidecar.setConnectionState("connected");
+    });
+    const errors: unknown[] = [];
+    client.on("error", (e) => errors.push(e));
+    return { client, sidecar, renegotiate, errors };
+  }
+
+  function twoFeeds(client: KerbcastClient, second: number) {
+    return (
+      <KerbcastProvider client={client}>
+        <CameraFeed key="a" flightId={1} />
+        <CameraFeed key="b" flightId={second} />
+      </KerbcastProvider>
+    );
+  }
+
+  function commandIndex(sidecar: MockSidecar, type: string, flightId: number): number {
+    return sidecar.commands.findIndex(
+      (c) => c.type === type && (c.content as { flightId?: number }).flightId === flightId,
+    );
+  }
+
+  it("frees the old slot before asking for the new camera on a swap in a full pool", async () => {
+    const { client, sidecar, errors } = await fullPool(false);
+    const view = render(twoFeeds(client, 2));
+    await act(async () => {});
+    const mid = sidecar.slotMidFor(2);
+    expect(mid).toBeDefined();
+
+    await act(async () => {
+      view.rerender(twoFeeds(client, 3));
+    });
+
+    const unsub = commandIndex(sidecar, "unsubscribe", 2);
+    expect(unsub).toBeGreaterThanOrEqual(0);
+    expect(unsub).toBeLessThan(commandIndex(sidecar, "subscribe", 3));
+    expect(sidecar.slotMidFor(3)).toBe(mid);
+    expect(client.camera(3).waitingForSlot).toBe(false);
+    expect(errors).toEqual([]);
+    expect(screen.queryByText(/Not streaming: too many feeds are open/)).toBeNull();
+  });
+
+  it("swaps in a full growable pool without a re-offer", async () => {
+    const { client, sidecar, renegotiate, errors } = await fullPool(true);
+    const view = render(twoFeeds(client, 2));
+    await act(async () => {});
+    const mid = sidecar.slotMidFor(2);
+
+    await act(async () => {
+      view.rerender(twoFeeds(client, 3));
+    });
+
+    expect(renegotiate).not.toHaveBeenCalled();
+    expect(sidecar.slotMids).toHaveLength(2);
+    expect(sidecar.slotMidFor(3)).toBe(mid);
+    expect(errors).toEqual([]);
+  });
+
   it("subscribes on the new client when the provider is handed one", async () => {
     const a = await buildConnectedSource();
     const b = await buildConnectedSource();

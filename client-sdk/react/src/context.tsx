@@ -108,6 +108,25 @@ export function createClientSubscriptions(
     if (state === "disconnected" || state === "failed") flushPendingReleases();
   });
 
+  /*
+   * A fresh subscribe made while a release is pending waits for a microtask
+   * and goes out after every release still pending is flushed. React runs
+   * every cleanup and effect of one commit in a single task, so a feed that
+   * remounts takes its camera back first and keeps the grace, while a feed
+   * switching cameras frees its old slot on the wire before asking for the
+   * new one. Otherwise a full pool would refuse the new camera, or grow by a
+   * re-offer, while the old one sat in its grace. With nothing pending the
+   * subscribe goes out at once.
+   */
+  const toSubscribe = new Set<number>();
+  function subscribeQueued(): void {
+    flushPendingReleases();
+    for (const flightId of toSubscribe) {
+      client.subscribe(flightId).catch(() => {});
+    }
+    toSubscribe.clear();
+  }
+
   return {
     acquire(flightId: number): void {
       const count = (refcounts.get(flightId) ?? 0) + 1;
@@ -120,7 +139,12 @@ export function createClientSubscriptions(
       }
       if (count === 1) {
         watchSlot(flightId);
-        client.subscribe(flightId).catch(() => {});
+        if (pendingRelease.size === 0 && toSubscribe.size === 0) {
+          client.subscribe(flightId).catch(() => {});
+          return;
+        }
+        if (toSubscribe.size === 0) queueMicrotask(subscribeQueued);
+        toSubscribe.add(flightId);
       }
     },
     release(flightId: number): void {
@@ -130,8 +154,14 @@ export function createClientSubscriptions(
         return;
       }
       refcounts.delete(flightId);
+      if (toSubscribe.delete(flightId)) {
+        stopWatchingSlot.get(flightId)?.();
+        stopWatchingSlot.delete(flightId);
+        return;
+      }
       if (pendingRelease.has(flightId)) return;
-      if (graceMs <= 0 || slotWanted()) {
+      /* A camera still waiting for a slot has no stream to keep. */
+      if (graceMs <= 0 || client.camera(flightId).waitingForSlot || slotWanted()) {
         unsubscribeNow(flightId);
         return;
       }
@@ -251,36 +281,55 @@ export interface KerbcastProviderProps {
   subscriptions?: KerbcastSubscriptions;
   /** Override the display-size registry. Defaults to a per-flightId MAX impl. */
   displaySizes?: KerbcastDisplaySizes;
+  /**
+   * Release grace for the default subscriptions, in milliseconds. Defaults to
+   * {@link KERBCAST_RELEASE_GRACE_MS}. Ignored when `subscriptions` is given.
+   */
+  releaseGraceMs?: number;
   children: ReactNode;
 }
 
 /*
- * One default subscriptions manager and display-size registry per client, kept
- * for the client's lifetime rather than a provider's. A provider that remounts
- * with the same client then finds the camera releases its feeds just made
- * still in their grace, and two providers sharing a client share one refcount
- * instead of each unsubscribing the other's cameras. A provider handed a new
- * client gets that client's own pair; the old client's pending releases run
- * out on it as they would have.
+ * The default subscriptions managers and display-size registry, per client,
+ * kept for the client's lifetime rather than a provider's. A provider that
+ * remounts with the same client then finds the camera releases its feeds just
+ * made still in their grace, and two providers sharing a client share one
+ * refcount instead of each unsubscribing the other's cameras. A provider
+ * handed a new client gets that client's own; the old client's pending
+ * releases run out on it as they would have. Each is built only when a
+ * provider needs it, and providers asking for different graces get separate
+ * managers.
  */
-const clientDefaults = new WeakMap<
-  KerbcastClient,
-  { subscriptions: KerbcastSubscriptions; displaySizes: KerbcastDisplaySizes }
->();
+interface ClientDefaults {
+  subscriptions: Map<number, KerbcastSubscriptions>;
+  displaySizes: KerbcastDisplaySizes | null;
+}
 
-function defaultsFor(client: KerbcastClient): {
-  subscriptions: KerbcastSubscriptions;
-  displaySizes: KerbcastDisplaySizes;
-} {
+const clientDefaults = new WeakMap<KerbcastClient, ClientDefaults>();
+
+function defaultsOf(client: KerbcastClient): ClientDefaults {
   let defaults = clientDefaults.get(client);
   if (!defaults) {
-    defaults = {
-      subscriptions: createClientSubscriptions(client),
-      displaySizes: createClientDisplaySizes(client),
-    };
+    defaults = { subscriptions: new Map(), displaySizes: null };
     clientDefaults.set(client, defaults);
   }
   return defaults;
+}
+
+function defaultSubscriptions(client: KerbcastClient, releaseGraceMs: number): KerbcastSubscriptions {
+  const byGrace = defaultsOf(client).subscriptions;
+  let subscriptions = byGrace.get(releaseGraceMs);
+  if (!subscriptions) {
+    subscriptions = createClientSubscriptions(client, { releaseGraceMs });
+    byGrace.set(releaseGraceMs, subscriptions);
+  }
+  return subscriptions;
+}
+
+function defaultDisplaySizes(client: KerbcastClient): KerbcastDisplaySizes {
+  const defaults = defaultsOf(client);
+  defaults.displaySizes ??= createClientDisplaySizes(client);
+  return defaults.displaySizes;
 }
 
 /**
@@ -291,16 +340,17 @@ export function KerbcastProvider({
   client,
   subscriptions: subscriptionsProp,
   displaySizes: displaySizesProp,
+  releaseGraceMs = KERBCAST_RELEASE_GRACE_MS,
   children,
 }: KerbcastProviderProps): React.JSX.Element {
-  const defaults = defaultsFor(client);
   const value = useMemo(
     () => ({
       client,
-      subscriptions: subscriptionsProp ?? defaults.subscriptions,
-      displaySizes: displaySizesProp ?? defaults.displaySizes,
+      /* Subscriptions first: their reconnect listener must run before the registry's. */
+      subscriptions: subscriptionsProp ?? defaultSubscriptions(client, releaseGraceMs),
+      displaySizes: displaySizesProp ?? defaultDisplaySizes(client),
     }),
-    [client, defaults, subscriptionsProp, displaySizesProp],
+    [client, subscriptionsProp, displaySizesProp, releaseGraceMs],
   );
 
   return (

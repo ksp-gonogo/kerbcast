@@ -187,10 +187,9 @@ quality follows how large it is shown (pass `reportSize={false}` to opt out).
   what `CameraFeed` uses internally. A released slot is kept for
   `KERBCAST_RELEASE_GRACE_MS` (2000 ms), so a feed that remounts inside
   that window picks up the running stream instead of starting it again.
-  It is let go at once when another feed is waiting for a slot. Build the
-  provider's `subscriptions` with
-  `createClientSubscriptions(client, { releaseGraceMs })` for a different
-  grace, or 0 for none
+  It is let go at once when a feed switches to another camera, or when a
+  feed is waiting for a slot. Pass `releaseGraceMs` to `KerbcastProvider`
+  (or to `createClientSubscriptions`) for a different grace, or 0 for none
 - `useKerbcastInFlight(): boolean | undefined`. Whether KSP is in a
   flight scene. `undefined` until the first signal arrives, so you can
   avoid flashing an out-of-flight state on connect.
