@@ -1185,7 +1185,7 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     Check(h.TryFind(8, out var r10, out _, out _, out bool back8) && r10.ValidFromUt == 10 && back8, "history: before the oldest record it is read back along it");
     h.Add(Published(15), kerbin, double.NaN);
     Check(h.Count == 6 && h.TryFind(10.5, out var r15, out _, out _, out _) && r15.ValidFromUt == 10, "history: a republished record drops those starting at or after it");
-    Check(Math.Abs(h.SpeedOver(10, 15) - Math.Sqrt(Accel * 15 * Accel * 15 + ground.Y * ground.Y)) < 0.01,
+    Check(Math.Abs(h.SpeedOver(10, 15, (v, b) => v) - Math.Sqrt(Accel * 15 * Accel * 15 + ground.Y * ground.Y)) < 0.01,
         "history: the kept records bound the craft's speed over the span they hold");
     var floored = Published(30);
     floored.HasAcceleration = false;
@@ -1195,6 +1195,105 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     Check(fh.TryFind(0, out var fr, out var fp, out double ff, out bool fb) && fb
         && ModelRecordHistory.TryPlace(fr, fp, ff, fb, kerbin, 0, out var fpos) && fpos.Magnitude >= R + 30000 - 1e-6,
         "history: a read back before the oldest record is held no lower than its floor");
+
+    ModelRecord Lasting(double at)
+    {
+        var r = Published(at);
+        r.ValidUntilUt = double.PositiveInfinity;
+        r.HasAcceleration = false;
+        return r;
+    }
+
+    var gap = new ModelRecordHistory();
+    for (double p = 0; p <= 20; p++) gap.Add(Published(p), kerbin, double.NaN);
+    gap.Add(Published(200), kerbin, double.NaN);
+    Check(!gap.TryFind(100, out _, out _, out _, out _) && double.IsNaN(gap.EarliestUt) && gap.Count == 1,
+        "history gaps: a record starting after the last one's window starts the history over, so none is read across the gap");
+
+    var jump = new ModelRecordHistory();
+    for (double p = 0; p <= 10; p++) jump.Add(Lasting(p), kerbin, double.NaN, p);
+    int beforeJump = jump.Count;
+    jump.Add(Lasting(11), kerbin, double.NaN, 11 + ModelRecordHistory.GapS + 1);
+    Check(beforeJump == 11 && jump.Count == 1 && !jump.TryFind(5, out _, out _, out _, out _),
+        "history gaps: a keep long after the last one starts the history over, even for records with no end");
+    var steady = new ModelRecordHistory();
+    for (double p = 0; p <= 40; p++) steady.Add(Lasting(p), kerbin, double.NaN, p);
+    Check(steady.Count == 41 && steady.EarliestUt == 0, $"history gaps: keeps at the publish cadence keep everything ({steady.Count}, {steady.EarliestUt})");
+
+    var tenureStore = NewStore();
+    long tenure0 = Frame(tenureStore).Tenure;
+    tenureStore.EndTenure();
+    long tenure1 = Frame(tenureStore).Tenure;
+    Check(tenure1 != tenure0, "history tenure: the store's view names a new tenure once one ends");
+    var owned = new ModelRecordHistory();
+    owned.Claim(7, 1, tenure0, "KSC", "home");
+    for (double p = 0; p <= 10; p++) owned.Add(Published(p), kerbin, double.NaN);
+    owned.Claim(7, 1, tenure0, "KSC", "home");
+    Check(owned.Count == 11, "history tenure: claiming it again for the same craft, epoch, tenure and scope keeps it");
+    owned.Claim(7, 1, tenure1, "KSC", "home");
+    Check(owned.Count == 0, "history tenure: a new lock tenure starts it over though the epoch is the same");
+
+    var scoped = new ModelRecordHistory();
+    scoped.Claim(7, 1, 0, "KSC", "home");
+    for (double p = 0; p <= 10; p++) scoped.Add(Published(p), kerbin, double.NaN);
+    Check(scoped.OwnedBy(7, "KSC", "home") && !scoped.OwnedBy(7, "KSC", "remote") && !scoped.OwnedBy(7, "Pad", "home") && !scoped.OwnedBy(8, "KSC", "home"),
+        "history scope: kept records are read only for the craft, site key and scope they were kept for");
+    scoped.Claim(7, 1, 0, "KSC", "remote");
+    Check(scoped.Count == 0, "history scope: a site key rebound to another scope starts it over");
+
+    var fast = new ModelRecordHistory();
+    for (int i = 0; i <= 8000; i++) fast.Add(Published(i * 0.1), kerbin, double.NaN, i * 0.1);
+    Check(fast.EarliestUt == 0 && fast.Count <= 802,
+        $"history retention: at 10 records a second the history still reaches back {800 - fast.EarliestUt:F0} s in {fast.Count} records");
+    Check(fast.TryFind(400.05, out var r400, out _, out _, out _) && Math.Abs(r400.ValidFromUt - 400) < 1,
+        "history retention: a thinned history places an instant from the record published within a second of it");
+
+    var hour = new ModelRecordHistory();
+    for (int i = 0; i <= 7200; i++) hour.Add(Lasting(i), kerbin, double.NaN, i);
+    Check(hour.EarliestUt >= 7200 - ModelRecordHistory.RetainS - 1 && hour.EarliestUt <= 7200 - ModelRecordHistory.RetainS
+        && hour.Count <= ModelRecordHistory.MaxRecords,
+        $"history retention: records older than the retained hour are dropped, earliest {hour.EarliestUt}, {hour.Count} kept");
+    bool found = true;
+    foreach (double t in new[] { 3600.5, 3601.0, 4000.25, 5555.9, 7000.0, 7194.5 })
+        found &= hour.TryFind(t, out var rt, out _, out _, out bool bt) && rt.ValidFromUt == Math.Floor(t) && !bt;
+    Check(found, "history search: across a wrapped ring each instant takes the record published for it");
+
+    var bodies = new ModelRecordHistory();
+    for (double p = 0; p <= 5; p++) bodies.Add(Published(p), kerbin, double.NaN);
+    for (double p = 6; p <= 10; p++)
+    {
+        var r = Published(p);
+        r.BodyIndex = 2;
+        bodies.Add(r, kerbin, double.NaN);
+    }
+    double Moon(double v, int b) => v + (b == 1 ? 540 : 0);
+    double bodyOne = bodies.SpeedOver(0, 6, (v, b) => v);
+    Check(bodies.SpeedOver(0, 10, Moon) >= bodyOne + 540 - 1e-9,
+        "history speed: each kept record is bounded about its own body, not the body the craft is at now");
+
+    Check(double.IsNaN(h.SpeedOver(15, 15, (v, b) => v)) && double.IsNaN(bodies.SpeedOver(10, 10, (v, b) => v)),
+        "history speed: an empty span adds nothing, so a light time within the newest record's reach keeps its bound");
+
+    Check(ModelRecordHistory.ReadsCurrentBack(16, 20) && !ModelRecordHistory.ReadsCurrentBack(15.9, 20),
+        "history hold: the current record is read back no further than its cap");
+    {
+        /* With the kept records unable to place any instant (a conic that will not converge, a body gone), the solve holds at the cap rather than reading the newest back. */
+        var only = new ModelRecordHistory();
+        for (double p = 0; p <= 100; p++) only.Add(Published(p), kerbin, double.NaN);
+        var newest = Published(100);
+        WorldModelSnapshot.BuildPath(newest, kerbin, out var newestPath);
+        DVec3? Along(double t)
+        {
+            if (!ModelRecordHistory.ReadsCurrentBack(t, newest.ValidFromUt)) return null;
+            return newestPath.TryAt(t, out var n, out _) ? n : (DVec3?)null;
+        }
+        DVec3? Windowed(double t) => t >= newest.ValidFromUt && newestPath.TryAt(t, out var n, out _) ? n : (DVec3?)null;
+        var along = new FnPath { At = Along };
+        var windowed = new FnPath { At = Windowed };
+        var status = PastInstant.SolveAlong(ref along, ref windowed, lens, 100.5, 30, 2200, newest.ValidFromUt, 100.5, out double held, only.EarliestUt);
+        Check(status != PastStatus.Found || held >= PastInstant.ReadBackFloor(newest.ValidFromUt) - 1e-6,
+            $"history hold: with no kept record for the instant the solve never reads the newest back past its cap ({status}, {held:F2})");
+    }
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

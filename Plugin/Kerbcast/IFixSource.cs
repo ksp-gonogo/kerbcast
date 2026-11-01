@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace Kerbcast
@@ -88,8 +89,8 @@ namespace Kerbcast
            from before the current one, which it reads back from in turn; NaN
            when it keeps none (truth, which has the whole past). */
         double SubjectKeptFromUt { get; }
-        /* The fastest those earlier records move the subject about its body between the two UTs; NaN for none. */
-        double SubjectKeptSpeedOver(double fromUt, double toUt);
+        /* The fastest those earlier records move the subject between the two UTs, as `toFrame` bounds a speed about a body (by flightGlobalsIndex) in the caller's frame; NaN for none. */
+        double SubjectKeptSpeedBound(double fromUt, double toUt, Func<double, int, double> toFrame);
         /* How the subject moves on from `ut`, for the forecast, the earliest UT
            the source places it at (minus infinity for truth, which has its
            whole past) and the UT that motion holds until (infinity for truth).
@@ -154,7 +155,8 @@ namespace Kerbcast
         public CraftFix Subject(double ut) => Now.Subject(ut);
         public CraftFix SubjectAlong(double ut) => Now.SubjectAlong(ut);
         public double SubjectKeptFromUt => Now.SubjectKeptFromUt;
-        public double SubjectKeptSpeedOver(double fromUt, double toUt) => Now.SubjectKeptSpeedOver(fromUt, toUt);
+        public double SubjectKeptSpeedBound(double fromUt, double toUt, Func<double, int, double> toFrame) =>
+            Now.SubjectKeptSpeedBound(fromUt, toUt, toFrame);
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt) =>
             Now.SubjectMotion(ut, out motion, out validFromUt, out validUntilUt);
         public double SubjectRadiusM => Now.SubjectRadiusM;

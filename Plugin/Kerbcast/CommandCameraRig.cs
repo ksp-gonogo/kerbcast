@@ -56,6 +56,8 @@ namespace Kerbcast
         private readonly CommandCameraMount _mount;
         private readonly SubjectSelection _selection;
         private readonly IFixSource _known;
+        private readonly Func<double, int, double> _keptToFrame;
+        private CelestialBody _keptFrame;
         private readonly DrawnSubject _drawn;
         private readonly CommandAuthority _authority;
         private readonly CommandTrackEventRing _events = new CommandTrackEventRing(EventCapacity);
@@ -402,6 +404,7 @@ namespace Kerbcast
             _mount = mount;
             _selection = selection;
             _known = known;
+            _keptToFrame = KeptToFrame;
             _drawn = drawn;
             _authority = authority;
             _wantModel = targetModel;
@@ -853,6 +856,13 @@ namespace Kerbcast
         private float _lightLoggedAt = float.MinValue;
         private const float LightLogSeconds = 5f;
 
+        /* A kept record's speed about its body, bounded in the frame the solve now runs in; NaN for a body the game no longer has. */
+        private double KeptToFrame(double ownSpeed, int bodyIndex)
+        {
+            var body = KinematicsWorld.Now().Body(bodyIndex);
+            return body != null && _keptFrame != null ? CommandCameraForecast.SpeedBound(ownSpeed, body, _keptFrame) : double.NaN;
+        }
+
         /*
          * The subject as the source knows it at its own estimate of the past
          * instant: the latest root of the light-time equation on the source's
@@ -936,8 +946,13 @@ namespace Kerbcast
                 double reach = Math.Max(PastInstant.ReadBackFloor(alongFrom), Math.Min(validFrom, ut - 2.0 * (station - now.World).Magnitude / c.Value));
                 double from = double.IsInfinity(reach) ? validFrom : reach;
                 double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, from, ut) : 0;
-                double keptSpeed = moves ? _known.SubjectKeptSpeedOver(from, validFrom) : double.NaN;
-                if (keptSpeed > 0) bound = Math.Max(bound, CommandCameraForecast.SpeedBound(keptSpeed, motion.Body, frameBody));
+                /* The kept records bound the whole span the solve may search, each about its own body; a light time within the newest record's reach asks none. */
+                if (moves && from < validFrom)
+                {
+                    _keptFrame = frameBody;
+                    double keptBound = _known.SubjectKeptSpeedBound(PastInstant.ReadBackFloor(alongFrom), validFrom, _keptToFrame);
+                    if (keptBound > bound) bound = keptBound;
+                }
                 /* A live place is never turned, so adds nothing to the bound. */
                 if (moves && motion.Body == lensBody && !now.Live)
                 {

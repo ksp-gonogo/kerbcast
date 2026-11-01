@@ -26,6 +26,8 @@ namespace Kerbcast
         public WorldModelMode Mode;
         /* Null in Truth and Waiting. */
         public WorldModelSnapshot Snapshot;
+        /* Rises each time a tenure ends, so a reader can tell one tenure's epochs from the next's. */
+        public long Tenure;
     }
 
     /*
@@ -65,6 +67,7 @@ namespace Kerbcast
         private bool _invalid;
         private long _invalidEpoch;
         private bool _pendingLoad;
+        private long _tenure;
 
         private WorldModelSnapshot _current;
         private long _frame;
@@ -154,6 +157,7 @@ namespace Kerbcast
             lock (_gate)
             {
                 _attachToken++;
+                _tenure++;
                 bool was = _governed;
                 _governed = false;
                 _hasEpoch = false;
@@ -202,9 +206,9 @@ namespace Kerbcast
                     _invalid = false;
                     _log?.Invoke($"[Kerbcast][WORLD] snapshot valid again at epoch {snap.Epoch}");
                 }
-                if (!_governed) _view = new WorldModelView { Mode = WorldModelMode.Truth };
-                else if (snap == null) _view = new WorldModelView { Mode = WorldModelMode.Waiting };
-                else _view = new WorldModelView { Mode = _invalid ? WorldModelMode.Stale : WorldModelMode.Model, Snapshot = snap };
+                if (!_governed) _view = new WorldModelView { Mode = WorldModelMode.Truth, Tenure = _tenure };
+                else if (snap == null) _view = new WorldModelView { Mode = WorldModelMode.Waiting, Tenure = _tenure };
+                else _view = new WorldModelView { Mode = _invalid ? WorldModelMode.Stale : WorldModelMode.Model, Snapshot = snap, Tenure = _tenure };
             }
             if (_view.Snapshot != null) _view.Snapshot.ReaderThread = Environment.CurrentManagedThreadId;
             return _view;
