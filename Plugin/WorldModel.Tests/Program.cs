@@ -1073,6 +1073,130 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     Check(rec.HasAcceleration && rec.Acceleration == new Vec3d(1, 2, 3), "acceleration: the snapshot copies it");
 }
 
+/*
+ * A Launchpad lens 500 m from the pad watching a vertical climb under a world
+ * model, with the rig's numbers: 50 m/s^2 net for 40 s to 2 km/s at 40 km,
+ * then a coast, and one state-vector record a second starting at its publish
+ * UT. The picture draws the craft at its light time on its true path; the aim
+ * solves the same equation on the model's records. Read back only from the
+ * newest record, the aim is held at its 4 s cap while the light time runs to
+ * tens of seconds, so it sits hundreds of pixels off the drawn craft at the
+ * 1 degree lens floor at 3 km/s, and the 30 degree lens at 30 m/s. Placed from the record published for the instant, it
+ * lands on the drawn craft. The lens's body is taken as not turning, which
+ * leaves the light-time instants as they are.
+ */
+{
+    const double Mu = 3.5316e12, R = 600000, PadAlt = 75, BurnS = 40, Accel = 50, FramePx = 576;
+    var kerbin = new KinematicsBody { Known = true, Mu = Mu, Radius = R, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1) };
+    var pad = new DVec3(R + PadAlt, 0, 0);
+    var ground = new DVec3(0, 174.9, 0);
+    var lens = new DVec3(R + 70, 0, -500);
+    var thrust = new DVec3(Accel, 0, 0);
+    KeplerPath.TryAccelerated(pad, ground, thrust, 0, 0, BurnS, out var burn);
+    burn.TryAt(BurnS, out var bp, out var bv);
+    KeplerPath.TryFromState(bp, bv, BurnS, Mu, out var coast, R);
+    DVec3 Truth(double t)
+    {
+        if (t <= 0) return pad + ground * t;
+        DVec3 p, v;
+        if (t <= BurnS) burn.TryAt(t, out p, out v);
+        else coast.TryAt(t, out p, out v);
+        return p;
+    }
+    ModelRecord Published(double at)
+    {
+        var p = Truth(at);
+        var v = (Truth(at + 1e-3) - Truth(at - 1e-3)) * (1.0 / 2e-3);
+        bool burning = at > 0 && at < BurnS;
+        return new ModelRecord
+        {
+            PersistentId = 7, State = CraftFixState.Positioned, Kinematics = KinematicsKind.StateVector, BodyIndex = 1,
+            ValidFromUt = at, ValidUntilUt = at + 10, StateUt = at,
+            Position = new Vec3d(p.X, p.Y, p.Z), Velocity = new Vec3d(v.X, v.Y, v.Z),
+            HasAcceleration = burning, Acceleration = new Vec3d(thrust.X, thrust.Y, thrust.Z),
+        };
+    }
+    double Px(DVec3 a, DVec3 b, double fovDeg)
+    {
+        double cos = DVec3.Dot((a - lens).Normalized, (b - lens).Normalized);
+        return Math.Acos(Math.Min(1, cos)) / Kinematics.Deg2Rad / fovDeg * FramePx;
+    }
+
+    /* The aim's instant and place at frame UT `ut`, from the records published up to it, as KnownSubject solves it. */
+    void Aim(double ut, double c, bool kept, out double tr, out DVec3 at)
+    {
+        var history = new ModelRecordHistory();
+        double last = Math.Floor(ut - 0.5);
+        for (double p = -20; p <= last; p++) history.Add(Published(p), kerbin, double.NaN);
+        var newest = Published(last);
+        WorldModelSnapshot.BuildPath(newest, kerbin, out var newestPath);
+        DVec3? Along(double t)
+        {
+            if (kept && history.TryFind(t, out var r, out var path, out double floor, out bool back))
+                return ModelRecordHistory.TryPlace(r, path, floor, back, kerbin, t, out var q) ? q : (DVec3?)null;
+            return newestPath.TryAt(t, out var n, out _) ? n : (DVec3?)null;
+        }
+        DVec3? Windowed(double t) => t >= newest.ValidFromUt && newestPath.TryAt(t, out var n, out _) ? n : (DVec3?)null;
+        var along = new FnPath { At = Along };
+        var windowed = new FnPath { At = Windowed };
+        PastInstant.SolveAlong(ref along, ref windowed, lens, ut, c, 2200, newest.ValidFromUt, ut, out tr,
+            kept ? history.EarliestUt : double.NaN);
+        at = Along(tr) ?? default;
+    }
+
+    void Drawn(double ut, double c, out double tr, out DVec3 at)
+    {
+        var truth = new FnPath { At = t => Truth(t) };
+        PastInstant.Solve(ref truth, lens, ut, c, 2200, -1e6, ut, out tr);
+        at = Truth(tr);
+    }
+
+    foreach (var (c, fov, uts) in new[] { (3000.0, 1.0, new[] { 105.5, 117.5, 141.5, 165.5 }), (30.0, 30.0, new[] { 70.5, 110.5, 160.5 }) })
+    {
+        double oldWorst = 0, newWorst = 0, oldLag = 0;
+        foreach (double ut in uts)
+        {
+            Drawn(ut, c, out double drawnUt, out var drawn);
+            Aim(ut, c, false, out double oldUt, out var oldAt);
+            Aim(ut, c, true, out double newUt, out var newAt);
+            oldWorst = Math.Max(oldWorst, Px(oldAt, drawn, fov));
+            newWorst = Math.Max(newWorst, Px(newAt, drawn, fov));
+            oldLag = Math.Max(oldLag, oldUt - drawnUt);
+            Console.WriteLine($"     c={c} ut={ut} drawn at {drawnUt:F2} ({drawn.Magnitude - R:F0} m); newest only {oldUt:F2}, {Px(oldAt, drawn, fov):F1} px; kept {newUt:F2}, {Px(newAt, drawn, fov):F2} px");
+        }
+        Check(oldWorst > 80 && oldLag > 3, $"history c={c}: the newest record alone holds the aim at its read-back cap, {oldLag:F1} s after the drawn craft and up to {oldWorst:F0} px off it");
+        Check(newWorst < 2, $"history c={c}: the records kept for each instant aim within {newWorst:F2} px of the drawn craft");
+    }
+
+    foreach (double ut in new[] { 20.5, 75.5, 140.5 })
+    {
+        const double c = 300000;
+        Aim(ut, c, false, out double oldUt, out var oldAt);
+        Aim(ut, c, true, out double newUt, out var newAt);
+        Check(oldUt == newUt && (oldAt - newAt).Magnitude == 0, $"history c=300 km/s ut={ut}: a light time within the newest record's read-back is solved as before");
+    }
+
+    var h = new ModelRecordHistory();
+    h.Add(Published(10), kerbin, double.NaN);
+    Check(!h.TryFind(0, out _, out _, out _, out _) && double.IsNaN(h.EarliestUt), "history: the newest record alone keeps nothing earlier");
+    for (double p = 11; p <= 20; p++) h.Add(Published(p), kerbin, double.NaN);
+    Check(!h.TryFind(16.5, out _, out _, out _, out _), "history: within the newest record's read-back the newest places the craft");
+    Check(h.TryFind(12.5, out var r12, out _, out _, out bool back12) && r12.ValidFromUt == 12 && !back12, "history: an earlier instant takes the record published for it");
+    Check(h.TryFind(8, out var r10, out _, out _, out bool back8) && r10.ValidFromUt == 10 && back8, "history: before the oldest record it is read back along it");
+    h.Add(Published(15), kerbin, double.NaN);
+    Check(h.Count == 6 && h.TryFind(10.5, out var r15, out _, out _, out _) && r15.ValidFromUt == 10, "history: a republished record drops those starting at or after it");
+    Check(Math.Abs(h.SpeedOver(10, 15) - Math.Sqrt(Accel * 15 * Accel * 15 + ground.Y * ground.Y)) < 0.01,
+        "history: the kept records bound the craft's speed over the span they hold");
+    var floored = Published(30);
+    floored.HasAcceleration = false;
+    var fh = new ModelRecordHistory();
+    fh.Add(floored, kerbin, R + 30000);
+    fh.Add(Published(40), kerbin, double.NaN);
+    Check(fh.TryFind(0, out var fr, out var fp, out double ff, out bool fb) && fb
+        && ModelRecordHistory.TryPlace(fr, fp, ff, fb, kerbin, 0, out var fpos) && fpos.Magnitude >= R + 30000 - 1e-6,
+        "history: a read back before the oldest record is held no lower than its floor");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
@@ -1148,4 +1272,17 @@ static partial class Program
 {
     /* This test's own assembly: a recorder's Reserve, like Kerbcast's, must name the caller. */
     static string Me => System.Reflection.Assembly.GetExecutingAssembly().GetName().Name;
+}
+
+/* A path from a function of UT, null where it has no place. */
+struct FnPath : IPastPath
+{
+    public Func<double, DVec3?> At;
+
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        var p = At(ut);
+        position = p ?? default;
+        return p.HasValue;
+    }
 }

@@ -215,24 +215,27 @@ namespace Kerbcast
             int i = r.Index;
             if (i < 0 || i >= _count || _records[i].PersistentId != r.PersistentId) return false;
             if (_pathStates[i] == PathState.NotBuilt)
-            {
-                bool built;
-                if (r.Kinematics == KinematicsKind.Conic)
-                    built = KeplerPath.TryFromElements(r.Inclination, r.Eccentricity, r.SemiMajorAxis, r.Lan,
-                        r.ArgumentOfPeriapsis, r.MeanAnomalyAtEpoch, r.Epoch, body.Mu, out _paths[i]);
-                else if (r.Kinematics == KinematicsKind.StateVector && r.HasAcceleration)
-                    built = KeplerPath.TryAccelerated(new DVec3(r.Position.X, r.Position.Y, r.Position.Z),
-                        new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z),
-                        new DVec3(r.Acceleration.X, r.Acceleration.Y, r.Acceleration.Z), r.StateUt, r.ValidFromUt, r.ValidUntilUt, out _paths[i]);
-                else if (r.Kinematics == KinematicsKind.StateVector)
-                    built = KeplerPath.TryFromState(new DVec3(r.Position.X, r.Position.Y, r.Position.Z),
-                        new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z), r.StateUt, body.Mu, out _paths[i], body.Radius);
-                else built = false;
-                _pathStates[i] = built ? PathState.Built : PathState.Failed;
-            }
+                _pathStates[i] = BuildPath(r, body, out _paths[i]) ? PathState.Built : PathState.Failed;
             if (_pathStates[i] != PathState.Built) return false;
             path = _paths[i];
             return true;
+        }
+
+        /* A conic or state-vector record's path about `body`; false for any other kind or one that cannot be built. */
+        public static bool BuildPath(in ModelRecord r, in KinematicsBody body, out KeplerPath path)
+        {
+            path = default;
+            if (r.Kinematics == KinematicsKind.Conic)
+                return KeplerPath.TryFromElements(r.Inclination, r.Eccentricity, r.SemiMajorAxis, r.Lan,
+                    r.ArgumentOfPeriapsis, r.MeanAnomalyAtEpoch, r.Epoch, body.Mu, out path);
+            if (r.Kinematics == KinematicsKind.StateVector && r.HasAcceleration)
+                return KeplerPath.TryAccelerated(new DVec3(r.Position.X, r.Position.Y, r.Position.Z),
+                    new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z),
+                    new DVec3(r.Acceleration.X, r.Acceleration.Y, r.Acceleration.Z), r.StateUt, r.ValidFromUt, r.ValidUntilUt, out path);
+            if (r.Kinematics == KinematicsKind.StateVector)
+                return KeplerPath.TryFromState(new DVec3(r.Position.X, r.Position.Y, r.Position.Z),
+                    new DVec3(r.Velocity.X, r.Velocity.Y, r.Velocity.Z), r.StateUt, body.Mu, out path, body.Radius);
+            return false;
         }
 
         public string ScopeForSite(string siteKey) =>

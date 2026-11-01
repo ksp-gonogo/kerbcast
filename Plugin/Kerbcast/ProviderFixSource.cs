@@ -103,6 +103,7 @@ namespace Kerbcast
                 else
                 {
                     fix = wanted == 0 ? CraftFix.Unknown(0) : Placed(view, ModelLookup.Find(view, ScopeIndex(view), wanted, ut, BodyKnownFn), ut, true);
+                    if (generation != _keptGeneration) Keep(view, wanted);
                     _subjectFrame = Time.frameCount;
                     _subjectGeneration = generation;
                     _subjectWanted = wanted;
@@ -121,9 +122,69 @@ namespace Kerbcast
             return fix;
         }
 
+        private readonly ModelRecordHistory _kept = new ModelRecordHistory();
+        private long _keptGeneration = -1;
+        private uint _keptPid;
+        private long _keptEpoch;
+        private string _keptSiteKey;
+
+        /* Keeps the subject's record from each new snapshot, starting over for another craft, scope or publisher epoch. */
+        private void Keep(WorldModelView view, uint wanted)
+        {
+            _keptGeneration = view.Snapshot != null ? view.Snapshot.Generation : 0;
+            int scope = ScopeIndex(view);
+            var known = ModelLookup.Find(view, scope, wanted, double.NaN, BodyKnownFn);
+            if (known.State != CraftFixState.Positioned)
+            {
+                _kept.Clear();
+                return;
+            }
+            var r = known.Record;
+            if (r.PersistentId != _keptPid || view.Snapshot.Epoch != _keptEpoch || !string.Equals(_scopeSiteKey, _keptSiteKey, StringComparison.Ordinal))
+            {
+                _kept.Clear();
+                _keptPid = r.PersistentId;
+                _keptEpoch = view.Snapshot.Epoch;
+                _keptSiteKey = _scopeSiteKey;
+            }
+            var world = KinematicsWorld.Now();
+            var body = world.Body(r.BodyIndex);
+            if (body == null || !_kept.Add(r, world.Of(body), FloorOf(view, r, body))) _kept.Clear();
+        }
+
+        public double SubjectKeptFromUt => _kept.Count > 0 && _keptPid == _subjectPid ? _kept.EarliestUt : double.NaN;
+
+        public double SubjectKeptSpeedOver(double fromUt, double toUt) =>
+            _kept.Count > 0 && _keptPid == _subjectPid ? _kept.SpeedOver(fromUt, toUt) : double.NaN;
+
+        /*
+         * The subject at `ut` from the record the model published for that
+         * instant, for an instant before the current record's read-back
+         * reaches; false when no kept record places it.
+         */
+        private bool TryKept(double ut, CraftFix refused, out CraftFix fix)
+        {
+            fix = refused;
+            if (_keptPid != _subjectPid || !_kept.TryFind(ut, out var r, out var path, out double floorM, out bool readBack)) return false;
+            var world = KinematicsWorld.Now();
+            var body = world.Body(r.BodyIndex);
+            if (body == null || !ModelRecordHistory.TryPlace(r, path, floorM, readBack, world.Of(body), ut, out var rel)) return false;
+            var at = world.ToWorld(body, rel);
+            if (!Finite(at)) return false;
+            fix.State = CraftFixState.Positioned;
+            fix.RefusalCode = null;
+            fix.RefusalText = null;
+            fix.World = at;
+            fix.Body = body;
+            fix.UncertaintyM = readBack ? ModelRules.UncertaintyAlong(r, ut) : ModelRules.UncertaintyAt(r, ut);
+            return true;
+        }
+
         /*
          * A record vouches for nothing before its ValidFromUt; read back from
-         * there, its own path places the craft as the record predicts it. The
+         * there, its own path places the craft as the record predicts it, as
+         * far back as PastInstant.MaxReadBackS. Further back the record the
+         * model published then places it (ModelRecordHistory). The
          * uncertainty grows with how far back it reads, as it does forward.
          * A path that is not a surface point is held no lower than the ground
          * under its start, or the start itself when that is lower or the
@@ -142,6 +203,7 @@ namespace Kerbcast
                 int scope = ScopeIndex(view);
                 var known = ModelLookup.Find(view, scope, _subjectPid, double.NaN, BodyKnownFn);
                 if (known.State != CraftFixState.Positioned || !(ut < known.Record.ValidFromUt)) return fix;
+                if (TryKept(ut, fix, out var kept)) return kept;
                 var start = ModelLookup.Of(view, known.Scope, known.Record, known.Record.ValidFromUt, BodyKnownFn);
                 if (start.State != CraftFixState.Positioned) return fix;
                 var along = Placed(view, start, ut, true);

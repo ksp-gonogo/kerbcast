@@ -20,6 +20,7 @@
     <Compile Include="../Kerbcast.API/**/*.cs" Exclude="../Kerbcast.API/obj/**;../Kerbcast.API/bin/**" />
     <Compile Include="../Kerbcast.API.Testing/**/*.cs" Exclude="../Kerbcast.API.Testing/obj/**;../Kerbcast.API.Testing/bin/**" />
     <Compile Include="../Kerbcast/WorldModelSnapshot.cs" />
+    <Compile Include="../Kerbcast/ModelRecordHistory.cs" />
     <Compile Include="../Kerbcast/Kinematics.cs" />
     <Compile Include="../Kerbcast/WorldModelStore.cs" />
     <Compile Include="../Kerbcast/TelemetryMeters.cs" />

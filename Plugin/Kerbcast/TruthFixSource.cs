@@ -81,6 +81,8 @@ namespace Kerbcast
 
         /* Truth has the craft's whole past. */
         public CraftFix SubjectAlong(double ut) => Subject(ut);
+        public double SubjectKeptFromUt => double.NaN;
+        public double SubjectKeptSpeedOver(double fromUt, double toUt) => double.NaN;
 
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt)
         {

@@ -229,6 +229,10 @@ namespace Kerbcast
             return own * SpeedMargin + BodySpeedBound(m.Body, frame);
         }
 
+        /* A point moving at no more than `ownSpeed` about `body`, relative to `frame`. */
+        internal static double SpeedBound(double ownSpeed, CelestialBody body, CelestialBody frame) =>
+            ownSpeed * SpeedMargin + BodySpeedBound(body, frame);
+
         /* A body's speed relative to `frame`: the periapsis speeds up its
            chain of parents to `frame`, or to the root plus frame's own when
            `frame` is not among them. */

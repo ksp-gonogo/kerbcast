@@ -202,14 +202,16 @@ namespace Kerbcast
          * there, so a lens whose light time is longer than the record's age
          * still follows the craft between publishes instead of holding it at
          * the record's start. It reads back MaxReadBackS at most and holds the
-         * craft there past it, as SolveFrom holds it at a start. Where `along`
+         * craft there past it, as SolveFrom holds it at a start. `alongFrom`,
+         * when earlier than `lo`, is the start of the earliest earlier record
+         * `along` keeps, which it reads back from instead. Where `along`
          * cannot be read back, SolveFrom on `windowed`, the record as it
          * vouches from `lo`.
          */
         public static PastStatus SolveAlong<TA, TW>(ref TA along, ref TW windowed, DVec3 lens, double t, double c,
-            double speedBound, double lo, double hi, out double tr) where TA : IPastPath where TW : IPastPath
+            double speedBound, double lo, double hi, out double tr, double alongFrom = double.NaN) where TA : IPastPath where TW : IPastPath
         {
-            var status = SolveFrom(ref along, lens, t, c, speedBound, ReadBackFloor(lo), hi, out tr);
+            var status = SolveFrom(ref along, lens, t, c, speedBound, ReadBackFloor(alongFrom < lo ? alongFrom : lo), hi, out tr);
             if (status != PastStatus.Unsolved || double.IsInfinity(lo)) return status;
             return SolveFrom(ref windowed, lens, t, c, speedBound, lo, hi, out tr);
         }
@@ -220,7 +222,9 @@ namespace Kerbcast
          * the record's age: no more than 4 s for light times up to 4 s, even
          * on a record just published. Further back the path's error grows
          * with the square of the time while its use does not, so past this
-         * the craft is held where the cap puts it.
+         * the record the model published for the instant places the craft
+         * (ModelRecordHistory), and the craft is held only past the earliest
+         * one kept.
          */
         public const double MaxReadBackS = 4.0;
 

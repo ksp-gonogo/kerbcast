@@ -862,9 +862,13 @@ namespace Kerbcast
          * a later UT (a world model's record from its ValidFromUt) is read back
          * along that record's own path, as it predicts the craft at the
          * instant, so a far lens follows the craft between publishes: no
-         * further back than PastInstant.MaxReadBackS, where it is held, and no
-         * lower than the ground under its start (or the start itself, when
-         * that is lower or the craft rests there). Only where it cannot be read
+         * further back than PastInstant.MaxReadBackS and no lower than the
+         * ground under its start (or the start itself, when that is lower or
+         * the craft rests there). Further back the records the source kept
+         * place it as the model published them for the instant, so a lens
+         * whose light time is far longer than a record's age still aims where
+         * the picture draws the craft; it is held only past the earliest
+         * kept record's read-back. Only where it cannot be read
          * back is the subject taken as it is placed from then. Otherwise a source that cannot be solved back to that
          * instant has no fix. A world model's place on the lens's own
          * ground stands where the source puts it now, at the instant of its
@@ -927,9 +931,13 @@ namespace Kerbcast
                 var windowed = path;
                 windowed.Along = false;
                 /* Read back before the record's start, the root lies no earlier than this while the craft is under half the light speed, and no read goes past the cap. */
-                double reach = Math.Max(PastInstant.ReadBackFloor(validFrom), Math.Min(validFrom, ut - 2.0 * (station - now.World).Magnitude / c.Value));
+                double kept = _known.SubjectKeptFromUt;
+                double alongFrom = kept < validFrom ? kept : validFrom;
+                double reach = Math.Max(PastInstant.ReadBackFloor(alongFrom), Math.Min(validFrom, ut - 2.0 * (station - now.World).Magnitude / c.Value));
                 double from = double.IsInfinity(reach) ? validFrom : reach;
                 double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, from, ut) : 0;
+                double keptSpeed = moves ? _known.SubjectKeptSpeedOver(from, validFrom) : double.NaN;
+                if (keptSpeed > 0) bound = Math.Max(bound, CommandCameraForecast.SpeedBound(keptSpeed, motion.Body, frameBody));
                 /* A live place is never turned, so adds nothing to the bound. */
                 if (moves && motion.Body == lensBody && !now.Live)
                 {
@@ -940,7 +948,7 @@ namespace Kerbcast
                         CommandCameraForecast.BodySpeedBound(lensBody, frameBody));
                 }
                 var lens = station - ToD(frameBody.position);
-                if (PastInstant.SolveAlong(ref path, ref windowed, lens, ut, c.Value, bound, validFrom, ut, out double tr) != PastStatus.Found)
+                if (PastInstant.SolveAlong(ref path, ref windowed, lens, ut, c.Value, bound, validFrom, ut, out double tr, alongFrom) != PastStatus.Found)
                 {
                     if (pass == 0) break;
                     /* The second frame would not solve: keep the first frame's instant. */
