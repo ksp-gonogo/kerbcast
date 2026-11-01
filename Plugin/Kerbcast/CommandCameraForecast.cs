@@ -232,7 +232,7 @@ namespace Kerbcast
         /* A body's speed relative to `frame`: the periapsis speeds up its
            chain of parents to `frame`, or to the root plus frame's own when
            `frame` is not among them. */
-        private static double BodySpeedBound(CelestialBody b, CelestialBody frame)
+        internal static double BodySpeedBound(CelestialBody b, CelestialBody frame)
         {
             double v = 0;
             for (int guard = 0; b != null && guard < 16; guard++)

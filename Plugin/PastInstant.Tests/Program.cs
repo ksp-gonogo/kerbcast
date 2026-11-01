@@ -1605,6 +1605,559 @@ bool IsLatest<T>(ref T path, DVec3 lens, double tt, double c, double k, double t
     Check(PastInstant.BodyFixedInstant(500, t0, c, t0 + 1) == t0, "a record that starts after now takes the present");
 }
 
+/* ---- the turning weight about the lens's body ---- */
+{
+    double w = 175 / 600000.0;
+    var spin = BodySpin.Of(Kerbin, new DVec3(0, 0, w), 600000, 70000);
+    Check(PastInstant.TurningWeight(spin, 0) == 1 && PastInstant.TurningWeight(spin, 70000) == 1
+        && PastInstant.TurningWeight(spin, 140000) == 0 && PastInstant.TurningWeight(spin, 1e7) == 0
+        && Math.Abs(PastInstant.TurningWeight(spin, 105000) - 0.5) < 1e-12,
+        "a craft turns with the body up to the threshold, not at all from twice it, and half way at the band's middle");
+    bool monotone = true;
+    double last = 1, steepest = 0;
+    for (double h = 60000; h <= 150000; h += 10)
+    {
+        double f = PastInstant.TurningWeight(spin, h);
+        if (f > last) monotone = false;
+        steepest = Math.Max(steepest, (last - f) / 10);
+        last = f;
+    }
+    Check(monotone && steepest <= PastInstant.TurningSlope(spin) * 1.0001,
+        $"the weight only falls with altitude, never faster than its stated slope ({steepest * 1e5:F3} per 100 km)");
+    var p = new DVec3(700000, 0, 0);
+    Check(PastInstant.Turn(spin, Mun, p, false, 0, 100).Magnitude == 0 && PastInstant.Turn(default, Kerbin, p, false, 0, 100).Magnitude == 0
+        && !BodySpin.Of(Kerbin, default, 600000, 70000).Turns && !BodySpin.Of(Kerbin, new DVec3(0, 0, w), 600000, double.PositiveInfinity).Turns,
+        "nothing turns about another body, with no spin, or with no threshold");
+    var high = new DVec3(600000 + 300000, 0, 0);
+    Check((PastInstant.Turn(spin, Kerbin, high, true, 0, 100) - new DVec3(0, 0, w * 100)).Magnitude < 1e-15,
+        "a craft on the surface turns in full whatever its altitude, as AboutDrawnBody carries it");
+}
+
+/* ---- a live place from truth is never turned; a conic read at its past is ---- */
+{
+    /*
+     * Truth gives a landed or loaded craft's place as it is now whatever UT
+     * is asked. Solved and aimed as the rig does (KnownTurned on the path,
+     * then on the fix at the instant), it must stay exactly on that place,
+     * which the picture draws it on. An unloaded craft's conic is read at
+     * its past and must still be carried round to now.
+     */
+    const double radius = 600000, w = 2 * Math.PI / 21549.425, t = 1e6;
+    var spin = BodySpin.Of(Kerbin, new DVec3(0, 0, w), radius, 70000);
+    var pad = new DVec3(radius + 70, 0, 0);
+    foreach (double c in new[] { 3000.0, 300000.0, 299792458.0 })
+    foreach (double d in new[] { 2400.0, 50000.0 })
+    {
+        double a = d / radius;
+        var lens = new DVec3((radius + 2) * Math.Cos(a), (radius + 2) * Math.Sin(a), 0);
+        var known = new Known { Spin = spin, Body = Kerbin, T = t, Live = true, F = _ => pad };
+        var st = PastInstant.Solve(ref known, lens, t, c, 0, double.NegativeInfinity, t, out double tr);
+        var aim = PastInstant.KnownTurned(spin, Kerbin, pad, true, tr, t);
+        double off = (aim - pad).Magnitude / (pad - lens).Magnitude;
+        Check(st == PastStatus.Found && off < 1e-6 && Math.Abs(t - tr - (pad - lens).Magnitude / c) < 1e-9,
+            $"c={c} d={d}: a live landed subject is aimed on its drawn place ({off:E1} rad), its light time d/c");
+        var twice = PastInstant.Turned(spin, Kerbin, pad, false, tr, t);
+        if (c == 3000) Check((twice - pad).Magnitude / (pad - lens).Magnitude > 1e-2, "turned as though read at its past, it would be aimed degrees off");
+    }
+    {
+        const double c = 3000;
+        var lens = new DVec3(radius + 2, 0, 0);
+        DVec3 Orbit(double ut) => new DVec3((radius + 50000) * Math.Cos(2.0e-3 * (ut - t)), (radius + 50000) * Math.Sin(2.0e-3 * (ut - t)), 0);
+        var known = new Known { Spin = spin, Body = Kerbin, T = t, Live = false, F = Orbit };
+        double bound = 2.0e-3 * (radius + 50000) + PastInstant.TurnSpeedBound(spin, 0, 0, radius + 50000);
+        var st = PastInstant.Solve(ref known, lens, t, c, bound, double.NegativeInfinity, t, out double tr);
+        var aim = PastInstant.KnownTurned(spin, Kerbin, Orbit(tr), false, tr, t);
+        var expected = PastInstant.Turned(spin, Kerbin, Orbit(tr), false, tr, t);
+        double turned = (aim - Orbit(tr)).Magnitude, want = w * (t - tr) * (radius + 50000);
+        Check(st == PastStatus.Found && (aim - expected).Magnitude < 1e-9 && Math.Abs(turned - want) < 1e-3 * want,
+            $"an unloaded conic subject is still carried round with the body ({turned:F0} m over {t - tr:F1} s)");
+    }
+}
+
+/* ---- a craft just launched beside the lens, solved on the turning body ---- */
+{
+    /*
+     * The lens and the pad 500 m apart on Kerbin's equator, c = 60: the
+     * ground turns at 175 m/s, faster than light. The craft lifts off at
+     * 15 m/s^2 and is published every 2 s as a state vector record about
+     * Kerbin's inertial frame, read back along it as the rig reads it, with
+     * the path carried round with the body (PastInstant.Turn) as KnownPath
+     * carries it.
+     */
+    const double c = 60, radius = 600000, w = 175 / radius, accel = 15, tL = 1000, publish = 2, fps = 60;
+    var spin = BodySpin.Of(Kerbin, new DVec3(0, 0, w), radius, 70000);
+    DVec3 Rot(DVec3 v, double a) => new DVec3(v.X * Math.Cos(a) - v.Y * Math.Sin(a), v.X * Math.Sin(a) + v.Y * Math.Cos(a), v.Z);
+    var lensB = new DVec3(radius, 0, 0);
+    foreach (double side in new[] { 1.0, -1.0 })
+    {
+        double theta = side * 500 / radius;
+        DVec3 CraftB(double ut)
+        {
+            double h = ut > tL ? 0.5 * accel * (ut - tL) * (ut - tL) : 0;
+            return new DVec3((radius + h) * Math.Cos(theta), (radius + h) * Math.Sin(theta), 0);
+        }
+        DVec3 CraftI(double ut) => Rot(CraftB(ut), w * ut);
+        Launch Record(double from) => new Launch
+        {
+            P = CraftI(from), T0 = from, From = double.NegativeInfinity,
+            V = (CraftI(from + 1e-3) - CraftI(from - 1e-3)) * (1 / 2e-3),
+            A = (CraftI(from + 1e-2) - CraftI(from) * 2 + CraftI(from - 1e-2)) * (1 / 1e-4),
+        };
+        string where = side > 0 ? "ahead of" : "behind";
+        /* The rig's bound: the record's inertial speed, and what turning adds over the read-back. */
+        double Bound(double from, double t)
+        {
+            double own = (175 + 160) * 1.1;
+            double span = t - PastInstant.ReadBackFloor(from);
+            return own + PastInstant.TurnSpeedBound(spin, own, span, radius + 1000);
+        }
+
+        var hold = new InstantHold();
+        int steps = 0;
+        double lastTr = double.NaN, worstTurn = 0, worstOff = 0, lastFrom = double.NaN;
+        DVec3 lastDir = default;
+        bool finite = true;
+        for (double t = tL + 1 / fps; t < tL + 10; t += 1 / fps)
+        {
+            double from = tL + Math.Floor((t - tL) / publish) * publish;
+            var path = new Turning<Launch> { Inner = Record(from), Spin = spin, Body = Kerbin, T = t };
+            var windowed = path;
+            windowed.Inner.From = from;
+            var lens = Rot(lensB, w * t);
+            if (PastInstant.SolveAlong(ref path, ref windowed, lens, t, c, Bound(from, t), from, t, out double tr) != PastStatus.Found)
+            {
+                finite = false;
+                continue;
+            }
+            double held = hold.NotBefore(t, 0, c, Kerbin);
+            if (held > tr && PastInstant.Arrived(ref path, lens, t, c, held)) tr = held;
+            hold.Shown(t, tr, 0, c, Kerbin, Kerbin);
+            if (tr < lastTr) steps++;
+            path.TryAt(tr, out var at);
+            /* The drawn offset from the lens on the body as it is now, against the craft over its own ground then. */
+            var drawn = Rot(at - lens, -w * t);
+            double off = (drawn - (CraftB(tr) - lensB)).Magnitude;
+            finite &= !double.IsNaN(off);
+            worstOff = Math.Max(worstOff, off);
+            var dir = drawn.Normalized;
+            /* A republish moves the read-back cap by 2 s, which turns the aim on its own; only frames between publishes count. */
+            if (from == lastFrom) worstTurn = Math.Max(worstTurn, Math.Acos(Math.Min(1, DVec3.Dot(dir, lastDir))) * 180 / Math.PI);
+            lastDir = dir;
+            lastTr = tr;
+            lastFrom = from;
+        }
+        /* What is left off is the first record read back 4 s through liftoff, where its quadratic is a / 4 * 4^2 = 60 m off. */
+        Check(finite && steps == 0 && worstOff < 61 && worstTurn < 2,
+            $"a craft just launched {where} the lens is aimed over its own ground ({worstOff:F1} m), never steps back "
+            + $"and turns at most {worstTurn:F2} deg in a frame between publishes");
+
+        /* At liftoff the rig passes from the surface record, placed as it is now, to the state vector. */
+        {
+            double t = tL + 1 / fps, from = tL;
+            var path = new Turning<Launch> { Inner = Record(from), Spin = spin, Body = Kerbin, T = t };
+            var windowed = path;
+            windowed.Inner.From = from;
+            var lens = Rot(lensB, w * t);
+            PastInstant.SolveAlong(ref path, ref windowed, lens, t, c, Bound(from, t), from, t, out double tr);
+            path.TryAt(tr, out var at);
+            double jump = (Rot(at - lens, -w * t) - (CraftB(tL) - lensB)).Magnitude;
+            Check(jump < 61, $"at liftoff a craft {where} the lens moves {jump:F1} m from its pad as its record turns to a state vector");
+        }
+    }
+}
+
+/* ---- the drawn craft and the aim, through the band ---- */
+{
+    /*
+     * A craft on Kerbin's equator rises straight up from its pad over the
+     * lens's ground at 20 m/s^2, through the band from 70 to 140 km, with a
+     * light speed at which light from the band takes about 40 s, and at
+     * c = 60, where the ground outruns light and the craft never leaves the
+     * lowest kilometres in the light shown. The ring holds its inertial
+     * path, landed then in flight, as the host samples it; the aim solves
+     * the same truth as the rig would.
+     */
+    foreach (double c in new[] { 3000.0, 60.0 })
+    {
+        const double radius = 600000, w = 175 / radius, accel = 20, tL = 100, dtRing = 0.05;
+        const uint pid = 31;
+        DVec3 Rot(DVec3 v, double a) => new DVec3(v.X * Math.Cos(a) - v.Y * Math.Sin(a), v.X * Math.Sin(a) + v.Y * Math.Cos(a), v.Z);
+        double theta = 2000 / radius;
+        double H(double ut) => ut > tL ? 0.5 * accel * (ut - tL) * (ut - tL) : 0;
+        DVec3 CraftB(double ut) => new DVec3((radius + H(ut)) * Math.Cos(theta), (radius + H(ut)) * Math.Sin(theta), 0);
+        DVec3 CraftI(double ut) => Rot(CraftB(ut), w * ut);
+        var lensB = new DVec3(radius, 0, 0);
+        var rate = new DVec3(0, 0, w);
+
+        var spun = (HistoryBody[])bodies.Clone();
+        spun[Kerbin].Spin = rate;
+        spun[Kerbin].RotThresholdM = 70000;
+        var ring = new LightHistory { SystemDiameterM = 2.4e11 };
+        ring.SetBodies(spun);
+        ring.SetLightSpeed(c);
+        var key = LightHistory.CraftKey(pid);
+        for (double ut = 0; ut <= tL + 400; ut += dtRing)
+        {
+            var s = new HistoryState { Ut = ut, Body = Kerbin, Attitude = DQuat.Identity };
+            if (ut <= tL)
+            {
+                s.Kind = HistoryKind.Surface;
+                s.Position = CraftI(ut);
+                s.AngularVelocity = rate;
+                s.Velocity = DVec3.Cross(rate, s.Position);
+            }
+            else
+            {
+                s.Kind = HistoryKind.Conic;
+                s.Position = CraftI(ut);
+                s.Velocity = (CraftI(ut + 1e-4) - CraftI(ut - 1e-4)) * (1 / 2e-4);
+            }
+            ring.Record(key, s, ut == 0 ? HistoryReason.Start : HistoryReason.Departure);
+        }
+        var spin = ring.SpinOf(Kerbin);
+        var tree = new Tree();
+        var truth = new Turning<Truth> { Inner = new Truth { F = CraftI }, Spin = spin, Body = Kerbin };
+
+        var hold = new InstantHold();
+        int steps = 0;
+        double lastTr = double.NegativeInfinity, worstGround = 0, worstStep = 0, worstAccel = 0, worstAgree = 0, worstAgreeS = 0, worstAbout = 0;
+        double worstShared = 0, worstAnchor = 0, nearestInertial = double.PositiveInfinity;
+        int anchorsMissed = 0;
+        double lastStepLen = double.NaN;
+        DVec3 lastDrawn = default, lastStep = default;
+        bool haveLast = false, found = true;
+        string agreeAt = "", accelAt = "";
+        bool aboveBand = false;
+        const double dt = 0.1;
+        for (double t = tL - 5; t < tL + 300; t += dt)
+        {
+            var lensOffset = Rot(lensB, w * t);
+            var sight = PastInstant.Craft(ring, pid, t, Kerbin, lensOffset, c, ref tree, hold.NotBefore(t, ring.Generation, c, Kerbin), hold.Frame);
+            if (!sight.Found) { found = false; continue; }
+            hold.Shown(t, sight.Ut, ring.Generation, c, Kerbin, sight.Frame);
+            if (sight.Ut < lastTr) steps++;
+            lastTr = sight.Ut;
+            var drawn = PastInstant.AboutDrawnBody(sight.State, t, spin);
+            worstAbout = Math.Max(worstAbout, (drawn - sight.About).Magnitude);
+            /* The rig and the anchors place a craft by the same helper the ring's path does. */
+            var shared = PastInstant.Turned(spin, Kerbin, sight.State.Position, sight.State.Kind == HistoryKind.Surface, sight.Ut, t);
+            worstShared = Math.Max(worstShared, (shared - sight.About).Magnitude);
+            /* On the body as it is now, against the craft's ground at the instant shown. */
+            var onBody = Rot(drawn, -w * t);
+            if (H(sight.Ut) <= 70000) worstGround = Math.Max(worstGround, (onBody - CraftB(sight.Ut)).Magnitude);
+            else aboveBand |= PastInstant.TurningWeight(spin, H(sight.Ut)) == 0;
+            if (haveLast)
+            {
+                var step = onBody - lastDrawn;
+                worstStep = Math.Max(worstStep, step.Magnitude);
+                if (!double.IsNaN(lastStepLen) && (step - lastStep).Magnitude > worstAccel)
+                {
+                    worstAccel = (step - lastStep).Magnitude;
+                    accelAt = $"{H(sight.Ut) / 1000:F1} km";
+                }
+                lastStep = step;
+                lastStepLen = step.Magnitude;
+            }
+            lastDrawn = onBody;
+            haveLast = true;
+
+            /* The aim on the same truth, solved as the rig solves it. */
+            truth.T = t;
+            double own = accel * Math.Max(0, t - tL) * 1.1 + 175;
+            double bound = own + PastInstant.TurnSpeedBoundAbout(spin, Kerbin, own, t, radius + H(t), lensOffset.Magnitude, c);
+            if (PastInstant.Solve(ref truth, lensOffset, t, c, bound, 0, t, out double tr) == PastStatus.Found)
+            {
+                truth.TryAt(tr, out var aim);
+                double off = (aim - drawn).Magnitude;
+                if (off > worstAgree) { worstAgree = off; agreeAt = $"{H(tr) / 1000:F0} km"; }
+                worstAgreeS = Math.Max(worstAgreeS, Math.Abs(tr - sight.Ut));
+            }
+            else found = false;
+
+            /* A state vector anchor on the craft, solved as the anchor projector solves it: no start, the span capped by the lens's distance. */
+            double anchorBound = own + PastInstant.TurnSpeedBoundAbout(spin, Kerbin, own, double.PositiveInfinity, double.NaN, lensOffset.Magnitude, c);
+            if (PastInstant.Solve(ref truth, lensOffset, t, c, anchorBound, double.NegativeInfinity, t, out double ta) == PastStatus.Found)
+            {
+                truth.TryAt(ta, out var anchor);
+                worstAnchor = Math.Max(worstAnchor, (anchor - drawn).Magnitude);
+            }
+            else anchorsMissed++;
+            /* The same anchor left inertial, as it was placed before, for scale. */
+            var inertial = new Truth { F = CraftI };
+            if (PastInstant.Solve(ref inertial, lensOffset, t, c, own + 300, double.NegativeInfinity, t, out double ti) == PastStatus.Found)
+            {
+                inertial.TryAt(ti, out var place);
+                if (H(sight.Ut) < 70000) nearestInertial = Math.Min(nearestInertial, (place - drawn).Magnitude);
+            }
+        }
+        Check(found && worstAbout < 1e-6, $"c={c}: the picture draws the craft where its light time was solved ({worstAbout:E1} m)");
+        Check(worstShared < 1e-9, $"c={c}: PastInstant.Turned, which the rig and the anchors place by, puts the craft where the ring's path does ({worstShared:E1} m)");
+        Check(anchorsMissed == 0 && worstAnchor < 1,
+            $"c={c}: a state vector anchor on the craft sits on the drawn craft ({worstAnchor:F3} m)");
+        if (c < 100)
+            Check(nearestInertial > 1000, $"c={c}: where left inertial it would sit at least {nearestInertial / 1000:F1} km off the craft below the band");
+        Check(steps == 0 && worstGround < 1 && (aboveBand || c < 100),
+            $"c={c}: climbing to the band the drawn craft stays over its own ground ({worstGround:F3} m) and never steps back"
+                + (aboveBand ? ", on up past the band" : ""));
+        /* A jump at either edge of the band would show as a change of step far above the climb's own bend. */
+        Check(worstAccel < 5, $"c={c}: and moves smoothly across the band: at most {worstStep:F1} m a frame, the step changing by at most {worstAccel:F2} m (at {accelAt})");
+        Check(worstAgree < 1 && worstAgreeS < 1e-3,
+            $"c={c}: the aim on the same truth agrees with the drawn craft from the pad up past the band ({worstAgree:F3} m at {agreeAt}, {worstAgreeS:E1} s)");
+
+        /* At real light speed the turn over a light time of milliseconds is under a metre. */
+        var plain = new LightHistory { SystemDiameterM = 2.4e11 };
+        plain.SetBodies(bodies);
+        plain.SetLightSpeed(299792458.0);
+        ring.SetLightSpeed(299792458.0);
+        for (double ut = 0; ut <= tL + 400; ut += dtRing)
+            plain.Record(key, ring.TryStateAt(pid, ut, out var st) ? st : default, ut == 0 ? HistoryReason.Start : HistoryReason.Departure);
+        double worstReal = 0, worstRealS = 0;
+        foreach (double t in new[] { tL - 1, tL + 50, tL + 105, tL + 300 })
+        {
+            var lensOffset = Rot(lensB, w * t);
+            var a = PastInstant.Craft(ring, pid, t, Kerbin, lensOffset, 299792458.0, ref tree);
+            var b = PastInstant.Craft(plain, pid, t, Kerbin, lensOffset, 299792458.0, ref tree);
+            worstReal = Math.Max(worstReal, (a.About - b.About).Magnitude);
+            worstRealS = Math.Max(worstRealS, Math.Abs(a.Ut - b.Ut));
+        }
+        Check(worstReal < 1 && worstRealS < 1e-6, $"at real light speed the drawn craft moves {worstReal:F3} m and its instant {worstRealS:E1} s");
+    }
+}
+
+/* ---- the band on small bodies ---- */
+{
+    var rate = new DVec3(0, 0, 1e-4);
+    var low = BodySpin.Of(Mun, rate, 200000, 5000);
+    Check(low.FromAltitudeM == 5000 && low.BandM == 20000 && PastInstant.TurningWeight(low, 5000) == 1
+        && PastInstant.TurningWeight(low, 25000) == 0 && PastInstant.TurningSlope(low) == 1.5 / 20000,
+        "a low threshold turns over a band no narrower than a tenth of the radius");
+    var tight = BodySpin.Of(Mun, rate, 200000, 100000, 300000);
+    var out1 = new DVec3(300000 + 1, 0, 0);
+    Check(Math.Abs(tight.TopRadiusM - 300000) < 1e-6 && Math.Abs(tight.FromAltitudeM - 50000) < 1e-6 && Math.Abs(tight.BandM - 50000) < 1e-6
+        && PastInstant.Turn(tight, Mun, out1, false, 0, 100).Magnitude == 0
+        && PastInstant.Turn(tight, Mun, new DVec3(299900, 0, 0), false, 0, 100).Magnitude < 1e-4 * 100 * 1e-3,
+        "a band reaching past the sphere of influence shrinks to end there, so nothing jumps at the crossing");
+    Check(!BodySpin.Of(Mun, rate, 200000, 100000, 150000).Turns && BodySpin.Of(Mun, rate, 200000, 100000, double.NaN).TopRadiusM == 400000,
+        "a sphere of influence inside the body turns nothing, and an unknown one clamps nothing");
+    var spun = (HistoryBody[])bodies.Clone();
+    spun[Mun].Spin = rate;
+    spun[Mun].RotThresholdM = 2e6;
+    var ring = NewRing(60);
+    ring.SetBodies(spun);
+    Check(Math.Abs(ring.SpinOf(Mun).TopRadiusM - bodies[Mun].SoiRadius) < 1e-3, "the ring's spin ends at the body's own sphere of influence");
+}
+
+/* ---- the weight's span, capped by the light time across the band ---- */
+{
+    /*
+     * A craft in a 100 km orbit of Kerbin, inside the band, for a day, seen
+     * from the ground at 3e5 m/s. Over its whole past the weight's part of
+     * the bound passes c; over the light time across the band, what a solve
+     * can need, it is tens of metres a second, so the solve still brackets.
+     */
+    const double c = 3e5, r = 700000, t = 86400;
+    const uint pid = 41;
+    double w = 2 * Math.PI / 21549.425, v = Math.Sqrt(MuKerbin / r);
+    var spun = (HistoryBody[])bodies.Clone();
+    spun[Kerbin].Spin = new DVec3(0, 0, w);
+    spun[Kerbin].RotThresholdM = 70000;
+    var ring = new LightHistory { SystemDiameterM = 2.4e11 };
+    ring.SetBodies(spun);
+    ring.SetLightSpeed(c);
+    ring.Record(LightHistory.CraftKey(pid), State(0, Kerbin, new DVec3(r, 0, 0), new DVec3(0, v, 0)), HistoryReason.Start);
+    var spin = ring.SpinOf(Kerbin);
+    var track = ring.Track(LightHistory.CraftKey(pid));
+    var lensOffset = new DVec3(0, 600000, 0);
+    double whole = ring.MaxSpeedAbout(track, Kerbin, spin, t, double.NaN, c);
+    double capped = ring.MaxSpeedAbout(track, Kerbin, spin, t, lensOffset.Magnitude, c);
+    Check(whole >= c && capped * PastInstant.SpeedMargin < c && capped < v + 400,
+        $"over its whole past the bound reaches {whole:E1} m/s, past c; capped at the light time across the band it is {capped:F0} m/s");
+    Check(PastInstant.TurnSpan(spin, t, 600000, c) == (600000 + spin.TopRadiusM) / c && PastInstant.TurnSpan(spin, 1, 600000, c) == 1
+        && PastInstant.TurnSpan(spin, double.PositiveInfinity, 600000, c) == (600000 + spin.TopRadiusM) / c
+        && PastInstant.TurnSpan(default, t, 600000, c) == t,
+        "the span is capped at the lens's distance plus the band's top over c, and only where something turns");
+    var tree = new Tree();
+    var sight = PastInstant.Craft(ring, pid, t, Kerbin, lensOffset, c, ref tree);
+    double g = sight.Found ? sight.Ut + (lensOffset - sight.About).Magnitude / c - t : double.NaN;
+    Check(sight.Found && g <= 0 && g > -1e-5, $"and the solve finds the craft's light arriving now ({g:E1} s)");
+}
+
+/*
+ * The fastest a ring path moves where a solve relies on its bound: |dP/du|
+ * sampled every `step` seconds over [lo, t] wherever light from P(u) has not
+ * reached `lens` by t (g > 0). `latestBand` is the largest t - u there with
+ * the craft within `top` of `body` and about it, the reach TurnSpan caps.
+ */
+double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t, double c, double step, double top, int body,
+    out double latestBand) where TB : IBodyTree
+{
+    double best = 0;
+    latestBand = 0;
+    const double h = 0.01;
+    for (double u = lo + h; u < t - h; u += step)
+    {
+        if (!path.TryAt(u, out var p) || G(lens, p, u, t, c) <= 0) continue;
+        if (path.Last.Body == body && path.Last.Position.Magnitude < top) latestBand = Math.Max(latestBand, t - u);
+        if (!path.TryAt(u - h, out var a) || !path.TryAt(u + h, out var b)) continue;
+        best = Math.Max(best, (b - a).Magnitude / (2 * h));
+    }
+    return best;
+}
+
+/* ---- the weight's span cap binding for a craft climbing through the band ---- */
+{
+    /*
+     * A craft waits on Kerbin's equator for 3000 s, then climbs straight up
+     * at 300 m/s through the band from 70 to 140 km, seen from 1000 km out
+     * on the far side at c = 1e3. Its past outlasts the cap of (L + Top) / c,
+     * 1740 s, so the cap binds; the weight's part is still needed, so a cap
+     * of nothing would leave the bound below the path's own rate. Kerbin's
+     * Mu is 0 here so each record bounds its own speed, as a powered climb's
+     * samples would, rather than by a conic's periapsis.
+     */
+    const double c = 1e3, radius = 600000, tL = 3000, climb = 300;
+    const uint pid = 61;
+    double w = 2 * Math.PI / 21549.425;
+    DVec3 Rot(DVec3 v, double a) => new DVec3(v.X * Math.Cos(a) - v.Y * Math.Sin(a), v.X * Math.Sin(a) + v.Y * Math.Cos(a), v.Z);
+    double H(double ut) => ut > tL ? climb * (ut - tL) : 0;
+    DVec3 CraftI(double ut) => Rot(new DVec3(radius + H(ut), 0, 0), w * ut);
+    var lensB = new DVec3(-1e6, 0, 0);
+    var rate = new DVec3(0, 0, w);
+    var spun = (HistoryBody[])bodies.Clone();
+    spun[Kerbin].Spin = rate;
+    spun[Kerbin].RotThresholdM = 70000;
+    spun[Kerbin].Mu = 0;
+    var ring = new LightHistory { SystemDiameterM = 2.4e11 };
+    ring.SetBodies(spun);
+    ring.SetLightSpeed(c);
+    var key = LightHistory.CraftKey(pid);
+    for (double ut = 0; ut <= tL + 2000; ut += 1)
+    {
+        var s = new HistoryState { Ut = ut, Body = Kerbin, Attitude = DQuat.Identity, Position = CraftI(ut) };
+        if (ut <= tL)
+        {
+            s.Kind = HistoryKind.Surface;
+            s.AngularVelocity = rate;
+            s.Velocity = DVec3.Cross(rate, s.Position);
+        }
+        else
+        {
+            s.Kind = HistoryKind.Conic;
+            s.Velocity = (CraftI(ut + 1e-4) - CraftI(ut - 1e-4)) * (1 / 2e-4);
+        }
+        ring.Record(key, s, ut == 0 ? HistoryReason.Start : HistoryReason.Departure);
+    }
+    var spin = ring.SpinOf(Kerbin);
+    var track = ring.Track(key);
+    var tree = new Tree();
+    double lo = Math.Max(track.StartUt, ring.FloorUt);
+    bool binds = true, covered = true, needed = false, latest = true;
+    double worstRatio = 0, mostOver = 0;
+    for (double t = tL + 300; t <= tL + 1500; t += 100)
+    {
+        var lensOffset = Rot(lensB, w * t);
+        double L = lensOffset.Magnitude;
+        binds &= PastInstant.TurnSpan(spin, t - lo, L, c) < t - lo;
+        double bound = ring.MaxSpeedAbout(track, Kerbin, spin, t - lo, L, c);
+        double none = ring.MaxSpeedAbout(track, Kerbin, spin, 0, L, c);
+        var path = new RingTurned<Tree> { Ring = ring, Track = track, Tree = tree, Frame = Kerbin, Spin = spin, T = t };
+        double sampled = SampledRate(ref path, lensOffset, lo, t, c, 0.5, spin.TopRadiusM, Kerbin, out _);
+        covered &= sampled <= bound;
+        worstRatio = Math.Max(worstRatio, sampled / bound);
+        if (sampled > none) needed = true;
+        mostOver = Math.Max(mostOver, sampled - none);
+        var sight = PastInstant.Craft(ring, pid, t, Kerbin, lensOffset, c, ref tree);
+        latest &= sight.Found && IsLatest(ref path, lensOffset, t, c, 1 + sampled * 1.1 / c, sight.Ut, LatestS);
+    }
+    Check(binds, "climbing through the band after a long wait on the pad, the span is capped at the light time across the band");
+    Check(covered && needed,
+        $"the capped bound covers the path's sampled rate where light has not arrived (at most {worstRatio:P0} of it), "
+            + $"which outruns a bound with no weight's part by {mostOver:F0} m/s");
+    Check(latest, "and the solve draws the latest root at every instant through the climb");
+}
+
+/* ---- the weight's span cap in a frame above the lens's body ---- */
+{
+    /*
+     * A lens on the Mun's leading side, c = 700, the Mun circling Kerbin at
+     * 540 m/s and spinning at 1e-3 rad/s, its band from 100 to 200 km. A
+     * craft hovers in the band on the trailing side, then climbs out at
+     * 1 km/s through the band's top and on out of the Mun's sphere, so the
+     * light time is solved in Kerbin's frame. There the lens's body runs
+     * from the band's old light, which lingers for up to (L + Top) / (c - v)
+     * rather than (L + Top) / c. Mu is 0 so each record bounds its own speed.
+     */
+    const double c = 700, munR = 1.2e7, munV = 540, hover = 350000, climb = 1000, tClimb = 1000;
+    const uint pid = 62;
+    var circle = new MunCircle { R = munR, W = munV / munR };
+    var trailing = new DVec3(0, -1, 0);
+    DVec3 AboutMun(double ut) => trailing * (ut > tClimb ? hover + climb * (ut - tClimb) : hover);
+    DVec3 VelMun(double ut) => ut > tClimb ? trailing * climb : default;
+    double soi = bodies[Mun].SoiRadius;
+    double exitUt = tClimb + (soi - hover) / climb;
+    var spun = (HistoryBody[])bodies.Clone();
+    spun[Mun].Spin = new DVec3(0, 0, 1e-3);
+    spun[Mun].RotThresholdM = 100000;
+    spun[Mun].Mu = 0;
+    spun[Kerbin].Mu = 0;
+    var ring = new LightHistory { SystemDiameterM = 2.4e11 };
+    ring.SetBodies(spun);
+    ring.SetLightSpeed(c);
+    var key = LightHistory.CraftKey(pid);
+    for (double ut = 0; ut <= 5000; ut += 1)
+    {
+        bool inMun = ut < exitUt;
+        circle.TryOffset(Mun, ut, out var munAt);
+        var munVel = circle.Velocity(ut);
+        var s = new HistoryState
+        {
+            Ut = ut, Body = inMun ? Mun : Kerbin, Kind = HistoryKind.Conic, Attitude = DQuat.Identity,
+            Position = inMun ? AboutMun(ut) : munAt + AboutMun(ut), Velocity = inMun ? VelMun(ut) : munVel + VelMun(ut),
+        };
+        ring.Record(key, s, ut == 0 ? HistoryReason.Start : HistoryReason.Departure);
+    }
+    var spin = ring.SpinOf(Mun);
+    var track = ring.Track(key);
+    var lensOffset = new DVec3(0, 200000, 0);
+    double L = lensOffset.Magnitude;
+    double lo = Math.Max(track.StartUt, ring.FloorUt);
+    double vMun = ring.BodySpeedBound(Mun, Kerbin);
+    double oldCap = (L + spin.TopRadiusM) / c, newCap = (L + spin.TopRadiusM) / (c - vMun);
+    bool frames = true, covered = true, outran = false, beyondOld = false, withinNew = true, latest = true;
+    double worstRatio = 0, longest = 0;
+    for (double t = exitUt + 100; t <= exitUt + 1300; t += 100)
+    {
+        circle.TryOffset(Mun, t, out var munAt);
+        var lens = munAt + lensOffset;
+        frames &= ring.TryStateAt(track, t, out var now) && PastInstant.CommonAncestor(ref circle, Mun, now.Body) == Kerbin;
+        double bound = ring.MaxSpeedAbout(track, Kerbin, spin, t - lo, L, c);
+        /* The bound as it was, with the cap over c alone. */
+        double old = 0;
+        foreach (var sp in track.Spheres)
+            old = Math.Max(old, sp.SpeedMs + ring.BodySpeedBound(sp.Body, Kerbin)
+                + PastInstant.TurnSpeedBoundAbout(spin, sp.Body, sp.SpeedMs, t - lo, sp.RadiusM, L, c));
+        var path = new RingTurned<MunCircle> { Ring = ring, Track = track, Tree = circle, Frame = Kerbin, Spin = spin, T = t };
+        double sampled = SampledRate(ref path, lens, lo, t, c, 0.5, spin.TopRadiusM, Mun, out double band);
+        longest = Math.Max(longest, band);
+        beyondOld |= band > oldCap;
+        withinNew &= band <= newCap;
+        covered &= sampled <= bound;
+        worstRatio = Math.Max(worstRatio, sampled / bound);
+        outran |= sampled > old;
+        var status = PastInstant.Solve(ref path, lens, t, c, bound, lo, t, out double tr);
+        latest &= status == PastStatus.Found && IsLatest(ref path, lens, t, c, 1 + sampled * 1.1 / c, tr, LatestS);
+    }
+    Check(frames, "a craft climbed out of the Mun's sphere is solved in Kerbin's frame");
+    Check(beyondOld && withinNew && PastInstant.TurnSpan(spin, double.PositiveInfinity, L, c, vMun) == newCap,
+        $"there the band's light reaches the lens up to {longest:F0} s after it left, past (L + Top) / c = {oldCap:F0} s "
+            + $"and within (L + Top) / (c - v) = {newCap:F0} s");
+    Check(covered && outran,
+        $"the bound with the Mun's speed taken off c covers the path's sampled rate (at most {worstRatio:P0} of it), which the cap over c alone does not");
+    Check(latest, "and the solve in Kerbin's frame draws the latest root");
+    Check(PastInstant.TurnSpan(spin, 5000, L, c, c) == 5000 && PastInstant.TurnSpan(spin, 5000, L, c, 2 * c) == 5000,
+        "a lens's body that can keep up with light leaves the span uncapped");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
@@ -1850,5 +2403,100 @@ struct CrossingFrom : IPastPath
     {
         position = default;
         return ut >= From && Inner.TryAt(ut, out position);
+    }
+}
+
+/* A record's quadratic path from T0, placed from From on. */
+struct Launch : IPastPath
+{
+    public DVec3 P, V, A;
+    public double T0, From;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        double dt = ut - T0;
+        position = P + V * dt + A * (0.5 * dt * dt);
+        return ut >= From;
+    }
+}
+
+/* A path known everywhere. */
+struct Truth : IPastPath
+{
+    public Func<double, DVec3> F;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = F(ut);
+        return true;
+    }
+}
+
+/* A path about `Body` carried round to `T` by PastInstant.Turned, as the rig's KnownPath and the anchors' KinematicPath carry it. */
+struct Turning<TP> : IPastPath where TP : IPastPath
+{
+    public TP Inner;
+    public BodySpin Spin;
+    public int Body;
+    public double T;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        if (!Inner.TryAt(ut, out var p))
+        {
+            position = default;
+            return false;
+        }
+        position = PastInstant.Turned(Spin, Body, p, false, ut, T);
+        return true;
+    }
+}
+
+/* A craft's ring path in `Frame`, turned about the lens's body as PastInstant's own ring path turns it. */
+struct RingTurned<TB> : IPastPath where TB : IBodyTree
+{
+    public LightHistory Ring;
+    public HistoryTrack Track;
+    public TB Tree;
+    public int Frame;
+    public BodySpin Spin;
+    public double T;
+    public HistoryState Last;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = default;
+        if (!Ring.TryStateAt(Track, ut, out var s) || !PastInstant.TryAbout(ref Tree, s.Body, Frame, ut, out var body)) return false;
+        Last = s;
+        position = body + PastInstant.Turned(Spin, s.Body, s.Position, s.Kind == HistoryKind.Surface, ut, T);
+        return true;
+    }
+}
+
+/* Kerbin still about the Sun, the Mun on a circle of radius R about Kerbin at angular rate W. */
+struct MunCircle : IBodyTree
+{
+    public double R, W;
+    public bool TryParent(int body, out int parent)
+    {
+        parent = body == 2 ? 1 : 0;
+        return body == 1 || body == 2;
+    }
+    public bool TryOffset(int body, double ut, out DVec3 offset)
+    {
+        offset = body == 2 ? new DVec3(R * Math.Cos(W * ut), R * Math.Sin(W * ut), 0) : default;
+        return body == 1 || body == 2;
+    }
+    public DVec3 Velocity(double ut) => new DVec3(-R * W * Math.Sin(W * ut), R * W * Math.Cos(W * ut), 0);
+}
+
+/* A source's known place about `Body`, solved as the rig's KnownPath solves it: a live place is never turned. */
+struct Known : IPastPath
+{
+    public Func<double, DVec3> F;
+    public BodySpin Spin;
+    public int Body;
+    public double T;
+    public bool Live;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = PastInstant.KnownTurned(Spin, Body, F(ut), Live, ut, T);
+        return true;
     }
 }

@@ -70,7 +70,7 @@ namespace Kerbcast
             if (_selection == null) return CraftFix.Unknown(0);
             _gate.BeforeRead();
             var fix = CraftFix.Unknown(0);
-            bool located = LocateSubject(ut, out fix.World, out fix.Body);
+            bool located = LocateSubject(ut, out fix.World, out fix.Body, out fix.Live);
             fix.PersistentId = _track.PersistentId;
             fix.Name = _track.Name ?? "";
             fix.State = located ? CraftFixState.Positioned
@@ -96,7 +96,7 @@ namespace Kerbcast
                 motion = BodyMotion.OnOrbit(orbit);
                 return true;
             }
-            if (!onSurface || !LocateSubject(ut, out var world, out var body) || body == null) return false;
+            if (!onSurface || !LocateSubject(ut, out var world, out var body, out _) || body == null) return false;
             motion = BodyMotion.OnSurface(body, new Vector3d(world.X, world.Y, world.Z));
             return true;
         }
@@ -190,10 +190,11 @@ namespace Kerbcast
 
         /* The subject's position, choosing a craft again every RepickSeconds
            while a chosen or default one cannot be placed. */
-        private bool LocateSubject(double ut, out DVec3 world, out CelestialBody body)
+        private bool LocateSubject(double ut, out DVec3 world, out CelestialBody body, out bool live)
         {
             world = default;
             body = null;
+            live = false;
             if (NoDefault())
             {
                 if (_track.PersistentId != 0 || _track.Following) _track.Forget();
@@ -207,10 +208,10 @@ namespace Kerbcast
                 else
                 {
                     Pick();
-                    located = _track.HasPosition && _track.TryLocate(ut, out world, out body);
+                    located = _track.HasPosition && _track.TryLocate(ut, out world, out body, out live);
                 }
             }
-            else located = _track.TryLocate(ut, out world, out body);
+            else located = _track.TryLocate(ut, out world, out body, out live);
             _selection.ResolvedPersistentId = _track.PersistentId;
             return located;
         }

@@ -49,6 +49,66 @@ namespace Kerbcast
     }
 
     /*
+     * The spin of the lens's body, which a craft near that body is solved and
+     * drawn with. Near the body the light-time equation is solved on the
+     * turning body: a craft's past place is carried round with the ground to
+     * now, so a craft over its own ground stays there whatever the light time,
+     * as a landed one does, and its path never outruns light merely because
+     * the ground beneath the lens does. Far out the inertial frame is right,
+     * since the turning frame's own speed grows with the distance. The weight
+     * passes from the one to the other over a band of altitude starting where
+     * KSP itself switches its world frame (the body's inverseRotThresholdAltitude).
+     *
+     * At real light speed the turn is the spin times a light time of distance
+     * over c, so it moves a craft by at most its ground speed over c in angle
+     * as the lens sees it: about 6e-7 rad at Kerbin and a few microradians at
+     * Jool, under a pixel at any but the narrowest field.
+     */
+    internal struct BodySpin
+    {
+        /* The band is never narrower than this fraction of the body's radius. */
+        public const double MinBandFraction = 0.1;
+
+        /* False for no turning: the default, and a body that does not spin. */
+        public bool Turns;
+        public int Body;
+        /* Angular velocity, rad/s, in the axes of the positions it turns. */
+        public DVec3 Rate;
+        public double Radius;
+        /* Fully turning up to this altitude, fully inertial at BandM above it. */
+        public double FromAltitudeM;
+        public double BandM;
+
+        /* The distance from the centre beyond which nothing turns. */
+        public double TopRadiusM => Radius + FromAltitudeM + BandM;
+
+        /*
+         * The band is as wide as the threshold is high, which KSP keeps at
+         * least the atmosphere's depth, and no narrower than MinBandFraction
+         * of the radius, so a body with a low threshold does not turn its
+         * weight steeply. The blend adds a drift of at most 1.5 / BandM times
+         * the craft's climb rate times its light time times the ground speed:
+         * through a 100 km band at 1 km/s climb with a 4 s read-back and
+         * Kerbin's 175 m/s, about 10 m/s, small next to the craft's own speed.
+         * Threshold and band shrink together to end at the sphere of influence
+         * `soiRadius`, so a craft leaving it is no longer turned and its path
+         * does not jump at the crossing.
+         */
+        public static BodySpin Of(int body, DVec3 rate, double radius, double threshold, double soiRadius = double.PositiveInfinity)
+        {
+            bool turns = rate.Magnitude > 0 && radius > 0 && threshold > 0 && !double.IsInfinity(threshold) && !(soiRadius <= radius);
+            double from = threshold, band = Math.Max(threshold, MinBandFraction * radius);
+            if (turns && radius + from + band > soiRadius)
+            {
+                double k = (soiRadius - radius) / (from + band);
+                from *= k;
+                band *= k;
+            }
+            return new BodySpin { Turns = turns, Body = body, Rate = rate, Radius = radius, FromAltitudeM = from, BandM = band };
+        }
+    }
+
+    /*
      * The past instant t_r at which light arriving at a lens at t left a
      * craft: the latest root of t_r + |lens - craft(t_r)| / c = t. Pure, so
      * any camera's picture, and the knowledge side on its own positions, can
@@ -328,6 +388,9 @@ namespace Kerbcast
          * its light has arrived in that frame, the same test every solution
          * passes; otherwise the solution is drawn.
          *
+         * Near the lens's body the craft's path is carried round with the body
+         * to t (Turn), as AboutDrawnBody draws it, and About is that place.
+         *
          * `spreadM` stands for several lenses sharing one solve: each within
          * that many metres of the lens. The light must have arrived at all of
          * them, so the instant is solved as though it arrived spreadM / c
@@ -337,6 +400,7 @@ namespace Kerbcast
         public static PastSight Craft<TB>(LightHistory ring, uint pid, double t, int lensBody, DVec3 lensOffset, double c,
             ref TB tree, double notBefore = double.NegativeInfinity, int heldFrame = -1, double spreadM = 0) where TB : IBodyTree
         {
+            var spin = ring.SpinOf(lensBody);
             /* Zero spread leaves `arrive` exactly t. */
             double arrive = t - spreadM / c;
             var sight = new PastSight { Status = PastStatus.Unseen, Ut = double.NaN, Frame = -1 };
@@ -347,7 +411,7 @@ namespace Kerbcast
                 double hi = Math.Min(track.EndUt, t);
                 var status = PastStatus.Unseen;
                 double tr = double.NaN;
-                var path = new RingPath<TB> { Ring = ring, Track = track, Tree = tree, Frame = -1 };
+                var path = new RingPath<TB> { Ring = ring, Track = track, Tree = tree, Frame = -1, Spin = spin, T = t };
                 DVec3 lens = default;
                 if (hi >= lo && ring.TryStateAt(track, hi, out var latest))
                     status = SolveInFrames(ref path, ref tree, ring, track, lensBody, lensOffset, t, arrive, c, lo, latest.Body, out tr, out lens);
@@ -401,7 +465,9 @@ namespace Kerbcast
                 if (frame < 0 || !TryAbout(ref tree, lensBody, frame, t, out var lensAt)) return PastStatus.Unsolved;
                 path.Frame = frame;
                 lens = lensAt + lensOffset;
-                status = Solve(ref path, lens, arrive, c, ring.MaxSpeedAbout(track, frame), lo, track.EndUt, out tr);
+                /* Spread included: the light must reach a lens up to (t - arrive) c further off. */
+                double lensDistance = lensOffset.Magnitude + (t - arrive) * c;
+                status = Solve(ref path, lens, arrive, c, ring.MaxSpeedAbout(track, frame, path.Spin, t - lo, lensDistance, c), lo, track.EndUt, out tr);
                 if (status != PastStatus.Found || !ring.TryStateAt(track, tr, out var then)) return status;
                 int next = CommonAncestor(ref tree, lensBody, then.Body);
                 if (next == frame) return status;
@@ -472,31 +538,138 @@ namespace Kerbcast
         }
 
         /*
-         * Where to put a craft seen in state `s` about a body drawn as it is
-         * at `t`: its offset at the past instant, kept in the inertial frame
-         * for a craft in flight, carried round with the body's spin for a craft
-         * on the surface, so a landed craft stays on its own ground.
+         * How much of the body's spin carries a craft at `altitude` about the
+         * lens's body: 1 up to the threshold, 0 from the top of the band, and
+         * a smoothstep between, so neither the place nor its rate jumps at
+         * either edge. Steepest at the band's middle, 1.5 / BandM per metre.
          */
-        public static DVec3 AboutDrawnBody(in HistoryState s, double t)
+        public static double TurningWeight(in BodySpin spin, double altitude)
         {
-            if (s.Kind != HistoryKind.Surface) return s.Position;
-            return DQuat.FromRotationVector(s.AngularVelocity * (t - s.Ut)).Rotate(s.Position);
+            if (!spin.Turns || double.IsNaN(altitude)) return 0;
+            double x = (altitude - spin.FromAltitudeM) / spin.BandM;
+            if (x <= 0) return 1;
+            if (x >= 1) return 0;
+            return 1 - x * x * (3 - 2 * x);
         }
 
-        /* The craft's attitude as AboutDrawnBody places it: turned with its body's spin while on the surface. */
-        public static DQuat AttitudeAboutDrawnBody(in HistoryState s, double t)
+        /* The steepest TurningWeight gets, per metre. */
+        public static double TurningSlope(in BodySpin spin) => spin.Turns ? 1.5 / spin.BandM : 0;
+
+        /*
+         * The rotation vector carrying a craft at `about` from body `body`'s
+         * centre at `ut` round with the lens's body to `t`: the spin times its
+         * weight at that altitude times t - ut, or nothing about any other
+         * body. A craft on the surface is carried in full.
+         */
+        public static DVec3 Turn(in BodySpin spin, int body, DVec3 about, bool surface, double ut, double t)
         {
-            if (s.Kind != HistoryKind.Surface) return s.Attitude;
-            return (DQuat.FromRotationVector(s.AngularVelocity * (t - s.Ut)) * s.Attitude).Normalized;
+            if (!spin.Turns || body != spin.Body) return default;
+            double f = surface ? 1 : TurningWeight(spin, about.Magnitude - spin.Radius);
+            return f > 0 ? spin.Rate * (f * (t - ut)) : default;
         }
 
-        /* A craft's past in the ring as a point about the frame body: its state about its body plus that body about the frame, both at one instant. */
+        /* Offset `about` from body `body`'s centre at `ut`, carried round to `t` by Turn: how every solve and every drawing places a craft about the lens's body. */
+        public static DVec3 Turned(in BodySpin spin, int body, DVec3 about, bool surface, double ut, double t)
+        {
+            var turn = Turn(spin, body, about, surface, ut, t);
+            return turn.Magnitude > 0 ? DQuat.FromRotationVector(turn).Rotate(about) : about;
+        }
+
+        /*
+         * A known place about the lens's body as the rig solves and aims at
+         * it: Turned, except for a `live` place, which its source gives as the
+         * craft is now whatever UT is asked (a loaded or landed craft read
+         * from KSP), so the body has already carried it round to now.
+         */
+        public static DVec3 KnownTurned(in BodySpin spin, int body, DVec3 about, bool live, double ut, double t) =>
+            live ? about : Turned(spin, body, about, false, ut, t);
+
+        /*
+         * A bound on the speed the turning adds to a craft's path about the
+         * lens's body over `span` seconds of past, for a craft no faster than
+         * `speed` and no further than `maxRadius` from the centre. The path is
+         * R(f w (t - ut)) x(ut), whose rate has a part f w x from the spin and
+         * a part f' climb w x (t - ut) from the weight changing with altitude;
+         * the second only where the craft can reach the band.
+         */
+        public static double TurnSpeedBound(in BodySpin spin, double speed, double span, double maxRadius)
+        {
+            if (!spin.Turns) return 0;
+            double top = spin.TopRadiusM;
+            double r = double.IsNaN(maxRadius) ? top : Math.Min(maxRadius, top);
+            double w = spin.Rate.Magnitude;
+            double bound = w * r;
+            /* An unbounded span leaves the weight's part out rather than stall the solve: a broken bound costs only which root. */
+            if (!(maxRadius <= spin.Radius + spin.FromAltitudeM) && !double.IsInfinity(span) && !double.IsInfinity(speed))
+                bound += w * r * TurningSlope(spin) * Math.Max(0, speed) * Math.Max(0, span);
+            return bound;
+        }
+
+        /*
+         * The part of `span` the weight's part of TurnSpeedBound must cover,
+         * for a lens `lensDistanceM` from the centre of the lens's body (any
+         * spread of lenses sharing the solve included). A solve relies on its
+         * bound only where light from the path has not yet arrived (g > 0),
+         * where t - ut is under the craft's distance from the lens over c, and
+         * the weight changes only in the band, within TopRadiusM of the centre:
+         * so t - ut is under (lensDistanceM + TopRadiusM) / c wherever that part
+         * counts, however long the track. Without the cap a craft that has
+         * once been in the band gets a bound that grows with its whole past.
+         *
+         * Solved in a frame above the lens's body, that body moves too: by up
+         * to `lensBodySpeed` (its speed bound in the frame) times t - ut, so
+         * the cap is over c less that speed, and there is none when the body
+         * may keep up with its own light.
+         */
+        public static double TurnSpan(in BodySpin spin, double span, double lensDistanceM, double c, double lensBodySpeed = 0)
+        {
+            double closing = c - Math.Max(0, lensBodySpeed);
+            if (!spin.Turns || !(closing > 0) || double.IsNaN(lensDistanceM) || double.IsInfinity(lensDistanceM)) return span;
+            double cap = (Math.Max(0, lensDistanceM) + spin.TopRadiusM) / closing;
+            return double.IsNaN(span) ? cap : Math.Min(span, cap);
+        }
+
+        /* TurnSpeedBound for a craft about body `body`, none about another, over `span` capped by TurnSpan. */
+        public static double TurnSpeedBoundAbout(in BodySpin spin, int body, double speed, double span, double maxRadius,
+            double lensDistanceM, double c, double lensBodySpeed = 0) =>
+            spin.Turns && body == spin.Body
+                ? TurnSpeedBound(spin, speed, TurnSpan(spin, span, lensDistanceM, c, lensBodySpeed), maxRadius)
+                : 0;
+
+        /*
+         * Where to put a craft seen in state `s` about a body drawn as it is
+         * at `t`: its offset at the past instant, carried round with the body's
+         * spin for a craft on the surface, so a landed craft stays on its own
+         * ground, and about the lens's body by Turn as the light time is solved.
+         * Elsewhere a craft in flight keeps its inertial place.
+         */
+        public static DVec3 AboutDrawnBody(in HistoryState s, double t, in BodySpin spin = default)
+        {
+            if (s.Kind == HistoryKind.Surface) return DQuat.FromRotationVector(s.AngularVelocity * (t - s.Ut)).Rotate(s.Position);
+            return Turned(spin, s.Body, s.Position, false, s.Ut, t);
+        }
+
+        /* The craft's attitude as AboutDrawnBody places it, turned by the same rotation. */
+        public static DQuat AttitudeAboutDrawnBody(in HistoryState s, double t, in BodySpin spin = default)
+        {
+            var turn = s.Kind == HistoryKind.Surface ? s.AngularVelocity * (t - s.Ut) : Turn(spin, s.Body, s.Position, false, s.Ut, t);
+            if (turn.Magnitude == 0) return s.Attitude;
+            return (DQuat.FromRotationVector(turn) * s.Attitude).Normalized;
+        }
+
+        /*
+         * A craft's past in the ring as a point about the frame body: its state
+         * about its body plus that body about the frame, both at one instant,
+         * the state carried round to `T` by Turn about the lens's body.
+         */
         private struct RingPath<TB> : IPastPath where TB : IBodyTree
         {
             public LightHistory Ring;
             public HistoryTrack Track;
             public TB Tree;
             public int Frame;
+            public BodySpin Spin;
+            public double T;
             public HistoryState Last;
 
             public bool TryAt(double ut, out DVec3 position)
@@ -505,7 +678,7 @@ namespace Kerbcast
                 if (!Ring.TryStateAt(Track, ut, out var s)) return false;
                 if (!TryAbout(ref Tree, s.Body, Frame, ut, out var body)) return false;
                 Last = s;
-                position = body + s.Position;
+                position = body + Turned(Spin, s.Body, s.Position, s.Kind == HistoryKind.Surface, ut, T);
                 return true;
             }
         }

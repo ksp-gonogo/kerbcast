@@ -25,6 +25,8 @@ namespace Kerbcast
            for a record out of date) and optional words to show. */
         public string RefusalCode;
         public string RefusalText;
+        /* The place is the craft's as it is now, whatever UT was asked: a loaded or landed craft read from KSP. */
+        public bool Live;
 
         public bool Positioned => State == CraftFixState.Positioned;
 

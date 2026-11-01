@@ -612,6 +612,7 @@ namespace Kerbcast
                 {
                     _aimedBody = aimBody;
                     _aimedAbout = KinematicsWorld.Now().Zup.FromWorld(aim - ToD(aimBody.position));
+                    _aimedAt = ut;
                     var w = new Vector3d(aim.X, aim.Y, aim.Z);
                     _heldBody = aimBody;
                     _heldLat = aimBody.GetLatitude(w);
@@ -667,6 +668,8 @@ namespace Kerbcast
         private CelestialBody _handoverBody;
         private DVec3 _handoverAbout;
         private double _handoverUt;
+        /* The render UTs the aim and the handover's place were carried round to with the lens's body (PastInstant.Turn). */
+        private double _aimedAt, _handoverAt;
 
         /*
          * Eases the aim across a world model publish for a craft aim on the
@@ -695,7 +698,7 @@ namespace Kerbcast
                     handed = _handover.Handover(_handoverAbout, _aimedAbout, _lastDistance, widest);
                 else
                 {
-                    var then = _known.SubjectAlong(_handoverUt);
+                    var then = Turned(_known.SubjectAlong(_handoverUt), _lensSpin, _handoverUt, _handoverAt);
                     if (then.Positioned && then.Body == _aimedBody)
                     {
                         var after = KinematicsWorld.Now().Zup.FromWorld(then.World - ToD(_aimedBody.position));
@@ -708,6 +711,7 @@ namespace Kerbcast
             _handover.Step(_frames.Clip(dt), AimHandover.TauS, AimSlew.SnapAfterS, floor);
             _handoverBody = craft ? _aimedBody : null;
             _handoverAbout = _aimedAbout;
+            _handoverAt = _aimedAt;
             _handoverUt = _subjectPlacedUt;
             return handed;
         }
@@ -869,6 +873,11 @@ namespace Kerbcast
          * the subject stays the same, except from a record's start to the root
          * when a republished record starts earlier: that start's light never
          * arrived, so nothing holds it.
+         *
+         * Near the lens's body the subject's path is carried round with the
+         * body to render UT and the subject placed there (PastInstant.Turn),
+         * as the picture draws it, so a craft lifting off stays over its own
+         * ground and the aim stays on the drawn craft.
          */
         private CraftFix KnownSubject(double ut, DVec3 station, CelestialBody lensBody)
         {
@@ -889,6 +898,7 @@ namespace Kerbcast
             }
             var tree = KeplerBodyTree.World;
             int lensIndex = lensBody.flightGlobalsIndex;
+            _lensSpin = SpinOf(lensBody);
             bool moves = _known.SubjectMotion(ut, out var motion, out double validFrom, out _) && motion.Body != null;
             if (moves && motion.Kind == BodyMotionKind.Surface && motion.Body == lensBody && !double.IsInfinity(validFrom))
             {
@@ -913,12 +923,22 @@ namespace Kerbcast
             {
                 var frameBody = tree.Body(frame);
                 if (frameBody == null) break;
-                var path = new KnownPath { Source = _known, Tree = tree, Frame = frame, Along = true };
+                var path = new KnownPath { Source = _known, Tree = tree, Frame = frame, Along = true, Spin = _lensSpin, T = ut };
                 var windowed = path;
                 windowed.Along = false;
                 /* Read back before the record's start, the root lies no earlier than this while the craft is under half the light speed, and no read goes past the cap. */
                 double reach = Math.Max(PastInstant.ReadBackFloor(validFrom), Math.Min(validFrom, ut - 2.0 * (station - now.World).Magnitude / c.Value));
-                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, double.IsInfinity(reach) ? validFrom : reach, ut) : 0;
+                double from = double.IsInfinity(reach) ? validFrom : reach;
+                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, from, ut) : 0;
+                /* A live place is never turned, so adds nothing to the bound. */
+                if (moves && motion.Body == lensBody && !now.Live)
+                {
+                    double span = ut - from;
+                    double lensDistance = (station - ToD(lensBody.position)).Magnitude;
+                    bound += PastInstant.TurnSpeedBoundAbout(_lensSpin, lensIndex, bound, span,
+                        (now.World - ToD(lensBody.position)).Magnitude + bound * span, lensDistance, c.Value,
+                        CommandCameraForecast.BodySpeedBound(lensBody, frameBody));
+                }
                 var lens = station - ToD(frameBody.position);
                 if (PastInstant.SolveAlong(ref path, ref windowed, lens, ut, c.Value, bound, validFrom, ut, out double tr) != PastStatus.Found)
                 {
@@ -977,11 +997,30 @@ namespace Kerbcast
             _knownHold.Shown(ut, tr, 0, c, lensIndex, path.Frame);
             _subjectUt = tr;
             _subjectPlacedUt = tr;
-            return _known.SubjectAlong(tr);
+            return Turned(_known.SubjectAlong(tr), path.Spin, tr, ut);
         }
 
         private InstantHold _knownHold;
         private uint _knownHoldPid;
+        private BodySpin _lensSpin;
+
+        /* Body `b`'s spin as PastInstant.Turn carries a craft about it, in world axes, its band ending at its sphere of influence as the ring's does. */
+        internal static BodySpin SpinOf(CelestialBody b)
+        {
+            if (b == null) return default;
+            bool root = b.referenceBody == null || b.referenceBody == b;
+            double soi = root || double.IsNaN(b.sphereOfInfluence) ? double.PositiveInfinity : b.sphereOfInfluence;
+            return BodySpin.Of(b.flightGlobalsIndex, CommandCameraOcclusion.Spin(b), b.Radius, b.inverseRotThresholdAltitude, soi);
+        }
+
+        /* A fix at `ut` placed as KnownPath solves it at `t`. */
+        private static CraftFix Turned(CraftFix fix, in BodySpin spin, double ut, double t)
+        {
+            if (!fix.Positioned || fix.Body == null) return fix;
+            var centre = ToD(fix.Body.position);
+            fix.World = centre + PastInstant.KnownTurned(spin, fix.Body.flightGlobalsIndex, fix.World - centre, fix.Live, ut, t);
+            return fix;
+        }
 
         /* The subject's known positions about the frame body as a path back in
            time. A fix's World is its body's present position plus its offset at
@@ -993,14 +1032,18 @@ namespace Kerbcast
             public int Frame;
             /* Read along the subject's motion before the start its source vouches from. */
             public bool Along;
+            /* About the lens's body the path is carried round with it to render UT `T`, as the picture's is. */
+            public BodySpin Spin;
+            public double T;
 
             public bool TryAt(double ut, out DVec3 position)
             {
                 position = default;
                 var fix = Along ? Source.SubjectAlong(ut) : Source.Subject(ut);
                 if (!fix.Positioned || fix.Body == null) return false;
-                if (!PastInstant.TryAbout(ref Tree, fix.Body.flightGlobalsIndex, Frame, ut, out var body)) return false;
-                position = body + (fix.World - ToD(fix.Body.position));
+                int index = fix.Body.flightGlobalsIndex;
+                if (!PastInstant.TryAbout(ref Tree, index, Frame, ut, out var body)) return false;
+                position = body + PastInstant.KnownTurned(Spin, index, fix.World - ToD(fix.Body.position), fix.Live, ut, T);
                 return true;
             }
         }

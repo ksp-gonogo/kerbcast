@@ -220,6 +220,7 @@ namespace Kerbcast
 
             /* Each body is stamped a tick back. */
             ObserveBodies(ut, deRot);
+            TakeSpins(deRot);
 
             var vessels = FlightGlobals.Vessels;
             for (int i = 0; i < vessels.Count; i++)
@@ -340,6 +341,17 @@ namespace Kerbcast
             if (added && v.packed && known) _packedDepartures++;
             var track = History.Track(key);
             if (track != null && track.Compositions.Count == 0) TakeComposition(v, ut);
+        }
+
+        /* Each body's spin in the ring's axes, read every tick since the world's axes turn while inverse rotation is on. */
+        private void TakeSpins(DQuat deRot)
+        {
+            var list = FlightGlobals.Bodies;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var b = list[i];
+                if (b != null) History.SetSpin(b.flightGlobalsIndex, b.rotates ? deRot.Rotate(D(b.angularVelocity)) : default);
+            }
         }
 
         /* The centre of mass about the root part of a craft not in the scene, as its save holds it. */
@@ -495,6 +507,7 @@ namespace Kerbcast
                     Parent = root ? -1 : b.referenceBody.flightGlobalsIndex,
                     Mu = b.gravParameter,
                     Radius = b.Radius,
+                    RotThresholdM = b.inverseRotThresholdAltitude,
                     SoiRadius = root || double.IsNaN(b.sphereOfInfluence) ? double.PositiveInfinity : b.sphereOfInfluence,
                 };
                 if (!root)

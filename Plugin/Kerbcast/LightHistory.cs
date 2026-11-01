@@ -835,6 +835,36 @@ namespace Kerbcast
             return best;
         }
 
+        /*
+         * MaxSpeedAbout for the path the light time is solved on, turned about
+         * the lens's body by `spin` over `span` seconds of past, for a lens
+         * `lensDistanceM` from that body's centre (PastInstant.TurnSpan). Only
+         * the lens's body's sphere turns, so its body bound is the lens body's
+         * speed in the frame that TurnSpan takes.
+         */
+        public double MaxSpeedAbout(HistoryTrack t, int frame, in BodySpin spin, double span, double lensDistanceM, double c)
+        {
+            double best = 0;
+            foreach (var s in t.Spheres)
+            {
+                double body = BodySpeedBound(s.Body, frame);
+                double v = s.SpeedMs + body
+                    + PastInstant.TurnSpeedBoundAbout(spin, s.Body, s.SpeedMs, span, s.RadiusM, lensDistanceM, c, body);
+                best = Math.Max(best, v);
+            }
+            return best;
+        }
+
+        /* Body `index`'s spin as the light time turns a craft about it, or none. */
+        public BodySpin SpinOf(int index) =>
+            TryBody(index, out var b) ? BodySpin.Of(index, b.Spin, b.Radius, b.RotThresholdM, b.SoiRadius) : default;
+
+        /* Sets body `index`'s angular velocity in the ring's axes. */
+        public void SetSpin(int index, DVec3 rate)
+        {
+            if (index >= 0 && index < _bodies.Length && _bodies[index].Index == index) _bodies[index].Spin = rate;
+        }
+
         /* A body's speed bound relative to the root, through its parents. A
            body's own track, once it has one, widens its Kepler bound. */
         public double BodySpeedBound(int index) => BodySpeedBound(index, -1);

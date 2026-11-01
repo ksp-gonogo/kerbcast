@@ -159,7 +159,8 @@ namespace Kerbcast
 
     /* What the ring needs to know of a body. MaxOrbitalSpeed bounds its speed
        about its parent; zero for the root. PeriapsisM is the nearest its orbit
-       comes to its parent, zero where that is not known. */
+       comes to its parent, zero where that is not known. Spin is zero where it
+       is not known, which turns nothing. */
     internal struct HistoryBody
     {
         public int Index;
@@ -169,6 +170,9 @@ namespace Kerbcast
         public double SoiRadius;
         public double MaxOrbitalSpeed;
         public double PeriapsisM;
+        /* Angular velocity in the ring's axes, and the altitude below which KSP turns its world with the body. */
+        public DVec3 Spin;
+        public double RotThresholdM;
     }
 
     internal static class LightHistoryMath

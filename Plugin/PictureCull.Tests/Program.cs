@@ -237,6 +237,120 @@ var pids = new uint[] { 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
     Check(skipped > tracks / 2, $"at 3e4 m/s, below Kerbin's own orbital speed plus twice it, looking away still skips most craft ({skipped} of {tracks})");
 }
 
+/* ---- a spun Kerbin: a craft climbing through the band, and one orbiting in it ---- */
+{
+    /*
+     * Kerbin turns and craft about it are solved and drawn turned with it
+     * below the band (70 to 140 km). Craft 50 lifts off beside the lens and
+     * climbs through the band; craft 51 has orbited at 100 km, inside it,
+     * since long before. No craft the cull skips may be drawn, and at 3e5 m/s
+     * looking away the orbiter is still skipped: its weight's span is the
+     * light time across the band, not the ring's horizon.
+     */
+    const double radius = 600000, accel = 20, tL = 0, threshold = 70000;
+    double w = 2 * Math.PI / 21549.425;
+    var rate = new DVec3(0, 0, w);
+    DVec3 Rot(DVec3 v, double a) => new DVec3(v.X * Math.Cos(a) - v.Y * Math.Sin(a), v.X * Math.Sin(a) + v.Y * Math.Cos(a), v.Z);
+    double theta = 3000 / radius;
+    double H(double ut) => ut > tL ? 0.5 * accel * (ut - tL) * (ut - tL) : 0;
+    DVec3 Climb(double ut) => Rot(new DVec3((radius + H(ut)) * Math.Cos(theta), (radius + H(ut)) * Math.Sin(theta), 0), w * ut);
+    const double orbit = 700000;
+    double vo = Math.Sqrt(MuKerbin / orbit);
+    var lensB = new DVec3(radius, 0, 0);
+    var spun = (HistoryBody[])bodies.Clone();
+    spun[Kerbin].Spin = rate;
+    spun[Kerbin].RotThresholdM = threshold;
+
+    LightHistory SpunRing(double c, double until)
+    {
+        var h = new LightHistory { SystemDiameterM = 2.4e11 };
+        h.SetBodies(spun);
+        h.SetLightSpeed(c);
+        h.Record(LightHistory.CraftKey(51), Conic(-86400, Kerbin, new DVec3(0, orbit, 0), new DVec3(-vo, 0, 0)), HistoryReason.Start);
+        h.SetComposition(51, -86400, Parts(8), 0, 0, 0);
+        var key = LightHistory.CraftKey(50);
+        for (double ut = -100; ut <= until; ut += 0.5)
+        {
+            var st = new HistoryState { Ut = ut, Body = Kerbin, Attitude = DQuat.Identity, Position = Climb(ut) };
+            if (ut <= tL)
+            {
+                st.Kind = HistoryKind.Surface;
+                st.AngularVelocity = rate;
+                st.Velocity = DVec3.Cross(rate, st.Position);
+            }
+            else
+            {
+                st.Kind = HistoryKind.Conic;
+                st.Velocity = (Climb(ut + 1e-4) - Climb(ut - 1e-4)) * (1 / 2e-4);
+            }
+            h.Record(key, st, ut == -100 ? HistoryReason.Start : HistoryReason.Departure);
+            if (ut == -100) h.SetComposition(50, ut, Parts(10), 0, 0, 0);
+        }
+        return h;
+    }
+
+    foreach (double c in new[] { 3e3, 3e5 })
+    {
+        int leaks = 0, skips = 0, checks = 0, seen = 0;
+        for (double t = 5; t <= 200; t += 13.7)
+        {
+            var h = SpunRing(c, t);
+            var spin = h.SpinOf(Kerbin);
+            var at = BodiesAt(t);
+            var lensOffset = Rot(lensB, w * t);
+            var eye = at[Kerbin] + lensOffset;
+            var views = new List<CullView>();
+            var drawn = new Dictionary<uint, (DVec3 World, double Size)>();
+            foreach (uint pid in new uint[] { 50, 51 })
+            {
+                var tr = tree;
+                var sight = PastInstant.Craft(h, pid, t, Kerbin, lensOffset, c, ref tr);
+                if (!sight.Found) continue;
+                var world = at[sight.State.Body] + PastInstant.AboutDrawnBody(sight.State, t, spin);
+                var comp = h.CompositionAt(sight.Track, sight.Ut);
+                drawn[pid] = (world, comp != null && comp.SizeM > 0 ? comp.SizeM : 2.0);
+                foreach (double fov in fovs)
+                {
+                    var forward = ((world - eye).Normalized + RandomUnit() * (rng.NextDouble() * fov * 0.004)).Normalized;
+                    var up = Math.Abs(forward.Z) < 0.9 ? new DVec3(0, 0, 1) : new DVec3(1, 0, 0);
+                    views.Add(CullView.Of(eye, forward, up, fov, 16.0 / 9.0, 1080));
+                }
+            }
+            foreach (var view in views)
+                foreach (var track in h.Tracks)
+                {
+                    if (track.IsBody || !drawn.TryGetValue(track.Pid, out var d)) continue;
+                    checks++;
+                    bool skip = PictureCull.Skip(h, track, t, view, DQuat.Identity, at, c, Kerbin);
+                    if (skip) skips++;
+                    bool visible = !PictureCull.OutOfView(view, d.World, d.Size)
+                        && PictureCull.RadiusPx(d.Size, (d.World - eye).Magnitude, view.RadPerPxToward(d.World - eye)) >= PictureCull.CutoffPx;
+                    if (visible) seen++;
+                    if (skip && visible) leaks++;
+                }
+        }
+        Check(leaks == 0 && seen > 50, $"c={c}: with Kerbin turning, no craft the cull skipped would have been drawn ({leaks} of {seen} seen, {skips} of {checks} skipped)");
+    }
+
+    {
+        const double c = 3e5, t = 100;
+        var h = SpunRing(c, t);
+        var spin = h.SpinOf(Kerbin);
+        var at = BodiesAt(t);
+        var eye = at[Kerbin] + Rot(lensB, w * t);
+        var away = CullView.Of(eye, new DVec3(0, 0, 1), new DVec3(1, 0, 0), 0.01, 16.0 / 9.0, 1080);
+        var orbiter = h.Track(LightHistory.CraftKey(51));
+        double whole = h.MaxSpeedAbout(orbiter, Kerbin, spin, h.HorizonS, double.NaN, c);
+        Check(whole >= PictureCull.NoCullFraction * c && PictureCull.Skip(h, orbiter, t, away, DQuat.Identity, at, c, Kerbin),
+            $"at 3e5 m/s an orbiter in the band is still culled looking away, though over the whole horizon its bound would be {whole:E1} m/s");
+        /* Lenses sharing the solve up to a horizon's light time further off can need the whole horizon's bound, which no cull trusts. */
+        double far = c * h.HorizonS;
+        Check(PictureCull.Skip(h, orbiter, t, away, DQuat.Identity, at, c, Kerbin, 1000)
+            && !PictureCull.Skip(h, orbiter, t, away, DQuat.Identity, at, c, Kerbin, far),
+            "a spread of lenses a kilometre wide still culls it, one spread a horizon's light time wide does not");
+    }
+}
+
 /* ---- the pieces ---- */
 {
     Check(PictureCull.LightTimeBound(3e5, 3e5, 0, 100) == 1, "light time bound at rest is D / c");

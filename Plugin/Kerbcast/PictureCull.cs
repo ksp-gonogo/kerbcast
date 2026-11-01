@@ -127,10 +127,12 @@ namespace Kerbcast
          * Whether track `t` can be skipped by `view` at render UT `now`.
          * `bodies` holds each body's world position as the scene draws it now
          * (NaN where unknown, which keeps the craft), `toWorld` turns the
-         * ring's frame into the world's, and `c` is the light speed.
+         * ring's frame into the world's, and `c` is the light speed. The
+         * craft's light time is solved from a point within `spreadM` of the
+         * eye, for lenses up to `spreadM` further off.
          */
         public static bool Skip(LightHistory ring, HistoryTrack t, double now, in CullView view, DQuat toWorld, DVec3[] bodies, double c,
-            int lensBody)
+            int lensBody, double spreadM = 0)
         {
             if (t == null || t.IsBody || !t.HasEntries) return false;
             double size = t.MaxSizeM > 0 ? t.MaxSizeM : UnknownSizeM;
@@ -142,8 +144,17 @@ namespace Kerbcast
             /* A body's motion counts about the same frame: the scene keeps the lens's frame still. */
             double bodyBound = 0;
             foreach (var s in t.Spheres) bodyBound = Math.Max(bodyBound, ring.BodySpeedBound(s.Body, frame));
-            double lightSpeed = ring.MaxSpeedAbout(t, frame);
+            /* About the lens's body the craft is solved and drawn carried round with it. */
+            var spin = ring.SpinOf(lensBody);
+            double horizon = ring.HorizonS;
+            /* NaN where the lens's body is not placed, which leaves the span the whole horizon. */
+            double lensDistance = TryBody(bodies, lensBody, out var lensCentre) ? (view.Eye - lensCentre).Magnitude + spreadM : double.NaN;
+            double lightSpeed = ring.MaxSpeedAbout(t, frame, spin, horizon, lensDistance, c);
             if (lightSpeed >= NoCullFraction * c) return false;
+            double turn = 0;
+            foreach (var s in t.Spheres)
+                turn = Math.Max(turn, PastInstant.TurnSpeedBoundAbout(spin, s.Body, s.SpeedMs, horizon, s.RadiusM, lensDistance, c,
+                    ring.BodySpeedBound(s.Body, frame)));
             /*
              * How fast the drawn craft can stray from where it is placed now.
              * About one body, by its own speed about that body and the body's
@@ -153,11 +164,10 @@ namespace Kerbcast
              * bodies' motion count.
              */
             double drift = t.Spheres.Count == 1
-                ? t.Spheres[0].SpeedMs + bodyBound
+                ? t.Spheres[0].SpeedMs + bodyBound + turn
                 : lightSpeed + 2 * bodyBound;
-            double horizon = ring.HorizonS;
             if (Tier1(ring, t, view, bodies, c, lightSpeed, frame, horizon, size)) return true;
-            return Tier2(ring, t, now, view, toWorld, bodies, c, lightSpeed, drift, horizon, size);
+            return Tier2(ring, t, now, view, toWorld, bodies, c, lightSpeed, drift, horizon, size, spin);
         }
 
         /* The nearest body both chains of parents share; -1 when they share none. */
@@ -195,11 +205,11 @@ namespace Kerbcast
         }
 
         private static bool Tier2(LightHistory ring, HistoryTrack t, double now, in CullView view, DQuat toWorld, DVec3[] bodies,
-            double c, double lightSpeed, double drift, double horizon, double size)
+            double c, double lightSpeed, double drift, double horizon, double size, in BodySpin spin)
         {
             double at = Math.Min(now, t.EndUt);
             if (!ring.TryStateAt(t, at, out var st) || !TryBody(bodies, st.Body, out var b)) return false;
-            var anchor = b + toWorld.Rotate(PastInstant.AboutDrawnBody(st, now));
+            var anchor = b + toWorld.Rotate(PastInstant.AboutDrawnBody(st, now, spin));
             double age = Math.Max(0, now - at);
             double d = (anchor - view.Eye).Magnitude;
             double lt = LightTimeBound(d + drift * age, c, lightSpeed, horizon);

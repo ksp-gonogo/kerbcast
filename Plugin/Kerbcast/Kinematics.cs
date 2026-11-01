@@ -152,6 +152,25 @@ namespace Kerbcast
         }
 
         /*
+         * The nearest and furthest the conic comes to its body's centre:
+         * periapsis, and apoapsis or infinity for an open one. False for an
+         * accelerated path, whose reach is not kept.
+         */
+        public bool TryRadii(out double lowest, out double highest)
+        {
+            lowest = 0;
+            highest = double.PositiveInfinity;
+            if (Accelerated || !(Mu > 0)) return false;
+            double v2 = DVec3.Dot(V0, V0), r0 = R0.Magnitude;
+            var h = DVec3.Cross(R0, V0);
+            double p = DVec3.Dot(h, h) / Mu;
+            double e = (R0 * (v2 / Mu - 1.0 / r0) - V0 * (DVec3.Dot(R0, V0) / Mu)).Magnitude;
+            lowest = p / (1.0 + e);
+            if (e < 1.0) highest = p / (1.0 - e);
+            return Kinematics.Finite(lowest) && !double.IsNaN(highest);
+        }
+
+        /*
          * The fastest the path goes between the two UTs: the conic's periapsis
          * speed, or, accelerated, the faster end, since |v0 + a d| has no
          * interior maximum. A NaN end gives the whole path's bound.

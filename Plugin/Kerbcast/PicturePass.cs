@@ -351,6 +351,8 @@ namespace Kerbcast
             var r = Planetarium.Rotation;
             var toWorld = new DQuat(r.x, r.y, r.z, r.w);
             double now = Planetarium.GetUniversalTime();
+            /* The eye is lens.Spread from the solve point, and the solve covers lenses up to its own spread from that point. */
+            double spread = lens.Spread + Math.Max(lens.Spread, s_lenses.SpreadOf(lens.Key));
             int skipped = 0;
             _walked.Clear();
             for (int i = 0; i < into.Count; i++) _walked.Add(into[i]);
@@ -358,7 +360,7 @@ namespace Kerbcast
             {
                 if (t.IsBody || t.Pid == 0 || rigDraws.Draws(t.Pid) || hider.SceneDraws(t.Pid)) continue;
                 if (_walked.Contains(t.Pid)) continue;
-                if (PictureCull.Skip(ring, t, now, view, toWorld, _bodies, c.Value, lensBody))
+                if (PictureCull.Skip(ring, t, now, view, toWorld, _bodies, c.Value, lensBody, spread))
                 {
                     skipped++;
                     continue;
@@ -578,7 +580,8 @@ namespace Kerbcast
                 /* Against a body drawn at its own past instant, or left out of the picture, the craft is at its own past
                    position and attitude in the frame both were solved in, whose centre is the lens's body or above it and
                    so drawn where it is.
-                   Against a body drawn where stock has it, it sits on that body as drawn, carried round with its spin. */
+                   Against a body drawn where stock has it, it sits on that body as drawn, carried round with its spin, and in flight
+                   about the lens's body turned as its light time was solved (PastInstant.Turn). */
                 var plan = BodiesFor(lens, c.Value);
                 int frame = sight.Frame;
                 DQuat q;
@@ -589,8 +592,9 @@ namespace Kerbcast
                 }
                 else
                 {
-                    seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, lens.Ut));
-                    q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, lens.Ut)).Normalized;
+                    var spin = ring.SpinOf(lens.Body.flightGlobalsIndex);
+                    seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, lens.Ut, spin));
+                    q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, lens.Ut, spin)).Normalized;
                 }
                 seen.Rotation = new Quaternion((float)q.X, (float)q.Y, (float)q.Z, (float)q.W);
                 seen.Parts = sight.Parts;

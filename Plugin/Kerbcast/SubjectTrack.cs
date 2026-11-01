@@ -172,10 +172,14 @@ namespace Kerbcast
         /* The craft at `ut`: the active craft live, a chosen craft in physics
            range live, otherwise from its conic or surface coordinates. False
            with nothing adopted. */
-        public bool TryLocate(double ut, out DVec3 world, out CelestialBody body)
+        public bool TryLocate(double ut, out DVec3 world, out CelestialBody body) => TryLocate(ut, out world, out body, out _);
+
+        /* As TryLocate; `live` says the place is the craft's now, whatever `ut` asked: every case but an unloaded craft on its conic. */
+        public bool TryLocate(double ut, out DVec3 world, out CelestialBody body, out bool live)
         {
             world = default;
             body = null;
+            live = true;
             if (_following)
             {
                 var v = FlightGlobals.fetch != null ? FlightGlobals.ActiveVessel : null;
@@ -209,6 +213,7 @@ namespace Kerbcast
             {
                 body = _orbit.referenceBody;
                 world = ToD(_orbit.getPositionAtUT(ut));
+                live = false;
             }
             return body != null;
         }

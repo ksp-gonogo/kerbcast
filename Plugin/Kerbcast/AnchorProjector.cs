@@ -351,7 +351,10 @@ namespace Kerbcast
          * Otherwise at the render UT. Placed as the picture draws a craft:
          * against a body drawn at its past instant, or left out, at its own
          * past place in the solve's frame; otherwise on the body as drawn.
-         * Caller-supplied knowledge, so nothing about any craft is read.
+         * About the lens's body its path is carried round with the body to the
+         * render UT (PastInstant.Turn), as a craft's is, so an anchor on a craft
+         * stays on the drawn craft. Caller-supplied knowledge, so nothing about
+         * any craft is read.
          */
         private static bool TryKinematic(AnchorSpec a, DVec3 eye, PicturePass picture, out DVec3 world)
         {
@@ -377,6 +380,7 @@ namespace Kerbcast
             double ut = Planetarium.GetUniversalTime();
             double at = ut;
             double? c = LightTime.LightSpeed;
+            var spin = default(BodySpin);
             if (c.HasValue && AnchorRules.PlacedAtLightInstant(a.Motion))
             {
                 var lensBody = FlightGlobals.getMainBody(new Vector3d(eye.X, eye.Y, eye.Z));
@@ -385,10 +389,20 @@ namespace Kerbcast
                 int frame = PastInstant.CommonAncestor(ref tree, lensBody.flightGlobalsIndex, body.flightGlobalsIndex);
                 var frameBody = tree.Body(frame);
                 if (frameBody == null) return false;
+                spin = CommandCameraRig.SpinOf(lensBody);
                 var motion = BodyMotion.OnPath(body, a.Path, zup);
-                var path = new KinematicPath { Spec = a, Body = kb, Zup = zup, Tree = tree, BodyIndex = body.flightGlobalsIndex, Frame = frame };
-                if (PastInstant.Solve(ref path, eye - ToD(frameBody.position), ut, c.Value,
-                        CommandCameraForecast.SpeedBound(motion, frameBody), double.NegativeInfinity, ut, out at) != PastStatus.Found)
+                double bound = CommandCameraForecast.SpeedBound(motion, frameBody);
+                /* A conic that stays above the band never turns; one that stays below it has no weight's part. */
+                bool radii = a.Path.TryRadii(out double lowest, out double highest);
+                if (!(radii && spin.Turns && lowest >= spin.TopRadiusM))
+                    bound += PastInstant.TurnSpeedBoundAbout(spin, body.flightGlobalsIndex, bound, double.PositiveInfinity,
+                        radii ? highest : double.NaN, (eye - ToD(lensBody.position)).Magnitude, c.Value);
+                var path = new KinematicPath
+                {
+                    Spec = a, Body = kb, Zup = zup, Tree = tree, BodyIndex = body.flightGlobalsIndex, Frame = frame, Spin = spin, T = ut,
+                };
+                if (PastInstant.Solve(ref path, eye - ToD(frameBody.position), ut, c.Value, bound, double.NegativeInfinity, ut, out at)
+                        != PastStatus.Found)
                     return false;
                 if (picture.HidesBody(body) || picture.TryDrawnBody(body, out _, out _))
                 {
@@ -399,7 +413,8 @@ namespace Kerbcast
             }
             else if (c.HasValue && picture.HidesBody(body)) return false;
             if (!KinematicAt(a, kb, at, out var rel)) return false;
-            world = OnDrawnBody(picture, body, ToD(body.position) + zup.ToWorld(rel));
+            var offset = PastInstant.Turned(spin, body.flightGlobalsIndex, zup.ToWorld(rel), false, at, ut);
+            world = OnDrawnBody(picture, body, ToD(body.position) + offset);
             return true;
         }
 
@@ -430,13 +445,16 @@ namespace Kerbcast
             public KeplerBodyTree Tree;
             public int BodyIndex;
             public int Frame;
+            /* About the lens's body the path is carried round with it to render UT `T`, as a craft's is. */
+            public BodySpin Spin;
+            public double T;
 
             public bool TryAt(double ut, out DVec3 position)
             {
                 position = default;
                 if (!KinematicAt(Spec, Body, ut, out var rel)) return false;
                 if (!PastInstant.TryAbout(ref Tree, BodyIndex, Frame, ut, out var centre)) return false;
-                position = centre + Zup.ToWorld(rel);
+                position = centre + PastInstant.Turned(Spin, BodyIndex, Zup.ToWorld(rel), false, ut, T);
                 return true;
             }
         }

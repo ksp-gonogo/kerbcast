@@ -269,6 +269,9 @@ namespace Kerbcast
 
         public void Clear() => _lenses.Clear();
 
+        /* The spread of lens `key`'s shared solves as last covered, without adding the lens; 0 for a lens not yet seen. */
+        public double SpreadOf(long key) => _lenses.TryGetValue(key, out var lens) ? lens.SpreadM : 0;
+
         /* The lens craft took another id (it docked into another craft): its sights and holds go with it, unless that craft has its own. */
         public void Rekey(long from, long to)
         {
