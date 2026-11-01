@@ -401,6 +401,17 @@ namespace Kerbcast
     /* Unity-free maths for the command camera: where the station
        is, where it looks, how wide it zooms, which layers carry the craft and
        whether a body is in the way. Compiled verbatim by CommandCameraMath.Tests. */
+    /* How an aim on truth with a light speed places its subject (CommandCameraMath.TruthAimPlaceFor). */
+    public enum TruthAimPlace
+    {
+        /* As the fix source gives it. */
+        Source,
+        /* Where and when the picture draws the craft. */
+        Drawn,
+        /* Not at all: none of the craft's light is drawn. */
+        NoFix,
+    }
+
     public static class CommandCameraMath
     {
         private const double Deg2Rad = Math.PI / 180.0;
@@ -653,6 +664,21 @@ namespace Kerbcast
             double alpha = 1.0 - Math.Exp(-dt / tau);
             return current + (target - current) * alpha;
         }
+
+        /*
+         * Where an aim on truth with a light speed places its subject, from
+         * how the picture draws that same craft (`sameCraft`): at its past
+         * instant (`drawnPast`), live, or not at all (`drawn` false). Truth
+         * gives a loaded craft as it is now and an unloaded one on its present
+         * conic, whatever instant is asked, so a solve on it neither moves a
+         * loaded craft back along its path nor stops at a change of sphere, a
+         * burn or the start of the craft's history. The picture reads the
+         * craft's recorded past, so the aim takes the picture's place and
+         * instant, and has no fix while the picture shows none of the craft's
+         * light. A craft drawn live is where truth puts it now.
+         */
+        public static TruthAimPlace TruthAimPlaceFor(bool sameCraft, bool drawn, bool drawnPast) =>
+            !sameCraft ? TruthAimPlace.Source : !drawn ? TruthAimPlace.NoFix : drawnPast ? TruthAimPlace.Drawn : TruthAimPlace.Source;
 
         /* The boundary light time τ, one 60 fps frame: craft nearer to the lens than its light covers in τ are drawn at render UT. */
         public const double BoundaryLightTimeS = 1.0 / 60.0;

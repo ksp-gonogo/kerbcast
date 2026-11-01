@@ -575,12 +575,13 @@ namespace Kerbcast
             north = new DVec3(z.X, z.Z, z.Y);
 
             var subject = KnownSubject(ut, station, body);
+            LocateDrawn(ut, station, body);
+            subject = TruthAsDrawn(subject);
             _knownUncertainty = subject.Positioned && subject.UncertaintyM > 0 ? subject.UncertaintyM : 0.0;
             _subjectRead = true;
             _subjectState = subject.State;
             _subjectRefusalCode = subject.RefusalCode;
             _subjectRefusalText = subject.RefusalText;
-            LocateDrawn(ut, station, body);
             CelestialBody aimBody;
             bool aimed = !AimIsCraft;
             if (!aimed)
@@ -997,6 +998,28 @@ namespace Kerbcast
             _knownHold.Reset();
             now.State = CraftFixState.Listed;
             return now;
+        }
+
+        /* On truth with a light speed, the subject where and when the picture draws it (CommandCameraMath.TruthAimPlaceFor). */
+        private CraftFix TruthAsDrawn(CraftFix subject)
+        {
+            if (!_known.KnowsWhatIsDrawn || !LightTime.LightSpeed.HasValue || !subject.Positioned) return subject;
+            switch (CommandCameraMath.TruthAimPlaceFor(_drawn.PersistentId == subject.PersistentId, _drawnOk, _drawn.ShownPast))
+            {
+                case TruthAimPlace.Drawn:
+                    subject.World = _drawnPos;
+                    subject.Body = _drawnBody;
+                    subject.Live = false;
+                    _subjectUt = _drawn.ShownUt;
+                    _subjectPlacedUt = _drawn.ShownUt;
+                    return subject;
+                case TruthAimPlace.NoFix:
+                    subject.State = CraftFixState.Listed;
+                    subject.Body = null;
+                    return subject;
+                default:
+                    return subject;
+            }
         }
 
         /* The subject at its solved instant, held as the picture holds it: an

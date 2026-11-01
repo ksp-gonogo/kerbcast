@@ -2158,6 +2158,116 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
         "a lens's body that can keep up with light leaves the span uncapped");
 }
 
+/* ---- truth knows a loaded craft only as it is now ---- */
+{
+    /*
+     * A Mun lens 30 m up at c = 300 m/s and a probe on a circular 60 km Mun
+     * orbit, about 500 m/s, faster than light. Truth gives a loaded craft's
+     * place now whatever instant is asked, so a solve on it stands still at
+     * the craft now; the picture draws the ring's latest root, hundreds of
+     * km back along the orbit. The aim takes the picture's place instead.
+     */
+    const double c = 300;
+    const uint pid = 71;
+    double r = 260000, v = Math.Sqrt(MuMun / r);
+    var tree = new MunCircle { R = 1.2e7, W = 543.0 / 1.2e7 };
+    var ring = NewRing(c);
+    ring.Record(LightHistory.CraftKey(pid), State(37, Mun, new DVec3(r, 0, 0), new DVec3(0, v, 0)), HistoryReason.Start);
+    var lens = new DVec3(-200030, 0, 0);
+    var track = ring.Track(LightHistory.CraftKey(pid));
+    bool stillNow = true, latest = true;
+    int found = 0, several = 0;
+    double widest = 0;
+    for (double t = 600; t < 6000; t += 37)
+    {
+        var sight = PastInstant.Craft(ring, pid, t, Mun, lens, c, ref tree);
+        if (!sight.Found) continue;
+        found++;
+        ring.TryStateAt(track, t, out var now);
+        var live = new Known { Body = Mun, T = t, Live = true, F = _ => now.Position };
+        var st = PastInstant.Solve(ref live, lens, t, c, 0, double.NegativeInfinity, t, out double liveTr);
+        stillNow &= st == PastStatus.Found && live.TryAt(liveTr, out var aimed) && (aimed - now.Position).Magnitude < 1e-6;
+        widest = Math.Max(widest, (sight.About - now.Position).Magnitude);
+        var path = new RingTurned<MunCircle> { Ring = ring, Track = track, Tree = tree, Frame = Mun, T = t };
+        latest &= IsLatest(ref path, lens, t, c, 1 + v * PastInstant.SpeedMargin / c, sight.Ut, LatestS);
+        int roots = 0;
+        double prev = double.NaN;
+        for (double u = 37; u <= t; u += 0.5)
+        {
+            path.TryAt(u, out var p);
+            double g = G(lens, p, u, t, c);
+            if (prev <= 0 && g > 0) roots++;
+            prev = g;
+        }
+        if (roots > 1) several++;
+    }
+    Check(found > 100 && several > 0, $"the probe is drawn at {found} instants, {several} of them with several roots");
+    Check(latest, "the picture draws the latest root throughout");
+    Check(stillNow && widest > 1e5, $"a live place solved as a path is the craft now, up to {widest / 1000:F0} km from where the picture draws it");
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, true) == TruthAimPlace.Drawn,
+        "so on truth with a light speed the aim takes the place and instant the picture draws");
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, false) == TruthAimPlace.Source,
+        "a craft drawn live is where truth puts it now");
+    Check(CommandCameraMath.TruthAimPlaceFor(true, false, false) == TruthAimPlace.NoFix,
+        "and a craft whose light the picture does not draw has no fix");
+    Check(CommandCameraMath.TruthAimPlaceFor(false, true, true) == TruthAimPlace.Source,
+        "an aim at a craft the picture is not drawing keeps truth's place");
+}
+
+/* ---- truth reads an unloaded craft's present conic at every instant ---- */
+{
+    /*
+     * A Mun lens at c = 30 m/s and a hyperbolic Mun escape (periapsis
+     * 300 km from the centre, e 1.5) from UT 37, into Kerbin's sphere.
+     * Truth gives an unloaded craft on the conic it is on now, about the body
+     * it is at now, at any instant asked, with no start: read back for its
+     * light time, the Kerbin conic lands before the craft's history began.
+     * The ring never solves before a track's start.
+     */
+    const double c = 30;
+    const uint pid = 72;
+    double rp = 300000, e = 1.5, vp = Math.Sqrt(MuMun * (1 + e) / rp);
+    var tree = new MunCircle { R = 1.2e7, W = 543.0 / 1.2e7 };
+    var ring = NewRing(c);
+    var key = LightHistory.CraftKey(pid);
+    ring.Record(key, State(37, Mun, new DVec3(rp, 0, 0), new DVec3(0, vp, 0)), HistoryReason.Start);
+    double exitUt = 37;
+    DVec3 rx = default, vx = default;
+    for (double ut = 37; ut < 1e5; ut += 1)
+    {
+        LightHistoryMath.Kepler(new DVec3(rp, 0, 0), new DVec3(0, vp, 0), MuMun, ut - 37, out rx, out vx);
+        if (rx.Magnitude > bodies[Mun].SoiRadius) { exitUt = ut; break; }
+    }
+    tree.TryOffset(Mun, exitUt, out var munAtExit);
+    ring.Record(key, State(exitUt, Kerbin, munAtExit + rx, tree.Velocity(exitUt) + vx), HistoryReason.SoiChange);
+    var track = ring.Track(key);
+    var lensOffset = new DVec3(-200030, 0, 0);
+    bool ringAfterStart = true;
+    int beforeStart = 0, solved = 0;
+    double earliest = double.PositiveInfinity;
+    for (double t = 20000; t <= 245000; t += 5000)
+    {
+        var sight = PastInstant.Craft(ring, pid, t, Mun, lensOffset, c, ref tree);
+        if (sight.Found && sight.Ut < track.StartUt) ringAfterStart = false;
+        ring.TryStateAt(track, t, out var now);
+        tree.TryOffset(Mun, t, out var munAt);
+        var lens = munAt + lensOffset;
+        var conic = new Known { Body = Kerbin, T = t, F = ut =>
+        {
+            LightHistoryMath.Kepler(now.Position, now.Velocity, MuKerbin, ut - t, out var p, out _);
+            return p;
+        } };
+        LightHistoryMath.ConicBound(now.Position, now.Velocity, MuKerbin, bodies[Kerbin].SoiRadius, out _, out double bound);
+        if (PastInstant.Solve(ref conic, lens, t, c, bound, double.NegativeInfinity, t, out double tr) != PastStatus.Found) continue;
+        solved++;
+        if (tr < track.StartUt) beforeStart++;
+        earliest = Math.Min(earliest, tr);
+    }
+    Check(beforeStart > 0,
+        $"read on its present conic the craft solves to before its history starts at UT 37 ({beforeStart} of {solved} instants, as early as UT {earliest:F0})");
+    Check(ringAfterStart, "while the picture's ring never draws it before its start");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
