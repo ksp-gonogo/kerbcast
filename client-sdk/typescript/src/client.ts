@@ -664,7 +664,7 @@ export class CommandTargetUnknownError extends Error {
 
 /**
  * The sidecar refused `POST /offer` with a reason, for example
- * `ErrorCode.CodecUnsupported` when the browser offers no H.264 video.
+ * `ErrorCode.CodecUnsupported` when the browser offers no H.264 constrained baseline.
  */
 export class OfferRefusedError extends Error {
   constructor(

@@ -44,8 +44,11 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
 use webrtc::track::track_local::TrackLocal;
 
@@ -84,25 +87,280 @@ fn session_token() -> String {
 /// already sheds that load.
 pub const MAX_SLOTS_PER_PEER: usize = 32;
 
+/// The one video format Kerbcast sends: H.264 constrained baseline,
+/// packetization-mode=1.
+///
+/// Packetization-mode=0 permits single-NAL packets only, and our encoder
+/// emits fragmented and aggregated NALs, so a mode-0 payload type yields RTP
+/// the browser accepts and cannot decode: traffic on the wire, readyState
+/// stuck at 0, and not one error anywhere in the stack. Constrained baseline
+/// at this level is the H.264 every browser offers.
+const SENT_H264_FMTP: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+
+/// The payload type the sent format is registered under. The answer carries
+/// the offerer's payload type for it instead, so this only has to be a valid
+/// dynamic one.
+const SENT_H264_PAYLOAD_TYPE: u8 = 125;
+
+/// The sent format's capability, shared by the media engine and every slot
+/// track so the track always binds to the payload type the answer names. Its
+/// feedback only feeds the engine: the answer echoes the offer's own rtcp-fb.
+fn sent_h264() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_H264.to_owned(),
+        clock_rate: 90000,
+        channels: 0,
+        sdp_fmtp_line: SENT_H264_FMTP.to_owned(),
+        rtcp_feedback: [
+            ("goog-remb", ""),
+            ("ccm", "fir"),
+            ("nack", ""),
+            ("nack", "pli"),
+        ]
+        .into_iter()
+        .map(|(typ, parameter)| RTCPFeedback {
+            typ: typ.to_owned(),
+            parameter: parameter.to_owned(),
+        })
+        .collect(),
+    }
+}
+
+/// A media engine that knows only the format Kerbcast sends.
+///
+/// The answer lists every codec of the offer the engine matches, so with
+/// webrtc-rs's defaults it named VP8, VP9, AV1 and several H.264 variants
+/// for a stream that is only ever one of them. Anything that picks the
+/// answer's first codec (a relay terminating the connection, say) would then
+/// label our H.264 as VP8. Registering one format leaves only H.264 in the
+/// answer, and `prefer_sent_format` narrows that to one payload type.
+fn sent_media_engine() -> Result<MediaEngine> {
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_codec(
+        RTCRtpCodecParameters {
+            capability: sent_h264(),
+            payload_type: SENT_H264_PAYLOAD_TYPE,
+            ..Default::default()
+        },
+        RTPCodecType::Video,
+    )?;
+    Ok(media_engine)
+}
+
+/// An SDP refused because its video does not carry the format Kerbcast sends,
+/// in every live video section and under one payload type.
+#[derive(Debug)]
+pub struct FormatRefused;
+
+impl std::fmt::Display for FormatRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the offer's video does not carry H.264 with packetization-mode=1 and \
+             profile-level-id 42e0xx in every section under one payload type, the only \
+             video Kerbcast sends",
+        )
+    }
+}
+
+impl std::error::Error for FormatRefused {}
+
+/// One m= section of an SDP: its kind, whether its port is 0, the payload
+/// types its m= line lists, and its attribute lines.
+struct MediaSection<'a> {
+    video: bool,
+    port_zero: bool,
+    formats: Vec<&'a str>,
+    lines: Vec<&'a str>,
+}
+
+impl<'a> MediaSection<'a> {
+    /// The value of the first `a=<attr>:<pt> <value>` line for `pt`.
+    fn attribute(&self, attr: &str, pt: &str) -> Option<&'a str> {
+        self.attributes(attr, pt).next()
+    }
+
+    /// The values of every `a=<attr>:<pt> <value>` line for `pt`.
+    fn attributes<'s>(&'s self, attr: &'s str, pt: &'s str) -> impl Iterator<Item = &'a str> + 's {
+        self.lines.iter().filter_map(move |l| {
+            let (p, value) = l.strip_prefix(attr)?.split_once(' ')?;
+            (p == pt).then_some(value)
+        })
+    }
+
+    /// Whether `pt` is listed on this section's m= line as the sent format.
+    fn is_sent_format(&self, pt: &str) -> bool {
+        self.formats.contains(&pt)
+            && self
+                .attribute("a=rtpmap:", pt)
+                .is_some_and(|codec| codec.to_ascii_lowercase().starts_with("h264/"))
+            && self.attribute("a=fmtp:", pt).is_some_and(is_sent_fmtp)
+    }
+
+    /// The first payload type on the m= line that is the sent format, the one
+    /// webrtc-rs's exact match lands on.
+    fn first_sent_format(&self) -> Option<&'a str> {
+        self.formats
+            .iter()
+            .copied()
+            .find(|pt| self.is_sent_format(pt))
+    }
+
+    /// The rtcp-fb lines for `pt`, wildcard ones included.
+    fn feedback(&self, pt: &str) -> Vec<RTCPFeedback> {
+        self.attributes("a=rtcp-fb:", pt)
+            .chain(self.attributes("a=rtcp-fb:", "*"))
+            .map(|value| {
+                let (typ, parameter) = value.trim().split_once(' ').unwrap_or((value.trim(), ""));
+                RTCPFeedback {
+                    typ: typ.to_owned(),
+                    parameter: parameter.trim().to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    /// A section with port 0 is rejected or stopped, unless it is
+    /// bundle-only, which uses port 0 and still carries media over the
+    /// bundle.
+    fn live_video(&self) -> bool {
+        self.video && (!self.port_zero || self.lines.contains(&"a=bundle-only"))
+    }
+}
+
+fn media_sections(sdp: &str) -> Vec<MediaSection<'_>> {
+    let mut sections: Vec<MediaSection<'_>> = Vec::new();
+    for line in sdp.lines().map(str::trim) {
+        if let Some(m) = line.strip_prefix("m=") {
+            let mut fields = m.split_whitespace();
+            let kind = fields.next().unwrap_or_default();
+            let port = fields.next().unwrap_or_default();
+            sections.push(MediaSection {
+                video: kind == "video",
+                port_zero: port == "0",
+                formats: fields.skip(1).collect(),
+                lines: Vec::new(),
+            });
+        } else if let Some(section) = sections.last_mut() {
+            section.lines.push(line);
+        }
+    }
+    sections
+}
+
+/// The section webrtc-rs takes a connection's video codecs from: the first
+/// m=video, whatever its port.
+fn codec_source<'s, 'a>(sections: &'s [MediaSection<'a>]) -> Option<&'s MediaSection<'a>> {
+    sections.iter().find(|s| s.video)
+}
+
+/// Mirrors webrtc-rs's exact H.264 match: the same packetization-mode, and a
+/// profile-level-id whose profile bytes agree. Any level is taken, as
+/// webrtc-rs takes it; browsers decode above the level they offer.
+fn is_sent_fmtp(params: &str) -> bool {
+    let mut mode1 = false;
+    let mut constrained_baseline = false;
+    for (key, value) in params.split(';').filter_map(|p| p.trim().split_once('=')) {
+        let value = value.trim();
+        if key.trim().eq_ignore_ascii_case("packetization-mode") {
+            mode1 = value == "1";
+        } else if key.trim().eq_ignore_ascii_case("profile-level-id") {
+            constrained_baseline = value.len() == 6
+                && value
+                    .get(..4)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("42e0"));
+        }
+    }
+    mode1 && constrained_baseline
+}
+
+/// Whether every live video section of `sdp` carries the sent format under
+/// payload type `pt`.
+fn carries_sent_format(sdp: &str, pt: &str) -> bool {
+    let sections = media_sections(sdp);
+    let mut video = sections.iter().filter(|s| s.live_video()).peekable();
+    video.peek().is_some() && video.all(|s| s.is_sent_format(pt))
+}
+
+/// Whether an offer's video can be answered with the format Kerbcast sends.
+///
+/// webrtc-rs picks a connection's video codecs from the first video section
+/// alone, whatever its port, and then answers every section with them. So
+/// that section has to carry the sent format, and every live one has to carry
+/// it under the same payload type, or the answer names a payload type that
+/// section never offered. Plain baseline (42001f) is not taken: every browser
+/// that offers it offers constrained baseline beside it.
+pub fn offers_sent_h264(sdp: &str) -> bool {
+    offered_payload_type(sdp).is_some_and(|pt| carries_sent_format(sdp, &pt))
+}
+
+/// The first payload type the codec-source section of an offer lists as the
+/// sent format, the one webrtc-rs's exact match lands on.
+fn offered_payload_type(sdp: &str) -> Option<String> {
+    codec_source(&media_sections(sdp))
+        .and_then(MediaSection::first_sent_format)
+        .map(str::to_owned)
+}
+
+/// The sent format under payload type `pt` as the offer describes it: the
+/// offerer's own fmtp and feedback, so the answer echoes what it asked for
+/// rather than claiming a level or feedback it never offered.
+fn offered_sent_format(sdp: &str, pt: &str) -> Option<RTCRtpCodecParameters> {
+    let sections = media_sections(sdp);
+    let section = sections.iter().find(|s| s.video && s.is_sent_format(pt))?;
+    let sent = sent_h264();
+    Some(RTCRtpCodecParameters {
+        capability: RTCRtpCodecCapability {
+            mime_type: sent.mime_type,
+            clock_rate: sent.clock_rate,
+            channels: sent.channels,
+            sdp_fmtp_line: section.attribute("a=fmtp:", pt)?.trim().to_owned(),
+            rtcp_feedback: section.feedback(pt),
+        },
+        payload_type: pt.parse().ok()?,
+        ..Default::default()
+    })
+}
+
+/// The payload type the first answered video section names, which is the
+/// one every video section of the connection sends under.
+fn answered_payload_type(answer: &str) -> Option<String> {
+    media_sections(answer)
+        .iter()
+        .find(|s| s.live_video())
+        .and_then(|s| s.formats.first())
+        .map(|pt| (*pt).to_owned())
+}
+
+/// Checks that every answered video section names one payload type, and that
+/// the matching offer section lists it as the sent format. Anything else is a
+/// feed the browser cannot decode or a section it cannot accept.
+fn check_answer(offer: &str, answer: &str) -> Result<()> {
+    let offered = media_sections(offer);
+    let answered = media_sections(answer);
+    if offered.len() != answered.len() {
+        return Err(anyhow!(
+            "the answer has {} media sections for an offer of {}",
+            answered.len(),
+            offered.len()
+        ));
+    }
+    let named_sent_format = offered
+        .iter()
+        .zip(&answered)
+        .filter(|(o, a)| o.live_video() && a.live_video())
+        .all(|(o, a)| matches!(a.formats.as_slice(), [pt] if o.is_sent_format(pt)));
+    if named_sent_format {
+        Ok(())
+    } else {
+        Err(FormatRefused.into())
+    }
+}
+
 /// A slot's send-track, named by its index in the pool.
 fn slot_track(i: usize, outbox: &Outbox) -> Arc<VideoTrack> {
     Arc::new(VideoTrack::new(
-        /* Declare the fmtp explicitly. With only a mime type here, codec
-        matching falls back to a mime-only fuzzy search across every
-        H.264 payload type the browser offered, including
-        packetization-mode=0 ones, which permit single-NAL packets
-        only. Our encoder emits fragmented and aggregated NALs, so
-        landing on such a payload type yields RTP the browser accepts
-        and cannot decode: traffic on the wire, readyState stuck at 0,
-        and not one error anywhere in the stack. Pinning
-        packetization-mode=1 with the constrained-baseline profile
-        every browser offers makes the choice deterministic. */
-        RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                .to_owned(),
-            ..Default::default()
-        },
+        sent_h264(),
         format!("video-slot{i}"),
         format!("kerbcast-slot{i}"),
         Some(outbox.clone()),
@@ -308,11 +566,10 @@ impl KerbcastPeer {
         slot_count: usize,
     ) -> Result<Self> {
         let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
-        let mut media_engine = MediaEngine::default();
-        media_engine.register_default_codecs()?;
+        let mut media_engine = sent_media_engine()?;
         // Install the default interceptors — critically the NACK responder,
         // which retransmits packets the browser reports lost (via the `nack`
-        // feedback `register_default_codecs` already advertises). Without it a
+        // feedback the browser offers, which the answer echoes). Without it a
         // single lost packet breaks the H.264 reference chain with no recovery
         // until the next scheduled keyframe (~2s GOP) — feeds "cut to static
         // for a moment then return". The responder recovers the loss in ~1 RTT.
@@ -551,10 +808,23 @@ impl KerbcastPeer {
     /// Browser POSTs its offer, we set it as the remote description, then
     /// create + return our answer.
     pub async fn answer_to_offer(&self, offer_sdp: String) -> Result<String> {
-        let offer = RTCSessionDescription::offer(offer_sdp)?;
-        self.pc.set_remote_description(offer).await?;
+        /* webrtc-rs answers an offer without the sent format using whatever
+        H.264 it offered, packetization-mode=0 included, which is a black feed
+        that negotiates cleanly. */
+        let sent_under = offered_payload_type(&offer_sdp);
+        let offers_video = codec_source(&media_sections(&offer_sdp)).is_some();
+        if offers_video && !offers_sent_h264(&offer_sdp) {
+            return Err(FormatRefused.into());
+        }
+        self.pc
+            .set_remote_description(RTCSessionDescription::offer(offer_sdp.clone())?)
+            .await?;
+        if let Some(pt) = &sent_under {
+            self.prefer_sent_format(&offer_sdp, pt).await?;
+        }
 
         let answer = self.pc.create_answer(None).await?;
+        check_answer(&offer_sdp, &answer.sdp)?;
         self.pc.set_local_description(answer).await?;
 
         let mut gather_complete = self.pc.gathering_complete_promise().await;
@@ -614,12 +884,8 @@ impl KerbcastPeer {
             .await
             .ok_or_else(|| anyhow!("local description missing after set_local_description"))?;
 
-        /* Which H.264 payload type and fmtp actually got negotiated. The slot
-        tracks declare only a mime type (no sdp_fmtp_line), so codec matching
-        falls back to a mime-only fuzzy search and can land on a payload type
-        whose parameters our encoder does not satisfy — packetization-mode or
-        profile-level-id in particular. That produces RTP the browser accepts
-        but cannot decode: traffic on the wire, readyState stuck at 0. */
+        /* Which H.264 payload type and fmtp got negotiated, for diagnosing a
+        feed that does not play. */
         for line in local.sdp.lines() {
             if line.starts_with("a=rtpmap:") && line.to_ascii_uppercase().contains("H264") {
                 info!(sdp_line = line, "negotiated H264 rtpmap");
@@ -629,6 +895,21 @@ impl KerbcastPeer {
             }
         }
         Ok(local.sdp)
+    }
+
+    /// Narrows every video transceiver to the sent format under payload type
+    /// `pt`, as `offer_sdp` describes it. webrtc-rs's exact match ignores the
+    /// level, so an offer of constrained baseline at two levels would
+    /// otherwise be answered with both; with one preference the answer names
+    /// one.
+    async fn prefer_sent_format(&self, offer_sdp: &str, pt: &str) -> Result<()> {
+        let preference = offered_sent_format(offer_sdp, pt).ok_or(FormatRefused)?;
+        for t in self.pc.get_transceivers().await {
+            if t.kind() == RTPCodecType::Video {
+                t.set_codec_preferences(vec![preference.clone()]).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Slots in the pool, confirmed or not.
@@ -708,6 +989,23 @@ impl KerbcastPeer {
                 .count();
             (slots.len(), stale, kept)
         };
+        /* Running senders stay bound to the payload type they started under,
+        so the re-offer must carry that payload type. Refused here, before the
+        exchange: a failure after set_remote_description would leave the
+        connection unable to take another re-offer. Checked once the
+        re-offer's slot counts are known good and before any slot changes. */
+        let sent_under = match self.pc.current_local_description().await {
+            Some(local) => answered_payload_type(&local.sdp),
+            None => None,
+        };
+        let carried = match &sent_under {
+            Some(pt) => carries_sent_format(&offer_sdp, pt),
+            None => offers_sent_h264(&offer_sdp),
+        };
+        if !carried {
+            return Err(FormatRefused.into());
+        }
+        let sent_under = sent_under.or_else(|| offered_payload_type(&offer_sdp));
         for &i in &stale {
             self.retire_slot(i).await;
         }
@@ -741,9 +1039,13 @@ impl KerbcastPeer {
 
         let answer = async {
             self.pc
-                .set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
+                .set_remote_description(RTCSessionDescription::offer(offer_sdp.clone())?)
                 .await?;
+            if let Some(pt) = &sent_under {
+                self.prefer_sent_format(&offer_sdp, pt).await?;
+            }
             let answer = self.pc.create_answer(None).await?;
+            check_answer(&offer_sdp, &answer.sdp)?;
             self.pc.set_local_description(answer).await?;
             self.pc
                 .local_description()
@@ -2359,8 +2661,8 @@ mod tests {
     use std::sync::Weak;
     use std::time::Duration;
 
-    // Build a minimal RTCPeerConnection the same way KerbcastPeer::new does, so
-    // the sender/track lifecycle matches production.
+    /// The browser's peer connection, with webrtc-rs's default codecs standing
+    /// in for a browser's.
     async fn build_pc() -> Arc<RTCPeerConnection> {
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -2625,7 +2927,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_re_offer_leaves_nothing_a_later_one_reuses() {
         let (peer, browser, _dir) = connected_pair().await;
-        assert!(peer.grow(4, "v=garbage".to_owned()).await.is_err());
+        let offer = browser_offer(&browser, 2).await;
+        /* Carries the sent format, so it gets as far as the SDP exchange. */
+        let broken = offer.replacen("v=0", "v=garbage", 1);
+        assert!(peer.grow(4, broken).await.is_err());
         assert_eq!(peer.slot_count().await, 2, "a failed re-offer adds nothing");
         let stopped_before = peer
             .pc
@@ -2636,7 +2941,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(stopped_before.len(), 2, "its transceivers are stopped");
 
-        let offer = browser_offer(&browser, 2).await;
         peer.grow(4, offer).await.expect("grow");
         for t in pool_transceivers(&peer).await.into_iter().flatten() {
             assert!(!is_stopped(&t));
@@ -3403,5 +3707,782 @@ mod tests {
         peer.mark_dead();
 
         assert!(!peer.is_alive());
+    }
+
+    /// Codec lines in the shape Chrome offers: VP8 first, packetization-mode=0
+    /// H.264 ahead of mode 1, plain baseline and High beside constrained
+    /// baseline, rtx for each, then AV1, red and ulpfec.
+    const CHROME_CODECS: &str = "96 97 98 100 101 102 103 104 106 107 45 116 117|\
+        a=rtpmap:96 VP8/90000\n\
+        a=rtcp-fb:96 goog-remb\na=rtcp-fb:96 transport-cc\na=rtcp-fb:96 ccm fir\na=rtcp-fb:96 nack\na=rtcp-fb:96 nack pli\n\
+        a=rtpmap:97 rtx/90000\na=fmtp:97 apt=96\n\
+        a=rtpmap:98 VP9/90000\na=fmtp:98 profile-id=0\n\
+        a=rtpmap:100 H264/90000\na=fmtp:100 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f\n\
+        a=rtpmap:101 H264/90000\na=fmtp:101 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\n\
+        a=rtpmap:102 H264/90000\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\n\
+        a=rtpmap:103 rtx/90000\na=fmtp:103 apt=102\n\
+        a=rtpmap:104 H264/90000\na=fmtp:104 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f\n\
+        a=rtpmap:106 H264/90000\n\
+        a=rtcp-fb:106 goog-remb\na=rtcp-fb:106 transport-cc\na=rtcp-fb:106 ccm fir\na=rtcp-fb:106 nack\na=rtcp-fb:106 nack pli\n\
+        a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\n\
+        a=rtpmap:107 rtx/90000\na=fmtp:107 apt=106\n\
+        a=rtpmap:45 AV1/90000\n\
+        a=rtpmap:116 red/90000\n\
+        a=rtpmap:117 ulpfec/90000";
+
+    /// Firefox with OpenH264: constrained baseline in both modes, mode 1 first.
+    const FIREFOX_CODECS: &str = "120 124 121 125 126 127 97 98|\
+        a=rtpmap:120 VP8/90000\na=fmtp:120 max-fs=12288;max-fr=60\n\
+        a=rtpmap:124 rtx/90000\na=fmtp:124 apt=120\n\
+        a=rtpmap:121 VP9/90000\na=fmtp:121 max-fs=12288;max-fr=60\n\
+        a=rtpmap:125 rtx/90000\na=fmtp:125 apt=121\n\
+        a=rtpmap:126 H264/90000\na=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1\n\
+        a=rtcp-fb:126 nack\na=rtcp-fb:126 nack pli\na=rtcp-fb:126 ccm fir\na=rtcp-fb:126 goog-remb\na=rtcp-fb:126 transport-cc\n\
+        a=rtpmap:127 rtx/90000\na=fmtp:127 apt=126\n\
+        a=rtpmap:97 H264/90000\na=fmtp:97 profile-level-id=42e01f;level-asymmetry-allowed=1\n\
+        a=rtpmap:98 rtx/90000\na=fmtp:98 apt=97";
+
+    /// Safari: High first, constrained baseline under its own payload types,
+    /// with an uppercase profile-level-id at a different level.
+    const SAFARI_CODECS: &str = "96 97 98 99 100 101 102|\
+        a=rtpmap:96 H264/90000\na=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\n\
+        a=rtpmap:97 rtx/90000\na=fmtp:97 apt=96\n\
+        a=rtpmap:98 H264/90000\na=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42E01F\n\
+        a=rtpmap:99 rtx/90000\na=fmtp:99 apt=98\n\
+        a=rtpmap:100 H264/90000\na=fmtp:100 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f\n\
+        a=rtpmap:101 VP8/90000\n\
+        a=rtpmap:102 rtx/90000\na=fmtp:102 apt=101";
+
+    /// `offer` with every video section's codecs replaced by `codecs`, given
+    /// as "<payload types>|<rtpmap, fmtp and rtcp-fb lines>".
+    fn with_codecs(offer: &str, codecs: &str) -> String {
+        let (pts, lines) = codecs.split_once('|').expect("codec spec");
+        let mut out = String::new();
+        let mut in_video = false;
+        for line in offer.lines() {
+            if line.starts_with("m=") {
+                in_video = line.starts_with("m=video");
+                if in_video {
+                    let proto: Vec<&str> = line.split(' ').take(3).collect();
+                    out.push_str(&format!("{} {pts}\r\n", proto.join(" ")));
+                    for codec_line in lines.lines() {
+                        out.push_str(codec_line.trim());
+                        out.push_str("\r\n");
+                    }
+                    continue;
+                }
+            } else if in_video
+                && ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+                    .iter()
+                    .any(|p| line.starts_with(p))
+            {
+                continue;
+            }
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    /// The payload types of each video section's rtpmap lines.
+    fn answered_video_codecs(sdp: &str) -> Vec<Vec<String>> {
+        let mut sections = Vec::new();
+        let mut in_video = false;
+        for line in sdp.lines() {
+            if line.starts_with("m=") {
+                in_video = line.starts_with("m=video");
+                if in_video {
+                    sections.push(Vec::new());
+                }
+            } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:").filter(|_| in_video) {
+                sections.last_mut().unwrap().push(rtpmap.to_owned());
+            }
+        }
+        sections
+    }
+
+    fn fmtp_of(sdp: &str, pt: &str) -> String {
+        sdp.lines()
+            .find_map(|l| l.strip_prefix(&format!("a=fmtp:{pt} ")))
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    }
+
+    async fn answer_for(codecs: &str, slots: usize) -> (KerbcastPeer, Result<String>) {
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], slots).await.expect("peer");
+        let browser = build_pc().await;
+        browser
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let offer = with_codecs(&browser_offer(&browser, slots).await, codecs);
+        let answer = peer.answer_to_offer(offer).await;
+        (peer, answer)
+    }
+
+    /// Each browser's offer is answered with the sent format alone, under
+    /// the payload type that browser gave it, in every video section.
+    #[tokio::test]
+    async fn the_answer_names_only_the_sent_format_under_the_offerers_payload_type() {
+        for (browser, codecs, pt) in [
+            ("chrome", CHROME_CODECS, "106"),
+            ("firefox", FIREFOX_CODECS, "126"),
+            ("safari", SAFARI_CODECS, "98"),
+        ] {
+            let (_peer, answer) = answer_for(codecs, 2).await;
+            let answer = answer.unwrap_or_else(|e| panic!("{browser}: {e}"));
+            assert_eq!(
+                answered_video_codecs(&answer),
+                vec![vec![format!("{pt} H264/90000")]; 2],
+                "{browser}: {answer}"
+            );
+            let fmtp = fmtp_of(&answer, pt);
+            assert!(
+                fmtp.contains("packetization-mode=1") && fmtp.contains("profile-level-id=42e01f"),
+                "{browser}: {fmtp}"
+            );
+            assert!(offers_sent_h264(&answer), "{browser}");
+        }
+    }
+
+    /// A re-offer gets the same single format as the first answer did.
+    #[tokio::test]
+    async fn a_re_offer_is_answered_with_the_sent_format_alone() {
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], 1).await.expect("peer");
+        let browser = build_pc().await;
+        browser
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let offer = with_codecs(&browser_offer(&browser, 1).await, CHROME_CODECS);
+        let answer = peer.answer_to_offer(offer).await.expect("answer");
+        browser
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set answer");
+
+        let offer = with_codecs(&browser_offer(&browser, 2).await, CHROME_CODECS);
+        let answer = peer.grow(3, offer).await.expect("grow");
+        assert_eq!(
+            answered_video_codecs(&answer),
+            vec![vec!["106 H264/90000".to_owned()]; 3],
+            "{answer}"
+        );
+        assert_eq!(
+            fmtp_of(&answer, "106"),
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+        );
+        let grown = pool_transceivers(&peer).await;
+        for t in grown.iter().skip(1).flatten() {
+            let codecs = t
+                .sender()
+                .await
+                .get_parameters()
+                .await
+                .rtp_parameters
+                .codecs;
+            let pts: Vec<u8> = codecs.iter().map(|c| c.payload_type).collect();
+            assert_eq!(
+                pts,
+                [106],
+                "a grown slot sends under the answered type alone"
+            );
+        }
+    }
+
+    #[test]
+    fn finds_the_sent_format_as_webrtc_rs_matches_it() {
+        let section = |codecs: &str| {
+            let (pts, lines) = codecs.split_once('|').unwrap();
+            format!(
+                "v=0\r\nm=video 9 X {pts}\r\n{}\r\n",
+                lines.replace('\n', "\r\n")
+            )
+        };
+        assert!(offers_sent_h264(&section(CHROME_CODECS)));
+        assert!(offers_sent_h264(&section(FIREFOX_CODECS)));
+        assert!(offers_sent_h264(&section(SAFARI_CODECS)));
+        for (why, codecs) in [
+            ("vp8 only", "96|a=rtpmap:96 VP8/90000"),
+            (
+                "mode 0 only",
+                "100|a=rtpmap:100 H264/90000\na=fmtp:100 packetization-mode=0;profile-level-id=42e01f",
+            ),
+            (
+                "baseline only",
+                "102|a=rtpmap:102 H264/90000\na=fmtp:102 packetization-mode=1;profile-level-id=42001f",
+            ),
+            (
+                "high only",
+                "96|a=rtpmap:96 H264/90000\na=fmtp:96 packetization-mode=1;profile-level-id=640c1f",
+            ),
+            (
+                "no profile",
+                "96|a=rtpmap:96 H264/90000\na=fmtp:96 packetization-mode=1",
+            ),
+            (
+                "fmtp on another codec",
+                "96|a=rtpmap:96 VP8/90000\na=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+            ),
+        ] {
+            assert!(!offers_sent_h264(&section(codecs)), "{why}");
+        }
+        /* Payload types are per section: an fmtp in another section does not count. */
+        let split = "v=0\r\nm=video 9 X 102\r\na=rtpmap:102 H264/90000\r\nm=video 9 X 102\r\na=rtpmap:102 VP8/90000\r\na=fmtp:102 packetization-mode=1;profile-level-id=42e01f\r\n";
+        assert!(!offers_sent_h264(split));
+    }
+
+    /// Below the signalling check, an offer with no sent format must not
+    /// produce an answer that looks healthy and carries a black feed.
+    #[tokio::test]
+    async fn an_offer_without_the_sent_format_gets_no_answer() {
+        for (why, codecs) in [
+            ("vp8 only", "96|a=rtpmap:96 VP8/90000"),
+            (
+                "mode 0 only",
+                "100 101|a=rtpmap:100 H264/90000\na=fmtp:100 packetization-mode=0;profile-level-id=42e01f\n\
+                 a=rtpmap:101 H264/90000\na=fmtp:101 packetization-mode=0;profile-level-id=42001f",
+            ),
+            (
+                "baseline only",
+                "102|a=rtpmap:102 H264/90000\na=fmtp:102 packetization-mode=1;profile-level-id=42001f",
+            ),
+        ] {
+            let (_peer, answer) = answer_for(codecs, 1).await;
+            assert!(answer.is_err(), "{why}: {answer:?}");
+        }
+        let (_peer, answer) = answer_for(
+            "100|a=rtpmap:100 H264/90000\na=fmtp:100 packetization-mode=0;profile-level-id=42e01f",
+            1,
+        )
+        .await;
+        let err = answer.unwrap_err().to_string();
+        assert!(err.contains("packetization-mode=1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_without_the_sent_format_adds_no_slots() {
+        let (peer, browser, _dir) = connected_pair().await;
+        let offer = with_codecs(
+            &browser_offer(&browser, 1).await,
+            "100|a=rtpmap:100 H264/90000\na=fmtp:100 packetization-mode=0;profile-level-id=42e01f",
+        );
+        assert!(peer.grow(3, offer).await.is_err());
+        assert_eq!(peer.slot_count().await, 2);
+    }
+
+    /// `offer` with its nth video section's codecs replaced by `specs[n]`, each
+    /// in the "<payload types>|<lines>" form `with_codecs` takes.
+    fn with_codecs_per_section(offer: &str, specs: &[&str]) -> String {
+        let mut out = String::new();
+        let mut in_video = false;
+        let mut next = specs.iter();
+        for line in offer.lines() {
+            if line.starts_with("m=") {
+                in_video = line.starts_with("m=video");
+                if in_video {
+                    let (pts, lines) = next
+                        .next()
+                        .expect("a spec per video section")
+                        .split_once('|')
+                        .unwrap();
+                    let proto: Vec<&str> = line.split(' ').take(3).collect();
+                    out.push_str(&format!("{} {pts}\r\n", proto.join(" ")));
+                    for codec_line in lines.lines() {
+                        out.push_str(codec_line.trim());
+                        out.push_str("\r\n");
+                    }
+                    continue;
+                }
+            } else if in_video
+                && ["a=rtpmap:", "a=fmtp:", "a=rtcp-fb:"]
+                    .iter()
+                    .any(|p| line.starts_with(p))
+            {
+                continue;
+            }
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    async fn answer_for_sections(specs: &[&str]) -> Result<String> {
+        answer_for_adjusted_sections(specs, |offer| offer).await
+    }
+
+    /// Like `answer_for_sections`, with `adjust` applied to the offer last.
+    async fn answer_for_adjusted_sections(
+        specs: &[&str],
+        adjust: impl Fn(String) -> String,
+    ) -> Result<String> {
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], specs.len())
+            .await
+            .expect("peer");
+        let browser = build_pc().await;
+        browser
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let offer = with_codecs_per_section(&browser_offer(&browser, specs.len()).await, specs);
+        peer.answer_to_offer(adjust(offer)).await
+    }
+
+    /// `offer` with its nth video section's port set to 0, and marked
+    /// bundle-only when `bundle_only` is set.
+    fn with_port_zero(offer: &str, n: usize, bundle_only: bool) -> String {
+        let mut out = String::new();
+        let mut video = 0;
+        for line in offer.lines() {
+            if let Some(rest) = line.strip_prefix("m=video ") {
+                video += 1;
+                if video == n + 1 {
+                    let (_, rest) = rest.split_once(' ').unwrap();
+                    out.push_str(&format!("m=video 0 {rest}\r\n"));
+                    if bundle_only {
+                        out.push_str("a=bundle-only\r\n");
+                    }
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    /* webrtc-rs takes a connection's video codecs from the first video section
+    alone, so sections that differ are refused up front: a first section
+    without the format would fail deep in the exchange, and a later one
+    without it would be answered with a payload type it never offered. */
+    #[tokio::test]
+    async fn an_offer_whose_video_sections_differ_is_refused() {
+        const VP8: &str = "96|a=rtpmap:96 VP8/90000";
+        const RENUMBERED: &str =
+            "108|a=rtpmap:108 H264/90000\na=fmtp:108 packetization-mode=1;profile-level-id=42e01f";
+        for (why, specs) in [
+            ("first section vp8 only", [VP8, CHROME_CODECS]),
+            ("later section vp8 only", [CHROME_CODECS, VP8]),
+            (
+                "later section under another payload type",
+                [CHROME_CODECS, RENUMBERED],
+            ),
+        ] {
+            let answer = answer_for_sections(&specs).await;
+            let err = answer.expect_err(why);
+            assert!(err.is::<FormatRefused>(), "{why}: {err}");
+        }
+
+        /* Port 0 does not take a section out of the reckoning: webrtc-rs reads
+        codecs from the first video section whatever its port, and a
+        bundle-only section is live on port 0. */
+        for (why, specs, n, bundle_only) in [
+            (
+                "first section on port 0, vp8 only",
+                [VP8, CHROME_CODECS],
+                0,
+                false,
+            ),
+            (
+                "first section bundle-only, vp8 only",
+                [VP8, CHROME_CODECS],
+                0,
+                true,
+            ),
+            (
+                "later section bundle-only, vp8 only",
+                [CHROME_CODECS, VP8],
+                1,
+                true,
+            ),
+        ] {
+            let answer =
+                answer_for_adjusted_sections(&specs, |o| with_port_zero(&o, n, bundle_only)).await;
+            let err = answer.expect_err(why);
+            assert!(err.is::<FormatRefused>(), "{why}: {err}");
+        }
+    }
+
+    #[test]
+    fn port_zero_sections_count_as_webrtc_rs_counts_them() {
+        const SENT: &str = "a=rtpmap:106 H264/90000\r\na=fmtp:106 packetization-mode=1;profile-level-id=42e01f\r\n";
+        let vp8 = |port: &str, extra: &str| {
+            format!("m=video {port} X 106\r\n{extra}a=rtpmap:106 VP8/90000\r\n")
+        };
+        let sent = |port: &str, extra: &str| format!("m=video {port} X 106\r\n{extra}{SENT}");
+        let offer = |sections: &[String]| format!("v=0\r\n{}", sections.concat());
+
+        /* A stopped later section is not answered with media, so it need
+        not carry the format. */
+        assert!(offers_sent_h264(&offer(&[sent("9", ""), vp8("0", "")])));
+        assert!(!offers_sent_h264(&offer(&[
+            sent("9", ""),
+            vp8("0", "a=bundle-only\r\n")
+        ])));
+        assert!(offers_sent_h264(&offer(&[
+            sent("9", ""),
+            sent("0", "a=bundle-only\r\n")
+        ])));
+        /* The first video section is the codec source even on port 0. */
+        assert!(!offers_sent_h264(&offer(&[vp8("0", ""), sent("9", "")])));
+        assert_eq!(
+            offered_payload_type(&offer(&[sent("0", ""), sent("9", "")])).as_deref(),
+            Some("106")
+        );
+    }
+
+    /// The answer check pairs each answered video section with its offer
+    /// section, whatever webrtc-rs produced.
+    #[test]
+    fn check_answer_refuses_a_section_answered_with_anything_but_one_offered_sent_format() {
+        const OFFER_SECTION: &str = "m=video 9 X 106 96\r\n\
+            a=rtpmap:106 H264/90000\r\n\
+            a=fmtp:106 packetization-mode=1;profile-level-id=42e01f\r\n\
+            a=rtpmap:96 VP8/90000\r\n";
+        let other_pt = OFFER_SECTION.replace("106", "108");
+        let offer = |second: &str| format!("v=0\r\n{OFFER_SECTION}{second}m=application 9 X y\r\n");
+        let answer = |first: &str, second: &str| {
+            format!("v=0\r\nm=video 9 X {first}\r\nm=video 9 X {second}\r\nm=application 9 X y\r\n")
+        };
+
+        check_answer(&offer(OFFER_SECTION), &answer("106", "106")).expect("one sent format");
+        for (why, offered, answered) in [
+            (
+                "two payload types",
+                offer(OFFER_SECTION),
+                answer("106", "106 96"),
+            ),
+            (
+                "not the sent format",
+                offer(OFFER_SECTION),
+                answer("106", "96"),
+            ),
+            ("no payload type", offer(OFFER_SECTION), answer("106", "")),
+            (
+                "not offered on that section",
+                offer(&other_pt),
+                answer("106", "106"),
+            ),
+            (
+                "a bundle-only section answered with what it never offered",
+                offer("m=video 0 X 96\r\na=bundle-only\r\na=rtpmap:96 VP8/90000\r\n"),
+                answer("106", "106"),
+            ),
+        ] {
+            let err = check_answer(&offered, &answered).expect_err(why);
+            assert!(err.is::<FormatRefused>(), "{why}: {err}");
+        }
+
+        /* A section stopped on both sides carries nothing to check. */
+        let stopped = "m=video 0 X 96\r\na=rtpmap:96 VP8/90000\r\n";
+        check_answer(
+            &offer(stopped),
+            "v=0\r\nm=video 9 X 106\r\nm=video 0 X 0\r\nm=application 9 X y\r\n",
+        )
+        .expect("stopped section");
+
+        let short = check_answer(&offer(OFFER_SECTION), "v=0\r\nm=video 9 X 106\r\n")
+            .expect_err("section count");
+        assert!(!short.is::<FormatRefused>(), "{short}");
+    }
+
+    /// The answer echoes the offerer's own fmtp and feedback for the chosen
+    /// payload type, so it never claims a level or feedback the offer lacked.
+    #[tokio::test]
+    async fn the_answer_echoes_the_offerers_fmtp_and_feedback() {
+        let (peer, answer) = answer_for(
+            "106|a=rtpmap:106 H264/90000\n\
+             a=fmtp:106 packetization-mode=1;profile-level-id=42e00d\n\
+             a=rtcp-fb:106 nack\n\
+             a=rtcp-fb:106 nack pli",
+            2,
+        )
+        .await;
+        let answer = answer.expect("answer");
+        assert_eq!(
+            fmtp_of(&answer, "106"),
+            "packetization-mode=1;profile-level-id=42e00d",
+            "{answer}"
+        );
+        let feedback: Vec<&str> = answer
+            .lines()
+            .filter_map(|l| l.strip_prefix("a=rtcp-fb:106 "))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            feedback,
+            ["nack", "nack pli", "nack", "nack pli"],
+            "{answer}"
+        );
+        for t in peer.pc.get_transceivers().await {
+            let codecs = t
+                .sender()
+                .await
+                .get_parameters()
+                .await
+                .rtp_parameters
+                .codecs;
+            assert_eq!(codecs.len(), 1, "{codecs:?}");
+            assert_eq!(codecs[0].payload_type, 106);
+        }
+    }
+
+    /// A re-offer that moves the sent format to a new payload type would leave
+    /// running senders on the old one, so it is refused before any slot changes.
+    #[tokio::test]
+    async fn a_re_offer_that_renumbers_the_sent_format_is_refused() {
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], 1).await.expect("peer");
+        let browser = build_pc().await;
+        browser
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let offer = with_codecs(&browser_offer(&browser, 1).await, CHROME_CODECS);
+        let answer = peer.answer_to_offer(offer).await.expect("answer");
+        browser
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set answer");
+
+        let offer = with_codecs(
+            &browser_offer(&browser, 1).await,
+            "108|a=rtpmap:108 H264/90000\na=fmtp:108 packetization-mode=1;profile-level-id=42e01f",
+        );
+        let err = peer.grow(2, offer).await.expect_err("renumbered re-offer");
+        assert!(err.is::<FormatRefused>(), "{err}");
+        assert_eq!(peer.slot_count().await, 1);
+    }
+
+    /// The exact match ignores the level, so constrained baseline offered at
+    /// two levels would put both in the answer; only the first is kept.
+    #[tokio::test]
+    async fn constrained_baseline_at_two_levels_is_answered_with_the_first() {
+        let (_peer, answer) = answer_for(
+            "106 108|a=rtpmap:106 H264/90000\n\
+             a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\n\
+             a=rtcp-fb:106 nack\n\
+             a=rtpmap:108 H264/90000\n\
+             a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034\n\
+             a=rtcp-fb:108 nack",
+            2,
+        )
+        .await;
+        let answer = answer.expect("answer");
+        assert_eq!(
+            answered_video_codecs(&answer),
+            vec![vec!["106 H264/90000".to_owned()]; 2],
+            "{answer}"
+        );
+        assert!(
+            !answer.contains(":108 "),
+            "no trace of the second level: {answer}"
+        );
+        assert!(answer
+            .lines()
+            .filter(|l| l.starts_with("m=video"))
+            .all(|l| l.ends_with(" 106")));
+    }
+
+    /// The slot senders are narrowed with the answer, so the track binds to
+    /// the payload type the answer names and to no other.
+    #[tokio::test]
+    async fn the_slot_senders_send_under_the_answered_payload_type_alone() {
+        let (peer, answer) = answer_for(
+            "108 106|a=rtpmap:108 H264/90000\n\
+             a=fmtp:108 packetization-mode=1;profile-level-id=42e034\n\
+             a=rtpmap:106 H264/90000\n\
+             a=fmtp:106 packetization-mode=1;profile-level-id=42e01f",
+            2,
+        )
+        .await;
+        let answer = answer.expect("answer");
+        assert_eq!(
+            answered_video_codecs(&answer),
+            vec![vec!["108 H264/90000".to_owned()]; 2],
+            "{answer}"
+        );
+        for t in peer.pc.get_transceivers().await {
+            let codecs = t
+                .sender()
+                .await
+                .get_parameters()
+                .await
+                .rtp_parameters
+                .codecs;
+            let pts: Vec<u8> = codecs.iter().map(|c| c.payload_type).collect();
+            assert_eq!(pts, [108], "{codecs:?}");
+        }
+    }
+
+    /// One video section of a representative Chrome offer, written from the
+    /// shape current Chrome produces for a recvonly video transceiver (not a
+    /// capture): plain baseline ahead of constrained baseline, both
+    /// packetization modes, Main and High, rtx for each, VP9, AV1, red and
+    /// ulpfec, with Chrome's header extensions and feedback.
+    fn representative_chrome_video_section(mid: u32) -> String {
+        let mut section = format!(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103 104 105 106 107 108 109 127 125 39 40 98 99 100 101 45 46 112 113 116 117 118\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=rtcp:9 IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:pZ3k\r\n\
+             a=ice-pwd:Qd1rWm8Xv0bTgYk2Hc5nLs7e\r\n\
+             a=ice-options:trickle\r\n\
+             a=fingerprint:sha-256 FINGERPRINT\r\n\
+             a=setup:actpass\r\n\
+             a=mid:{mid}\r\n\
+             a=extmap:1 urn:ietf:params:rtp-hdrext:toffset\r\n\
+             a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n\
+             a=extmap:3 urn:3gpp:video-orientation\r\n\
+             a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n\
+             a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n\
+             a=extmap:6 http://www.webrtc.org/experiments/rtp-hdrext/video-content-type\r\n\
+             a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/video-timing\r\n\
+             a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/color-space\r\n\
+             a=extmap:9 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+             a=extmap:10 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n\
+             a=extmap:11 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\r\n\
+             a=recvonly\r\n\
+             a=rtcp-mux\r\n\
+             a=rtcp-rsize\r\n"
+        );
+        let codecs = [
+            ("96", "VP8/90000", None, true),
+            (
+                "102",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"),
+                true,
+            ),
+            (
+                "104",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f"),
+                true,
+            ),
+            (
+                "106",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"),
+                true,
+            ),
+            (
+                "108",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f"),
+                true,
+            ),
+            (
+                "127",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f"),
+                true,
+            ),
+            (
+                "39",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=4d001f"),
+                true,
+            ),
+            ("98", "VP9/90000", Some("profile-id=0"), true),
+            ("100", "VP9/90000", Some("profile-id=2"), true),
+            (
+                "45",
+                "AV1/90000",
+                Some("level-idx=5;profile=0;tier=0"),
+                true,
+            ),
+            (
+                "112",
+                "H264/90000",
+                Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f"),
+                true,
+            ),
+            ("116", "red/90000", None, false),
+            ("118", "ulpfec/90000", None, false),
+        ];
+        let rtx = [
+            ("97", "96"),
+            ("103", "102"),
+            ("105", "104"),
+            ("107", "106"),
+            ("109", "108"),
+            ("125", "127"),
+            ("40", "39"),
+            ("99", "98"),
+            ("101", "100"),
+            ("46", "45"),
+            ("113", "112"),
+            ("117", "116"),
+        ];
+        for (pt, codec, fmtp, feedback) in codecs {
+            section.push_str(&format!("a=rtpmap:{pt} {codec}\r\n"));
+            if feedback {
+                for fb in ["goog-remb", "transport-cc", "ccm fir", "nack", "nack pli"] {
+                    section.push_str(&format!("a=rtcp-fb:{pt} {fb}\r\n"));
+                }
+            }
+            if let Some(fmtp) = fmtp {
+                section.push_str(&format!("a=fmtp:{pt} {fmtp}\r\n"));
+            }
+            if let Some((rtx_pt, _)) = rtx.iter().find(|(_, apt)| *apt == pt) {
+                section.push_str(&format!(
+                    "a=rtpmap:{rtx_pt} rtx/90000\r\na=fmtp:{rtx_pt} apt={pt}\r\n"
+                ));
+            }
+        }
+        section
+    }
+
+    /// A whole representative Chrome offer: two recvonly video sections and
+    /// the control data channel, bundled.
+    fn representative_chrome_offer() -> String {
+        let mut offer = "v=0\r\n\
+             o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE 0 1 2\r\n\
+             a=extmap-allow-mixed\r\n\
+             a=msid-semantic: WMS\r\n"
+            .to_owned();
+        offer.push_str(&representative_chrome_video_section(0));
+        offer.push_str(&representative_chrome_video_section(1));
+        offer.push_str(
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:pZ3k\r\n\
+             a=ice-pwd:Qd1rWm8Xv0bTgYk2Hc5nLs7e\r\n\
+             a=ice-options:trickle\r\n\
+             a=fingerprint:sha-256 FINGERPRINT\r\n\
+             a=setup:actpass\r\n\
+             a=mid:2\r\n\
+             a=sctp-port:5000\r\n\
+             a=max-message-size:262144\r\n",
+        );
+        offer.replace("FINGERPRINT", "0B:30:55:7A:9F:C4:E9:0E:33:58:7D:A2:C7:EC:11:36:5B:80:A5:CA:EF:14:39:5E:83:A8:CD:F2:17:3C:61:86")
+    }
+
+    /// A whole offer in Chrome's shape, header extensions, rtx and all, is
+    /// answered with constrained baseline mode 1 alone in both video sections.
+    #[tokio::test]
+    async fn a_representative_chrome_offer_is_answered_with_the_sent_format_alone() {
+        let offer = representative_chrome_offer();
+        assert!(offers_sent_h264(&offer));
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], 2).await.expect("peer");
+        let answer = peer.answer_to_offer(offer).await.expect("answer");
+        assert_eq!(
+            answered_video_codecs(&answer),
+            vec![vec!["106 H264/90000".to_owned()]; 2],
+            "{answer}"
+        );
+        let fmtp = fmtp_of(&answer, "106");
+        assert!(
+            fmtp.contains("packetization-mode=1") && fmtp.contains("profile-level-id=42e01f"),
+            "{fmtp}"
+        );
     }
 }

@@ -914,7 +914,8 @@ export enum ErrorCode {
 	 */
 	CommandTargetUnknown = "command-target-unknown",
 	/**
-	 * `POST /offer` refused: the offer's video carries no H.264 with
+	 * `POST /offer` or `POST /renegotiate` refused: the offer's video carries
+	 * no H.264 constrained baseline (profile-level-id 42e0xx) with
 	 * packetization-mode=1, the only video Kerbcast sends. A browser
 	 * without H.264 support (some Firefox builds lack OpenH264) offers none.
 	 */
