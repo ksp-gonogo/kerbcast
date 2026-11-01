@@ -21,7 +21,6 @@ KSP_SYNC="$HOME/personal/gonogo/local_docs/syncthing/kspdata"
 KSP_MANAGED="$KSP_SYNC/KSP_Data/Managed"
 KSP_GAMEDATA="$KSP_SYNC/GameData"
 ARTIFACT_NAME="kerbcast-sidecar-linux-x64-dev"
-READBACK_IN_ZIP="GameData/Kerbcast/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so"
 
 die() {
   echo "dev-build: $*" >&2
@@ -195,17 +194,44 @@ if [ "$DEV_PROVIDER" = "1" ]; then
   [ -f "$DEV_DLL" ] || die "expected $DEV_DLL after the build"
 fi
 
-# Readback .so: not built here, taken from the latest release and cached.
+# Release assets this script cannot build, taken from the latest release zip and
+# cached per tag: the readback .so and the Unity shader bundles. Without the
+# bundles HullcamVDS falls back to its own shaders.linux, which renders every
+# filtered Hullcam camera solid black on Linux, and the atmospheric FX are off.
 RELEASE_TAG="$(gh release view --json tagName -q .tagName)"
-SO_CACHE="$CACHE/readback/$RELEASE_TAG/libAsyncGPUReadbackPlugin.so"
-if [ ! -f "$SO_CACHE" ]; then
-  echo "dev-build: fetching libAsyncGPUReadbackPlugin.so from $RELEASE_TAG"
+RELEASE_CACHE="$CACHE/release/$RELEASE_TAG"
+RELEASE_ASSETS=(
+  "Plugins/linux-x64/libAsyncGPUReadbackPlugin.so"
+  "HullcamShaders/shaders.linux"
+  "HullcamShaders/LICENSE.md"
+  "kerbcast-shaders"
+)
+missing_release_asset() {
+  local a
+  for a in "${RELEASE_ASSETS[@]}"; do
+    [ -f "$RELEASE_CACHE/$a" ] || return 0
+  done
+  return 1
+}
+if missing_release_asset; then
+  echo "dev-build: fetching the readback library and shader bundles from $RELEASE_TAG"
   mkdir -p "$WORK/release"
   gh release download "$RELEASE_TAG" --pattern "kerbcast-${RELEASE_TAG}.zip" -D "$WORK/release"
-  unzip -q -o "$WORK/release/kerbcast-${RELEASE_TAG}.zip" "$READBACK_IN_ZIP" -d "$WORK/release/x"
-  mkdir -p "$(dirname "$SO_CACHE")"
-  cp "$WORK/release/x/$READBACK_IN_ZIP" "$SO_CACHE.tmp"
-  mv "$SO_CACHE.tmp" "$SO_CACHE"
+  for a in "${RELEASE_ASSETS[@]}"; do
+    unzip -q -o "$WORK/release/kerbcast-${RELEASE_TAG}.zip" "GameData/Kerbcast/$a" -d "$WORK/release/x" ||
+      die "kerbcast-${RELEASE_TAG}.zip has no GameData/Kerbcast/$a"
+  done
+  mkdir -p "$(dirname "$RELEASE_CACHE")"
+  rm -rf "$RELEASE_CACHE.tmp"
+  mv "$WORK/release/x/GameData/Kerbcast" "$RELEASE_CACHE.tmp"
+  rm -rf "$RELEASE_CACHE"
+  mv "$RELEASE_CACHE.tmp" "$RELEASE_CACHE"
+fi
+SO_CACHE="$RELEASE_CACHE/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so"
+if ! git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+  echo "dev-build: warning: tag $RELEASE_TAG is not local, so the shipped $RELEASE_TAG shader bundles are unchecked against this tree" >&2
+elif ! git diff --quiet "$RELEASE_TAG" HEAD -- ci/kerbcast-shaders ci/hullcam-shaders; then
+  echo "dev-build: warning: shader sources changed since $RELEASE_TAG; this build ships the $RELEASE_TAG bundles" >&2
 fi
 
 # Plugin tgz, extracted at GameData/Kerbcast/ (same layout as the release zip).
@@ -220,13 +246,16 @@ chmod 644 "$STAGE/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so"
 cp -R "$SIDECAR_DIR"/. "$STAGE/Sidecar/linux-x64/"
 chmod +x "$STAGE/Sidecar/linux-x64/kerbcast-sidecar"
 cp Plugin/settings.cfg "$STAGE/settings.cfg.reference"
+mkdir -p "$STAGE/HullcamShaders"
+cp "$RELEASE_CACHE/HullcamShaders/shaders.linux" "$RELEASE_CACHE/HullcamShaders/LICENSE.md" "$STAGE/HullcamShaders/"
+cp "$RELEASE_CACHE/kerbcast-shaders" "$STAGE/kerbcast-shaders"
 
 # The dev marker turns on a development light speed; it is placed by hand on a test install, never shipped.
 [ ! -e "$STAGE/PluginData" ] || die "PluginData must never ship"
 
 mkdir -p "$WORK/out"
 PLUGIN_TGZ="kerbcast-plugin-${DEV_VERSION}.tgz"
-COPYFILE_DISABLE=1 tar -czf "$WORK/out/$PLUGIN_TGZ" -C "$STAGE" Plugins Sidecar settings.cfg.reference
+COPYFILE_DISABLE=1 tar -czf "$WORK/out/$PLUGIN_TGZ" -C "$STAGE" Plugins Sidecar HullcamShaders kerbcast-shaders settings.cfg.reference
 
 # npm packages at DEV_VERSION, packed from temp copies so the tree is untouched.
 echo "dev-build: building npm packages"
@@ -265,10 +294,14 @@ INNER_JSON="$(jq -n \
   --arg apidll "$(sha256 "$STAGE/Plugins/Kerbcast.API.dll")" \
   --arg sidecar "$(sha256 "$STAGE/Sidecar/linux-x64/kerbcast-sidecar")" \
   --arg so "$(sha256 "$STAGE/Plugins/linux-x64/libAsyncGPUReadbackPlugin.so")" \
+  --arg hullcam "$(sha256 "$STAGE/HullcamShaders/shaders.linux")" \
+  --arg fx "$(sha256 "$STAGE/kerbcast-shaders")" \
   '{"Plugins/Kerbcast.dll": $dll,
     "Plugins/Kerbcast.API.dll": $apidll,
     "Sidecar/linux-x64/kerbcast-sidecar": $sidecar,
-    "Plugins/linux-x64/libAsyncGPUReadbackPlugin.so": $so}')"
+    "Plugins/linux-x64/libAsyncGPUReadbackPlugin.so": $so,
+    "HullcamShaders/shaders.linux": $hullcam,
+    "kerbcast-shaders": $fx}')"
 if [ "$DEV_PROVIDER" = "1" ]; then
   INNER_JSON="$(jq --arg dev "$(sha256 "$STAGE/Plugins/Kerbcast.DevProvider.dll")" \
     '. + {"Plugins/Kerbcast.DevProvider.dll": $dev}' <<<"$INNER_JSON")"
@@ -295,6 +328,7 @@ jq -n \
     built_at: $built_at,
     sidecar_ci_run: $run_url,
     readback_lib_from_release: $readback_tag,
+    shader_bundles_from_release: $readback_tag,
     plugin_tgz_extract_to: "GameData/Kerbcast",
     sha256: $files,
     plugin_tgz_contents_sha256: $inner,
@@ -309,4 +343,5 @@ echo "dev-build: done -> $OUT"
 echo "  version   $DEV_VERSION ($BRANCH @ $SHORT_SHA, base $DESCRIBE)"
 echo "  sidecar   $RUN_URL"
 echo "  readback  .so from $RELEASE_TAG ($(sha256 "$SO_CACHE" | cut -c1-12))"
+echo "  shaders   HullcamShaders/shaders.linux and kerbcast-shaders from $RELEASE_TAG"
 (cd "$OUT" && ls -1)
