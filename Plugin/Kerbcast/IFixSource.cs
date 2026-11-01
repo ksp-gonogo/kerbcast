@@ -78,6 +78,10 @@ namespace Kerbcast
 
         /* The subject at `ut`. */
         CraftFix Subject(double ut);
+        /* The subject at `ut` on the motion the source gives it now, read back
+           before the start of what the source vouches for as that motion
+           predicts it; otherwise as Subject. */
+        CraftFix SubjectAlong(double ut);
         /* How the subject moves on from `ut`, for the forecast, the earliest UT
            the source places it at (minus infinity for truth, which has its
            whole past) and the UT that motion holds until (infinity for truth).
@@ -140,6 +144,7 @@ namespace Kerbcast
         public uint SubjectPersistentId => Now.SubjectPersistentId;
         public string SubjectName => Now.SubjectName;
         public CraftFix Subject(double ut) => Now.Subject(ut);
+        public CraftFix SubjectAlong(double ut) => Now.SubjectAlong(ut);
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt) =>
             Now.SubjectMotion(ut, out motion, out validFromUt, out validUntilUt);
         public double SubjectRadiusM => Now.SubjectRadiusM;

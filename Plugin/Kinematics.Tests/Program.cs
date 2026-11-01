@@ -196,6 +196,64 @@ foreach (bool inverse in new[] { false, true })
     Check(((b - a) * 1000.0 - v).Magnitude < 1e-3, "surface velocity is the spin's");
 }
 
+/* LatLonOf undoes SurfaceAt as the body turns, on axes that are not the fixed frame's. */
+{
+    var tilt = 0.3;
+    var kb = new KinematicsBody { Known = true, Radius = KerbinRadius, AxisX = new DVec3(Math.Cos(tilt), Math.Sin(tilt), 0), AxisY = new DVec3(-Math.Sin(tilt), Math.Cos(tilt), 0),
+        AxisZ = new DVec3(0, 0, 1), SpinDegPerS = 360.0 / 21549.425, AxesUt = 100 };
+    double worst = 0;
+    foreach (var (lat, lon) in new[] { (-0.0972, -74.5577), (45.0, 120.0), (-60.0, 179.0), (10.0, 0.0) })
+        foreach (double ut in new[] { 100.0, 37.5, 5000.0 })
+        {
+            kb.LatLonOf(kb.SurfaceAt(lat, lon, 70, ut, out _), ut, out double gotLat, out double gotLon);
+            worst = Math.Max(worst, Math.Max(Math.Abs(gotLat - lat), Math.Abs(gotLon - lon)));
+        }
+    Check(worst < 1e-9, $"latLonOf: undoes SurfaceAt as the body turns (worst {worst:G3} deg)");
+}
+
+/* A resting pad craft published as a ballistic state vector, read back 3 s before its start, stays at the pad once floored. */
+{
+    var kb = new KinematicsBody { Known = true, Mu = KerbinMu, Radius = KerbinRadius, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1),
+        SpinDegPerS = 360.0 / 21549.425 };
+    const double padAlt = 70, from = 1000;
+    var pad = kb.SurfaceAt(-0.0972, -74.5577, padAlt, from, out var spin);
+    KeplerPath.TryFromState(pad, spin, from, KerbinMu, out var path, KerbinRadius);
+    path.TryAt(from - 3, out var back, out _);
+    double fell = pad.Magnitude - back.Magnitude;
+    Check(fell > 40, $"pad read-back: the ballistic path alone puts the resting craft {fell:F1} m under the pad 3 s back");
+    double ground = KerbinRadius + padAlt;
+    var floored = Kinematics.NoLowerThan(back, Math.Min(pad.Magnitude, ground));
+    var truth = kb.SurfaceAt(-0.0972, -74.5577, padAlt, from - 3, out _);
+    Check(floored.Magnitude >= ground - 1e-6, $"pad read-back: floored, it is at or above the pad ({floored.Magnitude - ground:F3} m)");
+    Check((floored - truth).Magnitude < 1, $"pad read-back: and where the pad was then ({(floored - truth).Magnitude:F3} m off)");
+    var high = new DVec3(KerbinRadius + 5000, 0, 0);
+    Check(Kinematics.NoLowerThan(high, ground).Equals(high) && Kinematics.NoLowerThan(back, double.NaN).Equals(back),
+        "noLowerThan: a place above its floor, or with no floor, is left");
+}
+
+/* A craft resting 30 m above the terrain (clamps, a roof), read back 4 s before its start, stays at its start radius; a moving one is held at the ground. */
+{
+    var kb = new KinematicsBody { Known = true, Mu = KerbinMu, Radius = KerbinRadius, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1),
+        SpinDegPerS = 360.0 / 21549.425 };
+    const double terrain = 70, from = 1000;
+    double ground = KerbinRadius + terrain;
+    var start = kb.SurfaceAt(-0.0972, -74.5577, terrain + 30, from, out var spin);
+    KeplerPath.TryFromState(start, spin, from, KerbinMu, out var path, KerbinRadius);
+    path.TryAt(from - 4, out var back, out _);
+    Check(start.Magnitude - back.Magnitude > 30, $"resting read-back: the ballistic path alone drops it below the terrain ({start.Magnitude - back.Magnitude:F1} m)");
+    double floor = Kinematics.ReadBackFloorM(kb, start, spin, ground);
+    var floored = Kinematics.NoLowerThan(back, floor);
+    Check(Kinematics.Resting(kb, start, spin) && Math.Abs(floored.Magnitude - start.Magnitude) < 1e-6,
+        $"resting read-back: floored, it stays at its start radius ({floored.Magnitude - start.Magnitude:F3} m)");
+
+    var climbing = spin + start.Normalized * 50;
+    Check(!Kinematics.Resting(kb, start, climbing) && Kinematics.ReadBackFloorM(kb, start, climbing, ground) == ground,
+        "climbing read-back: a craft moving against the ground is held at the ground, not at its start");
+    Check(Kinematics.ReadBackFloorM(kb, start, climbing, double.NaN) is double none && double.IsNaN(none)
+        && Kinematics.ReadBackFloorM(kb, start, spin, double.NaN) == start.Magnitude,
+        "read-back floor: no ground known leaves a moving craft unfloored, a resting one still at its start");
+}
+
 /* The propagator on its own: invariants, round trips and the awkward conics. */
 {
     var cases = new (string name, DVec3 r, DVec3 v)[]

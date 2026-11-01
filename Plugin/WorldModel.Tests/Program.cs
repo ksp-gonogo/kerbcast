@@ -807,6 +807,9 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     Check(!snap.TryStateAt(conic, default(KinematicsBody), 1234, out _, out _), "snapshot: an unknown body places nothing");
     Check(ModelRules.UncertaintyAt(state, 51) == 5 + 1 + 10 && ModelRules.UncertaintyAt(conic, 1000) == 0,
         "snapshot: a record's uncertainty at a UT, zero when it gave none");
+    Check(ModelRules.UncertaintyAlong(state, 49) == 5 + 1 + 10 && ModelRules.UncertaintyAlong(state, 51) == 5 + 1 + 10
+        && ModelRules.UncertaintyAt(state, 49) == 5 && ModelRules.UncertaintyAlong(conic, 0) == 0,
+        "snapshot: read back before its start, a record's uncertainty grows as it does after, where UncertaintyAt holds its start");
 
     Exception offThread = null;
     var t = new Thread(() => { try { snap.TryPath(conic, kerbin, out _); } catch (Exception ex) { offThread = ex; } });

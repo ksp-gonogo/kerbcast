@@ -121,6 +121,72 @@ namespace Kerbcast
             return fix;
         }
 
+        /*
+         * A record vouches for nothing before its ValidFromUt; read back from
+         * there, its own path places the craft as the record predicts it. The
+         * uncertainty grows with how far back it reads, as it does forward.
+         * A path that is not a surface point is held no lower than the ground
+         * under its start, or the start itself when that is lower or the
+         * craft rests there: a craft resting or just lifting off carries no
+         * fall in its past, though a ballistic path read back puts one there.
+         * Only the ground under the start is sampled, so a low, fast craft
+         * read back over higher ground can still be drawn into it.
+         */
+        public CraftFix SubjectAlong(double ut)
+        {
+            var fix = Subject(ut);
+            if (fix.Positioned || _subjectPid == 0) return fix;
+            try
+            {
+                var view = Capture(ut);
+                int scope = ScopeIndex(view);
+                var known = ModelLookup.Find(view, scope, _subjectPid, double.NaN, BodyKnownFn);
+                if (known.State != CraftFixState.Positioned || !(ut < known.Record.ValidFromUt)) return fix;
+                var start = ModelLookup.Of(view, known.Scope, known.Record, known.Record.ValidFromUt, BodyKnownFn);
+                if (start.State != CraftFixState.Positioned) return fix;
+                var along = Placed(view, start, ut, true);
+                if (!along.Positioned) return fix;
+                along.UncertaintyM = ModelRules.UncertaintyAlong(known.Record, ut);
+                if (known.Record.Kinematics != Api.KinematicsKind.Surface && along.Body != null)
+                {
+                    var centre = new DVec3(along.Body.position.x, along.Body.position.y, along.Body.position.z);
+                    along.World = centre + Kinematics.NoLowerThan(along.World - centre, FloorOf(view, known.Record, along.Body));
+                }
+                return along;
+            }
+            catch (Exception ex)
+            {
+                Threw(ex);
+                return fix;
+            }
+        }
+
+        private long _floorGeneration = -1;
+        private uint _floorPid;
+        private double _floorFromUt = double.NaN;
+        private double _floorM = double.NaN;
+
+        /* The read-back floor for `r`, in metres from its body's centre, worked out once per record since it may sample the terrain; NaN for none. */
+        private double FloorOf(WorldModelView view, in ModelRecord r, CelestialBody body)
+        {
+            long generation = view.Snapshot != null ? view.Snapshot.Generation : 0;
+            if (_floorGeneration == generation && _floorPid == r.PersistentId && _floorFromUt == r.ValidFromUt) return _floorM;
+            _floorGeneration = generation;
+            _floorPid = r.PersistentId;
+            _floorFromUt = r.ValidFromUt;
+            _floorM = double.NaN;
+            var kb = KinematicsWorld.Now().Of(body);
+            if (!view.Snapshot.TryStateAt(r, kb, r.ValidFromUt, out var at, out var velocity)) return _floorM;
+            double ground = double.NaN;
+            if (body.pqsController != null && !Kinematics.Resting(kb, at, velocity))
+            {
+                kb.LatLonOf(at, r.ValidFromUt, out double lat, out double lon);
+                ground = body.Radius + body.TerrainAltitude(lat, lon, !body.ocean);
+            }
+            _floorM = Kinematics.ReadBackFloorM(kb, at, velocity, ground);
+            return _floorM;
+        }
+
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt)
         {
             motion = default;

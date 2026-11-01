@@ -1485,6 +1485,71 @@ bool IsLatest<T>(ref T path, DVec3 lens, double tt, double c, double k, double t
         $"once its root passes the record's start the craft is drawn at the root, whose light has arrived, without a jump ({firstPast:F3} s past the start)");
 }
 
+/* ---- a far lens on a world model republished more often than its light time ---- */
+{
+    /* A craft 300 km out crossing at 200 m/s, light at 100 km/s: 3 s of light time against a record republished every 2 s from its publish UT. */
+    const double c = 100000, x0 = 300000, v = 200, publish = 2.0, t0 = 1000;
+    var lens = new DVec3(0, 0, 0);
+    DVec3 Truth(double ut) => new DVec3(x0, v * ut, 0);
+    double heldRun = 0, oldRun = 0, worstMiss = 0, lastY = double.NaN, worstStill = 0;
+    bool found = true, rising = true;
+    for (double t = t0; t < t0 + 20; t += 1.0 / 60)
+    {
+        double from = t0 + Math.Floor((t - t0) / publish) * publish;
+        var record = new Crossing { X = x0, V = v };
+        var windowed = new CrossingFrom { Inner = record, From = from };
+        var old = PastInstant.SolveFrom(ref windowed, lens, t, c, v, from, t, out double oldTr);
+        var st = PastInstant.SolveAlong(ref record, ref windowed, lens, t, c, v, from, t, out double tr);
+        if (st != PastStatus.Found) { found = false; continue; }
+        record.TryAt(tr, out var at);
+        /* Where the light arriving now left the craft. */
+        double truthTr = t - Truth(tr).Magnitude / c;
+        worstMiss = Math.Max(worstMiss, (at - Truth(truthTr)).Magnitude);
+        if (!double.IsNaN(lastY))
+        {
+            if (!(at.Y > lastY)) rising = false;
+            worstStill = Math.Max(worstStill, Math.Abs(at.Y - lastY - v / 60));
+        }
+        lastY = at.Y;
+        if (old == PastStatus.Found && oldTr == from) oldRun += 1.0 / 60;
+        if (tr == from) heldRun += 1.0 / 60;
+    }
+    Check(oldRun > 19, $"solved from the record's start, the far craft stands at the start for the whole interval ({oldRun:F1} of 20 s)");
+    Check(found && heldRun == 0 && rising, $"read back along its record, the far craft moves on every frame and is never held at a start ({heldRun:F1} s held)");
+    Check(worstMiss < 1 && worstStill < 0.1, $"it is placed where its light left it ({worstMiss:F3} m off), moving at its own speed every frame ({worstStill:F4} m off a frame's travel)");
+
+    var refuses = new CrossingFrom { Inner = new Crossing { X = x0, V = v }, From = t0 };
+    var st2 = PastInstant.SolveAlong(ref refuses, ref refuses, lens, t0 + 1, c, v, t0, t0 + 1, out double tr2);
+    Check(st2 == PastStatus.Found && tr2 == t0, $"a record that cannot be read back is still placed at its start ({st2})");
+}
+
+/* ---- a read-back is capped, and held at the cap past it ---- */
+{
+    /* 600 km at 100 km/s: 6 s of light time, deeper than the cap on every record. From UT 0, so the crossing stays near its closest. */
+    const double c = 100000, v = 200, t0 = 0;
+    var lens = new DVec3(0, 0, 0);
+    bool capped = true, found = true;
+    double lastTr = double.NegativeInfinity;
+    for (double t = t0; t < t0 + 1.9; t += 1.0 / 60)
+    {
+        var record = new Crossing { X = 600000, V = v };
+        var windowed = new CrossingFrom { Inner = record, From = t0 };
+        var st = PastInstant.SolveAlong(ref record, ref windowed, lens, t, c, v, t0, t, out double tr);
+        found &= st == PastStatus.Found;
+        capped &= tr == t0 - PastInstant.MaxReadBackS && tr >= lastTr;
+        lastTr = tr;
+    }
+    Check(found && capped, $"a light time past the cap holds the craft {PastInstant.MaxReadBackS} s before the record's start, never further");
+
+    /* 350 km: 3.5 s, inside the cap, read back to the root itself. */
+    var near = new Crossing { X = 350000, V = v };
+    var nearWindowed = new CrossingFrom { Inner = near, From = t0 };
+    var st2 = PastInstant.SolveAlong(ref near, ref nearWindowed, lens, t0, c, v, t0, t0, out double tr2);
+    near.TryAt(tr2, out var at2);
+    Check(st2 == PastStatus.Found && tr2 > t0 - PastInstant.MaxReadBackS && Math.Abs(tr2 + at2.Magnitude / c - t0) < 1e-5,
+        $"a light time inside the cap is read back to its root ({t0 - tr2:F3} s back)");
+}
+
 /* ---- a place on a turning body whose ground outruns light ---- */
 {
     /* Kerbin's equator turns at about 175 m/s; a lens and a craft on the pad 500 m apart, c = 60. */
@@ -1762,5 +1827,28 @@ struct Orbits : IBodyTree
         offset = new DVec3(Math.Cos(lan) * xp - Math.Sin(lan) * Math.Cos(inc) * yp, Math.Sin(lan) * xp + Math.Cos(lan) * Math.Cos(inc) * yp,
             Math.Sin(inc) * yp);
         return true;
+    }
+}
+
+/* A craft crossing the lens's view at X, moving along y at V. */
+struct Crossing : IPastPath
+{
+    public double X, V;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = new DVec3(X, V * ut, 0);
+        return true;
+    }
+}
+
+/* Inner, but placed only from From on. */
+struct CrossingFrom : IPastPath
+{
+    public Crossing Inner;
+    public double From;
+    public bool TryAt(double ut, out DVec3 position)
+    {
+        position = default;
+        return ut >= From && Inner.TryAt(ut, out position);
     }
 }

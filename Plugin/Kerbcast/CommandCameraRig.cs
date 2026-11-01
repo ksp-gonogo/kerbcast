@@ -778,9 +778,14 @@ namespace Kerbcast
          * positions, never the picture's, in the frame of the common ancestor
          * of the lens's body and the subject's, as the picture solves it. Render
          * UT with no light speed. A source that places the subject only from
-         * a later UT (a world model's record from its ValidFromUt) gives it as
-         * it places it then; otherwise a source that cannot be solved back to
-         * that instant has no fix. A world model's place on the lens's own
+         * a later UT (a world model's record from its ValidFromUt) is read back
+         * along that record's own path, as it predicts the craft at the
+         * instant, so a far lens follows the craft between publishes: no
+         * further back than PastInstant.MaxReadBackS, where it is held, and no
+         * lower than the ground under its start (or the start itself, when
+         * that is lower or the craft rests there). Only where it cannot be read
+         * back is the subject taken as it is placed from then. Otherwise a source that cannot be solved back to that
+         * instant has no fix. A world model's place on the lens's own
          * ground stands where the source puts it now, at the instant of its
          * light time from there; that instant steps back whenever the range
          * grows faster than light. Otherwise the instant never steps back while
@@ -830,10 +835,14 @@ namespace Kerbcast
             {
                 var frameBody = tree.Body(frame);
                 if (frameBody == null) break;
-                var path = new KnownPath { Source = _known, Tree = tree, Frame = frame };
-                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, validFrom, ut) : 0;
+                var path = new KnownPath { Source = _known, Tree = tree, Frame = frame, Along = true };
+                var windowed = path;
+                windowed.Along = false;
+                /* Read back before the record's start, the root lies no earlier than this while the craft is under half the light speed, and no read goes past the cap. */
+                double reach = Math.Max(PastInstant.ReadBackFloor(validFrom), Math.Min(validFrom, ut - 2.0 * (station - now.World).Magnitude / c.Value));
+                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, double.IsInfinity(reach) ? validFrom : reach, ut) : 0;
                 var lens = station - ToD(frameBody.position);
-                if (PastInstant.SolveFrom(ref path, lens, ut, c.Value, bound, validFrom, ut, out double tr) != PastStatus.Found)
+                if (PastInstant.SolveAlong(ref path, ref windowed, lens, ut, c.Value, bound, validFrom, ut, out double tr) != PastStatus.Found)
                 {
                     if (pass == 0) break;
                     /* The second frame would not solve: keep the first frame's instant. */
@@ -844,7 +853,7 @@ namespace Kerbcast
                     lens = station - ToD(frameBody.position);
                     return HeldKnown(ref path, lens, station, ut, c.Value, lensIndex, tr);
                 }
-                var then = _known.Subject(tr);
+                var then = _known.SubjectAlong(tr);
                 int next = then.Body != null ? PastInstant.CommonAncestor(ref tree, lensIndex, then.Body.flightGlobalsIndex) : frame;
                 bool settled = next == frame || pass == 1;
                 if (!settled)
@@ -889,7 +898,7 @@ namespace Kerbcast
             }
             _knownHold.Shown(ut, tr, 0, c, lensIndex, path.Frame);
             _subjectUt = tr;
-            return _known.Subject(tr);
+            return _known.SubjectAlong(tr);
         }
 
         private InstantHold _knownHold;
@@ -903,11 +912,13 @@ namespace Kerbcast
             public IFixSource Source;
             public KeplerBodyTree Tree;
             public int Frame;
+            /* Read along the subject's motion before the start its source vouches from. */
+            public bool Along;
 
             public bool TryAt(double ut, out DVec3 position)
             {
                 position = default;
-                var fix = Source.Subject(ut);
+                var fix = Along ? Source.SubjectAlong(ut) : Source.Subject(ut);
                 if (!fix.Positioned || fix.Body == null) return false;
                 if (!PastInstant.TryAbout(ref Tree, fix.Body.flightGlobalsIndex, Frame, ut, out var body)) return false;
                 position = body + (fix.World - ToD(fix.Body.position));

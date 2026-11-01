@@ -302,6 +302,15 @@ namespace Kerbcast
             r.HasUncertainty ? Kinematics.UncertaintyAt(r.UncertaintyRadiusM, r.RateMps, r.AccelMps2, r.SpeedCapMps, ut - r.ValidFromUt) : 0.0;
 
         /*
+         * The uncertainty radius at `ut` for a place read back along the
+         * record's own path before its ValidFromUt as well as after: the bound
+         * grows with the distance from the start either way, since the path is
+         * as unsure of where the craft was as of where it will be.
+         */
+        public static double UncertaintyAlong(in ModelRecord r, double ut) =>
+            r.HasUncertainty ? Kinematics.UncertaintyAt(r.UncertaintyRadiusM, r.RateMps, r.AccelMps2, r.SpeedCapMps, Math.Abs(ut - r.ValidFromUt)) : 0.0;
+
+        /*
          * A record's state at `ut`, before any position is computed. A
          * positioned record outside its window, or on a body index this game
          * does not have (`bodyKnown`), reads refused with the stale code; refused and

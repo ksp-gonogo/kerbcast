@@ -137,6 +137,37 @@ namespace Kerbcast
         }
 
         /*
+         * Solve for a world model's record read back before its start `lo`
+         * along its own path (`along`), as the record predicts the craft
+         * there, so a lens whose light time is longer than the record's age
+         * still follows the craft between publishes instead of holding it at
+         * the record's start. It reads back MaxReadBackS at most and holds the
+         * craft there past it, as SolveFrom holds it at a start. Where `along`
+         * cannot be read back, SolveFrom on `windowed`, the record as it
+         * vouches from `lo`.
+         */
+        public static PastStatus SolveAlong<TA, TW>(ref TA along, ref TW windowed, DVec3 lens, double t, double c,
+            double speedBound, double lo, double hi, out double tr) where TA : IPastPath where TW : IPastPath
+        {
+            var status = SolveFrom(ref along, lens, t, c, speedBound, ReadBackFloor(lo), hi, out tr);
+            if (status != PastStatus.Unsolved || double.IsInfinity(lo)) return status;
+            return SolveFrom(ref windowed, lens, t, c, speedBound, lo, hi, out tr);
+        }
+
+        /*
+         * How far before its start a record is read back. A record is
+         * republished every 2 s or so, so a lens reads back its light time less
+         * the record's age: no more than 4 s for light times up to 4 s, even
+         * on a record just published. Further back the path's error grows
+         * with the square of the time while its use does not, so past this
+         * the craft is held where the cap puts it.
+         */
+        public const double MaxReadBackS = 4.0;
+
+        /* The earliest UT a record starting at `lo` is read back to; an unbounded start stays unbounded. */
+        public static double ReadBackFloor(double lo) => double.IsInfinity(lo) ? lo : lo - MaxReadBackS;
+
+        /*
          * The instant a place fixed to a body, `distance` from the lens now,
          * stands for: its light time back from t, no earlier than `lo`. The
          * place is the same on its body at every instant, so it is drawn where

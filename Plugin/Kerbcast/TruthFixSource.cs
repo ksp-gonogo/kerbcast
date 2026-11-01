@@ -79,6 +79,9 @@ namespace Kerbcast
             return fix;
         }
 
+        /* Truth has the craft's whole past. */
+        public CraftFix SubjectAlong(double ut) => Subject(ut);
+
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt)
         {
             motion = default;

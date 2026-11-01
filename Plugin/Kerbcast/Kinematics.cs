@@ -64,6 +64,17 @@ namespace Kerbcast
             velocity = new DVec3(-w * at.Y, w * at.X, 0);
             return at;
         }
+
+        /* The latitude and longitude, in degrees, of the surface under a fixed-frame place about the body centre at `ut`: SurfaceAt undone. */
+        public void LatLonOf(DVec3 position, double ut, out double latitudeDeg, out double longitudeDeg)
+        {
+            double turn = -SpinDegPerS * Kinematics.Deg2Rad * (ut - AxesUt);
+            double c = Math.Cos(turn), s = Math.Sin(turn);
+            var p = new DVec3(position.X * c - position.Y * s, position.X * s + position.Y * c, position.Z);
+            double x = DVec3.Dot(p, AxisX), y = DVec3.Dot(p, AxisY), z = DVec3.Dot(p, AxisZ);
+            latitudeDeg = Math.Atan2(z, Math.Sqrt(x * x + y * y)) / Kinematics.Deg2Rad;
+            longitudeDeg = Math.Atan2(y, x) / Kinematics.Deg2Rad;
+        }
     }
 
     /*
@@ -309,6 +320,39 @@ namespace Kerbcast
         public const double Deg2Rad = Math.PI / 180.0;
 
         public static bool Finite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
+
+        /* A place about a body centre lifted along its own radius to at least `floorM` from the centre; a floor that is not a positive number leaves it. */
+        public static DVec3 NoLowerThan(DVec3 position, double floorM)
+        {
+            double r = position.Magnitude;
+            return floorM > 0 && r > 0 && r < floorM ? position * (floorM / r) : position;
+        }
+
+        /* A start moving slower than this against the ground under it is resting there. */
+        public const double RestingMps = 1.0;
+
+        /*
+         * The floor a record read back before its start is held at, in metres
+         * from the body centre, for a start at `start` moving at
+         * `startVelocity` in the fixed frame: the ground `groundM` under it,
+         * or the start itself when that is lower or when the craft rests
+         * there, since a craft standing on clamps or a roof carries no fall in
+         * its past either. NaN for none.
+         */
+        public static double ReadBackFloorM(in KinematicsBody body, DVec3 start, DVec3 startVelocity, double groundM)
+        {
+            double r = start.Magnitude;
+            if (Resting(body, start, startVelocity)) return r;
+            return Finite(groundM) ? Math.Min(r, groundM) : double.NaN;
+        }
+
+        /* Whether a craft at `position` moving at `velocity`, both in the fixed frame, moves with the ground under it. */
+        public static bool Resting(in KinematicsBody body, DVec3 position, DVec3 velocity)
+        {
+            double w = body.SpinDegPerS * Deg2Rad;
+            var ground = new DVec3(-w * position.Y, w * position.X, 0);
+            return (velocity - ground).Magnitude < RestingMps;
+        }
 
         /* Planetarium.CelestialFrame.SetFrame(LAN, inc, argPe) in radians: X toward periapsis, Y a quarter turn on in the direction of motion. */
         public static void OrbitalFrame(double lan, double inc, double argPe, out DVec3 x, out DVec3 y)
