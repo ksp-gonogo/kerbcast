@@ -83,6 +83,7 @@ export {
   ARM_TIMEOUT_MS,
   KEYFRAME_RETRY_MS,
   SOURCE_LOST_GRACE_MS,
+  CAMERA_UNLISTED_GRACE_MS,
   RECONNECT_GRACE_MS,
   videoElementDecodedSizeProbe,
   type ActiveRecordingInfo,

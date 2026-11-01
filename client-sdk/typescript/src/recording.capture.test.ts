@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { accessUnits } from "../fixtures/h264";
 import type { EncodedFrameCopy } from "./captureClip";
 import {
+  CAMERA_UNLISTED_GRACE_MS,
   KEYFRAME_RETRY_MS,
   RecordingController,
   type RecordingClient,
@@ -147,10 +148,12 @@ describe("capture-timed recording", () => {
     const controller = new RecordingController(client);
     const cam = client.camera(1);
     const aus = accessUnits();
+    vi.useFakeTimers();
     const id = controller.startRecording(1);
     for (let i = 0; i < 6; i++) cam.send(aus[i], i * 3000);
 
     client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
     await vi.waitFor(() => expect(controller.fetchRecording(id)).toBeDefined());
 
     const handle = controller.fetchRecording(id)!;

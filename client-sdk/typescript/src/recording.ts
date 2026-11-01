@@ -47,8 +47,9 @@ export interface UtSample {
  * Why a recording ended. `"user"`: stopped by a call (a Stop button, a
  * grouped stop). `"max-duration"`: its `maxDurationMs` ran out.
  * `"camera-gone"`: its camera went away (destroyed, as in a scene change, or
- * dropped from the camera list), or the game went back in time under it (a
- * revert or quickload, which starts a new capture epoch). `"feed-closed"`:
+ * still missing from the camera list after {@link CAMERA_UNLISTED_GRACE_MS}),
+ * or the game went back in time under it (a revert or quickload, which starts
+ * a new capture epoch). `"feed-closed"`:
  * the camera is still there but its feed left this client (its tile removed
  * or switched to another camera, its track ended) and did not come back
  * within {@link SOURCE_LOST_GRACE_MS}. `"disconnected"`: the client lost the
@@ -69,6 +70,18 @@ export type RecordingEndReason =
  * unmounted and mounted again in one layout change.
  */
 export const SOURCE_LOST_GRACE_MS = 2000;
+
+/**
+ * How long a recording keeps going through a brief gap in the camera list
+ * before it finishes as `"camera-gone"`. A camera listed again within it
+ * resumes into the same recording, and its feed gets a fresh
+ * {@link SOURCE_LOST_GRACE_MS} from then to rebind. A camera that stays away
+ * ends the clip when the grace runs out, so the clip keeps the grace as its
+ * tail. A camera reported destroyed still ends it at once, and so does a
+ * revert or quickload: game time went back, which one clip's timeline cannot
+ * hold.
+ */
+export const CAMERA_UNLISTED_GRACE_MS = 2000;
 
 /**
  * How long a recording waits for the client to reconnect and its camera's
@@ -1025,11 +1038,13 @@ export class RecordingController {
 
   /**
    * Ends a recording when its camera goes away, so the clip is saved rather
-   * than left recording a camera nobody can stop any more. A destroyed or
-   * unlisted camera ends it at once. A feed that leaves this client gets
-   * {@link SOURCE_LOST_GRACE_MS} to come back, or, once the connection has
-   * dropped, until {@link RECONNECT_GRACE_MS} after the sidecar was last
-   * heard from, as a reconnect brings it back.
+   * than left recording a camera nobody can stop any more. A destroyed camera
+   * ends it at once; one missing from the list gets
+   * {@link CAMERA_UNLISTED_GRACE_MS} to be listed again. A feed that leaves
+   * this client gets {@link SOURCE_LOST_GRACE_MS} to come back, or, once the
+   * connection has dropped, until {@link RECONNECT_GRACE_MS} after the
+   * sidecar was last heard from, as a reconnect brings it back. While the
+   * camera is missing from the list, the list decides, not the feed.
    */
   private watchCamera(rec: ActiveRecording): () => void {
     const cam = this.client.camera(rec.flightId);
@@ -1038,8 +1053,14 @@ export class RecordingController {
       if (timer != null) clearTimeout(timer);
       timer = undefined;
     };
+    let unlistedTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearUnlisted = (): void => {
+      if (unlistedTimer != null) clearTimeout(unlistedTimer);
+      unlistedTimer = undefined;
+    };
     const gone = (reason: RecordingEndReason): void => {
       clearTimer();
+      clearUnlisted();
       this.endOnItsOwn(rec.recordingId, reason);
     };
     const connected = (): boolean => this.client.state == null || this.client.state === "connected";
@@ -1082,9 +1103,14 @@ export class RecordingController {
         waitForReconnect();
         return;
       }
-      /* A camera that left the list ended the recording already, so one
-         still recording here is listed and only its feed is gone. */
+      /*
+       * A camera missing from the list usually loses its feed too, and that
+       * is the list's to judge: it ends the clip as camera-gone, or, listed
+       * again, restarts this grace so the feed has time to rebind. The timer
+       * stays set while it waits, marking the feed as missing.
+       */
       timer = setTimeout(() => {
+        if (unlistedTimer != null) return;
         if (connected() && !dropped) gone("feed-closed");
         else waitForReconnect();
       }, SOURCE_LOST_GRACE_MS);
@@ -1092,7 +1118,27 @@ export class RecordingController {
     /* Every camera state change also arrives as a new list. */
     const offCameras = this.client.on("cameras-change", (cameras) => {
       const listed = cameras.find((c) => c.flightId === rec.flightId);
-      if (!listed || listed.lifecycle === CameraLifecycle.Destroyed) gone("camera-gone");
+      if (listed && listed.lifecycle !== CameraLifecycle.Destroyed) {
+        if (unlistedTimer == null) return;
+        clearUnlisted();
+        /* The feed rebinds after the list returns, so its grace starts over. */
+        if (timer != null && !dropped) {
+          clearTimer();
+          onSource(false);
+        }
+        return;
+      }
+      if (listed) {
+        gone("camera-gone");
+        return;
+      }
+      if (unlistedTimer != null) return;
+      /* A dropped connection is the reconnect grace's to judge, and the list
+         comes back with the connection. */
+      unlistedTimer = setTimeout(() => {
+        unlistedTimer = undefined;
+        if (connected()) gone("camera-gone");
+      }, CAMERA_UNLISTED_GRACE_MS);
     });
     const offSource = cam.on("source", onSource);
     const offState = this.client.on("state-change", (state) => {
@@ -1109,6 +1155,7 @@ export class RecordingController {
     if (cam.hasSource === false) onSource(false);
     return () => {
       clearTimer();
+      clearUnlisted();
       offCameras();
       offSource();
       offState();
@@ -1661,11 +1708,23 @@ export class RecordingController {
     return rec.epoch != null && epoch != null && epoch !== rec.epoch;
   }
 
+  /** Adds a recording's last clock sample, at the stop, and returns its end UT. */
+  private closeUtTrack(rec: ActiveRecording): number | undefined {
+    const utEnd = this.utEndOf(rec);
+    rec.utSamples.push({ t: now() - rec.startedAt, ut: utEnd });
+    return utEnd;
+  }
+
   /** The clock's UT at a stop, or the last one in the recording's own epoch once the clock has left it. */
   private utEndOf(rec: ActiveRecording): number | undefined {
     return this.leftEpoch(rec) ? rec.latestUt : (this.client.clock.captureUt ?? undefined);
   }
 
+  /**
+   * Stops a recording and saves its clip, which runs up to this stop. A clip
+   * that ended on its own after a grace (a camera missing from the list, a
+   * feed that left) keeps that grace as its tail.
+   */
   private stopWith(recordingId: string, reason: RecordingEndReason): Promise<RecordingHandle> {
     const rec = this.active.get(recordingId);
     if (!rec) {
@@ -1690,7 +1749,7 @@ export class RecordingController {
          unconditionally. */
       rec.recorder.cancel();
       if (rec.forced) this.releaseForce(rec.flightId);
-      const utEnd = this.utEndOf(rec);
+      const utEnd = this.closeUtTrack(rec);
       const handle: RecordingHandle = {
         recordingId,
         flightId: rec.flightId,
@@ -1699,7 +1758,7 @@ export class RecordingController {
         timing: rec.recorder.timing,
         utStart: rec.utStart,
         utEnd,
-        utSamples: [...rec.utSamples, { t: now() - rec.startedAt, ut: utEnd }],
+        utSamples: rec.utSamples,
         byteSize: 0,
         durationMs: now() - rec.startedAt,
         endedBy: reason,
@@ -1717,8 +1776,7 @@ export class RecordingController {
       return rec.stopPromise;
     }
 
-    const utEnd = this.utEndOf(rec);
-    rec.utSamples.push({ t: now() - rec.startedAt, ut: utEnd });
+    const utEnd = this.closeUtTrack(rec);
     this.releaseHold(rec);
 
     rec.stopPromise = new Promise<RecordingHandle>((resolve, reject) => {
