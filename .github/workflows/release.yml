@@ -293,7 +293,7 @@ jobs:
             runner: ubuntu-22.04
             bin: kerbcast-sidecar
           - rid: osx-arm64
-            runner: macos-14
+            runner: macos-15
             bin: kerbcast-sidecar
           - rid: win-x64
             runner: windows-2022
