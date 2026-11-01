@@ -1296,6 +1296,153 @@ WorldModelBuilder One(IWorldModelPublisher p, long seq, long epoch)
     }
 }
 
+/*
+ * The same Launchpad lens at 30 m/s, watching a model whose own knowledge is
+ * delayed at that light speed, as a provider with signal delay is: the record
+ * it publishes at UT T predicts the craft at T from the last state it heard,
+ * sent at the instant whose light reaches the station at T. Its station is
+ * taken at the lens. A record kept for the picture's instant then knows the
+ * craft only a light time before that instant, so the delay counts twice:
+ * while that earlier knowledge predates liftoff the aim holds the pad with
+ * the climbing craft out of a 3.95 degree lens, and later it leaves the
+ * record's prediction error on screen. The newest record has heard the
+ * craft at the very instant the picture shows, and a record published from
+ * its heard instant places the aim on the drawn craft through the same code.
+ * Liftoff is at 0, a climb with rising thrust and a little sideways drift.
+ */
+{
+    const double R = 600000, PadAlt = 75, C = 30, A0 = 22, Jerk = 0.7, Side = 0.02, FramePx = 576;
+    var kerbin = new KinematicsBody { Known = true, Mu = 3.5316e12, Radius = R, AxisX = new DVec3(1, 0, 0), AxisY = new DVec3(0, 1, 0), AxisZ = new DVec3(0, 0, 1) };
+    var pad = new DVec3(R + PadAlt, 0, 0);
+    var lens = new DVec3(R + 70, 0, -500);
+    void State(double t, out DVec3 p, out DVec3 v, out DVec3 a)
+    {
+        if (t <= 0)
+        {
+            p = pad;
+            v = a = default;
+            return;
+        }
+        p = pad + new DVec3(A0 * t * t / 2 + Jerk * t * t * t / 6, -Side * t * t * t / 6, 0);
+        v = new DVec3(A0 * t + Jerk * t * t / 2, -Side * t * t / 2, 0);
+        a = new DVec3(A0 + Jerk * t, -Side * t, 0);
+    }
+    DVec3 Truth(double t)
+    {
+        State(t, out var p, out _, out _);
+        return p;
+    }
+    /* The latest instant whose light has reached the lens by `ut`; light from a receding craft arrives in order, so there is one. */
+    double Heard(double ut)
+    {
+        double lo = -1000, hi = ut;
+        for (int i = 0; i < 100; i++)
+        {
+            double mid = (lo + hi) / 2;
+            if (mid + (Truth(mid) - lens).Magnitude / C <= ut) lo = mid;
+            else hi = mid;
+        }
+        return lo;
+    }
+    ModelRecord Record(double stateUt, double from, DVec3 p, DVec3 v, DVec3 a) => new ModelRecord
+    {
+        PersistentId = 7, State = CraftFixState.Positioned, Kinematics = KinematicsKind.StateVector, BodyIndex = 1,
+        ValidFromUt = from, ValidUntilUt = from + 1e9, StateUt = stateUt,
+        Position = new Vec3d(p.X, p.Y, p.Z), Velocity = new Vec3d(v.X, v.Y, v.Z),
+        HasAcceleration = true, Acceleration = new Vec3d(a.X, a.Y, a.Z),
+    };
+    /* Published at T: the craft predicted at T from the state heard by then, carrying on under the thrust it was heard with. */
+    ModelRecord Predicted(double at)
+    {
+        double heard = Heard(at), d = at - heard;
+        State(heard, out var p, out var v, out var a);
+        return Record(at, at, p + v * d + a * (0.5 * d * d), v + a * d, a);
+    }
+    /* Published at T: the state heard by then, from the instant it was heard. */
+    ModelRecord AsHeard(double at)
+    {
+        double heard = Heard(at);
+        State(heard, out var p, out var v, out var a);
+        return Record(heard, heard, p, v, a);
+    }
+    double Deg(DVec3 a, DVec3 b) => Math.Acos(Math.Min(1, DVec3.Dot((a - lens).Normalized, (b - lens).Normalized))) / Kinematics.Deg2Rad;
+
+    /* The aim's instant and place at `ut` from the records published once a second up to it, as KnownSubject solves it. */
+    void Aim(double ut, Func<double, ModelRecord> published, out double tr, out DVec3 at)
+    {
+        var history = new ModelRecordHistory();
+        double last = Math.Floor(ut - 0.5);
+        for (double p = -20; p <= last; p++) history.Add(published(p), kerbin, double.NaN, p);
+        var newest = published(last);
+        WorldModelSnapshot.BuildPath(newest, kerbin, out var newestPath);
+        DVec3? Along(double t)
+        {
+            if (history.TryFind(t, out var r, out var path, out double floor, out bool back))
+                return ModelRecordHistory.TryPlace(r, path, floor, back, kerbin, t, out var q) ? q : (DVec3?)null;
+            return ModelRecordHistory.ReadsCurrentBack(t, newest.ValidFromUt) && newestPath.TryAt(t, out var n, out _) ? n : (DVec3?)null;
+        }
+        DVec3? Windowed(double t) => t >= newest.ValidFromUt && newestPath.TryAt(t, out var n, out _) ? n : (DVec3?)null;
+        var along = new FnPath { At = Along };
+        var windowed = new FnPath { At = Windowed };
+        PastInstant.SolveAlong(ref along, ref windowed, lens, ut, C, 20000, newest.ValidFromUt, ut, out tr, history.EarliestUt);
+        at = Along(tr) ?? Windowed(tr) ?? default;
+    }
+    void Drawn(double ut, out double tr, out DVec3 at)
+    {
+        var truth = new FnPath { At = t => Truth(t) };
+        PastInstant.Solve(ref truth, lens, ut, C, 20000, -1e6, ut, out tr);
+        at = Truth(tr);
+    }
+
+    bool padHeld = true, staleAtPad = true, outOfLens = true;
+    foreach (double ut in new[] { 22.0, 26.0, 30.0 })
+    {
+        Drawn(ut, out double drawnUt, out var drawn);
+        Aim(ut, Predicted, out double aimUt, out var aim);
+        double off = Deg(aim, drawn);
+        Console.WriteLine($"     pad hold ut={ut}: drawn at {drawnUt:F2} ({drawn.Magnitude - R - PadAlt:F0} m up); aim at {aimUt:F2}, {(aim - pad).Magnitude:F2} m from the pad, "
+            + $"record knows the craft from {Heard(aimUt):F2}; {off:F2} deg off");
+        padHeld &= (aim - pad).Magnitude < 1 && Math.Abs(ut - aimUt - (lens - pad).Magnitude / C) < 0.05;
+        staleAtPad &= Heard(aimUt) < 0 && drawnUt > 0;
+        outOfLens &= off > 3.95 / 2;
+    }
+    Check(padHeld, "double delay: after liftoff the aim holds the pad, its instant one pad light time back, as the rig's 500 m and 16.68 s");
+    Check(staleAtPad, "double delay: the record kept for the aim's instant last heard the craft before liftoff, though the picture shows it climbing");
+    Check(outOfLens, "double delay: the drawn craft is outside the 3.95 degree lens the pad aim frames");
+
+    bool newestHeardIt = true;
+    foreach (double ut in new[] { 26.0, 60.0, 120.0, 200.0 })
+    {
+        Drawn(ut, out double drawnUt, out _);
+        newestHeardIt &= Math.Abs(Heard(ut) - drawnUt) < 0.01;
+    }
+    Check(newestHeardIt, "double delay: the newest knowledge has heard the craft at the instant the picture shows");
+
+    double staleWorst = 0, heardWorst = 0, staleAge = double.PositiveInfinity;
+    foreach (double ut in new[] { 140.0, 200.0, 260.0 })
+    {
+        Drawn(ut, out double drawnUt, out var drawn);
+        Aim(ut, Predicted, out double aimUt, out var aim);
+        Aim(ut, AsHeard, out double heardUt, out var heardAim);
+        double px = Deg(aim, drawn) / 30 * FramePx, heardPx = Deg(heardAim, drawn) / 30 * FramePx;
+        staleWorst = Math.Max(staleWorst, px);
+        heardWorst = Math.Max(heardWorst, heardPx);
+        staleAge = Math.Min(staleAge, aimUt - Heard(aimUt));
+        Console.WriteLine($"     residual ut={ut}: drawn at {drawnUt:F2}; predicted records aim at {aimUt:F2} (heard {Heard(aimUt):F2}), {px:F1} px; as heard {heardUt:F2}, {heardPx:F2} px at 30 deg");
+    }
+    Check(staleWorst > 2 && staleAge > 10, $"double delay: in powered flight the kept record's prediction, {staleAge:F0} s or more past what it heard, leaves the aim {staleWorst:F0} px off at 30 degrees");
+    Check(heardWorst < 1, $"double delay: records published from their heard instant aim within {heardWorst:F2} px of the drawn craft through the same history and solve");
+
+    bool heardPad = true;
+    foreach (double ut in new[] { 22.0, 26.0, 30.0, 60.0, 100.0 })
+    {
+        Drawn(ut, out _, out var drawn);
+        Aim(ut, AsHeard, out _, out var aim);
+        heardPad &= Deg(aim, drawn) < 0.05;
+    }
+    Check(heardPad, "double delay: records published from their heard instant keep the climbing craft in the 3.95 degree lens from liftoff");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
