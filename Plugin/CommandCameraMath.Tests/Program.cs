@@ -1298,5 +1298,157 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(VNear(CommandCameraMath.EaseToward(a, nanTarget, 2.0, 0.4, 1.0), a, 0), "ease: a NaN target holds even after a gap");
 }
 
+/* ---- aim handover across world model records ---- */
+{
+    /* A capsule under a chute 2.5 km out, falling at a steady 8 m/s, read through records republished every second. */
+    const double range = 2500, fall = 8, g = 9.81, publish = 1.0, frame = 1.0 / 60, widest = 2 * Math.PI / 180;
+    DVec3 Truth(double t) => new DVec3(range, 1000 - fall * t, 0);
+    /* A record from its publish UT: ballistic (gravity, no drag), or with the craft's own net acceleration. */
+    DVec3 Predict(double from, bool ballistic, double t)
+    {
+        double d = t - from;
+        var at = Truth(from) + new DVec3(0, -fall * d, 0);
+        return ballistic ? at + new DVec3(0, -0.5 * g * d * d, 0) : at;
+    }
+    double Angle(DVec3 a, DVec3 b) => Math.Acos(Math.Min(1, DVec3.Dot(a.Normalized, b.Normalized)));
+
+    void Run(bool ballistic, bool eased, out double worstStepRad, out double worstLagM)
+    {
+        var handover = new AimHandover();
+        worstStepRad = 0;
+        worstLagM = 0;
+        double from = 0, lastT = double.NaN;
+        DVec3 last = default, lastRaw = default;
+        for (double t = 0; t < 10; t += frame)
+        {
+            double now = Math.Floor(t / publish) * publish;
+            bool published = now != from;
+            if (published && eased && !double.IsNaN(lastT)) handover.Handover(lastRaw, Predict(now, ballistic, lastT), range, widest);
+            from = now;
+            var raw = Predict(from, ballistic, t);
+            var offset = eased ? handover.Step(frame, AimHandover.TauS, 1.0, 0.001) : default;
+            var aim = raw + offset;
+            if (!double.IsNaN(lastT)) worstStepRad = Math.Max(worstStepRad, Angle(aim, last));
+            worstLagM = Math.Max(worstLagM, (aim - raw).Magnitude);
+            last = aim;
+            lastRaw = raw;
+            lastT = t;
+        }
+    }
+    double fallStep = fall * frame / range;
+    Run(true, false, out double snapRad, out _);
+    Run(true, true, out double easedRad, out _);
+    Check(snapRad > 10 * fallStep, $"handover: ballistic records under a chute snap the raw aim ({snapRad * 180 / Math.PI:F3} deg in a frame)");
+    Check(easedRad < 3 * fallStep, $"handover: eased, the aim never moves more than a little over its own fall in a frame ({easedRad / fallStep:F2} falls)");
+    Run(false, true, out double rightRad, out double rightLag);
+    Check(rightLag == 0 && rightRad <= fallStep * 1.0001, $"handover: records that predict right leave no offset, so the aim never lags ({rightLag} m)");
+
+    var one = new AimHandover();
+    Check(one.Handover(new DVec3(0, 20, 0), default, 1000, 0.5), "handover: a 20 m correction at 1 km is eased");
+    Check(VNear(one.Offset, new DVec3(0, 20, 0), 0), "handover: the offset starts on the old prediction");
+    double t1 = 0;
+    while (t1 < 1.0 - 1e-9) { one.Step(frame, AimHandover.TauS, 1.0, 0.001); t1 += frame; }
+    Check(one.Offset.Magnitude < 0.02 * 20, $"handover: a 20 m correction is under 2 % within a second ({one.Offset.Magnitude:F3} m)");
+    while (one.Easing && t1 < 10) { one.Step(frame, AimHandover.TauS, 1.0, 0.001); t1 += frame; }
+    Check(!one.Easing && t1 < 3.5, $"handover: and gone once under the floor ({t1:F2} s)");
+
+    var held = new AimHandover();
+    held.Handover(new DVec3(0, 5, 0), default, 1000, 0.5);
+    Check(!held.Handover(new DVec3(double.NaN, 0, 0), default, 1000, 0.5), "handover: a place that is not finite is not eased");
+    Check(VNear(held.Offset, new DVec3(0, 5, 0), 0), "handover: a place that is not finite holds the offset");
+    held.Step(0, AimHandover.TauS, 1.0, 0.001);
+    Check(VNear(held.Offset, new DVec3(0, 5, 0), 0), "handover: a step of no time holds it");
+    held.Step(1.5, AimHandover.TauS, 1.0, 0.001);
+    Check(!held.Easing, "handover: a gap longer than the snap drops it");
+    held.Handover(new DVec3(0, 5, 0), default, 1000, 0.5);
+    held.Reset();
+    Check(!held.Easing, "handover: a reset (a new subject, aim or vantage) starts on the aim, not eased from the last");
+}
+
+/* ---- aim handover: who leads, and what it leaves to the slew ---- */
+{
+    const double frame = 1.0 / 60, slew = AimSlew.MaxRateDegPerS * Math.PI / 180;
+    double Widest(double fieldRad) => AimHandover.WidestRad(fieldRad, slew);
+    double width = Widest(10 * Math.PI / 180);
+    /* The old record put the craft 20 m off; the new one is right. The aim leaves the old place at once and closes on the right one as the ease allows. */
+    var lag = new AimHandover();
+    Check(lag.Handover(new DVec3(20, 0, 0), default, 2000, width), "handover: an old wrong record's 20 m at 2 km is eased");
+    double t = 0, worstOver = 0;
+    while (lag.Easing && t < 5)
+    {
+        double off = lag.Step(frame, AimHandover.TauS, 1.0, 0.02).Magnitude;
+        t += frame;
+        worstOver = Math.Max(worstOver, off - 20 * Math.Exp(-t / AimHandover.TauS));
+    }
+    Check(worstOver <= 1e-9, $"handover: off a right new record by no more than 20 m e^(-t/tau) ({worstOver:G3} m over)");
+    Check(!lag.Easing && t < 2.0, $"handover: and on it within 2 s ({t:F2} s)");
+
+    /* Too wide to ease at a turn the slew allows: 50 m at 100 m, about 27 degrees. */
+    var wide = new AimHandover();
+    wide.Handover(new DVec3(0, 0, 1), default, 100, Widest(1.0));
+    Check(!wide.Handover(new DVec3(50, 0, 0), default, 100, Widest(1.0)) && !wide.Easing,
+        "handover: a 50 m correction at 100 m is refused, and what was easing with it is reset, for the slew to turn");
+    Check(Widest(10.0) / AimHandover.TauS <= slew * 1.0000001,
+        "handover: the widest ease starts turning no faster than the slew's top rate, however wide the field");
+    var narrowField = new AimHandover();
+    Check(!narrowField.Handover(new DVec3(10, 0, 0), default, 1000, Widest(0.01)),
+        "handover: a correction wider than half a narrow field goes to the slew too (0.57 deg in a 0.57 deg field)");
+    var noRange = new AimHandover();
+    Check(!noRange.Handover(new DVec3(1, 0, 0), default, 0, width), "handover: no range, no ease");
+    Check(Math.Abs(Widest(1.0) - 45 * Math.PI / 180 * AimHandover.TauS) < 1e-12, "handover: in a wide field the slew's rate sets the widest ease (11.25 deg)");
+}
+
+/* ---- aim handover: a publish that also steps the instant read back to the cap ---- */
+{
+    /*
+     * A craft crossing 500 km out at 200 m/s, records exact and republished
+     * every 2 s, read back no more than 4 s (PastInstant.MaxReadBackS). With
+     * a light time between 4 and 6 s each publish moves the placed instant
+     * on by L - 4 s at once.
+     */
+    const double range = 500000, speed = 200, publish = 2.0, cap = 4.0, frame = 1.0 / 60;
+    double widest = AimHandover.WidestRad(2 * Math.PI / 180, AimSlew.MaxRateDegPerS * Math.PI / 180);
+    DVec3 Truth(double t) => new DVec3(range, speed * t, 0);
+    double travel = speed * frame;
+
+    double WorstStep(double light, bool stepAware)
+    {
+        var handover = new AimHandover();
+        double from = 0, lastTr = double.NaN, worst = 0;
+        DVec3 lastRaw = default, last = default;
+        for (double t = 10; t < 30; t += frame)
+        {
+            double now = Math.Floor(t / publish) * publish;
+            bool published = now != from;
+            from = now;
+            double tr = Math.Max(t - light, from - cap);
+            var raw = Truth(tr);
+            if (published && !double.IsNaN(lastTr))
+            {
+                var after = stepAware && AimHandover.InstantStepped(tr - lastTr, frame) ? raw : Truth(lastTr);
+                handover.Handover(lastRaw, after, range, widest);
+            }
+            var aim = raw + handover.Step(frame, AimHandover.TauS, 1.0, 0.001);
+            if (!double.IsNaN(lastTr)) worst = Math.Max(worst, (aim - last).Magnitude);
+            last = aim;
+            lastRaw = raw;
+            lastTr = tr;
+        }
+        return worst;
+    }
+    foreach (double light in new[] { 4.5, 5.0, 5.5 })
+    {
+        double snapped = WorstStep(light, false), eased = WorstStep(light, true);
+        /* Eased, a frame moves its own travel plus the step's share of an e-fold over TauS, never the step at once. */
+        double easedBound = travel * (1 + (light - cap) / AimHandover.TauS) * 1.001;
+        Check(snapped >= speed * (light - cap) * 0.999, $"handover at the cap: L = {light} s, compared at one instant the step is left in ({snapped / travel:F1} frames of travel at once)");
+        Check(eased <= easedBound, $"handover at the cap: L = {light} s, the step eases ({eased / travel:F2} frames of travel at most, bound {easedBound / travel:F2})");
+    }
+    Check(!AimHandover.InstantStepped(frame, frame) && !AimHandover.InstantStepped(0.8 * frame, frame)
+        && AimHandover.InstantStepped(1.0 + frame, frame) && AimHandover.InstantStepped(-0.5, frame)
+        && !AimHandover.InstantStepped(double.NaN, frame) && !AimHandover.InstantStepped(1.0, double.NaN),
+        "instant stepped: a frame's own step, or a light time changing slowly, is none; a jump either way is; unknowns are none");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

@@ -204,6 +204,100 @@ namespace Kerbcast
             Started ? CommandCameraMath.BracketHalfPxForTan(_craft > _box ? _craft : _box, fovDeg, rows) : double.NaN;
     }
 
+    /*
+     * The aim eased from one world model record's prediction onto the next
+     * instead of snapping to it, as SubjectFraming eases the framing. At a
+     * publish the caller gives the subject's place under the old record and
+     * under the new one at the same instant, about the same body; what
+     * separates them becomes an offset on the aim that eases out on its own,
+     * while the aim itself moves with the new record at once. A new record
+     * that agrees with the old leaves no offset, so the aim is never held off
+     * a prediction that does not change. One that disagrees is followed late
+     * whichever of the two was right: the aim starts on the old place and is
+     * within e^(-t/TauS) of the correction on the new one after t, so a wrong
+     * old record is lagged behind a right new one for a second or so, and a
+     * right old record is left for a wrong new one as smoothly. A correction
+     * too wide to ease at a turn the slew allows is refused and left to the
+     * slew. Where the publish also moves the instant the subject is placed
+     * at (InstantStepped), the caller gives the new place at the new instant,
+     * so that step eases too. A real change of subject, aim or vantage resets
+     * it rather than easing across it, and a place that is not a finite
+     * number holds the offset.
+     */
+    public sealed class AimHandover
+    {
+        public const double TauS = 0.25;
+        /* The widest offset eased, as a fraction of the field. */
+        public const double MaxFieldFraction = 0.5;
+
+        /*
+         * The widest offset eased in a field of `fieldRad`, in radians. An
+         * ease starts turning at its angle over TauS, so it is also held to
+         * what keeps that turn under the slew's top rate `slewRadPerS`: wider
+         * than either, the slew's capped turn takes it instead.
+         */
+        public static double WidestRad(double fieldRad, double slewRadPerS) => Math.Min(MaxFieldFraction * fieldRad, slewRadPerS * TauS);
+
+        /* Slack on InstantStepped, in seconds, for a frame too short to scale it. */
+        public const double StepSlackS = 0.01;
+
+        /*
+         * Whether the instant the subject is placed at moved by `placedStepS`
+         * across a publish where the frame itself moved `utStepS`: a new
+         * record read back only to its cap starts the craft later than the
+         * old one held it, so the craft moves on that much at once. The caller
+         * then eases the whole move it draws, not only the records'
+         * disagreement at one instant. A light time changing at under half the
+         * light speed stays within the slack. False when either is not known.
+         */
+        public static bool InstantStepped(double placedStepS, double utStepS) =>
+            Math.Abs(placedStepS - utStepS) > Math.Max(StepSlackS, 0.5 * Math.Abs(utStepS));
+
+        private DVec3 _offset;
+
+        /* Metres added to the aim point, in the frame the caller gives its places in. */
+        public DVec3 Offset => _offset;
+        public bool Easing => _offset.Magnitude > 0;
+
+        public void Reset() => _offset = default;
+
+        /*
+         * A publish: `before` the subject as the old record placed it, `after`
+         * as the new one places it at that instant, about the same body, with
+         * the aim `rangeM` from the lens and `widestRad` from WidestRad. True
+         * when it is eased; false, with the offset reset, when the offset it
+         * would leave is wider (or no range or width is known), and the
+         * caller then lets the slew turn onto the new aim. A place that is not
+         * finite holds the offset and is not eased.
+         */
+        public bool Handover(DVec3 before, DVec3 after, double rangeM, double widestRad)
+        {
+            var moved = before - after;
+            if (!CommandCameraMath.Finite(moved)) return false;
+            var offset = _offset + moved;
+            if (!(rangeM > 0) || !(widestRad > 0) || Math.Atan2(offset.Magnitude, rangeM) > widestRad)
+            {
+                _offset = default;
+                return false;
+            }
+            _offset = offset;
+            return true;
+        }
+
+        /*
+         * Eases the offset out over `dt` seconds and returns it. A step of no
+         * time leaves it, a gap over `snapAfter` drops it, as a long gap snaps
+         * the framing, and so does what is left once it is under `floorM`.
+         */
+        public DVec3 Step(double dt, double tau, double snapAfter, double floorM)
+        {
+            if (!(dt > 0)) return _offset;
+            _offset = dt > snapAfter || !(tau > 0) ? default : _offset * Math.Exp(-dt / tau);
+            if (!(_offset.Magnitude > floorM)) _offset = default;
+            return _offset;
+        }
+    }
+
     /* Where a command camera looks while it has no subject to aim at. */
     public enum PlaceholderAim
     {

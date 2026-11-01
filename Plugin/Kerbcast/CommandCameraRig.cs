@@ -222,6 +222,8 @@ namespace Kerbcast
         private string _subjectRefusalCode;
         private string _subjectRefusalText;
         private double _subjectUt = double.NaN;
+        /* The UT the subject's place was read at, which a place on the lens's own ground takes at render UT, not at _subjectUt. */
+        private double _subjectPlacedUt = double.NaN;
 
         private void TakeFrameState() => FrameState = StateNow();
 
@@ -343,9 +345,9 @@ namespace Kerbcast
         private double FramingRadius => KnownRadius + (AimIsCraft ? _knownUncertainty : 0.0) + FramingMargin;
         private double _knownUncertainty;
 
-        /* The subject's framing sphere centre from its CoM, eased; the view looks there while everything else keeps the CoM. */
+        /* The subject's framing sphere centre from its CoM, eased; the view looks there, plus any handover offset still easing, while everything else keeps the CoM. */
         private DVec3 _viewOffset;
-        private DVec3 ViewOffset => _mode == SubjectAimMode.Subject && AimIsCraft ? _viewOffset : default;
+        private DVec3 ViewOffset => _mode == SubjectAimMode.Subject && AimIsCraft ? _viewOffset + HandoverOffset : default;
         /* The framing the last rendered frame used, for the status log. */
         private Shape _shape;
 
@@ -491,6 +493,7 @@ namespace Kerbcast
 
             bool ok = SolveGeometry(ut, out station, out aim, out localUp, out north, out occluder);
             NoteWaiting(ut);
+            if (!ok) ForgetHandover();
             if (!ok || _mode != SubjectAimMode.Subject)
             {
                 /* Without a fix the readings at the aim describe nothing; kept, they would carry the last solve, perhaps truth from before a lock, into the reports. */
@@ -503,19 +506,22 @@ namespace Kerbcast
             {
                 /* The pose turns onto a moved aim rather than snapping; everything
                    projected through the frame (TrueInFrame, anchors) uses it. */
-                bool jumped = AimJumped(ut);
-                if (jumped)
+                bool jumped = AimJumped(ut, out bool changed);
+                double clock = System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+                bool handed = EaseHandover(jumped && !changed, changed, double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt,
+                    double.IsNaN(_slewUt) ? double.NaN : ut - _slewUt, out bool dropped);
+                if (changed)
                 {
-                    /* A new subject or aim starts on its own framing, not eased from the last one's. */
+                    /* A new subject or aim starts on its own framing, not eased from the last one's; a publish eases it on. */
                     var shape = SubjectShape();
                     _viewOffset = shape.Known ? shape.Centre : default;
                 }
                 var toward = aim + ViewOffset - station;
                 double range = toward.Magnitude;
-                double clock = System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+                /* A publish the handover eases is no jump for the slew: the eased aim moves on smoothly. An offset it dropped is one. */
                 var view = range > 0
                     ? _slew.Step(toward * (1.0 / range), double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt,
-                        double.IsNaN(_slewUt) ? 0 : ut - _slewUt, jumped, _fov)
+                        double.IsNaN(_slewUt) ? 0 : ut - _slewUt, (jumped && !handed) || dropped, _fov)
                     : toward;
                 _slewAt = clock;
                 _slewUt = ut;
@@ -540,6 +546,7 @@ namespace Kerbcast
         {
             station = aim = localUp = north = default;
             occluder = null;
+            _aimedBody = null;
             _placeholder = PlaceholderAim.None;
             _mode = SubjectAimMode.Subject;
             ForgetDrawn();
@@ -603,6 +610,8 @@ namespace Kerbcast
                 aimBody = subject.Body;
                 if (aimBody != null)
                 {
+                    _aimedBody = aimBody;
+                    _aimedAbout = KinematicsWorld.Now().Zup.FromWorld(aim - ToD(aimBody.position));
                     var w = new Vector3d(aim.X, aim.Y, aim.Z);
                     _heldBody = aimBody;
                     _heldLat = aimBody.GetLatitude(w);
@@ -643,6 +652,72 @@ namespace Kerbcast
             return true;
         }
 
+        private readonly AimHandover _handover = new AimHandover();
+        /* The handover's offset in world axes this frame. */
+        private DVec3 HandoverOffset => _handover.Easing ? KinematicsWorld.Now().Zup.ToWorld(_handover.Offset) : default;
+        /*
+         * The craft aim's body and its place about that body at the last
+         * solve, in KSP's fixed frame, and the UT it was read at; null body
+         * when the last solve aimed at no craft. The fixed frame, because the
+         * world's axes turn with the body below its inverse-rotation height,
+         * which moves a place 600 km about Kerbin by metres a frame.
+         */
+        private CelestialBody _aimedBody;
+        private DVec3 _aimedAbout;
+        private CelestialBody _handoverBody;
+        private DVec3 _handoverAbout;
+        private double _handoverUt;
+
+        /*
+         * Eases the aim across a world model publish for a craft aim on the
+         * same body: the old record's place at the last instant against the
+         * new record's at that same instant, both about the body in its fixed
+         * frame, so the body's motion, its turn and any origin shift drop out.
+         * Where the publish also moved the placed instant by more than the
+         * frame's UT step `utStep` (a record read back only to its cap), the
+         * new place at the new instant is taken instead, so the whole move
+         * drawn eases. A correction too wide to ease is left to the slew
+         * instead, and any other cause of a jump resets it. Steps the ease by
+         * `dt` real seconds (a usual frame at most) and returns whether this
+         * publish was eased; `dropped` says an offset still easing was let
+         * go, which the slew must take as a jump.
+         */
+        private bool EaseHandover(bool published, bool changed, double dt, double utStep, out bool dropped)
+        {
+            bool craft = _mode == SubjectAimMode.Subject && AimIsCraft && _aimedBody != null;
+            bool handed = false;
+            bool easing = _handover.Easing;
+            if (!craft || changed || _handoverBody != _aimedBody) _handover.Reset();
+            else if (published)
+            {
+                double widest = AimHandover.WidestRad(_fov * Math.PI / 180.0, AimSlew.MaxRateDegPerS * Math.PI / 180.0);
+                if (AimHandover.InstantStepped(_subjectPlacedUt - _handoverUt, utStep))
+                    handed = _handover.Handover(_handoverAbout, _aimedAbout, _lastDistance, widest);
+                else
+                {
+                    var then = _known.SubjectAlong(_handoverUt);
+                    if (then.Positioned && then.Body == _aimedBody)
+                    {
+                        var after = KinematicsWorld.Now().Zup.FromWorld(then.World - ToD(_aimedBody.position));
+                        handed = _handover.Handover(_handoverAbout, after, _lastDistance, widest);
+                    }
+                }
+            }
+            dropped = easing && !_handover.Easing && !changed;
+            double floor = _lastDistance * AimSlew.MinOffsetFieldFraction * _fov * Math.PI / 180.0;
+            _handover.Step(_frames.Clip(dt), AimHandover.TauS, AimSlew.SnapAfterS, floor);
+            _handoverBody = craft ? _aimedBody : null;
+            _handoverAbout = _aimedAbout;
+            _handoverUt = _subjectPlacedUt;
+            return handed;
+        }
+
+        private void ForgetHandover()
+        {
+            _handover.Reset();
+            _handoverBody = null;
+        }
+
         private readonly AimSlew _slew;
         /* Real seconds, double, of the last slew step; NaN before the first. */
         private double _slewAt = double.NaN;
@@ -677,17 +752,19 @@ namespace Kerbcast
          * rather than as its motion suggests: a new aim, a new subject, a new
          * vantage, a new world-model publish that may correct where the
          * subject is, or the view taking or leaving a placeholder or a held aim.
-         * Between these the view follows the aim exactly.
+         * Between these the view follows the aim, plus the framing and
+         * handover offsets, exactly. `changed` is every cause but the publish.
          */
-        private bool AimJumped(double ut)
+        private bool AimJumped(double ut, out bool changed)
         {
             uint subject = _known.SubjectPersistentId;
             uint vantage = _mount.Site.VantagePersistentId;
             var store = _authority != null ? _authority.WorldModel : null;
             var snap = store != null ? store.Capture(Time.frameCount, ut).Snapshot : null;
             long generation = snap != null ? snap.Generation : 0;
-            bool jumped = !CommandAim.SameAs(_aim, _jumpAim) || subject != _jumpSubject || vantage != _jumpVantage
-                || generation != _jumpGeneration || _mode != _jumpMode;
+            changed = !CommandAim.SameAs(_aim, _jumpAim) || subject != _jumpSubject || vantage != _jumpVantage
+                || _mode != _jumpMode;
+            bool jumped = changed || generation != _jumpGeneration;
             _jumpMode = _mode;
             _jumpAim = _aim;
             _jumpSubject = subject;
@@ -796,6 +873,7 @@ namespace Kerbcast
         private CraftFix KnownSubject(double ut, DVec3 station, CelestialBody lensBody)
         {
             _subjectUt = ut;
+            _subjectPlacedUt = ut;
             double? c = LightTime.LightSpeed;
             if (!c.HasValue || lensBody == null)
             {
@@ -898,6 +976,7 @@ namespace Kerbcast
             }
             _knownHold.Shown(ut, tr, 0, c, lensIndex, path.Frame);
             _subjectUt = tr;
+            _subjectPlacedUt = tr;
             return _known.SubjectAlong(tr);
         }
 
@@ -2078,7 +2157,7 @@ namespace Kerbcast
                 double elev = CommandCameraMath.ElevationDeg(fwd, localUp);
                 Debug.Log($"{at} event=status elev={elev:F2} fov={_fov:F4} craftRadius={KnownRadius:F1} "
                     + (_shape.Known ? $"shapeHalf={_shape.Half:F1} shapeCentreM={_shape.Centre.Magnitude:F1} viewOffsetM={_viewOffset.Magnitude:F1} " : "shape=none ")
-                    + $"split={_plan.Split} occluded={Occluded} "
+                    + $"handoverM={_handover.Offset.Magnitude:F2} split={_plan.Split} occluded={Occluded} "
                     + (_hasFar ? $"far={(_plan.FarRender ? $"[{_plan.FarNear:F0},{_plan.FarFar:F0}]" : "skipped")} mid={(_plan.MidActive ? $"[{_plan.MidNear:F0},{_plan.MidFar:F0}]" : "off")} " : "")
                     + (_subpixelActive && _subpixel != null ? $"subpixelEnergy={_subpixel.LastEnergy:G3} subpixelCoverPx={_subpixel.LastCoverage:G3} subpixelPeak={_subpixel.LastPeak:G3} " : "")
                     + $"nearFar={_plan.NearFar:F0} originShifts={_originShifts} scaledSkewMaxPx={_scaledSkewMaxPx:F2} scaledSkewFrames={_scaledSkewFrames} "
