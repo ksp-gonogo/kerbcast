@@ -20,6 +20,7 @@ import {
   CONTACT_GAP_MS,
   type ContactGap,
   OfferRefusedError,
+  RenegotiateRefusedError,
   type KerbcastConnectionState,
   type KerbcastDataChannel,
   type KerbcastPeer,
@@ -1003,6 +1004,46 @@ describe("KerbcastClient", () => {
     expect((err as OfferRefusedError).code).toBe(ErrorCode.CodecUnsupported);
     expect((err as Error).message).toMatch(/no H\.264 video/);
     expect(client.state).toBe("failed");
+  });
+
+  describe("a refused /renegotiate", () => {
+    const offer = { session: "s", sdp: "v=0", slots: 5 };
+    const renegotiate = (client: KerbcastClient): Promise<{ sdp: string }> =>
+      (client as unknown as { httpRenegotiate(o: typeof offer): Promise<{ sdp: string }> }).httpRenegotiate(offer);
+    const make = (): KerbcastClient => new KerbcastClient({ host: "h", port: 1 }, makeFakeTransport().transport);
+
+    it("surfaces the sidecar's reason and code, and still reads as a RenegotiateRefusedError", async () => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            message: "the browser offered no H.264 video",
+            source: ErrorSource.Sidecar,
+            code: ErrorCode.CodecUnsupported,
+          }),
+          { status: 422, headers: { "content-type": "application/json" } },
+        ),
+      );
+      const err = await renegotiate(make()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RenegotiateRefusedError);
+      expect(err).toBeInstanceOf(OfferRefusedError);
+      expect((err as RenegotiateRefusedError).status).toBe(422);
+      expect((err as RenegotiateRefusedError).code).toBe(ErrorCode.CodecUnsupported);
+      expect((err as Error).message).toMatch(/no H\.264 video/);
+    });
+
+    it("keeps the bare status when the refusal has no payload", async () => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("nope", { status: 404 }));
+      const err = await renegotiate(make()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RenegotiateRefusedError);
+      expect((err as RenegotiateRefusedError).code).toBeUndefined();
+      expect((err as Error).message).toMatch(/404/);
+    });
+
+    it("leaves a retryable status as a plain error", async () => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("busy", { status: 429 }));
+      const err = await renegotiate(make()).catch((e: unknown) => e);
+      expect(err).not.toBeInstanceOf(RenegotiateRefusedError);
+    });
   });
 
   it("discover() returns the camera list from /cameras", async () => {
@@ -2821,6 +2862,32 @@ describe("KerbcastClient — dynamic slot subscription", () => {
       await vi.advanceTimersByTimeAsync(2_000);
       expect(calls.slice(3).map((t) => t - again)).toEqual([0, 2_000]);
       expect(errors).toHaveLength(2);
+    });
+
+    it("says a refused re-offer's reason once, with its code", async () => {
+      const sidecar = new MockSidecar().withSlots(["0"]).withRenegotiation();
+      const renegotiate = vi.fn(async () => {
+        throw new RenegotiateRefusedError(422, "the browser offered no H.264 video", ErrorCode.CodecUnsupported);
+      });
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+        sidecar.createTransport(),
+      );
+      const errors: { message: string; code?: ErrorCode }[] = [];
+      client.on("error", (e) => {
+        if (/could not add video slots/.test(e.message)) errors.push(e);
+      });
+      await client.connect([], { slots: 1 });
+      sidecar.open();
+      await client.subscribe(1);
+      await client.subscribe(2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(errors).toEqual([
+        expect.objectContaining({
+          message: "[kerbcast] could not add video slots: the browser offered no H.264 video",
+          code: ErrorCode.CodecUnsupported,
+        }),
+      ]);
     });
 
     it("stops retrying once the peer fails", async () => {

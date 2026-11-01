@@ -119,9 +119,6 @@ const TRANSFORM_HEAL_RETRIES = 3;
  */
 const MAX_GROW_FAILURES = 6;
 
-/** The sidecar refused a re-offer outright, so sending it again cannot help. */
-class RenegotiateRefusedError extends Error {}
-
 /** Controls the digital-static noise overlay baked into `cam.mediaStream`. */
 export interface NoiseConfig {
   /** When false, the pipeline is bypassed and `mediaStream` is the raw WebRTC track. */
@@ -663,8 +660,11 @@ export class CommandTargetUnknownError extends Error {
 }
 
 /**
- * The sidecar refused `POST /offer` with a reason, for example
- * `ErrorCode.CodecUnsupported` when the browser offers no H.264 constrained baseline.
+ * The sidecar refused `POST /offer` or `POST /renegotiate` with a reason, for
+ * example `ErrorCode.CodecUnsupported` when the browser offers no H.264
+ * constrained baseline. A refused `/renegotiate` throws the subclass
+ * {@link RenegotiateRefusedError}, which carries the same `status`, `reason`
+ * and `code`; `code` is absent when the refusal had no error payload.
  */
 export class OfferRefusedError extends Error {
   constructor(
@@ -674,6 +674,15 @@ export class OfferRefusedError extends Error {
   ) {
     super(`[kerbcast] connection refused: ${reason}`);
     this.name = "OfferRefusedError";
+  }
+}
+
+/** The sidecar refused a re-offer outright, so sending it again cannot help. */
+export class RenegotiateRefusedError extends OfferRefusedError {
+  constructor(status: number, reason: string, code?: ErrorCode) {
+    super(status, reason, code);
+    this.message = `[kerbcast] re-offer refused: ${reason}`;
+    this.name = "RenegotiateRefusedError";
   }
 }
 
@@ -2395,7 +2404,12 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
            proxy in front of it is worth another try. */
         const refused =
           res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
-        throw refused ? new RenegotiateRefusedError(message) : new Error(message);
+        if (!refused) throw new Error(message);
+        const refusal = (await res.json().catch(() => null)) as Partial<ErrorPayload> | null;
+        if (typeof refusal?.message === "string") {
+          throw new RenegotiateRefusedError(res.status, refusal.message, refusal.code);
+        }
+        throw new RenegotiateRefusedError(res.status, message);
       }
       return (await res.json()) as { sdp: string };
     } catch (err) {
@@ -2507,8 +2521,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       /* A run of failures is said once, not on every retry. */
       if (this.growFailures === 1 || this.growBroken) {
         this.emit("error", {
-          message: `[kerbcast] could not add video slots: ${err instanceof Error ? err.message : String(err)}`,
+          message: `[kerbcast] could not add video slots: ${
+            err instanceof RenegotiateRefusedError ? err.reason : err instanceof Error ? err.message : String(err)
+          }`,
           source: ErrorSource.Sidecar,
+          ...(err instanceof RenegotiateRefusedError && err.code !== undefined ? { code: err.code } : {}),
         });
       }
     } finally {

@@ -11,6 +11,7 @@ export {
   CommandLockedError,
   CommandTargetUnknownError,
   OfferRefusedError,
+  RenegotiateRefusedError,
   COMMAND_CAMERA_STATE_WAIT_MS,
   CONTROL_OPEN_TIMEOUT_MS,
   CONTACT_GAP_MS,
