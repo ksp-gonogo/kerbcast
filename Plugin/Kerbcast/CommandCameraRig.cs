@@ -1076,9 +1076,11 @@ namespace Kerbcast
                     return now;
                 default:
                     var known = KnownSubject(ut, station, body);
-                    if (known.Positioned && !CommandCameraMath.TruthPathHolds(_subjectUt, _known.SubjectPathFromUt))
+                    double pathFrom = _known.SubjectPathFromUt;
+                    if (known.Positioned && known.Body != null && _subjectUt < pathFrom && !CommandCameraMath.TruthPathHolds(_subjectUt, pathFrom, known.Body.flightGlobalsIndex,
+                        HistoryBody(known.PersistentId, _subjectUt), HistoryBody(known.PersistentId, pathFrom - PathStartBeforeUt)))
                     {
-                        /* Solved back past the start of the conic truth gives (an unloaded craft after an SOI change): no fix rather than a place it never was. */
+                        /* Solved back past an SOI change into the conic truth gives (an unloaded craft): no fix rather than a place it never was. */
                         _knownHold.Reset();
                         known.State = CraftFixState.Listed;
                         known.Body = null;
@@ -1109,6 +1111,13 @@ namespace Kerbcast
             _subjectPlacedUt = placedUt;
             return fix;
         }
+
+        /* How far before a conic's start the light history is read for the body the craft left: an SOI change's two entries share its UT. */
+        private const double PathStartBeforeUt = 0.001;
+
+        /* The body the light history has craft `pid` about at `ut`, by flightGlobalsIndex, or -1 with no record. */
+        private static int HistoryBody(uint pid, double ut) =>
+            LightHistoryHost.History.TryStateAt(pid, ut, out var state) ? state.Body : -1;
 
         /* Whether this solve's craft aim is the picture's place, drawn or kept, so its readings are the picture's and truth's forecast does not apply. */
         private bool AimFromPicture => _placed == TruthAimPlace.Drawn || _placed == TruthAimPlace.Kept;
@@ -1479,13 +1488,15 @@ namespace Kerbcast
             _trackEvents.Clear();
             for (int i = 0; i < _events.Count; i++) _trackEvents.Add(_events[i]);
             _forecastCount = 0;
-            /* An aim at the picture's place has no forecast: truth's motion is the craft now, not as it is drawn. */
-            if (!HasFix || _events.Count == 0 || (AimIsCraft && AimFromPicture)) return _trackEvents;
+            if (!HasFix || _events.Count == 0) return _trackEvents;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 double now = Planetarium.GetUniversalTime();
                 double horizon = Math.Min(ForecastRealSeconds * Math.Max(1.0, TimeWarp.CurrentRate), ForecastMaxUt);
+                /* Truth's motion is the craft now: an aim at a place drawn further in the past than the forecast resolves has no forecast. */
+                if (AimIsCraft && AimFromPicture && !CommandCameraMath.ForecastHoldsAtLightTime(TrackUt - _subjectUt, horizon, ForecastSamples))
+                    return _trackEvents;
                 _occlusion.UseSite(_mount.Site);
                 /* A world model's motion holds only until its record's window ends. */
                 bool moving = TryMotions(now, out var station, out var aim, out double until);

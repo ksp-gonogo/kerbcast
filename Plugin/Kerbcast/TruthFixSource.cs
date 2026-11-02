@@ -88,7 +88,11 @@ namespace Kerbcast
          * and that conic is its path only since KSP last rebuilt it (Orbit.epoch:
          * an SOI change on rails, or going on rails), so a read back past
          * that names a place the craft never was. A loaded or landed craft is
-         * given as it is now, which has no such start.
+         * given as it is now, which has no such start. The epoch also moves
+         * when the craft goes on rails in one SOI, so the rig cuts at it only
+         * across an SOI change (CommandCameraMath.TruthPathHolds). A mod that
+         * rewrites conics every frame keeps the epoch at about now, so the
+         * cut then rests on the light history's bodies alone.
          */
         public double SubjectPathFromUt =>
             _track != null && _track.Loaded == null && _track.TryMotion(out var orbit, out _) && orbit != null

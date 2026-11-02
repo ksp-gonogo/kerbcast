@@ -2293,7 +2293,8 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
         if (tr < track.StartUt) beforeStart++;
         earliest = Math.Min(earliest, tr);
         /* KSP rebuilt the craft's orbit at the SOI change, so its epoch is exitUt. */
-        if (CommandCameraMath.TruthPathHolds(tr, exitUt))
+        int BodyAt(double ut) => ring.TryStateAt(track, ut, out var st) ? st.Body : -1;
+        if (CommandCameraMath.TruthPathHolds(tr, exitUt, Kerbin, BodyAt(tr), BodyAt(exitUt - 0.001)))
         {
             guardKept++;
             if (tr < exitUt || tr < track.StartUt) guardLeaks++;
@@ -2304,9 +2305,31 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
     Check(ringAfterStart, "while the picture's ring never draws it before its start");
     Check(guardLeaks == 0 && guardKept < solved,
         $"truth's place holds only back to the conic's start at the SOI change (UT {exitUt:F0}): {solved - guardKept} of {solved} instants have no fix, none placed before the craft's history");
-    Check(CommandCameraMath.TruthPathHolds(1e5, 37) && CommandCameraMath.TruthPathHolds(1e5, double.NegativeInfinity)
-        && CommandCameraMath.TruthPathHolds(double.NaN, 37),
+    Check(CommandCameraMath.TruthPathHolds(1e5, 37, Kerbin, -1, -1) && CommandCameraMath.TruthPathHolds(1e5, double.NegativeInfinity, Kerbin, -1, -1)
+        && CommandCameraMath.TruthPathHolds(double.NaN, 37, Kerbin, -1, -1),
         "a craft coasting in one SOI since before its instant, a loaded or landed craft, and an unknown instant keep truth's place");
+
+    /*
+     * The same Mun escape, but the craft goes on rails at UT 150000, well
+     * into Kerbin's sphere: KSP rebuilds its conic there (epoch 150000) on
+     * the path it was already coasting, so a read back past it stands.
+     */
+    const double railsUt = 150000;
+    ring.TryStateAt(track, railsUt, out var atRails);
+    ring.Record(key, atRails, HistoryReason.OnRails);
+    int railsCut = 0, railsSolved = 0;
+    for (double tr = exitUt + 1000; tr < railsUt; tr += 5000)
+    {
+        railsSolved++;
+        int bodyAt = ring.TryStateAt(track, tr, out var st) ? st.Body : -1;
+        int before = ring.TryStateAt(track, railsUt - 0.001, out var sb) ? sb.Body : -1;
+        if (!CommandCameraMath.TruthPathHolds(tr, railsUt, Kerbin, bodyAt, before)) railsCut++;
+    }
+    Check(railsSolved > 0 && railsCut == 0,
+        $"a craft gone on rails in one SOI keeps truth's place read back past its conic's start ({railsCut} of {railsSolved} cut)");
+    Check(CommandCameraMath.TruthPathHolds(30, railsUt, Kerbin, -1, Kerbin) && !CommandCameraMath.TruthPathHolds(30, exitUt, Kerbin, -1, Mun)
+        && CommandCameraMath.TruthPathHolds(30, exitUt, Kerbin, -1, -1),
+        "before the history, the cut follows the body the history last saw before the start, and with no record at all the place stands");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

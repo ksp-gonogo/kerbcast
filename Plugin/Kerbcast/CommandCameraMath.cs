@@ -728,8 +728,32 @@ namespace Kerbcast
             : aimIsCraft && lightGone ? TruthAimPlace.NoFix
             : TruthAimPlace.Source;
 
-        /* Whether a truth place solved at `solvedUt` stands on a path that holds back only to `pathFromUt` (IFixSource.SubjectPathFromUt); an unknown instant stands. */
-        public static bool TruthPathHolds(double solvedUt, double pathFromUt) => !(solvedUt < pathFromUt);
+        /*
+         * Whether a truth place solved at `solvedUt` stands on a path that
+         * starts at `pathFromUt` (IFixSource.SubjectPathFromUt) about body
+         * `pathBody`. A start only cuts the past when it marks an SOI change:
+         * the light history has the craft about another body at the solved
+         * instant (`bodyAtSolved`) or, with no record there, just before the
+         * start (`bodyBeforePath`). Going on rails in one SOI keeps the conic
+         * the craft was on. Bodies are flightGlobalsIndex, -1 for no record;
+         * an unknown instant stands.
+         */
+        public static bool TruthPathHolds(double solvedUt, double pathFromUt, int pathBody, int bodyAtSolved, int bodyBeforePath)
+        {
+            if (!(solvedUt < pathFromUt)) return true;
+            int was = bodyAtSolved >= 0 ? bodyAtSolved : bodyBeforePath;
+            return was < 0 || was == pathBody;
+        }
+
+        /*
+         * Whether truth's forecast still serves an aim at the picture's place
+         * drawn `lightTimeS` in the past. The forecast samples its horizon at
+         * `samples` even steps and finds only edges it sees at a sample, so its
+         * timing holds to one step; truth's edges run early by the light time,
+         * which within one step is below what the forecast resolves already.
+         */
+        public static bool ForecastHoldsAtLightTime(double lightTimeS, double horizonUt, int samples) =>
+            !(lightTimeS > horizonUt / samples);
 
         /* The boundary light time τ, one 60 fps frame: craft nearer to the lens than its light covers in τ are drawn at render UT. */
         public const double BoundaryLightTimeS = 1.0 / 60.0;

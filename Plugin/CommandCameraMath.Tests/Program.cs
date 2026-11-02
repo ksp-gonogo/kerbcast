@@ -1460,6 +1460,15 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         "an aim at a point keeps truth's range even then");
 }
 
+/* ---- truth with a light speed: the forecast for an aim at a drawn place ---- */
+{
+    /* At 1x warp the 4 s horizon has 32 steps of 0.125 s: about 375 km of light at 1 % of real light speed. */
+    Check(CommandCameraMath.ForecastHoldsAtLightTime(60000 / 2.998e6, 4, 32), "a craft drawn 60 km away at 1 % c keeps truth's forecast");
+    Check(!CommandCameraMath.ForecastHoldsAtLightTime(1.2e7 / 2.998e6, 4, 32), "one drawn at the Mun's distance has none");
+    Check(CommandCameraMath.ForecastHoldsAtLightTime(1.2e7 / 2.998e6, 3600, 32), "unless the warp stretches a step past its light time");
+    Check(CommandCameraMath.ForecastHoldsAtLightTime(double.NaN, 4, 32), "an unknown instant keeps the forecast");
+}
+
 /* ---- truth with a light speed: a flicker in the picture does not move the aim ---- */
 {
     const int N = TruthPlaceFilter.Solves;

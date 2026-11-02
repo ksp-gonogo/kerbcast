@@ -81,6 +81,8 @@ var ringFiles = new[] { "PicturePass.cs", "LensSights.cs", "PictureCull.cs" };
 /* The lock hands the holder's light speed to the history, which writes to it and reads nothing back; the history's parts at a craft's past instant go from the picture pass to the stand-in built from them. */
 var ringPins = new[]
 {
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.HistoryBody", "LightHistoryHost.History.TryStateAt(pid, ut, out var state) ? state.Body : -1;", 1,
+        "truth with a light speed reads only which body the history had its craft about, to tell an SOI change from going on rails; truth knows the body already"),
     Pin.Line("KerbcastCore.cs", "KerbcastCore.AppendCosts", "var ring = LightHistoryHost.History;", 1,
         "telemetry reads the history's size and track counts, never a craft's state"),
     Pin.Line("KerbcastControl.cs", "KerbcastControl.SetLightSpeedCore", "LightHistoryHost.History.SetLightSpeed(metresPerSecond);", 1,
