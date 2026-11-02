@@ -2209,13 +2209,39 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
     Check(CommandCameraMath.TruthAimPlaceFor(true, true, true, false, true) == TruthAimPlace.Source,
         "a craft drawn live is where truth puts it now");
     Check(CommandCameraMath.TruthAimPlaceFor(true, true, false, false, true) == TruthAimPlace.NoFix,
-        "a craft whose light the picture does not draw, with the history reaching back past it, has no fix");
+        "a craft whose last light the picture says has already arrived has no fix");
     Check(CommandCameraMath.TruthAimPlaceFor(true, true, false, false, false) == TruthAimPlace.Source,
-        "a craft the picture cannot judge, its history younger than its light time, keeps truth's place");
+        "a craft the picture cannot judge keeps truth's place");
     Check(CommandCameraMath.TruthAimPlaceFor(false, true, false, false, true) == TruthAimPlace.Source,
         "an aim at a point keeps truth's range whatever the picture draws");
     Check(CommandCameraMath.TruthAimPlaceFor(true, false, true, true, true) == TruthAimPlace.Source,
         "an aim at a craft the picture is not drawing keeps truth's place");
+}
+
+/* ---- truth with a light speed: no fix only on the solve's own word ---- */
+{
+    /*
+     * A light speed of 300 m/s set at UT 0 starts the history there. A craft
+     * 300 km off at 0 closes at 150 m/s, so the light arriving at t left at
+     * 2 (t - 1000) and none of it is in the history before t = 1000. At
+     * t = 800 the craft is 180 km off: a leave instant from that present
+     * range, 800 - 600 = 200, falls inside the history and would read as
+     * light not arriving. The solve says Unseen, too young to judge, and the
+     * aim keeps truth's place.
+     */
+    var closing = new Line { X0 = 3e5, V = -150 };
+    var lens = new DVec3(0, 0, 0);
+    var st = PastInstant.Solve(ref closing, lens, 800, 300, 150, 0, double.PositiveInfinity, out _);
+    double presentLeave = 800 - (3e5 - 150 * 800) / 300.0;
+    Check(st == PastStatus.Unseen && presentLeave > 0,
+        $"a craft closing on the lens, its light older than the history, is Unseen ({st}) where its present range would say the history covers it");
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, false, false, st == PastStatus.Gone) == TruthAimPlace.Source,
+        "so the aim keeps truth's place rather than no fix");
+    st = PastInstant.Solve(ref closing, lens, 1500, 300, 150, 0, 900, out _);
+    Check(st == PastStatus.Gone && CommandCameraMath.TruthAimPlaceFor(true, true, false, false, st == PastStatus.Gone) == TruthAimPlace.NoFix,
+        "one whose history ended more than a light time ago is Gone, and has no fix");
+    st = PastInstant.Solve(ref closing, lens, 1500, 300, 150, 0, double.PositiveInfinity, out double tr);
+    Check(st == PastStatus.Found && Math.Abs(tr - 1000) <= 1e-3, $"once its light is in, it is drawn ({tr:F4})");
 }
 
 /* ---- truth reads an unloaded craft's present conic at every instant ---- */
@@ -2247,7 +2273,7 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
     var track = ring.Track(key);
     var lensOffset = new DVec3(-200030, 0, 0);
     bool ringAfterStart = true;
-    int beforeStart = 0, solved = 0;
+    int beforeStart = 0, solved = 0, guardKept = 0, guardLeaks = 0;
     double earliest = double.PositiveInfinity;
     for (double t = 20000; t <= 245000; t += 5000)
     {
@@ -2266,10 +2292,21 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
         solved++;
         if (tr < track.StartUt) beforeStart++;
         earliest = Math.Min(earliest, tr);
+        /* KSP rebuilt the craft's orbit at the SOI change, so its epoch is exitUt. */
+        if (CommandCameraMath.TruthPathHolds(tr, exitUt))
+        {
+            guardKept++;
+            if (tr < exitUt || tr < track.StartUt) guardLeaks++;
+        }
     }
     Check(beforeStart > 0,
         $"read on its present conic the craft solves to before its history starts at UT 37 ({beforeStart} of {solved} instants, as early as UT {earliest:F0})");
     Check(ringAfterStart, "while the picture's ring never draws it before its start");
+    Check(guardLeaks == 0 && guardKept < solved,
+        $"truth's place holds only back to the conic's start at the SOI change (UT {exitUt:F0}): {solved - guardKept} of {solved} instants have no fix, none placed before the craft's history");
+    Check(CommandCameraMath.TruthPathHolds(1e5, 37) && CommandCameraMath.TruthPathHolds(1e5, double.NegativeInfinity)
+        && CommandCameraMath.TruthPathHolds(double.NaN, 37),
+        "a craft coasting in one SOI since before its instant, a loaded or landed craft, and an unknown instant keep truth's place");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

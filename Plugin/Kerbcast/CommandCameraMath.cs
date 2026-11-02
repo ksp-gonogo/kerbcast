@@ -405,48 +405,46 @@ namespace Kerbcast
         Source,
         /* Where and when the picture draws the craft. */
         Drawn,
-        /* Not at all: the history reaches back past the craft's light and the picture draws none of it. */
+        /* Not at all: the picture shows the craft's last light has already arrived. */
         NoFix,
-        /* Where it was last aimed, while a change to no fix waits out TruthPlaceFilter. */
+        /* At the last Drawn place, read as drawn, while a loss waits out TruthPlaceFilter. */
         Kept,
     }
 
     /*
-     * Steadies TruthAimPlaceFor across picture flicker: a change between a
-     * fix and no fix is taken only once it has held for Frames solves in a
-     * row, so a craft whose light the picture finds and loses on alternate
-     * frames does not throw the aim between the craft and its hold. While a
-     * loss waits, the aim stays where it last was (Kept); while a return
-     * waits, it stays without a fix. A new craft takes its first place at once.
+     * Steadies TruthAimPlaceFor across picture flicker. A craft the picture
+     * stops drawing right after a Drawn solve is Kept for up to Solves - 1
+     * solves in a row, so a craft whose light the picture finds and loses on
+     * alternate frames does not throw the aim between its drawn place and
+     * truth's place or a hold. A drawn place is taken again at once. It counts
+     * solves, not frames: a hidden feed solves at its poll rate, and under
+     * warp a solve spans more game time. The caller resets it whenever the
+     * aim, subject or vantage changes and on any solve that places no subject,
+     * so only a Drawn solve of the same aim, subject and vantage is kept.
      */
     public sealed class TruthPlaceFilter
     {
-        public const int Frames = 4;
-        private TruthAimPlace _taken = TruthAimPlace.Source;
-        private uint _pid;
-        private bool _started;
-        private int _against;
+        public const int Solves = 4;
+        private int _misses = Solves;
 
-        public TruthAimPlace Step(TruthAimPlace raw, uint pid)
+        /* `drawn`: whether the picture drew the craft at all this solve, past or live. */
+        public TruthAimPlace Step(TruthAimPlace raw, bool drawn)
         {
-            if (!_started || pid != _pid)
+            if (raw == TruthAimPlace.Drawn)
             {
-                _started = true;
-                _pid = pid;
-                _against = 0;
-                _taken = raw;
+                _misses = 0;
                 return raw;
             }
-            if ((raw == TruthAimPlace.NoFix) == (_taken == TruthAimPlace.NoFix) || ++_against >= Frames)
+            if (!drawn && _misses < Solves - 1)
             {
-                _against = 0;
-                _taken = raw;
-                return raw;
+                _misses++;
+                return TruthAimPlace.Kept;
             }
-            return _taken == TruthAimPlace.NoFix ? TruthAimPlace.NoFix : TruthAimPlace.Kept;
+            _misses = Solves;
+            return raw;
         }
 
-        public void Reset() => _started = false;
+        public void Reset() => _misses = Solves;
     }
 
     /* Unity-free maths for the command camera: where the station
@@ -717,23 +715,21 @@ namespace Kerbcast
          * there, even one truth has lost or cannot solve back. A craft drawn
          * live is where truth puts it now.
          *
-         * A craft the picture does not draw has no fix only when the history
-         * reaches back past the instant its light would have left
-         * (`historyCovers`, HistoryCovers), so its light is truly not
-         * arriving, and only for a craft aim: an aim at a point keeps truth's
-         * range for its zoom. Where the history is younger than that (a light
-         * speed just set, a history dropped or trimmed, a craft just created
-         * or switched to) the picture cannot know, and truth's place stands.
+         * A craft the picture does not draw has no fix only when the picture
+         * says its last light has already arrived (`lightGone`), and only for
+         * a craft aim: an aim at a point keeps truth's range for its zoom. One
+         * whose light the history is too young to hold (a light speed just set,
+         * a history dropped or trimmed, a craft just created) or whose solve
+         * did not settle cannot be judged, and truth's place stands.
          */
-        public static TruthAimPlace TruthAimPlaceFor(bool aimIsCraft, bool sameCraft, bool drawn, bool drawnPast, bool historyCovers) =>
+        public static TruthAimPlace TruthAimPlaceFor(bool aimIsCraft, bool sameCraft, bool drawn, bool drawnPast, bool lightGone) =>
             !sameCraft ? TruthAimPlace.Source
             : drawn ? (drawnPast ? TruthAimPlace.Drawn : TruthAimPlace.Source)
-            : aimIsCraft && historyCovers ? TruthAimPlace.NoFix
+            : aimIsCraft && lightGone ? TruthAimPlace.NoFix
             : TruthAimPlace.Source;
 
-        /* Whether a history from `floorUt` holding a craft from `trackStartUt` reaches back past `leaveUt`, the instant the light arriving now left it; false for an unknown instant. */
-        public static bool HistoryCovers(double leaveUt, double floorUt, double trackStartUt) =>
-            leaveUt > floorUt && leaveUt > trackStartUt;
+        /* Whether a truth place solved at `solvedUt` stands on a path that holds back only to `pathFromUt` (IFixSource.SubjectPathFromUt); an unknown instant stands. */
+        public static bool TruthPathHolds(double solvedUt, double pathFromUt) => !(solvedUt < pathFromUt);
 
         /* The boundary light time τ, one 60 fps frame: craft nearer to the lens than its light covers in τ are drawn at render UT. */
         public const double BoundaryLightTimeS = 1.0 / 60.0;

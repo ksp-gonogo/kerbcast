@@ -49,6 +49,8 @@ namespace Kerbcast
         public CelestialBody About;
         public double Ut;
         public double SizeM;
+        /* Why the solve found the craft or not; Unsolved when nothing was solved. */
+        public PastStatus Status;
     }
 
     internal enum OtherSight
@@ -547,18 +549,10 @@ namespace Kerbcast
         public bool TrySeeSubject(uint subject, ref uint drawn, PictureLens lens, out PastPicture seen) =>
             TrySee(subject, ref drawn, true, lens, out seen);
 
-        /* Whether the history reaches back past `leaveUt` for craft `pid` (CommandCameraMath.HistoryCovers), so a craft it does not draw then is one whose light is not arriving. */
-        public static bool HistoryCovers(uint pid, double leaveUt)
-        {
-            if (pid == 0 || !LightTime.LightSpeed.HasValue) return false;
-            var ring = LightHistoryHost.History;
-            var track = ring.TrackFor(pid, leaveUt);
-            return track != null && CommandCameraMath.HistoryCovers(leaveUt, ring.FloorUt, track.StartUt);
-        }
-
         private bool TrySee(uint pid, ref uint drawn, bool subject, PictureLens lens, out PastPicture seen)
         {
             seen = default;
+            seen.Status = PastStatus.Unsolved;
             double? c = LightTime.LightSpeed;
             var bodies = FlightGlobals.Bodies;
             if (!c.HasValue || pid == 0 || bodies == null || !lens.Valid) return false;
@@ -581,6 +575,7 @@ namespace Kerbcast
                 var tree = new KeplerBodyTree(bodies, deRot);
                 sight = See(sights, ring, pid, ref drawn, subject, lens, lensOffset, c.Value, ref tree);
             }
+            seen.Status = sight.Status;
             int index = sight.State.Body;
             bool found = sight.Found && index >= 0 && index < bodies.Count && bodies[index] != null;
             if (found)

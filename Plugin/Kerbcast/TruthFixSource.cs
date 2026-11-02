@@ -82,6 +82,18 @@ namespace Kerbcast
         /* Truth has the craft's whole past. */
         public CraftFix SubjectAlong(double ut) => Subject(ut);
         public double SubjectKeptFromUt => double.NaN;
+
+        /*
+         * An unloaded craft is given on its present conic at every instant,
+         * and that conic is its path only since KSP last rebuilt it (Orbit.epoch:
+         * an SOI change on rails, or going on rails), so a read back past
+         * that names a place the craft never was. A loaded or landed craft is
+         * given as it is now, which has no such start.
+         */
+        public double SubjectPathFromUt =>
+            _track != null && _track.Loaded == null && _track.TryMotion(out var orbit, out _) && orbit != null
+                ? orbit.epoch
+                : double.NegativeInfinity;
         public double SubjectKeptSpeedBound(double fromUt, double toUt, Func<double, int, double> toFrame) => double.NaN;
 
         public bool SubjectMotion(double ut, out BodyMotion motion, out double validFromUt, out double validUntilUt)

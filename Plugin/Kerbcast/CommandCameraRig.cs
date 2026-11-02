@@ -188,13 +188,18 @@ namespace Kerbcast
         /* What the view followed last solve, and the last subject aim, body-fixed, that a Hold keeps. */
         private SubjectAimMode _mode;
         private readonly SubjectWait _wait = new SubjectWait();
-        private CommandAim _waitAim;
-        private uint _waitSubject, _waitVantage;
+        private AimKey _waitKey;
         private CelestialBody _heldBody;
         private double _heldLat, _heldLon, _heldAlt;
         /* On truth with a light speed, how the aim placed its subject this solve, steadied across picture flicker. */
         private readonly TruthPlaceFilter _truthPlace = new TruthPlaceFilter();
         private TruthAimPlace _placed = TruthAimPlace.Source;
+        private AimKey _placeKey;
+        /* The last Drawn place a Kept solve aims at: the body it hangs from, its offset from there in KSP's fixed frame, its own body and instant. */
+        private CelestialBody _keptAbout;
+        private CelestialBody _keptBody;
+        private DVec3 _keptOffset;
+        private double _keptUt;
         /* The body a Hold is taken against when it is not the aim's own: the one the drawn place hangs from. */
         private CelestialBody _holdAbout;
         private bool _waitingLogged;
@@ -562,10 +567,18 @@ namespace Kerbcast
             var site = _mount.Site;
             Vector3d vantage = default;
             string vantageSource = null;
+            /* A solve that places no subject breaks the run a Kept place needs. */
             if (site.HasVantage && !site.TryVantagePosition(ut, out vantage, out vantageSource))
+            {
+                _truthPlace.Reset();
                 return false;
+            }
             var body = site.Body;
-            if (body == null) return false;
+            if (body == null)
+            {
+                _truthPlace.Reset();
+                return false;
+            }
 
             var frame = body.BodyFrame;
             var bodyPos = ToD(body.position);
@@ -644,8 +657,8 @@ namespace Kerbcast
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
-            /* An aim at the picture's place is read against the bodies where the picture draws them, as it shows the craft. */
-            bool aimDrawn = !aimed && _placed == TruthAimPlace.Drawn;
+            /* An aim at the picture's place, drawn or kept, is read against the bodies where the picture draws them, as it shows the craft. */
+            bool aimDrawn = !aimed && AimFromPicture;
             string occluderSource;
             occluder = aimDrawn
                 ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, KnownRadius)
@@ -754,15 +767,22 @@ namespace Kerbcast
         private SubjectAimMode _jumpMode;
 
         /* Whether the subject, the aim or the vantage changed since the last solve, which makes a craft aim wait for its subject again. */
-        private bool WaitKeyChanged()
+        private bool WaitKeyChanged() => _waitKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId);
+
+        /* The aim, subject and vantage a solve was keyed on, to tell when one of them changes. */
+        private struct AimKey
         {
-            uint subject = _known.SubjectPersistentId;
-            uint vantage = _mount.Site.VantagePersistentId;
-            bool changed = !CommandAim.SameAs(_aim, _waitAim) || subject != _waitSubject || vantage != _waitVantage;
-            _waitAim = _aim;
-            _waitSubject = subject;
-            _waitVantage = vantage;
-            return changed;
+            private CommandAim _aim;
+            private uint _subject, _vantage;
+
+            public bool Changed(CommandAim aim, uint subject, uint vantage)
+            {
+                bool changed = !CommandAim.SameAs(aim, _aim) || subject != _subject || vantage != _vantage;
+                _aim = aim;
+                _subject = subject;
+                _vantage = vantage;
+                return changed;
+            }
         }
 
         /*
@@ -1017,54 +1037,38 @@ namespace Kerbcast
          * (CommandCameraMath.TruthAimPlaceFor, steadied by TruthPlaceFilter):
          * a craft drawn in the past is aimed where and when it is drawn, with
          * no read back on truth, which knows the craft only as it is now; one
-         * drawn live, or one the history is too young to judge, is solved on
-         * truth as 1.11 did; one whose light the history shows is not arriving
-         * has no fix. Truth reads the subject before the picture so the shared
-         * track holds the craft it resolved.
+         * drawn live, or one the picture cannot judge, is solved on truth as
+         * 1.11 did; one whose last light has already arrived has no fix. Truth
+         * reads the subject before the picture so the shared track holds the
+         * craft it resolved.
          */
         private CraftFix PlacedSubject(double ut, DVec3 station, CelestialBody body)
         {
             _placed = TruthAimPlace.Source;
             _holdAbout = null;
-            double? c = LightTime.LightSpeed;
-            if (!_known.KnowsWhatIsDrawn || !c.HasValue)
+            if (!_known.KnowsWhatIsDrawn || !LightTime.LightSpeed.HasValue)
             {
                 _truthPlace.Reset();
                 var known = KnownSubject(ut, station, body);
                 LocateDrawn(ut, station, body);
                 return known;
             }
+            if (_placeKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId)) _truthPlace.Reset();
             var now = _known.Subject(ut);
             LocateDrawn(ut, station, body);
-            double leaveUt = now.Positioned ? ut - (now.World - station).Magnitude / c.Value : double.NaN;
-            var raw = CommandCameraMath.TruthAimPlaceFor(AimIsCraft, now.PersistentId != 0 && _drawn.PersistentId == now.PersistentId, _drawnOk, _drawn.ShownPast, _drawn.HistoryCovers(leaveUt));
-            _placed = _truthPlace.Step(raw, now.PersistentId);
-            if (_placed == TruthAimPlace.Kept && _heldBody == null) _placed = TruthAimPlace.NoFix;
+            var raw = CommandCameraMath.TruthAimPlaceFor(AimIsCraft, now.PersistentId != 0 && _drawn.PersistentId == now.PersistentId, _drawnOk, _drawn.ShownPast, _drawn.LightGone);
+            _placed = _truthPlace.Step(raw, _drawnOk);
             switch (_placed)
             {
                 case TruthAimPlace.Drawn:
-                    _knownHold.Reset();
-                    now.State = CraftFixState.Positioned;
-                    now.RefusalCode = null;
-                    now.RefusalText = null;
-                    now.World = _drawnPos;
-                    now.Body = _drawnBody;
-                    now.Live = false;
-                    _holdAbout = _drawnAbout;
-                    _subjectUt = _drawn.ShownUt;
-                    _subjectPlacedUt = _drawn.ShownUt;
-                    return now;
+                    _keptAbout = _drawnAbout ?? _drawnBody;
+                    _keptBody = _drawnBody;
+                    _keptOffset = KinematicsWorld.Now().Zup.FromWorld(_drawnPos - ToD(_keptAbout.position));
+                    _keptUt = _drawn.ShownUt;
+                    return AsPictured(now, _drawnPos, _drawnBody, _keptAbout, _drawn.ShownUt);
                 case TruthAimPlace.Kept:
-                    /* Where the aim last held the craft; _subjectUt stays the instant it was placed at. */
-                    _knownHold.Reset();
-                    now.State = CraftFixState.Positioned;
-                    now.RefusalCode = null;
-                    now.RefusalText = null;
-                    now.World = ToD(_heldBody.GetWorldSurfacePosition(_heldLat, _heldLon, _heldAlt));
-                    now.Body = _heldBody;
-                    now.Live = false;
-                    _holdAbout = _heldBody;
-                    return now;
+                    /* Held still about the body the last drawn place hangs from, as the picture holds an instant. */
+                    return AsPictured(now, ToD(_keptAbout.position) + KinematicsWorld.Now().Zup.ToWorld(_keptOffset), _keptBody, _keptAbout, _keptUt);
                 case TruthAimPlace.NoFix:
                     _knownHold.Reset();
                     now.State = CraftFixState.Listed;
@@ -1072,6 +1076,14 @@ namespace Kerbcast
                     return now;
                 default:
                     var known = KnownSubject(ut, station, body);
+                    if (known.Positioned && !CommandCameraMath.TruthPathHolds(_subjectUt, _known.SubjectPathFromUt))
+                    {
+                        /* Solved back past the start of the conic truth gives (an unloaded craft after an SOI change): no fix rather than a place it never was. */
+                        _knownHold.Reset();
+                        known.State = CraftFixState.Listed;
+                        known.Body = null;
+                        return known;
+                    }
                     if (_drawnOk && !_drawn.ShownPast && _drawn.PersistentId == known.PersistentId)
                     {
                         /* Drawn live: placed now, as the picture draws it. */
@@ -1081,6 +1093,25 @@ namespace Kerbcast
                     return known;
             }
         }
+
+        /* `fix` placed at `world` about `body`, where the picture puts it at `placedUt`, with no read back on truth; a Hold after it is taken against `about`. */
+        private CraftFix AsPictured(CraftFix fix, DVec3 world, CelestialBody body, CelestialBody about, double placedUt)
+        {
+            _knownHold.Reset();
+            fix.State = CraftFixState.Positioned;
+            fix.RefusalCode = null;
+            fix.RefusalText = null;
+            fix.World = world;
+            fix.Body = body;
+            fix.Live = false;
+            _holdAbout = about;
+            _subjectUt = placedUt;
+            _subjectPlacedUt = placedUt;
+            return fix;
+        }
+
+        /* Whether this solve's craft aim is the picture's place, drawn or kept, so its readings are the picture's and truth's forecast does not apply. */
+        private bool AimFromPicture => _placed == TruthAimPlace.Drawn || _placed == TruthAimPlace.Kept;
 
         /* The subject at its solved instant, held as the picture holds it: an
            older solution leaves the held instant while its light has arrived
@@ -1448,7 +1479,8 @@ namespace Kerbcast
             _trackEvents.Clear();
             for (int i = 0; i < _events.Count; i++) _trackEvents.Add(_events[i]);
             _forecastCount = 0;
-            if (!HasFix || _events.Count == 0) return _trackEvents;
+            /* An aim at the picture's place has no forecast: truth's motion is the craft now, not as it is drawn. */
+            if (!HasFix || _events.Count == 0 || (AimIsCraft && AimFromPicture)) return _trackEvents;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {

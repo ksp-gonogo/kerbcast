@@ -84,6 +84,8 @@ namespace Kerbcast
         }
 
         public bool KnowsWhatIsDrawn => false;
+        /* A record vouches for its own window, which SubjectMotion gives. */
+        public double SubjectPathFromUt => double.NegativeInfinity;
         public bool ListsUnplacedByCareerRules => false;
         public bool IdentityIsKsp => false;
 

@@ -91,6 +91,7 @@ namespace Kerbcast
             ShownPast = false;
             ShownParts = null;
             Hidden = false;
+            LightGone = false;
             bool located = _truth.TryLocate(lens.Ut, out world, out body);
             ShownAbout = body;
             if (LightTime.LightSpeed.HasValue && Loaded != null) Hidden = _picture.Hides(Loaded);
@@ -100,7 +101,11 @@ namespace Kerbcast
                 return located;
             }
             bool seen = _picture.TrySeeSubject(_truth.PersistentId, ref _lineage, lens, out var past);
-            if (!seen) return false;
+            if (!seen)
+            {
+                LightGone = past.Status == PastStatus.Gone;
+                return false;
+            }
             world = past.World;
             body = past.Body;
             ShownAbout = past.About;
@@ -133,8 +138,8 @@ namespace Kerbcast
         /* The body whose present centre the drawn place hangs from, which differs from the craft's own body when the picture draws that body moved. */
         public CelestialBody ShownAbout { get; private set; }
 
-        /* Whether the history reaches back past `leaveUt` for the subject, so a subject not drawn is one whose light is not arriving. */
-        public bool HistoryCovers(double leaveUt) => PicturePass.HistoryCovers(_truth.PersistentId, leaveUt);
+        /* Not drawn because the craft's last light has already arrived (PastStatus.Gone), as opposed to light the history is too young to hold or a solve that did not settle. */
+        public bool LightGone { get; private set; }
         private double PastSizeM { get; set; }
 
         /* The size an anchor on the drawn craft takes: its parts at the past
