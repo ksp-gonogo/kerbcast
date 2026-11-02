@@ -2204,13 +2204,17 @@ double SampledRate<TB>(ref RingTurned<TB> path, DVec3 lens, double lo, double t,
     Check(found > 100 && several > 0, $"the probe is drawn at {found} instants, {several} of them with several roots");
     Check(latest, "the picture draws the latest root throughout");
     Check(stillNow && widest > 1e5, $"a live place solved as a path is the craft now, up to {widest / 1000:F0} km from where the picture draws it");
-    Check(CommandCameraMath.TruthAimPlaceFor(true, true, true) == TruthAimPlace.Drawn,
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, true, true, true) == TruthAimPlace.Drawn,
         "so on truth with a light speed the aim takes the place and instant the picture draws");
-    Check(CommandCameraMath.TruthAimPlaceFor(true, true, false) == TruthAimPlace.Source,
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, true, false, true) == TruthAimPlace.Source,
         "a craft drawn live is where truth puts it now");
-    Check(CommandCameraMath.TruthAimPlaceFor(true, false, false) == TruthAimPlace.NoFix,
-        "and a craft whose light the picture does not draw has no fix");
-    Check(CommandCameraMath.TruthAimPlaceFor(false, true, true) == TruthAimPlace.Source,
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, false, false, true) == TruthAimPlace.NoFix,
+        "a craft whose light the picture does not draw, with the history reaching back past it, has no fix");
+    Check(CommandCameraMath.TruthAimPlaceFor(true, true, false, false, false) == TruthAimPlace.Source,
+        "a craft the picture cannot judge, its history younger than its light time, keeps truth's place");
+    Check(CommandCameraMath.TruthAimPlaceFor(false, true, false, false, true) == TruthAimPlace.Source,
+        "an aim at a point keeps truth's range whatever the picture draws");
+    Check(CommandCameraMath.TruthAimPlaceFor(true, false, true, true, true) == TruthAimPlace.Source,
         "an aim at a craft the picture is not drawing keeps truth's place");
 }
 

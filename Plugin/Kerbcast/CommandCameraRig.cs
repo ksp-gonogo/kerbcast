@@ -149,6 +149,7 @@ namespace Kerbcast
         private bool _drawnOk;
         private DVec3 _drawnPos;
         private CelestialBody _drawnBody;
+        private CelestialBody _drawnAbout;
         private double _drawnDistance;
         private bool _drawnOccluded;
         private bool _drawnSunlit;
@@ -191,6 +192,11 @@ namespace Kerbcast
         private uint _waitSubject, _waitVantage;
         private CelestialBody _heldBody;
         private double _heldLat, _heldLon, _heldAlt;
+        /* On truth with a light speed, how the aim placed its subject this solve, steadied across picture flicker. */
+        private readonly TruthPlaceFilter _truthPlace = new TruthPlaceFilter();
+        private TruthAimPlace _placed = TruthAimPlace.Source;
+        /* The body a Hold is taken against when it is not the aim's own: the one the drawn place hangs from. */
+        private CelestialBody _holdAbout;
         private bool _waitingLogged;
         public CommandTrackEventRing Events => _events;
         public string AuthorityOwner => _authority != null ? _authority.Owner : null;
@@ -574,9 +580,7 @@ namespace Kerbcast
             var z = ToD(frame.Z);
             north = new DVec3(z.X, z.Z, z.Y);
 
-            var subject = KnownSubject(ut, station, body);
-            LocateDrawn(ut, station, body);
-            subject = TruthAsDrawn(subject);
+            var subject = PlacedSubject(ut, station, body);
             _knownUncertainty = subject.Positioned && subject.UncertaintyM > 0 ? subject.UncertaintyM : 0.0;
             _subjectRead = true;
             _subjectState = subject.State;
@@ -618,10 +622,11 @@ namespace Kerbcast
                     _aimedAbout = KinematicsWorld.Now().Zup.FromWorld(aim - ToD(aimBody.position));
                     _aimedAt = ut;
                     var w = new Vector3d(aim.X, aim.Y, aim.Z);
-                    _heldBody = aimBody;
-                    _heldLat = aimBody.GetLatitude(w);
-                    _heldLon = aimBody.GetLongitude(w);
-                    _heldAlt = aimBody.GetAltitude(w);
+                    /* Against the body the place hangs from, so a Hold stays where the craft was last drawn rather than riding a body drawn elsewhere. */
+                    _heldBody = _holdAbout ?? aimBody;
+                    _heldLat = _heldBody.GetLatitude(w);
+                    _heldLon = _heldBody.GetLongitude(w);
+                    _heldAlt = _heldBody.GetAltitude(w);
                 }
             }
             else if (_aim.Kind == CommandAimKind.Direction)
@@ -639,7 +644,12 @@ namespace Kerbcast
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
-            occluder = _occlusion.FindOccluder(station, aim, out string occluderSource, aimed ? 0 : KnownRadius);
+            /* An aim at the picture's place is read against the bodies where the picture draws them, as it shows the craft. */
+            bool aimDrawn = !aimed && _placed == TruthAimPlace.Drawn;
+            string occluderSource;
+            occluder = aimDrawn
+                ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, KnownRadius)
+                : _occlusion.FindOccluder(station, aim, out occluderSource, aimed ? 0 : KnownRadius);
             double distance = (aim - station).Magnitude;
             _lastDistance = distance;
             HasFix = true;
@@ -647,9 +657,9 @@ namespace Kerbcast
             ElevationDeg = CommandCameraMath.ElevationDeg(aim - station, localUp);
             Occluded = occluder != null;
             Blocker = occluder ?? "";
-            UpdateSunlit(ut, distance, aim);
+            UpdateSunlit(ut, distance, aim, aimDrawn);
 
-            SolveDrawn(station, aim, distance, !aimed && _known.KnowsWhatIsDrawn, aimBody);
+            SolveDrawn(station, aim, distance, !aimed && _known.KnowsWhatIsDrawn, aimDrawn, aimBody);
             double occMs = (System.Diagnostics.Stopwatch.GetTimestamp() - occT0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             _occlusionMs = _occlusionMs > 0 ? _occlusionMs + OcclusionMsAlpha * (occMs - _occlusionMs) : occMs;
 
@@ -838,6 +848,7 @@ namespace Kerbcast
             };
             _cam.Picture.Place(lens);
             _drawnOk = _drawn.TryLocate(lens, out _drawnPos, out _drawnBody);
+            _drawnAbout = _drawn.ShownAbout;
             if (!LightTime.LightSpeed.HasValue)
             {
                 _drawnLight = -1;
@@ -1000,25 +1011,74 @@ namespace Kerbcast
             return now;
         }
 
-        /* On truth with a light speed, the subject where and when the picture draws it (CommandCameraMath.TruthAimPlaceFor). */
-        private CraftFix TruthAsDrawn(CraftFix subject)
+        /*
+         * The subject the aim follows, and the picture placed from the same
+         * lens. On truth with a light speed the picture decides first
+         * (CommandCameraMath.TruthAimPlaceFor, steadied by TruthPlaceFilter):
+         * a craft drawn in the past is aimed where and when it is drawn, with
+         * no read back on truth, which knows the craft only as it is now; one
+         * drawn live, or one the history is too young to judge, is solved on
+         * truth as 1.11 did; one whose light the history shows is not arriving
+         * has no fix. Truth reads the subject before the picture so the shared
+         * track holds the craft it resolved.
+         */
+        private CraftFix PlacedSubject(double ut, DVec3 station, CelestialBody body)
         {
-            if (!_known.KnowsWhatIsDrawn || !LightTime.LightSpeed.HasValue || !subject.Positioned) return subject;
-            switch (CommandCameraMath.TruthAimPlaceFor(_drawn.PersistentId == subject.PersistentId, _drawnOk, _drawn.ShownPast))
+            _placed = TruthAimPlace.Source;
+            _holdAbout = null;
+            double? c = LightTime.LightSpeed;
+            if (!_known.KnowsWhatIsDrawn || !c.HasValue)
+            {
+                _truthPlace.Reset();
+                var known = KnownSubject(ut, station, body);
+                LocateDrawn(ut, station, body);
+                return known;
+            }
+            var now = _known.Subject(ut);
+            LocateDrawn(ut, station, body);
+            double leaveUt = now.Positioned ? ut - (now.World - station).Magnitude / c.Value : double.NaN;
+            var raw = CommandCameraMath.TruthAimPlaceFor(AimIsCraft, now.PersistentId != 0 && _drawn.PersistentId == now.PersistentId, _drawnOk, _drawn.ShownPast, _drawn.HistoryCovers(leaveUt));
+            _placed = _truthPlace.Step(raw, now.PersistentId);
+            if (_placed == TruthAimPlace.Kept && _heldBody == null) _placed = TruthAimPlace.NoFix;
+            switch (_placed)
             {
                 case TruthAimPlace.Drawn:
-                    subject.World = _drawnPos;
-                    subject.Body = _drawnBody;
-                    subject.Live = false;
+                    _knownHold.Reset();
+                    now.State = CraftFixState.Positioned;
+                    now.RefusalCode = null;
+                    now.RefusalText = null;
+                    now.World = _drawnPos;
+                    now.Body = _drawnBody;
+                    now.Live = false;
+                    _holdAbout = _drawnAbout;
                     _subjectUt = _drawn.ShownUt;
                     _subjectPlacedUt = _drawn.ShownUt;
-                    return subject;
+                    return now;
+                case TruthAimPlace.Kept:
+                    /* Where the aim last held the craft; _subjectUt stays the instant it was placed at. */
+                    _knownHold.Reset();
+                    now.State = CraftFixState.Positioned;
+                    now.RefusalCode = null;
+                    now.RefusalText = null;
+                    now.World = ToD(_heldBody.GetWorldSurfacePosition(_heldLat, _heldLon, _heldAlt));
+                    now.Body = _heldBody;
+                    now.Live = false;
+                    _holdAbout = _heldBody;
+                    return now;
                 case TruthAimPlace.NoFix:
-                    subject.State = CraftFixState.Listed;
-                    subject.Body = null;
-                    return subject;
+                    _knownHold.Reset();
+                    now.State = CraftFixState.Listed;
+                    now.Body = null;
+                    return now;
                 default:
-                    return subject;
+                    var known = KnownSubject(ut, station, body);
+                    if (_drawnOk && !_drawn.ShownPast && _drawn.PersistentId == known.PersistentId)
+                    {
+                        /* Drawn live: placed now, as the picture draws it. */
+                        _subjectUt = _drawn.ShownUt;
+                        _subjectPlacedUt = _drawn.ShownUt;
+                    }
+                    return known;
             }
         }
 
@@ -1100,16 +1160,17 @@ namespace Kerbcast
          * source reads the same truth the picture draws and the aim is the
          * craft, otherwise when the two points coincide. The aim's occlusion
          * and sunlight read the bodies as they are now, so they stand for the
-         * picture's only while the picture draws every body there too.
+         * picture's only while the picture draws every body there too, or
+         * when `readDrawn` says they were read where the picture draws them.
          */
-        private void SolveDrawn(DVec3 station, DVec3 aim, double distance, bool aimIsDrawn, CelestialBody aimBody)
+        private void SolveDrawn(DVec3 station, DVec3 aim, double distance, bool aimIsDrawn, bool readDrawn, CelestialBody aimBody)
         {
             if (_drawnOk)
             {
                 if (aimIsDrawn || (aim - _drawnPos).Magnitude < 1e-3)
                 {
                     _drawnDistance = distance;
-                    bool moved = _cam.Picture.MovesBodies();
+                    bool moved = !readDrawn && _cam.Picture.MovesBodies();
                     _drawnOccluded = moved ? _occlusion.FindDrawnOccluder(_cam.Picture, station, _drawnPos, out _, _drawn.Radius) != null : Occluded;
                     _drawnSunlit = moved ? IsDrawnSunlit(_drawnPos) : Sunlit;
                 }
@@ -1307,9 +1368,10 @@ namespace Kerbcast
             return true;
         }
 
-        private void UpdateSunlit(double ut, double d, DVec3 target)
+        /* `drawn`: the target is the picture's place, lit past the bodies where the picture draws them. */
+        private void UpdateSunlit(double ut, double d, DVec3 target, bool drawn)
         {
-            bool lit = IsSunlit(target);
+            bool lit = drawn ? IsDrawnSunlit(target) : IsSunlit(target);
             if (!_sunlitLogged || lit != Sunlit)
             {
                 _sunlitLogged = true;

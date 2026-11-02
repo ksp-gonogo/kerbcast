@@ -1450,5 +1450,66 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         "instant stepped: a frame's own step, or a light time changing slowly, is none; a jump either way is; unknowns are none");
 }
 
+/* ---- truth with a light speed: when the history can say a craft is not drawn ---- */
+{
+    /*
+     * A Kerbin lens and a Mun craft 12 Mm away at c = 300 m/s: its light
+     * left 40000 s ago. Only a history that reaches back past that instant
+     * can say the craft is not drawn because its light is not arriving.
+     */
+    const double ut = 1e6, c = 300, d = 1.2e7;
+    double leave = ut - d / c;
+    Check(CommandCameraMath.HistoryCovers(leave, double.NegativeInfinity, 37),
+        "a history kept since the craft's launch reaches back past its light");
+    Check(!CommandCameraMath.HistoryCovers(leave, ut - 5, 37),
+        "a light speed just set, or a history dropped, starts at now and cannot");
+    Check(!CommandCameraMath.HistoryCovers(leave, leave + 1, 37),
+        "a history trimmed past the instant cannot");
+    Check(!CommandCameraMath.HistoryCovers(leave, double.NegativeInfinity, ut - 1),
+        "a craft just created or switched to cannot");
+    Check(!CommandCameraMath.HistoryCovers(leave, double.NegativeInfinity, double.PositiveInfinity)
+        && !CommandCameraMath.HistoryCovers(double.NaN, double.NegativeInfinity, 37),
+        "an empty track or an unknown instant cannot");
+    bool NoFix(bool covers) => CommandCameraMath.TruthAimPlaceFor(true, true, false, false, covers) == TruthAimPlace.NoFix;
+    Check(!NoFix(CommandCameraMath.HistoryCovers(leave, ut - 5, 37)),
+        "so a craft far away when a light speed is set keeps truth's place rather than no fix for its whole light time");
+
+    /* 1 % of real light speed: a craft created 60 km away is hidden beyond the boundary before its first history entry, then before its light is in. */
+    const double c1 = 2997924.58;
+    double leave1 = ut - 60000 / c1;
+    Check(!NoFix(CommandCameraMath.HistoryCovers(leave1, double.NegativeInfinity, double.PositiveInfinity))
+        && !NoFix(CommandCameraMath.HistoryCovers(leave1, double.NegativeInfinity, ut)),
+        "at 1 % of real light speed a craft just created is aimed at truth's place, never a placeholder");
+}
+
+/* ---- truth with a light speed: a flicker in the picture does not move the aim ---- */
+{
+    var f = new TruthPlaceFilter();
+    Check(f.Step(TruthAimPlace.Drawn, 5) == TruthAimPlace.Drawn, "a craft's first place is taken at once");
+    bool kept = true;
+    for (int i = 0; i < 20; i++)
+    {
+        var lost = f.Step(TruthAimPlace.NoFix, 5);
+        var found = f.Step(TruthAimPlace.Drawn, 5);
+        kept &= lost == TruthAimPlace.Kept && found == TruthAimPlace.Drawn;
+    }
+    Check(kept, "a picture that finds and loses the craft on alternate frames keeps the aim on it");
+    var steps = new List<TruthAimPlace>();
+    for (int i = 0; i < TruthPlaceFilter.Frames; i++) steps.Add(f.Step(TruthAimPlace.NoFix, 5));
+    Check(steps.GetRange(0, TruthPlaceFilter.Frames - 1).TrueForAll(p => p == TruthAimPlace.Kept) && steps[steps.Count - 1] == TruthAimPlace.NoFix,
+        $"a loss is taken after {TruthPlaceFilter.Frames} solves in a row, the aim kept until then");
+    Check(f.Step(TruthAimPlace.Drawn, 5) == TruthAimPlace.NoFix && f.Step(TruthAimPlace.NoFix, 5) == TruthAimPlace.NoFix,
+        "a return that does not hold is not taken");
+    var ret = new List<TruthAimPlace>();
+    for (int i = 0; i < TruthPlaceFilter.Frames; i++) ret.Add(f.Step(TruthAimPlace.Source, 5));
+    Check(ret[ret.Count - 1] == TruthAimPlace.Source && ret.GetRange(0, TruthPlaceFilter.Frames - 1).TrueForAll(p => p == TruthAimPlace.NoFix),
+        "a return is taken once it holds");
+    Check(f.Step(TruthAimPlace.Drawn, 5) == TruthAimPlace.Drawn,
+        "between a place drawn live and one drawn past there is nothing to wait for");
+    Check(f.Step(TruthAimPlace.NoFix, 6) == TruthAimPlace.NoFix, "a new craft takes its place at once");
+    f.Reset();
+    Check(f.Step(TruthAimPlace.Drawn, 6) == TruthAimPlace.Drawn, "and so does the first solve after a reset");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

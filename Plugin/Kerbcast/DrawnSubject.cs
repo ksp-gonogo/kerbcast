@@ -92,6 +92,7 @@ namespace Kerbcast
             ShownParts = null;
             Hidden = false;
             bool located = _truth.TryLocate(lens.Ut, out world, out body);
+            ShownAbout = body;
             if (LightTime.LightSpeed.HasValue && Loaded != null) Hidden = _picture.Hides(Loaded);
             if (!LightTime.LightSpeed.HasValue || (located && Loaded != null && !Hidden))
             {
@@ -102,6 +103,7 @@ namespace Kerbcast
             if (!seen) return false;
             world = past.World;
             body = past.Body;
+            ShownAbout = past.About;
             ShownUt = past.Ut;
             ShownPast = true;
             ShownRotation = past.Rotation;
@@ -128,6 +130,11 @@ namespace Kerbcast
         public double ShownUt { get; private set; }
         /* Drawn from the ring at its past instant, sized by its parts then. */
         public bool ShownPast { get; private set; }
+        /* The body whose present centre the drawn place hangs from, which differs from the craft's own body when the picture draws that body moved. */
+        public CelestialBody ShownAbout { get; private set; }
+
+        /* Whether the history reaches back past `leaveUt` for the subject, so a subject not drawn is one whose light is not arriving. */
+        public bool HistoryCovers(double leaveUt) => PicturePass.HistoryCovers(_truth.PersistentId, leaveUt);
         private double PastSizeM { get; set; }
 
         /* The size an anchor on the drawn craft takes: its parts at the past

@@ -45,6 +45,8 @@ namespace Kerbcast
         public Quaternion Rotation;
         public Composition Parts;
         public CelestialBody Body;
+        /* The body whose present centre World hangs from: Body, or the frame it was solved in when Body is drawn moved or left out. */
+        public CelestialBody About;
         public double Ut;
         public double SizeM;
     }
@@ -545,6 +547,15 @@ namespace Kerbcast
         public bool TrySeeSubject(uint subject, ref uint drawn, PictureLens lens, out PastPicture seen) =>
             TrySee(subject, ref drawn, true, lens, out seen);
 
+        /* Whether the history reaches back past `leaveUt` for craft `pid` (CommandCameraMath.HistoryCovers), so a craft it does not draw then is one whose light is not arriving. */
+        public static bool HistoryCovers(uint pid, double leaveUt)
+        {
+            if (pid == 0 || !LightTime.LightSpeed.HasValue) return false;
+            var ring = LightHistoryHost.History;
+            var track = ring.TrackFor(pid, leaveUt);
+            return track != null && CommandCameraMath.HistoryCovers(leaveUt, ring.FloorUt, track.StartUt);
+        }
+
         private bool TrySee(uint pid, ref uint drawn, bool subject, PictureLens lens, out PastPicture seen)
         {
             seen = default;
@@ -588,12 +599,14 @@ namespace Kerbcast
                 if (plan != null && (plan.Moves(index) || plan.Hides(index)) && frame >= 0 && frame < bodies.Count && bodies[frame] != null)
                 {
                     seen.World = ToD(bodies[frame].position) + back.Rotate(sight.About);
+                    seen.About = bodies[frame];
                     q = (back * sight.State.Attitude).Normalized;
                 }
                 else
                 {
                     var spin = ring.SpinOf(lens.Body.flightGlobalsIndex);
                     seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, lens.Ut, spin));
+                    seen.About = seen.Body;
                     q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, lens.Ut, spin)).Normalized;
                 }
                 seen.Rotation = new Quaternion((float)q.X, (float)q.Y, (float)q.Z, (float)q.W);
