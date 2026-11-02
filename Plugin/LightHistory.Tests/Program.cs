@@ -624,6 +624,38 @@ PartRecord[] Parts(uint first, int count)
     Check(kerbinSphere <= Math.Max(84159286, atExitR.Magnitude) + 1, "the old body's sphere covers only reads up to the change");
 }
 
+/* ---- An unloaded craft's SOI change under warp is stamped at its conic's epoch ---- */
+{
+    /*
+     * The rig's MkI: unloaded since a scene switch rebuilt it from its save
+     * record, so no patched conic solver ever set its StartUT (0), and its
+     * last entry is thousands of seconds old. KSP's on-rails transition put
+     * its new conic's epoch at the crossing, UT 52330.236, seen on the tick
+     * at 52333.915.
+     */
+    const double lastUt = 3618.4, epoch = 52330.236, tickUt = 52333.915, patchStart = 0;
+    double stale = Math.Min(Math.Max(patchStart, lastUt), tickUt);
+    double at = LightHistoryMath.SoiChangeUt(patchStart, epoch, lastUt, tickUt);
+    Check(stale == lastUt && at == epoch, "an unloaded craft's change is stamped at its conic's epoch, not its last entry");
+    Check(LightHistoryMath.SoiChangeUt(20000, 20000, 0, 26000) == 20000, "a solved patch start and its epoch agree");
+    Check(LightHistoryMath.SoiChangeUt(0, 1e9, lastUt, tickUt) == tickUt, "never later than the tick that saw it");
+    Check(LightHistoryMath.SoiChangeUt(0, double.NaN, lastUt, tickUt) == lastUt, "no epoch falls back to the last entry");
+
+    var r = new DVec3(700000, 0, 0); var v = new DVec3(0, 3200, 0);
+    foreach (bool fixedUt in new[] { false, true })
+    {
+        var h = NewRing();
+        h.Sample(1, State(lastUt, Kerbin, r, v), false, false);
+        var atChange = State(fixedUt ? at : stale, Sun, new DVec3(1.36e10 + 8.4e7, 0, 0), new DVec3(0, 9300, 0));
+        h.BodyChanged(1, atChange, tickUt);
+        int before = h.TryStateAt(1, epoch - 0.001, out var s) ? s.Body : -1;
+        int atSolved = h.TryStateAt(1, -1.4e8, out var s2) ? s2.Body : -1;
+        bool holds = CommandCameraMath.TruthPathHolds(-1.4e8, epoch, Sun, atSolved, before);
+        if (fixedUt) Check(before == Kerbin && !holds, "so a truth place solved back across that change is cut");
+        else Check(before == Sun && holds, "while the last entry's stamp hides the change from the cut (the rig's failure)");
+    }
+}
+
 /* ---- A mutation earlier than anything seen is a rewind ---- */
 {
     var h = NewRing();

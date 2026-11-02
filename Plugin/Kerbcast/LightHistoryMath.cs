@@ -186,6 +186,23 @@ namespace Kerbcast
         /* Hermite spans no longer than this; anything longer reads by prediction. */
         public const double HermiteMaxGapS = 2.0;
 
+        /*
+         * When a craft on rails changed body, seen late on the tick at `nowUt`
+         * under warp: the start of its new conic, no earlier than its last
+         * entry (`lastUt`) and no later than the tick. KSP solves a patch
+         * start (`patchStartUt`, Orbit.StartUT) only for the active craft, so
+         * an unloaded one keeps a stale start; its on-rails transition does
+         * set the conic's epoch (`epochUt`) to the crossing. Either missing
+         * (NaN) is ignored.
+         */
+        public static double SoiChangeUt(double patchStartUt, double epochUt, double lastUt, double nowUt)
+        {
+            double at = lastUt;
+            if (patchStartUt > at) at = patchStartUt;
+            if (epochUt > at) at = epochUt;
+            return at < nowUt ? at : nowUt;
+        }
+
         /* Universal-variable Kepler propagation, valid for every eccentricity. */
         public static void Kepler(DVec3 r0, DVec3 v0, double mu, double dt, out DVec3 r, out DVec3 v)
         {

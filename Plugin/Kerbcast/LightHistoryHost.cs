@@ -311,7 +311,7 @@ namespace Kerbcast
             if (known && lastBody != body && v.packed)
             {
                 /* Under warp the tick that sees the change can come long after it. */
-                double at = Math.Min(Math.Max(v.orbit.StartUT, History.Track(key).Last.Ut), ut);
+                double at = LightHistoryMath.SoiChangeUt(v.orbit.StartUT, v.orbit.epoch, History.Track(key).Last.Ut, ut);
                 History.BodyChanged(key, StateOf(v, at, deRot), ut);
                 return;
             }
