@@ -5852,3 +5852,97 @@ describe("KerbcastClient: withdrawing a display size", () => {
     expect(sizes).toEqual([]);
   });
 });
+
+describe("KerbcastClient: a display size the sidecar already holds", () => {
+  async function connected() {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    await client.subscribe(42);
+    const sizes = (from = 0) =>
+      sidecar.commands
+        .slice(from)
+        .filter((m) => m.type === "report-display-size")
+        .map((m) => (m as { content: { width: number; height: number } }).content)
+        .map(({ width, height }) => `${width}x${height}`);
+    return { sidecar, client, sizes };
+  }
+
+  it("sends a repeat of the size it last sent only once", async () => {
+    const { client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.reportDisplaySize(42, 432, 244);
+    await client.reportDisplaySize(42, 640, 360);
+    await client.reportDisplaySize(42, 640, 360);
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "640x360", "432x244"]);
+  });
+
+  it("sends the size again after a withdraw", async () => {
+    const { client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.reportDisplaySize(42, 0, 0);
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "0x0", "432x244"]);
+  });
+
+  it("sends the size again after an unsubscribe", async () => {
+    const { client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.unsubscribe(42);
+    await client.subscribe(42);
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+  });
+
+  it("sends the size again on a new connection", async () => {
+    const { sidecar, client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.connect([42], { slots: 4 });
+    sidecar.open();
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+  });
+
+  it("sends the size again after a send that failed", async () => {
+    const { client, sizes } = await connected();
+    client.disconnect();
+    await expect(client.reportDisplaySize(42, 432, 244)).rejects.toThrow();
+    expect(sizes()).toEqual([]);
+  });
+
+  it("holds back a repeat after a scene change has sent the size again", async () => {
+    const { sidecar, client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    sidecar.setCameras([]);
+    sidecar.setCameras([{ flightId: 42 }]);
+    await vi.waitFor(() => expect(sizes()).toEqual(["432x244", "432x244"]));
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+  });
+
+  it("sends a size again that went out while its camera was not listed", async () => {
+    const { sidecar, client, sizes } = await connected();
+    sidecar.setCameras([]);
+    await client.reportDisplaySize(42, 432, 244);
+    await client.unsubscribe(42);
+    sidecar.setCameras([{ flightId: 42 }]);
+    await client.subscribe(42);
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+  });
+
+  it("sends the size again to a destroyed camera that comes back", async () => {
+    const { sidecar, client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    sidecar.destroyCamera(42);
+    sidecar.updateCamera(42, { lifecycle: CameraLifecycle.Active });
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+  });
+});

@@ -1862,6 +1862,12 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /** This client's last display size report for each camera. */
   private readonly displaySizes = new Map<number, { width: number; height: number }>();
   /**
+   * The size the sidecar holds from this client for each camera on the
+   * current connection, so a repeat of it is not sent again. Cleared wherever
+   * the sidecar forgets: a new peer, an unsubscribe, a camera leaving the list.
+   */
+  private readonly sentSizes = new Map<number, string>();
+  /**
    * Names this client to the sidecar across its connections, so a reconnect
    * takes over the force and holds the last connection left behind instead
    * of the camera resizing in between.
@@ -2699,6 +2705,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.peer = null;
     this.control = null;
     this.controlOpen = false;
+    this.sentSizes.clear();
     this.rejectPendingSends("[kerbcast] client disconnected before the control channel opened");
     this.tearDownStreams();
     if (!quiet) this.setState("disconnected");
@@ -2735,6 +2742,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.clearWaitingForSlot(flightId);
     /* The sidecar forgets this client's size with the subscription. */
     this.displaySizes.delete(flightId);
+    this.sentSizes.delete(flightId);
     await this._send({ type: "unsubscribe", content: { flightId } });
   }
 
@@ -2745,12 +2753,30 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * per-consumer input the sidecar aggregates MAX-across-consumers, so a big
    * spotlight bumps the stream up while tiny avatars leave it small. The SDK's
    * feed primitives self-measure and call this; consumers do not report by hand.
-   * A size under 2 on either axis withdraws this consumer's report.
+   * A size under 2 on either axis withdraws this consumer's report. A size
+   * the sidecar already holds from this client is not sent again.
    */
   async reportDisplaySize(flightId: number, width: number, height: number): Promise<void> {
-    if (width < 2 || height < 2) this.displaySizes.delete(flightId);
-    else this.displaySizes.set(flightId, { width, height });
-    await this._send({ type: "report-display-size", content: { flightId, width, height } });
+    if (width < 2 || height < 2) {
+      this.displaySizes.delete(flightId);
+      this.sentSizes.delete(flightId);
+      await this._send({ type: "report-display-size", content: { flightId, width, height } });
+      return;
+    }
+    this.displaySizes.set(flightId, { width, height });
+    await this._sendDisplaySize(flightId, width, height);
+  }
+
+  private async _sendDisplaySize(flightId: number, width: number, height: number): Promise<void> {
+    const key = `${width}x${height}`;
+    if (this.sentSizes.get(flightId) === key) return;
+    this.sentSizes.set(flightId, key);
+    try {
+      await this._send({ type: "report-display-size", content: { flightId, width, height } });
+    } catch (err) {
+      if (this.sentSizes.get(flightId) === key) this.sentSizes.delete(flightId);
+      throw err;
+    }
   }
 
   /**
@@ -3190,10 +3216,19 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       const handle = this.getOrCreateHandle(cam.flightId);
       const reattached = attachChanged(handle.state, cam);
       const resurrected = handle._setState(cam);
-      if (resurrected) this._resourceHandle(cam.flightId);
+      if (resurrected) {
+        /* A destroyed camera that comes back is new to the sidecar, which holds no size for it. */
+        this.sentSizes.delete(cam.flightId);
+        this._resourceHandle(cam.flightId);
+      }
       if (resurrected || reattached || (listed && !listed.has(cam.flightId))) {
         this._renewEncodedTransform(cam.flightId);
       }
+    }
+    /* The sidecar drops a size for a camera it does not list, and a camera new to the list starts with none. */
+    const present = new Set(cameras.map((c) => c.flightId));
+    for (const flightId of [...this.sentSizes.keys()]) {
+      if (!present.has(flightId) || (listed && !listed.has(flightId))) this.sentSizes.delete(flightId);
     }
     this.emit("cameras-change", cameras);
     this._sendHeldAnchors();
@@ -3220,9 +3255,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       void this._send({ type: "set-size-hold", content: { flightId, hold: true } }).catch(() => {});
     }
     const size = this.displaySizes.get(flightId);
-    if (size) {
-      void this._send({ type: "report-display-size", content: { flightId, ...size } }).catch(() => {});
-    }
+    if (size) void this._sendDisplaySize(flightId, size.width, size.height).catch(() => {});
   }
 
   private handleServerMessage(raw: string): void {
@@ -3302,7 +3335,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         const handle = this.getOrCreateHandle(msg.content.state.flightId);
         const reattached = attachChanged(handle.state, msg.content.state);
         const resurrected = handle._setState(msg.content.state);
-        if (resurrected) this._resourceHandle(msg.content.state.flightId);
+        if (resurrected) {
+          this.sentSizes.delete(msg.content.state.flightId);
+          this._resourceHandle(msg.content.state.flightId);
+        }
         if (resurrected || reattached) this._renewEncodedTransform(msg.content.state.flightId);
         this.emit("cameras-change", this._cameras);
         this._sendHeldAnchors();
