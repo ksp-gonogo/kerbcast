@@ -1723,8 +1723,8 @@ export type ServerMessage =
 	| { type: "error", content: ErrorPayload }
 	/**
 	 * Keepalive probe sent by the sidecar every 5 seconds. Browser responds
-	 * with `Pong`; if no Ping arrives within 15s the browser tears down
-	 * the connection.
+	 * with `Pong`, which the sidecar does not wait for. Neither side closes
+	 * the connection over a missing Ping or Pong.
 	 */
 	| { type: "ping", content?: undefined }
 	/**

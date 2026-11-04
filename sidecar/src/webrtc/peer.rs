@@ -52,8 +52,6 @@ use webrtc::track::track_local::TrackLocal;
 use super::outbox::{ControlChannel, Outbox};
 use super::video_track::VideoTrack;
 
-use crate::cameras::CameraState as InternalCameraState;
-
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::protocol::{
@@ -451,6 +449,7 @@ impl KerbcastPeer {
         let liveness_for_handler = liveness.clone();
         let slots_for_state = slots.clone();
         let outbox_for_state = outbox.clone();
+        let registry_for_state = registry.clone();
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             info!(?state, "peer connection state");
             if state == RTCPeerConnectionState::Connected {
@@ -468,9 +467,18 @@ impl KerbcastPeer {
             browser notices still leaves a 1.11 client static. */
             let slots = slots_for_state.clone();
             let outbox = outbox_for_state.clone();
+            let registry = registry_for_state.clone();
             Box::pin(async move {
                 info!("peer reconnected, announcing its slot bindings again");
                 send_slot_maps(&slots, &outbox).await;
+                /* Whatever was lost during the outage left each feed's
+                reference chain broken, so every bound camera starts over from
+                an IDR. */
+                for flight_id in bound_cameras(&slots).await {
+                    if let Some(cam) = registry.get(flight_id).await {
+                        cam.request_keyframe();
+                    }
+                }
             })
         }));
 
@@ -1056,12 +1064,8 @@ async fn handle_client_message(
             }
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {
-            // The encoder backends expose `request_keyframe()`; we call
-            // it through the per-camera encoder lock if it's currently
-            // initialised. If not, the next encode produces an IDR
-            // anyway (cold start), so the no-op is the right thing.
             if let Some(cam) = registry.get(flight_id).await {
-                request_keyframe_for(&cam).await;
+                cam.request_keyframe();
                 info!(flight_id, "keyframe requested");
             }
         }
@@ -1146,16 +1150,6 @@ async fn handle_client_message(
             // Anchors go with their client, on every camera it set them on.
             registry.forget_anchors_all(peer_id).await;
         }
-    }
-}
-
-/// Force the camera's encoder to emit an IDR on its next encode. No-op when no
-/// encoder exists yet (a cold start already produces an IDR). Shared by the
-/// explicit keyframe request and the slot-subscribe path.
-async fn request_keyframe_for(cam: &Arc<InternalCameraState>) {
-    let mut guard = cam.encoder.lock().await;
-    if let Some(backend) = guard.as_mut() {
-        backend.request_keyframe();
     }
 }
 
@@ -1258,7 +1252,7 @@ async fn handle_subscribe(
         // SPS/PPS) to every track of this camera, including the freshly-added
         // slot — otherwise the slot's first frame is a mid-GOP P-frame that
         // decodes as garbage until the next periodic IDR.
-        request_keyframe_for(&cam).await;
+        cam.request_keyframe();
         cam.add_track(track).await;
         registry.set_subscribed(flight_id, true).await;
         info!(flight_id, "subscribed camera to slot");
@@ -1436,6 +1430,10 @@ async fn send_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Outbox) {
     for payload in slot_maps(&guard) {
         send_server_message(dc, &ServerMessage::SlotMap(payload));
     }
+}
+
+async fn bound_cameras(slots: &Arc<Mutex<Vec<Slot>>>) -> Vec<u32> {
+    slots.lock().await.iter().filter_map(|s| s.bound).collect()
 }
 
 /// The slot map of every bound slot that has a negotiated mid.
@@ -1945,25 +1943,6 @@ fn rtcp_keyframe_request_count(packets: &[Box<dyn rtcp::packet::Packet + Send + 
         .count()
 }
 
-/// Decide whether to honor a keyframe request for the camera currently bound to
-/// a slot, given the `(flight_id, time)` of the last keyframe this slot forced.
-/// Honor it when the bound camera has *changed* since then (a camera freshly
-/// swapped into the slot must always get its first IDR — otherwise it stays
-/// static for a GOP), or when the per-camera debounce gap has elapsed. The
-/// debounce only suppresses repeats for the *same* camera, so it bounds IDR
-/// bursts under sustained loss without ever starving a newly-bound feed.
-fn should_force_keyframe(
-    bound: u32,
-    last: Option<(u32, std::time::Instant)>,
-    now: std::time::Instant,
-    min_gap: std::time::Duration,
-) -> bool {
-    match last {
-        Some((fid, t)) if fid == bound => now.duration_since(t) >= min_gap,
-        _ => true,
-    }
-}
-
 /// Per-slot RTCP drain. webrtc-rs's NACK/PLI pipelines stall silently if a
 /// sender's RTCP isn't read, so every slot-track's sender must be drained for
 /// the connection's lifetime regardless of which camera (if any) currently
@@ -1973,11 +1952,11 @@ fn should_force_keyframe(
 ///
 /// On top of draining, a PLI/FIR keyframe request is honored: the browser sends
 /// one when a loss broke the reference chain and retransmission didn't recover
-/// it, so we force an IDR on the camera bound to this slot. A per-slot debounce
-/// caps this to one forced keyframe per `MIN_KEYFRAME_GAP`: a forced IDR is a
-/// large packet burst, and without the cap a sustained loss (browser PLI every
-/// few hundred ms) would become an IDR storm -> bitrate spike -> more loss. The
-/// NACK responder recovers most losses with no PLI at all, so this rarely fires.
+/// it, so we ask the camera bound to this slot for an IDR. The camera's own
+/// `MIN_KEYFRAME_GAP` turns a sustained loss (a PLI every few hundred ms, from
+/// any number of viewers) into at most one IDR a second rather than a storm
+/// that spikes the bitrate into more loss. The NACK responder recovers most
+/// losses with no PLI at all, so this rarely fires.
 ///
 /// REMB is still deliberately NOT consumed. In the slot model a slot's camera
 /// changes on Subscribe/Unsubscribe, so a REMB keyed by the slot's (stable)
@@ -1993,14 +1972,6 @@ async fn drain_rtcp_sink(
     slots: Arc<Mutex<Vec<Slot>>>,
     registry: Arc<CameraRegistry>,
 ) {
-    use std::time::Instant;
-    const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
-
-    // (flight_id, when) of the last keyframe this slot forced. Tracking the
-    // flight_id (not just the time) means a camera freshly swapped into the slot
-    // always gets its first PLI honored instead of being suppressed by the
-    // previous camera's debounce.
-    let mut last_forced: Option<(u32, Instant)> = None;
     while let Ok((packets, _)) = sender.read_rtcp().await {
         // REMB and other RTCP intentionally discarded — see fn doc. Only a
         // keyframe request is acted on.
@@ -2017,13 +1988,7 @@ async fn drain_rtcp_sink(
             continue;
         };
         cam.note_keyframe_requests(requests as u64);
-        let now = Instant::now();
-        if !should_force_keyframe(flight_id, last_forced, now, MIN_KEYFRAME_GAP) {
-            continue;
-        }
-        request_keyframe_for(&cam).await;
-        last_forced = Some((flight_id, now));
-        info!(flight_id, "keyframe forced by browser PLI/FIR");
+        cam.request_keyframe();
     }
     // read_rtcp errors when the sender closes (peer torn down) — the normal
     // exit. If it ever happens mid-connection this slot loses its NACK pump and
@@ -2592,8 +2557,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = MmapRingConfig {
             slot_count: 4,
-            max_width: 64,
-            max_height: 64,
+            max_width: 256,
+            max_height: 256,
         };
         let ring_path = dir.path().join("1.ring");
         MmapFrameRing::create(&ring_path, cfg).expect("create ring");
@@ -2604,7 +2569,9 @@ mod tests {
                 .await
                 .expect("peer"),
         );
-        registry.record_display_size(1, peer.peer_id, 32, 32).await;
+        registry
+            .record_display_size(1, peer.peer_id, 160, 160)
+            .await;
 
         std::fs::remove_file(&ring_path).expect("delete ring");
         std::fs::remove_file(dir.path().join("1.control.bin")).expect("delete control");
@@ -2615,7 +2582,7 @@ mod tests {
         let bytes = std::fs::read(dir.path().join("1.control.bin")).expect("control written");
         let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
         assert!(snap.subscribed);
-        assert_eq!((snap.width, snap.height), (Some(32), Some(32)));
+        assert_eq!((snap.width, snap.height), (Some(160), Some(160)));
     }
 
     /// A browser PLI is the signal that a feed is wedged on a broken reference
@@ -2665,39 +2632,6 @@ mod tests {
         ];
         assert_eq!(rtcp_keyframe_request_count(&pkts), 3);
         assert_eq!(rtcp_keyframe_request_count(&pkts[1..2]), 0);
-    }
-
-    const GAP: Duration = Duration::from_millis(1000);
-
-    #[test]
-    fn first_keyframe_request_for_a_slot_is_honored() {
-        let now = std::time::Instant::now();
-        assert!(should_force_keyframe(7, None, now, GAP));
-    }
-
-    #[test]
-    fn repeat_request_for_same_camera_within_gap_is_debounced() {
-        let t0 = std::time::Instant::now();
-        let now = t0 + Duration::from_millis(400);
-        assert!(!should_force_keyframe(7, Some((7, t0)), now, GAP));
-    }
-
-    #[test]
-    fn repeat_request_for_same_camera_after_gap_is_honored() {
-        let t0 = std::time::Instant::now();
-        let now = t0 + Duration::from_millis(1200);
-        assert!(should_force_keyframe(7, Some((7, t0)), now, GAP));
-    }
-
-    /// The slot-rebind case: camera 9 was just subscribed into the slot camera 7
-    /// held. Its first PLI must be honored even though camera 7 forced a
-    /// keyframe under the debounce gap ago — otherwise the freshly-bound feed
-    /// stays static for a full GOP (a narrower recurrence of the very bug).
-    #[test]
-    fn request_for_newly_bound_camera_bypasses_the_previous_cameras_debounce() {
-        let t0 = std::time::Instant::now();
-        let now = t0 + Duration::from_millis(200);
-        assert!(should_force_keyframe(9, Some((7, t0)), now, GAP));
     }
 
     /// The regression this state machine exists for: `Disconnected` used to be

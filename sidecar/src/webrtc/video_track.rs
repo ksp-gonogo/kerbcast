@@ -30,6 +30,30 @@ pub struct VideoTrack {
     packetizer: Mutex<Paced>,
     /// Where frame stamps for this track go. `None` sends none (tests).
     stamps: Option<Outbox>,
+    /// The camera whose frames this track last sent live, cleared while the
+    /// track sends nothing. See `first_live_frame`.
+    live_camera: std::sync::Mutex<Option<u32>>,
+}
+
+/// What `write_frame` sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentFrameInfo {
+    pub rtp_timestamp: u32,
+    /// The frame was the first this track sent live for its camera and was
+    /// not a keyframe, so the viewer cannot decode it: the camera must
+    /// produce an IDR.
+    pub wants_keyframe: bool,
+}
+
+/**
+ * Whether a frame sent live for `flight_id` is the first since the track last
+ * sent nothing or fed another camera, recording it as the track's camera.
+ * Frames go nowhere until the RTP binding is live after DTLS, so the IDR a new
+ * camera binding or a cold encoder starts with is usually dropped, and this
+ * is the first moment one can reach the viewer.
+ */
+fn first_live_frame(live_camera: &mut Option<u32>, flight_id: u32) -> bool {
+    live_camera.replace(flight_id) != Some(flight_id)
 }
 
 impl VideoTrack {
@@ -54,6 +78,7 @@ impl VideoTrack {
                 clock: MediaClock::default(),
             }),
             stamps,
+            live_camera: std::sync::Mutex::new(None),
         }
     }
 
@@ -76,11 +101,12 @@ impl VideoTrack {
         keyframe: bool,
         flight_id: u32,
         capture: &CaptureStamp,
-    ) -> webrtc::error::Result<Option<u32>> {
+    ) -> webrtc::error::Result<Option<SentFrameInfo>> {
         /* Unbound or paused everywhere (`all` is true with no bindings): send
         nothing and leave the sequence untouched, matching
         TrackLocalStaticSample. */
         if self.rtp.all_binding_paused().await {
+            *self.live_camera.lock().unwrap() = None;
             return Ok(None);
         }
         let packets = self.packetize(data, time, capture).await?;
@@ -101,7 +127,11 @@ impl VideoTrack {
         for p in &packets {
             self.rtp.write_rtp_with_extensions(p, &[]).await?;
         }
-        Ok(Some(rtp_timestamp))
+        let first = first_live_frame(&mut self.live_camera.lock().unwrap(), flight_id);
+        Ok(Some(SentFrameInfo {
+            rtp_timestamp,
+            wants_keyframe: first && !keyframe,
+        }))
     }
 
     /// Every packet of one frame shares the timestamp, which is the last
@@ -674,6 +704,41 @@ mod tests {
         assert!(ts.iter().all(|&x| x == ts[0]));
     }
 
+    /// A camera's first live frame on a track asks for an IDR; later frames,
+    /// or the same camera after a write that went live, do not. Rebinding the
+    /// track to another camera, or a spell of sending nothing, asks again.
+    #[test]
+    fn first_live_frame_per_camera_binding() {
+        let mut live = None;
+        assert!(first_live_frame(&mut live, 7), "the binding's first frame");
+        assert!(!first_live_frame(&mut live, 7), "the next frame is not");
+        assert!(
+            first_live_frame(&mut live, 9),
+            "a camera swapped into the slot"
+        );
+        assert!(!first_live_frame(&mut live, 9));
+        live = None;
+        assert!(
+            first_live_frame(&mut live, 9),
+            "sending again after a pause"
+        );
+    }
+
+    /// A track that sends nothing forgets which camera it last sent live,
+    /// so its next live frame is checked for a keyframe again.
+    #[tokio::test]
+    async fn a_track_sending_nothing_forgets_its_live_camera() {
+        let t = track();
+        *t.live_camera.lock().unwrap() = Some(1);
+        let (time, stamp) = at(33.0, Some(1.0));
+        let got = t
+            .write_frame(&nal(64), time, false, 1, &stamp)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+        assert_eq!(*t.live_camera.lock().unwrap(), None);
+    }
+
     #[tokio::test]
     async fn unbound_track_sends_nothing() {
         let t = track();
@@ -929,12 +994,13 @@ mod tests {
                 )),
                 ..CaptureStamp::at(Some(ut), 2)
             };
-            if let Some(ts) = vt
+            if let Some(info) = vt
                 .write_frame(&nal(64), at(n as f64 * 33.0, None).0, true, 9, &stamp)
                 .await
                 .unwrap()
             {
-                sent.push((ts, ut));
+                assert!(!info.wants_keyframe, "a keyframe needs no other");
+                sent.push((info.rtp_timestamp, ut));
             }
             n += 1;
             tokio::time::sleep(Duration::from_millis(33)).await;

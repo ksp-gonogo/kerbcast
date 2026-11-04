@@ -1600,8 +1600,7 @@ namespace Kerbcast
             var (resScale, drop) = ShedTable[_shedLevel];
             float scale = QualityClamp.EffectiveScale(resScale, _viewerLevel);
 
-            int targetW = QualityClamp.ScaleDimension(OperatorWidth, scale);
-            int targetH = QualityClamp.ScaleDimension(OperatorHeight, scale);
+            var (targetW, targetH) = QualityClamp.ScaleSize(OperatorWidth, OperatorHeight, scale);
             if (!_sizeHeld && (targetW != RenderWidth || targetH != RenderHeight))
             {
                 SetRenderSize(targetW, targetH);

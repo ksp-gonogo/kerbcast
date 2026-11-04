@@ -1795,8 +1795,8 @@ pub enum ServerMessage {
     /// payload so the client can log it.
     Error(ErrorPayload),
     /// Keepalive probe sent by the sidecar every 5 seconds. Browser responds
-    /// with `Pong`; if no Ping arrives within 15s the browser tears down
-    /// the connection.
+    /// with `Pong`, which the sidecar does not wait for. Neither side closes
+    /// the connection over a missing Ping or Pong.
     Ping,
     /// Current value of global settings (throttle state). Sent after `Hello`
     /// so a freshly-connected client shows correct state immediately, and

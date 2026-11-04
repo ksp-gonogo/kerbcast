@@ -27,3 +27,7 @@ AVBufferRef *kerbcast_avcodec_get_hw_frames_ctx(const AVCodecContext *ctx) {
 void kerbcast_avcodec_set_hw_device_ctx(AVCodecContext *ctx, AVBufferRef *ref) {
     ctx->hw_device_ctx = ref;
 }
+
+int kerbcast_avcodec_get_profile(const AVCodecContext *ctx) {
+    return ctx->profile;
+}

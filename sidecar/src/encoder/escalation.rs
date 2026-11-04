@@ -27,6 +27,21 @@ pub const SILENT_SESSION_FRAME_LIMIT: u32 = 90;
 /// before the camera's encode is pinned to the software fallback.
 pub const SESSION_STRIKE_LIMIT: u32 = 2;
 
+/// Smallest frame side every encoder backend accepts. The Steam Deck's VAAPI
+/// refuses anything under 128x128, and OpenH264 fails on frames that small.
+pub const MIN_ENCODE_DIMENSION: u32 = 128;
+
+/// Largest frame side the hardware encoders accept.
+pub const MAX_ENCODE_DIMENSION: u32 = 4096;
+
+/// Whether a session failure at this frame size says anything about the
+/// backend. Outside the range any backend may refuse the size itself, so the
+/// failure is the size's fault and must not push the camera to software.
+pub fn size_is_encodable(width: u32, height: u32) -> bool {
+    let range = MIN_ENCODE_DIMENSION..=MAX_ENCODE_DIMENSION;
+    range.contains(&width) && range.contains(&height)
+}
+
 /// What the consume loop must do after recording a session-health event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionVerdict {
@@ -80,6 +95,17 @@ impl SessionHealth {
         self.strike()
     }
 
+    /// `note_session_error` for a session encoding `width` x `height`: one
+    /// at a size no encoder supports is dropped without a strike.
+    pub fn note_session_error_at(&mut self, width: u32, height: u32) -> SessionVerdict {
+        if size_is_encodable(width, height) {
+            self.note_session_error()
+        } else {
+            self.silent_frames = 0;
+            SessionVerdict::DropSession
+        }
+    }
+
     fn strike(&mut self) -> SessionVerdict {
         if self.forced_software {
             // Already escalated; software sessions don't strike further.
@@ -114,13 +140,15 @@ impl SessionHealth {
 /// Media Foundation on certain D3D devices, fail hardware init on every
 /// resolution reinit rather than just going silent post-init). Only
 /// hardware backends strike — software's own init failures have nowhere
-/// softer to fall back to. Returns the verdict, or `None` if the failed
-/// backend wasn't hardware.
+/// softer to fall back to, and neither does a failure at a size outside
+/// `size_is_encodable`. Returns the verdict, or `None` when nothing struck.
 pub fn record_init_failure(
     health: &mut SessionHealth,
     was_hardware: bool,
+    width: u32,
+    height: u32,
 ) -> Option<SessionVerdict> {
-    was_hardware.then(|| health.note_session_error())
+    (was_hardware && size_is_encodable(width, height)).then(|| health.note_session_error())
 }
 
 #[cfg(test)]
@@ -299,12 +327,12 @@ mod tests {
     fn init_failure_on_hardware_backend_strikes_and_escalates() {
         let mut health = SessionHealth::new();
         assert_eq!(
-            record_init_failure(&mut health, true),
+            record_init_failure(&mut health, true, 640, 360),
             Some(SessionVerdict::DropSession)
         );
         assert!(!health.forced_software());
         assert_eq!(
-            record_init_failure(&mut health, true),
+            record_init_failure(&mut health, true, 640, 360),
             Some(SessionVerdict::EscalateToSoftware)
         );
         assert!(health.forced_software());
@@ -313,7 +341,7 @@ mod tests {
     #[test]
     fn init_failure_on_software_backend_does_not_strike() {
         let mut health = SessionHealth::new();
-        assert_eq!(record_init_failure(&mut health, false), None);
+        assert_eq!(record_init_failure(&mut health, false, 640, 360), None);
         assert!(!health.forced_software());
     }
 
@@ -337,7 +365,7 @@ mod tests {
         // succeeds — deliberately NOT calling note_output() here, since
         // the fallback backend is software, not hardware.
         assert_eq!(
-            record_init_failure(&mut health, true),
+            record_init_failure(&mut health, true, 640, 360),
             Some(SessionVerdict::DropSession)
         );
         assert!(!health.forced_software());
@@ -346,7 +374,7 @@ mod tests {
         // had been wiped by an intervening note_output(), this would only
         // be strike 1 again (DropSession) instead of strike 2 (escalate).
         assert_eq!(
-            record_init_failure(&mut health, true),
+            record_init_failure(&mut health, true, 640, 360),
             Some(SessionVerdict::EscalateToSoftware)
         );
         assert!(health.forced_software());
@@ -362,5 +390,47 @@ mod tests {
         health.note_output();
         assert!(!health.forced_software());
         assert_eq!(health.note_silent_frame(), SessionVerdict::Continue);
+    }
+
+    /// A hardware open refused because the frame is smaller than the encoder
+    /// supports, then a software session failing at the same size, must not
+    /// pin the camera to software once the size grows back.
+    #[test]
+    fn failures_at_an_unsupported_size_do_not_strike() {
+        let mut health = SessionHealth::new();
+        assert_eq!(record_init_failure(&mut health, true, 18, 10), None);
+        assert_eq!(
+            health.note_session_error_at(18, 10),
+            SessionVerdict::DropSession
+        );
+        assert_eq!(record_init_failure(&mut health, true, 640, 8192), None);
+        assert!(!health.forced_software());
+        assert!(health.select(EncoderChoice::Mediafoundation).is_hardware());
+
+        /* Strikes at a supported size still count, so the size exemption
+        cannot hide a backend that really is failing. */
+        assert_eq!(
+            record_init_failure(&mut health, true, 640, 360),
+            Some(SessionVerdict::DropSession)
+        );
+        assert_eq!(
+            health.note_session_error_at(640, 360),
+            SessionVerdict::EscalateToSoftware
+        );
+    }
+
+    #[test]
+    fn encodable_range_is_inclusive_on_both_axes() {
+        assert!(size_is_encodable(
+            MIN_ENCODE_DIMENSION,
+            MIN_ENCODE_DIMENSION
+        ));
+        assert!(size_is_encodable(
+            MAX_ENCODE_DIMENSION,
+            MAX_ENCODE_DIMENSION
+        ));
+        assert!(!size_is_encodable(MIN_ENCODE_DIMENSION - 1, 720));
+        assert!(!size_is_encodable(1280, MIN_ENCODE_DIMENSION - 1));
+        assert!(!size_is_encodable(MAX_ENCODE_DIMENSION + 1, 720));
     }
 }

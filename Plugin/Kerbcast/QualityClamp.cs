@@ -69,5 +69,38 @@ namespace Kerbcast
             v -= v & 1;
             return v < 2 ? 2 : v;
         }
+
+        /// <summary>Smallest render side every encoder accepts: the Steam
+        /// Deck's VAAPI refuses anything under 128x128. Matches the
+        /// sidecar's MIN_ENCODE_DIMENSION.</summary>
+        public const int MinEncodeDimension = 128;
+
+        /// <summary>
+        /// The effective render size for the operator dims at <paramref name="scale"/>:
+        /// ScaleDimension on each axis, then, if either side lands under
+        /// MinEncodeDimension, raised at the operator's shape until neither
+        /// is, never past the operator dims. Shedding a small viewer's size
+        /// further would only produce frames the hardware encoder refuses.
+        /// </summary>
+        public static (int w, int h) ScaleSize(int operatorW, int operatorH, float scale)
+        {
+            int w = ScaleDimension(operatorW, scale);
+            int h = ScaleDimension(operatorH, scale);
+            if ((w >= MinEncodeDimension && h >= MinEncodeDimension) || operatorW <= 0 || operatorH <= 0)
+                return (w, h);
+            double lift = Math.Max(
+                Math.Max((double)MinEncodeDimension / operatorW, (double)MinEncodeDimension / operatorH),
+                scale);
+            return (RaiseDimension(operatorW, lift), RaiseDimension(operatorH, lift));
+        }
+
+        static int RaiseDimension(int operatorDim, double scale)
+        {
+            int v = (int)Math.Ceiling(operatorDim * scale - 1e-6);
+            v += v & 1;
+            int ceiling = operatorDim - (operatorDim & 1);
+            if (v > ceiling) v = ceiling;
+            return v < 2 ? 2 : v;
+        }
     }
 }

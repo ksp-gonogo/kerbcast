@@ -87,5 +87,27 @@ Check(QualityClamp.ScaleDimension(1024, 0.75f) == 768, "exact products untouched
     Check(!exceeded, "no shed/viewer combination exceeds the operator ceiling");
 }
 
+// --- Shedding never takes a render under the encoder minimum. ---
+{
+    int min = QualityClamp.MinEncodeDimension;
+    Check(QualityClamp.ScaleSize(1024, 576, 0.25f) == (256, 144), "a large size sheds as before");
+    Check(QualityClamp.ScaleSize(228, 128, 1.0f) == (228, 128), "unshed small size untouched");
+    Check(QualityClamp.ScaleSize(228, 128, 0.75f) == (228, 128), "a shed 228x128 stays at the minimum");
+    Check(QualityClamp.ScaleSize(228, 128, 0.25f) == (228, 128), "a deep shed too");
+    Check(QualityClamp.ScaleSize(456, 256, 0.25f) == (228, 128), "shed lands on the minimum at its shape");
+    Check(QualityClamp.ScaleSize(128, 456, 0.5f) == (128, 456), "a tall size keeps its shape");
+    Check(QualityClamp.ScaleSize(64, 64, 1.0f) == (64, 64), "never past the operator dims");
+    bool under = false;
+    foreach (var (ow, oh) in new[] { (228, 128), (300, 170), (1024, 576), (170, 300), (2048, 256) })
+        for (int shed = 0; shed < shedScales.Length; shed++)
+            for (int viewer = 0; viewer <= QualityClamp.MaxViewerLevel; viewer++)
+            {
+                float scale = QualityClamp.EffectiveScale(shedScales[shed], viewer);
+                var (w, h) = QualityClamp.ScaleSize(ow, oh, scale);
+                if (w < min || h < min || w > ow || h > oh || (w & 1) != 0 || (h & 1) != 0) under = true;
+            }
+    Check(!under, "every shed/viewer step stays within [minimum, operator] and even");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");
 return failures == 0 ? 0 : 1;

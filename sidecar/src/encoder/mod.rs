@@ -18,7 +18,8 @@ mod software;
 mod videotoolbox;
 
 pub use escalation::{
-    record_init_failure, SessionHealth, SessionVerdict, SILENT_SESSION_FRAME_LIMIT,
+    record_init_failure, size_is_encodable, SessionHealth, SessionVerdict, MAX_ENCODE_DIMENSION,
+    MIN_ENCODE_DIMENSION, SILENT_SESSION_FRAME_LIMIT,
 };
 pub use libva::Libva;
 pub use mediafoundation::MediaFoundation;

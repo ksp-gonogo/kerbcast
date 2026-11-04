@@ -27,7 +27,7 @@ use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
 use crate::commands::{
     validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
 };
-use crate::encoder::{EncoderBackend, SessionHealth};
+use crate::encoder::{EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION};
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
@@ -769,8 +769,9 @@ pub struct CameraState {
     /// Promoted out of background capture but not yet renderable — set when display demand
     /// appears, cleared when a keyframe is emitted.
     pub ramping: AtomicBool,
-    /// Pending forced-IDR request, consumed by the encode path.
-    pub keyframe_wanted: AtomicBool,
+    /// Pending forced-IDR request and when this camera last produced one,
+    /// consumed by the encode path.
+    pub keyframe_gate: std::sync::Mutex<KeyframeGate>,
     /// One `VideoTrack` per subscribed peer-track. Weak refs so
     /// dropped peers get GC'd from this list naturally — no manual unsub
     /// bookkeeping per peer needed.
@@ -883,15 +884,23 @@ impl CameraState {
     /// path once a keyframe is emitted.
     pub fn begin_ramp(&self) {
         self.ramping.store(true, Ordering::Release);
-        self.keyframe_wanted.store(true, Ordering::Release);
+        self.request_keyframe();
     }
 
-    /// Whether the encoder should force an IDR on its next encode, consuming
-    /// the request. Promotion sets it: background capture stream's periodic IDR is counted
-    /// in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural keyframe can
-    /// be ~60s away and a promoted camera would sit unrenderable until then.
-    pub fn take_keyframe_request(&self) -> bool {
-        self.keyframe_wanted.swap(false, Ordering::AcqRel)
+    /// Ask for an IDR from this camera's encoder. Every keyframe source goes
+    /// through here (PLI, FIR, a client request, a new binding, a promotion),
+    /// so the per-camera gap in `KeyframeGate` bounds them all at once.
+    pub fn request_keyframe(&self) {
+        self.keyframe_gate.lock().unwrap().request();
+    }
+
+    /// Whether the encoder should force an IDR on this encode, consuming the
+    /// request. Promotion needs it: background capture's periodic IDR is
+    /// counted in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural
+    /// keyframe can be ~60s away and a promoted camera would sit unrenderable
+    /// until then. A request inside the gap stays pending for a later encode.
+    pub fn take_keyframe_request(&self, now: Instant) -> bool {
+        self.keyframe_gate.lock().unwrap().take(now)
     }
 
     /// The promotion completed: a keyframe went out, so the feed is renderable
@@ -982,7 +991,10 @@ impl CameraState {
     /// keyed by `peer_id`. A sub-2 report (a `display:none` / not-yet-laid-out
     /// tile reporting offsetWidth 0) is NO DEMAND, not a real 0x0 render
     /// target: drop the peer's entry so the sole-0x0-consumer case resolves to
-    /// `None` (plugin default) rather than a 0x0 that could wedge the ring.
+    /// `None` (plugin default) rather than a 0x0 that could wedge the ring. A
+    /// small but real box (a phone tile, a face cam) is kept as reported;
+    /// `effective_render_size` raises the demand to an encodable size once it
+    /// has the ring's shape, so a thin strip cannot inflate it.
     pub async fn record_display_size(&self, peer_id: u32, width: u32, height: u32) {
         let mut sizes = self.display_sizes.lock().await;
         if width < 2 || height < 2 {
@@ -1141,8 +1153,11 @@ impl CameraState {
         self.send_tally.note_sent();
     }
 
-    pub fn note_keyframe_sent(&self) {
+    /// A keyframe went out at `now`, forced or periodic. It answers every
+    /// request made before it and starts the gap.
+    pub fn note_keyframe_sent(&self, now: Instant) {
         self.keyframes_sent.fetch_add(1, Ordering::Relaxed);
+        self.keyframe_gate.lock().unwrap().note_sent(now);
     }
 
     pub fn note_keyframe_requests(&self, n: u64) {
@@ -1199,7 +1214,8 @@ impl CameraState {
     }
 
     /// Effective render size = min(demand, manual cap) at the ring's aspect,
-    /// clamped to the ring's max dims and made even (H.264 chroma). Demand is normally the auto MAX-
+    /// raised to `MIN_ENCODE_DIMENSION` on both sides, clamped to the ring's
+    /// max dims and made even (H.264 chroma). Demand is normally the auto MAX-
     /// across-consumers display size; while ANY peer forces this camera (see
     /// `forced_full_res`), demand is instead the ring ceiling, so a forced feed
     /// sizes up regardless of what's actually being displayed. `None` when
@@ -1229,12 +1245,60 @@ impl CameraState {
             (None, None) => None,
         };
         combined.map(|(w, h)| {
+            let (w, h) = raise_to_encodable(w, h);
             let (w, h) = fit_within(w, h, mw, mh);
             (
                 even_clamp(w.round() as u32, mw),
                 even_clamp(h.round() as u32, mh),
             )
         })
+    }
+}
+
+/// Least time between two keyframes one camera produces. An IDR from the
+/// per-camera encoder reaches every viewer of that camera as a burst of
+/// packets, so without a gap a few lossy viewers asking at once would make a
+/// storm of them that causes more loss.
+pub const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(1000);
+
+/**
+ * Debounces one camera's keyframe requests without ever dropping one: a
+ * request inside `MIN_KEYFRAME_GAP` of the last keyframe stays pending and is
+ * served by the first encode after the gap ends, or answered sooner by any
+ * keyframe the encoder produces on its own.
+ */
+#[derive(Debug, Default)]
+pub struct KeyframeGate {
+    wanted: bool,
+    last: Option<Instant>,
+}
+
+impl KeyframeGate {
+    pub fn request(&mut self) {
+        self.wanted = true;
+    }
+
+    pub fn pending(&self) -> bool {
+        self.wanted
+    }
+
+    /// Whether to force an IDR now. A forced one starts the gap at once,
+    /// since a pipelined hardware encoder may emit it a frame later.
+    pub fn take(&mut self, now: Instant) -> bool {
+        let gap_open = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= MIN_KEYFRAME_GAP);
+        if !self.wanted || !gap_open {
+            return false;
+        }
+        self.wanted = false;
+        self.last = Some(now);
+        true
+    }
+
+    pub fn note_sent(&mut self, now: Instant) {
+        self.wanted = false;
+        self.last = Some(now);
     }
 }
 
@@ -1250,6 +1314,17 @@ fn cover_at_aspect((w, h): (u32, u32), max_w: u32, max_h: u32) -> (f64, f64) {
     let aspect = max_w as f64 / max_h as f64;
     let width = (w as f64).max(h as f64 * aspect);
     (width, width / aspect)
+}
+
+/// Scale `(w, h)` up uniformly, keeping its aspect, until neither side is under
+/// `MIN_ENCODE_DIMENSION`. Only a ring smaller than that can bring it back under.
+fn raise_to_encodable(w: f64, h: f64) -> (f64, f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return (w, h);
+    }
+    let min = MIN_ENCODE_DIMENSION as f64;
+    let scale = (min / w).max(min / h).max(1.0);
+    (w * scale, h * scale)
 }
 
 /// Scale `(w, h)` down uniformly, keeping its aspect, until it fits `limit_w` x `limit_h`.
@@ -1824,7 +1899,7 @@ impl CameraRegistry {
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
                             ramping: AtomicBool::new(false),
-                            keyframe_wanted: AtomicBool::new(false),
+                            keyframe_gate: std::sync::Mutex::new(KeyframeGate::default()),
                             tracks: RwLock::new(Vec::new()),
                             display_sizes: Mutex::new(display_sizes),
                             manual_render_cap: Mutex::new(manual_render_cap),
@@ -3951,7 +4026,7 @@ mod tests {
     #[tokio::test]
     async fn display_size_tracker_takes_max_across_consumers() {
         let (_dir, cam) = attach_camera_for_tracker(7_001).await;
-        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(1, 200, 200).await;
         cam.record_display_size(2, 512, 512).await;
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
     }
@@ -3962,14 +4037,14 @@ mod tests {
     #[tokio::test]
     async fn display_size_relaxes_when_large_consumer_departs() {
         let (_dir, cam) = attach_camera_for_tracker(7_002).await;
-        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(1, 200, 200).await;
         cam.record_display_size(2, 512, 512).await;
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
 
         cam.forget_display_size(2).await;
         assert_eq!(
             cam.effective_render_size().await,
-            Some((40, 40)),
+            Some((200, 200)),
             "effective size must relax after the large consumer departs (clear-on-departure)"
         );
 
@@ -4033,6 +4108,140 @@ mod tests {
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
         cam.record_display_size(1, 0, 0).await;
         assert_eq!(cam.effective_render_size().await, None);
+    }
+
+    /// With no keyframe yet, a request is served by the very next encode.
+    #[test]
+    fn keyframe_request_with_no_recent_keyframe_is_served_at_once() {
+        let mut gate = KeyframeGate::default();
+        let t0 = Instant::now();
+        assert!(!gate.take(t0), "nothing asked");
+        gate.request();
+        assert!(gate.take(t0));
+        assert!(!gate.pending());
+    }
+
+    /// Requests inside the gap are held, not dropped, however many arrive, and
+    /// one IDR serves them all as soon as the gap ends.
+    #[test]
+    fn keyframe_requests_inside_the_gap_wait_for_it_and_coalesce() {
+        let mut gate = KeyframeGate::default();
+        let t0 = Instant::now();
+        gate.request();
+        assert!(gate.take(t0));
+
+        for ms in [10, 300, 600] {
+            gate.request();
+            assert!(
+                !gate.take(t0 + Duration::from_millis(ms)),
+                "inside the gap at {ms} ms"
+            );
+            assert!(gate.pending(), "still owed at {ms} ms");
+        }
+        assert!(gate.take(t0 + MIN_KEYFRAME_GAP), "served when the gap ends");
+        assert!(
+            !gate.take(t0 + MIN_KEYFRAME_GAP * 3),
+            "the three requests made one IDR"
+        );
+    }
+
+    /// The gap runs from any keyframe the camera sent, and that keyframe
+    /// answers whatever was pending before it.
+    #[test]
+    fn a_periodic_keyframe_answers_pending_requests_and_starts_the_gap() {
+        let mut gate = KeyframeGate::default();
+        let t0 = Instant::now();
+        gate.note_sent(t0);
+        gate.request();
+        assert!(
+            !gate.take(t0 + Duration::from_millis(500)),
+            "inside the gap"
+        );
+        gate.note_sent(t0 + Duration::from_millis(700));
+        assert!(!gate.pending(), "the periodic IDR answered it");
+        assert!(!gate.take(t0 + MIN_KEYFRAME_GAP * 2));
+
+        gate.request();
+        assert!(
+            !gate.take(t0 + Duration::from_millis(1500)),
+            "the gap restarted at the periodic IDR"
+        );
+        assert!(gate.take(t0 + Duration::from_millis(1700)));
+    }
+
+    /// Every source reaches the encode path through the camera, so one camera
+    /// takes at most one forced IDR per gap whoever asks.
+    #[tokio::test]
+    async fn camera_keyframe_requests_share_one_gap() {
+        let (_dir, cam) = attach_camera_for_tracker(7_010).await;
+        let t0 = Instant::now();
+        cam.request_keyframe();
+        assert!(cam.take_keyframe_request(t0));
+        cam.request_keyframe();
+        cam.begin_ramp();
+        assert!(!cam.take_keyframe_request(t0 + Duration::from_millis(200)));
+        assert!(cam.take_keyframe_request(t0 + MIN_KEYFRAME_GAP));
+    }
+
+    /// A small but real box (a phone's half-width tile, an older client's
+    /// 16x10 report) still counts as demand, raised to a size every encoder
+    /// accepts rather than dropped to the plugin default.
+    #[tokio::test]
+    async fn small_size_report_is_raised_to_the_encodable_minimum() {
+        let (_dir, cam) = attach_camera_sized(7_007, 1280, 720).await;
+        cam.record_display_size(1, 170, 96).await;
+        assert_eq!(cam.effective_render_size().await, Some((228, 128)));
+
+        cam.record_display_size(1, 16, 10).await;
+        assert_eq!(cam.effective_render_size().await, Some((228, 128)));
+
+        /* The larger viewer still wins the max. */
+        cam.record_display_size(2, 320, 180).await;
+        assert_eq!(cam.effective_render_size().await, Some((320, 180)));
+    }
+
+    /// A thin strip (a tile mid collapse) is covered at the ring's shape
+    /// before the floor applies, so it asks for what covers it, never the
+    /// ring max that raising it at its own shape would reach.
+    #[tokio::test]
+    async fn a_thin_box_does_not_inflate_to_the_ring_max() {
+        let (_dir, cam) = attach_camera_sized(7_011, 1280, 720).await;
+        cam.record_display_size(1, 400, 20).await;
+        assert_eq!(cam.effective_render_size().await, Some((400, 224)));
+        cam.record_display_size(1, 20, 400).await;
+        assert_eq!(cam.effective_render_size().await, Some((710, 400)));
+        cam.record_display_size(1, 200, 4).await;
+        assert_eq!(cam.effective_render_size().await, Some((228, 128)));
+    }
+
+    /// No path asks for a render under `MIN_ENCODE_DIMENSION` on either side:
+    /// the smallest accepted report, a tiny manual cap and a cap on a wide
+    /// ring all come out at least that size, at the ring's aspect.
+    #[tokio::test]
+    async fn render_size_never_goes_under_the_encodable_minimum() {
+        let min = MIN_ENCODE_DIMENSION;
+        let (_dir, cam) = attach_camera_sized(7_008, 1280, 720).await;
+        cam.record_display_size(1, min, min).await;
+        let (w, h) = cam.effective_render_size().await.expect("demand");
+        assert_eq!(h, min, "the box's height already covers it");
+        assert!(w >= min && w % 2 == 0, "{w}x{h}");
+
+        cam.set_manual_render_cap(Some((32, 16))).await;
+        let (w, h) = cam.effective_render_size().await.expect("capped");
+        assert!(w >= min && h >= min, "a tiny cap is lifted: {w}x{h}");
+        assert_eq!((w % 2, h % 2), (0, 0));
+        assert!(
+            (w as f64 / h as f64 - 16.0 / 9.0).abs() < 0.02,
+            "at the ring's aspect: {w}x{h}"
+        );
+
+        cam.forget_display_size(1).await;
+        let (w, h) = cam.effective_render_size().await.expect("cap alone");
+        assert!(w >= min && h >= min, "a cap with no viewer: {w}x{h}");
+
+        let (_dir2, wide) = attach_camera_sized(7_009, 2048, 256).await;
+        wide.set_manual_render_cap(Some((100, 10))).await;
+        assert_eq!(wide.effective_render_size().await, Some((1024, 128)));
     }
 
     /// With background capture disabled (ceiling 0 — the default, and what an older plugin
@@ -4121,9 +4330,10 @@ mod tests {
         // the state stays honest instead of claiming Full while undecodable.
         cam.begin_ramp();
         assert_eq!(cam.capture_state_with(false), CaptureState::Ramping);
-        assert!(cam.take_keyframe_request(), "promotion asks for an IDR");
+        let now = Instant::now();
+        assert!(cam.take_keyframe_request(now), "promotion asks for an IDR");
         assert!(
-            !cam.take_keyframe_request(),
+            !cam.take_keyframe_request(now + MIN_KEYFRAME_GAP * 2),
             "the request is consumed, not re-armed every encode"
         );
         assert_eq!(
@@ -4239,8 +4449,8 @@ mod tests {
     #[tokio::test]
     async fn forced_full_res_sizes_to_the_ceiling_over_tiny_demand() {
         let (_dir, cam) = attach_camera_for_tracker(7_005).await;
-        cam.record_display_size(1, 40, 40).await;
-        assert_eq!(cam.effective_render_size().await, Some((40, 40)));
+        cam.record_display_size(1, 200, 200).await;
+        assert_eq!(cam.effective_render_size().await, Some((200, 200)));
 
         cam.set_forced(1, true).await;
         assert_eq!(
@@ -4257,7 +4467,7 @@ mod tests {
     #[tokio::test]
     async fn forced_full_res_or_aggregates_across_peers() {
         let (_dir, cam) = attach_camera_for_tracker(7_006).await;
-        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(1, 200, 200).await;
 
         cam.set_forced(1, true).await;
         cam.set_forced(2, true).await;
@@ -4273,7 +4483,7 @@ mod tests {
         cam.set_forced(2, false).await;
         assert_eq!(
             cam.effective_render_size().await,
-            Some((40, 40)),
+            Some((200, 200)),
             "released back to demand once every peer clears"
         );
     }
@@ -6262,7 +6472,7 @@ mod tests {
         let (registry, cam) = registry_with_one_camera(&dir).await;
         cam.note_keyframe_requests(2);
         cam.note_keyframe_requests(1);
-        cam.note_keyframe_sent();
+        cam.note_keyframe_sent(Instant::now());
         let info = info_for(&registry, 1).await;
         assert_eq!(info.keyframe_requests_received, 3);
         assert_eq!(info.keyframes_sent, 1);
@@ -6287,7 +6497,7 @@ mod tests {
         let (_dir, cam) = attach_camera_for_tracker(7_203).await;
         cam.record_display_size(1, 800, 450).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
-        cam.record_display_size(2, 100, 100).await;
+        cam.record_display_size(2, 200, 200).await;
         let now = Instant::now() + Duration::from_millis(200);
         let ds = cam.display_size_report_at(now).await.expect("held");
         assert_eq!((ds.width, ds.height), (800, 450));

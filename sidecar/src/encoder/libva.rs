@@ -36,7 +36,7 @@ mod imp {
     use std::path::Path;
     use std::ptr;
     use std::sync::OnceLock;
-    use tracing::{debug, warn};
+    use tracing::{debug, info, warn};
 
     // C shim: access AVCodecContext::hw_frames_ctx / hw_device_ctx via
     // compiled C so field offsets match the runtime libavcodec ABI exactly.
@@ -47,6 +47,7 @@ mod imp {
             ctx: *mut ffmpeg::ffi::AVCodecContext,
             r: *mut ffmpeg::ffi::AVBufferRef,
         );
+        fn kerbcast_avcodec_get_profile(ctx: *const ffmpeg::ffi::AVCodecContext) -> i32;
     }
 
     use super::super::annexb::split_annexb_into;
@@ -280,6 +281,131 @@ mod imp {
         false
     }
 
+    /// The profile asked of h264_vaapi first: the constrained baseline the SDP
+    /// answer advertises as profile-level-id 42e01f.
+    const ADVERTISED_PROFILE: &str = "constrained_baseline";
+
+    /// libavcodec's FF_PROFILE_H264_CONSTRAINED_BASELINE: profile_idc 66 with
+    /// the constrained flag (1 << 9).
+    const FF_PROFILE_H264_CONSTRAINED_BASELINE: i32 = 66 | (1 << 9);
+
+    fn profile_name(profile: i32) -> &'static str {
+        match profile {
+            FF_PROFILE_H264_CONSTRAINED_BASELINE => "constrained baseline",
+            66 => "baseline",
+            77 => "main",
+            100 => "high",
+            -99 => "unset, the driver picks",
+            _ => "other",
+        }
+    }
+
+    /// Build and open an h264_vaapi encoder for `cfg` on the hardware frames
+    /// pool, with `profile` as the encoder's profile option, or its default
+    /// when `None`.
+    ///
+    /// # Safety
+    /// `hw_frames_ref` must be a valid, initialised hardware frames context
+    /// whose pixel format is `hw_pix_fmt`.
+    unsafe fn open_encoder(
+        codec: ffmpeg::Codec,
+        cfg: &EncodeConfig,
+        hw_pix_fmt: ffmpeg::ffi::AVPixelFormat,
+        hw_frames_ref: *mut ffmpeg::ffi::AVBufferRef,
+        profile: Option<&str>,
+    ) -> Result<ffmpeg::codec::encoder::Video, String> {
+        // ffmpeg-next safe wrappers: Context::new_with_codec → encoder
+        // → video → set params → open. We splice in the raw
+        // hw_frames_ctx on the AVCodecContext just before open;
+        // that's the bit the safe wrapper doesn't cover.
+        let ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+        let mut encoder = ctx
+            .encoder()
+            .video()
+            .map_err(|e| format!("encoder().video() failed: {e}"))?;
+
+        encoder.set_width(cfg.width);
+        encoder.set_height(cfg.height);
+        // Set pix_fmt directly on the raw AVCodecContext using the same
+        // runtime value we used for the hwframe pool, which avoids the same
+        // enum-alias mismatch that broke av_hwframe_ctx_init.
+        // encoder.set_format(Pixel::VAAPI) would write the wrong value.
+        /* VBR, not CBR, and the difference is load-bearing. Setting
+        max_bit_rate EQUAL to bit_rate makes ffmpeg select CBR for
+        h264_vaapi, and VAAPI's CBR keeps a strict HRD: it pads every
+        frame with filler NAL units up to bitrate/fps bytes, so every
+        frame is exactly the same size whatever is in it (measured on
+        the Deck: a dead-constant 33345 B/frame at 8 Mbit, and 6250
+        B/frame at the 1.5 Mbit default). A per-frame byte CEILING on
+        a detailed scene forces QP up until small inter-frame motion
+        quantises to zero, so the picture holds for several frames and
+        then snaps as the error crosses the threshold: the judder.
+        Giving max_bit_rate headroom selects VBR: frame size follows
+        content, no filler, and slow motion survives quantisation. */
+        encoder.set_bit_rate(cfg.bitrate_bps as usize);
+        encoder.set_max_bit_rate((cfg.bitrate_bps as usize).saturating_mul(2));
+        encoder.set_time_base((1, cfg.fps as i32));
+        encoder.set_frame_rate(Some((cfg.fps as i32, 1)));
+        // Keyframe roughly every 2 seconds, the same default as
+        // OpenH264's typical config. Subscriber join still triggers
+        // an explicit keyframe via request_keyframe().
+        encoder.set_gop(cfg.fps.saturating_mul(2).max(1));
+
+        // Inject hw_frames_ctx + pix_fmt on the raw AVCodecContext.
+        // av_buffer_ref bumps refcount; the encoder owns the new
+        // reference, we keep our own hw_frames_ref live for the
+        // session in case we need to allocate fresh upload frames
+        // later (we do, every encode call).
+        //
+        // hw_frames_ctx is set via the C shim rather than direct
+        // Rust struct field access: the bindgen-generated offset
+        // diverges from the compiled runtime library due to FF_API_*
+        // guard differences (confirmed by diagnostic 2026-05-24).
+        let ctx_mut = encoder.as_mut_ptr();
+        (*ctx_mut).pix_fmt = hw_pix_fmt;
+        /* Cap the quantiser. Rate control left to its own devices picks
+        a QP high enough that slow inter-frame motion quantises to
+        zero: every macroblock comes back "skip" and the encoder emits
+        a near-empty P-frame, so the picture holds for several frames
+        and then snaps when accumulated error finally survives the
+        quantiser. Measured on the Deck as a clean period-3 (two
+        ~180 B frames then one ~7 kB frame) against a ring whose
+        content was changing smoothly every frame (MAD sd 0.021).
+        This is not a bitrate shortage: at 1.5 Mbit the encoder was
+        spending ~400 kbit. Bounding qmax forces it to spend what it
+        has rather than throw the motion away; qmin keeps it from
+        wasting the whole budget on a static scene. */
+        (*ctx_mut).qmin = 10;
+        (*ctx_mut).qmax = 26;
+        /* No B-frames. This one is the judder. B-frames are REORDERED:
+        they are transmitted after the reference frame they sit
+        between, so a decoder must buffer and re-sort by PTS before
+        display. WebRTC H.264 assumes no reordering (constrained
+        baseline semantics; our RTP path carries no DTS), so the
+        browser presents them in arrival order and the picture walks
+        backwards and forwards while still trending the right way.
+        Left unset, the VAAPI default supplies two of them, which is
+        exactly the period-3 measured on the Deck: one large
+        reference frame then two small ones, motion going
+        -60, +44, -22, -60, +37, -39 in the delivered stream while
+        the ring feeding it moved smoothly one way (3% direction
+        reversals at the ring vs 67% after the encoder). */
+        (*ctx_mut).max_b_frames = 0;
+        let frames_bref = ffmpeg::ffi::av_buffer_ref(hw_frames_ref);
+        if frames_bref.is_null() {
+            return Err("av_buffer_ref(hw_frames_ref) returned null".into());
+        }
+        kerbcast_avcodec_set_hw_frames_ctx(ctx_mut, frames_bref);
+
+        let mut options = ffmpeg::Dictionary::new();
+        if let Some(profile) = profile {
+            options.set("profile", profile);
+        }
+        encoder
+            .open_as_with(codec, options)
+            .map_err(|e| e.to_string())
+    }
+
     impl EncoderBackend for Libva {
         fn name(&self) -> &'static str {
             "h264_vaapi (libva)"
@@ -397,106 +523,52 @@ mod imp {
                     }
                 };
 
-                // ffmpeg-next safe wrappers: Context::new_with_codec → encoder
-                // → video → set params → open. We splice in the raw
-                // hw_frames_ctx on the AVCodecContext just before open;
-                // that's the bit the safe wrapper doesn't cover.
-                let ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
-                let mut encoder = match ctx.encoder().video() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.close();
-                        return Err(EncodeError::Runtime(format!(
-                            "encoder().video() failed: {e}"
-                        )));
-                    }
-                };
-
-                encoder.set_width(cfg.width);
-                encoder.set_height(cfg.height);
-                // Set pix_fmt directly on the raw AVCodecContext using the same
-                // runtime value we used for the hwframe pool — avoids the same
-                // enum-alias mismatch that broke av_hwframe_ctx_init.
-                // encoder.set_format(Pixel::VAAPI) would write the wrong value.
-                /* VBR, not CBR, and the difference is load-bearing. Setting
-                max_bit_rate EQUAL to bit_rate makes ffmpeg select CBR for
-                h264_vaapi, and VAAPI's CBR keeps a strict HRD: it pads every
-                frame with filler NAL units up to bitrate/fps bytes, so every
-                frame is exactly the same size whatever is in it (measured on
-                the Deck: a dead-constant 33345 B/frame at 8 Mbit, and 6250
-                B/frame at the 1.5 Mbit default). A per-frame byte CEILING on
-                a detailed scene forces QP up until small inter-frame motion
-                quantises to zero, so the picture holds for several frames and
-                then snaps as the error crosses the threshold — the judder.
-                Giving max_bit_rate headroom selects VBR: frame size follows
-                content, no filler, and slow motion survives quantisation. */
-                encoder.set_bit_rate(cfg.bitrate_bps as usize);
-                encoder.set_max_bit_rate((cfg.bitrate_bps as usize).saturating_mul(2));
-                encoder.set_time_base((1, cfg.fps as i32));
-                encoder.set_frame_rate(Some((cfg.fps as i32, 1)));
-                // Keyframe roughly every 2 seconds — same default as
-                // OpenH264's typical config. Subscriber join still triggers
-                // an explicit keyframe via request_keyframe().
-                encoder.set_gop(cfg.fps.saturating_mul(2).max(1));
-
-                // Inject hw_frames_ctx + pix_fmt on the raw AVCodecContext.
-                // av_buffer_ref bumps refcount; the encoder owns the new
-                // reference, we keep our own hw_frames_ref live for the
-                // session in case we need to allocate fresh upload frames
-                // later (we do — every encode call).
-                //
-                // hw_frames_ctx is set via the C shim rather than direct
-                // Rust struct field access: the bindgen-generated offset
-                // diverges from the compiled runtime library due to FF_API_*
-                // guard differences (confirmed by diagnostic 2026-05-24).
-                let ctx_mut = encoder.as_mut_ptr();
-                (*ctx_mut).pix_fmt = hw_pix_fmt;
-                /* Cap the quantiser. Rate control left to its own devices picks
-                a QP high enough that slow inter-frame motion quantises to
-                zero: every macroblock comes back "skip" and the encoder emits
-                a near-empty P-frame, so the picture holds for several frames
-                and then snaps when accumulated error finally survives the
-                quantiser. Measured on the Deck as a clean period-3 — two
-                ~180 B frames then one ~7 kB frame — against a ring whose
-                content was changing smoothly every frame (MAD sd 0.021).
-                This is not a bitrate shortage: at 1.5 Mbit the encoder was
-                spending ~400 kbit. Bounding qmax forces it to spend what it
-                has rather than throw the motion away; qmin keeps it from
-                wasting the whole budget on a static scene. */
-                (*ctx_mut).qmin = 10;
-                (*ctx_mut).qmax = 26;
-                /* No B-frames. This one is the judder. B-frames are REORDERED:
-                they are transmitted after the reference frame they sit
-                between, so a decoder must buffer and re-sort by PTS before
-                display. WebRTC H.264 assumes no reordering (constrained
-                baseline semantics; our RTP path carries no DTS), so the
-                browser presents them in arrival order and the picture walks
-                backwards and forwards while still trending the right way.
-                Left unset, the VAAPI default supplies two of them, which is
-                exactly the period-3 measured on the Deck: one large
-                reference frame then two small ones, motion going
-                -60, +44, -22, -60, +37, -39 in the delivered stream while
-                the ring feeding it moved smoothly one way (3% direction
-                reversals at the ring vs 67% after the encoder). */
-                (*ctx_mut).max_b_frames = 0;
-                let frames_bref = ffmpeg::ffi::av_buffer_ref(self.hw_frames_ref);
-                if frames_bref.is_null() {
-                    self.close();
-                    return Err(EncodeError::Runtime(
-                        "av_buffer_ref(hw_frames_ref) returned null".into(),
-                    ));
-                }
-                kerbcast_avcodec_set_hw_frames_ctx(ctx_mut, frames_bref);
-
-                let opened = match encoder.open_as(codec) {
+                /* Ask for the profile the SDP answer advertises: left unset,
+                h264_vaapi picks a higher one that a strict decoder or relay
+                may refuse under that answer. A driver that cannot do it gets
+                one retry on the encoder's default, so the camera keeps
+                hardware rather than counting a failure. */
+                let opened = match open_encoder(
+                    codec,
+                    &cfg,
+                    hw_pix_fmt,
+                    self.hw_frames_ref,
+                    Some(ADVERTISED_PROFILE),
+                ) {
                     Ok(o) => o,
-                    Err(e) => {
-                        self.close();
-                        return Err(EncodeError::Runtime(format!(
-                            "h264_vaapi encoder open failed: {e}"
-                        )));
+                    Err(refused) => {
+                        warn!(
+                            profile = ADVERTISED_PROFILE,
+                            error = %refused,
+                            "h264_vaapi refused the advertised H.264 profile; retrying with the encoder default"
+                        );
+                        match open_encoder(codec, &cfg, hw_pix_fmt, self.hw_frames_ref, None) {
+                            Ok(o) => o,
+                            Err(e) => {
+                                self.close();
+                                return Err(EncodeError::Runtime(format!(
+                                    "h264_vaapi encoder open failed: {e}"
+                                )));
+                            }
+                        }
                     }
                 };
+                /* The profile option can be ignored without an error, so
+                report what the opened encoder actually holds. */
+                let profile = kerbcast_avcodec_get_profile(opened.as_ptr());
+                if profile == FF_PROFILE_H264_CONSTRAINED_BASELINE {
+                    info!(
+                        profile,
+                        profile_name = profile_name(profile),
+                        "h264_vaapi opened with the advertised H.264 profile"
+                    );
+                } else {
+                    warn!(
+                        profile,
+                        profile_name = profile_name(profile),
+                        "h264_vaapi opened with an H.264 profile other than the advertised constrained baseline"
+                    );
+                }
                 self.encoder = Some(opened);
             }
 

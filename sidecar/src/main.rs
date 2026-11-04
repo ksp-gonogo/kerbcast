@@ -24,8 +24,8 @@ use tracing::{debug, info, warn};
 
 use kerbcast_sidecar::cameras::{CameraRegistry, CameraState};
 use kerbcast_sidecar::encoder::{
-    record_init_failure, resolve_bitrate_bps, select_backend, EncodeConfig, EncoderBackend,
-    EncoderChoice, RawFrame, SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
+    record_init_failure, resolve_bitrate_bps, select_backend, size_is_encodable, EncodeConfig,
+    EncoderBackend, EncoderChoice, RawFrame, SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
 };
 use kerbcast_sidecar::frame_watch::{sleep_until_ready, FRAME_WATCH_STEP};
 use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
@@ -665,8 +665,8 @@ fn warn_escalated(cam: &Arc<CameraState>, backend_name: &str, what_happened: &st
         camera = %cam.camera_name,
         part = %cam.part_title,
         backend = backend_name,
-        "{what_happened}; this camera now encodes in software \
-         (likely concurrent hardware encode session limit). Other cameras keep hardware."
+        "{what_happened}; this camera now encodes in software until the sidecar restarts. \
+         Other cameras keep hardware."
     );
 }
 
@@ -914,7 +914,21 @@ async fn encode_next_frame(
         // The session-health machine picks the backend: the configured
         // choice normally, the software fallback once this camera has
         // been escalated (consecutive silent/failed hardware sessions).
-        let mut backend = cam.session_health.lock().unwrap().select(encoder_choice);
+        /* A size no hardware encoder accepts goes straight to software:
+        trying hardware first would only cost a refused open, a warning and a
+        retry on every resize at that size. */
+        let encodable = size_is_encodable(frame.width, frame.height);
+        let mut backend = if encodable {
+            cam.session_health.lock().unwrap().select(encoder_choice)
+        } else {
+            debug!(
+                flight_id = cam.flight_id,
+                width = frame.width,
+                height = frame.height,
+                "frame size outside the hardware encoder range; encoding in software"
+            );
+            Box::new(Software::new())
+        };
         if let Err(e) = backend.init(cfg.clone()) {
             // Hardware backend failed (e.g. VAAPI probe passed but
             // avcodec_open2 rejected the resolution or profile). Fall back
@@ -925,12 +939,25 @@ async fn encode_next_frame(
             // resolution reinit, and without this the camera would retry
             // the doomed hardware path on every adaptive-quality resize
             // for the rest of the session instead of pinning to software
-            // after a couple of strikes.
+            // after a couple of strikes. A size no encoder supports is not
+            // the backend's fault and strikes nothing.
             let was_hardware = backend.is_hardware();
             let failed_backend_name = backend.name();
-            warn!(flight_id = cam.flight_id, error = %e, backend = failed_backend_name, "encoder init failed; falling back to software");
-            let verdict =
-                record_init_failure(&mut cam.session_health.lock().unwrap(), was_hardware);
+            warn!(
+                flight_id = cam.flight_id,
+                error = %e,
+                backend = failed_backend_name,
+                width = frame.width,
+                height = frame.height,
+                size_supported = size_is_encodable(frame.width, frame.height),
+                "encoder init failed; falling back to software"
+            );
+            let verdict = record_init_failure(
+                &mut cam.session_health.lock().unwrap(),
+                was_hardware,
+                frame.width,
+                frame.height,
+            );
             if verdict == Some(SessionVerdict::EscalateToSoftware) {
                 warn_escalated(
                     cam,
@@ -940,7 +967,11 @@ async fn encode_next_frame(
             }
             backend = Box::new(Software::new());
             if let Err(e2) = backend.init(cfg) {
-                warn!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
+                if encodable {
+                    warn!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
+                } else {
+                    debug!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
+                }
                 return true;
             }
         }
@@ -963,8 +994,10 @@ async fn encode_next_frame(
 
     /* Consume any pending promotion keyframe request before encoding, so the
     IDR rides the very next frame rather than waiting out the periodic GOP. */
-    if cam.take_keyframe_request() {
+    let forced_keyframe = cam.take_keyframe_request(Instant::now());
+    if forced_keyframe {
         encoder.request_keyframe();
+        info!(flight_id = cam.flight_id, "keyframe forced");
     }
 
     let encode_started = Instant::now();
@@ -979,7 +1012,7 @@ async fn encode_next_frame(
         Ok(n) => {
             cam.encode_failure_streak.store(0, Ordering::Release);
             if n.iter().any(|nal| nal.is_keyframe()) {
-                cam.note_keyframe_sent();
+                cam.note_keyframe_sent(Instant::now());
             }
             /* A promotion is complete once a keyframe actually goes out — that
             is the moment the feed becomes renderable, so it's what flips the
@@ -999,16 +1032,34 @@ async fn encode_next_frame(
             // session-health strike means a backend whose fresh sessions
             // keep failing too escalates to software instead of cycling
             // the same broken hardware forever.
+            /* The backends clear their own keyframe flag before the work
+            that failed, so a forced IDR would be lost: ask again. The gap
+            started when it was taken, so a run of failures cannot storm. */
+            if forced_keyframe {
+                cam.request_keyframe();
+            }
             let streak = cam.encode_failure_streak.fetch_add(1, Ordering::AcqRel) + 1;
-            warn!(flight_id = cam.flight_id, error = %e, streak, "encode failed");
+            /* A failing session fails every frame: warn once per session,
+            and only debug at a size no encoder supports. */
+            if streak == 1 && size_is_encodable(frame.width, frame.height) {
+                warn!(flight_id = cam.flight_id, error = %e, "encode failed");
+            } else {
+                debug!(flight_id = cam.flight_id, error = %e, streak, "encode failed");
+            }
             if streak >= ENCODE_FAILURE_REINIT_THRESHOLD {
                 drop_encoder_session(cam, &mut encoder_guard);
-                warn!(
-                    flight_id = cam.flight_id,
-                    backend = backend_name,
-                    "encoder dropped after {streak} consecutive failures; will reinit on next frame"
-                );
-                let verdict = cam.session_health.lock().unwrap().note_session_error();
+                if size_is_encodable(frame.width, frame.height) {
+                    warn!(
+                        flight_id = cam.flight_id,
+                        backend = backend_name,
+                        "encoder dropped after {streak} consecutive failures; will reinit on next frame"
+                    );
+                }
+                let verdict = cam
+                    .session_health
+                    .lock()
+                    .unwrap()
+                    .note_session_error_at(frame.width, frame.height);
                 if verdict == SessionVerdict::EscalateToSoftware {
                     warn_escalated(cam, backend_name, "consecutive sessions kept failing");
                 }
@@ -1077,7 +1128,7 @@ async fn encode_next_frame(
     let mut sent = 0usize;
     for weak in prev {
         if let Some(track) = weak.upgrade() {
-            if let Err(e) = track
+            match track
                 .write_frame(
                     &combined,
                     capture_time,
@@ -1087,9 +1138,19 @@ async fn encode_next_frame(
                 )
                 .await
             {
-                warn!(flight_id = cam.flight_id, error = %e, "write_frame failed");
-            } else {
-                sent += 1;
+                Err(e) => {
+                    warn!(flight_id = cam.flight_id, error = %e, "write_frame failed");
+                }
+                Ok(written) => {
+                    sent += 1;
+                    if written.is_some_and(|w| w.wants_keyframe) {
+                        cam.request_keyframe();
+                        info!(
+                            flight_id = cam.flight_id,
+                            "track went live mid-GOP; keyframe requested"
+                        );
+                    }
+                }
             }
             alive.push(weak);
         } else {
@@ -1220,6 +1281,60 @@ mod tests {
             Duration::from_secs(1) / 30,
         )
         .await;
+    }
+
+    /// Accepts a session and fails every encode, as a backend does when the
+    /// upload or encode under a forced IDR fails.
+    struct FailingBackend;
+
+    impl EncoderBackend for FailingBackend {
+        fn name(&self) -> &'static str {
+            "failing fake"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn is_hardware(&self) -> bool {
+            false
+        }
+        fn init(
+            &mut self,
+            _cfg: EncodeConfig,
+        ) -> Result<(), kerbcast_sidecar::encoder::EncodeError> {
+            Ok(())
+        }
+        fn encode(
+            &mut self,
+            _frame: &RawFrame<'_>,
+        ) -> Result<Vec<kerbcast_sidecar::encoder::Nal>, kerbcast_sidecar::encoder::EncodeError>
+        {
+            Err(kerbcast_sidecar::encoder::EncodeError::Runtime(
+                "fake".into(),
+            ))
+        }
+        fn request_keyframe(&mut self) {}
+        fn close(&mut self) {}
+    }
+
+    /// A forced keyframe whose encode fails is asked for again, so the
+    /// viewer that wanted it still gets one from a later encode.
+    #[tokio::test]
+    async fn a_forced_keyframe_survives_a_failed_encode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
+        *cam.encoder.lock().await = Some(Box::new(FailingBackend));
+        cam.encoder_width.store(64, Ordering::Release);
+        cam.encoder_height.store(64, Ordering::Release);
+
+        cam.request_keyframe();
+        ring.produce(64, 64, 0.0, &vec![0x80u8; 64 * 64 * 4])
+            .unwrap();
+        tick(&cam).await;
+        assert_eq!(cam.send_tally.take().sent, 0, "the encode failed");
+        assert!(
+            cam.keyframe_gate.lock().unwrap().pending(),
+            "the forced keyframe is still owed"
+        );
     }
 
     /// Two readbacks landing in one game frame reach the ring a moment apart.
