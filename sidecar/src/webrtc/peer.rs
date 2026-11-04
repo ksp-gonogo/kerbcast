@@ -54,6 +54,7 @@ use super::video_track::VideoTrack;
 
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
+use crate::ladder::{Ladder, LadderConfig, LadderState, SlotView};
 use crate::link::{LinkMonitor, LinkWindow, SlotCounters, LINK_WINDOW};
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ConfirmSlotsPayload,
@@ -276,7 +277,19 @@ pub struct KerbcastPeer {
     link: SharedLink,
 }
 
-type SharedLink = Arc<StdMutex<LinkMonitor>>;
+/// A viewer's link measurements and the tier decisions made from them. The
+/// decisions are shadow only for now: logged and reported, never applied.
+#[derive(Debug)]
+struct LinkState {
+    monitor: LinkMonitor,
+    ladder: Ladder,
+}
+
+type SharedLink = Arc<StdMutex<LinkState>>;
+
+fn lock_link(link: &SharedLink) -> MutexGuard<'_, LinkState> {
+    link.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 impl KerbcastPeer {
     /// Build a peer with a pool of `slot_count` pre-negotiated H.264 video
@@ -402,7 +415,10 @@ impl KerbcastPeer {
         }
 
         let slots = Arc::new(Mutex::new(slots));
-        let link: SharedLink = Arc::new(StdMutex::new(LinkMonitor::new()));
+        let link: SharedLink = Arc::new(StdMutex::new(LinkState {
+            monitor: LinkMonitor::new(),
+            ladder: Ladder::new(LadderConfig::default()),
+        }));
 
         // Spawn the per-slot RTCP drains now that the slot pool is shared. Each
         // drain pumps its sender's RTCP (driving the NACK responder) and honors
@@ -491,6 +507,7 @@ impl KerbcastPeer {
 
         tokio::spawn(sample_link(
             Arc::downgrade(&pc),
+            registry.clone(),
             peer_id,
             liveness.clone(),
             slots.clone(),
@@ -858,7 +875,12 @@ impl KerbcastPeer {
     /// The last closed window of this viewer's connection quality, `None`
     /// until two samples have been taken.
     pub fn link_window(&self) -> Option<LinkWindow> {
-        self.link.lock().unwrap_or_else(|e| e.into_inner()).latest()
+        lock_link(&self.link).monitor.latest()
+    }
+
+    /// The tiers the detector has chosen for this viewer's feeds.
+    pub fn ladder_state(&self) -> LadderState {
+        lock_link(&self.link).ladder.state()
     }
 
     /// Block until the peer reaches the Connected state. Used by tests.
@@ -1983,6 +2005,7 @@ fn rtcp_remb_bps(packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>]) -> Opt
  */
 async fn sample_link(
     pc: std::sync::Weak<RTCPeerConnection>,
+    registry: Arc<CameraRegistry>,
     peer_id: u32,
     liveness: LivenessHandle,
     slots: Arc<Mutex<Vec<Slot>>>,
@@ -2003,15 +2026,27 @@ async fn sample_link(
         let report = pc.get_stats().await;
         drop(pc);
         let counters = slot_counters(&report);
-        let window = link
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .observe(std::time::Instant::now(), &counters);
+        let now = std::time::Instant::now();
+        let window = lock_link(&link).monitor.observe(now, &counters);
         let Some(w) = window else { continue };
         if w.packets_sent == 0 {
             continue;
         }
         tracing::debug!(peer_id, window = ?w, "viewer link window");
+        let views = slot_views(&registry, peer_id, &slots).await;
+        let changes = lock_link(&link).ladder.step(now, &w, &views);
+        for c in changes {
+            info!(
+                peer_id,
+                flight_id = c.flight_id,
+                slot = c.slot,
+                to = ?c.to,
+                reason = ?c.reason,
+                loss_pct = format!("{:.1}", w.loss * 100.0),
+                rtt_ms = w.rtt_ms.map(|r| r.round() as u64),
+                "shadow tier change (not applied)"
+            );
+        }
         windows += 1;
         if windows % SUMMARY_EVERY == 1 {
             let cameras: Vec<u32> = slots.lock().await.iter().filter_map(|s| s.bound).collect();
@@ -2029,6 +2064,34 @@ async fn sample_link(
             );
         }
     }
+}
+
+/// The viewer's bound slots as the tier detector sees them.
+async fn slot_views(
+    registry: &Arc<CameraRegistry>,
+    peer_id: u32,
+    slots: &Arc<Mutex<Vec<Slot>>>,
+) -> Vec<SlotView> {
+    let bound: Vec<(usize, u32)> = slots
+        .lock()
+        .await
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.bound.map(|f| (i, f)))
+        .collect();
+    let mut views = Vec::with_capacity(bound.len());
+    for (slot, flight_id) in bound {
+        let Some(cam) = registry.get(flight_id).await else {
+            continue;
+        };
+        views.push(SlotView {
+            slot,
+            flight_id,
+            display_area: cam.display_area_for(peer_id).await,
+            pinned_full: cam.forced_full_res.lock().await.contains(&peer_id),
+        });
+    }
+    views
 }
 
 /// Each video slot's cumulative counters from a `get_stats` report, joining
@@ -2091,9 +2154,8 @@ async fn drain_rtcp_sink(
 ) {
     while let Ok((packets, _)) = sender.read_rtcp().await {
         if let Some(bps) = rtcp_remb_bps(&packets) {
-            let first = link
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let first = lock_link(&link)
+                .monitor
                 .note_remb(std::time::Instant::now(), bps);
             if first {
                 info!(slot_idx, remb_bps = bps, "viewer sends REMB");

@@ -122,6 +122,9 @@ pub struct PeerLink {
     pub cameras: Vec<u32>,
     /// `None` until the peer has been sampled twice.
     pub link: Option<crate::link::LinkWindow>,
+    /// The tiers the detector would put this viewer's feeds on. Shadow only:
+    /// every feed is still sent the full stream.
+    pub shadow: crate::ladder::LadderState,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +190,7 @@ async fn links(State(state): State<AppState>) -> impl IntoResponse {
             peer_id: peer.peer_id,
             cameras: peer.bound_flight_ids().await,
             link: peer.link_window(),
+            shadow: peer.ladder_state(),
         });
     }
     (StatusCode::OK, Json(LinksResponse { peers: out })).into_response()

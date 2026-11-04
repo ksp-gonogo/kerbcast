@@ -1010,6 +1010,15 @@ impl CameraState {
     /// reap) so the MAX relaxes. Returns whether an entry was actually removed
     /// (so callers skip a redundant reflush). Idempotent — a second call, or
     /// one for a peer that never reported, returns false.
+    /// The display area `peer_id` last reported for this camera, 0 if none.
+    pub async fn display_area_for(&self, peer_id: u32) -> u64 {
+        self.display_sizes
+            .lock()
+            .await
+            .get(&peer_id)
+            .map_or(0, |&(w, h, _)| w as u64 * h as u64)
+    }
+
     pub async fn forget_display_size(&self, peer_id: u32) -> bool {
         self.display_sizes.lock().await.remove(&peer_id).is_some()
     }
