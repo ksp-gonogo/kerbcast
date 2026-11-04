@@ -28,6 +28,7 @@ use crate::commands::{
     validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
 };
 use crate::encoder::{EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION};
+use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
@@ -700,35 +701,9 @@ pub struct CameraState {
     /// A `std::sync::Mutex`, not the tokio one — the mmap write is synchronous
     /// and never held across an await.
     pub control_block: std::sync::Mutex<Option<ControlBlock>>,
-    /// Lazy: created on first encoded frame so the encoder sees the
-    /// actual frame dimensions, not the ring's max. Closed + reinit if
-    /// the frame dimensions change (the plugin's adaptive downscale
-    /// path triggers this).
-    pub encoder: Mutex<Option<Box<dyn EncoderBackend>>>,
-    /// Width/height the encoder is currently initialised for. The
-    /// consume loop compares these against the incoming frame's
-    /// dimensions to detect adaptive-downscale resolution changes.
-    /// Both 0 when no encoder is running.
-    pub encoder_width: AtomicU32,
-    pub encoder_height: AtomicU32,
-    /// Bitrate the current encoder session was initialised with.
-    /// 0 = no encoder running yet. The consume loop compares against
-    /// `target_bitrate_bps` and reinitialises the encoder when they
-    /// diverge significantly (REMB-driven adaptation).
-    pub encoder_bitrate: AtomicU32,
-    /// Consecutive encode() failures. Reset on success; at the consume
-    /// loop's threshold the encoder is closed + dropped so the next
-    /// frame re-initialises it (hardware first, software fallback) —
-    /// otherwise a wedged encoder session stalls subscribed peers
-    /// forever while only emitting warn logs.
-    pub encode_failure_streak: AtomicU32,
-    /// Session-level escalation state: hardware sessions that stay
-    /// silent (init fine, accept frames, never emit a NAL, the GPU
-    /// concurrent-session-limit signature) or persistently error
-    /// strike toward pinning this camera to the software fallback.
-    /// std Mutex: only touched under the encoder lock, never across
-    /// an await.
-    pub session_health: std::sync::Mutex<SessionHealth>,
+    /// The camera's own encoder at the ring's size, and the viewer tracks it
+    /// feeds.
+    pub full: TierEncoder,
     /// Most-recent target bitrate, computed as the min across active
     /// subscribers' REMB estimates (so the slowest receiver doesn't
     /// drop the whole stream). 0 = no REMB received yet; consume loop
@@ -769,15 +744,8 @@ pub struct CameraState {
     /// Promoted out of background capture but not yet renderable — set when display demand
     /// appears, cleared when a keyframe is emitted.
     pub ramping: AtomicBool,
-    /// Pending forced-IDR request and when this camera last produced one,
-    /// consumed by the encode path.
-    pub keyframe_gate: std::sync::Mutex<KeyframeGate>,
     /// Holds back a falling render size; see `ShrinkDelay`.
     pub shrink_delay: std::sync::Mutex<ShrinkDelay>,
-    /// One `VideoTrack` per subscribed peer-track. Weak refs so
-    /// dropped peers get GC'd from this list naturally — no manual unsub
-    /// bookkeeping per peer needed.
-    pub tracks: RwLock<Vec<Weak<VideoTrack>>>,
     /// Per-consumer reported display size in px, keyed by `peer_id` (stable for
     /// the connection's lifetime, present at the report site AND every teardown
     /// site). Auto-resolution takes the per-dimension MAX across live entries;
@@ -819,7 +787,12 @@ impl CameraState {
     /// on the 0→1 transition. Adding a track the camera already feeds is a
     /// no-op: a Subscribe can race the rescan's own resync and bind it twice.
     pub async fn add_track(&self, track: Arc<VideoTrack>) -> usize {
-        let mut tracks = self.tracks.write().await;
+        for tier in self.tiers().into_iter().skip(1) {
+            if tier.holds(&track).await {
+                return self.subscribers.load(Ordering::Acquire);
+            }
+        }
+        let mut tracks = self.full.tracks.write().await;
         if tracks
             .iter()
             .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, &track)))
@@ -847,11 +820,13 @@ impl CameraState {
     /// subscriber count after the decrement; removing a track this camera
     /// isn't feeding is a no-op.
     pub async fn remove_track(&self, track: &Arc<VideoTrack>) -> usize {
-        let mut tracks = self.tracks.write().await;
-        let before = tracks.len();
-        tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
-        let removed = before - tracks.len();
-        drop(tracks);
+        let mut removed = 0;
+        for tier in self.tiers() {
+            let mut tracks = tier.tracks.write().await;
+            let before = tracks.len();
+            tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
+            removed += before - tracks.len();
+        }
         if removed > 0 {
             self.subscribers.fetch_sub(removed, Ordering::AcqRel);
         }
@@ -889,20 +864,38 @@ impl CameraState {
         self.request_keyframe();
     }
 
-    /// Ask for an IDR from this camera's encoder. Every keyframe source goes
-    /// through here (PLI, FIR, a client request, a new binding, a promotion),
-    /// so the per-camera gap in `KeyframeGate` bounds them all at once.
-    pub fn request_keyframe(&self) {
-        self.keyframe_gate.lock().unwrap().request();
+    /// Every delivery tier of this camera, Full first.
+    pub fn tiers(&self) -> [&TierEncoder; 1] {
+        [&self.full]
     }
 
-    /// Whether the encoder should force an IDR on this encode, consuming the
-    /// request. Promotion needs it: background capture's periodic IDR is
-    /// counted in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural
-    /// keyframe can be ~60s away and a promoted camera would sit unrenderable
-    /// until then. A request inside the gap stays pending for a later encode.
-    pub fn take_keyframe_request(&self, now: Instant) -> bool {
-        self.keyframe_gate.lock().unwrap().take(now)
+    pub fn tier(&self, tier: Tier) -> &TierEncoder {
+        match tier {
+            Tier::Full | Tier::Reduced => &self.full,
+        }
+    }
+
+    /// Ask every tier of this camera for an IDR, for an event every viewer
+    /// shares (a promotion, a reattached ring). Each tier's `KeyframeGate`
+    /// bounds them.
+    pub fn request_keyframe(&self) {
+        for tier in self.tiers() {
+            tier.request_keyframe();
+        }
+    }
+
+    /// Ask for an IDR from the tier feeding `track` only, for a request one
+    /// viewer made (a PLI, a reconnect): the other tiers' viewers lost nothing.
+    /// A track this camera does not feed asks every tier, which costs at most
+    /// a wasted IDR.
+    pub async fn request_keyframe_for(&self, track: &Arc<VideoTrack>) {
+        for tier in self.tiers() {
+            if tier.holds(track).await {
+                tier.request_keyframe();
+                return;
+            }
+        }
+        self.request_keyframe();
     }
 
     /// The promotion completed: a keyframe went out, so the feed is renderable
@@ -1166,9 +1159,9 @@ impl CameraState {
 
     /// A keyframe went out at `now`, forced or periodic. It answers every
     /// request made before it and starts the gap.
-    pub fn note_keyframe_sent(&self, now: Instant) {
+    pub fn note_keyframe_sent(&self, tier: &TierEncoder, now: Instant) {
         self.keyframes_sent.fetch_add(1, Ordering::Relaxed);
-        self.keyframe_gate.lock().unwrap().note_sent(now);
+        tier.keyframe_gate.lock().unwrap().note_sent(now);
     }
 
     pub fn note_keyframe_requests(&self, n: u64) {
@@ -1263,6 +1256,74 @@ impl CameraState {
                 even_clamp(h.round() as u32, mh),
             )
         })
+    }
+}
+
+/**
+ * One delivery tier's encoder for a camera and the viewer tracks it feeds.
+ * Each tier keeps its own session, keyframe gap and hardware health, so one
+ * tier's keyframes and failures never reach another tier's viewers.
+ */
+pub struct TierEncoder {
+    pub tier: Tier,
+    /// Lazy: created on the first frame this tier encodes, so the encoder
+    /// sees the actual frame dimensions. Closed and reinitialised when they
+    /// change (the plugin's adaptive downscale path triggers this).
+    pub encoder: Mutex<Option<Box<dyn EncoderBackend>>>,
+    /// Dimensions and bitrate the current session was initialised with; all 0
+    /// when no session is running.
+    pub encoder_width: AtomicU32,
+    pub encoder_height: AtomicU32,
+    pub encoder_bitrate: AtomicU32,
+    /// Consecutive encode() failures. Reset on success; at the consume
+    /// loop's threshold the session is dropped so the next frame
+    /// reinitialises it, instead of a wedged session stalling its viewers.
+    pub encode_failure_streak: AtomicU32,
+    /// Hardware sessions that stay silent or keep failing strike toward
+    /// pinning this tier to the software fallback. Only touched under the
+    /// encoder lock, never across an await.
+    pub session_health: std::sync::Mutex<SessionHealth>,
+    /// Pending forced-IDR request and when this tier last produced one.
+    pub keyframe_gate: std::sync::Mutex<KeyframeGate>,
+    /// One `VideoTrack` per viewer slot this tier feeds. Weak refs so a
+    /// dropped peer's tracks go stale and are pruned on the next fan-out.
+    pub tracks: RwLock<Vec<Weak<VideoTrack>>>,
+}
+
+impl TierEncoder {
+    pub fn new(tier: Tier) -> Self {
+        Self {
+            tier,
+            encoder: Mutex::new(None),
+            encoder_width: AtomicU32::new(0),
+            encoder_height: AtomicU32::new(0),
+            encoder_bitrate: AtomicU32::new(0),
+            encode_failure_streak: AtomicU32::new(0),
+            session_health: std::sync::Mutex::new(SessionHealth::new()),
+            keyframe_gate: std::sync::Mutex::new(KeyframeGate::default()),
+            tracks: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn request_keyframe(&self) {
+        self.keyframe_gate.lock().unwrap().request();
+    }
+
+    /// Whether this tier's next encode should force an IDR, consuming the
+    /// request. Promotion needs it: background capture's periodic IDR is
+    /// counted in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural
+    /// keyframe can be ~60s away and a promoted camera would sit unrenderable
+    /// until then. A request inside the gap stays pending for a later encode.
+    pub fn take_keyframe_request(&self, now: Instant) -> bool {
+        self.keyframe_gate.lock().unwrap().take(now)
+    }
+
+    pub async fn holds(&self, track: &Arc<VideoTrack>) -> bool {
+        self.tracks
+            .read()
+            .await
+            .iter()
+            .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)))
     }
 }
 
@@ -1947,12 +2008,7 @@ impl CameraRegistry {
                             pan_pitch_max: manifest.pan_pitch_max,
                             destroyed: AtomicBool::new(false),
                             destruction_broadcast_sent: AtomicBool::new(false),
-                            encoder: Mutex::new(None),
-                            encoder_width: AtomicU32::new(0),
-                            encoder_height: AtomicU32::new(0),
-                            encoder_bitrate: AtomicU32::new(0),
-                            encode_failure_streak: AtomicU32::new(0),
-                            session_health: std::sync::Mutex::new(SessionHealth::new()),
+                            full: TierEncoder::new(Tier::Full),
                             target_bitrate_bps: AtomicU32::new(0),
                             bandwidth_estimates: Mutex::new(std::collections::HashMap::new()),
                             effective_degrade: AtomicU32::new(0),
@@ -1962,9 +2018,7 @@ impl CameraRegistry {
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
                             ramping: AtomicBool::new(false),
-                            keyframe_gate: std::sync::Mutex::new(KeyframeGate::default()),
                             shrink_delay: std::sync::Mutex::new(shrink_delay),
-                            tracks: RwLock::new(Vec::new()),
                             display_sizes: Mutex::new(display_sizes),
                             manual_render_cap: Mutex::new(manual_render_cap),
                             forced_full_res: Mutex::new(forced_full_res),
@@ -2103,7 +2157,7 @@ impl CameraRegistry {
                 pan_yaw_max: s.pan_yaw_max,
                 pan_pitch_min: s.pan_pitch_min,
                 pan_pitch_max: s.pan_pitch_max,
-                encoder_bitrate_bps: s.encoder_bitrate.load(Ordering::Acquire),
+                encoder_bitrate_bps: s.full.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: s.target_bitrate_bps.load(Ordering::Acquire),
                 degrade_level: s.current_degrade(),
                 target_capture_fps: stats.target_capture_fps,
@@ -2335,7 +2389,7 @@ impl CameraRegistry {
                 pan_yaw_max: cam.pan_yaw_max,
                 pan_pitch_min: cam.pan_pitch_min,
                 pan_pitch_max: cam.pan_pitch_max,
-                encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
+                encoder_bitrate_bps: cam.full.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
                 degrade_level: cam.current_degrade(),
                 viewer_quality,
@@ -3378,7 +3432,7 @@ impl CameraRegistry {
             pan_yaw_max: cam.pan_yaw_max,
             pan_pitch_min: cam.pan_pitch_min,
             pan_pitch_max: cam.pan_pitch_max,
-            encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
+            encoder_bitrate_bps: cam.full.encoder_bitrate.load(Ordering::Acquire),
             target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
             degrade_level: cam.current_degrade(),
             viewer_quality,
@@ -4281,11 +4335,13 @@ mod tests {
         let (_dir, cam) = attach_camera_for_tracker(7_010).await;
         let t0 = Instant::now();
         cam.request_keyframe();
-        assert!(cam.take_keyframe_request(t0));
+        assert!(cam.full.take_keyframe_request(t0));
         cam.request_keyframe();
         cam.begin_ramp();
-        assert!(!cam.take_keyframe_request(t0 + Duration::from_millis(200)));
-        assert!(cam.take_keyframe_request(t0 + MIN_KEYFRAME_GAP));
+        assert!(!cam
+            .full
+            .take_keyframe_request(t0 + Duration::from_millis(200)));
+        assert!(cam.full.take_keyframe_request(t0 + MIN_KEYFRAME_GAP));
     }
 
     /// A small but real box (a phone's half-width tile, an older client's
@@ -4436,9 +4492,12 @@ mod tests {
         cam.begin_ramp();
         assert_eq!(cam.capture_state_with(false), CaptureState::Ramping);
         let now = Instant::now();
-        assert!(cam.take_keyframe_request(now), "promotion asks for an IDR");
         assert!(
-            !cam.take_keyframe_request(now + MIN_KEYFRAME_GAP * 2),
+            cam.full.take_keyframe_request(now),
+            "promotion asks for an IDR"
+        );
+        assert!(
+            !cam.full.take_keyframe_request(now + MIN_KEYFRAME_GAP * 2),
             "the request is consumed, not re-armed every encode"
         );
         assert_eq!(
@@ -6577,7 +6636,7 @@ mod tests {
         let (registry, cam) = registry_with_one_camera(&dir).await;
         cam.note_keyframe_requests(2);
         cam.note_keyframe_requests(1);
-        cam.note_keyframe_sent(Instant::now());
+        cam.note_keyframe_sent(&cam.full, Instant::now());
         let info = info_for(&registry, 1).await;
         assert_eq!(info.keyframe_requests_received, 3);
         assert_eq!(info.keyframes_sent, 1);

@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use kerbcast_sidecar::cameras::{CameraRegistry, CameraState};
+use kerbcast_sidecar::cameras::{CameraRegistry, CameraState, TierEncoder};
 use kerbcast_sidecar::encoder::{
     record_init_failure, resolve_bitrate_bps, select_backend, size_is_encodable, EncodeConfig,
     EncoderBackend, EncoderChoice, RawFrame, SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
@@ -32,7 +32,7 @@ use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
 use kerbcast_sidecar::protocol::{
     AdaptiveShedPayload, CameraStateChangedPayload, SceneStateChangedPayload, ServerMessage,
 };
-use kerbcast_sidecar::shared_mem::MmapRingConfig;
+use kerbcast_sidecar::shared_mem::{CaptureStamp, MmapRingConfig};
 use kerbcast_sidecar::signalling::{router, AppState};
 use kerbcast_sidecar::webrtc::video_track::CaptureTime;
 use kerbcast_sidecar::webrtc::{resync_after_camera_churn, KerbcastPeer};
@@ -645,16 +645,16 @@ async fn broadcast_destroyed_cameras(
 /// Close and forget a camera's encoder session so the next frame
 /// re-runs init, and reset the per-session counters that describe it.
 fn drop_encoder_session(
-    cam: &Arc<CameraState>,
+    tier: &TierEncoder,
     encoder_guard: &mut tokio::sync::MutexGuard<'_, Option<Box<dyn EncoderBackend>>>,
 ) {
     if let Some(mut backend) = encoder_guard.take() {
         backend.close();
     }
-    cam.encoder_width.store(0, Ordering::Release);
-    cam.encoder_height.store(0, Ordering::Release);
-    cam.encoder_bitrate.store(0, Ordering::Release);
-    cam.encode_failure_streak.store(0, Ordering::Release);
+    tier.encoder_width.store(0, Ordering::Release);
+    tier.encoder_height.store(0, Ordering::Release);
+    tier.encoder_bitrate.store(0, Ordering::Release);
+    tier.encode_failure_streak.store(0, Ordering::Release);
 }
 
 /// The one operator-facing line when a camera gives up on hardware
@@ -848,6 +848,60 @@ async fn encode_next_frame(
         }
     }
 
+    let tier_frame = TierFrame {
+        width: frame.width,
+        height: frame.height,
+        pixels: &frame.pixels,
+        capture_ts_ms: frame.capture_ts_ms,
+        capture: &frame.capture,
+    };
+    encode_for_tier(
+        cam,
+        &cam.full,
+        &tier_frame,
+        capture_time,
+        TierSettings {
+            encoder_choice,
+            fps,
+            bitrate_bps,
+            degrade,
+        },
+    )
+    .await;
+    true
+}
+
+/// One frame as a tier encodes it: the ring frame itself, or a smaller copy.
+struct TierFrame<'a> {
+    width: u32,
+    height: u32,
+    pixels: &'a [u8],
+    capture_ts_ms: f64,
+    capture: &'a CaptureStamp,
+}
+
+#[derive(Clone, Copy)]
+struct TierSettings {
+    encoder_choice: EncoderChoice,
+    fps: u32,
+    bitrate_bps: u32,
+    degrade: f32,
+}
+
+/// Encode one frame on `tier` and send it to that tier's tracks.
+async fn encode_for_tier(
+    cam: &Arc<CameraState>,
+    tier: &TierEncoder,
+    frame: &TierFrame<'_>,
+    capture_time: CaptureTime,
+    settings: TierSettings,
+) {
+    let TierSettings {
+        encoder_choice,
+        fps,
+        bitrate_bps,
+        degrade,
+    } = settings;
     // Lazy encoder init — first encoded frame per camera. Done under
     // the camera's encoder lock so concurrent ticks can't double-init.
     //
@@ -871,9 +925,9 @@ async fn encode_next_frame(
     // initial bitrate stand. The wire bitrate stays predictable, the
     // decoder stays in sync, and the LAN can comfortably carry
     // 6 × 1.5Mbps anyway.
-    let mut encoder_guard = cam.encoder.lock().await;
-    let cur_w = cam.encoder_width.load(Ordering::Acquire);
-    let cur_h = cam.encoder_height.load(Ordering::Acquire);
+    let mut encoder_guard = tier.encoder.lock().await;
+    let cur_w = tier.encoder_width.load(Ordering::Acquire);
+    let cur_h = tier.encoder_height.load(Ordering::Acquire);
     // Always init at the CLI bitrate default — DO NOT consult REMB's
     // target_bitrate_bps here. REMB starts with a very low probe
     // estimate (often <100kbps) and ramps up, so consulting it at
@@ -920,7 +974,7 @@ async fn encode_next_frame(
         retry on every resize at that size. */
         let encodable = size_is_encodable(frame.width, frame.height);
         let mut backend = if encodable {
-            cam.session_health.lock().unwrap().select(encoder_choice)
+            tier.session_health.lock().unwrap().select(encoder_choice)
         } else {
             debug!(
                 flight_id = cam.flight_id,
@@ -954,7 +1008,7 @@ async fn encode_next_frame(
                 "encoder init failed; falling back to software"
             );
             let verdict = record_init_failure(
-                &mut cam.session_health.lock().unwrap(),
+                &mut tier.session_health.lock().unwrap(),
                 was_hardware,
                 frame.width,
                 frame.height,
@@ -973,7 +1027,7 @@ async fn encode_next_frame(
                 } else {
                     debug!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
                 }
-                return true;
+                return;
             }
         }
         info!(
@@ -984,9 +1038,9 @@ async fn encode_next_frame(
             backend = backend.name(),
             "per-camera encoder initialised",
         );
-        cam.encoder_width.store(frame.width, Ordering::Release);
-        cam.encoder_height.store(frame.height, Ordering::Release);
-        cam.encoder_bitrate.store(effective_bps, Ordering::Release);
+        tier.encoder_width.store(frame.width, Ordering::Release);
+        tier.encoder_height.store(frame.height, Ordering::Release);
+        tier.encoder_bitrate.store(effective_bps, Ordering::Release);
         *encoder_guard = Some(backend);
     }
     let encoder = encoder_guard.as_mut().unwrap();
@@ -995,7 +1049,7 @@ async fn encode_next_frame(
 
     /* Consume any pending promotion keyframe request before encoding, so the
     IDR rides the very next frame rather than waiting out the periodic GOP. */
-    let forced_keyframe = cam.take_keyframe_request(Instant::now());
+    let forced_keyframe = tier.take_keyframe_request(Instant::now());
     if forced_keyframe {
         encoder.request_keyframe();
         info!(flight_id = cam.flight_id, "keyframe forced");
@@ -1005,15 +1059,15 @@ async fn encode_next_frame(
     let encoded = encoder.encode(&RawFrame {
         width: frame.width,
         height: frame.height,
-        data: &frame.pixels,
+        data: frame.pixels,
         capture_ts_ms: frame.capture_ts_ms,
     });
     cam.send_tally.note_encode(encode_started.elapsed());
     let nals = match encoded {
         Ok(n) => {
-            cam.encode_failure_streak.store(0, Ordering::Release);
+            tier.encode_failure_streak.store(0, Ordering::Release);
             if n.iter().any(|nal| nal.is_keyframe()) {
-                cam.note_keyframe_sent(Instant::now());
+                cam.note_keyframe_sent(tier, Instant::now());
             }
             /* A promotion is complete once a keyframe actually goes out — that
             is the moment the feed becomes renderable, so it's what flips the
@@ -1037,9 +1091,9 @@ async fn encode_next_frame(
             that failed, so a forced IDR would be lost: ask again. The gap
             started when it was taken, so a run of failures cannot storm. */
             if forced_keyframe {
-                cam.request_keyframe();
+                tier.request_keyframe();
             }
-            let streak = cam.encode_failure_streak.fetch_add(1, Ordering::AcqRel) + 1;
+            let streak = tier.encode_failure_streak.fetch_add(1, Ordering::AcqRel) + 1;
             /* A failing session fails every frame: warn once per session,
             and only debug at a size no encoder supports. */
             if streak == 1 && size_is_encodable(frame.width, frame.height) {
@@ -1048,7 +1102,7 @@ async fn encode_next_frame(
                 debug!(flight_id = cam.flight_id, error = %e, streak, "encode failed");
             }
             if streak >= ENCODE_FAILURE_REINIT_THRESHOLD {
-                drop_encoder_session(cam, &mut encoder_guard);
+                drop_encoder_session(tier, &mut encoder_guard);
                 if size_is_encodable(frame.width, frame.height) {
                     warn!(
                         flight_id = cam.flight_id,
@@ -1056,7 +1110,7 @@ async fn encode_next_frame(
                         "encoder dropped after {streak} consecutive failures; will reinit on next frame"
                     );
                 }
-                let verdict = cam
+                let verdict = tier
                     .session_health
                     .lock()
                     .unwrap()
@@ -1066,7 +1120,7 @@ async fn encode_next_frame(
                 }
             }
             cam.send_tally.note_encode_failed();
-            return true;
+            return;
         }
     };
 
@@ -1080,9 +1134,9 @@ async fn encode_next_frame(
         // streamed black with zero log evidence. Strike the session;
         // enough strikes pin this camera to the software encoder.
         if backend_is_hardware {
-            let verdict = cam.session_health.lock().unwrap().note_silent_frame();
+            let verdict = tier.session_health.lock().unwrap().note_silent_frame();
             if verdict != SessionVerdict::Continue {
-                drop_encoder_session(cam, &mut encoder_guard);
+                drop_encoder_session(tier, &mut encoder_guard);
                 warn!(
                     flight_id = cam.flight_id,
                     camera = %cam.camera_name,
@@ -1096,7 +1150,7 @@ async fn encode_next_frame(
             }
         }
         cam.send_tally.note_no_output();
-        return true;
+        return;
     }
     // Only a hardware session producing real output clears strikes. A
     // software encode succeeding here (the fallback path after a hardware
@@ -1106,7 +1160,7 @@ async fn encode_next_frame(
     // strike, immediately get cleared by the successful fallback encode,
     // and never reach SESSION_STRIKE_LIMIT.
     if backend_is_hardware {
-        cam.session_health.lock().unwrap().note_output();
+        tier.session_health.lock().unwrap().note_output();
     }
     drop(encoder_guard);
 
@@ -1122,7 +1176,7 @@ async fn encode_next_frame(
     // dropped without telling us — decrement the camera's subscriber
     // count so the encoder can idle once the last viewer leaves.
     *cam.last_sent.lock().await = Some(capture_time);
-    let mut tracks = cam.tracks.write().await;
+    let mut tracks = tier.tracks.write().await;
     let prev = std::mem::take(&mut *tracks);
     let mut alive = Vec::with_capacity(prev.len());
     let mut pruned = 0usize;
@@ -1135,7 +1189,7 @@ async fn encode_next_frame(
                     capture_time,
                     keyframe,
                     cam.flight_id,
-                    &frame.capture,
+                    frame.capture,
                 )
                 .await
             {
@@ -1145,7 +1199,7 @@ async fn encode_next_frame(
                 Ok(written) => {
                     sent += 1;
                     if written.is_some_and(|w| w.wants_keyframe) {
-                        cam.request_keyframe();
+                        tier.request_keyframe();
                         info!(
                             flight_id = cam.flight_id,
                             "track went live mid-GOP; keyframe requested"
@@ -1183,7 +1237,6 @@ async fn encode_next_frame(
     if pruned > 0 {
         cam.release(pruned);
     }
-    true
 }
 
 #[cfg(test)]
@@ -1323,9 +1376,9 @@ mod tests {
     async fn a_forced_keyframe_survives_a_failed_encode() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut ring, cam, _track) = camera_with_viewer(dir.path()).await;
-        *cam.encoder.lock().await = Some(Box::new(FailingBackend));
-        cam.encoder_width.store(64, Ordering::Release);
-        cam.encoder_height.store(64, Ordering::Release);
+        *cam.full.encoder.lock().await = Some(Box::new(FailingBackend));
+        cam.full.encoder_width.store(64, Ordering::Release);
+        cam.full.encoder_height.store(64, Ordering::Release);
 
         cam.request_keyframe();
         ring.produce(64, 64, 0.0, &vec![0x80u8; 64 * 64 * 4])
@@ -1333,7 +1386,7 @@ mod tests {
         tick(&cam).await;
         assert_eq!(cam.send_tally.take().sent, 0, "the encode failed");
         assert!(
-            cam.keyframe_gate.lock().unwrap().pending(),
+            cam.full.keyframe_gate.lock().unwrap().pending(),
             "the forced keyframe is still owed"
         );
     }

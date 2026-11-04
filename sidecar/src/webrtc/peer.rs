@@ -495,11 +495,11 @@ impl KerbcastPeer {
                 info!("peer reconnected, announcing its slot bindings again");
                 send_slot_maps(&slots, &outbox).await;
                 /* Whatever was lost during the outage left each feed's
-                reference chain broken, so every bound camera starts over from
-                an IDR. */
-                for flight_id in bound_cameras(&slots).await {
+                reference chain broken, so every bound feed starts over from
+                an IDR, on the tier that feeds it. */
+                for (flight_id, track) in bound_tracks(&slots).await {
                     if let Some(cam) = registry.get(flight_id).await {
-                        cam.request_keyframe();
+                        cam.request_keyframe_for(&track).await;
                     }
                 }
             })
@@ -1110,7 +1110,18 @@ async fn handle_client_message(
         }
         ClientMessage::RequestKeyframe(FlightIdPayload { flight_id }) => {
             if let Some(cam) = registry.get(flight_id).await {
-                cam.request_keyframe();
+                let tracks: Vec<Arc<VideoTrack>> = bound_tracks(&slots)
+                    .await
+                    .into_iter()
+                    .filter(|(f, _)| *f == flight_id)
+                    .map(|(_, t)| t)
+                    .collect();
+                if tracks.is_empty() {
+                    cam.request_keyframe();
+                }
+                for track in &tracks {
+                    cam.request_keyframe_for(track).await;
+                }
                 info!(flight_id, "keyframe requested");
             }
         }
@@ -1296,8 +1307,9 @@ async fn handle_subscribe(
         // Keyframe BEFORE add_track so the next encode emits an IDR (with
         // SPS/PPS) to every track of this camera, including the freshly-added
         // slot — otherwise the slot's first frame is a mid-GOP P-frame that
-        // decodes as garbage until the next periodic IDR.
-        cam.request_keyframe();
+        // decodes as garbage until the next periodic IDR. A new binding always
+        // starts on the Full tier.
+        cam.full.request_keyframe();
         cam.add_track(track).await;
         registry.set_subscribed(flight_id, true).await;
         info!(flight_id, "subscribed camera to slot");
@@ -1477,8 +1489,14 @@ async fn send_slot_maps(slots: &Arc<Mutex<Vec<Slot>>>, dc: &Outbox) {
     }
 }
 
-async fn bound_cameras(slots: &Arc<Mutex<Vec<Slot>>>) -> Vec<u32> {
-    slots.lock().await.iter().filter_map(|s| s.bound).collect()
+/// Every bound slot's camera and track.
+async fn bound_tracks(slots: &Arc<Mutex<Vec<Slot>>>) -> Vec<(u32, Arc<VideoTrack>)> {
+    slots
+        .lock()
+        .await
+        .iter()
+        .filter_map(|s| s.bound.map(|f| (f, s.track.clone())))
+        .collect()
 }
 
 /// The slot map of every bound slot that has a negotiated mid.
@@ -2167,14 +2185,18 @@ async fn drain_rtcp_sink(
         }
         let bound = {
             let guard = slots.lock().await;
-            guard.get(slot_idx).and_then(|s| s.bound)
+            guard
+                .get(slot_idx)
+                .and_then(|s| s.bound.map(|f| (f, s.track.clone())))
         };
-        let Some(flight_id) = bound else { continue };
+        let Some((flight_id, track)) = bound else {
+            continue;
+        };
         let Some(cam) = registry.get(flight_id).await else {
             continue;
         };
         cam.note_keyframe_requests(requests as u64);
-        cam.request_keyframe();
+        cam.request_keyframe_for(&track).await;
     }
     // read_rtcp errors when the sender closes (peer torn down) — the normal
     // exit. If it ever happens mid-connection this slot loses its NACK pump and
