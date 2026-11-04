@@ -226,11 +226,14 @@ export function createClientDisplaySizes(
   function recompute(flightId: number): void {
     const instances = perCamera.get(flightId);
     if (!instances || instances.size === 0) {
-      // No reporters left. Drop bookkeeping and send nothing: the subscription
-      // release (unsubscribe -> sidecar remove_track -> forget_display_size)
-      // clears the sidecar side. Sending a spurious size here would fight it.
+      /*
+       * No reporters left, as when the last feed showing the camera is hidden
+       * while still subscribed. A 0x0 report is no demand to the sidecar, so
+       * the camera stops rendering at a size nobody sees. An unsubscribe that
+       * follows clears the same entry, so the two never disagree.
+       */
       perCamera.delete(flightId);
-      lastSent.delete(flightId);
+      if (lastSent.delete(flightId)) client.reportDisplaySize(flightId, 0, 0).catch(() => {});
       return;
     }
     let maxW = 0;

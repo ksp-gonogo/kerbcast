@@ -80,13 +80,27 @@ describe("createClientDisplaySizes", () => {
     expect(reports.at(-1)).toEqual({ flightId: 1, width: 40, height: 40 });
   });
 
-  it("sends nothing more once the last reporter departs (backend forget clears it)", () => {
+  it("withdraws the size with a 0x0 report once the last reporter departs, once", () => {
     const { client, reports } = fakeClient();
     const reg = createClientDisplaySizes(client);
-    reg.report(1, "a", 40, 40);
-    const countBefore = reports.length;
+    reg.report(1, "a", 400, 400);
+    reg.report(1, "b", 200, 200);
+    reg.clear(1, "b");
+    expect(reports).toEqual([{ flightId: 1, width: 400, height: 400 }]);
     reg.clear(1, "a");
-    expect(reports.length).toBe(countBefore); // no extra report on empty
+    expect(reports.at(-1)).toEqual({ flightId: 1, width: 0, height: 0 });
+    reg.clear(1, "a");
+    expect(reports).toHaveLength(2);
+    /* A feed laid out again reports afresh. */
+    reg.report(1, "a", 400, 400);
+    expect(reports.at(-1)).toEqual({ flightId: 1, width: 400, height: 400 });
+  });
+
+  it("sends nothing for a camera that never reported", () => {
+    const { client, reports } = fakeClient();
+    const reg = createClientDisplaySizes(client);
+    reg.clear(1, "a");
+    expect(reports).toEqual([]);
   });
 
   it("keeps separate maxes per flightId", () => {

@@ -152,14 +152,14 @@ describe("KerbalFaceFeed - reporting + showActions", () => {
       </KerbcastProvider>,
     );
     // A non-square measured box still reports square (min edge, bucketed): the
-    // face capture is square, so 50x40 -> min 40 -> 48x48.
+    // face capture is square, so 50x40 -> min 40 -> 48x48, raised to the 128 floor.
     act(() => {
       resizeCallback?.(
         [{ contentRect: { width: 50, height: 40 } }] as ResizeObserverEntry[],
         {} as ResizeObserver,
       );
     });
-    expect(reports.at(-1)).toEqual({ flightId: KERBAL_ID, w: 48, h: 48 });
+    expect(reports.at(-1)).toEqual({ flightId: KERBAL_ID, w: 128, h: 128 });
   });
 
   it("does not report when reportSize is false", async () => {

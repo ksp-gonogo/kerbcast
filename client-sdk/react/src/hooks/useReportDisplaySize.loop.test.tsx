@@ -172,7 +172,7 @@ function mount(mode: Mode, sidecar = makeSidecar()) {
 
 beforeEach(() => {
   vi.useFakeTimers();
-  tile = { width: 170, height: 400 };
+  tile = { width: 340, height: 800 };
   watched = [];
   globalThis.ResizeObserver = class {
     private readonly cb: ResizeObserverCallback;
@@ -198,13 +198,13 @@ describe("useReportDisplaySize: a box sized from the stream", () => {
   it("asks once for a tile sized by layout, at 16:9 whatever the tile's shape", () => {
     const sidecar = mount("tile");
     run(5000);
-    expect(sidecar.reports).toEqual([{ width: 176, height: 100 }]);
+    expect(sidecar.reports).toEqual([{ width: 352, height: 198 }]);
   });
 
   it("settles after the first request when the frame keeps the stream's aspect", () => {
     const sidecar = mount("fit");
     run(10_000);
-    expect(sidecar.reports).toEqual([{ width: 176, height: 100 }]);
+    expect(sidecar.reports).toEqual([{ width: 352, height: 198 }]);
   });
 
   it("does not ratchet down when a video at its own size arrives smaller than asked", () => {
@@ -278,11 +278,32 @@ describe("useReportDisplaySize: a genuine layout change", () => {
     expect(sidecar.reports.slice(before)).toEqual([{ width: 320, height: 180 }]);
   });
 
+  it("reports a tile shown again right after a stream change, even inside the hold", () => {
+    const sidecar = mount("tile");
+    run(5000);
+    const before = sidecar.reports.length;
+    /* A resize near a stream change uses up the hold. */
+    sidecar.streamBecomes({ width: 400, height: 300 });
+    resizeTile({ width: 640, height: 400 });
+    run(500);
+    expect(sidecar.reports.slice(before)).toEqual([{ width: 640, height: 360 }]);
+    /* Hidden, then shown again next to another stream change. */
+    resizeTile({ width: 0, height: 0 });
+    run(500);
+    sidecar.streamBecomes({ width: 200, height: 150 });
+    resizeTile({ width: 960, height: 600 });
+    run(500);
+    expect(sidecar.reports.slice(before)).toEqual([
+      { width: 640, height: 360 },
+      { width: 960, height: 540 },
+    ]);
+  });
+
   it("still reports a resize right after a stream change that the stream can not explain", () => {
     const sidecar = mount("fit");
     run(10_000);
     const before = sidecar.reports.length;
-    sidecar.streamBecomes({ width: 160, height: 90 });
+    sidecar.streamBecomes({ width: 320, height: 180 });
     resizeTile({ width: 640, height: 400 });
     run(1000);
     expect(sidecar.reports.slice(before)).toEqual([{ width: 640, height: 360 }]);

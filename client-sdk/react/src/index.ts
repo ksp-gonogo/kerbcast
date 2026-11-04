@@ -30,7 +30,7 @@ export { useKerbcastClock } from "./hooks/useKerbcastClock";
 export { useDisplayedFrameUt } from "./hooks/useDisplayedFrameUt";
 export { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 export { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
-export { useReportDisplaySize } from "./hooks/useReportDisplaySize";
+export { useReportDisplaySize, MIN_DISPLAY_REPORT_PX } from "./hooks/useReportDisplaySize";
 export { useRecordings } from "./hooks/useRecordings";
 export type { RecordingsStore, ActiveRecordingInfo } from "./hooks/useRecordings";
 

@@ -181,7 +181,11 @@ quality follows how large it is shown (pass `reportSize={false}` to opt out).
   feed primitives use it internally; multiple views of one camera from a
   client collapse to a single MAX report. Pass `aspect` for the shape to ask
   for (default 16:9), and `videoRef` / `streamSize` so a resize that follows
-  the stream is not reported.
+  the stream is not reported. A request is never under `MIN_DISPLAY_REPORT_PX`
+  (128) on either axis: a smaller box asks for that much at the camera's
+  shape. An empty box (a hidden or not yet laid out tile) reports nothing.
+  When the last feed of a camera empties, the client tells the sidecar it no
+  longer needs a size, so the camera stops rendering for a box nobody sees.
 
 - `useKerbcastCameras(): CameraState[]`. The live camera registry,
   re-rendering as cameras appear, change, or are destroyed.

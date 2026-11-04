@@ -49,12 +49,19 @@ const SOURCELESS_INTENSITY = 1.0;
 /** Floor applied to the degrade-driven intensity of a live feed. */
 const LIVE_INTENSITY_FLOOR = 0.05;
 /**
- * While a feed is stalled, how often to re-request a keyframe. A stall is
- * usually a wedged decoder that only a fresh IDR clears; the first request or
- * its keyframe can be lost during the same outage, so we keep asking until
- * frames resume.
+ * While a feed is stalled, how long to wait before re-requesting a keyframe.
+ * A stall is usually a wedged decoder that only a fresh IDR clears; the first
+ * request or its keyframe can be lost during the same outage, so we keep
+ * asking until frames resume. The wait doubles after each request up to the
+ * cap, because on a lossy link every IDR burst adds loss of its own.
  */
 const STALL_KEYFRAME_RETRY_MS = 2000;
+const STALL_KEYFRAME_RETRY_MAX_MS = 8000;
+/**
+ * How long frames must flow before a new stall starts the backoff over. A
+ * lossy link that trickles a frame every second or two keeps its backoff.
+ */
+const STALL_KEYFRAME_RESET_MS = 5000;
 /**
  * The fewest slots one re-offer adds. A page opening several feeds at once
  * gets them in one exchange instead of one per feed.
@@ -484,6 +491,45 @@ export interface KerbcastClientConfig {
    * this and get the default.
    */
   recording?: RecordingControllerOptions;
+  /**
+   * Rebuild the connection by itself when one that was up fails, with the
+   * same cameras subscribed. `true` takes the defaults in
+   * {@link AutoReconnectOptions}. Off by default: a consumer that rebuilds
+   * its own connection on `"failed"` sees no change. Between attempts the
+   * state stays `"failed"`, and an attempt goes from there to `"connecting"`
+   * without passing `"disconnected"`; `reconnect-attempt`, `reconnect-success` and
+   * `reconnect-give-up` report progress. {@link KerbcastClient.connect} and
+   * {@link KerbcastClient.disconnect} cancel a reconnect under way.
+   */
+  autoReconnect?: boolean | AutoReconnectOptions;
+}
+
+/** Tuning for {@link KerbcastClientConfig.autoReconnect}. */
+export interface AutoReconnectOptions {
+  /** Attempts before giving up. Default 8. */
+  maxAttempts?: number;
+  /** Wait before the first attempt, doubling after each. Default 1000 ms. */
+  initialDelayMs?: number;
+  /** Longest wait between attempts. Default 30 000 ms. */
+  maxDelayMs?: number;
+  /**
+   * How long an attempt may take to connect before it counts as failed, so
+   * an offer exchange that never answers cannot stall the run. Default
+   * 30 000 ms.
+   */
+  attemptTimeoutMs?: number;
+}
+
+const AUTO_RECONNECT_DEFAULTS: Required<AutoReconnectOptions> = {
+  maxAttempts: 8,
+  initialDelayMs: 1000,
+  maxDelayMs: 30_000,
+  attemptTimeoutMs: 30_000,
+};
+
+/** Payload of the reconnect events: the attempt starting, or how many were made. */
+export interface ReconnectProgress {
+  attempt: number;
 }
 
 /** WebRTC connection state surface. */
@@ -718,6 +764,12 @@ export interface KerbcastClientEvents {
    * and is handed the messages held back meanwhile.
    */
   "contact-gap": ContactGap;
+  /** Fired as each {@link KerbcastClientConfig.autoReconnect} attempt starts, numbered from 1. */
+  "reconnect-attempt": ReconnectProgress;
+  /** Fired when a reconnect attempt's connection comes up; `attempt` is the one that did. */
+  "reconnect-success": ReconnectProgress;
+  /** Fired when the last allowed attempt has failed; `attempt` is how many were made. The client stays `"failed"`. */
+  "reconnect-give-up": ReconnectProgress;
 }
 
 /** A silence from the sidecar: when it was last heard from and when it next was, both as `Date.now()`. */
@@ -1267,8 +1319,12 @@ class CameraHandle
   private _waitingForSlot = false;
   /** The raw stream {@link _watchSource} last subscribed to, so a re-apply of it adds no listener. */
   private _watchedStream: MediaStream | null = null;
-  /** Interval that re-requests keyframes while stalled; null when not stalled. */
-  private _keyframeRetry: ReturnType<typeof setInterval> | null = null;
+  /** Timer for the next keyframe re-request while stalled; null when not stalled. */
+  private _keyframeRetry: ReturnType<typeof setTimeout> | null = null;
+  /** The wait owed after the last keyframe request; null when a fresh backoff starts. */
+  private _keyframeGap: number | null = null;
+  private _lastKeyframeAt = Number.NEGATIVE_INFINITY;
+  private _unstalledAt = Number.NEGATIVE_INFINITY;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
   private _showStatic = true;
   /** True while the pipeline runs as a static-free frame-lock passthrough (noise off, `frameLock` on). */
@@ -1527,17 +1583,42 @@ class CameraHandle
       // reference chain after packet loss or heavy degrade), which only a
       // fresh keyframe clears. Force one now and keep asking while stalled,
       // rather than waiting on the browser's rate-limited PLI.
-      this._requestKeyframeForRecovery();
-      if (this._keyframeRetry === null) {
-        this._keyframeRetry = setInterval(
-          () => this._requestKeyframeForRecovery(),
-          STALL_KEYFRAME_RETRY_MS,
-        );
+      const now = Date.now();
+      if (now - this._unstalledAt >= STALL_KEYFRAME_RESET_MS) this._keyframeGap = null;
+      const gap = this._keyframeGap;
+      if (gap === null || now - this._lastKeyframeAt >= gap) {
+        this._keyframeAfter(0);
+      } else {
+        this._keyframeAfter(this._lastKeyframeAt + gap - now);
       }
-    } else if (this._keyframeRetry !== null) {
-      clearInterval(this._keyframeRetry);
-      this._keyframeRetry = null;
+    } else {
+      this._cancelKeyframeRetry();
+      this._unstalledAt = Date.now();
     }
+  }
+
+  /** Requests a keyframe after `delayMs`, then keeps asking with the wait doubling to the cap. */
+  private _keyframeAfter(delayMs: number): void {
+    const fire = () => {
+      this._requestKeyframeForRecovery();
+      this._lastKeyframeAt = Date.now();
+      this._keyframeGap =
+        this._keyframeGap === null
+          ? STALL_KEYFRAME_RETRY_MS
+          : Math.min(this._keyframeGap * 2, STALL_KEYFRAME_RETRY_MAX_MS);
+      this._keyframeAfter(this._keyframeGap);
+    };
+    if (delayMs <= 0) {
+      fire();
+      return;
+    }
+    this._keyframeRetry = setTimeout(fire, delayMs);
+  }
+
+  private _cancelKeyframeRetry(): void {
+    if (this._keyframeRetry === null) return;
+    clearTimeout(this._keyframeRetry);
+    this._keyframeRetry = null;
   }
 
   private _requestKeyframeForRecovery(): void {
@@ -1570,10 +1651,10 @@ class CameraHandle
    * the persistent pipeline, stops its rAF loop, and nulls the stream.
    */
   _teardown(): void {
-    if (this._keyframeRetry !== null) {
-      clearInterval(this._keyframeRetry);
-      this._keyframeRetry = null;
-    }
+    this._cancelKeyframeRetry();
+    this._keyframeGap = null;
+    this._lastKeyframeAt = Number.NEGATIVE_INFINITY;
+    this._unstalledAt = Number.NEGATIVE_INFINITY;
     this._noisePipeline?.destroy();
     this._noisePipeline = null;
     this._rawStream = null;
@@ -1824,6 +1905,21 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * response is simply missing here.
    */
   private readonly maxRenderSizeByFlight = new Map<number, { width: number; height: number }>();
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Fails a reconnect attempt that has not connected in time. */
+  private attemptDeadline: ReturnType<typeof setTimeout> | null = null;
+  /** Peers that failed: kept as `peer` until the next connection, but nothing more is done on them. */
+  private readonly failedPeers = new WeakSet<KerbcastPeer>();
+  /** Attempts made in the current reconnect run; 0 when none is under way. */
+  private reconnectAttempts = 0;
+  /** Bumped by every consumer `connect` and `disconnect`, so a reconnect begun before one gives way. */
+  private connectEpoch = 0;
+  /** Whether a peer since the consumer's last `connect` reached connected; only such a connection is rebuilt. */
+  private everConnected = false;
+  /** The slot pool the consumer's last `connect` asked for. */
+  private connectSlots: number | undefined;
+  /** The largest pool any peer since the consumer's last `connect` negotiated, so a rebuild needs no regrowth. */
+  private peakSlots = 0;
 
   constructor(cfg: KerbcastClientConfig, transport?: KerbcastTransport) {
     super();
@@ -2096,7 +2192,18 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     requestedCameras: number[] = [],
     opts: { slots?: number } = {},
   ): Promise<void> {
-    this.disconnect();
+    this.stopReconnect();
+    this.connectSlots = opts.slots;
+    await this.openPeer(requestedCameras, opts);
+  }
+
+  /** `quiet` skips the `"disconnected"` a consumer's connect passes through, so a reconnect goes from failed to connecting. */
+  private async openPeer(
+    requestedCameras: number[],
+    opts: { slots?: number },
+    quiet = false,
+  ): Promise<void> {
+    this.closePeer(quiet);
     this.setState("connecting");
     this.requestedOrder = [...requestedCameras];
     this.dynamicMode = opts.slots !== undefined;
@@ -2154,21 +2261,19 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
 
     peer.onStateChange((s) => {
       this.setState(s);
+      if (s === "connected" && this.peer === peer) {
+        this.everConnected = true;
+        this.clearAttemptDeadline();
+        if (this.reconnectAttempts > 0) {
+          const attempt = this.reconnectAttempts;
+          this.reconnectAttempts = 0;
+          this.emit("reconnect-success", { attempt });
+        }
+      }
       /* Disconnected is a pause the peer comes back from on its own, with the
          same tracks and slots, so the feeds keep their streams and the stall
          static covers the gap. Only a failed peer is gone for good. */
-      if (s === "failed" && this.peer === peer) {
-        this.clearEncodedTransforms();
-        this.tearDownStreams();
-      }
-      /* A failed peer never recovers; closing it frees its relay allocations. */
-      if (s === "failed") {
-        if (this.peer === peer) {
-          this.growBroken = true;
-          this.cancelGrowRetry();
-        }
-        peer.close();
-      }
+      if (s === "failed") this.peerFailed(peer);
     });
 
     const control = peer.createDataChannel("kerbcast-control");
@@ -2205,7 +2310,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     });
 
     await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
+    if (!this.isCurrent(peer)) return;
     await peer.waitForIceComplete();
+    /* A connect or disconnect made meanwhile owns the client now. */
+    if (!this.isCurrent(peer)) return;
 
     const body: { sdp: string; cameras: number[]; slots?: number } = {
       sdp: peer.localSdp(),
@@ -2220,11 +2328,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         : this.httpNegotiate(body));
     } catch (err) {
       peer.close();
+      if (!this.isCurrent(peer)) return;
       this.setState("failed");
       throw err;
     }
+    if (!this.isCurrent(peer)) return;
     await peer.setRemoteAnswer(answer.sdp);
+    if (!this.isCurrent(peer)) return;
     this.slotCount = slotCount;
+    this.peakSlots = Math.max(this.peakSlots, slotCount);
     this.session = answer.session ?? null;
     // Legacy mode routes by index → requestedOrder, so realign to what the
     // sidecar actually wired. Dynamic mode routes by mid via SlotMap (initial
@@ -2345,6 +2457,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         /* A reconnect during that await owns the client now; this grow belongs to a dead peer. */
         if (this.peer !== peer) return;
         this.slotCount = target;
+        this.peakSlots = Math.max(this.peakSlots, target);
         this.growFailures = 0;
         /* The sidecar binds no camera to the new slots until this lands, and
            the channel is ordered, so the subscribes below can use them. */
@@ -2473,6 +2586,113 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   disconnect(): void {
+    this.stopReconnect();
+    this.closePeer();
+  }
+
+  private reconnectOptions(): Required<AutoReconnectOptions> | null {
+    const opt = this.cfg.autoReconnect;
+    if (!opt) return null;
+    if (opt === true) return AUTO_RECONNECT_DEFAULTS;
+    /* A missing, negative or non-finite field takes its default. */
+    const pick = (v: number | undefined, d: number) =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : d;
+    const d = AUTO_RECONNECT_DEFAULTS;
+    return {
+      maxAttempts: Math.floor(pick(opt.maxAttempts, d.maxAttempts)),
+      initialDelayMs: pick(opt.initialDelayMs, d.initialDelayMs),
+      maxDelayMs: pick(opt.maxDelayMs, d.maxDelayMs),
+      attemptTimeoutMs: pick(opt.attemptTimeoutMs, d.attemptTimeoutMs),
+    };
+  }
+
+  /**
+   * `peer` failed, or a reconnect attempt on it ran out of time: drop its
+   * streams, close it to free its relay allocations, and rebuild it when the
+   * client reconnects by itself.
+   */
+  private peerFailed(peer: KerbcastPeer): void {
+    if (this.failedPeers.has(peer)) return;
+    this.failedPeers.add(peer);
+    if (this.peer === peer) {
+      this.clearAttemptDeadline();
+      this.clearEncodedTransforms();
+      this.tearDownStreams();
+      this.growBroken = true;
+      this.cancelGrowRetry();
+    }
+    peer.close();
+    if (this.peer === peer) this.scheduleReconnect();
+  }
+
+  /** Whether `peer` is still the client's live peer, so work begun on it may go on. */
+  private isCurrent(peer: KerbcastPeer): boolean {
+    return this.peer === peer && !this.failedPeers.has(peer);
+  }
+
+  private clearAttemptDeadline(): void {
+    if (this.attemptDeadline === null) return;
+    clearTimeout(this.attemptDeadline);
+    this.attemptDeadline = null;
+  }
+
+  /** Ends any reconnect run, for a consumer `connect` or `disconnect` that takes over. */
+  private stopReconnect(): void {
+    this.connectEpoch++;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.clearAttemptDeadline();
+    this.reconnectAttempts = 0;
+    this.everConnected = false;
+    this.peakSlots = 0;
+  }
+
+  /** The current peer failed: schedule the next attempt to rebuild it, or give up. */
+  private scheduleReconnect(): void {
+    const opts = this.reconnectOptions();
+    if (!opts || this.reconnectTimer !== null) return;
+    if (!this.everConnected && this.reconnectAttempts === 0) return;
+    if (this.reconnectAttempts >= opts.maxAttempts) {
+      const attempt = this.reconnectAttempts;
+      this.reconnectAttempts = 0;
+      this.everConnected = false;
+      this.emit("reconnect-give-up", { attempt });
+      return;
+    }
+    const delay = Math.min(opts.initialDelayMs * 2 ** this.reconnectAttempts, opts.maxDelayMs);
+    const epoch = this.connectEpoch;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (epoch !== this.connectEpoch) return;
+      this.reconnectAttempts++;
+      this.emit("reconnect-attempt", { attempt: this.reconnectAttempts });
+      /* A listener may have connected or disconnected itself. */
+      if (epoch !== this.connectEpoch) return;
+      /* The same cameras on a pool as large as the last one grew to. */
+      const cameras = this.dynamicMode ? [...this.wanted] : [...this.requestedOrder];
+      const peerOpts = this.dynamicMode
+        ? { slots: Math.max(this.connectSlots ?? 0, this.peakSlots) }
+        : {};
+      const opening = this.openPeer(cameras, peerOpts, true);
+      const peer = this.peer;
+      if (!peer) return;
+      /* An offer exchange can hang with no answer; past the deadline the attempt counts as failed. */
+      this.attemptDeadline = setTimeout(() => {
+        this.attemptDeadline = null;
+        if (this.peer !== peer) return;
+        this.setState("failed");
+        this.peerFailed(peer);
+      }, opts.attemptTimeoutMs);
+      opening.catch(() => {
+        if (epoch !== this.connectEpoch || this.peer !== peer) return;
+        this.failedPeers.add(peer);
+        this.clearAttemptDeadline();
+        this.scheduleReconnect();
+      });
+    }, delay);
+  }
+
+  private closePeer(quiet = false): void {
     this.cancelGrowRetry();
     this.clearEncodedTransforms();
     this.peer?.close();
@@ -2481,7 +2701,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.controlOpen = false;
     this.rejectPendingSends("[kerbcast] client disconnected before the control channel opened");
     this.tearDownStreams();
-    this.setState("disconnected");
+    if (!quiet) this.setState("disconnected");
   }
 
   /**
@@ -2525,9 +2745,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * per-consumer input the sidecar aggregates MAX-across-consumers, so a big
    * spotlight bumps the stream up while tiny avatars leave it small. The SDK's
    * feed primitives self-measure and call this; consumers do not report by hand.
+   * A size under 2 on either axis withdraws this consumer's report.
    */
   async reportDisplaySize(flightId: number, width: number, height: number): Promise<void> {
-    this.displaySizes.set(flightId, { width, height });
+    if (width < 2 || height < 2) this.displaySizes.delete(flightId);
+    else this.displaySizes.set(flightId, { width, height });
     await this._send({ type: "report-display-size", content: { flightId, width, height } });
   }
 

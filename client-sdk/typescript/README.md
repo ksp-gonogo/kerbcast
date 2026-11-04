@@ -68,6 +68,36 @@ ship without OpenH264) is refused, and `connect` rejects with an
 `OfferRefusedError` whose `code` is `ErrorCode.CodecUnsupported` and whose
 message says what to change.
 
+### Reconnecting
+
+A connection that fails stays failed: by default the client never rebuilds
+it, so a consumer can do that itself on `state-change` reaching `"failed"`.
+Pass `autoReconnect` to have the client do it instead:
+
+```ts
+const client = new KerbcastClient({
+  host: "192.168.1.74",
+  port: 8088,
+  autoReconnect: { maxAttempts: 8, initialDelayMs: 1000, maxDelayMs: 30_000, attemptTimeoutMs: 30_000 },
+});
+
+client.on("reconnect-attempt", ({ attempt }) => console.log("reconnecting, try", attempt));
+client.on("reconnect-success", ({ attempt }) => console.log("back after", attempt));
+client.on("reconnect-give-up", ({ attempt }) => console.log("gave up after", attempt));
+```
+
+`autoReconnect: true` takes the defaults shown. Once a connection that was up
+fails, the client waits `initialDelayMs`, opens a new connection with the same
+cameras subscribed, and doubles the wait after each failed attempt up to
+`maxDelayMs`. An attempt that has not connected within `attemptTimeoutMs`
+counts as failed. A first connection that never came up is left to the
+caller. Between attempts the state stays `"failed"`, and each attempt goes
+straight to `"connecting"`, so `"disconnected"` still means only a pause the
+connection may recover from by itself, or your own `disconnect`. The feeds
+show no signal until the new connection carries frames; display sizes, forces,
+holds and anchors are sent again on it. Calling `connect` or `disconnect`,
+even from a reconnect listener, cancels a reconnect under way.
+
 ### Pre-handshake discovery
 
 ```ts

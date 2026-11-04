@@ -1933,6 +1933,89 @@ describe("KerbcastClient", () => {
       }
     });
 
+    it("backs keyframe requests off while stalled and starts over once frames flow", async () => {
+      const spy = makePipelineSpy();
+      vi.useFakeTimers();
+      try {
+        const sidecar = new MockSidecar();
+        sidecar.addCamera({ flightId: 43 });
+        const client = await connectCamera42(sidecar);
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+        const requests = () =>
+          sidecar.commands.filter((c) => c.type === "request-keyframe").map((c) => c.content);
+
+        spy.fireStall(true);
+        expect(requests()).toEqual([{ flightId: 42 }]);
+        const at = (ms: number) => {
+          vi.advanceTimersByTime(ms);
+          return requests().length;
+        };
+        expect(at(1999)).toBe(1);
+        expect(at(1)).toBe(2);
+        expect(at(3999)).toBe(2);
+        expect(at(1)).toBe(3);
+        expect(at(8000)).toBe(4);
+        /* Capped: no further doubling past 8 s. */
+        expect(at(8000)).toBe(5);
+        expect(requests().every((c) => (c as { flightId: number }).flightId === 42)).toBe(true);
+
+        spy.fireStall(false);
+        expect(at(60_000)).toBe(5);
+
+        /* A fresh stall asks promptly again and restarts the backoff at 2 s. */
+        spy.fireStall(true);
+        expect(requests().length).toBe(6);
+        expect(at(2000)).toBe(7);
+        client.disconnect();
+        expect(at(60_000)).toBe(7);
+      } finally {
+        vi.useRealTimers();
+        spy.createSpy.mockRestore();
+      }
+    });
+
+    it("keeps the keyframe backoff through a stall that flaps on a trickle of frames", async () => {
+      const spy = makePipelineSpy();
+      vi.useFakeTimers();
+      try {
+        const sidecar = new MockSidecar();
+        const client = await connectCamera42(sidecar);
+        sidecar.deliverTrack("0", {} as MediaStreamTrack);
+        const requests = () => sidecar.commands.filter((c) => c.type === "request-keyframe").length;
+        const flap = (ms: number) => {
+          vi.advanceTimersByTime(ms);
+          spy.fireStall(false);
+          vi.advanceTimersByTime(100);
+          spy.fireStall(true);
+        };
+
+        spy.fireStall(true);
+        expect(requests()).toBe(1);
+        /* A frame a second: the stall clears and returns, but the 2 s gap still holds. */
+        flap(900);
+        expect(requests()).toBe(1);
+        flap(900);
+        expect(requests()).toBe(2);
+        /* Then 4 s, whatever the flapping. */
+        flap(900);
+        flap(900);
+        flap(900);
+        expect(requests()).toBe(2);
+        flap(900);
+        expect(requests()).toBe(3);
+
+        /* Frames flowing for 5 s start the backoff over: a new stall asks at once. */
+        spy.fireStall(false);
+        vi.advanceTimersByTime(5000);
+        spy.fireStall(true);
+        expect(requests()).toBe(4);
+        client.disconnect();
+      } finally {
+        vi.useRealTimers();
+        spy.createSpy.mockRestore();
+      }
+    });
+
     it("teardown (disconnect) clears a latched stall", async () => {
       const spy = makePipelineSpy();
       try {
@@ -5353,5 +5436,419 @@ describe("KerbcastCameraHandle.tapEncodedFrames", () => {
       { mid: "0", on: true },
       { mid: "1", on: true },
     ]);
+  });
+});
+
+describe("KerbcastClient: auto-reconnect", () => {
+  interface FakePeer {
+    closed: boolean;
+    state?: (s: KerbcastConnectionState) => void;
+    track?: (t: MediaStreamTrack, idx: number, mid?: string) => void;
+    open: () => void;
+    message: (raw: string) => void;
+    sent: string[];
+  }
+
+  /* A transport that keeps every peer it built, so a test can fail one and see the next. */
+  function multiPeerTransport() {
+    const peers: FakePeer[] = [];
+    const transport: KerbcastTransport = {
+      createPeer: () => {
+        const p: FakePeer = { closed: false, open: () => {}, message: () => {}, sent: [] };
+        peers.push(p);
+        return {
+          addRecvOnlyTransceiver: () => {},
+          createDataChannel: () => ({
+            send: (s: string) => p.sent.push(s),
+            onOpen: (h: () => void) => {
+              p.open = h;
+            },
+            onMessage: (h: (raw: string) => void) => {
+              p.message = h;
+            },
+            onClose: () => {},
+          }),
+          onTrack: (h) => {
+            p.track = h;
+          },
+          onStateChange: (h) => {
+            p.state = h;
+          },
+          createOffer: async () => "v=0\r\n",
+          setLocalDescription: async () => {},
+          setRemoteAnswer: async () => {},
+          waitForIceComplete: async () => {},
+          localSdp: () => "v=0\r\n",
+          close: () => {
+            p.closed = true;
+          },
+        };
+      },
+    };
+    return { transport, peers };
+  }
+
+  function setup(
+    autoReconnect: KerbcastClientConfig["autoReconnect"],
+    negotiateFails = () => false,
+    negotiate?: KerbcastClientConfig["negotiate"],
+  ) {
+    const { transport, peers } = multiPeerTransport();
+    const offers: Array<{ cameras: number[]; slots?: number }> = [];
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        autoReconnect,
+        negotiate: async (offer) => {
+          offers.push({ cameras: offer.cameras, slots: offer.slots });
+          if (negotiate) return negotiate(offer);
+          if (negotiateFails()) throw new Error("sidecar unreachable");
+          return { sdp: "v=0\r\n", cameras: offer.cameras, session: "s" };
+        },
+      },
+      transport,
+    );
+    const events: string[] = [];
+    client.on("reconnect-attempt", ({ attempt }) => events.push(`attempt ${attempt}`));
+    client.on("reconnect-success", ({ attempt }) => events.push(`success ${attempt}`));
+    client.on("reconnect-give-up", ({ attempt }) => events.push(`give-up ${attempt}`));
+    return { client, peers, offers, events };
+  }
+
+  /* Lets the attempt's async offer and answer run. */
+  async function flush() {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does nothing by default when a connection fails", async () => {
+    const { client, peers, events } = setup(undefined);
+    await client.connect([42], { slots: 4 });
+    peers[0].state?.("connected");
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(1);
+    expect(events).toEqual([]);
+    expect(client.state).toBe("failed");
+  });
+
+  it("rebuilds a failed connection with the same cameras, after a backoff, and closes the old peer", async () => {
+    const { client, peers, offers, events } = setup(true);
+    await client.connect([42], { slots: 4 });
+    void client.subscribe(43).catch(() => {});
+    peers[0].state?.("connected");
+    peers[0].state?.("failed");
+    expect(peers[0].closed).toBe(true);
+    expect(client.state).toBe("failed");
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(peers).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(peers).toHaveLength(2);
+    expect(events).toEqual(["attempt 1"]);
+    expect(offers.at(-1)).toEqual({ cameras: [42, 43], slots: 4 });
+
+    peers[1].state?.("connected");
+    expect(events).toEqual(["attempt 1", "success 1"]);
+    expect(client.state).toBe("connected");
+    /* A failed attempt's peer is closed too, and only the current peer stays open. */
+    expect(peers.map((p) => p.closed)).toEqual([true, false]);
+  });
+
+  it("doubles the wait between failed attempts and gives up after the last", async () => {
+    const { client, peers, events } = setup({ maxAttempts: 3, initialDelayMs: 100, maxDelayMs: 250 });
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    peers[0].state?.("failed");
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(peers).toHaveLength(2);
+    peers[1].state?.("failed");
+    await vi.advanceTimersByTimeAsync(199);
+    expect(peers).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(peers).toHaveLength(3);
+    peers[2].state?.("failed");
+    /* Capped at 250 ms rather than 400. */
+    await vi.advanceTimersByTimeAsync(250);
+    expect(peers).toHaveLength(4);
+    peers[3].state?.("failed");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(peers).toHaveLength(4);
+    expect(events).toEqual(["attempt 1", "attempt 2", "attempt 3", "give-up 3"]);
+    expect(peers.every((p) => p.closed)).toBe(true);
+    expect(client.state).toBe("failed");
+  });
+
+  it("retries an attempt whose offer exchange fails", async () => {
+    let failing = false;
+    const { client, peers, events } = setup({ initialDelayMs: 100 }, () => failing);
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    failing = true;
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    expect(peers[1].closed).toBe(true);
+    failing = false;
+    await vi.advanceTimersByTimeAsync(200);
+    await flush();
+    expect(peers).toHaveLength(3);
+    peers[2].state?.("connected");
+    expect(events).toEqual(["attempt 1", "attempt 2", "success 2"]);
+  });
+
+  it("never reconnects after a manual disconnect, even from inside a failed listener", async () => {
+    const { client, peers, events } = setup(true);
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    client.disconnect();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(1);
+
+    await client.connect([42], { slots: 2 });
+    peers[1].state?.("connected");
+    const off = client.on("state-change", (s) => {
+      if (s === "failed") client.disconnect();
+    });
+    peers[1].state?.("failed");
+    off();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(2);
+    expect(events).toEqual([]);
+  });
+
+  it("drops a pending reconnect when the consumer disconnects or connects meanwhile", async () => {
+    const { client, peers, events } = setup(true);
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    peers[0].state?.("failed");
+    client.disconnect();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(1);
+
+    await client.connect([42], { slots: 2 });
+    peers[1].state?.("connected");
+    peers[1].state?.("failed");
+    await client.connect([7], { slots: 2 });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(3);
+    expect(events).toEqual([]);
+  });
+
+  it("leaves a first connection that never came up to the consumer", async () => {
+    const { client, peers, events } = setup(true);
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(1);
+    expect(events).toEqual([]);
+  });
+
+  it("drops the failed peer's streams while rebuilding and restores them on the new peer", async () => {
+    const { client, peers } = setup({ initialDelayMs: 100 });
+    await client.connect([42], { slots: 2 });
+    peers[0].open();
+    const cam = client.camera(42);
+    const sources: boolean[] = [];
+    cam.on("source", (s) => sources.push(s));
+    peers[0].message(JSON.stringify({ type: "slot-map", content: { mid: "0", flightId: 42 } }));
+    peers[0].track?.({} as MediaStreamTrack, 0, "0");
+    peers[0].state?.("connected");
+    expect(cam.hasSource).toBe(true);
+
+    peers[0].state?.("failed");
+    expect(cam.hasSource).toBe(false);
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    peers[1].open();
+    peers[1].message(JSON.stringify({ type: "slot-map", content: { mid: "0", flightId: 42 } }));
+    peers[1].track?.({} as MediaStreamTrack, 0, "0");
+    peers[1].state?.("connected");
+    expect(cam.hasSource).toBe(true);
+    expect(sources).toEqual([true, false, true]);
+  });
+
+  it("goes from failed to connecting on each attempt, never through disconnected", async () => {
+    const { client, peers } = setup({ initialDelayMs: 100 });
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    const states: KerbcastConnectionState[] = [];
+    client.on("state-change", (st) => states.push(st));
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    peers[1].state?.("connected");
+    expect(states).toEqual(["failed", "connecting", "connected"]);
+  });
+
+  it("gives way to a disconnect or connect made inside a reconnect-attempt listener", async () => {
+    const { client, peers, offers } = setup({ initialDelayMs: 100 });
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    const off = client.on("reconnect-attempt", () => client.disconnect());
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    off();
+    expect(peers).toHaveLength(1);
+    expect(client.state).toBe("disconnected");
+
+    await client.connect([42], { slots: 2 });
+    peers[1].state?.("connected");
+    const off2 = client.on("reconnect-attempt", () => {
+      void client.connect([7], { slots: 2 });
+    });
+    peers[1].state?.("failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    off2();
+    expect(peers).toHaveLength(3);
+    expect(offers.at(-1)?.cameras).toEqual([7]);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(peers).toHaveLength(3);
+  });
+
+  it("counts an attempt that does not connect in time as failed and tries again", async () => {
+    const hang = () => new Promise<never>(() => {});
+    let hanging = false;
+    const { client, peers, events } = setup(
+      { initialDelayMs: 100, attemptTimeoutMs: 1000, maxAttempts: 2 },
+      () => false,
+      async (offer) => (hanging ? hang() : { sdp: "v=0\r\n", cameras: offer.cameras, session: "s" }),
+    );
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    hanging = true;
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(peers).toHaveLength(2);
+    expect(client.state).toBe("connecting");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(client.state).toBe("connecting");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.state).toBe("failed");
+    expect(peers[1].closed).toBe(true);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(peers).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(events).toEqual(["attempt 1", "attempt 2", "give-up 2"]);
+    expect(client.state).toBe("failed");
+  });
+
+  it("an attempt that connects in time is not failed by its deadline", async () => {
+    const { client, peers, events } = setup({ initialDelayMs: 100, attemptTimeoutMs: 1000 });
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await flush();
+    peers[1].state?.("connected");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(client.state).toBe("connected");
+    expect(peers[1].closed).toBe(false);
+    expect(events).toEqual(["attempt 1", "success 1"]);
+  });
+
+  it("takes the default for a missing or unusable option field", async () => {
+    const { client, peers, events } = setup({
+      maxAttempts: undefined,
+      initialDelayMs: Number.NaN,
+      maxDelayMs: -5,
+    });
+    await client.connect([42], { slots: 2 });
+    peers[0].state?.("connected");
+    peers[0].state?.("failed");
+    await vi.advanceTimersByTimeAsync(999);
+    expect(peers).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(events).toEqual(["attempt 1"]);
+  });
+});
+
+describe("KerbcastClient: an offer answered after the client moved on", () => {
+  /* Lets a connect run up to its offer exchange. */
+  async function settle() {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  it("does not mark a newer connection failed when an old offer is refused late", async () => {
+    const pending: Array<{ resolve: (a: { sdp: string; cameras: number[] }) => void; reject: (e: Error) => void }> = [];
+    const { transport } = makeFakeTransport();
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: () =>
+          new Promise((resolve, reject) => {
+            pending.push({ resolve, reject });
+          }),
+      },
+      transport,
+    );
+    const first = client.connect([42]);
+    await settle();
+    client.disconnect();
+    const second = client.connect([7]);
+    await settle();
+    pending[1].resolve({ sdp: "v=0\r\n", cameras: [7] });
+    await second;
+    const states: KerbcastConnectionState[] = [];
+    client.on("state-change", (st) => states.push(st));
+    pending[0].reject(new Error("late refusal"));
+    await expect(first).resolves.toBeUndefined();
+    expect(states).toEqual([]);
+    expect(client.state).toBe("connecting");
+  });
+
+  it("does not let a late answer for an old offer overwrite the newer connection", async () => {
+    const pending: Array<(a: { sdp: string; cameras: number[] }) => void> = [];
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: () => new Promise((resolve) => pending.push(resolve)),
+      },
+      transport,
+    );
+    const first = client.connect([42]);
+    await settle();
+    const second = client.connect([7]);
+    await settle();
+    pending[1]({ sdp: "v=0\r\n", cameras: [7] });
+    await second;
+    pending[0]({ sdp: "v=0\r\n", cameras: [99] });
+    await first;
+    /* Legacy routing follows the newer answer: the first track is camera 7's. */
+    captured.onTrack?.({ kind: "video" } as MediaStreamTrack, 0, "0");
+    expect(client.camera(7).hasSource).toBe(true);
+    expect(client.camera(99).hasSource).toBe(false);
+  });
+});
+
+describe("KerbcastClient: withdrawing a display size", () => {
+  it("forgets a withdrawn size, so a new connection does not send it again", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(fakeAnswer([42])));
+    await client.connect([42]);
+    captured.dc?._open();
+    await client.reportDisplaySize(42, 640, 360);
+    await client.reportDisplaySize(42, 0, 0);
+    await client.connect([42]);
+    captured.dc?._open();
+    captured.dc?._msg(JSON.stringify({ type: "hello", content: { sidecarVersion: "1.12.0", encoderBackend: "x" } }));
+    captured.dc?._msg(JSON.stringify({ type: "camera-snapshot", content: { cameras: [fakeCameraState(42)] } }));
+    const sizes = (captured.dc?.sent ?? []).map((m) => JSON.parse(m)).filter((m) => m.type === "report-display-size");
+    expect(sizes).toEqual([]);
   });
 });

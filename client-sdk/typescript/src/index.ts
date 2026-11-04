@@ -15,6 +15,8 @@ export {
   CONTROL_OPEN_TIMEOUT_MS,
   CONTACT_GAP_MS,
   type ContactGap,
+  type AutoReconnectOptions,
+  type ReconnectProgress,
   type CreateCommandCameraOptions,
   type BrowserKerbcastTransportOptions,
   type InboundVideoStats,

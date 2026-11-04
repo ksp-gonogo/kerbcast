@@ -1043,6 +1043,85 @@ describe("CameraFeed - stall presentation (showStatic)", () => {
     }
   });
 
+  it("data-kc-signal reads none while an auto-reconnect rebuilds the peer, then stalled, then live", async () => {
+    const env = installStallEnv();
+    try {
+      const sidecar = new MockSidecar();
+      sidecar.addCamera(toInit(makeCamera({ flightId: 42, cameraName: "Starboard Cam" })));
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), autoReconnect: { initialDelayMs: 1 } },
+        sidecar.createTransport(),
+      );
+      createdClients.push(client);
+      await act(async () => {
+        await client.connect([], { slots: 4 });
+      });
+      await act(async () => {
+        sidecar.open();
+        sidecar.setConnectionState("connected");
+      });
+      const { container } = renderFeed(client, { flightId: 42 });
+      const signal = () => container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+
+      const reconnected = new Promise<void>((resolve) => {
+        const off = client.on("reconnect-attempt", () => {
+          off();
+          resolve();
+        });
+      });
+      await act(async () => {
+        sidecar.setConnectionState("failed");
+      });
+      expect(signal()).toBe("none");
+      await act(async () => {
+        await reconnected;
+      });
+      expect(signal()).toBe("none");
+
+      /* The mock outlives the peer, so the re-subscribe binds a slot of its own. */
+      let reboundMid: string | undefined;
+      sidecar.onSubscribe((flightId, mid) => {
+        if (flightId === 42) reboundMid = mid;
+      });
+      await act(async () => {
+        sidecar.open();
+        sidecar.setConnectionState("connected");
+      });
+      expect(signal()).toBe("none");
+      await act(async () => {
+        sidecar.deliverTrack(reboundMid as string, {} as MediaStreamTrack);
+      });
+      env.setNow(2000);
+      await act(async () => {
+        env.drawOnce();
+      });
+      /* A fresh source with no frame yet never reads live. */
+      expect(signal()).toBe("stalled");
+      env.setNow(2601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+    } finally {
+      env.restore();
+    }
+  });
+
   it("data-kc-signal reads stalled for a source that never delivers a frame", async () => {
     const env = installStallEnv();
     try {
@@ -1848,7 +1927,8 @@ describe("CameraFeed - render size in a narrow, tall tile", () => {
     const { client, sidecar } = await connect();
     renderFeed(client, { flightId: 42 });
     await run(500);
-    expect(sizeReports(sidecar)).toEqual([{ flightId: 42, width: 176, height: 100 }]);
+    /* 176x99 at 16:9, raised so the height meets the floor. */
+    expect(sizeReports(sidecar)).toEqual([{ flightId: 42, width: 240, height: 136 }]);
   });
 
   it("sends no request when the stream comes back smaller, larger or another shape", async () => {

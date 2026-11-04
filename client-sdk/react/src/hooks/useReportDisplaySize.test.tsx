@@ -11,7 +11,7 @@ import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KerbcastProvider, type KerbcastDisplaySizes } from "../context";
-import { displayReportSize, useReportDisplaySize } from "./useReportDisplaySize";
+import { displayReportSize, MIN_DISPLAY_REPORT_PX, useReportDisplaySize } from "./useReportDisplaySize";
 
 // A controllable ResizeObserver: captures the callback so a test can fire a
 // resize with a chosen contentRect.
@@ -89,16 +89,16 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    // 40x30 -> width ceiled to a 16-multiple (48), height at 16:9 rounded to even (28), reported without advancing timers.
-    fireResize(40, 30);
-    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 28 }]);
+    // 440x330 -> width ceiled to a 16-multiple (448), height at 16:9 rounded to even (252), reported without advancing timers.
+    fireResize(440, 330);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 448, h: 252 }]);
   });
 
   it("asks for the 16:9 picture that fits the box, never the box's shape", () => {
     expect(displayReportSize(1024, 576)).toEqual({ width: 1024, height: 576 });
     expect(displayReportSize(441, 246)).toEqual({ width: 448, height: 252 });
-    // A narrow, tall tile is limited by its width.
-    expect(displayReportSize(170, 400)).toEqual({ width: 176, height: 100 });
+    // A narrow, tall tile is limited by its width, then raised so the height meets the floor.
+    expect(displayReportSize(170, 400)).toEqual({ width: 240, height: 136 });
     // A wide, short one by its height: the letterboxed picture is ~356x200.
     expect(displayReportSize(800, 200)).toEqual({ width: 368, height: 208 });
   });
@@ -110,9 +110,9 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} square />
       </KerbcastProvider>,
     );
-    // min(50,40)=40 -> 48x48 square.
-    fireResize(50, 40);
-    expect(reports.at(-1)).toMatchObject({ w: 48, h: 48 });
+    // min(250,200)=200 -> 208x208 square.
+    fireResize(250, 200);
+    expect(reports.at(-1)).toMatchObject({ w: 208, h: 208 });
   });
 
   it("debounces churn after the first report", () => {
@@ -122,12 +122,12 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    fireResize(48, 48); // prompt first -> 48x28
-    fireResize(200, 200); // debounced, not yet applied
+    fireResize(300, 300); // prompt first -> 304x172
+    fireResize(600, 600); // debounced, not yet applied
     expect(reports).toHaveLength(1);
     act(() => vi.advanceTimersByTime(200));
-    // 200 -> 208 wide at 16:9; the debounced resize now lands.
-    expect(reports.at(-1)).toMatchObject({ w: 208, h: 118 });
+    // 600 -> 608 wide at 16:9; the debounced resize now lands.
+    expect(reports.at(-1)).toMatchObject({ w: 608, h: 342 });
   });
 
   it("does not re-report a sub-bucket change", () => {
@@ -137,8 +137,8 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    fireResize(40, 40); // -> 48x28
-    fireResize(44, 44); // still ceils to 48x28 -> no new report
+    fireResize(290, 290); // -> 304x172
+    fireResize(300, 300); // still ceils to 304x172 -> no new report
     act(() => vi.advanceTimersByTime(200));
     expect(reports).toHaveLength(1);
   });
@@ -150,7 +150,7 @@ describe("useReportDisplaySize", () => {
         <Harness flightId={7} />
       </KerbcastProvider>,
     );
-    fireResize(40, 40);
+    fireResize(400, 400);
     const id = reports[0].id;
     act(() => unmount());
     expect(clears).toEqual([{ flightId: 7, id }]);
@@ -189,7 +189,74 @@ describe("useReportDisplaySize", () => {
     const { rerender } = render(view(false));
     expect(resizeCallback).toBeUndefined();
     rerender(view(true));
-    fireResize(40, 30);
-    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 48, h: 28 }]);
+    fireResize(440, 330);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 448, h: 252 }]);
+  });
+
+  it("never asks for less than the floor on either axis", () => {
+    for (const [w, h] of [[16, 10], [1, 1], [140, 130], [130, 2000], [4000, 130]]) {
+      const size = displayReportSize(w, h);
+      expect(size.width).toBeGreaterThanOrEqual(MIN_DISPLAY_REPORT_PX);
+      expect(size.height).toBeGreaterThanOrEqual(MIN_DISPLAY_REPORT_PX);
+    }
+    // A tall camera is held to the floor by its width.
+    expect(displayReportSize(16, 10, 9 / 16)).toEqual({ width: 128, height: 228 });
+  });
+
+  it("reports nothing for an empty box, then reports the first laid out box promptly", () => {
+    const { displaySizes, reports, clears } = recordingRegistry();
+    render(
+      <KerbcastProvider client={fakeClient} displaySizes={displaySizes}>
+        <Harness flightId={7} />
+      </KerbcastProvider>,
+    );
+    fireResize(0, 0);
+    fireResize(400, 1);
+    act(() => vi.advanceTimersByTime(1000));
+    expect(reports).toEqual([]);
+    expect(clears).toEqual([]);
+    fireResize(440, 330);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 448, h: 252 }]);
+  });
+
+  it("withdraws its size when the box empties, and reports again when it is laid out again", () => {
+    const { displaySizes, reports, clears } = recordingRegistry();
+    render(
+      <KerbcastProvider client={fakeClient} displaySizes={displaySizes}>
+        <Harness flightId={7} />
+      </KerbcastProvider>,
+    );
+    fireResize(440, 330);
+    const id = reports[0].id;
+    fireResize(0, 0);
+    act(() => vi.advanceTimersByTime(200));
+    expect(clears).toEqual([{ flightId: 7, id }]);
+    expect(reports).toHaveLength(1);
+    fireResize(440, 330);
+    act(() => vi.advanceTimersByTime(200));
+    expect(reports).toHaveLength(2);
+    expect(reports.at(-1)).toMatchObject({ w: 448, h: 252 });
+  });
+
+  it("raises a small box's request to the floor", () => {
+    const { displaySizes, reports } = recordingRegistry();
+    render(
+      <KerbcastProvider client={fakeClient} displaySizes={displaySizes}>
+        <Harness flightId={7} />
+      </KerbcastProvider>,
+    );
+    fireResize(18, 10);
+    expect(reports).toEqual([{ flightId: 7, id: expect.any(String), w: 240, h: 136 }]);
+  });
+
+  it("raises a small square box's request to the floor", () => {
+    const { displaySizes, reports } = recordingRegistry();
+    render(
+      <KerbcastProvider client={fakeClient} displaySizes={displaySizes}>
+        <Harness flightId={7} square />
+      </KerbcastProvider>,
+    );
+    fireResize(50, 40);
+    expect(reports.at(-1)).toMatchObject({ w: 128, h: 128 });
   });
 });
