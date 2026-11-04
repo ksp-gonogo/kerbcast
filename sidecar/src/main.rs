@@ -477,6 +477,7 @@ async fn consume_loop(
             registry.forget_anchors_all(peer.peer_id).await;
         }
         registry.expire_departed(Instant::now()).await;
+        registry.settle_render_shrinks(Instant::now()).await;
 
         let cameras = registry.snapshot().await;
         let mut any_active = false;

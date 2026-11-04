@@ -772,6 +772,8 @@ pub struct CameraState {
     /// Pending forced-IDR request and when this camera last produced one,
     /// consumed by the encode path.
     pub keyframe_gate: std::sync::Mutex<KeyframeGate>,
+    /// Holds back a falling render size; see `ShrinkDelay`.
+    pub shrink_delay: std::sync::Mutex<ShrinkDelay>,
     /// One `VideoTrack` per subscribed peer-track. Weak refs so
     /// dropped peers get GC'd from this list naturally — no manual unsub
     /// bookkeeping per peer needed.
@@ -1302,6 +1304,57 @@ impl KeyframeGate {
     }
 }
 
+/// How long a lower render size must stay wanted before the camera shrinks to
+/// it. Every size change restarts the camera's one encoder for all its viewers,
+/// so a viewer flicking a tile to another feed and back must not cost the
+/// others two restarts. A rise still applies at once.
+pub const SHRINK_HOLD: Duration = Duration::from_secs(10);
+
+/**
+ * Delays a camera's render size shrinking until the lower demand has held for
+ * `SHRINK_HOLD`. Tracks the size last written for the plugin; a size that is
+ * no bigger on either side (or no demand at all) starts the clock, and a
+ * return to the written size or above stops it, so a brief dip never reaches
+ * the encoder.
+ */
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ShrinkDelay {
+    applied: Option<(u32, u32)>,
+    lower_since: Option<Instant>,
+}
+
+impl ShrinkDelay {
+    /// The size to write for `target` at `now`. `immediate` applies a shrink
+    /// at once, for an explicit choice such as the operator's manual cap.
+    pub fn settle(
+        &mut self,
+        target: Option<(u32, u32)>,
+        now: Instant,
+        immediate: bool,
+    ) -> Option<(u32, u32)> {
+        let lowers = match (self.applied, target) {
+            (Some((aw, ah)), Some((tw, th))) => tw <= aw && th <= ah && (tw, th) != (aw, ah),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if lowers && !immediate {
+            let since = *self.lower_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < SHRINK_HOLD {
+                return self.applied;
+            }
+        }
+        self.applied = target;
+        self.lower_since = None;
+        target
+    }
+
+    /// Whether a held shrink is due at `now`.
+    pub fn due(&self, now: Instant) -> bool {
+        self.lower_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= SHRINK_HOLD)
+    }
+}
+
 /* The configured capture size fixes a feed's shape; viewers only scale or crop
 it. Demand becomes the smallest picture at the max_width:max_height aspect
 that covers the requested box, so a viewer that crops still gets enough
@@ -1819,13 +1872,14 @@ impl CameraRegistry {
             still connected and will not ask again, so what they asked of it
             carries over. Their departure clears it from the new entry as it
             would have from the old. A destroyed camera coming back is new. */
-            let (display_sizes, forced_full_res, size_holds, manual_render_cap) =
+            let (display_sizes, forced_full_res, size_holds, manual_render_cap, shrink_delay) =
                 match cameras.get(id) {
                     Some(old) if !old.destroyed.load(Ordering::Acquire) => (
                         old.display_sizes.lock().await.clone(),
                         old.forced_full_res.lock().await.clone(),
                         old.size_holds.lock().await.clone(),
                         *old.manual_render_cap.lock().await,
+                        *old.shrink_delay.lock().unwrap_or_else(|e| e.into_inner()),
                     ),
                     _ => Default::default(),
                 };
@@ -1900,6 +1954,7 @@ impl CameraRegistry {
                             subscribers: AtomicUsize::new(0),
                             ramping: AtomicBool::new(false),
                             keyframe_gate: std::sync::Mutex::new(KeyframeGate::default()),
+                            shrink_delay: std::sync::Mutex::new(shrink_delay),
                             tracks: RwLock::new(Vec::new()),
                             display_sizes: Mutex::new(display_sizes),
                             manual_render_cap: Mutex::new(manual_render_cap),
@@ -2836,11 +2891,50 @@ impl CameraRegistry {
 
     /// Called after any display-size report, forget, or manual-cap change. The
     /// plugin's adaptive-shed min() still rides underneath on the game side.
+    /// A fall in demand waits out `SHRINK_HOLD` first.
     pub async fn flush_effective_render_size(&self, flight_id: u32) -> std::io::Result<()> {
+        self.flush_render_size_at(flight_id, Instant::now(), false)
+            .await
+    }
+
+    /// Applies every held shrink whose `SHRINK_HOLD` has run out. Called from
+    /// the consume loop's tick, since nothing else may arrive to apply it.
+    pub async fn settle_render_shrinks(&self, now: Instant) {
+        let due: Vec<u32> = self
+            .cameras
+            .read()
+            .await
+            .iter()
+            .filter(|(_, cam)| {
+                cam.shrink_delay
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .due(now)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for flight_id in due {
+            if let Err(e) = self.flush_render_size_at(flight_id, now, false).await {
+                warn!(flight_id, error = %e, "held shrink flush failed");
+            }
+        }
+    }
+
+    async fn flush_render_size_at(
+        &self,
+        flight_id: u32,
+        now: Instant,
+        immediate: bool,
+    ) -> std::io::Result<()> {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(()); // camera gone this tick — nothing to flush
         };
-        let eff = cam.effective_render_size().await;
+        let target = cam.effective_render_size().await;
+        let eff = cam
+            .shrink_delay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settle(target, now, immediate);
         /* Demand drives the capture RATE as well as the size: a subscribed
         camera nobody is displaying runs background capture instead of running at full rate.
         Recomputed here because this is exactly the path every display-size
@@ -3094,7 +3188,8 @@ impl CameraRegistry {
     }
 
     /// Operator `SetRenderSize`: set (or clear) the manual cap and reflush the
-    /// effective size (min(auto, cap)).
+    /// effective size (min(auto, cap)). The player chose this size, so it
+    /// applies at once, past `SHRINK_HOLD`.
     pub async fn set_manual_render_size(
         &self,
         flight_id: u32,
@@ -3104,7 +3199,8 @@ impl CameraRegistry {
             Some(cam) => cam.set_manual_render_cap(cap).await,
             None => return Ok(()),
         }
-        self.flush_effective_render_size(flight_id).await
+        self.flush_render_size_at(flight_id, Instant::now(), true)
+            .await
     }
 
     /// Flag a camera for a state broadcast on the consume loop's next tick.
@@ -6542,5 +6638,156 @@ mod tests {
         assert_eq!(v["displaySize"]["width"], 320);
         assert_eq!(v["displaySize"]["height"], 180);
         assert!(v["displaySize"]["ageMs"].is_number());
+    }
+
+    async fn registry_with_hd_camera(
+        dir: &tempfile::TempDir,
+    ) -> (CameraRegistry, Arc<CameraState>) {
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 1280,
+            max_height: 720,
+        };
+        MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(1).await.expect("camera attached from ring");
+        (registry, cam)
+    }
+
+    async fn written_size(cam: &CameraState) -> Option<(u32, u32)> {
+        let ctrl = cam.control.lock().await;
+        ctrl.width.zip(ctrl.height)
+    }
+
+    /// A viewer going bigger gets the size on the same flush.
+    #[tokio::test]
+    async fn render_size_grows_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 320, 180).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((320, 180)));
+
+        cam.record_display_size(2, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
+    }
+
+    /// The bigger viewer switching away keeps its size for `SHRINK_HOLD`,
+    /// then the camera shrinks on the tick that finds the hold run out.
+    #[tokio::test]
+    async fn render_size_shrinks_after_the_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 320, 180).await;
+        cam.record_display_size(2, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        cam.forget_display_size(2).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((640, 360)), "held");
+
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD / 2).await;
+        assert_eq!(written_size(&cam).await, Some((640, 360)), "still held");
+
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD).await;
+        assert_eq!(written_size(&cam).await, Some((320, 180)), "hold over");
+    }
+
+    /// A smaller report and a withdrawn report hold the same way, and demand
+    /// coming back inside the hold leaves the size untouched with no shrink
+    /// left pending.
+    #[tokio::test]
+    async fn render_shrink_is_cancelled_when_demand_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 434, 244).await;
+        cam.record_display_size(2, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        cam.record_display_size(2, 0, 0).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        cam.record_display_size(2, 640, 360).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(2), false)
+            .await
+            .unwrap();
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
+
+        cam.record_display_size(2, 500, 280).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(3), false)
+            .await
+            .unwrap();
+        cam.record_display_size(2, 640, 360).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(5), false)
+            .await
+            .unwrap();
+
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD * 3).await;
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert!(!cam.shrink_delay.lock().unwrap().due(t0 + SHRINK_HOLD * 3));
+    }
+
+    /// The last viewer leaving holds its size too, so a quick return costs
+    /// no restart; after the hold the camera goes back to the plugin default.
+    #[tokio::test]
+    async fn last_viewer_leaving_holds_then_releases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        cam.forget_display_size(1).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
+
+        cam.record_display_size(1, 640, 360).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(4), false)
+            .await
+            .unwrap();
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
+
+        cam.forget_display_size(1).await;
+        let left = t0 + Duration::from_secs(6);
+        registry.flush_render_size_at(1, left, false).await.unwrap();
+        registry.settle_render_shrinks(left + SHRINK_HOLD).await;
+        assert_eq!(written_size(&cam).await, None);
+    }
+
+    /// The operator's manual cap is an explicit choice and applies at once;
+    /// a force grows at once and its release waits like any fall in demand.
+    #[tokio::test]
+    async fn manual_cap_skips_the_hold_and_force_follows_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        registry
+            .set_manual_render_size(1, Some((320, 180)))
+            .await
+            .unwrap();
+        assert_eq!(written_size(&cam).await, Some((320, 180)));
+        registry.set_manual_render_size(1, None).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
+
+        cam.set_forced(9, true).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((1280, 720)));
+
+        cam.set_forced(9, false).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((1280, 720)));
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD).await;
+        assert_eq!(written_size(&cam).await, Some((640, 360)));
     }
 }
