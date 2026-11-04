@@ -54,6 +54,7 @@ use super::video_track::VideoTrack;
 
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
+use crate::link::{LinkMonitor, LinkWindow, SlotCounters, LINK_WINDOW};
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ConfirmSlotsPayload,
     DestroyCommandCameraPayload, ErrorCode, ErrorPayload, ErrorSource, FlightIdPayload,
@@ -271,7 +272,11 @@ pub struct KerbcastPeer {
     /// daemon polls `is_alive()` each consume tick and reaps what it reports
     /// dead.
     liveness: LivenessHandle,
+    /// This viewer's connection quality, sampled every `LINK_WINDOW`.
+    link: SharedLink,
 }
+
+type SharedLink = Arc<StdMutex<LinkMonitor>>;
 
 impl KerbcastPeer {
     /// Build a peer with a pool of `slot_count` pre-negotiated H.264 video
@@ -397,6 +402,7 @@ impl KerbcastPeer {
         }
 
         let slots = Arc::new(Mutex::new(slots));
+        let link: SharedLink = Arc::new(StdMutex::new(LinkMonitor::new()));
 
         // Spawn the per-slot RTCP drains now that the slot pool is shared. Each
         // drain pumps its sender's RTCP (driving the NACK responder) and honors
@@ -405,8 +411,9 @@ impl KerbcastPeer {
         for (slot_idx, sender) in senders.into_iter().enumerate() {
             let slots = slots.clone();
             let registry = registry.clone();
+            let link = link.clone();
             tokio::spawn(async move {
-                drain_rtcp_sink(sender, slot_idx, slots, registry).await;
+                drain_rtcp_sink(sender, slot_idx, slots, registry, link).await;
             });
         }
 
@@ -482,6 +489,14 @@ impl KerbcastPeer {
             })
         }));
 
+        tokio::spawn(sample_link(
+            Arc::downgrade(&pc),
+            peer_id,
+            liveness.clone(),
+            slots.clone(),
+            link.clone(),
+        ));
+
         Ok(Self {
             pc,
             peer_id,
@@ -494,6 +509,7 @@ impl KerbcastPeer {
             outbox,
             connected,
             liveness,
+            link,
         })
     }
 
@@ -738,8 +754,9 @@ impl KerbcastPeer {
             let sender = transceiver.sender().await;
             let pool = self.slots.clone();
             let registry = self.registry.clone();
+            let link = self.link.clone();
             tokio::spawn(async move {
-                drain_rtcp_sink(sender, slot_idx, pool, registry).await;
+                drain_rtcp_sink(sender, slot_idx, pool, registry, link).await;
             });
         }
         info!(
@@ -836,6 +853,12 @@ impl KerbcastPeer {
      */
     pub fn push_message(&self, msg: &ServerMessage) {
         self.outbox.send(msg);
+    }
+
+    /// The last closed window of this viewer's connection quality, `None`
+    /// until two samples have been taken.
+    pub fn link_window(&self) -> Option<LinkWindow> {
+        self.link.lock().unwrap_or_else(|e| e.into_inner()).latest()
     }
 
     /// Block until the peer reaches the Connected state. Used by tests.
@@ -1943,6 +1966,102 @@ fn rtcp_keyframe_request_count(packets: &[Box<dyn rtcp::packet::Packet + Send + 
         .count()
 }
 
+/// The lowest bandwidth estimate among the REMB packets in one RTCP read.
+fn rtcp_remb_bps(packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>]) -> Option<u64> {
+    use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+    packets
+        .iter()
+        .filter_map(|p| p.as_any().downcast_ref::<ReceiverEstimatedMaximumBitrate>())
+        .map(|r| r.bitrate.max(0.0) as u64)
+        .min()
+}
+
+/**
+ * Samples one peer's outbound stream stats every `LINK_WINDOW` into its link
+ * monitor, until the peer dies. Holds the connection weakly so it never keeps
+ * a reaped peer alive.
+ */
+async fn sample_link(
+    pc: std::sync::Weak<RTCPeerConnection>,
+    peer_id: u32,
+    liveness: LivenessHandle,
+    slots: Arc<Mutex<Vec<Slot>>>,
+    link: SharedLink,
+) {
+    /* One summary line per this many windows keeps a rig pass's log readable
+    while still showing how each viewer's link moved. */
+    const SUMMARY_EVERY: u32 = 15;
+    let mut ticker = tokio::time::interval(LINK_WINDOW);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut windows = 0u32;
+    loop {
+        ticker.tick().await;
+        if !liveness.is_alive(Instant::now()) {
+            return;
+        }
+        let Some(pc) = pc.upgrade() else { return };
+        let report = pc.get_stats().await;
+        drop(pc);
+        let counters = slot_counters(&report);
+        let window = link
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(std::time::Instant::now(), &counters);
+        let Some(w) = window else { continue };
+        if w.packets_sent == 0 {
+            continue;
+        }
+        tracing::debug!(peer_id, window = ?w, "viewer link window");
+        windows += 1;
+        if windows % SUMMARY_EVERY == 1 {
+            let cameras: Vec<u32> = slots.lock().await.iter().filter_map(|s| s.bound).collect();
+            info!(
+                peer_id,
+                ?cameras,
+                send_kbps = w.send_bps / 1000,
+                loss_pct = format!("{:.1}", w.loss * 100.0),
+                rtt_ms = w.rtt_ms.map(|r| r.round() as u64),
+                min_rtt_ms = w.min_rtt_ms.map(|r| r.round() as u64),
+                nacks_per_s = format!("{:.1}", w.nacks_per_s),
+                plis_per_s = format!("{:.2}", w.plis_per_s),
+                remb_kbps = w.remb_bps.map(|b| b / 1000),
+                "viewer link"
+            );
+        }
+    }
+}
+
+/// Each video slot's cumulative counters from a `get_stats` report, joining
+/// the outbound stream to the browser's receiver report for it.
+fn slot_counters(report: &webrtc::stats::StatsReport) -> Vec<SlotCounters> {
+    use webrtc::stats::StatsReportType;
+    let mut remote = std::collections::HashMap::new();
+    for stat in report.reports.values() {
+        if let StatsReportType::RemoteInboundRTP(r) = stat {
+            remote.insert(r.ssrc, (r.packets_lost, r.round_trip_time));
+        }
+    }
+    report
+        .reports
+        .values()
+        .filter_map(|stat| match stat {
+            StatsReportType::OutboundRTP(o) if o.kind == "video" => {
+                let (lost, rtt) = remote.get(&o.ssrc).copied().unwrap_or((0, None));
+                Some(SlotCounters {
+                    ssrc: o.ssrc,
+                    packets_sent: o.packets_sent,
+                    bytes_sent: o.bytes_sent,
+                    nacks: o.nack_count,
+                    plis: o.pli_count.unwrap_or(0),
+                    remote_lost: lost,
+                    rtt_ms: rtt,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Per-slot RTCP drain. webrtc-rs's NACK/PLI pipelines stall silently if a
 /// sender's RTCP isn't read, so every slot-track's sender must be drained for
 /// the connection's lifetime regardless of which camera (if any) currently
@@ -1958,23 +2077,28 @@ fn rtcp_keyframe_request_count(packets: &[Box<dyn rtcp::packet::Packet + Send + 
 /// that spikes the bitrate into more loss. The NACK responder recovers most
 /// losses with no PLI at all, so this rarely fires.
 ///
-/// REMB is still deliberately NOT consumed. In the slot model a slot's camera
-/// changes on Subscribe/Unsubscribe, so a REMB keyed by the slot's (stable)
-/// SSRC can't be pinned to one camera. That's acceptable *only* because
-/// REMB-driven bitrate is currently disabled (it caused a reinit death spiral
-/// — see `main.rs`). The frame-skip congestion follow-up must re-introduce
-/// per-slot bandwidth attribution before it can act on REMB again. A PLI is
+/// A REMB is recorded against the whole peer, never a camera: it estimates the
+/// viewer's link, which every slot shares. It never drives an encoder (REMB
+/// driven reinits caused a death spiral, see `main.rs`). A PLI is
 /// instantaneous, so it pins to the slot's *current* binding cleanly (a stale
-/// rebind just costs one wasted IDR), unlike REMB's running bitrate estimate.
+/// rebind just costs one wasted IDR).
 async fn drain_rtcp_sink(
     sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
     slot_idx: usize,
     slots: Arc<Mutex<Vec<Slot>>>,
     registry: Arc<CameraRegistry>,
+    link: SharedLink,
 ) {
     while let Ok((packets, _)) = sender.read_rtcp().await {
-        // REMB and other RTCP intentionally discarded — see fn doc. Only a
-        // keyframe request is acted on.
+        if let Some(bps) = rtcp_remb_bps(&packets) {
+            let first = link
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_remb(std::time::Instant::now(), bps);
+            if first {
+                info!(slot_idx, remb_bps = bps, "viewer sends REMB");
+            }
+        }
         let requests = rtcp_keyframe_request_count(&packets);
         if requests == 0 {
             continue;
@@ -2619,6 +2743,27 @@ mod tests {
 
     /// Every PLI/FIR in a batch counts toward the camera's received-request
     /// counter; routine RTCP does not.
+    #[test]
+    fn remb_reads_the_lowest_estimate_in_a_read() {
+        use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+        use rtcp::receiver_report::ReceiverReport;
+        let remb = |bitrate: f32| -> Box<dyn rtcp::packet::Packet + Send + Sync> {
+            Box::new(ReceiverEstimatedMaximumBitrate {
+                bitrate,
+                ..Default::default()
+            })
+        };
+        let pkts = vec![
+            remb(900_000.0),
+            Box::new(ReceiverReport::default()),
+            remb(400_000.0),
+        ];
+        assert_eq!(rtcp_remb_bps(&pkts), Some(400_000));
+        let none: Vec<Box<dyn rtcp::packet::Packet + Send + Sync>> =
+            vec![Box::new(ReceiverReport::default())];
+        assert_eq!(rtcp_remb_bps(&none), None);
+    }
+
     #[test]
     fn keyframe_requests_are_counted_per_packet() {
         use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;

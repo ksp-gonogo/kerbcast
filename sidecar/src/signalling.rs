@@ -110,6 +110,21 @@ pub struct CamerasResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct LinksResponse {
+    pub peers: Vec<PeerLink>,
+}
+
+/// One viewer's connection quality, for diagnosing a slow viewer remotely.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerLink {
+    pub peer_id: u32,
+    pub cameras: Vec<u32>,
+    /// `None` until the peer has been sampled twice.
+    pub link: Option<crate::link::LinkWindow>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DumpLogsResponse {
     pub entries: Vec<StatusLogEntry>,
 }
@@ -120,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/mediabunny.min.mjs", get(serve_mediabunny))
         .route("/health", get(health))
         .route("/cameras", get(cameras))
+        .route("/links", get(links))
         .route("/offer", post(offer))
         .route("/renegotiate", post(renegotiate))
         .route("/dumpLogs", get(dump_logs))
@@ -161,6 +177,19 @@ async fn serve_mediabunny() -> impl IntoResponse {
 async fn cameras(State(state): State<AppState>) -> impl IntoResponse {
     let list = state.registry.list().await;
     (StatusCode::OK, Json(CamerasResponse { cameras: list })).into_response()
+}
+
+async fn links(State(state): State<AppState>) -> impl IntoResponse {
+    let peers: Vec<Arc<KerbcastPeer>> = state.peers.read().await.clone();
+    let mut out = Vec::with_capacity(peers.len());
+    for peer in peers.iter().filter(|p| p.is_alive()) {
+        out.push(PeerLink {
+            peer_id: peer.peer_id,
+            cameras: peer.bound_flight_ids().await,
+            link: peer.link_window(),
+        });
+    }
+    (StatusCode::OK, Json(LinksResponse { peers: out })).into_response()
 }
 
 /// Serves the plugin's latest `global.status.json` (the per-phase render/
