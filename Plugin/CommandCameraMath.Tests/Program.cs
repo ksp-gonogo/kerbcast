@@ -1519,5 +1519,21 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(h.Step(TruthAimPlace.NoFix, false) == TruthAimPlace.NoFix, "and a loss after it has nothing drawn to keep");
 }
 
+// OccludedSince: the raw edge's UT, held while occluded, NaN once clear.
+{
+    double since = double.NaN;
+    since = CommandCameraMath.OccludedSince(false, since, 100);
+    Check(double.IsNaN(since), "not occluded has no since time");
+    since = CommandCameraMath.OccludedSince(true, since, 200);
+    Check(since == 200, "the solve that turns occlusion on stamps its UT");
+    since = CommandCameraMath.OccludedSince(true, since, 260);
+    Check(since == 200, "later occluded solves keep the first UT, whatever blocks the view now");
+    since = CommandCameraMath.OccludedSince(false, since, 300);
+    Check(double.IsNaN(since), "clearing forgets it, with no hold");
+    since = CommandCameraMath.OccludedSince(true, since, 301);
+    Check(since == 301, "a fresh occlusion stamps a fresh UT");
+    Check(CommandCameraMath.OccludedSince(true, double.NaN, 0) == 0, "UT 0 is a real time, distinct from not occluded");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

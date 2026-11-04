@@ -405,6 +405,12 @@ namespace Kerbcast
                 Position = new Vec3d(pos.x, pos.y, pos.z),
                 TrackMode = (TrackMode)c.GetTrackMode(),
             };
+            if (c.Rig is CommandCameraRig gr && gr.Occluded)
+            {
+                view.Occluded = true;
+                view.OccludedSinceUt = gr.OccludedSinceUt;
+                view.Occluder = string.IsNullOrEmpty(gr.Blocker) ? null : gr.Blocker;
+            }
             ReadDocking(part, view);
             return view;
         }

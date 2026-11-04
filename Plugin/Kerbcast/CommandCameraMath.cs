@@ -907,6 +907,10 @@ namespace Kerbcast
             return null;
         }
 
+        /* The UT the view's target became occluded, carried from `since` while it stays occluded (whatever now blocks it), NaN while it is not. */
+        public static double OccludedSince(bool occluded, double since, double ut) =>
+            !occluded ? double.NaN : double.IsNaN(since) ? ut : since;
+
         /*
          * Unit vector `azimuthDeg` clockwise from north and `elevationDeg` above
          * the horizon, at a point whose up is `up`. `north` and `east` only need

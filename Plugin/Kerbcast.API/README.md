@@ -28,6 +28,7 @@ if (kerbcast != null && KerbcastApi.Supports(ApiFeature.CraftIdentity))
 - `ICameras` and `ICommand` are main thread only; every member throws `InvalidOperationException` on another thread
 - `IWorldModelPublisher` is safe on any thread
 - `ICameras` controls part cameras. `View` also shows command feeds (`Kind == CameraKind.Command`), which only `ICommand` controls
+- A command feed's view says whether its target is occluded (`Occluded`), since when in game time (`OccludedSinceUt`, NaN while clear) and by what (`Occluder`, a body's name). It is the raw reading with no smoothing, so ease it yourself. Part cameras always read as clear. Added in 1.2
 - `KerbcastApi.Identity` reports merges, splits, destructions, recoveries and renumbers. A subscription lasts for the whole process, whatever the scene and whether or not `Instance` is set
 - `ICameras.TryVessel` and `TryPersistentId` translate between a craft's persistentId and Vessel.id, even after KSP has dropped the craft
 - `KerbcastApi.LockLost` says when the command lock left its holder without a `ReleaseLock`: the scene is ending, or the player released it in game. Take the lock again once the next scene starts; the dying scene refuses a take from the handler. Like `Identity`, a subscription lasts for the whole process
@@ -35,7 +36,7 @@ if (kerbcast != null && KerbcastApi.Supports(ApiFeature.CraftIdentity))
 - `TakeLock`, `SetAim` and `Publish` return `NotRunning` when Kerbcast is not running in the scene, as through an object kept from an earlier one
 - Every result enum (`LockResult`, `AimResult`, `PublishResult`) has `Unknown = 0`, which Kerbcast never returns, so a result nobody set never reads as success
 - A member whose `ApiFeature` is unsupported still exists and throws `NotSupportedException`. Check `Supports` when you were built against a newer minor than the Kerbcast you run with
-- A member added without its own `ApiFeature` (such as `WorldModelBuilder.Acceleration` in 1.1) is guarded by `KerbcastApi.ApiMinor`, not `Supports`
+- A member added without its own `ApiFeature` (such as `WorldModelBuilder.Acceleration` in 1.1, or `CameraView`'s occlusion in 1.2) is guarded by `KerbcastApi.ApiMinor`, not `Supports`
 - Built against a newer minor, keep each call to a member that minor added in its own `[MethodImpl(MethodImplOptions.NoInlining)]` method too. The JIT resolves every member a method names when it compiles that method, so an older Kerbcast throws `MissingMethodException` even when the call sits behind a `Supports` check that returns false
 
 ## Versioning

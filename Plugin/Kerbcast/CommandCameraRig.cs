@@ -135,6 +135,8 @@ namespace Kerbcast
         public bool HasFix { get; private set; }
         public bool Occluded { get; private set; }
         public string Blocker { get; private set; } = "";
+        /* The UT Occluded last turned on, NaN while it is off. */
+        public double OccludedSinceUt { get; private set; } = double.NaN;
         public double RangeM { get; private set; }
         public double ElevationDeg { get; private set; }
         public uint SubjectPersistentId => _known.SubjectPersistentId;
@@ -548,6 +550,7 @@ namespace Kerbcast
             Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost, _authority?.SilentText);
             UpdateBracket(now);
             NoteGovernance(ut, governed);
+            OccludedSinceUt = CommandCameraMath.OccludedSince(Occluded, OccludedSinceUt, ut);
             _events.Record(new CommandTrackEvent(ut, Occluded, Blocker, Sunlit, Blank));
             return ok;
         }

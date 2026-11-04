@@ -73,6 +73,34 @@ namespace Kerbcast.Api
 
         public TrackMode TrackMode { get; set; }
 
+        /**
+         * <summary>
+         * Whether something stands between a command feed's lens and the point it aims at, as of its last
+         * solve (every rendered frame, and every few seconds otherwise). The raw reading, with no smoothing, so it
+         * may flicker at an edge. A command feed reads what it knows: under a world model, the target where the
+         * model places it. False for a part camera and for a command feed with no target. Added in API 1.2;
+         * check <see cref="KerbcastApi.ApiMinor"/>, since an older Kerbcast leaves it false.
+         * </summary>
+         */
+        public bool Occluded { get; set; }
+
+        /**
+         * <summary>
+         * The game time (UT) the feed's target last became occluded, NaN while <see cref="Occluded"/> is false.
+         * It stays put while one occluder gives way to another. Added in API 1.2.
+         * </summary>
+         */
+        public double OccludedSinceUt { get; set; } = double.NaN;
+
+        /**
+         * <summary>
+         * The name of what blocks the view, null while <see cref="Occluded"/> is false. Today always a celestial
+         * body's name ("Kerbin", "Mun"); a later Kerbcast may name other things, so treat it as display text.
+         * Added in API 1.2.
+         * </summary>
+         */
+        public string Occluder { get; set; }
+
         /** <summary>A copy of this view.</summary> */
         public CameraView Clone() => (CameraView)MemberwiseClone();
     }

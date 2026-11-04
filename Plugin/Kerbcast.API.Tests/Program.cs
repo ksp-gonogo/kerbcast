@@ -35,7 +35,7 @@ var guidB = Guid.NewGuid();
 
 // Entry point with nothing installed.
 Check(KerbcastApi.Instance == null, "Instance is null without Kerbcast");
-Check(KerbcastApi.ApiMinor == 1, "ApiMinor is 1 for API 1.1");
+Check(KerbcastApi.ApiMinor == 2, "ApiMinor is 2 for API 1.2");
 Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(ApiFeature.CraftIdentity)
     && KerbcastApi.Supports(ApiFeature.Throttle) && KerbcastApi.Supports(ApiFeature.CommandFeeds)
     && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
@@ -93,6 +93,19 @@ using (var kc = RecordingKerbcast.Install())
     docked.Fov = 1;
     Check(cams.View(10).Fov == 40, "a view is a copy");
     Check(cams.View(12).Kind == CameraKind.Command && cams.View(99) == null, "View finds command feeds too, marked, and null when unknown");
+    var clear = new CameraView();
+    Check(!clear.Occluded && double.IsNaN(clear.OccludedSinceUt) && clear.Occluder == null,
+        "a view nobody filled reads as not occluded, with no since time and no occluder");
+    kc.Cameras.Add(new CameraView
+    {
+        FlightId = 12, Kind = CameraKind.Command, VesselPersistentId = 42, VesselId = guidA,
+        Occluded = true, OccludedSinceUt = 1234.5, Occluder = "Mun",
+    });
+    var blocked = cams.View(12);
+    Check(blocked.Occluded && blocked.OccludedSinceUt == 1234.5 && blocked.Occluder == "Mun", "a command feed's view carries its occlusion");
+    blocked.Occluder = "Kerbin";
+    Check(cams.View(12).Occluder == "Mun" && blocked.Clone().Occluder == "Kerbin", "occlusion is copied with the view");
+    Check(!cams.View(10).Occluded && double.IsNaN(cams.View(10).OccludedSinceUt), "a part camera reads as not occluded");
     Check(!cams.SetFov(12, 30) && !cams.SetPan(12, 0, 0) && !cams.AimAt(12, Vec3d.Zero) && !cams.SetTrackMode(12, TrackMode.Target),
         "the controls refuse a command feed");
 
