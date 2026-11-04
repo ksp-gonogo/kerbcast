@@ -54,7 +54,7 @@ use super::video_track::VideoTrack;
 
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
-use crate::ladder::{Ladder, LadderConfig, LadderState, SlotView};
+use crate::ladder::{Ladder, LadderConfig, LadderState, SlotTier, SlotView, Tier};
 use crate::link::{LinkMonitor, LinkWindow, SlotCounters, LINK_WINDOW};
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ConfirmSlotsPayload,
@@ -67,6 +67,10 @@ use crate::protocol::{
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
+
+/// Names an extra address to offer as a server-reflexive candidate, for the
+/// shaped-relay test rig only.
+const RIG_ICE_IP_ENV: &str = "KERBCAST_RIG_ICE_IP";
 
 /// An unguessable name for a peer's session: 128 bits from a CSPRNG seeded
 /// by the operating system.
@@ -323,6 +327,19 @@ impl KerbcastPeer {
         // Chrome cannot, preventing streams from loading on mobile.
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_ice_multicast_dns_mode(ice::mdns::MulticastDnsMode::QueryOnly);
+        /* A test rig whose relay runs behind a container's NAT can only reach
+        the sidecar at the address the NAT gives the host, so it names that
+        address here and every peer also offers it as a server-reflexive
+        candidate. Host candidates are untouched. */
+        if let Ok(raw) = std::env::var(RIG_ICE_IP_ENV) {
+            match raw.parse::<std::net::IpAddr>() {
+                Ok(ip) => setting_engine.set_nat_1to1_ips(
+                    vec![ip.to_string()],
+                    webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType::Srflx,
+                ),
+                Err(_) => warn!(value = %raw, "{RIG_ICE_IP_ENV} is not an IP address; ignored"),
+            }
+        }
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_setting_engine(setting_engine)
@@ -876,6 +893,57 @@ impl KerbcastPeer {
     /// until two samples have been taken.
     pub fn link_window(&self) -> Option<LinkWindow> {
         lock_link(&self.link).monitor.latest()
+    }
+
+    /// The tier each of this viewer's feeds is actually sent on.
+    pub async fn delivery_tiers(&self) -> Vec<SlotTier> {
+        let mut out = Vec::new();
+        for (slot, flight_id, track) in self.bound_slot_tracks().await {
+            let Some(cam) = self.registry.get(flight_id).await else {
+                continue;
+            };
+            if let Some(tier) = cam.tier_of(&track).await {
+                out.push(SlotTier {
+                    slot,
+                    flight_id,
+                    tier,
+                });
+            }
+        }
+        out
+    }
+
+    /// Move this viewer's feed of `flight_id` onto `tier`, by hand. Returns
+    /// false when the viewer is not watching that camera.
+    pub async fn set_tier(&self, flight_id: u32, tier: Tier) -> bool {
+        let Some(cam) = self.registry.get(flight_id).await else {
+            return false;
+        };
+        let mut moved = false;
+        for (_, f, track) in self.bound_slot_tracks().await {
+            if f == flight_id {
+                moved |= cam.set_track_tier(&track, tier).await;
+            }
+        }
+        if moved {
+            info!(
+                peer_id = self.peer_id,
+                flight_id,
+                ?tier,
+                "feed tier set by hand"
+            );
+        }
+        moved
+    }
+
+    async fn bound_slot_tracks(&self) -> Vec<(usize, u32, Arc<VideoTrack>)> {
+        self.slots
+            .lock()
+            .await
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.bound.map(|f| (i, f, s.track.clone())))
+            .collect()
     }
 
     /// The tiers the detector has chosen for this viewer's feeds.

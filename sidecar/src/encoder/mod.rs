@@ -17,6 +17,7 @@ mod nvenc;
 mod software;
 mod videotoolbox;
 
+pub use convert::{downscale_half_rgba, half_size};
 pub use escalation::{
     record_init_failure, size_is_encodable, SessionHealth, SessionVerdict, MAX_ENCODE_DIMENSION,
     MIN_ENCODE_DIMENSION, SILENT_SESSION_FRAME_LIMIT,

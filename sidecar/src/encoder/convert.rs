@@ -80,9 +80,77 @@ pub(crate) fn rgba_to_nv12_planes(
     }
 }
 
+/**
+ * The size a half-size copy of a `width` by `height` frame has: half on each
+ * side rounded down to even, or `None` when that would fall under `min` on
+ * either side (the frame is then sent at its own size).
+ */
+pub fn half_size(width: u32, height: u32, min: u32) -> Option<(u32, u32)> {
+    let (w, h) = ((width / 2) & !1, (height / 2) & !1);
+    (w >= min && h >= min).then_some((w, h))
+}
+
+/// Box-filter a tightly packed RGBA frame down to `out_w` by `out_h`, each
+/// output pixel the average of the 2x2 block under it.
+pub fn downscale_half_rgba(rgba: &[u8], width: u32, out_w: u32, out_h: u32, out: &mut Vec<u8>) {
+    let (w, ow, oh) = (width as usize, out_w as usize, out_h as usize);
+    out.clear();
+    out.resize(ow * oh * 4, 0);
+    for y in 0..oh {
+        let top = 2 * y * w * 4;
+        let bottom = top + w * 4;
+        for x in 0..ow {
+            let (a, b) = (top + 2 * x * 4, bottom + 2 * x * 4);
+            let o = (y * ow + x) * 4;
+            for c in 0..4 {
+                let sum = rgba[a + c] as u16
+                    + rgba[a + 4 + c] as u16
+                    + rgba[b + c] as u16
+                    + rgba[b + 4 + c] as u16;
+                out[o + c] = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_size_is_even_and_respects_the_minimum() {
+        assert_eq!(half_size(1024, 576, 128), Some((512, 288)));
+        assert_eq!(half_size(642, 362, 128), Some((320, 180)));
+        assert_eq!(
+            half_size(384, 216, 128),
+            None,
+            "108 rows is under the minimum"
+        );
+    }
+
+    #[test]
+    fn downscale_averages_each_two_by_two_block() {
+        /* 4x2 image: left block 0 and 100 alternating, right block all 200. */
+        let px = |v: u8| [v, v, v, 0xFF];
+        let mut rgba = Vec::new();
+        for row in 0..2 {
+            for col in 0..4 {
+                let v = if col < 2 {
+                    if (row + col) % 2 == 0 {
+                        0
+                    } else {
+                        100
+                    }
+                } else {
+                    200
+                };
+                rgba.extend_from_slice(&px(v));
+            }
+        }
+        let mut out = Vec::new();
+        downscale_half_rgba(&rgba, 4, 2, 1, &mut out);
+        assert_eq!(out, vec![50, 50, 50, 0xFF, 200, 200, 200, 0xFF]);
+    }
 
     /// Convert a uniform RGBA image and return (y, u, v) of the first
     /// sample of each plane.

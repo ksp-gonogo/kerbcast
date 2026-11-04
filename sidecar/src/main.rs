@@ -24,8 +24,9 @@ use tracing::{debug, info, warn};
 
 use kerbcast_sidecar::cameras::{CameraRegistry, CameraState, TierEncoder};
 use kerbcast_sidecar::encoder::{
-    record_init_failure, resolve_bitrate_bps, select_backend, size_is_encodable, EncodeConfig,
-    EncoderBackend, EncoderChoice, RawFrame, SessionVerdict, Software, SILENT_SESSION_FRAME_LIMIT,
+    downscale_half_rgba, half_size, record_init_failure, resolve_bitrate_bps, select_backend,
+    size_is_encodable, EncodeConfig, EncoderBackend, EncoderChoice, RawFrame, SessionVerdict,
+    Software, MIN_ENCODE_DIMENSION, SILENT_SESSION_FRAME_LIMIT,
 };
 use kerbcast_sidecar::frame_watch::{sleep_until_ready, FRAME_WATCH_STEP};
 use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
@@ -498,6 +499,7 @@ async fn consume_loop(
                 }
             }
             if idle {
+                close_idle_tier(cam, &cam.reduced, Instant::now());
                 continue;
             }
             any_active = true;
@@ -853,31 +855,114 @@ async fn encode_next_frame(
         height: frame.height,
         pixels: &frame.pixels,
         capture_ts_ms: frame.capture_ts_ms,
-        capture: &frame.capture,
     };
-    encode_for_tier(
-        cam,
-        &cam.full,
-        &tier_frame,
-        capture_time,
-        TierSettings {
-            encoder_choice,
-            fps,
-            bitrate_bps,
-            degrade,
-        },
-    )
-    .await;
+    let settings = TierSettings {
+        encoder_choice,
+        fps,
+        bitrate_bps,
+        degrade,
+    };
+    /* A viewer that dropped without unsubscribing leaves only a dead weak
+    ref, which the fan-out would prune. A tier with nobody else left is not
+    encoded and never fans out, so sweep every tier here first or the camera
+    keeps rendering for a viewer who is gone. */
+    for tier in cam.tiers() {
+        let dead = tier.prune_dead().await;
+        if dead > 0 {
+            cam.release(dead);
+        }
+    }
+
+    let full = if cam.full.wanted().await {
+        encode_for_tier(cam, &cam.full, &tier_frame, settings).await
+    } else {
+        None
+    };
+    let mut reduced = None;
+    if cam.reduced.wanted().await {
+        *cam.reduced.idle_since.lock().unwrap() = None;
+        /* Every other frame: half the rate. */
+        if cam
+            .reduced
+            .offered
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(2)
+        {
+            let mut small = cam.reduced.scratch.lock().await;
+            let reduced_frame = match half_size(frame.width, frame.height, MIN_ENCODE_DIMENSION) {
+                Some((w, h)) => {
+                    downscale_half_rgba(&frame.pixels, frame.width, w, h, &mut small);
+                    TierFrame {
+                        width: w,
+                        height: h,
+                        pixels: &small,
+                        ..tier_frame
+                    }
+                }
+                None => tier_frame,
+            };
+            let settings = TierSettings {
+                fps: (fps / 2).max(1),
+                bitrate_bps: REDUCED_BITRATE_BPS,
+                ..settings
+            };
+            reduced = encode_for_tier(cam, &cam.reduced, &reduced_frame, settings).await;
+        }
+    } else {
+        close_idle_tier(cam, &cam.reduced, now);
+    }
+
+    /* Every tier encodes before any tier sends, so a viewer moving on a
+    keyframe leaves its old tier before that tier sends the same capture. */
+    for (tier, encoded) in [(&cam.full, &full), (&cam.reduced, &reduced)] {
+        if encoded.as_ref().is_some_and(|e| e.keyframe) {
+            land_pending(cam, tier).await;
+        }
+    }
+    let mut sent = false;
+    for (tier, encoded) in [(&cam.full, &full), (&cam.reduced, &reduced)] {
+        if let Some(encoded) = encoded {
+            sent |= fan_out_tier(cam, tier, encoded, &frame.capture, capture_time).await;
+        }
+    }
+    if sent {
+        cam.note_frame_sent();
+    }
     true
 }
 
+/// Target bitrate of the Reduced tier, before any degrade squeeze.
+const REDUCED_BITRATE_BPS: u32 = 350_000;
+
+/// How long a tier with nobody to send to keeps its encoder session, so a
+/// viewer flapping between tiers does not reopen one each time.
+const TIER_IDLE_CLOSE: Duration = Duration::from_secs(30);
+
+/// Close `tier`'s session once it has been idle for `TIER_IDLE_CLOSE`.
+fn close_idle_tier(cam: &Arc<CameraState>, tier: &TierEncoder, now: Instant) {
+    let due = {
+        let mut idle = tier.idle_since.lock().unwrap();
+        let since = *idle.get_or_insert(now);
+        now.saturating_duration_since(since) >= TIER_IDLE_CLOSE
+    };
+    if !due {
+        return;
+    }
+    if let Ok(mut guard) = tier.encoder.try_lock() {
+        if guard.is_some() {
+            drop_encoder_session(tier, &mut guard);
+            info!(flight_id = cam.flight_id, tier = ?tier.tier, "idle tier encoder closed");
+        }
+    }
+}
+
 /// One frame as a tier encodes it: the ring frame itself, or a smaller copy.
+#[derive(Clone, Copy)]
 struct TierFrame<'a> {
     width: u32,
     height: u32,
     pixels: &'a [u8],
     capture_ts_ms: f64,
-    capture: &'a CaptureStamp,
 }
 
 #[derive(Clone, Copy)]
@@ -888,14 +973,20 @@ struct TierSettings {
     degrade: f32,
 }
 
-/// Encode one frame on `tier` and send it to that tier's tracks.
+/// One frame encoded on one tier, as an Annex-B bytestream.
+struct Encoded {
+    bytes: Vec<u8>,
+    keyframe: bool,
+}
+
+/// Encode one frame on `tier`. `None` when the encoder produced nothing
+/// (failed, buffering, or could not start).
 async fn encode_for_tier(
     cam: &Arc<CameraState>,
     tier: &TierEncoder,
     frame: &TierFrame<'_>,
-    capture_time: CaptureTime,
     settings: TierSettings,
-) {
+) -> Option<Encoded> {
     let TierSettings {
         encoder_choice,
         fps,
@@ -1027,7 +1118,7 @@ async fn encode_for_tier(
                 } else {
                     debug!(flight_id = cam.flight_id, error = %e2, "software fallback init failed");
                 }
-                return;
+                return None;
             }
         }
         info!(
@@ -1036,6 +1127,7 @@ async fn encode_for_tier(
             height = frame.height,
             bitrate_bps = effective_bps,
             backend = backend.name(),
+            tier = ?tier.tier,
             "per-camera encoder initialised",
         );
         tier.encoder_width.store(frame.width, Ordering::Release);
@@ -1120,7 +1212,7 @@ async fn encode_for_tier(
                 }
             }
             cam.send_tally.note_encode_failed();
-            return;
+            return None;
         }
     };
 
@@ -1150,7 +1242,7 @@ async fn encode_for_tier(
             }
         }
         cam.send_tally.note_no_output();
-        return;
+        return None;
     }
     // Only a hardware session producing real output clears strikes. A
     // software encode succeeding here (the fallback path after a hardware
@@ -1172,10 +1264,45 @@ async fn encode_for_tier(
         combined.extend_from_slice(&nal.0);
     }
 
+    Some(Encoded {
+        bytes: combined,
+        keyframe,
+    })
+}
+
+/**
+ * Move every viewer waiting on `tier` onto it. Called only when `tier` has a
+ * keyframe for this frame and before any tier sends it, so a moving viewer's
+ * first frame from its new tier is that keyframe and it never gets the same
+ * capture twice.
+ */
+async fn land_pending(cam: &Arc<CameraState>, tier: &TierEncoder) {
+    for track in tier.take_pending().await {
+        if cam.move_track(&track, tier.tier).await {
+            info!(flight_id = cam.flight_id, tier = ?tier.tier, "viewer moved to tier");
+        }
+    }
+}
+
+/// Send one encoded frame to `tier`'s tracks. Returns whether any viewer was
+/// sent it.
+async fn fan_out_tier(
+    cam: &Arc<CameraState>,
+    tier: &TierEncoder,
+    encoded: &Encoded,
+    capture: &CaptureStamp,
+    capture_time: CaptureTime,
+) -> bool {
+    let Encoded {
+        bytes: combined,
+        keyframe,
+    } = encoded;
+    let keyframe = *keyframe;
     // Fan-out + GC dead weak refs in one pass. Pruned weaks mean a peer
     // dropped without telling us — decrement the camera's subscriber
     // count so the encoder can idle once the last viewer leaves.
     *cam.last_sent.lock().await = Some(capture_time);
+    let waiting = tier.pending.read().await.len();
     let mut tracks = tier.tracks.write().await;
     let prev = std::mem::take(&mut *tracks);
     let mut alive = Vec::with_capacity(prev.len());
@@ -1184,13 +1311,7 @@ async fn encode_for_tier(
     for weak in prev {
         if let Some(track) = weak.upgrade() {
             match track
-                .write_frame(
-                    &combined,
-                    capture_time,
-                    keyframe,
-                    cam.flight_id,
-                    frame.capture,
-                )
+                .write_frame(combined, capture_time, keyframe, cam.flight_id, capture)
                 .await
             {
                 Err(e) => {
@@ -1215,17 +1336,18 @@ async fn encode_for_tier(
     /* Subscribers>0 but zero live tracks means the subscriber count and the
     weak-ref list have diverged: we believe someone is watching, so we keep
     encoding, but there is nobody to send to. Silent black feed. */
-    if sent == 0 {
+    if sent == 0 && waiting == 0 {
         warn!(
             flight_id = cam.flight_id,
+            tier = ?tier.tier,
             pruned,
             subscribers = cam.subscribers.load(Ordering::Acquire),
             "encoded a frame but sent it to NOBODY (no live tracks)"
         );
     } else {
-        cam.note_frame_sent();
         debug!(
             flight_id = cam.flight_id,
+            tier = ?tier.tier,
             sent,
             pruned,
             bytes = combined.len(),
@@ -1237,6 +1359,7 @@ async fn encode_for_tier(
     if pruned > 0 {
         cam.release(pruned);
     }
+    sent > 0
 }
 
 #[cfg(test)]
@@ -1299,6 +1422,18 @@ mod tests {
         Arc<CameraState>,
         Arc<kerbcast_sidecar::webrtc::video_track::VideoTrack>,
     ) {
+        camera_with_viewer_sized(dir, 64, 64).await
+    }
+
+    async fn camera_with_viewer_sized(
+        dir: &std::path::Path,
+        max_width: u32,
+        max_height: u32,
+    ) -> (
+        kerbcast_sidecar::shared_mem::MmapFrameRing,
+        Arc<CameraState>,
+        Arc<kerbcast_sidecar::webrtc::video_track::VideoTrack>,
+    ) {
         use kerbcast_sidecar::shared_mem::MmapFrameRing;
         use kerbcast_sidecar::webrtc::video_track::VideoTrack;
         use webrtc::api::media_engine::MIME_TYPE_H264;
@@ -1306,8 +1441,8 @@ mod tests {
 
         let cfg = MmapRingConfig {
             slot_count: 4,
-            max_width: 64,
-            max_height: 64,
+            max_width,
+            max_height,
         };
         let ring = MmapFrameRing::create(&dir.join("1.ring"), cfg).expect("create ring");
         let registry = CameraRegistry::new(dir.to_path_buf());
@@ -1389,6 +1524,109 @@ mod tests {
             cam.full.keyframe_gate.lock().unwrap().pending(),
             "the forced keyframe is still owed"
         );
+    }
+
+    /// A viewer moved to Reduced keeps the Full stream until Reduced's first
+    /// keyframe, then gets half size at half rate, and Full stops encoding
+    /// once nobody is left on it. Moving back works the same way.
+    #[tokio::test]
+    async fn a_viewer_moved_to_reduced_switches_on_its_keyframe_at_half_size() {
+        use kerbcast_sidecar::ladder::Tier;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, track) = camera_with_viewer_sized(dir.path(), 512, 288).await;
+        let pixels = vec![0x80u8; 512 * 288 * 4];
+        let mut n = 0u32;
+        let mut frame = |ring: &mut kerbcast_sidecar::shared_mem::MmapFrameRing| {
+            ring.produce(512, 288, 33.0 * n as f64, &pixels).unwrap();
+            n += 1;
+        };
+
+        frame(&mut ring);
+        tick(&cam).await;
+        assert_eq!(cam.send_tally.take().sent, 1);
+        assert!(cam.set_track_tier(&track, Tier::Reduced).await);
+        assert_eq!(
+            cam.tier_of(&track).await,
+            Some(Tier::Full),
+            "not before the keyframe"
+        );
+
+        let given = track.frames_given();
+        frame(&mut ring);
+        tick(&cam).await;
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Reduced));
+        assert_eq!(
+            track.frames_given() - given,
+            1,
+            "the moving viewer gets the new tier's keyframe and not the old tier's frame too"
+        );
+        assert_eq!(cam.reduced.encoder_width.load(Ordering::Acquire), 256);
+        assert_eq!(cam.reduced.encoder_height.load(Ordering::Acquire), 144);
+        assert!(!cam.full.wanted().await);
+        assert_eq!(
+            cam.send_tally.take().sent,
+            1,
+            "no frame lost across the move"
+        );
+
+        for _ in 0..4 {
+            frame(&mut ring);
+            tick(&cam).await;
+        }
+        assert_eq!(cam.send_tally.take().sent, 2, "every other frame");
+
+        /* Full made a keyframe a moment ago, so its gap holds the move back
+        while Reduced keeps the viewer fed. */
+        assert!(cam.set_track_tier(&track, Tier::Full).await);
+        frame(&mut ring);
+        tick(&cam).await;
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Reduced));
+        tokio::time::sleep(kerbcast_sidecar::cameras::MIN_KEYFRAME_GAP).await;
+        let given = track.frames_given();
+        frame(&mut ring);
+        tick(&cam).await;
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Full));
+        assert_eq!(
+            track.frames_given() - given,
+            1,
+            "one frame on the move back too"
+        );
+        assert!(!cam.reduced.wanted().await);
+    }
+
+    /// An idle tier keeps its session for `TIER_IDLE_CLOSE`, then closes it.
+    #[tokio::test]
+    async fn an_idle_tier_closes_its_session_after_the_linger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_ring, cam, _track) = camera_with_viewer(dir.path()).await;
+        *cam.reduced.encoder.lock().await = Some(Box::new(FailingBackend));
+        let t0 = Instant::now();
+        close_idle_tier(&cam, &cam.reduced, t0);
+        close_idle_tier(&cam, &cam.reduced, t0 + TIER_IDLE_CLOSE / 2);
+        assert!(
+            cam.reduced.encoder.lock().await.is_some(),
+            "still lingering"
+        );
+        close_idle_tier(&cam, &cam.reduced, t0 + TIER_IDLE_CLOSE);
+        assert!(cam.reduced.encoder.lock().await.is_none());
+    }
+
+    /// A viewer that drops without unsubscribing, alone on its tier, is still
+    /// released, so the camera stops rendering for it.
+    #[tokio::test]
+    async fn a_dropped_viewer_alone_on_a_tier_is_released() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, track) = camera_with_viewer(dir.path()).await;
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+        ring.produce(64, 64, 0.0, &pixels).unwrap();
+        tick(&cam).await;
+        assert_eq!(cam.subscribers.load(Ordering::Acquire), 1);
+
+        drop(track);
+        ring.produce(64, 64, 33.0, &pixels).unwrap();
+        tick(&cam).await;
+        assert_eq!(cam.subscribers.load(Ordering::Acquire), 0);
+        assert!(cam.full.tracks.read().await.is_empty());
     }
 
     /// Two readbacks landing in one game frame reach the ring a moment apart.

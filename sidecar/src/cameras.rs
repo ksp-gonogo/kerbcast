@@ -704,6 +704,9 @@ pub struct CameraState {
     /// The camera's own encoder at the ring's size, and the viewer tracks it
     /// feeds.
     pub full: TierEncoder,
+    /// A lighter stream (half size, half rate) for viewers whose link cannot
+    /// carry Full. Encodes only while some viewer is on it.
+    pub reduced: TierEncoder,
     /// Most-recent target bitrate, computed as the min across active
     /// subscribers' REMB estimates (so the slowest receiver doesn't
     /// drop the whole stream). 0 = no REMB received yet; consume loop
@@ -787,19 +790,15 @@ impl CameraState {
     /// on the 0→1 transition. Adding a track the camera already feeds is a
     /// no-op: a Subscribe can race the rescan's own resync and bind it twice.
     pub async fn add_track(&self, track: Arc<VideoTrack>) -> usize {
-        for tier in self.tiers().into_iter().skip(1) {
-            if tier.holds(&track).await {
-                return self.subscribers.load(Ordering::Acquire);
-            }
-        }
-        let mut tracks = self.full.tracks.write().await;
-        if tracks
-            .iter()
-            .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, &track)))
-        {
+        let (mut full, reduced) = self.lock_tracks().await;
+        let fed = |list: &Vec<Weak<VideoTrack>>| {
+            list.iter()
+                .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, &track)))
+        };
+        if fed(&full) || fed(&reduced) {
             return self.subscribers.load(Ordering::Acquire);
         }
-        tracks.push(Arc::downgrade(&track));
+        full.push(Arc::downgrade(&track));
         self.subscribers.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -821,11 +820,16 @@ impl CameraState {
     /// isn't feeding is a no-op.
     pub async fn remove_track(&self, track: &Arc<VideoTrack>) -> usize {
         let mut removed = 0;
+        {
+            let (mut full, mut reduced) = self.lock_tracks().await;
+            for tracks in [&mut *full, &mut *reduced] {
+                let before = tracks.len();
+                tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
+                removed += before - tracks.len();
+            }
+        }
         for tier in self.tiers() {
-            let mut tracks = tier.tracks.write().await;
-            let before = tracks.len();
-            tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
-            removed += before - tracks.len();
+            tier.forget_pending(track).await;
         }
         if removed > 0 {
             self.subscribers.fetch_sub(removed, Ordering::AcqRel);
@@ -865,14 +869,96 @@ impl CameraState {
     }
 
     /// Every delivery tier of this camera, Full first.
-    pub fn tiers(&self) -> [&TierEncoder; 1] {
-        [&self.full]
+    pub fn tiers(&self) -> [&TierEncoder; 2] {
+        [&self.full, &self.reduced]
     }
 
     pub fn tier(&self, tier: Tier) -> &TierEncoder {
         match tier {
-            Tier::Full | Tier::Reduced => &self.full,
+            Tier::Full => &self.full,
+            Tier::Reduced => &self.reduced,
         }
+    }
+
+    /**
+     * Both tiers' track lists, always locked Full first. Adding, removing and
+     * moving a track hold both, so a viewer leaving in the middle of a tier
+     * switch can never be left fed by a tier after it unsubscribed.
+     */
+    pub async fn lock_tracks(
+        &self,
+    ) -> (
+        tokio::sync::RwLockWriteGuard<'_, Vec<Weak<VideoTrack>>>,
+        tokio::sync::RwLockWriteGuard<'_, Vec<Weak<VideoTrack>>>,
+    ) {
+        let full = self.full.tracks.write().await;
+        let reduced = self.reduced.tracks.write().await;
+        (full, reduced)
+    }
+
+    /**
+     * Move `track` onto `to`'s live list from the other tier's. Returns false
+     * when the other tier no longer feeds it (the viewer left), so nothing
+     * moves.
+     */
+    pub async fn move_track(&self, track: &Arc<VideoTrack>, to: Tier) -> bool {
+        let (mut full, mut reduced) = self.lock_tracks().await;
+        let (from, dest) = match to {
+            Tier::Full => (&mut *reduced, &mut *full),
+            Tier::Reduced => (&mut *full, &mut *reduced),
+        };
+        let before = from.len();
+        from.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
+        if from.len() == before {
+            return false;
+        }
+        dest.push(Arc::downgrade(track));
+        true
+    }
+
+    /// The tier currently sending to `track`, if this camera feeds it.
+    pub async fn tier_of(&self, track: &Arc<VideoTrack>) -> Option<Tier> {
+        for tier in self.tiers() {
+            if tier.holds(track).await {
+                return Some(tier.tier);
+            }
+        }
+        None
+    }
+
+    /**
+     * Move a viewer's track to `to`. The track keeps receiving from its
+     * current tier until `to` produces a keyframe, then switches on that
+     * keyframe (see `TierEncoder::take_pending`), so the viewer never gets a
+     * frame it cannot decode. Returns false when this camera does not feed
+     * the track. Asking for the tier it is already on cancels a pending move.
+     */
+    pub async fn set_track_tier(&self, track: &Arc<VideoTrack>, to: Tier) -> bool {
+        /* Held across the check and the push, so a racing remove_track either
+        runs first (and this finds nothing to move) or after (and forgets the
+        pending entry). */
+        let (full, reduced) = self.lock_tracks().await;
+        let fed = |list: &Vec<Weak<VideoTrack>>| {
+            list.iter()
+                .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)))
+        };
+        let current = if fed(&full) {
+            Tier::Full
+        } else if fed(&reduced) {
+            Tier::Reduced
+        } else {
+            return false;
+        };
+        for tier in self.tiers() {
+            tier.forget_pending(track).await;
+        }
+        if current != to {
+            let dest = self.tier(to);
+            dest.pending.write().await.push(Arc::downgrade(track));
+            dest.request_keyframe();
+        }
+        drop((full, reduced));
+        true
     }
 
     /// Ask every tier of this camera for an IDR, for an event every viewer
@@ -1288,6 +1374,15 @@ pub struct TierEncoder {
     /// One `VideoTrack` per viewer slot this tier feeds. Weak refs so a
     /// dropped peer's tracks go stale and are pruned on the next fan-out.
     pub tracks: RwLock<Vec<Weak<VideoTrack>>>,
+    /// Tracks moving to this tier from another, still fed by the other until
+    /// this tier's next keyframe.
+    pub pending: RwLock<Vec<Weak<VideoTrack>>>,
+    /// Frames offered to this tier, for tiers that encode only some of them.
+    pub offered: AtomicU64,
+    /// Since when this tier has had nobody to send to.
+    pub idle_since: std::sync::Mutex<Option<Instant>>,
+    /// Reused buffer for this tier's downscaled copy of each frame.
+    pub scratch: Mutex<Vec<u8>>,
 }
 
 impl TierEncoder {
@@ -1302,7 +1397,47 @@ impl TierEncoder {
             session_health: std::sync::Mutex::new(SessionHealth::new()),
             keyframe_gate: std::sync::Mutex::new(KeyframeGate::default()),
             tracks: RwLock::new(Vec::new()),
+            pending: RwLock::new(Vec::new()),
+            offered: AtomicU64::new(0),
+            idle_since: std::sync::Mutex::new(None),
+            scratch: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Drop the tracks and pending moves whose viewer has gone, returning how
+    /// many live tracks that was so the caller can release them.
+    pub async fn prune_dead(&self) -> usize {
+        self.pending.write().await.retain(|w| w.strong_count() > 0);
+        let mut tracks = self.tracks.write().await;
+        let before = tracks.len();
+        tracks.retain(|w| w.strong_count() > 0);
+        before - tracks.len()
+    }
+
+    /// Whether this tier has anyone to encode for: a track it feeds, or one
+    /// waiting to move onto it.
+    pub async fn wanted(&self) -> bool {
+        let live = |list: &Vec<Weak<VideoTrack>>| list.iter().any(|w| w.strong_count() > 0);
+        live(&*self.tracks.read().await) || live(&*self.pending.read().await)
+    }
+
+    async fn forget_pending(&self, track: &Arc<VideoTrack>) {
+        self.pending
+            .write()
+            .await
+            .retain(|w| w.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, track)));
+    }
+
+    /**
+     * Take every track waiting to move onto this tier. Called by the encode
+     * path when this tier has a keyframe in hand, so the moved tracks' first
+     * frame from it is that keyframe.
+     */
+    pub async fn take_pending(&self) -> Vec<Arc<VideoTrack>> {
+        std::mem::take(&mut *self.pending.write().await)
+            .into_iter()
+            .filter_map(|w| w.upgrade())
+            .collect()
     }
 
     pub fn request_keyframe(&self) {
@@ -2009,6 +2144,7 @@ impl CameraRegistry {
                             destroyed: AtomicBool::new(false),
                             destruction_broadcast_sent: AtomicBool::new(false),
                             full: TierEncoder::new(Tier::Full),
+                            reduced: TierEncoder::new(Tier::Reduced),
                             target_bitrate_bps: AtomicU32::new(0),
                             bandwidth_estimates: Mutex::new(std::collections::HashMap::new()),
                             effective_degrade: AtomicU32::new(0),
@@ -4458,6 +4594,90 @@ mod tests {
         );
         cam.set_forced(1, false).await;
         assert_eq!(cam.requested_capture_fps(2.0).await, Some(2.0));
+    }
+
+    fn bare_track(name: &str) -> Arc<VideoTrack> {
+        use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+        Arc::new(VideoTrack::new(
+            RTCRtpCodecCapability {
+                mime_type: "video/H264".to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            name.to_owned(),
+            None,
+        ))
+    }
+
+    /// A move waits on the destination tier, which is asked for a keyframe,
+    /// while the viewer stays on the tier it is on.
+    #[tokio::test]
+    async fn a_tier_move_waits_on_the_destination_keyframe() {
+        let (_dir, cam) = attach_camera_for_tracker(7_201).await;
+        let track = bare_track("t");
+        cam.add_track(track.clone()).await;
+        assert!(!cam.reduced.wanted().await);
+
+        assert!(cam.set_track_tier(&track, Tier::Reduced).await);
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Full));
+        assert!(cam.reduced.wanted().await);
+        assert!(cam.reduced.keyframe_gate.lock().unwrap().pending());
+        assert!(!cam.full.keyframe_gate.lock().unwrap().pending());
+
+        let moved = cam.reduced.take_pending().await;
+        assert_eq!(moved.len(), 1);
+        assert!(cam.move_track(&moved[0], Tier::Reduced).await);
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Reduced));
+        assert!(!cam.full.wanted().await);
+        assert_eq!(
+            cam.subscribers.load(Ordering::Acquire),
+            1,
+            "a move is not a new viewer"
+        );
+    }
+
+    /// Asking for the tier a viewer is already on cancels its pending move.
+    #[tokio::test]
+    async fn moving_back_before_the_keyframe_cancels_the_move() {
+        let (_dir, cam) = attach_camera_for_tracker(7_202).await;
+        let track = bare_track("t");
+        cam.add_track(track.clone()).await;
+        cam.set_track_tier(&track, Tier::Reduced).await;
+        assert!(cam.set_track_tier(&track, Tier::Full).await);
+        assert!(!cam.reduced.wanted().await);
+        assert!(cam.reduced.take_pending().await.is_empty());
+    }
+
+    /// A viewer leaving mid-move is forgotten by both tiers, and the move
+    /// lands nowhere.
+    #[tokio::test]
+    async fn a_viewer_leaving_mid_move_is_not_moved() {
+        let (_dir, cam) = attach_camera_for_tracker(7_203).await;
+        let track = bare_track("t");
+        cam.add_track(track.clone()).await;
+        cam.set_track_tier(&track, Tier::Reduced).await;
+        assert_eq!(cam.remove_track(&track).await, 0);
+        assert!(!cam.reduced.wanted().await);
+        assert!(!cam.move_track(&track, Tier::Reduced).await);
+        assert_eq!(cam.tier_of(&track).await, None);
+        assert!(!cam.set_track_tier(&track, Tier::Full).await, "not fed");
+    }
+
+    /// One viewer's keyframe request reaches only the tier feeding it.
+    #[tokio::test]
+    async fn a_viewer_keyframe_request_goes_to_its_own_tier() {
+        let (_dir, cam) = attach_camera_for_tracker(7_204).await;
+        let slow = bare_track("slow");
+        let fast = bare_track("fast");
+        cam.add_track(slow.clone()).await;
+        cam.add_track(fast.clone()).await;
+        assert!(cam.move_track(&slow, Tier::Reduced).await);
+
+        cam.request_keyframe_for(&slow).await;
+        assert!(cam.reduced.keyframe_gate.lock().unwrap().pending());
+        assert!(!cam.full.keyframe_gate.lock().unwrap().pending());
+        cam.request_keyframe_for(&fast).await;
+        assert!(cam.full.keyframe_gate.lock().unwrap().pending());
     }
 
     /// Published state: Off when nobody subscribes, Hum when capturing in the background, Ramping

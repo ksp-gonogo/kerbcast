@@ -122,9 +122,19 @@ pub struct PeerLink {
     pub cameras: Vec<u32>,
     /// `None` until the peer has been sampled twice.
     pub link: Option<crate::link::LinkWindow>,
+    /// The tier each feed is actually sent on.
+    pub tiers: Vec<crate::ladder::SlotTier>,
     /// The tiers the detector would put this viewer's feeds on. Shadow only:
-    /// every feed is still sent the full stream.
+    /// nothing moves a feed except `POST /links/tier`.
     pub shadow: crate::ladder::LadderState,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTierRequest {
+    pub peer_id: u32,
+    pub flight_id: u32,
+    pub tier: crate::ladder::Tier,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,8 +142,22 @@ pub struct DumpLogsResponse {
     pub entries: Vec<StatusLogEntry>,
 }
 
+/// Turns on `POST /links/tier`, for test rigs only.
+pub const RIG_MANUAL_TIERS_ENV: &str = "KERBCAST_RIG_MANUAL_TIERS";
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let manual_tiers = std::env::var(RIG_MANUAL_TIERS_ENV).is_ok_and(|v| v == "1");
+    router_with(state, manual_tiers)
+}
+
+fn router_with(state: AppState, manual_tiers: bool) -> Router {
+    let mut router = Router::new();
+    /* Any web page a viewer opens can reach the sidecar (CORS allows every
+    origin), so the hand tier switch exists only when a rig asks for it. */
+    if manual_tiers {
+        router = router.route("/links/tier", post(set_link_tier));
+    }
+    router
         .route("/", get(serve_index))
         .route("/assets/mediabunny.min.mjs", get(serve_mediabunny))
         .route("/health", get(health))
@@ -190,10 +214,39 @@ async fn links(State(state): State<AppState>) -> impl IntoResponse {
             peer_id: peer.peer_id,
             cameras: peer.bound_flight_ids().await,
             link: peer.link_window(),
+            tiers: peer.delivery_tiers().await,
             shadow: peer.ladder_state(),
         });
     }
     (StatusCode::OK, Json(LinksResponse { peers: out })).into_response()
+}
+
+/// Move one viewer's feed of one camera onto a delivery tier by hand, for
+/// testing a tier switch on a real link. Served only when
+/// `KERBCAST_RIG_MANUAL_TIERS=1` is set.
+async fn set_link_tier(
+    State(state): State<AppState>,
+    Json(req): Json<SetTierRequest>,
+) -> impl IntoResponse {
+    let peer = state
+        .peers
+        .read()
+        .await
+        .iter()
+        .find(|p| p.peer_id == req.peer_id && p.is_alive())
+        .cloned();
+    let Some(peer) = peer else {
+        return (StatusCode::NOT_FOUND, "no live viewer with that peerId\n").into_response();
+    };
+    if peer.set_tier(req.flight_id, req.tier).await {
+        (StatusCode::OK, "ok\n").into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            "that viewer is not watching that camera\n",
+        )
+            .into_response()
+    }
 }
 
 /// Serves the plugin's latest `global.status.json` (the per-phase render/

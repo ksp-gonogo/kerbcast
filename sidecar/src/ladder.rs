@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::link::LinkWindow;
 
 /// A rung of the delivery ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Tier {
     /// The camera's own encoder at the ring's size and full rate.
@@ -47,11 +47,13 @@ pub struct LadderConfig {
     /// a queue is building.
     pub queue_rtt_ms: f64,
     pub queue_factor: f64,
-    pub clean_rtt_ms: f64,
     pub severe_rtt_ms: f64,
-    /// A REMB under this share of what is being sent means the browser sees
-    /// the link as full.
+    /// A REMB under this share of what is being sent backs up loss or PLI
+    /// evidence of congestion. It never demotes on its own: Chrome's estimate
+    /// ramps up from a low start and dips now and then on a clean link.
     pub remb_short: f64,
+    /// How long a new viewer's REMB is ignored while it ramps up.
+    pub remb_warmup: Duration,
     /// Consecutive congested windows before a demote.
     pub congested_windows: u32,
     /// Least time between two demotes, so each step's effect lands first.
@@ -80,9 +82,9 @@ impl Default for LadderConfig {
             clean_loss: 0.01,
             queue_rtt_ms: 150.0,
             queue_factor: 1.5,
-            clean_rtt_ms: 50.0,
             severe_rtt_ms: 1000.0,
             remb_short: 0.8,
+            remb_warmup: Duration::from_secs(10),
             congested_windows: 2,
             demote_dwell: Duration::from_secs(3),
             mask_after_switch: Duration::from_secs(2),
@@ -160,6 +162,7 @@ pub struct Ladder {
     last_promote: Option<Instant>,
     promote_wait: Duration,
     verdict: Option<Verdict>,
+    first_window: Option<Instant>,
 }
 
 impl Ladder {
@@ -174,6 +177,7 @@ impl Ladder {
             last_demote: None,
             last_promote: None,
             verdict: None,
+            first_window: None,
         }
     }
 
@@ -218,17 +222,19 @@ impl Ladder {
         let remb_short = w
             .remb_bps
             .is_some_and(|remb| (remb as f64) < c.remb_short * w.send_bps as f64);
-        if w.loss > c.congested_loss || queued || plis_in_window > 1.0 || remb_short {
+        let some_loss = w.loss >= c.clean_loss || plis_in_window >= 0.5;
+        if w.loss > c.congested_loss || queued || plis_in_window > 1.0 || (remb_short && some_loss)
+        {
             return Verdict::Congested;
         }
-        let rtt_settled = match (rtt, floor) {
-            (Some(r), Some(f)) => r <= f + c.clean_rtt_ms,
-            _ => true,
-        };
-        if w.loss < c.clean_loss && rtt_settled && plis_in_window < 0.5 {
-            return Verdict::Clean;
+        /* RTT that rises and falls without building a queue is jitter (a Wi-Fi
+        LAN swings between 10 and 95 ms on a clean link), so only the queue
+        rule above counts RTT against a window. */
+        if some_loss {
+            Verdict::Fair
+        } else {
+            Verdict::Clean
         }
-        Verdict::Fair
     }
 
     /**
@@ -238,6 +244,12 @@ impl Ladder {
      * every unpinned Full feed to Reduced at once.
      */
     pub fn step(&mut self, now: Instant, w: &LinkWindow, slots: &[SlotView]) -> Vec<TierChange> {
+        let first = *self.first_window.get_or_insert(now);
+        let warming = now.saturating_duration_since(first) < self.cfg.remb_warmup;
+        let w = &LinkWindow {
+            remb_bps: if warming { None } else { w.remb_bps },
+            ..*w
+        };
         self.tiers
             .retain(|key, _| slots.iter().any(|s| (s.slot, s.flight_id) == *key));
         let mut changes = Vec::new();
@@ -314,12 +326,15 @@ impl Ladder {
                     let headroom = w.remb_bps.is_some_and(|remb| {
                         remb as f64 >= self.cfg.remb_headroom * promoted_bps as f64
                     });
+                    /* A browser estimate below what the promote would send says
+                    the room is not there yet; the spell keeps running. */
+                    let room = w.remb_bps.is_none_or(|remb| remb >= promoted_bps);
                     let wait = if headroom {
                         self.promote_wait.min(self.cfg.remb_promote_wait)
                     } else {
                         self.promote_wait
                     };
-                    if clean_for >= wait {
+                    if room && clean_for >= wait {
                         self.last_promote = Some(now);
                         changes.push(self.set(&s, Tier::Full, ChangeReason::Recovered));
                     }
@@ -481,15 +496,26 @@ mod tests {
         );
         assert_eq!(
             l.judge(&window(0.0, Some(400.0), Some(300.0))),
-            Verdict::Fair,
+            Verdict::Clean,
             "a long but steady RTT is not a queue"
+        );
+        assert_eq!(
+            l.judge(&window(0.0, Some(95.0), Some(12.5))),
+            Verdict::Clean,
+            "RTT jitter on a LAN is not a queue"
         );
         let mut plis = clean();
         plis.plis_per_s = 1.0;
         assert_eq!(l.judge(&plis), Verdict::Congested);
         let mut remb = clean();
         remb.remb_bps = Some(1_000_000);
-        assert_eq!(l.judge(&remb), Verdict::Congested);
+        assert_eq!(l.judge(&remb), Verdict::Clean, "REMB alone never congests");
+        remb.loss = 0.02;
+        assert_eq!(
+            l.judge(&remb),
+            Verdict::Congested,
+            "REMB backs up some loss"
+        );
     }
 
     #[test]
@@ -605,6 +631,140 @@ mod tests {
         roomy.remb_bps = Some(10_000_000);
         assert!(r.feed_n(roomy, 6).is_empty());
         assert_eq!(r.feed(roomy).len(), 1, "promoted after 10 s, not 20");
+    }
+
+    fn remb_window(send_bps: u64, remb_bps: u64, rtt: f64, min_rtt: f64) -> LinkWindow {
+        LinkWindow {
+            send_bps,
+            remb_bps: Some(remb_bps),
+            ..window(0.0, Some(rtt), Some(min_rtt))
+        }
+    }
+
+    #[test]
+    fn remb_below_the_send_rate_alone_never_demotes() {
+        let mut r = Run::new();
+        assert!(r
+            .feed_n(remb_window(2_000_000, 1_500_000, 90.0, 12.0), 30)
+            .is_empty());
+    }
+
+    #[test]
+    fn remb_is_ignored_while_a_new_viewer_ramps_up() {
+        let mut r = Run::new();
+        let mut w = remb_window(2_000_000, 400_000, 14.0, 12.0);
+        w.loss = 0.02;
+        r.feed(w);
+        assert_eq!(r.ladder.state().verdict, Some(Verdict::Fair));
+        r.feed_n(w, 4);
+        assert_eq!(r.ladder.state().verdict, Some(Verdict::Fair), "8 s in");
+        r.feed(w);
+        assert_eq!(
+            r.ladder.state().verdict,
+            Some(Verdict::Congested),
+            "10 s in"
+        );
+    }
+
+    #[test]
+    fn a_short_remb_holds_back_a_promote_until_it_recovers() {
+        let mut r = Run::new();
+        r.feed(severe());
+        let short = remb_window(1_050_000, 1_500_000, 14.0, 12.0);
+        assert!(r.feed_n(short, 20).is_empty(), "1.5 Mbps cannot carry 2.2");
+        let roomy = remb_window(1_050_000, 2_500_000, 14.0, 12.0);
+        assert_eq!(r.feed(roomy).len(), 1);
+    }
+
+    /// A Wi-Fi LAN's RTT swings well above its floor on a clean link. That
+    /// must not keep a demoted feed from coming back.
+    #[test]
+    fn rtt_jitter_does_not_hold_back_a_promote() {
+        let mut r = Run::new();
+        r.feed_n(lossy(), 2);
+        assert_eq!(r.ladder.tier(1, 11), Tier::Reduced);
+        let calm = window(0.0, Some(14.0), Some(12.5));
+        let jitter = window(0.0, Some(88.0), Some(12.5));
+        let mut changes = Vec::new();
+        for n in 0..12 {
+            changes.extend(r.feed(if n % 2 == 0 { jitter } else { calm }));
+        }
+        assert_eq!(
+            changes.len(),
+            1,
+            "promoted within the 20 s dwell plus the mask"
+        );
+        assert_eq!(r.ladder.tier(1, 11), Tier::Full);
+    }
+
+    /// Two clean LAN viewers measured on a Deck (390x844 phone and 1280x720
+    /// desktop, three feeds each), one window every 5 s, each fed twice so
+    /// every reading lasts two windows. Send rate, REMB, RTT and RTT floor.
+    /// Chrome's REMB dips below the send rate twice per viewer; none of it
+    /// is congestion.
+    #[test]
+    fn measured_clean_lan_viewers_are_never_demoted() {
+        const PHONE: &[(u64, u64, f64, f64)] = &[
+            (1677313, 2149984, 53.8, 53.8),
+            (1148456, 2151984, 79.2, 13.4),
+            (1864714, 2366992, 12.3, 12.3),
+            (2022355, 3237712, 43.9, 12.3),
+            (2000957, 3524272, 87.6, 12.3),
+            (2133183, 3811376, 16.1, 12.3),
+            (2013338, 3811376, 54.2, 12.3),
+            (1750374, 3811376, 17.6, 12.3),
+            (1832340, 1565424, 14.0, 12.3),
+            (1972617, 2245888, 14.3, 12.2),
+            (2110700, 2886608, 48.2, 12.2),
+            (1902016, 3246688, 13.2, 12.2),
+            (2046075, 3565760, 35.8, 12.2),
+            (1941240, 3565760, 13.5, 12.2),
+            (1960202, 3678048, 44.0, 11.2),
+            (1979626, 3736000, 18.1, 11.2),
+            (1998285, 3854608, 13.5, 11.2),
+            (1989255, 3854608, 13.3, 11.2),
+            (1977360, 3854608, 14.5, 10.5),
+            (2190671, 2049152, 30.1, 10.5),
+            (1823988, 2672064, 16.8, 10.5),
+            (1793800, 3378720, 77.1, 10.5),
+            (2119657, 3593168, 67.7, 10.5),
+            (1850114, 3756432, 33.6, 10.5),
+            (1785988, 3875552, 68.6, 10.5),
+        ];
+        const DESKTOP: &[(u64, u64, f64, f64)] = &[
+            (1641930, 1715560, 46.1, 46.1),
+            (1167512, 1744528, 74.0, 46.1),
+            (1895538, 2138320, 13.5, 13.5),
+            (1973244, 2975344, 13.3, 13.3),
+            (1999424, 3390848, 12.5, 12.5),
+            (2099349, 3842336, 47.0, 12.5),
+            (2060822, 3842336, 87.9, 12.5),
+            (1845306, 3842336, 88.6, 12.5),
+            (1993942, 1531336, 94.7, 12.5),
+            (1958527, 2236720, 14.5, 12.5),
+            (2064825, 2916848, 81.2, 12.5),
+            (1955497, 3261920, 13.1, 12.5),
+            (1982024, 3526304, 50.7, 12.5),
+            (1962562, 3526304, 11.5, 11.4),
+            (2042877, 3628560, 14.8, 11.4),
+            (1901853, 3743984, 65.7, 11.1),
+            (1988635, 3863488, 86.7, 11.1),
+            (1939308, 3863488, 26.8, 11.1),
+            (2055874, 3863488, 11.7, 11.1),
+            (2191171, 2052864, 10.5, 9.8),
+            (1877274, 2636416, 17.5, 9.8),
+            (1811142, 3330688, 15.7, 9.8),
+            (2154637, 3602032, 14.5, 9.8),
+            (1845464, 3716576, 61.5, 9.8),
+            (1757836, 3896240, 13.3, 9.8),
+        ];
+        for samples in [PHONE, DESKTOP] {
+            let mut r = Run::new();
+            for &(send, remb, rtt, min_rtt) in samples {
+                let w = remb_window(send, remb, rtt, min_rtt);
+                assert!(r.feed_n(w, 2).is_empty(), "demoted on {w:?}");
+            }
+        }
     }
 
     #[test]

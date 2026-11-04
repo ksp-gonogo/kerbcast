@@ -33,6 +33,8 @@ pub struct VideoTrack {
     /// The camera whose frames this track last sent live, cleared while the
     /// track sends nothing. See `first_live_frame`.
     live_camera: std::sync::Mutex<Option<u32>>,
+    /// Frames handed to this track, sent or not.
+    frames_given: std::sync::atomic::AtomicU64,
 }
 
 /// What `write_frame` sent.
@@ -79,10 +81,16 @@ impl VideoTrack {
             }),
             stamps,
             live_camera: std::sync::Mutex::new(None),
+            frames_given: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// The webrtc-rs track to `add_track` onto the peer connection.
+    /// How many frames have been handed to this track, sent or not.
+    pub fn frames_given(&self) -> u64 {
+        self.frames_given.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn rtp_track(&self) -> Arc<TrackLocalStaticRTP> {
         self.rtp.clone()
     }
@@ -102,6 +110,8 @@ impl VideoTrack {
         flight_id: u32,
         capture: &CaptureStamp,
     ) -> webrtc::error::Result<Option<SentFrameInfo>> {
+        self.frames_given
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         /* Unbound or paused everywhere (`all` is true with no bindings): send
         nothing and leave the sequence untouched, matching
         TrackLocalStaticSample. */
