@@ -83,6 +83,12 @@ struct Cli {
     #[arg(long)]
     bitrate_bps: Option<u32>,
 
+    /// Test tool: serve POST /links/tier, which moves one viewer's feed
+    /// between the full and the lighter stream by hand. The plugin passes it
+    /// when settings.cfg sets ManualStreamTierTesting = true.
+    #[arg(long)]
+    manual_tier_switch: bool,
+
     /// Polling interval (ms) for the consumer loop while at least one
     /// peer is subscribed. When no peer is subscribed the loop sleeps for
     /// `idle_interval_ms` instead.
@@ -193,6 +199,7 @@ async fn main() -> Result<()> {
         encoder_choice: cli.encoder,
         fps: cli.fps,
         bitrate_bps,
+        manual_tier_switch: cli.manual_tier_switch,
     };
 
     let http_listener = TcpListener::bind(cli.http_bind).await.map_err(|e| {

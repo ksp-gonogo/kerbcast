@@ -135,6 +135,7 @@
     <Compile Remove="QualityClamp.Tests/**/*.cs" />
     <Compile Remove="QualityTier.Tests/**/*.cs" />
     <Compile Remove="SidecarLifecycle.Tests/**/*.cs" />
+    <Compile Remove="SidecarArgs.Tests/**/*.cs" />
     <Compile Remove="IntegrationPolicy.Tests/**/*.cs" />
     <Compile Remove="CaptureEpoch.Tests/**/*.cs" />
     <Compile Remove="InFlightSignal.Tests/**/*.cs" />

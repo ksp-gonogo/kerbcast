@@ -58,6 +58,8 @@ pub struct AppState {
     pub encoder_choice: EncoderChoice,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// Serve POST /links/tier (`--manual-tier-switch`).
+    pub manual_tier_switch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,15 +144,13 @@ pub struct DumpLogsResponse {
     pub entries: Vec<StatusLogEntry>,
 }
 
-/// Turns on `POST /links/tier`, for test rigs only.
+/// Turns on `POST /links/tier` like `--manual-tier-switch`, for test rigs
+/// that start the sidecar themselves.
 pub const RIG_MANUAL_TIERS_ENV: &str = "KERBCAST_RIG_MANUAL_TIERS";
 
 pub fn router(state: AppState) -> Router {
-    let manual_tiers = std::env::var(RIG_MANUAL_TIERS_ENV).is_ok_and(|v| v == "1");
-    router_with(state, manual_tiers)
-}
-
-fn router_with(state: AppState, manual_tiers: bool) -> Router {
+    let manual_tiers =
+        state.manual_tier_switch || std::env::var(RIG_MANUAL_TIERS_ENV).is_ok_and(|v| v == "1");
     let mut router = Router::new();
     /* Any web page a viewer opens can reach the sidecar (CORS allows every
     origin), so the hand tier switch exists only when a rig asks for it. */
@@ -222,8 +222,9 @@ async fn links(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Move one viewer's feed of one camera onto a delivery tier by hand, for
-/// testing a tier switch on a real link. Served only when
-/// `KERBCAST_RIG_MANUAL_TIERS=1` is set.
+/// testing a tier switch on a real link. Served only with
+/// `--manual-tier-switch` (settings.cfg ManualStreamTierTesting) or
+/// `KERBCAST_RIG_MANUAL_TIERS=1`.
 async fn set_link_tier(
     State(state): State<AppState>,
     Json(req): Json<SetTierRequest>,
@@ -602,6 +603,7 @@ mod tests {
             encoder_choice: EncoderChoice::Auto,
             fps: 30,
             bitrate_bps: 2_000_000,
+            manual_tier_switch: false,
         }
     }
 
@@ -638,6 +640,40 @@ mod tests {
             body.len() > 400_000,
             "expected the real Mediabunny bundle, got {} bytes",
             body.len(),
+        );
+    }
+
+    /// The hand tier switch exists only when the operator turns it on.
+    #[tokio::test]
+    async fn the_manual_tier_switch_is_served_only_when_turned_on() {
+        let post = |state: AppState| async move {
+            let response = router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/links/tier")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"peerId":7,"flightId":1,"tier":"reduced"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let (status, body) = post(empty_state()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.is_empty(), "no such route: {body}");
+        let on = AppState {
+            manual_tier_switch: true,
+            ..empty_state()
+        };
+        let (status, body) = post(on).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.contains("no live viewer"),
+            "the route answered: {body}"
         );
     }
 

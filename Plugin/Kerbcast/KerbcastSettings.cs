@@ -96,6 +96,10 @@ namespace Kerbcast
         // software fallback). Set explicitly to trade bandwidth for image
         // quality. Applies to every stream; only read at sidecar launch.
         public int BitrateBps { get; private set; } = 0;
+        /* Test tool: lets a test rig move one viewer's feed between the full
+           and the lighter stream by hand (the sidecar's POST /links/tier).
+           Forwarded to the sidecar at launch. Default false. */
+        public bool ManualStreamTierTesting { get; private set; } = false;
         /* Adaptive QUALITY ladder (resolution + FX-layer cascade,
            see KerbcastCamera.ShedTable) driven by AdaptiveQualityController.
            Default true: kerbcast demotes quality once staggering is exhausted
@@ -517,6 +521,7 @@ namespace Kerbcast
             ApplyInt(node, "Width", v => settings.Width = v);
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyInt(node, "BitrateBps", v => settings.BitrateBps = v);
+            ApplyBool(node, "ManualStreamTierTesting", v => settings.ManualStreamTierTesting = v);
             ApplyBool(node, "AdaptiveQuality", v => settings.AdaptiveQuality = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyFloat(node, "devLightSpeedMps", v => settings.DevLightSpeedMps = v);

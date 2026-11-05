@@ -130,11 +130,12 @@ namespace Kerbcast
                 || fresh.Width != _settings.Width
                 || fresh.Height != _settings.Height
                 || fresh.BitrateBps != _settings.BitrateBps
+                || fresh.ManualStreamTierTesting != _settings.ManualStreamTierTesting
                 || fresh.AutoSpawnSidecar != _settings.AutoSpawnSidecar)
             {
                 Debug.LogWarning(
                     "[Kerbcast] process-level settings (bind/port, Width/Height, BitrateBps, "
-                    + "AutoSpawnSidecar) changed since the sidecar was launched; they apply "
+                    + "ManualStreamTierTesting, AutoSpawnSidecar) changed since the sidecar was launched; they apply "
                     + "on the next KSP start. Camera-level settings apply now.");
             }
         }
@@ -276,21 +277,13 @@ namespace Kerbcast
                 // accepts every value we care about as a long-form arg,
                 // so there's no config file to keep in sync on the
                 // sidecar side.
-                var args =
-                    $"--shm-dir \"{_ringDir}\" " +
-                    $"--http-bind {_settings.HttpBind} " +
-                    $"--max-width {_settings.Width} " +
-                    $"--max-height {_settings.Height}";
-
-                // Explicit bitrate only when the operator configured one.
-                // BitrateBps = 0 (the default) means auto: omit the flag so
-                // the sidecar derives its default from the encoder backend
-                // it selects (hardware backends default higher than the
-                // software fallback).
-                if (_settings.BitrateBps > 0)
-                {
-                    args += $" --bitrate-bps {_settings.BitrateBps}";
-                }
+                var args = SidecarArgs.Build(
+                    _ringDir,
+                    _settings.HttpBind,
+                    _settings.Width,
+                    _settings.Height,
+                    _settings.BitrateBps,
+                    _settings.ManualStreamTierTesting);
 
                 var psi = new ProcessStartInfo
                 {
