@@ -126,8 +126,9 @@ pub struct PeerLink {
     pub link: Option<crate::link::LinkWindow>,
     /// The tier each feed is actually sent on.
     pub tiers: Vec<crate::ladder::SlotTier>,
-    /// The tiers the detector would put this viewer's feeds on. Shadow only:
-    /// nothing moves a feed except `POST /links/tier`.
+    /// The tiers the detector chose for this viewer's feeds. They are applied
+    /// only with `--lighter-streams-for-slow-viewers`; otherwise they are a
+    /// shadow of what it would do.
     pub shadow: crate::ladder::LadderState,
 }
 

@@ -54,7 +54,7 @@ use super::video_track::VideoTrack;
 
 use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
-use crate::ladder::{Ladder, LadderConfig, LadderState, SlotTier, SlotView, Tier};
+use crate::ladder::{Ladder, LadderConfig, LadderState, SlotTier, SlotView, Tier, TierChange};
 use crate::link::{LinkMonitor, LinkWindow, SlotCounters, LINK_WINDOW};
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ConfirmSlotsPayload,
@@ -281,8 +281,8 @@ pub struct KerbcastPeer {
     link: SharedLink,
 }
 
-/// A viewer's link measurements and the tier decisions made from them. The
-/// decisions are shadow only for now: logged and reported, never applied.
+/// A viewer's link measurements and the tier decisions made from them,
+/// applied only when lighter streams for slow viewers is on.
 #[derive(Debug)]
 struct LinkState {
     monitor: LinkMonitor,
@@ -937,13 +937,7 @@ impl KerbcastPeer {
     }
 
     async fn bound_slot_tracks(&self) -> Vec<(usize, u32, Arc<VideoTrack>)> {
-        self.slots
-            .lock()
-            .await
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.bound.map(|f| (i, f, s.track.clone())))
-            .collect()
+        bound_tracks_by_slot(&self.slots).await
     }
 
     /// The tiers the detector has chosen for this viewer's feeds.
@@ -1221,6 +1215,10 @@ async fn handle_client_message(
             registry
                 .set_forced_full_res(flight_id, peer_id, force)
                 .await;
+            if force {
+                let bound = bound_tracks_by_slot(&slots).await;
+                return_recorded_feeds_to_full(&registry, flight_id, &bound).await;
+            }
         }
         // A recording holding this camera at its current size. Released with
         // the force below on unsubscribe / disconnect / peer reap.
@@ -2121,17 +2119,17 @@ async fn sample_link(
         tracing::debug!(peer_id, window = ?w, "viewer link window");
         let views = slot_views(&registry, peer_id, &slots).await;
         let changes = lock_link(&link).ladder.step(now, &w, &views);
-        for c in changes {
-            info!(
+        if !changes.is_empty() {
+            let bound = bound_tracks_by_slot(&slots).await;
+            act_on_tier_changes(
+                &registry,
                 peer_id,
-                flight_id = c.flight_id,
-                slot = c.slot,
-                to = ?c.to,
-                reason = ?c.reason,
-                loss_pct = format!("{:.1}", w.loss * 100.0),
-                rtt_ms = w.rtt_ms.map(|r| r.round() as u64),
-                "shadow tier change (not applied)"
-            );
+                &bound,
+                &changes,
+                &w,
+                registry.lighter_streams(),
+            )
+            .await;
         }
         windows += 1;
         if windows % SUMMARY_EVERY == 1 {
@@ -2150,6 +2148,88 @@ async fn sample_link(
             );
         }
     }
+}
+
+/**
+ * Carry out the detector's moves, or with `apply` off only log them. A move
+ * goes through `set_track_tier`, which replaces any move still pending on the
+ * same feed, so a feed is never left waiting on two tiers.
+ */
+async fn act_on_tier_changes(
+    registry: &Arc<CameraRegistry>,
+    peer_id: u32,
+    bound: &[(usize, u32, Arc<VideoTrack>)],
+    changes: &[TierChange],
+    w: &LinkWindow,
+    apply: bool,
+) {
+    for c in changes {
+        let loss_pct = format!("{:.1}", w.loss * 100.0);
+        let rtt_ms = w.rtt_ms.map(|r| r.round() as u64);
+        if !apply {
+            info!(
+                peer_id,
+                flight_id = c.flight_id,
+                slot = c.slot,
+                to = ?c.to,
+                reason = ?c.reason,
+                loss_pct,
+                rtt_ms,
+                "shadow tier change (not applied)"
+            );
+            continue;
+        }
+        let track = bound
+            .iter()
+            .find(|(slot, flight_id, _)| (*slot, *flight_id) == (c.slot, c.flight_id))
+            .map(|(_, _, t)| t);
+        let Some(track) = track else { continue };
+        let Some(cam) = registry.get(c.flight_id).await else {
+            continue;
+        };
+        if cam.set_track_tier(track, c.to).await {
+            info!(
+                peer_id,
+                flight_id = c.flight_id,
+                slot = c.slot,
+                to = ?c.to,
+                reason = ?c.reason,
+                loss_pct,
+                rtt_ms,
+                "viewer tier change (applied)"
+            );
+        }
+    }
+}
+
+/// A recording needs the full stream: when a viewer starts forcing full
+/// resolution on a camera, its feed of that camera leaves Reduced at once
+/// rather than at the next link window.
+async fn return_recorded_feeds_to_full(
+    registry: &Arc<CameraRegistry>,
+    flight_id: u32,
+    bound: &[(usize, u32, Arc<VideoTrack>)],
+) {
+    let Some(cam) = registry.get(flight_id).await else {
+        return;
+    };
+    for (_, f, track) in bound {
+        if *f == flight_id && cam.tier_of(track).await == Some(Tier::Reduced) {
+            cam.set_track_tier(track, Tier::Full).await;
+            info!(flight_id, "recording started, feed back to the full stream");
+        }
+    }
+}
+
+/// Every bound slot's index, camera and track.
+async fn bound_tracks_by_slot(slots: &Arc<Mutex<Vec<Slot>>>) -> Vec<(usize, u32, Arc<VideoTrack>)> {
+    slots
+        .lock()
+        .await
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.bound.map(|f| (i, f, s.track.clone())))
+        .collect()
 }
 
 /// The viewer's bound slots as the tier detector sees them.
@@ -2763,6 +2843,221 @@ mod tests {
     // (flight re-entry, same flight id) must get its subscription rebound
     // onto the brand-new CameraState by resync_after_camera_churn, so the
     // stream resumes without the browser doing anything.
+    /// Cameras 1, 2 and 3, each fed to one slot of peer 9 whose reported
+    /// display sizes are 640x360, 200x112 and 320x180.
+    async fn three_watched_cameras() -> (
+        tempfile::TempDir,
+        Arc<CameraRegistry>,
+        Vec<(usize, u32, Arc<VideoTrack>)>,
+    ) {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 640,
+            max_height: 360,
+        };
+        for id in 1..=3 {
+            MmapFrameRing::create(&dir.path().join(format!("{id}.ring")), cfg).expect("ring");
+        }
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let outbox = Outbox::spawn(Arc::new(Mutex::new(None)), "test".to_owned());
+        let mut bound = Vec::new();
+        for (slot, (id, w, h)) in [(1, 640, 360), (2, 200, 112), (3, 320, 180)]
+            .into_iter()
+            .enumerate()
+        {
+            let cam = registry.get(id).await.expect("camera");
+            let track = slot_track(slot, &outbox);
+            cam.add_track(track.clone()).await;
+            cam.record_display_size(9, w, h).await;
+            bound.push((slot, id, track));
+        }
+        (dir, registry, bound)
+    }
+
+    async fn views(
+        registry: &Arc<CameraRegistry>,
+        bound: &[(usize, u32, Arc<VideoTrack>)],
+    ) -> Vec<SlotView> {
+        let mut out = Vec::new();
+        for (slot, flight_id, _) in bound {
+            let cam = registry.get(*flight_id).await.unwrap();
+            out.push(SlotView {
+                slot: *slot,
+                flight_id: *flight_id,
+                display_area: cam.display_area_for(9).await,
+                pinned_full: cam.forced_full_res.lock().await.contains(&9),
+            });
+        }
+        out
+    }
+
+    fn link(loss: f64, rtt: f64, min_rtt: f64, remb: Option<u64>) -> LinkWindow {
+        LinkWindow {
+            span_ms: 2000,
+            send_bps: 2_000_000,
+            packets_sent: 600,
+            loss,
+            rtt_ms: Some(rtt),
+            min_rtt_ms: Some(min_rtt),
+            nacks_per_s: 0.0,
+            plis_per_s: 0.0,
+            remb_bps: remb,
+        }
+    }
+
+    /// Drive the detector over `windows` and act on every change, the way the
+    /// link sampler does.
+    async fn drive(
+        registry: &Arc<CameraRegistry>,
+        bound: &[(usize, u32, Arc<VideoTrack>)],
+        ladder: &mut Ladder,
+        windows: &[LinkWindow],
+        apply: bool,
+        start: std::time::Instant,
+    ) -> usize {
+        let mut moves = 0;
+        for (n, w) in windows.iter().enumerate() {
+            let now = start + LINK_WINDOW * (n as u32 + 1);
+            let changes = ladder.step(now, w, &views(registry, bound).await);
+            moves += changes.len();
+            act_on_tier_changes(registry, 9, bound, &changes, w, apply).await;
+        }
+        moves
+    }
+
+    async fn reduced_wanted(registry: &Arc<CameraRegistry>, id: u32) -> bool {
+        registry.get(id).await.unwrap().reduced.wanted().await
+    }
+
+    #[tokio::test]
+    async fn with_the_setting_off_no_feed_ever_moves() {
+        let (_dir, registry, bound) = three_watched_cameras().await;
+        let mut ladder = Ladder::new(LadderConfig::default());
+        let lossy = vec![link(0.3, 40.0, 40.0, None); 4];
+        let decided = drive(
+            &registry,
+            &bound,
+            &mut ladder,
+            &lossy,
+            false,
+            std::time::Instant::now(),
+        )
+        .await;
+        assert!(decided > 0, "the detector still decides, in shadow");
+        for id in 1..=3 {
+            assert!(
+                !reduced_wanted(&registry, id).await,
+                "camera {id} stayed on Full"
+            );
+        }
+    }
+
+    /// The Deck's two clean LAN viewers move no feed even with the setting on.
+    #[tokio::test]
+    async fn measured_clean_lan_viewers_move_no_feed_with_the_setting_on() {
+        use crate::ladder::measured::{DESKTOP, PHONE};
+        for samples in [PHONE, DESKTOP] {
+            let (_dir, registry, bound) = three_watched_cameras().await;
+            let mut ladder = Ladder::new(LadderConfig::default());
+            let windows: Vec<LinkWindow> = samples
+                .iter()
+                .flat_map(|&(send, remb, rtt, min_rtt)| {
+                    let w = LinkWindow {
+                        send_bps: send,
+                        ..link(0.0, rtt, min_rtt, Some(remb))
+                    };
+                    [w, w]
+                })
+                .collect();
+            let moves = drive(
+                &registry,
+                &bound,
+                &mut ladder,
+                &windows,
+                true,
+                std::time::Instant::now(),
+            )
+            .await;
+            assert_eq!(moves, 0);
+            for id in 1..=3 {
+                assert!(!reduced_wanted(&registry, id).await);
+            }
+        }
+    }
+
+    /// With the setting on, sustained loss moves the smallest feed first, one
+    /// feed per dwell, and a clean spell brings it back.
+    #[tokio::test]
+    async fn with_the_setting_on_congestion_moves_the_smallest_feed_and_recovery_returns_it() {
+        let (_dir, registry, bound) = three_watched_cameras().await;
+        let mut ladder = Ladder::new(LadderConfig::default());
+        let start = std::time::Instant::now();
+        let lossy = vec![link(0.08, 60.0, 40.0, None); 2];
+        assert_eq!(
+            drive(&registry, &bound, &mut ladder, &lossy, true, start).await,
+            1
+        );
+        assert!(
+            reduced_wanted(&registry, 2).await,
+            "the 200x112 feed moves first"
+        );
+        assert!(!reduced_wanted(&registry, 1).await);
+        assert!(!reduced_wanted(&registry, 3).await);
+
+        /* The move lands on Reduced's keyframe. */
+        let cam = registry.get(2).await.unwrap();
+        for track in cam.reduced.take_pending().await {
+            assert!(cam.move_track(&track, Tier::Reduced).await);
+        }
+
+        let clean = vec![link(0.0, 40.0, 40.0, None); 12];
+        let later = start + LINK_WINDOW * 2;
+        assert_eq!(
+            drive(&registry, &bound, &mut ladder, &clean, true, later).await,
+            1
+        );
+        assert!(cam.full.wanted().await, "on its way back to Full");
+        assert_eq!(cam.full.pending.read().await.len(), 1);
+    }
+
+    /// A recording takes its feed off Reduced at once, and the detector
+    /// never moves a recorded feed.
+    #[tokio::test]
+    async fn a_recorded_feed_returns_to_full_at_once_and_stays_there() {
+        let (_dir, registry, bound) = three_watched_cameras().await;
+        let (_, _, track) = &bound[1];
+        let cam = registry.get(2).await.unwrap();
+        assert!(cam.move_track(track, Tier::Reduced).await);
+
+        registry.set_forced_full_res(2, 9, true).await;
+        return_recorded_feeds_to_full(&registry, 2, &bound).await;
+        assert_eq!(cam.full.pending.read().await.len(), 1, "moving back now");
+        for t in cam.full.take_pending().await {
+            assert!(cam.move_track(&t, Tier::Full).await);
+        }
+
+        let mut ladder = Ladder::new(LadderConfig::default());
+        let severe = vec![link(0.3, 40.0, 40.0, None); 6];
+        drive(
+            &registry,
+            &bound,
+            &mut ladder,
+            &severe,
+            true,
+            std::time::Instant::now(),
+        )
+        .await;
+        assert!(
+            !cam.reduced.wanted().await,
+            "the recorded feed stays on Full"
+        );
+        assert!(reduced_wanted(&registry, 1).await, "the others still move");
+        assert!(reduced_wanted(&registry, 3).await);
+    }
+
     #[tokio::test]
     async fn reattached_ring_rebinds_surviving_subscription() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};

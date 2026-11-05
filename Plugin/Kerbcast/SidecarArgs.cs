@@ -10,7 +10,8 @@ namespace Kerbcast
             int width,
             int height,
             int bitrateBps,
-            bool manualStreamTierTesting)
+            bool manualStreamTierTesting,
+            bool lighterStreamsForSlowViewers)
         {
             var args =
                 $"--shm-dir \"{ringDir}\" " +
@@ -28,6 +29,10 @@ namespace Kerbcast
             if (manualStreamTierTesting)
             {
                 args += " --manual-tier-switch";
+            }
+            if (lighterStreamsForSlowViewers)
+            {
+                args += " --lighter-streams-for-slow-viewers";
             }
             return args;
         }

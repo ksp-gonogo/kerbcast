@@ -1645,6 +1645,10 @@ pub struct CameraRegistry {
     /// consume loop never encodes; we measure the plugin's KSP-frametime
     /// cost cleanly, not the sidecar encode path.
     force_render: AtomicBool,
+    /// Move a slow viewer's feeds onto the lighter stream automatically
+    /// (`--lighter-streams-for-slow-viewers`). Off: the tier detector only
+    /// logs what it would do.
+    lighter_streams: AtomicBool,
     /*
      * Monotonic sequence counter for global.control.json writes. Seeded on
      * the first write from the on-disk file (max(on-disk seq, 0) + 1) so a
@@ -1822,6 +1826,7 @@ impl CameraRegistry {
             status_log: Mutex::new(std::collections::VecDeque::new()),
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
+            lighter_streams: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
             command_queue: Mutex::new(CommandQueue::default()),
             command_signal: std::sync::Mutex::new(None),
@@ -1896,6 +1901,14 @@ impl CameraRegistry {
 
     pub fn force_render(&self) -> bool {
         self.force_render.load(Ordering::Acquire)
+    }
+
+    pub fn set_lighter_streams(&self, on: bool) {
+        self.lighter_streams.store(on, Ordering::Release);
+    }
+
+    pub fn lighter_streams(&self) -> bool {
+        self.lighter_streams.load(Ordering::Acquire)
     }
 
     /// Per-tick subscription bookkeeping. Normally: a camera that has lost its

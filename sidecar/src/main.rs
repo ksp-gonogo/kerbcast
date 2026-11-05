@@ -89,6 +89,13 @@ struct Cli {
     #[arg(long)]
     manual_tier_switch: bool,
 
+    /// Move a viewer whose connection cannot carry a camera's full stream
+    /// onto a lighter one (half size and frame rate), and back once it
+    /// recovers. The plugin passes it when settings.cfg sets
+    /// LighterStreamsForSlowViewers = true.
+    #[arg(long)]
+    lighter_streams_for_slow_viewers: bool,
+
     /// Polling interval (ms) for the consumer loop while at least one
     /// peer is subscribed. When no peer is subscribed the loop sleeps for
     /// `idle_interval_ms` instead.
@@ -191,6 +198,10 @@ async fn main() -> Result<()> {
         "camera registry initialised — scanning for rings (per-ring geometry)",
     );
     registry.reset_anchors().await;
+    registry.set_lighter_streams(cli.lighter_streams_for_slow_viewers);
+    if cli.lighter_streams_for_slow_viewers {
+        info!("lighter streams for slow viewers: on");
+    }
 
     let peers: Arc<RwLock<Vec<Arc<KerbcastPeer>>>> = Arc::new(RwLock::new(Vec::new()));
     let state = AppState {

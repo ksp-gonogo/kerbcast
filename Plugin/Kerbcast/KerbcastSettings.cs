@@ -100,6 +100,11 @@ namespace Kerbcast
            and the lighter stream by hand (the sidecar's POST /links/tier).
            Forwarded to the sidecar at launch. Default false. */
         public bool ManualStreamTierTesting { get; private set; } = false;
+        /* Give a viewer whose connection cannot carry a camera's full stream
+           a lighter one (half size and frame rate) automatically, and the
+           full one back once it recovers. Forwarded to the sidecar at launch.
+           Default false until measured on more connections. */
+        public bool LighterStreamsForSlowViewers { get; private set; } = false;
         /* Adaptive QUALITY ladder (resolution + FX-layer cascade,
            see KerbcastCamera.ShedTable) driven by AdaptiveQualityController.
            Default true: kerbcast demotes quality once staggering is exhausted
@@ -522,6 +527,7 @@ namespace Kerbcast
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyInt(node, "BitrateBps", v => settings.BitrateBps = v);
             ApplyBool(node, "ManualStreamTierTesting", v => settings.ManualStreamTierTesting = v);
+            ApplyBool(node, "LighterStreamsForSlowViewers", v => settings.LighterStreamsForSlowViewers = v);
             ApplyBool(node, "AdaptiveQuality", v => settings.AdaptiveQuality = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
             ApplyFloat(node, "devLightSpeedMps", v => settings.DevLightSpeedMps = v);

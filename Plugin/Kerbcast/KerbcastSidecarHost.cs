@@ -131,11 +131,12 @@ namespace Kerbcast
                 || fresh.Height != _settings.Height
                 || fresh.BitrateBps != _settings.BitrateBps
                 || fresh.ManualStreamTierTesting != _settings.ManualStreamTierTesting
+                || fresh.LighterStreamsForSlowViewers != _settings.LighterStreamsForSlowViewers
                 || fresh.AutoSpawnSidecar != _settings.AutoSpawnSidecar)
             {
                 Debug.LogWarning(
                     "[Kerbcast] process-level settings (bind/port, Width/Height, BitrateBps, "
-                    + "ManualStreamTierTesting, AutoSpawnSidecar) changed since the sidecar was launched; they apply "
+                    + "ManualStreamTierTesting, LighterStreamsForSlowViewers, AutoSpawnSidecar) changed since the sidecar was launched; they apply "
                     + "on the next KSP start. Camera-level settings apply now.");
             }
         }
@@ -283,7 +284,8 @@ namespace Kerbcast
                     _settings.Width,
                     _settings.Height,
                     _settings.BitrateBps,
-                    _settings.ManualStreamTierTesting);
+                    _settings.ManualStreamTierTesting,
+                    _settings.LighterStreamsForSlowViewers);
 
                 var psi = new ProcessStartInfo
                 {
