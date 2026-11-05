@@ -1209,9 +1209,13 @@ function installStubMediaStream(): void {
  * Minimal MediaRecorder stand-in for jsdom, installed by {@link installDomStubs}.
  *
  * jsdom implements no MediaRecorder, so the recording controller can't run
- * headlessly without this. On `stop()` it synchronously flushes one canned
- * Blob (a fixed byte pattern tagged with the negotiated mimeType) then fires
- * `stop`, closing the start -> stop -> Blob path the controller drives.
+ * headlessly without this. It flushes data the way Chromium's MP4 recorder
+ * does: `requestData()` before the stop yields only the 36-byte file header
+ * the first time and nothing after, and `stop()` flushes the rest of the file
+ * in one 2048-byte Blob (a fixed byte pattern tagged with the negotiated
+ * mimeType), then fires `stop`. So a clip cut at a chunk boundary keeps no
+ * media, as in the browser. `pause()` and `resume()` leave the paused time
+ * out of the file, which {@link mediaMs} reports.
  *
  * `isTypeSupported` is controllable so tests exercise mime negotiation:
  *   - `supportedTypes = null` (default): support everything, so negotiation
@@ -1222,6 +1226,8 @@ function installStubMediaStream(): void {
 export class StubMediaRecorder {
   /** Types isTypeSupported reports available; null = everything. */
   static supportedTypes: string[] | null = null;
+  /** The recorder made last. */
+  static last: StubMediaRecorder | null = null;
 
   static isTypeSupported(type: string): boolean {
     return StubMediaRecorder.supportedTypes === null
@@ -1234,10 +1240,19 @@ export class StubMediaRecorder {
   state: "inactive" | "recording" | "paused" = "inactive";
 
   private readonly _listeners = new Map<string, Set<(e: { data?: Blob }) => void>>();
+  private _headerSent = false;
+  private _recordedMs = 0;
+  private _since: number | null = null;
 
   constructor(stream: MediaStream, options?: { mimeType?: string }) {
     this.stream = stream;
     this.mimeType = options?.mimeType ?? "";
+    StubMediaRecorder.last = this;
+  }
+
+  /** How long the file runs, in ms: the time spent recording, paused stretches left out. */
+  get mediaMs(): number {
+    return this._recordedMs + (this._since == null ? 0 : stubNow() - this._since);
   }
 
   addEventListener(type: string, cb: (e: { data?: Blob }) => void): void {
@@ -1257,25 +1272,51 @@ export class StubMediaRecorder {
     this._listeners.get(type)?.forEach((cb) => cb(e));
   }
 
+  private _type(): string {
+    return this.mimeType || "video/webm";
+  }
+
   start(_timeslice?: number): void {
+    this.state = "recording";
+    this._since = stubNow();
+  }
+
+  pause(): void {
+    if (this.state !== "recording") return;
+    this._recordedMs = this.mediaMs;
+    this._since = null;
+    this.state = "paused";
+  }
+
+  resume(): void {
+    if (this.state !== "paused") return;
+    this._since = stubNow();
     this.state = "recording";
   }
 
-  /** Flush a canned data chunk, then fire `stop`, mirroring the real order. */
+  /** Flush the rest of the file, then fire `stop`, mirroring the real order. */
   stop(): void {
     if (this.state === "inactive") return;
+    this._recordedMs = this.mediaMs;
+    this._since = null;
     this.state = "inactive";
     const bytes = new Uint8Array(2048);
     for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
-    const data = new Blob([bytes], { type: this.mimeType || "video/webm" });
-    this._emit("dataavailable", { data });
+    this._emit("dataavailable", { data: new Blob([bytes], { type: this._type() }) });
     this._emit("stop", {});
   }
 
-  /** Emit a partial data chunk without stopping (matches the real API). */
+  /** The file header on the first call and nothing after, as Chromium's MP4 muxer does. */
   requestData(): void {
-    if (this.state !== "recording") return;
-    const data = new Blob([new Uint8Array(512)], { type: this.mimeType || "video/webm" });
-    this._emit("dataavailable", { data });
+    if (this.state === "inactive") return;
+    const size = this._headerSent ? 0 : 36;
+    this._headerSent = true;
+    this._emit("dataavailable", { data: new Blob([new Uint8Array(size)], { type: this._type() }) });
   }
+}
+
+function stubNow(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
 }

@@ -216,6 +216,66 @@ describe("capture-timed recording", () => {
     expect(handle.utEnd).toBeCloseTo(100 + 5 / 30);
   });
 
+  it("ends a clip whose camera stays off the list with the frames from before it left", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.useFakeTimers();
+    const client = new TapClient();
+    const controller = new RecordingController(client);
+    const cam = client.camera(1);
+    const aus = accessUnits();
+    const id = controller.startRecording(1);
+    for (let i = 0; i < 6; i++) {
+      client.stamps.set(i * 3000, 100 + i / 30);
+      cam.send(aus[i], i * 3000);
+    }
+    client.emitCameras([]);
+    /* The feed keeps sending while the grace runs (static, as the Deck shows). */
+    for (let i = 6; i < 12; i++) {
+      client.stamps.set(i * 3000, 100 + i / 30);
+      cam.send(aus[i], i * 3000);
+    }
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
+    await vi.waitFor(() => expect(controller.fetchRecording(id)).toBeDefined());
+
+    const handle = controller.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBeCloseTo(200);
+    expect(handle.utSamples.map((s) => s.ut)).toEqual(Array.from({ length: 6 }, (_, i) => 100 + i / 30));
+    expect(handle.utEnd).toBeCloseTo(100 + 5 / 30);
+  });
+
+  it("drops a brief list gap's frames and picks up at the next keyframe, holding the last picture across it", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const client = new TapClient();
+    const controller = new RecordingController(client);
+    const cam = client.camera(1);
+    const aus = accessUnits();
+    const listedCam = { flightId: 1 } as CameraState;
+    const at = (i: number): number => (i * 100) / 3;
+    const id = controller.startRecording(1);
+    for (let i = 0; i < 6; i++) {
+      client.stamps.set(i * 3000, 100 + i / 30);
+      cam.send(aus[i], i * 3000, at(i));
+    }
+    client.emitCameras([]);
+    for (let i = 6; i < 9; i++) cam.send(aus[i], i * 3000, at(i));
+    client.emitCameras([listedCam]);
+    const asked = cam.keyframeRequests;
+    client.tick(101);
+    expect(cam.keyframeRequests).toBe(asked + 1);
+    /* P-frames before the keyframe refer to pictures the clip never took. */
+    for (let i = 9; i < 14; i++) {
+      client.stamps.set(i * 3000, 100 + i / 30);
+      cam.send(aus[i], i * 3000, i < 12 ? at(i) : 2000 + at(i - 12));
+    }
+    const handle = await controller.stopRecording(id);
+
+    expect(handle.endedBy).toBe("user");
+    expect(handle.utSamples.map((s) => s.ut)).toEqual([0, 1, 2, 3, 4, 5, 12, 13].map((i) => 100 + i / 30));
+    /* The keyframe after the gap lands at its own arrival time. */
+    expect(handle.utSamples[6].t).toBeCloseTo(2000, 0);
+  });
+
   it("falls back to the clock UT track when frames carry no stamps", async () => {
     const client = new TapClient();
     const controller = new RecordingController(client);

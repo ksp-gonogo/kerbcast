@@ -1719,6 +1719,9 @@ describe("RecordingController when the camera goes away", () => {
     await vi.advanceTimersByTimeAsync(0);
   };
 
+  /** The media length of the file the recorder made last. */
+  const fileMs = (): number => StubMediaRecorder.last!.mediaMs;
+
   it("cuts a revert's clip back to when its camera left the list", async () => {
     vi.useFakeTimers();
     client.captureUt = 100;
@@ -1740,8 +1743,9 @@ describe("RecordingController when the camera goes away", () => {
     ]);
     expect(handle.utEnd).toBe(102);
     expect(handle.durationMs).toBe(2500);
-    /* Only the media up to the list emptying: the stub's requestData chunk, not its stop chunk. */
-    expect(handle.byteSize).toBe(512);
+    /* The whole file, which the recorder stopped taking frames into when the list emptied. */
+    expect(fileMs()).toBe(2500);
+    expect(handle.byteSize).toBe(2048);
     expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
   });
 
@@ -1760,10 +1764,38 @@ describe("RecordingController when the camera goes away", () => {
     expect(handle.endedBy).toBe("camera-gone");
     expect(handle.durationMs).toBe(1000);
     expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 101, 101]);
-    expect(handle.byteSize).toBe(512);
+    expect(fileMs()).toBe(1000);
+    expect(handle.byteSize).toBe(2048);
   });
 
-  it("keeps a brief list gap whole once the clock shows no revert came with it", async () => {
+  it("ends a clip whose camera stays off the list where the camera left, not after the grace", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(101);
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    /* The clock runs on through the gap; none of it belongs in the clip. */
+    client.tick(102);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBe(1500);
+    expect(handle.utSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 1000, ut: 101 },
+      { t: 1500, ut: 101 },
+    ]);
+    expect(handle.utEnd).toBe(101);
+    expect(fileMs()).toBe(1500);
+    expect(handle.byteSize).toBe(2048);
+  });
+
+  it("leaves a brief list gap out of the clip once the clock shows no revert came with it", async () => {
     vi.useFakeTimers();
     client.captureUt = 100;
     const id = ctrl.startRecording(1);
@@ -1771,8 +1803,11 @@ describe("RecordingController when the camera goes away", () => {
     client.emitCameras([]);
     await vi.advanceTimersByTimeAsync(1000);
     client.emitCameras(listed(1, 2));
+    /* Listed again, but held until the clock shows the same timeline. */
     await vi.advanceTimersByTimeAsync(500);
+    expect(StubMediaRecorder.last!.state).toBe("paused");
     client.tick(102);
+    expect(StubMediaRecorder.last!.state).toBe("recording");
     await vi.advanceTimersByTimeAsync(1500);
     /* A later revert with the camera staying listed ends the clip where the clock saw it. */
     client.tick(30, 1);
@@ -1780,23 +1815,53 @@ describe("RecordingController when the camera goes away", () => {
 
     const handle = ctrl.fetchRecording(id)!;
     expect(handle.endedBy).toBe("camera-gone");
-    expect(handle.durationMs).toBe(4000);
-    expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 102, 102]);
-    expect(handle.byteSize).toBe(512 + 2048);
+    /* 1 s before the gap and 1.5 s after it; the 1.5 s held is not in the file. */
+    expect(handle.durationMs).toBe(2500);
+    expect(fileMs()).toBe(2500);
+    /* The UT steps where the gap was left out. */
+    expect(handle.utSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 1000, ut: 100 },
+      { t: 1000, ut: 102 },
+      { t: 2500, ut: 102 },
+    ]);
+    /* A UT inside the gap maps to where the clip skips it. */
+    expect(utToRecordingTimeMs(handle.utSamples, 101)).toBe(1000);
+    expect(handle.byteSize).toBe(2048);
   });
 
-  it("does not cut a clip stopped by hand after a brief list gap", async () => {
+  it("ends a clip stopped by hand during a list gap where the camera left", async () => {
     vi.useFakeTimers();
     client.captureUt = 100;
     const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
     client.emitCameras([]);
     await vi.advanceTimersByTimeAsync(1000);
     client.emitCameras(listed(1, 2));
     await vi.advanceTimersByTimeAsync(500);
     const handle = await ctrl.stopRecording(id);
     expect(handle.endedBy).toBe("user");
-    expect(handle.durationMs).toBe(1500);
-    expect(handle.byteSize).toBe(512 + 2048);
+    expect(handle.durationMs).toBe(1000);
+    expect(fileMs()).toBe(1000);
+    expect(handle.utSamples.map((s) => s.t)).toEqual([0, 1000]);
+  });
+
+  it("holds the clip at the first time its camera left when it leaves again before the clock confirms", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(500);
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.durationMs).toBe(1000);
+    expect(fileMs()).toBe(1000);
   });
 
   it("takes the epoch of the first clock when it started without one", async () => {
