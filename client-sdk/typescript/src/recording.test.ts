@@ -1705,6 +1705,100 @@ describe("RecordingController when the camera goes away", () => {
     expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
   });
 
+  /*
+   * Revert to Launch as a Deck run saw it: the list empties, the same cameras
+   * come back a second later under their old flight ids, and the clock push
+   * with the new epoch arrives two seconds after that.
+   */
+  const revertToLaunch = async (): Promise<void> => {
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(2000);
+    client.tick(40, 1);
+    await vi.advanceTimersByTimeAsync(0);
+  };
+
+  it("cuts a revert's clip back to when its camera left the list", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(101);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(102);
+    await vi.advanceTimersByTimeAsync(500);
+    await revertToLaunch();
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 1000, ut: 101 },
+      { t: 2000, ut: 102 },
+      { t: 2500, ut: 102 },
+    ]);
+    expect(handle.utEnd).toBe(102);
+    expect(handle.durationMs).toBe(2500);
+    /* Only the media up to the list emptying: the stub's requestData chunk, not its stop chunk. */
+    expect(handle.byteSize).toBe(512);
+    expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
+  });
+
+  it("cuts back to when the camera left when the revert's clock arrives before it is listed again", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(101);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBe(1000);
+    expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 101, 101]);
+    expect(handle.byteSize).toBe(512);
+  });
+
+  it("keeps a brief list gap whole once the clock shows no revert came with it", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(500);
+    client.tick(102);
+    await vi.advanceTimersByTimeAsync(1500);
+    /* A later revert with the camera staying listed ends the clip where the clock saw it. */
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBe(4000);
+    expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 102, 102]);
+    expect(handle.byteSize).toBe(512 + 2048);
+  });
+
+  it("does not cut a clip stopped by hand after a brief list gap", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(500);
+    const handle = await ctrl.stopRecording(id);
+    expect(handle.endedBy).toBe("user");
+    expect(handle.durationMs).toBe(1500);
+    expect(handle.byteSize).toBe(512 + 2048);
+  });
+
   it("takes the epoch of the first clock when it started without one", async () => {
     const id = ctrl.startRecording(1);
     client.tick(100, 3);

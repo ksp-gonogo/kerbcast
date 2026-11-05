@@ -204,6 +204,11 @@ export class CaptureClip {
     return !this.decodable;
   }
 
+  /** Frames kept so far. */
+  get frameCount(): number {
+    return this.frames.length;
+  }
+
   push(frame: EncodedFrameCopy): void {
     if (frame.ssrc !== undefined && this.lastSsrc !== undefined && frame.ssrc !== this.lastSsrc) {
       /* A new source restarts its reference chain at a keyframe. */
@@ -303,8 +308,8 @@ export class CaptureClip {
     this.utMisses = still;
   }
 
-  /** Muxes everything collected so far. */
-  finish(): CaptureClipResult {
+  /** Muxes everything collected so far, or only the first `upTo` frames kept. */
+  finish(upTo?: number): CaptureClipResult {
     const frameUtSamples: UtSample[] = [];
     for (const f of this.frames) {
       /* A stamp can trail its frame; the client keeps seconds of them, so retry the misses. */
@@ -319,10 +324,11 @@ export class CaptureClip {
      * push that ends the recording; the clip stops at the first of them.
      */
     const firstLater = this.frames.findIndex((f) => f.later);
-    if (firstLater >= 0) {
-      this.frames.length = firstLater;
-      this.writer.truncate(firstLater);
-      if (firstLater === 0) this.firstFrameAt = null;
+    const kept = Math.min(firstLater >= 0 ? firstLater : this.frames.length, upTo ?? this.frames.length);
+    if (kept < this.frames.length) {
+      this.frames.length = kept;
+      this.writer.truncate(kept);
+      if (kept === 0) this.firstFrameAt = null;
     }
     for (const f of this.frames) {
       if (f.ut != null) frameUtSamples.push({ t: (f.dts * 1000) / RTP_VIDEO_CLOCK_HZ, ut: f.ut });

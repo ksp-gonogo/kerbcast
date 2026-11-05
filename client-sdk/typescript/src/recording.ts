@@ -49,12 +49,13 @@ export interface UtSample {
  * `"camera-gone"`: its camera went away (destroyed, as in a scene change, or
  * still missing from the camera list after {@link CAMERA_UNLISTED_GRACE_MS}),
  * or the game went back in time under it (a revert or quickload, which starts
- * a new capture epoch). `"feed-closed"`:
- * the camera is still there but its feed left this client (its tile removed
- * or switched to another camera, its track ended) and did not come back
- * within {@link SOURCE_LOST_GRACE_MS}. `"disconnected"`: the client lost the
- * sidecar and did not get the camera back within {@link RECONNECT_GRACE_MS}.
- * Whatever the reason, the clip keeps everything recorded up to then.
+ * a new capture epoch). `"feed-closed"`: the camera is still there but its
+ * feed left this client (its tile removed or switched to another camera, its
+ * track ended) and did not come back within {@link SOURCE_LOST_GRACE_MS}.
+ * `"disconnected"`: the client lost the sidecar and did not get the camera
+ * back within {@link RECONNECT_GRACE_MS}. Whatever the reason, the clip keeps
+ * everything recorded up to then, except that a revert's clip ends where its
+ * camera left the list (see {@link CAMERA_UNLISTED_GRACE_MS}).
  */
 export type RecordingEndReason =
   | "user"
@@ -77,9 +78,11 @@ export const SOURCE_LOST_GRACE_MS = 2000;
  * resumes into the same recording, and its feed gets a fresh
  * {@link SOURCE_LOST_GRACE_MS} from then to rebind. A camera that stays away
  * ends the clip when the grace runs out, so the clip keeps the grace as its
- * tail. A camera reported destroyed still ends it at once, and so does a
- * revert or quickload: game time went back, which one clip's timeline cannot
- * hold.
+ * tail. A camera reported destroyed still ends it at once. A revert or
+ * quickload ends it too, since game time went back, which one clip's
+ * timeline cannot hold. A revert takes the cameras off the list before the
+ * clock reports the jump, so that clip is cut back to when its camera left
+ * the list, with no frames or UT samples from after it.
  */
 export const CAMERA_UNLISTED_GRACE_MS = 2000;
 
@@ -376,6 +379,7 @@ interface MediaRecorderLike {
   state: string;
   start(timeslice?: number): void;
   stop(): void;
+  requestData?(): void;
   addEventListener(type: string, cb: (e: { data?: Blob }) => void): void;
   removeEventListener(type: string, cb: (e: { data?: Blob }) => void): void;
 }
@@ -405,8 +409,13 @@ interface ClipRecorder {
   /** The clip's container type as known before it stops. */
   readonly mimeType: string;
   start(): void;
-  /** Ends a started clip and resolves its media. */
-  stop(): Promise<ClipOutput>;
+  /**
+   * Notes how far a started clip has got, so a later {@link stop} can end it
+   * there instead. A new mark replaces the last.
+   */
+  mark(): void;
+  /** Ends a started clip and resolves its media, up to its {@link mark} with `toMark`. */
+  stop(toMark?: boolean): Promise<ClipOutput>;
   /** Abandons the clip, started or not, releasing everything it holds. */
   cancel(): void;
   /**
@@ -423,8 +432,14 @@ function mediaRecorderClip(recorder: MediaRecorderLike, mimeType: string): ClipR
   let stopping = false;
   let endedByItself: (() => void) | null = null;
   const waiting: Array<() => void> = [];
+  /* The chunks up to the mark, known once the data asked for at the mark arrives. */
+  let marked: number | null = null;
+  let markPending = false;
   recorder.addEventListener("dataavailable", (e) => {
     if (e.data && e.data.size > 0) chunks.push(e.data);
+    if (!markPending) return;
+    markPending = false;
+    marked = chunks.length;
   });
   /* The browser stops a recorder whose tracks all end and fires "stop"
      once; a later stop() would wait for it forever. */
@@ -437,10 +452,27 @@ function mediaRecorderClip(recorder: MediaRecorderLike, mimeType: string): ClipR
     timing: "arrival",
     mimeType,
     start: () => recorder.start(),
-    stop: () =>
+    mark: () => {
+      /*
+       * The data flushed here ends at the mark, and a recording's chunks
+       * joined in order are a playable file at any chunk boundary.
+       */
+      marked = null;
+      markPending = false;
+      if (recorder.state !== "recording" || typeof recorder.requestData !== "function") return;
+      markPending = true;
+      try {
+        recorder.requestData();
+      } catch {
+        markPending = false;
+      }
+    },
+    stop: (toMark) =>
       new Promise<ClipOutput>((resolve) => {
-        const settle = (): void =>
-          resolve({ blob: new Blob(chunks, { type: mimeType }), mimeType, timing: "arrival" });
+        const settle = (): void => {
+          const kept = toMark && marked != null ? chunks.slice(0, marked) : chunks;
+          resolve({ blob: new Blob(kept, { type: mimeType }), mimeType, timing: "arrival" });
+        };
         if (ended) {
           settle();
           return;
@@ -520,6 +552,7 @@ function captureClipRecorder(
 ): ClipRecorder | null {
   if (!cam.tapEncodedFrames || !cam.canTapEncodedFrames?.()) return null;
   let clip: CaptureClip | null = null;
+  let marked: number | null = null;
   let untap: (() => void) | null = null;
   let retry: ReturnType<typeof setInterval> | undefined;
   const release = (): void => {
@@ -549,12 +582,16 @@ function captureClipRecorder(
         if (target.waitingForKeyframe) askForKeyframe();
       }, KEYFRAME_RETRY_MS);
     },
-    stop: () => {
+    mark: () => {
+      marked = clip?.frameCount ?? null;
+    },
+    stop: (toMark) => {
       release();
       const finished = clip ?? new CaptureClip();
       clip = null;
+      const upTo = toMark && marked != null ? marked : undefined;
       return muxAfterPaint((): ClipOutput => {
-        const result = finished.finish();
+        const result = finished.finish(upTo);
         return {
           blob: result.blob,
           mimeType: result.mimeType,
@@ -881,6 +918,15 @@ interface ActiveRecording {
   latestUt?: number;
   /** The capture epoch its UT belongs to, set once a clock is known. */
   epoch?: number;
+  /** True while its camera is missing from the camera list. */
+  unlisted?: boolean;
+  /**
+   * Where the clip stood when its camera last left the list, held until a
+   * clock push in its own epoch finds the camera listed again. A revert takes
+   * the cameras off the list before its new epoch reaches the page, so a
+   * revert seen while this is held ends the clip here.
+   */
+  cutMark?: { t: number; samples: number; ut?: number };
   /** Detach from the client's settings-change clock feed. */
   unsubscribeClock: () => void;
   maxDurationTimer?: ReturnType<typeof setTimeout>;
@@ -1119,6 +1165,7 @@ export class RecordingController {
     const offCameras = this.client.on("cameras-change", (cameras) => {
       const listed = cameras.find((c) => c.flightId === rec.flightId);
       if (listed && listed.lifecycle !== CameraLifecycle.Destroyed) {
+        rec.unlisted = false;
         if (unlistedTimer == null) return;
         clearUnlisted();
         /* The feed rebinds after the list returns, so its grace starts over. */
@@ -1133,6 +1180,8 @@ export class RecordingController {
         return;
       }
       if (unlistedTimer != null) return;
+      if (!rec.unlisted) this.markCut(rec);
+      rec.unlisted = true;
       /* A dropped connection is the reconnect grace's to judge, and the list
          comes back with the connection. */
       unlistedTimer = setTimeout(() => {
@@ -1168,11 +1217,12 @@ export class RecordingController {
    * A grouped member that was the last one recording finishes its group too,
    * so a scene change that takes every camera still yields the grouped set.
    */
-  private endOnItsOwn(recordingId: string, reason: RecordingEndReason): void {
+  private endOnItsOwn(recordingId: string, reason: RecordingEndReason, toMark = false): void {
     const rec = this.active.get(recordingId);
     if (!rec || rec.stopPromise) return;
-    console.info(`kerbcast: recording ${recordingId} of camera ${rec.flightId} ended (${reason}); saving what it has`);
-    void this.stopWith(recordingId, reason).catch(() => {});
+    const upTo = toMark && rec.cutMark ? " up to when its camera left the list" : "";
+    console.info(`kerbcast: recording ${recordingId} of camera ${rec.flightId} ended (${reason}); saving what it has${upTo}`);
+    void this.stopWith(recordingId, reason, toMark).catch(() => {});
     const groupId = this.memberOfGroup.get(recordingId);
     if (groupId == null) return;
     const ids = this.groups.get(groupId) ?? [];
@@ -1504,9 +1554,10 @@ export class RecordingController {
          * one rescan, so the list may never show it destroyed. Its UT now
          * runs from an earlier point, which a clip's timeline cannot hold.
          */
-        this.endOnItsOwn(recordingId, "camera-gone");
+        this.endOnItsOwn(recordingId, "camera-gone", true);
         return;
       }
+      if (!rec.unlisted) rec.cutMark = undefined;
       rec.utSamples.push({ t: now() - rec.startedAt, ut });
       if (ut != null) rec.latestUt = ut;
     });
@@ -1708,8 +1759,23 @@ export class RecordingController {
     return rec.epoch != null && epoch != null && epoch !== rec.epoch;
   }
 
-  /** Adds a recording's last clock sample, at the stop, and returns its end UT. */
-  private closeUtTrack(rec: ActiveRecording): number | undefined {
+  /** Notes where a started clip stands, so a revert seen later can end it there. */
+  private markCut(rec: ActiveRecording): void {
+    if (rec.arming) return;
+    rec.cutMark = { t: now() - rec.startedAt, samples: rec.utSamples.length, ut: rec.latestUt };
+    rec.recorder.mark();
+  }
+
+  /**
+   * Adds a recording's last clock sample and returns its end UT: at the stop,
+   * or at `cut` with the samples after it dropped.
+   */
+  private closeUtTrack(rec: ActiveRecording, cut?: ActiveRecording["cutMark"]): number | undefined {
+    if (cut) {
+      rec.utSamples.length = cut.samples;
+      rec.utSamples.push({ t: cut.t, ut: cut.ut });
+      return cut.ut;
+    }
     const utEnd = this.utEndOf(rec);
     rec.utSamples.push({ t: now() - rec.startedAt, ut: utEnd });
     return utEnd;
@@ -1723,9 +1789,11 @@ export class RecordingController {
   /**
    * Stops a recording and saves its clip, which runs up to this stop. A clip
    * that ended on its own after a grace (a camera missing from the list, a
-   * feed that left) keeps that grace as its tail.
+   * feed that left) keeps that grace as its tail. With `toMark`, a clip whose
+   * camera left the list since the clock last confirmed its epoch ends where
+   * the camera left.
    */
-  private stopWith(recordingId: string, reason: RecordingEndReason): Promise<RecordingHandle> {
+  private stopWith(recordingId: string, reason: RecordingEndReason, toMark = false): Promise<RecordingHandle> {
     const rec = this.active.get(recordingId);
     if (!rec) {
       const done = this.finished.get(recordingId);
@@ -1776,7 +1844,8 @@ export class RecordingController {
       return rec.stopPromise;
     }
 
-    const utEnd = this.closeUtTrack(rec);
+    const cut = toMark ? rec.cutMark : undefined;
+    const utEnd = this.closeUtTrack(rec, cut);
     this.releaseHold(rec);
 
     rec.stopPromise = new Promise<RecordingHandle>((resolve, reject) => {
@@ -1790,7 +1859,7 @@ export class RecordingController {
           timing: output.timing,
           ...clipUtTrack(output, rec.utSamples, rec.startedAt, rec.utStart, utEnd),
           byteSize: blob.size,
-          durationMs: output.mediaDurationMs ?? now() - rec.startedAt,
+          durationMs: output.mediaDurationMs ?? cut?.t ?? now() - rec.startedAt,
           endedBy: reason,
         };
         /* Unconditional: a discarded-while-settling recording still held the
@@ -1824,7 +1893,7 @@ export class RecordingController {
       };
       let stopping: Promise<ClipOutput>;
       try {
-        stopping = rec.recorder.stop();
+        stopping = rec.recorder.stop(cut != null);
       } catch (err) {
         stopping = Promise.reject(err);
       }

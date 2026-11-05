@@ -191,6 +191,31 @@ describe("capture-timed recording", () => {
     expect(handle.utEnd).toBeCloseTo(100 + 5 / 30);
   });
 
+  it("cuts a revert's clip back to when its camera left the list, dropping frames whose stamps never came", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const client = new TapClient();
+    const controller = new RecordingController(client);
+    const cam = client.camera(1);
+    const aus = accessUnits();
+    const listedCam = { flightId: 1 } as CameraState;
+    const id = controller.startRecording(1);
+    for (let i = 0; i < 6; i++) {
+      client.stamps.set(i * 3000, 100 + i / 30);
+      cam.send(aus[i], i * 3000);
+    }
+    client.emitCameras([]);
+    client.emitCameras([listedCam]);
+    /* Frames from the reverted flight with no stamp found for them. */
+    for (let i = 6; i < 9; i++) cam.send(aus[i], i * 3000);
+    client.tick(20.3, 1);
+    await vi.waitFor(() => expect(controller.fetchRecording(id)).toBeDefined());
+
+    const handle = controller.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBeCloseTo(200);
+    expect(handle.utEnd).toBeCloseTo(100 + 5 / 30);
+  });
+
   it("falls back to the clock UT track when frames carry no stamps", async () => {
     const client = new TapClient();
     const controller = new RecordingController(client);
