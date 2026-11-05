@@ -12,6 +12,7 @@ interface SettingsProps {
   recordFullResolution: boolean;
   crewPlacement: CrewBarPlacement;
   crewMerge: boolean;
+  showLaunchpad: boolean;
   onThemeChange: (t: ThemePreference) => void;
   onDebugChange: (enabled: boolean) => void;
   onShowStaticChange: (enabled: boolean) => void;
@@ -19,6 +20,7 @@ interface SettingsProps {
   onRecordFullResolutionChange: (enabled: boolean) => void;
   onCrewPlacementChange: (placement: CrewBarPlacement) => void;
   onCrewMergeChange: (merge: boolean) => void;
+  onShowLaunchpadChange: (show: boolean) => void;
   onClose: () => void;
 }
 
@@ -30,6 +32,7 @@ export function Settings({
   recordFullResolution,
   crewPlacement,
   crewMerge,
+  showLaunchpad,
   onThemeChange,
   onDebugChange,
   onShowStaticChange,
@@ -37,6 +40,7 @@ export function Settings({
   onRecordFullResolutionChange,
   onCrewPlacementChange,
   onCrewMergeChange,
+  onShowLaunchpadChange,
   onClose,
 }: SettingsProps): React.JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -155,6 +159,24 @@ export function Settings({
             <option value="row">Bottom row</option>
             <option value="column">Side column</option>
           </NativeSelect>
+        </FieldRow>
+
+        <SectionLabel style={{ marginTop: "0.75rem" }}>Launchpad camera</SectionLabel>
+
+        <FieldRow>
+          <div>
+            <FieldLabel htmlFor="kc-launchpad-toggle">Show the Launchpad camera</FieldLabel>
+            <FieldHint>
+              Hides it on this browser only. Set EnableCommandCamera = false in settings.cfg to turn it off for everyone
+            </FieldHint>
+          </div>
+          <input
+            id="kc-launchpad-toggle"
+            type="checkbox"
+            checked={showLaunchpad}
+            onChange={(e) => onShowLaunchpadChange(e.target.checked)}
+            style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
+          />
         </FieldRow>
 
         <SectionLabel style={{ marginTop: "0.75rem" }}>Developer</SectionLabel>

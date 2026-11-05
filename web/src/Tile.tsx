@@ -4,12 +4,11 @@ import {
   useKerbcastCameras,
 } from "@ksp-gonogo/kerbcast-react";
 import type { FeedAction } from "@ksp-gonogo/kerbcast-react";
-import { CameraKind } from "@ksp-gonogo/kerbcast";
 import { Check, ListPlus, ListX, Pencil, Pin, PinOff, Plus, Trash2, WifiOff, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { loadLabel, saveLabel } from "./labels";
-import { cameraKey } from "./tiles";
+import { cameraKey, isCameraShown } from "./tiles";
 
 /**
  * How the tile is sized by its container:
@@ -36,6 +35,8 @@ interface TileProps {
   /** When false (crew NOT merged), the camera picker offers ONLY part cams, so
    *  crew cams stay in the crew bar and can't be selected into a part tile. */
   mergeCrew: boolean;
+  /** When false, the camera picker leaves out the command (Launchpad) camera. */
+  showLaunchpad?: boolean;
   onSelectCamera: (flightId: number) => void;
   onRemove: () => void;
   onToggleSpotlight: () => void;
@@ -58,6 +59,7 @@ export function Tile({
   variant = "grid",
   spotlightActive = false,
   mergeCrew,
+  showLaunchpad = true,
   onSelectCamera,
   onRemove,
   onToggleSpotlight,
@@ -216,7 +218,7 @@ export function Tile({
           recordFullResolution={recordFullResolution}
           showStandbyIcon={false}
           onSelectCamera={onSelectCamera}
-          cameraFilter={mergeCrew ? undefined : (c) => c.kind !== CameraKind.Kerbal}
+          cameraFilter={mergeCrew && showLaunchpad ? undefined : (c) => isCameraShown(c, { mergeCrew, showLaunchpad })}
           onDisplayedCameraChange={setDisplayedFlightId}
           enableFullscreen
           enablePictureInPicture

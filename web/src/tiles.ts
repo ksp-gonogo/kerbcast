@@ -249,6 +249,38 @@ export function pruneCrewTiles(
 }
 
 /**
+ * Whether a viewer-facing camera list (seeding, reconcile, grid, pickers)
+ * includes this camera. Kerbal face cams need the crew merge; the command
+ * (Launchpad) camera needs its own show toggle.
+ */
+export function isCameraShown(
+  camera: Pick<CameraState, "kind">,
+  opts: { mergeCrew: boolean; showLaunchpad: boolean },
+): boolean {
+  if (camera.kind === CameraKind.Kerbal) return opts.mergeCrew;
+  if (camera.kind === CameraKind.Command) return opts.showLaunchpad;
+  return true;
+}
+
+/**
+ * Drop tiles bound to a live command camera (used when the Launchpad camera is
+ * hidden). Like pruneCrewTiles, `cameras` must be the unfiltered list, empty
+ * slots and unknown ids are kept, and the same array comes back when nothing
+ * is pruned.
+ */
+export function pruneCommandTiles(
+  tiles: Tile[],
+  cameras: Pick<CameraState, "flightId" | "kind">[],
+): Tile[] {
+  const commandIds = new Set(
+    cameras.filter((c) => c.kind === CameraKind.Command).map((c) => c.flightId),
+  );
+  if (commandIds.size === 0) return tiles;
+  const next = tiles.filter((t) => t.flightId === null || !commandIds.has(t.flightId));
+  return next.length === tiles.length ? tiles : next;
+}
+
+/**
  * Add a new empty tile. There is no upper bound on tile count: the plugin and
  * sidecar adapt to load (capture staggering, frame budget), and the grid
  * layout flows into more rows as tiles are added.

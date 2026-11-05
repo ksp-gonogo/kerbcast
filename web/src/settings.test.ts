@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { loadRecordFullResolution, saveRecordFullResolution } from "./settings";
+import {
+  loadRecordFullResolution,
+  loadShowLaunchpad,
+  saveRecordFullResolution,
+  saveShowLaunchpad,
+} from "./settings";
 
 describe("record-full-resolution setting", () => {
   beforeEach(() => {
@@ -19,5 +24,19 @@ describe("record-full-resolution setting", () => {
     saveRecordFullResolution(true);
     saveRecordFullResolution(false);
     expect(loadRecordFullResolution()).toBe(false);
+  });
+});
+
+describe("show Launchpad camera", () => {
+  it("defaults to shown when the key is absent", () => {
+    localStorage.clear();
+    expect(loadShowLaunchpad()).toBe(true);
+  });
+
+  it("round-trips an explicit choice", () => {
+    saveShowLaunchpad(false);
+    expect(loadShowLaunchpad()).toBe(false);
+    saveShowLaunchpad(true);
+    expect(loadShowLaunchpad()).toBe(true);
   });
 });

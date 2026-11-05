@@ -5,7 +5,9 @@ import {
   addTile,
   cameraKey,
   loadPerfNoteDismissed,
+  isCameraShown,
   loadTiles,
+  pruneCommandTiles,
   pruneCrewTiles,
   reconcileTiles,
   removeAllCameras,
@@ -533,5 +535,35 @@ describe("performance note persistence", () => {
   it("remembers dismissal", () => {
     savePerfNoteDismissed();
     expect(loadPerfNoteDismissed()).toBe(true);
+  });
+});
+
+describe("pruneCommandTiles", () => {
+  const commandCam = (flightId: number) => ({ flightId, kind: CameraKind.Command, cameraName: "Launchpad" });
+
+  it("drops a tile bound to a command camera and keeps the rest", () => {
+    const partTile = tile(1);
+    const tiles = [partTile, tile(null), tile(301)];
+    const result = pruneCommandTiles(tiles, [partCam(1), commandCam(301)]);
+    expect(result.map((t) => t.flightId)).toEqual([1, null]);
+    expect(result[0]).toBe(partTile);
+  });
+
+  it("returns the same array when no command tile is present", () => {
+    const tiles = [tile(1), tile(null)];
+    expect(pruneCommandTiles(tiles, [partCam(1), commandCam(301)])).toBe(tiles);
+  });
+});
+
+describe("isCameraShown", () => {
+  it("gates kerbal cams on merge and command cams on the Launchpad toggle", () => {
+    const on = { mergeCrew: true, showLaunchpad: true };
+    const off = { mergeCrew: false, showLaunchpad: false };
+    expect(isCameraShown({ kind: CameraKind.Kerbal }, on)).toBe(true);
+    expect(isCameraShown({ kind: CameraKind.Kerbal }, off)).toBe(false);
+    expect(isCameraShown({ kind: CameraKind.Command }, on)).toBe(true);
+    expect(isCameraShown({ kind: CameraKind.Command }, off)).toBe(false);
+    expect(isCameraShown({ kind: CameraKind.Part }, off)).toBe(true);
+    expect(isCameraShown({ kind: undefined }, off)).toBe(true);
   });
 });

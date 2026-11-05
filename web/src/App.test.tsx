@@ -1454,3 +1454,132 @@ describe("App - kerbal-only vessel does not double-feed (crew bar + grid)", () =
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Launchpad camera visibility
+// ---------------------------------------------------------------------------
+
+describe("App - Launchpad camera setting", () => {
+  const KEY = "kerbcast:showLaunchpadCamera";
+
+  const launchpadFixture = () =>
+    buildFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 301, kind: CameraKind.Command, cameraName: "Launchpad" }),
+    ]);
+
+  const storedIds = () =>
+    (JSON.parse(localStorage.getItem("kerbcast:tiles") ?? "[]") as { flightId: number | null }[]).map(
+      (t) => t.flightId,
+    );
+
+  const subscribedTo = (sidecar: MockSidecar, flightId: number) =>
+    sidecar.commands.filter(
+      (c) =>
+        c.type === "subscribe" &&
+        (c as { content: { flightId: number } }).content.flightId === flightId,
+    ).length;
+
+  const unsubscribes = (sidecar: MockSidecar) =>
+    sidecar.commands.filter((c) => c.type === "unsubscribe").length;
+
+  async function toggleLaunchpad() {
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => screen.getByRole("dialog"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("checkbox", { name: /show the launchpad camera/i }));
+    });
+  }
+
+  it("is shown by default", async () => {
+    const { client, openSidecar } = launchpadFixture();
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => expect(storedIds()).toEqual([1, 301]));
+
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => screen.getByRole("dialog"));
+    const cb = screen.getByRole("checkbox", { name: /show the launchpad camera/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+  });
+
+  it("when hidden by the setting, initial seeding leaves it out", async () => {
+    localStorage.setItem(KEY, "false");
+    const { client, sidecar, openSidecar } = launchpadFixture();
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    await waitFor(() => expect(storedIds()).toEqual([1]));
+    expect(subscribedTo(sidecar, 301)).toBe(0);
+  });
+
+  it("persists the choice across a reload", async () => {
+    const first = launchpadFixture();
+    const view = await renderApp(first.client);
+    await act(async () => { first.openSidecar(); });
+    await toggleLaunchpad();
+    expect(localStorage.getItem(KEY)).toBe("false");
+
+    view.unmount();
+    const second = launchpadFixture();
+    await renderApp(second.client);
+    await act(async () => { second.openSidecar(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => screen.getByRole("dialog"));
+    const cb = screen.getByRole("checkbox", { name: /show the launchpad camera/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+    expect(storedIds()).toEqual([1]);
+  });
+
+  it("switching off removes the tile and unsubscribes its feed", async () => {
+    const { client, sidecar, openSidecar } = launchpadFixture();
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+    await waitFor(() => expect(subscribedTo(sidecar, 301)).toBe(1));
+    expect(unsubscribes(sidecar)).toBe(0);
+
+    await toggleLaunchpad();
+
+    await waitFor(() => expect(storedIds()).toEqual([1]));
+    // The SDK holds a released camera for a 2 s grace before unsubscribing.
+    await waitFor(() => expect(unsubscribes(sidecar)).toBe(1), { timeout: 5000 });
+    expect(
+      sidecar.commands.filter(
+        (c) =>
+          c.type === "unsubscribe" &&
+          (c as { content: { flightId: number } }).content.flightId === 301,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("switching back on lets the camera be added again", async () => {
+    localStorage.setItem(KEY, "false");
+    const { client, sidecar, openSidecar } = launchpadFixture();
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+    await waitFor(() => expect(storedIds()).toEqual([1]));
+
+    await toggleLaunchpad();
+    expect(localStorage.getItem(KEY)).toBe("true");
+
+    await waitFor(() => screen.getByRole("button", { name: /add all cameras/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /add all cameras/i }));
+    });
+
+    await waitFor(() => expect(storedIds()).toEqual([1, 301]));
+    await waitFor(() => expect(subscribedTo(sidecar, 301)).toBe(1));
+  });
+
+  it("when hidden, add-all does not offer the camera", async () => {
+    localStorage.setItem(KEY, "false");
+    const { client, openSidecar } = launchpadFixture();
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+    await waitFor(() => expect(storedIds()).toEqual([1]));
+
+    expect(screen.queryByRole("button", { name: /add all cameras/i })).toBeNull();
+  });
+});
