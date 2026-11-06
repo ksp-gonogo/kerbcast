@@ -1902,13 +1902,12 @@ async fn apply_layer_change(
         }
     };
 
-    let snapshot = {
+    {
         let mut ctrl = cam.control.lock().await;
         ctrl.layers = layers.clone();
-        ctrl.clone()
-    };
+    }
 
-    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+    if let Err(e) = registry.flush_control(flight_id).await {
         warn!(flight_id, error = %e, "control file flush failed");
         send_server_message(
             dc,
@@ -2010,7 +2009,7 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
     // a value the Hullcam module would reject.
     let clamped = fov.clamp(cam.fov_min, cam.fov_max);
 
-    let snapshot = {
+    {
         let mut ctrl = cam.control.lock().await;
         ctrl.fov = Some(clamped);
         // Bump so the plugin applies this absolute even mid zoom-rate hold
@@ -2018,10 +2017,9 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
         // unrelated write). Wrapping is fine — the plugin compares for
         // change, not magnitude.
         ctrl.fov_seq = ctrl.fov_seq.wrapping_add(1);
-        ctrl.clone()
-    };
+    }
 
-    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+    if let Err(e) = registry.flush_control(flight_id).await {
         warn!(flight_id, error = %e, "control file flush failed");
         send_server_message(
             dc,
@@ -2076,17 +2074,16 @@ async fn apply_pan_change(
     let yaw_clamped = yaw.clamp(cam.pan_yaw_min, cam.pan_yaw_max);
     let pitch_clamped = pitch.clamp(cam.pan_pitch_min, cam.pan_pitch_max);
 
-    let snapshot = {
+    {
         let mut ctrl = cam.control.lock().await;
         ctrl.pan_yaw = Some(yaw_clamped);
         ctrl.pan_pitch = Some(pitch_clamped);
         // Bump so the plugin applies this absolute even mid pan-rate hold
         // (see `ControlState::pan_seq`). Covers both yaw and pitch.
         ctrl.pan_seq = ctrl.pan_seq.wrapping_add(1);
-        ctrl.clone()
-    };
+    }
 
-    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+    if let Err(e) = registry.flush_control(flight_id).await {
         warn!(flight_id, error = %e, "control file flush failed");
         send_server_message(
             dc,
@@ -2150,14 +2147,13 @@ async fn apply_pan_rate_change(
     let yaw_clamped = yaw_rate.clamp(-1.0, 1.0);
     let pitch_clamped = pitch_rate.clamp(-1.0, 1.0);
 
-    let snapshot = {
+    {
         let mut ctrl = cam.control.lock().await;
         ctrl.pan_yaw_rate = Some(yaw_clamped);
         ctrl.pan_pitch_rate = Some(pitch_clamped);
-        ctrl.clone()
-    };
+    }
 
-    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+    if let Err(e) = registry.flush_control(flight_id).await {
         warn!(flight_id, error = %e, "control file flush failed");
         send_server_message(
             dc,
@@ -2215,13 +2211,12 @@ async fn apply_zoom_rate_change(
     }
     let clamped = rate.clamp(-1.0, 1.0);
 
-    let snapshot = {
+    {
         let mut ctrl = cam.control.lock().await;
         ctrl.zoom_rate = Some(clamped);
-        ctrl.clone()
-    };
+    }
 
-    if let Err(e) = registry.flush_control(flight_id, &snapshot).await {
+    if let Err(e) = registry.flush_control(flight_id).await {
         warn!(flight_id, error = %e, "control file flush failed");
         send_server_message(
             dc,

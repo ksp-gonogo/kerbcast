@@ -1911,23 +1911,31 @@ impl CameraRegistry {
         self.lighter_streams.load(Ordering::Acquire)
     }
 
-    /// Per-tick subscription bookkeeping. Normally: a camera that has lost its
-    /// last peer-track is flushed `subscribed=false` so the plugin sleeps it.
-    /// Under the force-render profiling override, every live camera is instead
-    /// kept `subscribed=true` so it renders without a peer. `set_subscribed` is
+    /// Per-tick subscription bookkeeping: the flag follows the viewer count, so
+    /// a camera that has lost its last peer-track is flushed `subscribed=false`
+    /// and the plugin sleeps it, and one with a viewer is flushed
+    /// `subscribed=true`. The wake repairs a release that read zero viewers just
+    /// as another viewer bound and then slept the camera under it; that viewer
+    /// has no reason to subscribe again, so the feed would stay silent. Under
+    /// the force-render profiling override, every live camera is instead kept
+    /// `subscribed=true` so it renders without a peer. `set_subscribed` is
     /// idempotent (no flush without a transition), so calling this each consume
-    /// tick is cheap. Replaces the old free-standing `maybe_sleep_idle_cameras`
-    /// so the force-render branch is unit-testable.
+    /// tick is cheap.
     pub async fn refresh_idle_subscriptions(&self, cameras: &[Arc<CameraState>]) {
         let force = self.force_render();
         for cam in cameras {
             if cam.destroyed.load(Ordering::Acquire) {
                 continue;
             }
-            if force {
-                self.set_subscribed(cam.flight_id, true).await;
-            } else if cam.subscribers.load(Ordering::Acquire) == 0 {
-                self.set_subscribed(cam.flight_id, false).await;
+            let viewers = cam.subscribers.load(Ordering::Acquire);
+            let woken = self
+                .set_subscribed(cam.flight_id, force || viewers > 0)
+                .await;
+            if woken && viewers > 0 {
+                info!(
+                    flight_id = cam.flight_id,
+                    viewers, "camera with viewers was asleep, woke it"
+                );
             }
         }
     }
@@ -2594,11 +2602,17 @@ impl CameraRegistry {
     /// rapid rate=0 stop right after a drag can't be missed. The block is
     /// created on first flush and persists for the camera's life so the
     /// seqlock counter keeps advancing. No-op if the camera is gone.
-    pub async fn flush_control(&self, flight_id: u32, state: &ControlState) -> std::io::Result<()> {
+    ///
+    /// Always the state as it stands, read and written under the state's lock.
+    /// Writers race (a viewer's message, the reaper, the consume loop), and one
+    /// that wrote a state it read earlier could overwrite a newer one, leaving
+    /// the plugin asleep while this side believes the camera awake.
+    pub async fn flush_control(&self, flight_id: u32) -> std::io::Result<()> {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(());
         };
-        let state = cam.control_for_plugin(state).await;
+        let current = cam.control.lock().await;
+        let state = cam.control_for_plugin(&current).await;
         let mut guard = cam.control_block.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let path = self.shm_dir.join(format!("{flight_id}.control.bin"));
@@ -2879,21 +2893,22 @@ impl CameraRegistry {
     /// dead-track pruner (false on last-release). The plugin polls
     /// control.json by mtime, so the next tick after this flush is
     /// when the camera wakes / sleeps.
-    pub async fn set_subscribed(&self, flight_id: u32, subscribed: bool) {
+    /// Returns whether the flag changed.
+    pub async fn set_subscribed(&self, flight_id: u32, subscribed: bool) -> bool {
         let Some(cam) = self.get(flight_id).await else {
-            return;
+            return false;
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             if ctrl.subscribed == subscribed {
-                return; // no transition, no flush
+                return false; // no transition, no flush
             }
             ctrl.subscribed = subscribed;
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        }
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "set_subscribed flush failed");
         }
+        true
     }
 
     /// Zero a camera's persistent pan/zoom rates (the disconnect deadman).
@@ -2908,7 +2923,7 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return;
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             let already_stopped = |r: Option<f32>| r.unwrap_or(0.0) == 0.0;
             if already_stopped(ctrl.pan_yaw_rate)
@@ -2920,9 +2935,8 @@ impl CameraRegistry {
             ctrl.pan_yaw_rate = Some(0.0);
             ctrl.pan_pitch_rate = Some(0.0);
             ctrl.zoom_rate = Some(0.0);
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        }
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "zero_rates flush failed");
         }
     }
@@ -2950,12 +2964,11 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return Err(format!("no camera with flight_id={flight_id}"));
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             ctrl.viewer_level = preset.map(|p| p.viewer_level());
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        }
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "viewer quality flush failed");
             return Err(format!("control flush failed: {e}"));
         }
@@ -2992,16 +3005,15 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(()); // camera gone this tick — nothing to write
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             ctrl.track_mode = mode;
             ctrl.track_seq = ctrl.track_seq.wrapping_add(1);
-            ctrl.clone()
-        };
+        }
         // Mirror to the lock-free publish source BEFORE the broadcast so
         // list()/protocol_state read the new value.
         cam.set_track_mode_bits(mode);
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "track target flush failed");
             return Err(format!("control flush failed: {e}"));
         }
@@ -3165,7 +3177,7 @@ impl CameraRegistry {
                 cam.begin_ramp();
             }
         }
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             let (w, h) = match eff {
                 Some((w, h)) => (Some(w), Some(h)),
@@ -3174,9 +3186,8 @@ impl CameraRegistry {
             ctrl.width = w;
             ctrl.height = h;
             ctrl.capture_fps = fps;
-            ctrl.clone()
-        };
-        self.flush_control(flight_id, &snapshot).await?;
+        }
+        self.flush_control(flight_id).await?;
         self.mark_camera_dirty(flight_id).await;
         Ok(())
     }
@@ -6054,6 +6065,92 @@ mod tests {
             !cam.control.lock().await.subscribed,
             "clearing force_render releases the camera (cleanup path)"
         );
+    }
+
+    /// What the plugin would read: the subscribed byte of the camera's control
+    /// block on disk.
+    fn published_subscribed(dir: &std::path::Path, flight_id: u32) -> bool {
+        let bytes = std::fs::read(dir.join(format!("{flight_id}.control.bin"))).expect("block");
+        crate::shared_mem::control::decode(&bytes)
+            .expect("decodes")
+            .subscribed
+    }
+
+    async fn registry_with_camera(
+        flight_id: u32,
+    ) -> (tempfile::TempDir, CameraRegistry, Arc<CameraState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join(format!("{flight_id}.ring")), cfg)
+            .expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        (dir, registry, cam)
+    }
+
+    /* The last viewer's release reads zero viewers and then writes
+    subscribed=false. A viewer binding between the two leaves a camera asleep
+    with a viewer on it, and no viewer has reason to subscribe again. */
+    #[tokio::test]
+    async fn a_camera_put_to_sleep_under_a_viewer_wakes_on_the_next_tick() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        let cams = vec![cam.clone()];
+
+        cam.subscribers.store(1, Ordering::Release);
+        registry.set_subscribed(1, true).await;
+        registry.set_subscribed(1, false).await;
+
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(cam.control.lock().await.subscribed, "woken for its viewer");
+        assert!(
+            published_subscribed(dir.path(), 1),
+            "and the plugin is told"
+        );
+
+        cam.subscribers.store(0, Ordering::Release);
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(
+            !cam.control.lock().await.subscribed,
+            "asleep once it leaves"
+        );
+        assert!(!published_subscribed(dir.path(), 1));
+    }
+
+    /* Writers racing on one camera must leave the block saying what the state
+    says. A flush of a state read before another writer's change would put the
+    plugin to sleep while the sidecar believes it awake, and since no later
+    write sees a transition, nothing would correct it. */
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_control_writes_publish_the_final_state() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        let registry = Arc::new(registry);
+        for round in 0..2000u32 {
+            let writers: Vec<_> = (0..4u32)
+                .map(|w| {
+                    let registry = registry.clone();
+                    tokio::spawn(async move {
+                        if w % 2 == 0 {
+                            registry.set_subscribed(1, (round + w / 2) % 2 == 0).await;
+                        } else {
+                            registry.record_display_size(1, w, 640, 360).await;
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.await.expect("writer");
+            }
+            assert_eq!(
+                published_subscribed(dir.path(), 1),
+                cam.control.lock().await.subscribed,
+                "block and state differ after round {round}"
+            );
+        }
     }
 
     /// The persistent rate fields serialise to the camelCase keys the
