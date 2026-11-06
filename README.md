@@ -1,6 +1,7 @@
 # kerbcast
 
 [![SpaceDock](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fspacedock.info%2Fapi%2Fmod%2F4366&label=SpaceDock&query=%24.versions%5B0%5D.friendly_version)](https://spacedock.info/mod/4366/Kerbcast)
+
 [![npm: @ksp-gonogo/kerbcast](https://img.shields.io/npm/v/%40ksp-gonogo%2Fkerbcast?label=%40ksp-gonogo%2Fkerbcast)](https://www.npmjs.com/package/@ksp-gonogo/kerbcast)
 [![npm: @ksp-gonogo/kerbcast-react](https://img.shields.io/npm/v/%40ksp-gonogo%2Fkerbcast-react?label=%40ksp-gonogo%2Fkerbcast-react)](https://www.npmjs.com/package/@ksp-gonogo/kerbcast-react)
 [![NuGet: KspGonogo.Kerbcast.API](https://img.shields.io/nuget/v/KspGonogo.Kerbcast.API?label=KspGonogo.Kerbcast.API)](https://www.nuget.org/packages/KspGonogo.Kerbcast.API/)
