@@ -148,16 +148,58 @@ fn default_shm_dir() -> PathBuf {
     PathBuf::from("/tmp/kerbcast")
 }
 
+/**
+ * Sets up stdout logging (the plugin pipes it into KSP.log) and, when
+ * `KERBCAST_LOG_DIR` is set, a per-session file there that outlives a game
+ * relaunch. An environment variable rather than a flag, because an older
+ * sidecar exits on a flag it does not know.
+ */
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let stdout = tracing_subscriber::fmt::layer().with_target(false);
+    let opened = std::env::var_os("KERBCAST_LOG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(|d| kerbcast_sidecar::session_log::open_now(&PathBuf::from(d)));
+    let (file, note) = match opened {
+        Some(Ok((path, writer))) => (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(writer),
+            ),
+            Some(Ok(path)),
+        ),
+        Some(Err(e)) => (None, Some(Err(e))),
+        None => (None, None),
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout)
+        .with(file)
+        .init();
+    match note {
+        Some(Ok(path)) => info!(path = %path.display(), "writing the session log file"),
+        Some(Err(e)) => warn!(error = %e, "could not open the session log file"),
+        None => {}
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    init_logging();
+    if let Err(e) = run().await {
+        tracing::error!(error = %e, "kerbcast sidecar exiting on error");
+        return Err(e);
+    }
+    Ok(())
+}
 
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     info!(
         version = VERSION,

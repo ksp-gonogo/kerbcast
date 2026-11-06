@@ -333,6 +333,12 @@ namespace Kerbcast
                     psi.EnvironmentVariables["KERBCAST_TELEMETRY"] = "1";
                 }
 
+                /* KSP.log is overwritten at every launch, so the sidecar also
+                   keeps its own log files here (the last five sessions). An
+                   environment variable for the same old-sidecar reason. */
+                psi.EnvironmentVariables["KERBCAST_LOG_DIR"] =
+                    Path.Combine(KSPUtil.ApplicationRootPath, "Logs", "Kerbcast");
+
                 _sidecar = new Process { StartInfo = psi, EnableRaisingEvents = true };
                 _sidecar.OutputDataReceived += (sender, e) =>
                 {

@@ -13,6 +13,7 @@ pub mod link;
 pub mod protocol;
 pub mod rate;
 pub mod send_tally;
+pub mod session_log;
 pub mod shared_mem;
 pub mod signalling;
 pub mod webrtc;
