@@ -3491,6 +3491,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _renewEncodedTransform(flightId: number): void {
     for (const [mid, installed] of this.transformInstalls) {
       if (installed.flightId !== flightId) continue;
+      this.warnTransformLeaving(mid, flightId, "the camera's source restarted, so a fresh one replaces it");
       this.noteDrain(mid, installed);
       this.transformInstalls.delete(mid);
     }
@@ -3616,6 +3617,17 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       const flightId = bindings.get(mid);
       const factory = flightId === undefined ? null : (this.handles.get(flightId)?._encodedTransform ?? null);
       if (flightId === installed.flightId && factory === installed.factory) continue;
+      this.warnTransformLeaving(
+        mid,
+        installed.flightId,
+        flightId === undefined
+          ? "its slot was freed"
+          : flightId !== installed.flightId
+            ? `its slot now carries camera ${flightId}`
+            : factory === null
+              ? "setEncodedTransform(null) removed it, so the receiver runs the passthrough"
+              : "setEncodedTransform gave a new factory",
+      );
       this.noteDrain(mid, installed);
       this.transformInstalls.delete(mid);
       if (this.setReceiverTransform(peer, mid, installed.flightId, null) && path === "script") {
@@ -3861,6 +3873,12 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private renewForHeal(peer: KerbcastPeer, mid: string, pending: PendingHeal): void {
     const bindings = this.dynamicMode ? this.flightByMid : this.legacyFlightByMid;
     const bound = bindings.get(mid);
+    this.warnTransformLeaving(
+      mid,
+      bound ?? pending.flightId,
+      `packets arrive with no frame decoded, so it is renewed (renewal ${pending.renewals + 1})`,
+      pending.install === null,
+    );
     const renewed = pending.install
       ? this.installTransform(peer, mid, pending.install, "script")
       : this.setReceiverTransform(peer, mid, bound ?? pending.flightId, null);
@@ -3877,7 +3895,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     const holdMs = this.healHoldMs(pending);
     const drainMs = pending.install ? Math.max(holdMs ?? 0, pending.install.maxHoldMs) : 0;
     this.drainUntil.set(mid, monotonicNowMs() + drainMs);
-    if (!renewed || ++pending.renewals > TRANSFORM_HEAL_RETRIES || holdMs === null) {
+    const exhausted = ++pending.renewals > TRANSFORM_HEAL_RETRIES;
+    if (renewed && exhausted) {
+      console.warn(
+        `[kerbcast] slot ${mid}, camera ${bound ?? pending.flightId}: no frame decoded after ${pending.renewals} renewals of its encoded transform; it is no longer watched`,
+      );
+    }
+    if (!renewed || exhausted || holdMs === null) {
       this.pendingHeals.delete(mid);
     } else {
       pending.seq = ++this.healSeq;
@@ -3889,6 +3913,18 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     }
     /* The instance it replaced may have taken the keyframe with it. */
     if (renewed && bound !== undefined) this.handles.get(bound)?.requestKeyframe().catch(() => {});
+  }
+
+  /**
+   * Says on the console that a transform on `mid` is being replaced or
+   * removed. A host transform still reading from the instance that leaves
+   * gets no more frames, which is silent from the host's side; this names
+   * the slot and camera so it can be traced.
+   */
+  private warnTransformLeaving(mid: string, flightId: number, why: string, passthrough = false): void {
+    console.warn(
+      `[kerbcast] slot ${mid}, camera ${flightId}: ${passthrough ? "the passthrough" : "its encoded transform"} leaves the receiver: ${why}`,
+    );
   }
 
   private stopHeals(): void {
