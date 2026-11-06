@@ -6,6 +6,8 @@
 //! with no OS dependencies, so it lives here once and the unit tests run
 //! on every platform.
 
+use super::frame_size::aligned_down;
+
 /// BT.601 limited-range RGBA to NV12 conversion into caller-provided
 /// planes. Writes the Y plane into `y_plane` and the interleaved UV plane
 /// into `uv_plane`, respecting each plane's stride. We do BT.601 (not
@@ -82,25 +84,49 @@ pub(crate) fn rgba_to_nv12_planes(
 
 /**
  * The size a half-size copy of a `width` by `height` frame has: half on each
- * side rounded down to even, or `None` when that would fall under `min` on
- * either side (the frame is then sent at its own size).
+ * side, rounded down to an aligned size at the frame's shape, or `None` when
+ * that would fall under `min` on either side (the frame is then sent at its own
+ * size). Never more than half, which `downscale_half_rgba` relies on.
  */
 pub fn half_size(width: u32, height: u32, min: u32) -> Option<(u32, u32)> {
-    let (w, h) = ((width / 2) & !1, (height / 2) & !1);
-    (w >= min && h >= min).then_some((w, h))
+    let half = (width / 2, height / 2);
+    let (w, h) = aligned_down(
+        (half.0 as f64, half.1 as f64),
+        half,
+        width as f64 / height as f64,
+    );
+    (w >= min && h >= min && w <= half.0 && h <= half.1).then_some((w, h))
 }
 
-/// Box-filter a tightly packed RGBA frame down to `out_w` by `out_h`, each
-/// output pixel the average of the 2x2 block under it.
-pub fn downscale_half_rgba(rgba: &[u8], width: u32, out_w: u32, out_h: u32, out: &mut Vec<u8>) {
-    let (w, ow, oh) = (width as usize, out_w as usize, out_h as usize);
+/**
+ * Box-filter a tightly packed RGBA frame down to `out_w` by `out_h`, at most half
+ * the frame on each side, each output pixel the average of a 2x2 block. The
+ * blocks spread evenly from edge to edge, so a copy a little under half still
+ * holds the whole picture rather than losing its right and bottom edges.
+ */
+pub fn downscale_half_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+    out: &mut Vec<u8>,
+) {
+    let (w, h, ow, oh) = (
+        width as usize,
+        height as usize,
+        out_w as usize,
+        out_h as usize,
+    );
     out.clear();
     out.resize(ow * oh * 4, 0);
+    let (x_gaps, y_gaps) = ((ow - 1).max(1), (oh - 1).max(1));
     for y in 0..oh {
-        let top = 2 * y * w * 4;
+        let top = (y * (h - 2) / y_gaps) * w * 4;
         let bottom = top + w * 4;
         for x in 0..ow {
-            let (a, b) = (top + 2 * x * 4, bottom + 2 * x * 4);
+            let src_x = x * (w - 2) / x_gaps;
+            let (a, b) = (top + src_x * 4, bottom + src_x * 4);
             let o = (y * ow + x) * 4;
             for c in 0..4 {
                 let sum = rgba[a + c] as u16
@@ -118,14 +144,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn half_size_is_even_and_respects_the_minimum() {
+    fn half_size_is_aligned_and_respects_the_minimum() {
         assert_eq!(half_size(1024, 576, 128), Some((512, 288)));
-        assert_eq!(half_size(642, 362, 128), Some((320, 180)));
+        assert_eq!(half_size(1280, 720, 128), Some((624, 352)));
+        assert_eq!(half_size(480, 272, 128), Some((224, 128)));
+        assert_eq!(half_size(656, 368, 128), Some((288, 160)));
         assert_eq!(
             half_size(384, 216, 128),
             None,
             "108 rows is under the minimum"
         );
+    }
+
+    /// A copy a little under half keeps both far edges of the picture.
+    #[test]
+    fn downscale_reaches_every_edge_when_under_half() {
+        let (w, h) = (8usize, 6usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                if x == w - 1 || y == h - 1 {
+                    rgba[(y * w + x) * 4] = 200;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        downscale_half_rgba(&rgba, w as u32, h as u32, 3, 2, &mut out);
+        assert_eq!(out[0], 0, "top-left block is untouched");
+        assert_eq!(out[2 * 4], 100, "right column reached");
+        assert_eq!(out[3 * 4], 100, "bottom row reached");
     }
 
     #[test]
@@ -148,7 +195,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        downscale_half_rgba(&rgba, 4, 2, 1, &mut out);
+        downscale_half_rgba(&rgba, 4, 2, 2, 1, &mut out);
         assert_eq!(out, vec![50, 50, 50, 0xFF, 200, 200, 200, 0xFF]);
     }
 

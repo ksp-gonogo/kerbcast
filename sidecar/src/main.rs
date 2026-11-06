@@ -909,7 +909,7 @@ async fn encode_next_frame(
             let mut small = cam.reduced.scratch.lock().await;
             let reduced_frame = match half_size(frame.width, frame.height, MIN_ENCODE_DIMENSION) {
                 Some((w, h)) => {
-                    downscale_half_rgba(&frame.pixels, frame.width, w, h, &mut small);
+                    downscale_half_rgba(&frame.pixels, frame.width, frame.height, w, h, &mut small);
                     TierFrame {
                         width: w,
                         height: h,

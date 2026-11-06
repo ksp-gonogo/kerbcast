@@ -115,7 +115,7 @@ namespace Kerbcast
             _ringPath = Path.Combine(ringDir, $"{FlightId}.ring");
             _infoPath = Path.Combine(ringDir, $"{FlightId}.info.json");
             _controlPath = Path.Combine(ringDir, $"{FlightId}.control.bin");
-            _maxSide = MakeEven(Math.Min(512, Math.Min(width, height)));
+            _maxSide = QualityClamp.AlignDown(Math.Min(512, Math.Min(width, height)));
             _renderSide = _maxSide;
             // Ring allocated at the SQUARE MAX so live auto-resolution stays
             // RT-pool-only. Each slot's header carries the actual content side, so
@@ -207,15 +207,15 @@ namespace Kerbcast
 
                 // Auto-resolution: the sidecar writes the effective max-consumer
                 // size into Width/Height (both present-flag gated). A face is
-                // square, so fit it to the smaller reported side, rounded even and
+                // square, so fit it to the smaller reported side, aligned to 16 and
                 // clamped to [MinSide, _maxSide]. SetRenderSize no-ops when unchanged
                 // (re-published snapshots are free). A held size (a viewer is
                 // recording) waits; the release snapshot carries the latest size.
                 if (!snap.SizeHeld && snap.Width.HasValue && snap.Height.HasValue)
                 {
-                    int even = MakeEven((int)Math.Min(snap.Width.Value, snap.Height.Value));
+                    int aligned = QualityClamp.AlignDown((int)Math.Min(snap.Width.Value, snap.Height.Value));
                     int lo = Math.Min(MinSide, _maxSide);
-                    int side = Math.Max(lo, Math.Min(_maxSide, even));
+                    int side = Math.Max(lo, Math.Min(_maxSide, aligned));
                     SetRenderSize(side);
                 }
             }
@@ -259,17 +259,15 @@ namespace Kerbcast
         // Square resize onto the shared CaptureCore path — the facecam mirror of
         // KerbcastCamera.SetRenderSize with w==h. Records the requested side; the
         // pooled-RT switch happens in EnsureCapture (inside Refresh's try, so a
-        // BuildTargets throw is caught). Even (H.264 chroma) and within
+        // BuildTargets throw is caught). A multiple of 16 and within
         // (0, _maxSide]; faces have no layers/zoom/pan, so there is no
         // ApplyEffectiveQuality machinery.
         public void SetRenderSize(int side)
         {
-            if (side <= 0 || side % 2 != 0 || side > _maxSide || side == _renderSide) return;
+            if (side <= 0 || side % QualityClamp.FrameAlignment != 0 || side > _maxSide || side == _renderSide) return;
             _renderSide = side;
             Debug.Log($"[Kerbcast] kerbal cam={FlightId} render side → {side}");
         }
-
-        private static int MakeEven(int v) => v & ~1; // round down to even
 
         private void LogRateLimited(string message)
         {

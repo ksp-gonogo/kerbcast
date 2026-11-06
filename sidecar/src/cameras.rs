@@ -27,7 +27,9 @@ use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
 use crate::commands::{
     validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
 };
-use crate::encoder::{EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION};
+use crate::encoder::{
+    align_down, aligned_cover, EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION,
+};
 use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
@@ -1305,7 +1307,7 @@ impl CameraState {
 
     /// Effective render size = min(demand, manual cap) at the ring's aspect,
     /// raised to `MIN_ENCODE_DIMENSION` on both sides, clamped to the ring's
-    /// max dims and made even (H.264 chroma). Demand is normally the auto MAX-
+    /// max dims and aligned as `aligned_cover` describes. Demand is normally the auto MAX-
     /// across-consumers display size; while ANY peer forces this camera (see
     /// `forced_full_res`), demand is instead the ring ceiling, so a forced feed
     /// sizes up regardless of what's actually being displayed. `None` when
@@ -1337,10 +1339,15 @@ impl CameraState {
         combined.map(|(w, h)| {
             let (w, h) = raise_to_encodable(w, h);
             let (w, h) = fit_within(w, h, mw, mh);
-            (
-                even_clamp(w.round() as u32, mw),
-                even_clamp(h.round() as u32, mh),
-            )
+            /* A cap limits the rounding too, unless the encoder's minimum has
+            already lifted the size past it. */
+            let limit = match cap {
+                Some((cw, ch)) if w <= cw as f64 + 0.5 && h <= ch as f64 + 0.5 => {
+                    (mw.min(cw), mh.min(ch))
+                }
+                _ => (mw, mh),
+            };
+            aligned_cover((w, h), limit, mw as f64 / mh as f64)
         })
     }
 }
@@ -1592,13 +1599,6 @@ fn fit_within(w: f64, h: f64, limit_w: u32, limit_h: u32) -> (f64, f64) {
     }
     let scale = (limit_w as f64 / w).min(limit_h as f64 / h).min(1.0);
     (w * scale, h * scale)
-}
-
-/// Clamp a requested dimension to the ring's allocated max and force it even
-/// (H.264 chroma needs even dims; anything over the ring max would be rejected
-/// by the plugin's `MmapFrameRing.Produce`).
-fn even_clamp(v: u32, max: u32) -> u32 {
-    (v.min(max)) & !1
 }
 
 /// Registry of cameras. Owns the rescan logic that discovers new rings
@@ -3599,7 +3599,7 @@ impl CameraRegistry {
 
 /// Why the effective resolution differs from the viewer's request, if it
 /// does. Expected width = the operator ceiling scaled by the viewer's
-/// preset (1.0 when auto), floored to even exactly like the plugin's
+/// preset (1.0 when auto), floored to a multiple of 16 exactly like the plugin's
 /// `QualityClamp` does. Anything below that means the adaptive perf
 /// machinery is holding the camera down: report `"throttled"` so UIs can
 /// mark the feed. The viewer request itself can never push the effective
@@ -3611,7 +3611,7 @@ pub fn quality_limited_reason(
     viewer_quality: Option<QualityPreset>,
 ) -> Option<String> {
     let scale = viewer_quality.map(|p| p.scale()).unwrap_or(1.0);
-    let expected = (((operator_width as f32) * scale) as u32 & !1).max(2);
+    let expected = align_down(((operator_width as f32) * scale) as u32);
     if render_width < expected {
         Some("throttled".to_string())
     } else {
@@ -4315,7 +4315,7 @@ mod tests {
         let (_dir, cam) = attach_camera_sized(7_051, 1920, 1080).await;
         cam.record_display_size(1, 640, 360).await;
         cam.record_display_size(2, 300, 500).await;
-        assert_eq!(cam.effective_render_size().await, Some((888, 500)));
+        assert_eq!(cam.effective_render_size().await, Some((912, 512)));
     }
 
     /// A manual cap of another shape bounds the size but not the shape.
@@ -4323,10 +4323,35 @@ mod tests {
     async fn manual_cap_keeps_the_configured_aspect() {
         let (_dir, cam) = attach_camera_sized(7_052, 1280, 720).await;
         cam.set_manual_render_cap(Some((640, 480))).await;
-        assert_eq!(cam.effective_render_size().await, Some((640, 360)));
+        assert_eq!(cam.effective_render_size().await, Some((624, 352)));
 
         cam.record_display_size(1, 1024, 576).await;
-        assert_eq!(cam.effective_render_size().await, Some((640, 360)));
+        assert_eq!(cam.effective_render_size().await, Some((624, 352)));
+    }
+
+    /// The sizes a phone tile asks for, and the sizes at a ring max, all arrive
+    /// as multiples of 16 at the configured shape.
+    #[tokio::test]
+    async fn every_requested_size_is_sixteen_aligned() {
+        let (_dir, cam) = attach_camera_sized(7_053, 1024, 576).await;
+        cam.record_display_size(1, 432, 244).await;
+        assert_eq!(cam.effective_render_size().await, Some((480, 272)));
+        cam.record_display_size(1, 434, 244).await;
+        assert_eq!(cam.effective_render_size().await, Some((480, 272)));
+        cam.record_display_size(1, 3, 3).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
+        cam.record_display_size(1, 1024, 576).await;
+        assert_eq!(cam.effective_render_size().await, Some((1024, 576)));
+        cam.record_display_size(1, 4000, 4000).await;
+        assert_eq!(cam.effective_render_size().await, Some((1024, 576)));
+
+        let (_dir2, full_hd) = attach_camera_sized(7_054, 1920, 1080).await;
+        full_hd.record_display_size(1, 1920, 1080).await;
+        assert_eq!(full_hd.effective_render_size().await, Some((1920, 1072)));
+
+        let (_dir3, low) = attach_camera_sized(7_055, 640, 360).await;
+        low.record_display_size(1, 640, 360).await;
+        assert_eq!(low.effective_render_size().await, Some((624, 352)));
     }
 
     /// Auto-resolution aggregates each consumer's reported display size as the
@@ -4352,7 +4377,7 @@ mod tests {
         cam.forget_display_size(2).await;
         assert_eq!(
             cam.effective_render_size().await,
-            Some((200, 200)),
+            Some((208, 208)),
             "effective size must relax after the large consumer departs (clear-on-departure)"
         );
 
@@ -4500,14 +4525,14 @@ mod tests {
     async fn small_size_report_is_raised_to_the_encodable_minimum() {
         let (_dir, cam) = attach_camera_sized(7_007, 1280, 720).await;
         cam.record_display_size(1, 170, 96).await;
-        assert_eq!(cam.effective_render_size().await, Some((228, 128)));
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
 
         cam.record_display_size(1, 16, 10).await;
-        assert_eq!(cam.effective_render_size().await, Some((228, 128)));
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
 
         /* The larger viewer still wins the max. */
         cam.record_display_size(2, 320, 180).await;
-        assert_eq!(cam.effective_render_size().await, Some((320, 180)));
+        assert_eq!(cam.effective_render_size().await, Some((368, 208)));
     }
 
     /// A thin strip (a tile mid collapse) is covered at the ring's shape
@@ -4519,9 +4544,9 @@ mod tests {
         cam.record_display_size(1, 400, 20).await;
         assert_eq!(cam.effective_render_size().await, Some((400, 224)));
         cam.record_display_size(1, 20, 400).await;
-        assert_eq!(cam.effective_render_size().await, Some((710, 400)));
+        assert_eq!(cam.effective_render_size().await, Some((736, 416)));
         cam.record_display_size(1, 200, 4).await;
-        assert_eq!(cam.effective_render_size().await, Some((228, 128)));
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
     }
 
     /// No path asks for a render under `MIN_ENCODE_DIMENSION` on either side:
@@ -4533,13 +4558,12 @@ mod tests {
         let (_dir, cam) = attach_camera_sized(7_008, 1280, 720).await;
         cam.record_display_size(1, min, min).await;
         let (w, h) = cam.effective_render_size().await.expect("demand");
-        assert_eq!(h, min, "the box's height already covers it");
-        assert!(w >= min && w % 2 == 0, "{w}x{h}");
+        assert_eq!((w, h), (256, 144), "the smallest aligned size at the shape");
 
         cam.set_manual_render_cap(Some((32, 16))).await;
         let (w, h) = cam.effective_render_size().await.expect("capped");
         assert!(w >= min && h >= min, "a tiny cap is lifted: {w}x{h}");
-        assert_eq!((w % 2, h % 2), (0, 0));
+        assert_eq!((w % 16, h % 16), (0, 0));
         assert!(
             (w as f64 / h as f64 - 16.0 / 9.0).abs() < 0.02,
             "at the ring's aspect: {w}x{h}"
@@ -4847,7 +4871,7 @@ mod tests {
     async fn forced_full_res_sizes_to_the_ceiling_over_tiny_demand() {
         let (_dir, cam) = attach_camera_for_tracker(7_005).await;
         cam.record_display_size(1, 200, 200).await;
-        assert_eq!(cam.effective_render_size().await, Some((200, 200)));
+        assert_eq!(cam.effective_render_size().await, Some((208, 208)));
 
         cam.set_forced(1, true).await;
         assert_eq!(
@@ -4880,7 +4904,7 @@ mod tests {
         cam.set_forced(2, false).await;
         assert_eq!(
             cam.effective_render_size().await,
-            Some((200, 200)),
+            Some((208, 208)),
             "released back to demand once every peer clears"
         );
     }
@@ -6505,7 +6529,7 @@ mod tests {
     }
 
     /// The pure expected-width computation: viewer scale applied to the
-    /// operator ceiling, floored to even like the plugin's QualityClamp.
+    /// operator ceiling, floored to 16 like the plugin's QualityClamp.
     #[test]
     fn quality_limited_reason_thresholds() {
         use QualityPreset::*;
@@ -6518,13 +6542,14 @@ mod tests {
         // Half of 1024 = 512: exact match honored, below = throttled.
         assert_eq!(quality_limited_reason(1024, 512, Some(Half)), None);
         assert_eq!(
-            quality_limited_reason(1024, 510, Some(Half)).as_deref(),
+            quality_limited_reason(1024, 496, Some(Half)).as_deref(),
             Some("throttled")
         );
         // Render above the target (shed gentler than the preset) is fine.
         assert_eq!(quality_limited_reason(1024, 768, Some(Half)), None);
-        // Odd products floor to even, matching the plugin's MakeEven.
-        assert_eq!(quality_limited_reason(1030, 772, Some(ThreeQuarter)), None);
+        // Other products floor to 16, matching the plugin's ScaleDimension.
+        assert_eq!(quality_limited_reason(1280, 960, Some(ThreeQuarter)), None);
+        assert_eq!(quality_limited_reason(1040, 768, Some(ThreeQuarter)), None);
     }
 
     /* Tombstone-pruning fixture: a part camera whose ring + manifest the test
@@ -6969,11 +6994,11 @@ mod tests {
         let t0 = Instant::now();
         cam.record_display_size(1, 320, 180).await;
         registry.flush_render_size_at(1, t0, false).await.unwrap();
-        assert_eq!(written_size(&cam).await, Some((320, 180)));
+        assert_eq!(written_size(&cam).await, Some((368, 208)));
 
         cam.record_display_size(2, 640, 360).await;
         registry.flush_render_size_at(1, t0, false).await.unwrap();
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
     }
 
     /// The bigger viewer switching away keeps its size for `SHRINK_HOLD`,
@@ -6989,13 +7014,13 @@ mod tests {
 
         cam.forget_display_size(2).await;
         registry.flush_render_size_at(1, t0, false).await.unwrap();
-        assert_eq!(written_size(&cam).await, Some((640, 360)), "held");
+        assert_eq!(written_size(&cam).await, Some((656, 368)), "held");
 
         registry.settle_render_shrinks(t0 + SHRINK_HOLD / 2).await;
-        assert_eq!(written_size(&cam).await, Some((640, 360)), "still held");
+        assert_eq!(written_size(&cam).await, Some((656, 368)), "still held");
 
         registry.settle_render_shrinks(t0 + SHRINK_HOLD).await;
-        assert_eq!(written_size(&cam).await, Some((320, 180)), "hold over");
+        assert_eq!(written_size(&cam).await, Some((368, 208)), "hold over");
     }
 
     /// A smaller report and a withdrawn report hold the same way, and demand
@@ -7017,7 +7042,7 @@ mod tests {
             .flush_render_size_at(1, t0 + Duration::from_secs(2), false)
             .await
             .unwrap();
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
 
         cam.record_display_size(2, 500, 280).await;
         registry
@@ -7031,7 +7056,7 @@ mod tests {
             .unwrap();
 
         registry.settle_render_shrinks(t0 + SHRINK_HOLD * 3).await;
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
         assert!(!cam.shrink_delay.lock().unwrap().due(t0 + SHRINK_HOLD * 3));
     }
 
@@ -7047,14 +7072,14 @@ mod tests {
 
         cam.forget_display_size(1).await;
         registry.flush_render_size_at(1, t0, false).await.unwrap();
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
 
         cam.record_display_size(1, 640, 360).await;
         registry
             .flush_render_size_at(1, t0 + Duration::from_secs(4), false)
             .await
             .unwrap();
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
 
         cam.forget_display_size(1).await;
         let left = t0 + Duration::from_secs(6);
@@ -7077,9 +7102,9 @@ mod tests {
             .set_manual_render_size(1, Some((320, 180)))
             .await
             .unwrap();
-        assert_eq!(written_size(&cam).await, Some((320, 180)));
+        assert_eq!(written_size(&cam).await, Some((256, 144)));
         registry.set_manual_render_size(1, None).await.unwrap();
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
 
         cam.set_forced(9, true).await;
         registry.flush_render_size_at(1, t0, false).await.unwrap();
@@ -7089,6 +7114,6 @@ mod tests {
         registry.flush_render_size_at(1, t0, false).await.unwrap();
         assert_eq!(written_size(&cam).await, Some((1280, 720)));
         registry.settle_render_shrinks(t0 + SHRINK_HOLD).await;
-        assert_eq!(written_size(&cam).await, Some((640, 360)));
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
     }
 }

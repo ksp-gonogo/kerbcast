@@ -615,18 +615,16 @@ namespace Kerbcast
                 {
                     settings._atmosphericFxLayers[partName] = ParseAtmoFxLayers(fxLayersRaw);
                 }
-                // Per-camera Width/Height overrides must be even (H.264
-                // chroma sampling) and <= the global Width/Height (the
-                // ring's allocated capacity). Either field defaults to the
-                // global value if omitted.
+                /* Per-camera Width/Height overrides must be <= the global
+                   Width/Height (the ring's allocated capacity). Either field
+                   defaults to the global value if omitted. KerbcastCamera
+                   aligns the result to a multiple of 16 inside it. */
                 int? w = TryParseIntField(camNode, "Width");
                 int? h = TryParseIntField(camNode, "Height");
                 if (w.HasValue || h.HasValue)
                 {
                     int width = w ?? settings.Width;
                     int height = h ?? settings.Height;
-                    width -= width & 1;
-                    height -= height & 1;
                     if (width > settings.Width || height > settings.Height)
                     {
                         Debug.LogWarning($"[Kerbcast] settings.cfg: Camera '{partName}' size {width}x{height} exceeds global max {settings.Width}x{settings.Height}; capping");

@@ -476,6 +476,9 @@ namespace Kerbcast
             FlightId = flightId;
             MaxWidth = maxWidth;
             MaxHeight = maxHeight;
+            /* The ring keeps the configured size, which is the feed's shape; frames
+               are aligned inside it. */
+            (renderWidth, renderHeight) = QualityClamp.ScaleSize(renderWidth, renderHeight, 1f);
             OperatorWidth = renderWidth;
             OperatorHeight = renderHeight;
             RenderWidth = renderWidth;
@@ -796,13 +799,13 @@ namespace Kerbcast
         /// <summary>
         /// Rebuild the RenderTexture chain at a new size and rebind every
         /// Unity Camera to it. Caller is responsible for staying within
-        /// MaxWidth × MaxHeight (the ring slot capacity). Even dimensions
-        /// only — H.264 chroma sampling requires that.
+        /// MaxWidth × MaxHeight (the ring slot capacity). Multiples of 16 only,
+        /// so H.264 has no padding to crop (see QualityClamp.FrameAlignment).
         /// </summary>
         public void SetRenderSize(int width, int height)
         {
             if (width <= 0 || height <= 0) return;
-            if (width % 2 != 0 || height % 2 != 0) return;
+            if (width % QualityClamp.FrameAlignment != 0 || height % QualityClamp.FrameAlignment != 0) return;
             if (width > MaxWidth || height > MaxHeight) return;
             if (width == RenderWidth && height == RenderHeight) return;
 
@@ -1733,7 +1736,7 @@ namespace Kerbcast
                 // size (already capped at manual SetRenderSize) into Width/Height.
                 // Apply it as the runtime operator CEILING; the adaptive-shed and
                 // viewer-clamp min() still ride underneath via ApplyEffectiveQuality.
-                // Both fields must be present (a size needs both); the even/clamp/
+                // Both fields must be present (a size needs both); the align/clamp/
                 // <=max guards live in SetOperatorRenderSize -> SetRenderSize, so no
                 // duplication here. Changed-check avoids re-applying the same
                 // ceiling when an unrelated field triggered this poll.

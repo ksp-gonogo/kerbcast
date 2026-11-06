@@ -11,6 +11,7 @@ use thiserror::Error;
 mod annexb;
 mod convert;
 mod escalation;
+mod frame_size;
 mod libva;
 mod mediafoundation;
 mod nvenc;
@@ -22,6 +23,7 @@ pub use escalation::{
     record_init_failure, size_is_encodable, SessionHealth, SessionVerdict, MAX_ENCODE_DIMENSION,
     MIN_ENCODE_DIMENSION, SILENT_SESSION_FRAME_LIMIT,
 };
+pub use frame_size::{align_down, aligned_cover, aligned_down, FRAME_ALIGNMENT};
 pub use libva::Libva;
 pub use mediafoundation::MediaFoundation;
 pub use nvenc::Nvenc;
