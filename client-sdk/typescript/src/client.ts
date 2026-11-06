@@ -40,6 +40,11 @@ import type { EncodedFrameCopy } from "./captureClip";
 import { MAX_ANCHORS_PER_CAMERA } from "./anchors";
 import { CommandCentreHistory } from "./commandTrack";
 
+/** A reported display size as the wire carries it: whole px, 0 for anything that is not a number. */
+function wholeDisplayPx(px: number): number {
+  return Number.isFinite(px) ? Math.round(px) : 0;
+}
+
 /** Cadence of estimated frames from a watcher on a browser without `requestVideoFrameCallback`. */
 const ESTIMATED_FRAME_INTERVAL_MS = 100;
 /* How long after an element's last exactly identified frame that frame still bounds an unidentified one. */
@@ -2770,10 +2775,14 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * per-consumer input the sidecar aggregates MAX-across-consumers, so a big
    * spotlight bumps the stream up while tiny avatars leave it small. The SDK's
    * feed primitives self-measure and call this; consumers do not report by hand.
-   * A size under 2 on either axis withdraws this consumer's report. A size
-   * the sidecar already holds from this client is not sent again.
+   * A size under 2 on either axis withdraws this consumer's report, which is
+   * also what a size that is not a number does. A size the sidecar already
+   * holds from this client is not sent again.
    */
-  async reportDisplaySize(flightId: number, width: number, height: number): Promise<void> {
+  async reportDisplaySize(flightId: number, rawWidth: number, rawHeight: number): Promise<void> {
+    /* The wire takes whole numbers. NaN goes out as null and a fraction as itself, and the sidecar refuses either message whole, leaving the old size in force. */
+    const width = wholeDisplayPx(rawWidth);
+    const height = wholeDisplayPx(rawHeight);
     if (width < 2 || height < 2) {
       this.displaySizes.delete(flightId);
       this.sentSizes.delete(flightId);

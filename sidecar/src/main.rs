@@ -451,6 +451,13 @@ async fn consume_loop(
                     resync_after_camera_churn(&registry, &snapshot, &[]).await;
                 }
             }
+            /* Each viewer is on its camera and each watched ring is moving: what
+            nothing above would notice going wrong, and a page reload would clear. */
+            let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+            for peer in &snapshot {
+                peer.rebind_lost_tracks(&registry).await;
+            }
+            registry.recover_silent_feeds(Instant::now()).await;
             last_rescan = Instant::now();
         }
 

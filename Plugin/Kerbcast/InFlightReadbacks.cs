@@ -55,6 +55,11 @@ namespace Kerbcast
         public int Height(int slot) => _height[slot];
         public int IssuedFrame(int slot) => _issuedFrame[slot];
 
+        /// <summary>Whether the oldest readback has been in flight for <paramref
+        /// name="maxFrames"/> game frames or more at <paramref name="frame"/>.</summary>
+        public bool OldestOverdue(int frame, int maxFrames)
+            => _count > 0 && frame - _issuedFrame[_oldest] >= maxFrames;
+
         /// <summary>Take the next slot for a readback issued on <paramref
         /// name="frame"/> against the current size, and return it. The size is a
         /// snapshot: a later SetCurrent does not change it.</summary>

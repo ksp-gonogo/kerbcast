@@ -54,6 +54,13 @@ namespace Kerbcast
            buffer, one frame of pixels, held until it lands. */
         internal const int MaxInFlight = 2;
 
+        /* A readback normally lands within a few game frames. One that never does
+           would hold its slot for good, and with every slot held the camera stops
+           capturing with nothing to bring it back: its sleep and wake leave the
+           slots alone. Far past any real latency, so giving up costs one late
+           frame at worst. */
+        private const int AbandonAfterFrames = 600;
+
         /* Each in-flight readback's size and issue frame, described
            independently of the *current* target so a resolution change
            mid-readback still drains the pending frame at its original
@@ -243,7 +250,14 @@ namespace Kerbcast
             while (_inFlight.Count > 0)
             {
                 int slot = _inFlight.Oldest;
-                if (!_pending[slot].Request.done) return;
+                if (!_pending[slot].Request.done)
+                {
+                    if (!_inFlight.OldestOverdue(Time.frameCount, AbandonAfterFrames)) return;
+                    _logRateLimited($"gave up on a readback after {AbandonAfterFrames} frames");
+                    _pending[slot].Request = default;
+                    _inFlight.Land();
+                    continue;
+                }
                 _counters.Land(Time.frameCount - _inFlight.IssuedFrame(slot));
                 ProcessReadback(slot);
                 _pending[slot].Request = default;

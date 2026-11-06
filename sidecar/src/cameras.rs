@@ -30,6 +30,7 @@ use crate::commands::{
 use crate::encoder::{
     align_down, aligned_cover, EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION,
 };
+use crate::feed_watch::{FeedVerdict, FeedWatch};
 use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
@@ -703,6 +704,8 @@ pub struct CameraState {
     /// A `std::sync::Mutex`, not the tokio one — the mmap write is synchronous
     /// and never held across an await.
     pub control_block: std::sync::Mutex<Option<ControlBlock>>,
+    /// Whether this camera's ring is moving while it has viewers.
+    pub feed_watch: std::sync::Mutex<FeedWatch>,
     /// The camera's own encoder at the ring's size, and the viewer tracks it
     /// feeds.
     pub full: TierEncoder,
@@ -2187,6 +2190,7 @@ impl CameraRegistry {
                             keyframe_requests_received: AtomicU64::new(0),
                             control: Mutex::new(ControlState::default()),
                             control_block: std::sync::Mutex::new(None),
+                            feed_watch: std::sync::Mutex::new(FeedWatch::default()),
                         }),
                     );
                 }
@@ -2909,6 +2913,85 @@ impl CameraRegistry {
             warn!(flight_id, error = %e, "set_subscribed flush failed");
         }
         true
+    }
+
+    /**
+     * Looks for cameras with viewers whose ring has stopped moving, and does what
+     * can be done without disturbing their viewers: publishes the control block
+     * again, so a plugin that missed a write or lost the file reads it afresh,
+     * and asks for a keyframe. The log line is the point when this does not
+     * help, since it separates a camera the plugin stopped capturing from a
+     * viewer that stopped showing a feed still arriving.
+     */
+    pub async fn recover_silent_feeds(&self, now: Instant) {
+        let primary_fps = self.primary_capture_fps().await;
+        let cameras = self.snapshot().await;
+        for cam in &cameras {
+            if cam.destroyed.load(Ordering::Acquire) {
+                continue;
+            }
+            let viewers = cam.subscribers.load(Ordering::Acquire);
+            let sequence = cam.ring.published_sequence();
+            let (subscribed, target_fps) = {
+                let ctrl = cam.control.lock().await;
+                (ctrl.subscribed, cam.target_capture_fps(&ctrl, primary_fps))
+            };
+            let verdict = cam
+                .feed_watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(now, viewers > 0, sequence, target_fps);
+            match verdict {
+                FeedVerdict::Quiet => {}
+                FeedVerdict::Resumed {
+                    silent_for,
+                    attempts,
+                } => info!(
+                    flight_id = cam.flight_id,
+                    silent_s = silent_for.as_secs(),
+                    attempts,
+                    "camera is capturing again"
+                ),
+                FeedVerdict::Silent {
+                    silent_for,
+                    attempt,
+                } => {
+                    let others_capturing = cameras
+                        .iter()
+                        .filter(|c| {
+                            c.flight_id != cam.flight_id && c.capture_rate.rate_at(now) > 0.0
+                        })
+                        .count();
+                    warn!(
+                        flight_id = cam.flight_id,
+                        camera = %cam.camera_name,
+                        viewers,
+                        subscribed,
+                        target_fps,
+                        ring_sequence = sequence,
+                        silent_s = silent_for.as_secs(),
+                        attempt,
+                        others_capturing,
+                        "camera with viewers has captured nothing; publishing its control block again"
+                    );
+                    self.forget_lost_control_block(cam).await;
+                    if let Err(e) = self.flush_control(cam.flight_id).await {
+                        warn!(flight_id = cam.flight_id, error = %e, "silent feed flush failed");
+                    }
+                    cam.request_keyframe();
+                }
+            }
+        }
+    }
+
+    /// Drops a control block whose file has gone, so the next flush makes a new
+    /// one the plugin can open. A block still on disk is kept, since creating
+    /// one truncates it and restarts its sequence.
+    async fn forget_lost_control_block(&self, cam: &CameraState) {
+        let path = self.shm_dir.join(format!("{}.control.bin", cam.flight_id));
+        if tokio::fs::metadata(&path).await.is_err() {
+            *cam.control_block.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     /// Zero a camera's persistent pan/zoom rates (the disconnect deadman).
@@ -6151,6 +6234,41 @@ mod tests {
                 "block and state differ after round {round}"
             );
         }
+    }
+
+    /* A control block lost from under the sidecar leaves it writing to a file the
+    plugin can no longer open, so the camera never wakes, and nothing on this
+    side looks wrong. */
+    #[tokio::test]
+    async fn a_silent_feed_gets_its_control_block_and_a_keyframe_back() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        cam.subscribers.store(1, Ordering::Release);
+        registry.set_subscribed(1, true).await;
+        let block = dir.path().join("1.control.bin");
+        std::fs::remove_file(&block).expect("block lost");
+
+        let t = Instant::now();
+        registry.recover_silent_feeds(t).await;
+        assert!(!block.exists(), "not silent long enough yet");
+
+        registry
+            .recover_silent_feeds(t + crate::feed_watch::SILENT_AFTER)
+            .await;
+        assert!(published_subscribed(dir.path(), 1), "the plugin is told");
+        assert!(cam.full.keyframe_gate.lock().unwrap().pending());
+    }
+
+    /// A viewer's feed that is moving, or a camera nobody watches, is left alone.
+    #[tokio::test]
+    async fn the_silent_feed_recovery_leaves_healthy_cameras_alone() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        let t = Instant::now();
+        registry.recover_silent_feeds(t).await;
+        registry
+            .recover_silent_feeds(t + crate::feed_watch::SILENT_AFTER)
+            .await;
+        assert!(!dir.path().join("1.control.bin").exists(), "no viewer");
+        assert!(!cam.full.keyframe_gate.lock().unwrap().pending());
     }
 
     /// The persistent rate fields serialise to the camelCase keys the

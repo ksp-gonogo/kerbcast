@@ -4172,6 +4172,34 @@ describe("KerbcastCameraHandle.setEncodedTransform", () => {
     return { ...t, client };
   }
 
+  /* A viewer's slot release must reach only that slot's receiver: the other cameras keep their stream and their transform. */
+  it("releasing one camera's slot leaves the other slots' streams and transforms alone", async () => {
+    const t = makeTransformTransport(optedInScript);
+    const client = new KerbcastClient({ host: "h", port: 1, encodedTransforms: true }, t.transport);
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(fakeAnswer([])));
+    await client.connect([], { slots: 4 });
+    t.captured.dc?._open();
+    const { factory } = countingFactory();
+    const cameras: [number, string][] = [[11, "0"], [22, "1"], [33, "2"]];
+    for (const [flightId, mid] of cameras) {
+      client.camera(flightId).setEncodedTransform(factory);
+      t.captured.onTrack?.({ id: `track-${mid}` } as MediaStreamTrack, Number(mid), mid);
+      slotMap(t.captured, mid, flightId);
+    }
+    const hull = client.camera(22).mediaStream;
+    const launchpad = client.camera(11).mediaStream;
+    expect(hull).not.toBeNull();
+    t.installs.length = 0;
+
+    slotMap(t.captured, "2", null);
+    await client.reportDisplaySize(11, 368, 208);
+
+    expect(t.installs).toEqual([{ mid: "2", transform: null }]);
+    expect(client.camera(33).mediaStream).toBeNull();
+    expect(client.camera(22).mediaStream).toBe(hull);
+    expect(client.camera(11).mediaStream).toBe(launchpad);
+  });
+
   it("installs a fresh instance when the camera is bound to a slot", async () => {
     const { client, captured, installs } = await connectDynamic();
     const { factory, made } = countingFactory();
@@ -5939,6 +5967,14 @@ describe("KerbcastClient: a display size the sidecar already holds", () => {
         .map(({ width, height }) => `${width}x${height}`);
     return { sidecar, client, sizes };
   }
+
+  it("sends a size the sidecar can parse whatever it is given", async () => {
+    const { client, sizes } = await connected();
+    await client.reportDisplaySize(42, 640.4, 359.6);
+    await client.reportDisplaySize(42, Number.NaN, 208);
+    await client.reportDisplaySize(42, 640, undefined as unknown as number);
+    expect(sizes()).toEqual(["640x360", "0x208", "640x0"]);
+  });
 
   it("sends a repeat of the size it last sent only once", async () => {
     const { client, sizes } = await connected();

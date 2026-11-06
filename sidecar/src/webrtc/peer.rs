@@ -1173,6 +1173,45 @@ impl KerbcastPeer {
             .collect()
     }
 
+    /**
+     * Puts each bound slot's track back on its camera if the camera no longer
+     * feeds it, and returns how many it put back. A subscribe racing a rescan
+     * can land on the entry the rescan just replaced, after the churn resync
+     * has run, leaving a viewer the live entry has never heard of. Checked under
+     * the slots' lock, since an unsubscribe unbinds its slot under it before
+     * removing the track, so a slot found bound here cannot be left fed once freed.
+     */
+    pub async fn rebind_lost_tracks(&self, registry: &Arc<CameraRegistry>) -> usize {
+        let mut rebound = Vec::new();
+        {
+            let slots = self.slots.lock().await;
+            for slot in slots.iter() {
+                let Some(flight_id) = slot.bound else {
+                    continue;
+                };
+                let Some(cam) = registry.get(flight_id).await else {
+                    continue;
+                };
+                if cam.destroyed.load(Ordering::Acquire) || cam.tier_of(&slot.track).await.is_some()
+                {
+                    continue;
+                }
+                cam.full.request_keyframe();
+                cam.add_track(slot.track.clone()).await;
+                rebound.push(flight_id);
+            }
+        }
+        for &flight_id in &rebound {
+            warn!(
+                flight_id,
+                peer_id = self.peer_id,
+                "bound slot was not being fed by its camera; put its track back"
+            );
+            registry.set_subscribed(flight_id, true).await;
+        }
+        rebound.len()
+    }
+
     /// Push a fresh camera snapshot over the control channel (no-op until
     /// the channel opens). Server-initiated counterpart of the Hello-time
     /// snapshot, used when registry membership churns mid-connection so a
@@ -2774,6 +2813,243 @@ mod tests {
         );
     }
 
+    /* Three cameras on one viewer's connection, as a phone holds them: releasing
+    the third slot and resizing the first must leave the second's packets
+    arriving on the mid they always came on. Run over a real connection, since a
+    reload clearing a stall points at state only a connection holds. Each frame
+    carries its camera's id as its payload, so a packet landing on the wrong mid
+    fails as surely as one that never arrives. */
+    #[tokio::test]
+    async fn releasing_one_slot_and_resizing_another_keeps_the_third_feed_arriving() {
+        use crate::shared_mem::{CaptureStamp, MmapFrameRing, MmapRingConfig};
+        use crate::webrtc::video_track::CaptureTime;
+        use std::collections::HashMap;
+        use std::time::Duration;
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+
+        const LAUNCHPAD: u32 = 11;
+        const HULL: u32 = 22;
+        const FACE: u32 = 33;
+        type Arrivals = Arc<std::sync::Mutex<HashMap<(String, u8), usize>>>;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 512,
+            max_height: 512,
+        };
+        for id in [LAUNCHPAD, HULL, FACE] {
+            MmapFrameRing::create(&dir.path().join(format!("{id}.ring")), cfg).expect("ring");
+        }
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let peer = KerbcastPeer::new(registry.clone(), &[], 4)
+            .await
+            .expect("peer");
+
+        let viewer = build_pc().await;
+        viewer
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("control channel");
+        let arrivals: Arrivals = Default::default();
+        let seen = arrivals.clone();
+        viewer.on_track(Box::new(move |track, _, transceiver| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                let mid = transceiver.mid().map(|m| m.to_string()).unwrap_or_default();
+                tokio::spawn(async move {
+                    while let Ok((packet, _)) = track.read_rtp().await {
+                        let Some(&camera) = packet.payload.last() else {
+                            continue;
+                        };
+                        *seen
+                            .lock()
+                            .unwrap()
+                            .entry((mid.clone(), camera))
+                            .or_default() += 1;
+                    }
+                });
+            })
+        }));
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<()>(1);
+        viewer.on_peer_connection_state_change(Box::new(move |state| {
+            let up_tx = up_tx.clone();
+            Box::pin(async move {
+                if state == RTCPeerConnectionState::Connected {
+                    let _ = up_tx.try_send(());
+                }
+            })
+        }));
+        let mut gathered = viewer.gathering_complete_promise().await;
+        browser_offer(&viewer, 4).await;
+        let _ = gathered.recv().await;
+        let offer = viewer.local_description().await.expect("offer").sdp;
+        let answer = peer.answer_to_offer(offer).await.expect("answer");
+        viewer
+            .set_remote_description(RTCSessionDescription::answer(answer).unwrap())
+            .await
+            .expect("set answer");
+        tokio::time::timeout(Duration::from_secs(15), up_rx.recv())
+            .await
+            .expect("viewer connects");
+
+        for id in [LAUNCHPAD, HULL, FACE] {
+            handle_subscribe(&registry, &peer.slots, &peer.outbox, id).await;
+        }
+        let slots_of = |slots: &Vec<Slot>| -> Vec<(Option<String>, Option<u32>)> {
+            slots.iter().map(|s| (s.mid.clone(), s.bound)).collect()
+        };
+        let before = slots_of(&*peer.slots.lock().await);
+        let mid_of = |id: u32| {
+            before
+                .iter()
+                .find(|(_, bound)| *bound == Some(id))
+                .and_then(|(mid, _)| mid.clone())
+                .expect("bound with a mid")
+        };
+        let (hull_mid, face_mid, launchpad_mid) = (mid_of(HULL), mid_of(FACE), mid_of(LAUNCHPAD));
+
+        let mut clock = 0.0;
+        let send = |clock: f64| {
+            let registry = registry.clone();
+            async move {
+                for id in [LAUNCHPAD, HULL, FACE] {
+                    let cam = registry.get(id).await.expect("camera");
+                    let tracks: Vec<_> = cam
+                        .full
+                        .tracks
+                        .read()
+                        .await
+                        .iter()
+                        .filter_map(|w| w.upgrade())
+                        .collect();
+                    for track in tracks {
+                        let mut frame = vec![0, 0, 0, 1, 0x65];
+                        frame.resize(64, id as u8);
+                        track
+                            .write_frame(
+                                &frame,
+                                CaptureTime {
+                                    game_clock_ms: clock,
+                                    picked_up: std::time::Instant::now(),
+                                },
+                                true,
+                                id,
+                                &CaptureStamp::at(Some(clock / 1000.0), 0),
+                            )
+                            .await
+                            .expect("write");
+                    }
+                }
+            }
+        };
+        let count = |mid: &str, id: u32| {
+            *arrivals
+                .lock()
+                .unwrap()
+                .get(&(mid.to_owned(), id as u8))
+                .unwrap_or(&0)
+        };
+        /* Sends until the feed's count has risen by `want`, or the deadline. */
+        for _ in 0..200 {
+            clock += 33.0;
+            send(clock).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if count(&hull_mid, HULL) >= 30
+                && count(&launchpad_mid, LAUNCHPAD) >= 30
+                && count(&face_mid, FACE) >= 30
+            {
+                break;
+            }
+        }
+        assert!(
+            count(&hull_mid, HULL) >= 30,
+            "hull flows before the release"
+        );
+        assert!(count(&face_mid, FACE) >= 30, "and the face camera");
+
+        handle_unsubscribe(&registry, peer.peer_id, &peer.slots, &peer.outbox, FACE).await;
+        registry
+            .record_display_size(LAUNCHPAD, peer.peer_id, 368, 208)
+            .await;
+
+        let after = slots_of(&*peer.slots.lock().await);
+        let expected: Vec<_> = before
+            .iter()
+            .map(|(mid, bound)| {
+                let bound = bound.filter(|&id| id != FACE);
+                (mid.clone(), bound)
+            })
+            .collect();
+        assert_eq!(after, expected, "only the released slot changes");
+        let hull = registry.get(HULL).await.expect("hull");
+        assert_eq!(
+            hull.subscribers.load(Ordering::Acquire),
+            1,
+            "hull keeps its viewer"
+        );
+        assert!(hull.control.lock().await.subscribed, "and stays awake");
+        assert!(
+            !registry
+                .get(FACE)
+                .await
+                .unwrap()
+                .control
+                .lock()
+                .await
+                .subscribed,
+            "the released camera sleeps"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (hull_before, launchpad_before, face_before) = (
+            count(&hull_mid, HULL),
+            count(&launchpad_mid, LAUNCHPAD),
+            count(&face_mid, FACE),
+        );
+        for _ in 0..200 {
+            clock += 33.0;
+            send(clock).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if count(&hull_mid, HULL) >= hull_before + 60
+                && count(&launchpad_mid, LAUNCHPAD) >= launchpad_before + 60
+            {
+                break;
+            }
+        }
+        assert!(
+            count(&hull_mid, HULL) >= hull_before + 60,
+            "hull kept arriving on its own mid: {} then {}",
+            hull_before,
+            count(&hull_mid, HULL)
+        );
+        assert!(
+            count(&launchpad_mid, LAUNCHPAD) >= launchpad_before + 60,
+            "the resized camera too"
+        );
+        assert_eq!(
+            count(&face_mid, FACE),
+            face_before,
+            "the released one stops"
+        );
+        let strays = arrivals
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(mid, id)| {
+                !matches!(
+                    (mid.as_str(), *id as u32),
+                    (m, HULL) if m == hull_mid
+                ) && !matches!((mid.as_str(), *id as u32), (m, LAUNCHPAD) if m == launchpad_mid)
+                    && !matches!((mid.as_str(), *id as u32), (m, FACE) if m == face_mid)
+            })
+            .count();
+        assert_eq!(strays, 0, "no feed reached another camera's mid");
+        viewer.close().await.expect("close viewer");
+        peer.close().await.expect("close peer");
+    }
+
     /// A peer with two confirmed slots and the browser that negotiated them.
     async fn connected_pair() -> (KerbcastPeer, Arc<RTCPeerConnection>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3414,6 +3690,85 @@ mod tests {
             cam2.control.lock().await.subscribed,
             "plugin is told to resume rendering"
         );
+    }
+
+    /* A subscribe that looked the camera up just before a rescan replaced it adds
+    its track to the discarded entry, and binds its slot only after the churn
+    resync has already run. The live entry never hears of the viewer, so it goes
+    idle and the plugin sleeps the camera, and a repeat subscribe only announces
+    the slot again. */
+    #[tokio::test]
+    async fn a_slot_bound_through_a_rescan_gets_its_track_back() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let ring_path = dir.path().join("1.ring");
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let peer = Arc::new(
+            KerbcastPeer::new(registry.clone(), &[], 2)
+                .await
+                .expect("peer"),
+        );
+        let discarded = registry.get(1).await.expect("camera attached");
+
+        std::fs::remove_file(&ring_path).expect("delete ring");
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        let outcome = registry.rescan().await;
+        assert_eq!(outcome.attached, vec![1], "re-attached in place");
+        resync_after_camera_churn(&registry, std::slice::from_ref(&peer), &outcome.attached).await;
+
+        let track = {
+            let mut slots = peer.slots.lock().await;
+            slots[0].bound = Some(1);
+            slots[0].track.clone()
+        };
+        discarded.add_track(track.clone()).await;
+
+        let live = registry.get(1).await.expect("camera live");
+        assert_eq!(
+            live.subscribers.load(Ordering::Acquire),
+            0,
+            "the viewer is lost"
+        );
+        assert_eq!(peer.rebind_lost_tracks(&registry).await, 1);
+        assert_eq!(
+            live.subscribers.load(Ordering::Acquire),
+            1,
+            "the viewer is back"
+        );
+        assert!(live.tier_of(&track).await.is_some(), "and is fed");
+        assert!(live.control.lock().await.subscribed, "and the camera wakes");
+        assert!(
+            live.full.keyframe_gate.lock().unwrap().pending(),
+            "with a keyframe"
+        );
+
+        assert_eq!(
+            peer.rebind_lost_tracks(&registry).await,
+            0,
+            "nothing left to do"
+        );
+        assert_eq!(
+            live.subscribers.load(Ordering::Acquire),
+            1,
+            "and no double count"
+        );
+
+        handle_unsubscribe(&registry, 0, &peer.slots, &peer.outbox, 1).await;
+        assert_eq!(
+            peer.rebind_lost_tracks(&registry).await,
+            0,
+            "a freed slot stays free"
+        );
+        assert_eq!(live.subscribers.load(Ordering::Acquire), 0);
     }
 
     /// A ring recreated in place within one rescan keeps its viewers' sizes on

@@ -2214,6 +2214,23 @@ mod tests {
         }
     }
 
+    /// The wire form of a missing or NaN width, and a fractional one: refused
+    /// whole, so the size the sidecar already holds stands.
+    #[test]
+    fn a_display_size_without_a_whole_width_does_not_parse() {
+        for content in [
+            r#"{"flightId":1,"width":null,"height":208}"#,
+            r#"{"flightId":1,"height":208}"#,
+            r#"{"flightId":1,"width":208.5,"height":208}"#,
+        ] {
+            let msg = format!(r#"{{"type":"report-display-size","content":{content}}}"#);
+            assert!(
+                serde_json::from_str::<ClientMessage>(&msg).is_err(),
+                "{msg}"
+            );
+        }
+    }
+
     #[test]
     fn set_force_full_resolution_roundtrips() {
         let s = r#"{"type":"set-force-full-resolution","content":{"flightId":7,"force":true}}"#;

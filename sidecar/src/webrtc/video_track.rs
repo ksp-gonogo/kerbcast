@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
+use tracing::info;
 use webrtc::rtp::codecs::h264::H264Payloader;
 use webrtc::rtp::packetizer::{new_packetizer, Packetizer};
 use webrtc::rtp::sequence::new_random_sequencer;
@@ -116,7 +117,12 @@ impl VideoTrack {
         nothing and leave the sequence untouched, matching
         TrackLocalStaticSample. */
         if self.rtp.all_binding_paused().await {
-            *self.live_camera.lock().unwrap() = None;
+            if self.live_camera.lock().unwrap().take().is_some() {
+                info!(
+                    flight_id,
+                    "track stopped sending: its sender is paused or unbound"
+                );
+            }
             return Ok(None);
         }
         let packets = self.packetize(data, time, capture).await?;

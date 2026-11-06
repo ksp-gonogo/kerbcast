@@ -74,6 +74,19 @@ void Check(bool cond, string msg)
     Check(t.Full, "and only that Issue fills it");
 }
 
+// --- A readback that never lands is overdue, so its slot can be taken back. ---
+{
+    var t = new InFlightReadbacks(2);
+    Check(!t.OldestOverdue(1000, 600), "nothing in flight is never overdue");
+    t.Issue(100);
+    t.Issue(150);
+    Check(!t.OldestOverdue(699, 600), "the oldest is within its allowance");
+    Check(t.OldestOverdue(700, 600), "and overdue once the allowance is spent");
+    t.Land();
+    Check(!t.OldestOverdue(700, 600), "the next one is timed from its own issue");
+    Check(t.OldestOverdue(750, 600), "and overdue in its own turn");
+}
+
 // --- A single slot behaves as the old one-in-flight invariant. ---
 {
     var t = new InFlightReadbacks(1);
