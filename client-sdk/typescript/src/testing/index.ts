@@ -62,6 +62,8 @@ export interface MockCameraInit {
    */
   maxWidth?: number;
   maxHeight?: number;
+  /** Which attach of this flight id the camera is, as the sidecar counts them. Omitted when not given. */
+  attach?: number;
 }
 
 /** The `commandCentre` aim fields the game reports for `aim`; null is the default aim. */
@@ -113,6 +115,7 @@ function buildCamera(init: MockCameraInit): CameraState {
     viewerQuality: init.viewerQuality,
     qualityLimitedBy: init.qualityLimitedBy,
     trackMode: init.trackMode ?? TrackMode.None,
+    ...(init.attach !== undefined ? { attach: init.attach } : {}),
   };
 }
 
@@ -178,6 +181,8 @@ export class MockSidecar {
   private readonly _preForceSize = new Map<number, { width: number; height: number }>();
   /** Per-flight pending bump/revert timer, so a rapid force/unforce toggle cancels the stale one. */
   private readonly _forceTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** The display size held from this client per camera, read through {@link displaySizeFor}. */
+  private readonly _displaySizes = new Map<number, { width: number; height: number }>();
 
   constructor(opts: MockSidecarOptions = {}) {
     this._forceBumpDelayMs = opts.forceBumpDelayMs ?? 600;
@@ -380,6 +385,12 @@ export class MockSidecar {
     for (const timer of this._forceTimers.values()) clearTimeout(timer);
     this._forceTimers.clear();
     this._preForceSize.clear();
+    /* A camera that stays listed, and was not destroyed, keeps its sizes; any other starts afresh. */
+    for (const flightId of [...this._displaySizes.keys()]) {
+      const before = this._cameras.get(flightId);
+      const kept = inits.some((c) => c.flightId === flightId);
+      if (!kept || before?.lifecycle === CameraLifecycle.Destroyed) this._displaySizes.delete(flightId);
+    }
     this._cameras.clear();
     this._maxRenderSizes.clear();
     for (const init of inits) {
@@ -509,6 +520,17 @@ export class MockSidecar {
       if (fid === flightId) return mid;
     }
     return undefined;
+  }
+
+  /**
+   * The display size the sidecar holds from this client for a camera, or
+   * undefined when it holds none. Follows the sidecar's rules: a report for a
+   * camera it does not list is dropped, a withdraw or an unsubscribe forgets
+   * the size, and a camera that leaves the list (or comes back from
+   * destroyed) starts again with none.
+   */
+  displaySizeFor(flightId: number): { width: number; height: number } | undefined {
+    return this._displaySizes.get(flightId);
   }
 
   /** Every `ClientMessage` received from the client, in order. */
@@ -852,6 +874,7 @@ export class MockSidecar {
             break;
           }
         }
+        this._displaySizes.delete(flightId);
         if (bound !== undefined) {
           this._slotBindings.delete(bound);
           this._sendToClient({
@@ -865,11 +888,19 @@ export class MockSidecar {
       // the mock has no frame clock, so it doesn't model their *effect* on
       // panYaw/fov. They're still recorded in `_commands`, so consumer tests
       // can assert the command was sent via `lastCommand("set-pan-rate")`.
-      // Advisory per-consumer display-size input. The real sidecar aggregates
-      // it MAX-across-consumers to drive auto-resolution; the mock has no
-      // aggregator, so it just records the command (via `_commands`) and does
-      // NOT mutate camera render dims (unlike the operator `set-render-size`).
-      case "report-display-size":
+      /*
+       * Advisory per-consumer display-size input. The real sidecar aggregates
+       * it MAX-across-consumers to drive auto-resolution; the mock has one
+       * consumer, so it holds the size (see displaySizeFor) and does NOT
+       * mutate camera render dims (unlike the operator `set-render-size`).
+       */
+      case "report-display-size": {
+        const { flightId, width, height } = msg.content;
+        if (!this._cameras.has(flightId)) break;
+        if (width < 2 || height < 2) this._displaySizes.delete(flightId);
+        else this._displaySizes.set(flightId, { width, height });
+        break;
+      }
       case "set-pan-rate":
       case "set-zoom-rate":
       case "hello":

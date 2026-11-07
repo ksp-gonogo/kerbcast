@@ -2164,12 +2164,18 @@ describe("KerbcastClient — dynamic slot subscription", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(sidecar.commands.slice(gone)).toEqual([]);
 
+    const resubscribed = sidecar.commands.length;
     await client.subscribe(42);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sidecar.commands.slice(resubscribed).map((m) => m.type)).toEqual(["subscribe", "report-display-size"]);
     sidecar.setCameras([]);
     const again = sidecar.commands.length;
     sidecar.setCameras([{ flightId: 42 }]);
     await new Promise((r) => setTimeout(r, 0));
-    expect(sidecar.commands.slice(again).map((m) => m.type)).toEqual(["set-force-full-resolution"]);
+    expect(sidecar.commands.slice(again).map((m) => m.type)).toEqual([
+      "set-force-full-resolution",
+      "report-display-size",
+    ]);
   });
 
   /* The mock announces every bound slot again on recovery, as the sidecar does,
@@ -6048,6 +6054,40 @@ describe("KerbcastClient: a display size the sidecar already holds", () => {
     await client.reportDisplaySize(42, 0, 0);
     await client.reportDisplaySize(42, 432, 244);
     expect(sizes()).toEqual(["432x244", "0x0", "432x244"]);
+  });
+
+  it("sends the size it holds again when it subscribes after an unsubscribe", async () => {
+    const { client, sidecar, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.unsubscribe(42);
+    expect(sidecar.displaySizeFor(42)).toBeUndefined();
+    await client.subscribe(42);
+    await client.reportDisplaySize(42, 432, 244);
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+    expect(sidecar.displaySizeFor(42)).toEqual({ width: 432, height: 244 });
+  });
+
+  it("sends nothing on subscribe after the size was withdrawn", async () => {
+    const { client, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.reportDisplaySize(42, 0, 0);
+    await client.unsubscribe(42);
+    await client.subscribe(42);
+    expect(sizes()).toEqual(["432x244", "0x0"]);
+  });
+
+  /* The sidecar drops a report for a camera it does not list, so the size waits for the camera's return. */
+  it("sends the size on the camera's return, not into the gap, when it subscribes while the camera is away", async () => {
+    const { client, sidecar, sizes } = await connected();
+    await client.reportDisplaySize(42, 432, 244);
+    await client.unsubscribe(42);
+    sidecar.setCameras([]);
+    await client.subscribe(42);
+    expect(sizes()).toEqual(["432x244"]);
+    sidecar.setCameras([{ flightId: 42 }]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sizes()).toEqual(["432x244", "432x244"]);
+    expect(sidecar.displaySizeFor(42)).toEqual({ width: 432, height: 244 });
   });
 
   it("sends the size again after an unsubscribe", async () => {

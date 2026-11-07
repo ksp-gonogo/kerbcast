@@ -2752,6 +2752,21 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   async subscribe(flightId: number): Promise<void> {
     if (this.dynamicMode) this.wanted.add(flightId);
     await this._send({ type: "subscribe", content: { flightId } });
+    this._sendHeldSizeOnSubscribe(flightId);
+  }
+
+  /**
+   * A subscribe after an unsubscribe finds the sidecar holding no size from
+   * this client, and a feed whose box did not change has nothing new to
+   * report, so the size this consumer last reported goes out again. A camera
+   * the list does not have yet would drop it; its return to the list sends
+   * it instead.
+   */
+  private _sendHeldSizeOnSubscribe(flightId: number): void {
+    const size = this.displaySizes.get(flightId);
+    if (!size) return;
+    if (this.camerasListed && !this._cameras.some((c) => c.flightId === flightId)) return;
+    void this._sendDisplaySize(flightId, size.width, size.height).catch(() => {});
   }
 
   /**
@@ -2762,8 +2777,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.wanted.delete(flightId);
     this.growQueue.delete(flightId);
     this.clearWaitingForSlot(flightId);
-    /* The sidecar forgets this client's size with the subscription. */
-    this.displaySizes.delete(flightId);
+    /* The sidecar forgets this client's size with the subscription. The size stays held for a later subscribe. */
     this.sentSizes.delete(flightId);
     await this._send({ type: "unsubscribe", content: { flightId } });
   }
