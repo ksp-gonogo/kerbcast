@@ -3237,16 +3237,14 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.camerasListed = true;
     this.commandCentres.retain(cameras.map((c) => c.flightId));
     this.frameHistory.retain(cameras.map((c) => c.flightId));
+    const registeredAgain = new Set<number>();
     for (const cam of cameras) {
       this.commandCentres.record(cam.flightId, cam.commandCentre);
       const handle = this.getOrCreateHandle(cam.flightId);
       const reattached = attachChanged(handle.state, cam);
       const resurrected = handle._setState(cam);
-      if (resurrected) {
-        /* A destroyed camera that comes back is new to the sidecar, which holds no size for it. */
-        this.sentSizes.delete(cam.flightId);
-        this._resourceHandle(cam.flightId);
-      }
+      if (resurrected) this._resourceHandle(cam.flightId);
+      if (resurrected || reattached) registeredAgain.add(cam.flightId);
       if (resurrected || reattached || (listed && !listed.has(cam.flightId))) {
         this._renewEncodedTransform(cam.flightId);
       }
@@ -3258,15 +3256,28 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     }
     this.emit("cameras-change", cameras);
     this._sendHeldAnchors();
-    /* A camera back in the list after a scene change is a new camera to the
-       sidecar, which has forgotten what this client asked of the old one.
-       Only cameras this client still subscribes to, so a size from a feed it
-       has since closed cannot pin the camera for everyone. */
-    if (listed) {
-      for (const cam of cameras) {
-        if (!listed.has(cam.flightId) && this._subscribes(cam.flightId)) this._sendHeldFor(cam.flightId);
-      }
+    /* A camera back in the list after a scene change, or registered again in
+       place, is a new camera to the sidecar, which has forgotten what this
+       client asked of the old one. */
+    for (const cam of cameras) {
+      const isNew = (listed && !listed.has(cam.flightId)) || registeredAgain.has(cam.flightId);
+      if (isNew) this._sendHeldAfterReregister(cam.flightId);
     }
+  }
+
+  /**
+   * A camera registered again under its flight id (destroyed and back, or its
+   * ring attached afresh) may have lost what this client asked of it: the
+   * sidecar starts a destroyed camera that returns with no size, force or
+   * hold, and may never have shown it destroyed. The consumer's tile has not
+   * changed size, so nothing else would send them, and the camera would stay
+   * at its default size for good. Only for cameras this client still
+   * subscribes to, so a size from a feed it has since closed cannot pin the
+   * camera for everyone.
+   */
+  private _sendHeldAfterReregister(flightId: number): void {
+    this.sentSizes.delete(flightId);
+    if (this._subscribes(flightId)) this._sendHeldFor(flightId);
   }
 
   private _subscribes(flightId: number): boolean {
@@ -3361,13 +3372,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         const handle = this.getOrCreateHandle(msg.content.state.flightId);
         const reattached = attachChanged(handle.state, msg.content.state);
         const resurrected = handle._setState(msg.content.state);
-        if (resurrected) {
-          this.sentSizes.delete(msg.content.state.flightId);
-          this._resourceHandle(msg.content.state.flightId);
-        }
+        if (resurrected) this._resourceHandle(msg.content.state.flightId);
         if (resurrected || reattached) this._renewEncodedTransform(msg.content.state.flightId);
         this.emit("cameras-change", this._cameras);
         this._sendHeldAnchors();
+        if (resurrected || reattached) this._sendHeldAfterReregister(msg.content.state.flightId);
         break;
       }
       case "slot-map": {

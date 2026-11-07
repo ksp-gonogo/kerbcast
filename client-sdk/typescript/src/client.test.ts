@@ -5948,6 +5948,62 @@ describe("KerbcastClient: withdrawing a display size", () => {
   });
 });
 
+describe("KerbcastClient: a camera registered again under the same flight id", () => {
+  async function connected() {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(fakeAnswer([42])));
+    await client.connect([42]);
+    captured.dc?._open();
+    const push = (type: string, content: unknown) => captured.dc?._msg(JSON.stringify({ type, content }));
+    push("camera-snapshot", { cameras: [fakeCameraState(42, { attach: 1 })] });
+    await client.reportDisplaySize(42, 368, 208);
+    const sizes = () =>
+      (captured.dc?.sent ?? [])
+        .map((m) => JSON.parse(m))
+        .filter((m) => m.type === "report-display-size")
+        .map((m) => `${m.content.width}x${m.content.height}`);
+    return { client, push, sizes };
+  }
+
+  /* The sidecar starts a destroyed camera that comes back with no size, and a viewer whose tile did not change has nothing new to report. */
+  it("sends its size again when a destroyed camera comes back", async () => {
+    const { client, push, sizes } = await connected();
+    push("camera-state-changed", { state: fakeCameraState(42, { attach: 1, lifecycle: CameraLifecycle.Destroyed }) });
+    push("camera-state-changed", { state: fakeCameraState(42, { attach: 2 }) });
+    expect(sizes()).toEqual(["368x208", "368x208"]);
+    await client.reportDisplaySize(42, 368, 208);
+    expect(sizes()).toEqual(["368x208", "368x208"]);
+  });
+
+  /* Destroyed and back within one sidecar tick: the client never sees it destroyed, only a new attach. */
+  it("sends its size again when only the attach changes in a snapshot", async () => {
+    const { push, sizes } = await connected();
+    push("camera-snapshot", { cameras: [fakeCameraState(42, { attach: 2 })] });
+    expect(sizes()).toEqual(["368x208", "368x208"]);
+  });
+
+  it("sends its size again when only the attach changes in a state update", async () => {
+    const { push, sizes } = await connected();
+    push("camera-state-changed", { state: fakeCameraState(42, { attach: 2 }) });
+    expect(sizes()).toEqual(["368x208", "368x208"]);
+  });
+
+  it("does not send its size again while the attach stays the same", async () => {
+    const { push, sizes } = await connected();
+    push("camera-snapshot", { cameras: [fakeCameraState(42, { attach: 1 })] });
+    push("camera-state-changed", { state: fakeCameraState(42, { attach: 1 }) });
+    expect(sizes()).toEqual(["368x208"]);
+  });
+
+  it("sends nothing for a camera it has stopped showing", async () => {
+    const { client, push, sizes } = await connected();
+    await client.reportDisplaySize(42, 0, 0);
+    push("camera-snapshot", { cameras: [fakeCameraState(42, { attach: 2 })] });
+    expect(sizes()).toEqual(["368x208", "0x0"]);
+  });
+});
+
 describe("KerbcastClient: a display size the sidecar already holds", () => {
   async function connected() {
     const sidecar = new MockSidecar();
