@@ -2167,7 +2167,11 @@ describe("KerbcastClient — dynamic slot subscription", () => {
     const resubscribed = sidecar.commands.length;
     await client.subscribe(42);
     await new Promise((r) => setTimeout(r, 0));
-    expect(sidecar.commands.slice(resubscribed).map((m) => m.type)).toEqual(["subscribe", "report-display-size"]);
+    expect(sidecar.commands.slice(resubscribed).map((m) => m.type)).toEqual([
+      "subscribe",
+      "set-force-full-resolution",
+      "report-display-size",
+    ]);
     sidecar.setCameras([]);
     const again = sidecar.commands.length;
     sidecar.setCameras([{ flightId: 42 }]);
@@ -6065,6 +6069,59 @@ describe("KerbcastClient: a display size the sidecar already holds", () => {
     await client.reportDisplaySize(42, 432, 244);
     expect(sizes()).toEqual(["432x244", "432x244"]);
     expect(sidecar.displaySizeFor(42)).toEqual({ width: 432, height: 244 });
+  });
+
+  describe("a force and a size hold across an unsubscribe and subscribe pair", () => {
+    const heldTypes = (sidecar: MockSidecar, from: number) =>
+      sidecar.commands
+        .slice(from)
+        .map((m) => m.type)
+        .filter((t) => t === "set-force-full-resolution" || t === "set-size-hold");
+
+    it("sends the force again", async () => {
+      const { client, sidecar } = await connected();
+      await client.camera(42).setForceFullResolution(true);
+      await client.unsubscribe(42);
+      const from = sidecar.commands.length;
+      await client.subscribe(42);
+      expect(heldTypes(sidecar, from)).toEqual(["set-force-full-resolution"]);
+    });
+
+    it("sends the hold again", async () => {
+      const { client, sidecar } = await connected();
+      await client.camera(42).setSizeHold(true);
+      await client.unsubscribe(42);
+      const from = sidecar.commands.length;
+      await client.subscribe(42);
+      expect(heldTypes(sidecar, from)).toEqual(["set-size-hold"]);
+    });
+
+    it("sends nothing after an explicit release", async () => {
+      const { client, sidecar } = await connected();
+      await client.camera(42).setForceFullResolution(true);
+      await client.camera(42).setSizeHold(true);
+      await client.camera(42).setForceFullResolution(false);
+      await client.camera(42).setSizeHold(false);
+      await client.unsubscribe(42);
+      const from = sidecar.commands.length;
+      await client.subscribe(42);
+      expect(heldTypes(sidecar, from)).toEqual([]);
+    });
+
+    it("sends them on the camera's return, not into the gap, when the camera is away", async () => {
+      const { client, sidecar } = await connected();
+      await client.camera(42).setForceFullResolution(true);
+      await client.camera(42).setSizeHold(true);
+      await client.unsubscribe(42);
+      sidecar.setCameras([]);
+      const from = sidecar.commands.length;
+      await client.subscribe(42);
+      expect(heldTypes(sidecar, from)).toEqual([]);
+      sidecar.setCameras([{ flightId: 42 }]);
+      await vi.waitFor(() =>
+        expect(heldTypes(sidecar, from)).toEqual(["set-force-full-resolution", "set-size-hold"]),
+      );
+    });
   });
 
   it("sends nothing on subscribe after the size was withdrawn", async () => {
