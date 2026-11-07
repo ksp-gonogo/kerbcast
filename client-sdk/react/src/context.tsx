@@ -1,4 +1,5 @@
-import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { CameraLifecycle } from "@ksp-gonogo/kerbcast";
 import { createContext, useContext, useMemo, type ReactNode } from "react";
 
 // ---------------------------------------------------------------------------
@@ -257,6 +258,34 @@ export function createClientDisplaySizes(
   client.on("control-open", () => {
     lastSent.clear();
     for (const flightId of [...perCamera.keys()]) recompute(flightId);
+  });
+
+  /*
+   * A camera registered again under its flight id (destroyed and back, or its
+   * ring attached afresh) starts on the sidecar with no size from anyone. The
+   * reporters' boxes have not changed, so their MAX equals lastSent and would
+   * never go out again; the client re-sends only a size it still holds, which
+   * it drops when the size is withdrawn or the camera unsubscribed. Re-send the
+   * current MAX for such a camera, as on a reconnect.
+   */
+  const registered = new Map<number, { destroyed: boolean; attach: number }>();
+  const note = (cam: CameraState) => {
+    const next = { destroyed: cam.lifecycle === CameraLifecycle.Destroyed, attach: cam.attach ?? 0 };
+    const prev = registered.get(cam.flightId);
+    registered.set(cam.flightId, next);
+    return { prev, next };
+  };
+  /* Built when a provider first needs it, possibly after the cameras were listed. */
+  for (const cam of client.cameras ?? []) note(cam);
+  client.on("cameras-change", (cameras: CameraState[]) => {
+    for (const cam of cameras) {
+      const { prev, next } = note(cam);
+      if (!prev || next.destroyed || !perCamera.has(cam.flightId)) continue;
+      const reattached = !!prev.attach && !!next.attach && prev.attach !== next.attach;
+      if (!prev.destroyed && !reattached) continue;
+      lastSent.delete(cam.flightId);
+      recompute(cam.flightId);
+    }
   });
 
   return {

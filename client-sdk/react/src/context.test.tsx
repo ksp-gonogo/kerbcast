@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { CameraLifecycle } from "@ksp-gonogo/kerbcast";
 import { act, render } from "@testing-library/react";
 import { useEffect } from "react";
 import {
@@ -19,9 +20,9 @@ import {
  */
 function fakeClient() {
   const reports: Array<{ flightId: number; width: number; height: number }> = [];
-  const handlers = new Map<string, Array<() => void>>();
+  const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
   const client = {
-    on: (event: string, h: () => void) => {
+    on: (event: string, h: (...args: unknown[]) => void) => {
       handlers.set(event, [...(handlers.get(event) ?? []), h]);
       return () => {};
     },
@@ -31,7 +32,10 @@ function fakeClient() {
   } as unknown as KerbcastClient;
   /** Simulate the control channel (re)opening on a fresh peer. */
   const openControl = () => handlers.get("control-open")?.forEach((h) => h());
-  return { client, reports, openControl };
+  /** Simulate a cameras-change carrying each camera's lifecycle and ring attach. */
+  const listCameras = (cameras: Array<{ flightId: number; lifecycle?: CameraLifecycle; attach?: number }>) =>
+    handlers.get("cameras-change")?.forEach((h) => h(cameras));
+  return { client, reports, openControl, listCameras };
 }
 
 describe("createClientDisplaySizes", () => {
@@ -174,6 +178,95 @@ describe("createClientDisplaySizes", () => {
       expect(reports).toEqual([]);
     });
   });
+  describe("camera registered again", () => {
+    const active = CameraLifecycle.Active;
+    const destroyed = CameraLifecycle.Destroyed;
+
+    it("re-sends an unchanged size when a destroyed camera comes back", () => {
+      const { client, reports, listCameras } = fakeClient();
+      const reg = createClientDisplaySizes(client);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      reg.report(1, "a", 640, 360);
+      listCameras([{ flightId: 1, lifecycle: destroyed, attach: 5 }]);
+      expect(reports).toHaveLength(1);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      expect(reports).toEqual([
+        { flightId: 1, width: 640, height: 360 },
+        { flightId: 1, width: 640, height: 360 },
+      ]);
+    });
+
+    it("re-sends the current MAX when a camera's ring is attached afresh", () => {
+      const { client, reports, listCameras } = fakeClient();
+      const reg = createClientDisplaySizes(client);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      reg.report(1, "small", 40, 40);
+      reg.report(1, "big", 512, 512);
+      reports.length = 0;
+      listCameras([{ flightId: 1, lifecycle: active, attach: 6 }]);
+      expect(reports).toEqual([{ flightId: 1, width: 512, height: 512 }]);
+    });
+
+    it("keeps de-duplicating after the re-send", () => {
+      const { client, reports, listCameras } = fakeClient();
+      const reg = createClientDisplaySizes(client);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      reg.report(1, "a", 640, 360);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 6 }]);
+      reg.report(1, "a", 640, 360);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 6 }]);
+      expect(reports).toHaveLength(2);
+    });
+
+    it("sends nothing for an unchanged camera, a first listing or a missing attach", () => {
+      const { client, reports, listCameras } = fakeClient();
+      const reg = createClientDisplaySizes(client);
+      reg.report(1, "a", 640, 360);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      listCameras([{ flightId: 1, lifecycle: active }]);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 7 }]);
+      expect(reports).toHaveLength(1);
+    });
+
+    it("sends nothing for a camera that comes back with no reporters, and only for the one that came back", () => {
+      const { client, reports, listCameras } = fakeClient();
+      const reg = createClientDisplaySizes(client);
+      listCameras([
+        { flightId: 1, lifecycle: active, attach: 5 },
+        { flightId: 2, lifecycle: active, attach: 8 },
+        { flightId: 3, lifecycle: active, attach: 9 },
+      ]);
+      reg.report(1, "a", 640, 360);
+      reg.report(2, "b", 320, 180);
+      reports.length = 0;
+      listCameras([
+        { flightId: 1, lifecycle: active, attach: 5 },
+        { flightId: 2, lifecycle: destroyed, attach: 8 },
+        { flightId: 3, lifecycle: destroyed, attach: 9 },
+      ]);
+      listCameras([
+        { flightId: 1, lifecycle: active, attach: 5 },
+        { flightId: 2, lifecycle: active, attach: 8 },
+        { flightId: 3, lifecycle: active, attach: 9 },
+      ]);
+      expect(reports).toEqual([{ flightId: 2, width: 320, height: 180 }]);
+    });
+
+    it("reports afresh after a withdraw while the camera was away", () => {
+      const { client, reports, listCameras } = fakeClient();
+      const reg = createClientDisplaySizes(client);
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      reg.report(1, "a", 640, 360);
+      listCameras([{ flightId: 1, lifecycle: destroyed, attach: 5 }]);
+      reg.clear(1, "a");
+      listCameras([{ flightId: 1, lifecycle: active, attach: 5 }]);
+      expect(reports.at(-1)).toEqual({ flightId: 1, width: 0, height: 0 });
+      reg.report(1, "a", 640, 360);
+      expect(reports.at(-1)).toEqual({ flightId: 1, width: 640, height: 360 });
+      expect(reports).toHaveLength(3);
+    });
+  });
 });
 
 describe("createClientSubscriptions reconnect", () => {
@@ -181,8 +274,8 @@ describe("createClientSubscriptions reconnect", () => {
     const calls: string[] = [];
     const handlers: Array<() => void> = [];
     const client = {
-      on: (_event: string, h: () => void) => {
-        handlers.push(h);
+      on: (event: string, h: () => void) => {
+        if (event === "control-open") handlers.push(h);
         return () => {};
       },
       subscribe: vi.fn(async (id: number) => {

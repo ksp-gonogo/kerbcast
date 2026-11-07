@@ -6,6 +6,7 @@
  */
 
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
+import { CameraLifecycle } from "@ksp-gonogo/kerbcast";
 import { act, cleanup, render } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -258,5 +259,85 @@ describe("useReportDisplaySize", () => {
     );
     fireResize(50, 40);
     expect(reports.at(-1)).toMatchObject({ w: 128, h: 128 });
+  });
+
+  describe("with the default registry, across a camera registered again", () => {
+    /* A client that records what reaches reportDisplaySize, with cameras-change driven by the test. */
+    function sizingClient() {
+      const sent: Array<{ flightId: number; w: number; h: number }> = [];
+      const handlers = new Map<string, Array<(arg?: unknown) => void>>();
+      const client = {
+        on: (event: string, h: (arg?: unknown) => void) => {
+          handlers.set(event, [...(handlers.get(event) ?? []), h]);
+          return () => {};
+        },
+        reportDisplaySize: vi.fn(async (flightId: number, w: number, h: number) => {
+          sent.push({ flightId, w, h });
+        }),
+        cameras: [{ flightId: 7, lifecycle: CameraLifecycle.Active, attach: 3 }],
+      } as unknown as KerbcastClient;
+      const list = (lifecycle: CameraLifecycle, attach: number) =>
+        act(() => handlers.get("cameras-change")?.forEach((h) => h([{ flightId: 7, lifecycle, attach }])));
+      return { client, sent, list };
+    }
+
+    it("re-sends the unchanged size of a reporter that stays mounted while its camera is destroyed and back", () => {
+      const { client, sent, list } = sizingClient();
+      render(
+        <KerbcastProvider client={client}>
+          <Harness flightId={7} />
+        </KerbcastProvider>,
+      );
+      fireResize(440, 330);
+      expect(sent).toEqual([{ flightId: 7, w: 448, h: 252 }]);
+      list(CameraLifecycle.Destroyed, 3);
+      list(CameraLifecycle.Active, 3);
+      expect(sent).toEqual([
+        { flightId: 7, w: 448, h: 252 },
+        { flightId: 7, w: 448, h: 252 },
+      ]);
+    });
+
+    it("re-sends the unchanged size of a reporter that stays mounted while its camera's ring is attached afresh", () => {
+      const { client, sent, list } = sizingClient();
+      render(
+        <KerbcastProvider client={client}>
+          <Harness flightId={7} />
+        </KerbcastProvider>,
+      );
+      fireResize(440, 330);
+      list(CameraLifecycle.Active, 4);
+      expect(sent).toHaveLength(2);
+      expect(sent.at(-1)).toEqual({ flightId: 7, w: 448, h: 252 });
+    });
+
+    it("withdraws when the feed moves to another camera, and reports afresh when it moves back", () => {
+      const { client, sent, list } = sizingClient();
+      const { rerender } = render(
+        <KerbcastProvider client={client}>
+          <Harness flightId={7} />
+        </KerbcastProvider>,
+      );
+      fireResize(440, 330);
+      rerender(
+        <KerbcastProvider client={client}>
+          <Harness flightId={8} />
+        </KerbcastProvider>,
+      );
+      expect(sent).toContainEqual({ flightId: 7, w: 0, h: 0 });
+      list(CameraLifecycle.Destroyed, 3);
+      list(CameraLifecycle.Active, 3);
+      rerender(
+        <KerbcastProvider client={client}>
+          <Harness flightId={7} />
+        </KerbcastProvider>,
+      );
+      fireResize(440, 330);
+      expect(sent.filter((r) => r.flightId === 7)).toEqual([
+        { flightId: 7, w: 448, h: 252 },
+        { flightId: 7, w: 0, h: 0 },
+        { flightId: 7, w: 448, h: 252 },
+      ]);
+    });
   });
 });
