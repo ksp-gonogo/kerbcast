@@ -422,6 +422,17 @@ async fn consume_loop(
                 let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
                 broadcast(&snapshot, &ServerMessage::SiteCatalog(sites)).await;
             }
+            let networks = registry.poll_networks().await;
+            if networks.definitions.is_some() || !networks.results.is_empty() {
+                let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+                if let Some(defs) = networks.definitions {
+                    broadcast(&snapshot, &ServerMessage::NetworkDefinitions(defs)).await;
+                }
+                /* Every peer gets each outcome; only the one holding the token acts on it. */
+                for r in networks.results {
+                    broadcast(&snapshot, &ServerMessage::NetworkResult(r)).await;
+                }
+            }
             // Scene state lives in a separate host-written file (outlives the
             // flight-only status writer). Broadcast only when the flag flips.
             let mut left_flight = false;

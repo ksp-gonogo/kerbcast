@@ -1,6 +1,6 @@
 //! Global requests a client makes of the plugin that are not about one
 //! existing camera's control block: creating, destroying and aiming command
-//! cameras. The sidecar validates each, then
+//! cameras, and saving and deleting tracking networks. The sidecar validates each, then
 //! appends it to `global.commands.json`, which the plugin re-reads on the
 //! game frame after it changes. Each write bumps the counter in
 //! `COMMANDS_SIGNAL_FILE`, which is how the plugin knows.
@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::anchors::AnchorSet;
 use crate::protocol::{
     CommandAim, CommandAimKind, CommandVantage, CommandVantageKind, CreateCommandCameraPayload,
-    DestroyCommandCameraPayload, SetCommandAimPayload,
+    DeleteNetworkPayload, DestroyCommandCameraPayload, NetworkOptionsSpec, SaveNetworkPayload,
+    SetCommandAimPayload,
 };
 
 pub const COMMANDS_FILE: &str = "global.commands.json";
@@ -38,6 +39,13 @@ pub const MAX_KEPT: usize = 32;
 
 const MAX_TOKEN_LEN: usize = 128;
 const MAX_NAME_LEN: usize = 128;
+/// Longest saved network name, as the plugin keeps it.
+pub const MAX_NETWORK_NAME_LEN: usize = 48;
+/// Most vantages one network takes, as the plugin's `NetworkMath.MaxVantages`.
+pub const MAX_NETWORK_VANTAGES: usize = 64;
+/// Longest vantage label, as the plugin's `NetworkMath.MaxLabelLength`.
+const MAX_NETWORK_LABEL_LEN: usize = 64;
+const MAX_NETWORK_ID_LEN: usize = 64;
 
 /// One request as the plugin reads it: `{"id": n, "op": "...", ...payload}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,6 +64,8 @@ pub enum CommandOp {
     Create(CreateCommandCameraPayload),
     Destroy(DestroyCommandCameraPayload),
     Aim(SetCommandAimPayload),
+    SaveNetwork(SaveNetworkPayload),
+    DeleteNetwork(DeleteNetworkPayload),
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -261,6 +271,96 @@ pub fn validate_create(p: &CreateCommandCameraPayload) -> Result<(), String> {
         validate_aim(a)?;
     }
     Ok(())
+}
+
+/// A refusal the sidecar can decide alone: a `NetworkResult` code and its text.
+pub type NetworkRefusal = (&'static str, String);
+
+fn validate_token(token: &str) -> Result<(), NetworkRefusal> {
+    let token = token.trim();
+    if token.is_empty() || token.chars().count() > MAX_TOKEN_LEN {
+        return Err((
+            "badToken",
+            format!("token must be 1 to {MAX_TOKEN_LEN} characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_network_id(id: &str) -> Result<(), NetworkRefusal> {
+    if id.trim().is_empty() || id.chars().count() > MAX_NETWORK_ID_LEN {
+        return Err((
+            "notFound",
+            format!("networkId must be 1 to {MAX_NETWORK_ID_LEN} characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_options(o: &NetworkOptionsSpec) -> Result<(), NetworkRefusal> {
+    let ok = |x: Option<f64>| x.is_none_or(|v| v.is_finite() && v >= 0.0);
+    if ok(o.min_hold_ut) && ok(o.min_hold_real_seconds) && ok(o.margin_stops) {
+        Ok(())
+    } else {
+        Err((
+            "badNumber",
+            "hold times and margin must be finite, 0 or more".into(),
+        ))
+    }
+}
+
+/// Shape only: whether the stations and craft exist, and whether the client
+/// edited the latest revision, are the game's call.
+pub fn validate_save_network(p: &SaveNetworkPayload) -> Result<(), NetworkRefusal> {
+    validate_token(&p.token)?;
+    if let Some(id) = &p.network_id {
+        validate_network_id(id)?;
+    }
+    if p.name
+        .as_deref()
+        .is_some_and(|n| n.chars().count() > MAX_NETWORK_NAME_LEN)
+    {
+        return Err((
+            "badName",
+            format!("name must be at most {MAX_NETWORK_NAME_LEN} characters"),
+        ));
+    }
+    if p.vantages.is_empty() {
+        return Err(("noVantages", "a network needs at least one vantage".into()));
+    }
+    if p.vantages.len() > MAX_NETWORK_VANTAGES {
+        return Err((
+            "tooManyVantages",
+            format!("a network takes at most {MAX_NETWORK_VANTAGES} vantages"),
+        ));
+    }
+    for (i, v) in p.vantages.iter().enumerate() {
+        validate_vantage(&v.vantage).map_err(|e| ("badVantage", format!("vantage {i}: {e}")))?;
+        if v.label
+            .as_deref()
+            .is_some_and(|l| l.chars().count() > MAX_NETWORK_LABEL_LEN)
+        {
+            return Err((
+                "badVantage",
+                format!("vantage {i}: label must be at most {MAX_NETWORK_LABEL_LEN} characters"),
+            ));
+        }
+    }
+    if let Some(w) = &p.watch {
+        if w.kind != CommandAimKind::Vessel {
+            return Err(("badAim", "a network watches a craft (a vessel aim)".into()));
+        }
+        validate_aim(w).map_err(|e| ("badAim", e))?;
+    }
+    if let Some(o) = &p.options {
+        validate_options(o)?;
+    }
+    Ok(())
+}
+
+pub fn validate_delete_network(p: &DeleteNetworkPayload) -> Result<(), NetworkRefusal> {
+    validate_token(&p.token)?;
+    validate_network_id(&p.network_id)
 }
 
 #[cfg(test)]
@@ -578,5 +678,110 @@ mod tests {
         assert_eq!(file.requests.len(), MAX_KEPT);
         assert_eq!(file.requests.first().unwrap().id, 6);
         assert_eq!(file.requests.last().unwrap().id, MAX_KEPT as u64 + 5);
+    }
+
+    fn station(name: &str) -> crate::protocol::NetworkVantageSpec {
+        crate::protocol::NetworkVantageSpec {
+            vantage: CommandVantage {
+                kind: CommandVantageKind::Station,
+                site: None,
+                distance: None,
+                bearing: None,
+                height: None,
+                station: Some(name.into()),
+                body: None,
+                latitude: None,
+                longitude: None,
+                persistent_id: None,
+            },
+            label: None,
+            fallback: false,
+        }
+    }
+
+    fn save(vantages: Vec<crate::protocol::NetworkVantageSpec>) -> SaveNetworkPayload {
+        SaveNetworkPayload {
+            token: "t1".into(),
+            network_id: None,
+            base_revision: None,
+            name: Some("Polar net".into()),
+            watch: None,
+            vantages,
+            options: None,
+        }
+    }
+
+    #[test]
+    fn save_network_validation_names_the_code() {
+        assert!(validate_save_network(&save(vec![station("KSC")])).is_ok());
+        assert_eq!(
+            validate_save_network(&save(vec![])).unwrap_err().0,
+            "noVantages"
+        );
+        let many = (0..=MAX_NETWORK_VANTAGES).map(|_| station("KSC")).collect();
+        assert_eq!(
+            validate_save_network(&save(many)).unwrap_err().0,
+            "tooManyVantages"
+        );
+        assert_eq!(
+            validate_save_network(&save(vec![station(" ")]))
+                .unwrap_err()
+                .0,
+            "badVantage"
+        );
+        let mut long = save(vec![station("KSC")]);
+        long.name = Some("x".repeat(MAX_NETWORK_NAME_LEN + 1));
+        assert_eq!(validate_save_network(&long).unwrap_err().0, "badName");
+        let mut path = save(vec![station("KSC")]);
+        path.watch = Some(aim(CommandAimKind::Direction));
+        assert_eq!(validate_save_network(&path).unwrap_err().0, "badAim");
+        let mut craft = save(vec![station("KSC")]);
+        craft.watch = Some(aim(CommandAimKind::Vessel));
+        assert_eq!(
+            validate_save_network(&craft).unwrap_err().0,
+            "badAim",
+            "a vessel watch needs its craft"
+        );
+        craft.watch.as_mut().unwrap().persistent_id = Some(42);
+        assert!(validate_save_network(&craft).is_ok());
+        let mut nan = save(vec![station("KSC")]);
+        nan.options = Some(NetworkOptionsSpec {
+            min_hold_ut: Some(f64::NAN),
+            min_hold_real_seconds: None,
+            margin_stops: None,
+        });
+        assert_eq!(validate_save_network(&nan).unwrap_err().0, "badNumber");
+        let mut no_token = save(vec![station("KSC")]);
+        no_token.token = "".into();
+        assert_eq!(validate_save_network(&no_token).unwrap_err().0, "badToken");
+        assert!(validate_delete_network(&DeleteNetworkPayload {
+            token: "t".into(),
+            network_id: "".into()
+        })
+        .is_err());
+    }
+
+    /// The plugin's reader takes the payload's fields beside `id` and `op`.
+    #[test]
+    fn network_requests_flatten_into_the_file() {
+        let mut q = CommandQueue::default();
+        q.seed(None);
+        let mut p = save(vec![station("Crater Rim")]);
+        p.network_id = Some("n1".into());
+        p.base_revision = Some(3);
+        q.push(CommandOp::SaveNetwork(p));
+        q.push(CommandOp::DeleteNetwork(DeleteNetworkPayload {
+            token: "t2".into(),
+            network_id: "n1".into(),
+        }));
+        let json: serde_json::Value = serde_json::from_str(&q.to_json().unwrap()).unwrap();
+        let r = &json["requests"];
+        assert_eq!(r[0]["op"], "saveNetwork");
+        assert_eq!(r[0]["networkId"], "n1");
+        assert_eq!(r[0]["baseRevision"], 3);
+        assert_eq!(r[0]["vantages"][0]["vantage"]["station"], "Crater Rim");
+        assert_eq!(r[0]["vantages"][0]["fallback"], false);
+        assert_eq!(r[1]["op"], "deleteNetwork");
+        assert_eq!(r[1]["token"], "t2");
     }
 }

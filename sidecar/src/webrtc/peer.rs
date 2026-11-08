@@ -1316,6 +1316,25 @@ fn send_error(dc: &Outbox, message: String) {
     );
 }
 
+/// A network request the sidecar refused before it reached the game.
+fn send_network_refusal(
+    dc: &Outbox,
+    token: String,
+    network_id: Option<String>,
+    (code, text): crate::commands::NetworkRefusal,
+) {
+    send_server_message(
+        dc,
+        &ServerMessage::NetworkResult(crate::protocol::NetworkResultPayload {
+            token,
+            ok: false,
+            network_id,
+            code: Some(code.to_owned()),
+            text: Some(text),
+        }),
+    );
+}
+
 /// Single-message dispatch. Pulled out of the closure so the error
 /// paths and per-variant logic don't drown the construction code.
 async fn handle_client_message(
@@ -1365,6 +1384,7 @@ async fn handle_client_message(
                     resume: Some(true),
                     renegotiate: Some(true),
                     max_slots: Some(MAX_SLOTS_PER_PEER as u32),
+                    networks: Some(true),
                 }),
             );
             send_camera_snapshot(&registry, &dc).await;
@@ -1376,6 +1396,9 @@ async fn handle_client_message(
             );
             if let Some(sites) = registry.last_sites().await {
                 send_server_message(&dc, &ServerMessage::SiteCatalog(sites));
+            }
+            if let Some(networks) = registry.last_networks().await {
+                send_server_message(&dc, &ServerMessage::NetworkDefinitions(networks));
             }
             /* Prime scene state so a peer connecting out of flight shows the
              * standby immediately, not a stale live layout. */
@@ -1497,6 +1520,22 @@ async fn handle_client_message(
                     flight_id, "command camera destruction requested"
                 ),
                 Err(message) => send_error(&dc, message),
+            }
+        }
+        ClientMessage::SaveNetwork(payload) => {
+            let token = payload.token.clone();
+            let network_id = payload.network_id.clone();
+            match registry.request_save_network(payload).await {
+                Ok(id) => info!(request = id, token, "tracking network save requested"),
+                Err(refusal) => send_network_refusal(&dc, token, network_id, refusal),
+            }
+        }
+        ClientMessage::DeleteNetwork(payload) => {
+            let token = payload.token.clone();
+            let network_id = Some(payload.network_id.clone());
+            match registry.request_delete_network(payload).await {
+                Ok(id) => info!(request = id, token, "tracking network delete requested"),
+                Err(refusal) => send_network_refusal(&dc, token, network_id, refusal),
             }
         }
         ClientMessage::SetCommandAim(payload) => {

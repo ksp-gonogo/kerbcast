@@ -25,7 +25,8 @@ use tracing::{info, warn};
 
 use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
 use crate::commands::{
-    validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
+    validate_aim, validate_create, validate_delete_network, validate_save_network, CommandOp,
+    CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
 };
 use crate::encoder::{
     align_down, aligned_cover, EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION,
@@ -35,8 +36,9 @@ use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandNetworkInfo, CommandTarget, CommandTrackState,
-    CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
-    ErrorCode, Layer, QualityPreset, ResumePayload, SetCommandAimPayload, SettingsStatePayload,
+    CreateCommandCameraPayload, CrewLocation, DeleteNetworkPayload, DestroyCommandCameraPayload,
+    DisplaySizeReport, ErrorCode, Layer, NetworkDefinitionsPayload, NetworkResultPayload,
+    QualityPreset, ResumePayload, SaveNetworkPayload, SetCommandAimPayload, SettingsStatePayload,
     SiteCatalogPayload, SiteKind, TrackMode,
 };
 use crate::rate::RateWindow;
@@ -85,6 +87,41 @@ pub fn parse_in_flight(body: &str) -> Option<bool> {
 /// The ground stations the plugin lists, rewritten only when they change.
 /// Kept out of `global.status.json`, which is written every second.
 pub const SITES_FILE: &str = "global.sites.json";
+
+/// The plugin's tracking networks and the outcome of the latest network
+/// requests, rewritten on every change.
+pub const NETWORKS_FILE: &str = "global.networks.json";
+
+/// How many request outcomes the sidecar remembers having sent, well above
+/// the few the plugin keeps in the file.
+const SEEN_RESULTS_KEPT: usize = 256;
+
+/// On-disk shape of `global.networks.json`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworksFile {
+    #[serde(default)]
+    networks: Vec<crate::protocol::NetworkDefinition>,
+    #[serde(default)]
+    results: Vec<NetworkResultPayload>,
+}
+
+/// What one read of `global.networks.json` brought that clients have not seen.
+#[derive(Debug, Default, PartialEq)]
+pub struct NetworksNews {
+    /// The definitions, when they differ from the last read (the first included).
+    pub definitions: Option<NetworkDefinitionsPayload>,
+    /// Request outcomes not sent before.
+    pub results: Vec<NetworkResultPayload>,
+}
+
+#[derive(Debug, Default)]
+struct NetworksSeen {
+    definitions: Option<NetworkDefinitionsPayload>,
+    /// None until the first read, whose results predate this process's
+    /// clients and are not sent.
+    results: Option<std::collections::VecDeque<String>>,
+}
 
 /// On-disk shape of `global.status.json` — the plugin → sidecar push
 /// half of the IPC. The plugin rewrites this file at ~1Hz with the
@@ -1702,6 +1739,8 @@ pub struct CameraRegistry {
     /// Last `global.sites.json` read, so a change is broadcast once and a
     /// connecting peer is primed with it.
     last_sites: Mutex<Option<SiteCatalogPayload>>,
+    /// The tracking networks last read and the request outcomes already sent.
+    networks_seen: Mutex<NetworksSeen>,
     /// Capped ring of every distinct `global.status.json` snapshot seen
     /// since the last `reset_run_logs()`. Powers the harness's
     /// `GET /dumpLogs` endpoint so perf runs can replay the full
@@ -1905,6 +1944,7 @@ impl CameraRegistry {
             background_requests: Mutex::new(std::collections::HashMap::new()),
             last_in_flight: Mutex::new(None),
             last_sites: Mutex::new(None),
+            networks_seen: Mutex::new(NetworksSeen::default()),
             status_log: Mutex::new(std::collections::VecDeque::new()),
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
@@ -1981,6 +2021,55 @@ impl CameraRegistry {
     /// plugin has listed its stations.
     pub async fn last_sites(&self) -> Option<SiteCatalogPayload> {
         self.last_sites.lock().await.clone()
+    }
+
+    /// Poll `global.networks.json` for changed definitions and new request
+    /// outcomes. A missing or partial file brings nothing; the last
+    /// definitions stay for new peers.
+    pub async fn poll_networks(&self) -> NetworksNews {
+        let path = self.shm_dir.join(NETWORKS_FILE);
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return NetworksNews::default();
+        };
+        let file: NetworksFile = match serde_json::from_slice(&bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "tracking network file parse failed");
+                return NetworksNews::default();
+            }
+        };
+        let mut seen = self.networks_seen.lock().await;
+        let mut news = NetworksNews::default();
+        let defs = NetworkDefinitionsPayload {
+            networks: file.networks,
+        };
+        if seen.definitions.as_ref() != Some(&defs) {
+            seen.definitions = Some(defs.clone());
+            news.definitions = Some(defs);
+        }
+        match seen.results.as_mut() {
+            None => {
+                seen.results = Some(file.results.into_iter().map(|r| r.token).collect());
+            }
+            Some(sent) => {
+                for r in file.results {
+                    if sent.contains(&r.token) {
+                        continue;
+                    }
+                    sent.push_back(r.token.clone());
+                    while sent.len() > SEEN_RESULTS_KEPT {
+                        sent.pop_front();
+                    }
+                    news.results.push(r);
+                }
+            }
+        }
+        news
+    }
+
+    /// The definitions last read, to prime a connecting peer.
+    pub async fn last_networks(&self) -> Option<NetworkDefinitionsPayload> {
+        self.networks_seen.lock().await.definitions.clone()
     }
 
     /*
@@ -2904,6 +2993,30 @@ impl CameraRegistry {
         self.append_command(CommandOp::Create(payload))
             .await
             .map_err(|e| format!("command request write failed: {e}"))
+    }
+
+    /// Queue a saved tracking network for the plugin to create or replace.
+    /// Errors with a `NetworkResult` code on a malformed request or a failed
+    /// write; everything else is answered by the plugin.
+    pub async fn request_save_network(
+        &self,
+        payload: SaveNetworkPayload,
+    ) -> Result<u64, crate::commands::NetworkRefusal> {
+        validate_save_network(&payload)?;
+        self.append_command(CommandOp::SaveNetwork(payload))
+            .await
+            .map_err(|e| ("writeFailed", format!("command request write failed: {e}")))
+    }
+
+    /// Queue a saved tracking network's deletion, as `request_save_network`.
+    pub async fn request_delete_network(
+        &self,
+        payload: DeleteNetworkPayload,
+    ) -> Result<u64, crate::commands::NetworkRefusal> {
+        validate_delete_network(&payload)?;
+        self.append_command(CommandOp::DeleteNetwork(payload))
+            .await
+            .map_err(|e| ("writeFailed", format!("command request write failed: {e}")))
     }
 
     /// Queue the destruction of a created command camera. Errors on an
@@ -4081,6 +4194,55 @@ mod tests {
             .await
             .expect("a station switched off is news");
         assert!(!changed.stations[0].enabled);
+    }
+
+    /// Definitions are news on first read and on change; a request outcome
+    /// is sent once, and those already in the file when the sidecar starts
+    /// are not sent at all.
+    #[tokio::test]
+    async fn poll_networks_sends_changes_and_each_outcome_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+        let path = dir.path().join(NETWORKS_FILE);
+        assert_eq!(reg.poll_networks().await, NetworksNews::default());
+
+        let def = r#"{"networkId":"n1","name":"Polar net","vantages":[{"vantage":{"kind":"station","station":"KSC"},"fallback":true}],"revision":2,"flightId":4294901761}"#;
+        let old = r#"{"token":"old","ok":true,"networkId":"n1"}"#;
+        tokio::fs::write(
+            &path,
+            format!(r#"{{"networks":[{def}],"results":[{old}]}}"#),
+        )
+        .await
+        .unwrap();
+        let first = reg.poll_networks().await;
+        let defs = first.definitions.expect("first read is news");
+        assert_eq!(defs.networks[0].network_id, "n1");
+        assert_eq!(defs.networks[0].flight_id, Some(0xFFFF_0001));
+        assert!(defs.networks[0].vantages[0].fallback);
+        assert!(
+            first.results.is_empty(),
+            "outcomes from before this process are not sent"
+        );
+
+        let fresh = r#"{"token":"t2","ok":false,"code":"stale","text":"changed"}"#;
+        tokio::fs::write(
+            &path,
+            format!(r#"{{"networks":[{def}],"results":[{old},{fresh}]}}"#),
+        )
+        .await
+        .unwrap();
+        let second = reg.poll_networks().await;
+        assert!(
+            second.definitions.is_none(),
+            "same definitions are not news"
+        );
+        assert_eq!(second.results.len(), 1);
+        assert_eq!(second.results[0].code.as_deref(), Some("stale"));
+        assert!(reg.poll_networks().await.results.is_empty(), "sent once");
+
+        tokio::fs::write(&path, "{\"networks\":[").await.unwrap();
+        assert_eq!(reg.poll_networks().await, NetworksNews::default());
+        assert_eq!(reg.last_networks().await, Some(defs));
     }
 
     /// A status write whose `captureUt` advanced produces a `settings`

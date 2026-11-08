@@ -277,6 +277,10 @@ pub struct CommandNetworkVantage {
     /// Where the camera stands when no vantage can see the craft.
     #[serde(default)]
     pub fallback: bool,
+    /// The body hiding the craft from this vantage while `state` is
+    /// `occluded`. Absent otherwise and from games older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occluder: Option<String>,
 }
 
 /// What kind of place a command camera's site is.
@@ -1444,6 +1448,11 @@ pub struct HelloPayload {
     /// renegotiation. Absent from sidecars older than 1.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_slots: Option<u32>,
+    /// True when this sidecar sends `NetworkDefinitions` and takes
+    /// `SaveNetwork` and `DeleteNetwork`. Absent from sidecars older than
+    /// 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub networks: Option<bool>,
 }
 
 #[typeshare]
@@ -1510,6 +1519,36 @@ pub struct CatalogStation {
     /// The game has the station switched on. A vantage at one switched off
     /// reads `disabled`.
     pub enabled: bool,
+    /// Why the game has it off: `extraStationsOff` (the game's extra ground
+    /// stations option is off) or `modDisabled` (the mod that adds it turned
+    /// it off). Absent while it is on. New codes may appear; show a generic
+    /// reason for one you do not recognise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+/// One craft the game knows, as a `vessel` vantage or a `vessel` aim can
+/// name it.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogVessel {
+    /// `Vessel.persistentId`, the key a `vessel` vantage or aim takes.
+    pub persistent_id: u32,
+    pub name: String,
+    /// KSP's `VesselType` name: `Relay`, `Probe`, `Ship`, `Debris`,
+    /// `SpaceObject` and so on.
+    pub vessel_type: String,
+    /// The body whose sphere of influence it is in, by name.
+    pub body: String,
+    /// KSP's `Vessel.Situations` name: `ORBITING`, `LANDED` and so on.
+    pub situation: String,
+    /// Within physics range of the active craft.
+    #[serde(default)]
+    pub loaded: bool,
+    /// The craft the player is flying.
+    #[serde(default)]
+    pub active: bool,
 }
 
 /// The places a command camera can stand, as the game has them now. Sent
@@ -1521,6 +1560,139 @@ pub struct CatalogStation {
 pub struct SiteCatalogPayload {
     #[serde(default)]
     pub stations: Vec<CatalogStation>,
+    /// Every craft the game knows, the active one first. Absent from games
+    /// older than 1.12.
+    #[serde(default)]
+    pub vessels: Vec<CatalogVessel>,
+    /// Craft left out of `vessels` to keep the message small, debris and
+    /// space objects first. Absent when none were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessels_omitted: Option<u32>,
+}
+
+/// One vantage of a saved tracking network.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkVantageSpec {
+    pub vantage: CommandVantage,
+    /// Shown for this vantage in place of the site's own name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Where the camera stands when no vantage can see the craft.
+    #[serde(default)]
+    pub fallback: bool,
+}
+
+/// How long a tracking network holds a vantage and how much clearer another
+/// must be before it cuts. Absent fields keep the game's defaults.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkOptionsSpec {
+    /// Least game seconds between cuts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hold_ut: Option<f64>,
+    /// Least real seconds between cuts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hold_real_seconds: Option<f64>,
+    /// How many stops clearer another vantage must be to cut to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_stops: Option<f64>,
+}
+
+/// A tracking network: one a viewer saved with the game, or one a mod made
+/// in game (`owner` set), which only that mod can change.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDefinition {
+    /// Stable for the life of the save; made by the game on create.
+    pub network_id: String,
+    pub name: String,
+    /// The craft it watches (a `vessel` aim), or absent for the active
+    /// vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<CommandAim>,
+    pub vantages: Vec<NetworkVantageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<NetworkOptionsSpec>,
+    /// Bumps on every change; send it back as `baseRevision` to edit.
+    #[serde(default)]
+    pub revision: u32,
+    /// The camera it runs as in this scene, absent where command cameras do
+    /// not run. A saved network keeps the same flight id in every scene.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_id: Option<u32>,
+    /// The mod that made it in game; absent for a saved network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// Every tracking network: the saved ones, then those mods made in game.
+/// Sent after `Hello` once known, and whenever one changes.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDefinitionsPayload {
+    #[serde(default)]
+    pub networks: Vec<NetworkDefinition>,
+}
+
+/// The outcome of one `SaveNetwork` or `DeleteNetwork`, matched by `token`.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkResultPayload {
+    pub token: String,
+    pub ok: bool,
+    /// The network saved or deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    /// Why it was refused: `notOwner`, `notFound`, `stale`, `noVantages`,
+    /// `tooManyVantages`, `badVantage`, `badAim`, `badName`, `badNumber`,
+    /// `badToken` or `writeFailed`. New codes may appear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The refusal in words, for a log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Create or replace a saved tracking network. The game answers with a
+/// `NetworkResult` carrying the same token, normally within a second.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveNetworkPayload {
+    /// Chosen by the client, unique per request (1 to 128 characters).
+    pub token: String,
+    /// The network to replace; absent to create one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    /// The `revision` the client edited; refused as `stale` when the network
+    /// has changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<u32>,
+    /// 1 to 48 characters; absent or blank for "Tracking network".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// A `vessel` aim, or absent to watch the active vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<CommandAim>,
+    /// 1 to 64 vantages.
+    pub vantages: Vec<NetworkVantageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<NetworkOptionsSpec>,
+}
+
+/// Delete a saved tracking network; its camera ends for every viewer.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNetworkPayload {
+    pub token: String,
+    pub network_id: String,
 }
 
 /// Scene-state change: whether KSP is currently in a flight scene. Sent
@@ -1724,6 +1896,12 @@ pub enum ClientMessage {
     DestroyCommandCamera(DestroyCommandCameraPayload),
     /// Point a command camera, or return it to its default. Server-wide.
     SetCommandAim(SetCommandAimPayload),
+    /// Create or replace a saved tracking network. Server-wide; answered
+    /// with `NetworkResult`.
+    SaveNetwork(SaveNetworkPayload),
+    /// Delete a saved tracking network. Server-wide; answered with
+    /// `NetworkResult`.
+    DeleteNetwork(DeleteNetworkPayload),
     /// Replace or clear this client's anchors on one camera. Per client:
     /// other clients never see them, and they go when this client does.
     /// Send only to a sidecar whose `Hello` has `anchors: true`.
@@ -1906,6 +2084,11 @@ pub enum ServerMessage {
     /// The ground stations a command camera can stand at. Sent after
     /// `Hello` once known, and whenever the list changes.
     SiteCatalog(SiteCatalogPayload),
+    /// Every tracking network. Sent after `Hello` once known, and whenever
+    /// one changes.
+    NetworkDefinitions(NetworkDefinitionsPayload),
+    /// The outcome of a `SaveNetwork` or `DeleteNetwork`, by its token.
+    NetworkResult(NetworkResultPayload),
 }
 
 #[cfg(test)]
@@ -1923,11 +2106,56 @@ mod tests {
                 longitude: -172.25,
                 altitude: 4000.0,
                 enabled: false,
+                disabled_reason: Some("extraStationsOff".into()),
             }],
+            vessels: vec![CatalogVessel {
+                persistent_id: 42,
+                name: "Comms Relay".into(),
+                vessel_type: "Relay".into(),
+                body: "Kerbin".into(),
+                situation: "ORBITING".into(),
+                loaded: false,
+                active: false,
+            }],
+            vessels_omitted: None,
         });
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"site-catalog","content":{"stations":[{"nodeName":"Crater Rim","displayName":"Crater Rim","body":"Kerbin","latitude":9.5,"longitude":-172.25,"altitude":4000.0,"enabled":false}]}}"#
+            r#"{"type":"site-catalog","content":{"stations":[{"nodeName":"Crater Rim","displayName":"Crater Rim","body":"Kerbin","latitude":9.5,"longitude":-172.25,"altitude":4000.0,"enabled":false,"disabledReason":"extraStationsOff"}],"vessels":[{"persistentId":42,"name":"Comms Relay","vesselType":"Relay","body":"Kerbin","situation":"ORBITING","loaded":false,"active":false}]}}"#
+        );
+        /* A plugin older than 1.12 lists stations only. */
+        let old: SiteCatalogPayload = serde_json::from_str(r#"{"stations":[]}"#).unwrap();
+        assert!(old.vessels.is_empty() && old.vessels_omitted.is_none());
+    }
+
+    /// Network requests arrive as tagged client messages; the outcome goes
+    /// back by token.
+    #[test]
+    fn network_messages_round_trip() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"save-network","content":{"token":"t","vantages":[{"vantage":{"kind":"vessel","persistentId":7}}],"watch":{"kind":"vessel","persistentId":9}}}"#,
+        )
+        .unwrap();
+        let ClientMessage::SaveNetwork(p) = msg else {
+            panic!("not a save")
+        };
+        assert!(p.network_id.is_none() && !p.vantages[0].fallback);
+        assert_eq!(p.watch.unwrap().persistent_id, Some(9));
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"delete-network","content":{"token":"t","networkId":"n1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(msg, ClientMessage::DeleteNetwork(_)));
+        let out = ServerMessage::NetworkResult(NetworkResultPayload {
+            token: "t".into(),
+            ok: false,
+            network_id: None,
+            code: Some("stale".into()),
+            text: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&out).unwrap(),
+            r#"{"type":"network-result","content":{"token":"t","ok":false,"code":"stale"}}"#
         );
     }
 
@@ -2059,10 +2287,12 @@ mod tests {
             resume: Some(true),
             renegotiate: Some(true),
             max_slots: Some(32),
+            networks: Some(true),
         });
         let hello = serde_json::to_string(&hello).unwrap();
         assert!(hello.contains(r#""renegotiate":true"#));
         assert!(hello.contains(r#""maxSlots":32"#));
+        assert!(hello.contains(r#""networks":true"#));
         assert!(hello.contains(r#""sizeHold":true"#));
         assert!(hello.contains(r#""resume":true"#));
         assert!(hello.contains(r#""maxAnchorsPerCamera":16"#));

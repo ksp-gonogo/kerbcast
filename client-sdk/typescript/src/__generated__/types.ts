@@ -316,6 +316,11 @@ export interface CommandNetworkVantage {
 	active: boolean;
 	/** Where the camera stands when no vantage can see the craft. */
 	fallback?: boolean;
+	/**
+	 * The body hiding the craft from this vantage while `state` is
+	 * `occluded`. Absent otherwise and from games older than 1.12.
+	 */
+	occluder?: string;
 }
 
 /** A tracking network camera's vantages, as its last scoring pass left them. */
@@ -807,6 +812,36 @@ export interface CatalogStation {
 	 * reads `disabled`.
 	 */
 	enabled: boolean;
+	/**
+	 * Why the game has it off: `extraStationsOff` (the game's extra ground
+	 * stations option is off) or `modDisabled` (the mod that adds it turned
+	 * it off). Absent while it is on. New codes may appear; show a generic
+	 * reason for one you do not recognise.
+	 */
+	disabledReason?: string;
+}
+
+/**
+ * One craft the game knows, as a `vessel` vantage or a `vessel` aim can
+ * name it.
+ */
+export interface CatalogVessel {
+	/** `Vessel.persistentId`, the key a `vessel` vantage or aim takes. */
+	persistentId: number;
+	name: string;
+	/**
+	 * KSP's `VesselType` name: `Relay`, `Probe`, `Ship`, `Debris`,
+	 * `SpaceObject` and so on.
+	 */
+	vesselType: string;
+	/** The body whose sphere of influence it is in, by name. */
+	body: string;
+	/** KSP's `Vessel.Situations` name: `ORBITING`, `LANDED` and so on. */
+	situation: string;
+	/** Within physics range of the active craft. */
+	loaded?: boolean;
+	/** The craft the player is flying. */
+	active?: boolean;
 }
 
 /**
@@ -958,6 +993,12 @@ export interface CreateCommandCameraPayload {
 	 * flight). Not applied while a command authority holds the lock.
 	 */
 	aim?: CommandAim;
+}
+
+/** Delete a saved tracking network; its camera ends for every viewer. */
+export interface DeleteNetworkPayload {
+	token: string;
+	networkId: string;
 }
 
 /**
@@ -1293,6 +1334,84 @@ export interface HelloPayload {
 	 * renegotiation. Absent from sidecars older than 1.12.
 	 */
 	maxSlots?: number;
+	/**
+	 * True when this sidecar sends `NetworkDefinitions` and takes
+	 * `SaveNetwork` and `DeleteNetwork`. Absent from sidecars older than
+	 * 1.12.
+	 */
+	networks?: boolean;
+}
+
+/** One vantage of a saved tracking network. */
+export interface NetworkVantageSpec {
+	vantage: CommandVantage;
+	/** Shown for this vantage in place of the site's own name. */
+	label?: string;
+	/** Where the camera stands when no vantage can see the craft. */
+	fallback?: boolean;
+}
+
+/**
+ * How long a tracking network holds a vantage and how much clearer another
+ * must be before it cuts. Absent fields keep the game's defaults.
+ */
+export interface NetworkOptionsSpec {
+	/** Least game seconds between cuts. */
+	minHoldUt?: number;
+	/** Least real seconds between cuts. */
+	minHoldRealSeconds?: number;
+	/** How many stops clearer another vantage must be to cut to it. */
+	marginStops?: number;
+}
+
+/**
+ * A tracking network: one a viewer saved with the game, or one a mod made
+ * in game (`owner` set), which only that mod can change.
+ */
+export interface NetworkDefinition {
+	/** Stable for the life of the save; made by the game on create. */
+	networkId: string;
+	name: string;
+	/**
+	 * The craft it watches (a `vessel` aim), or absent for the active
+	 * vessel.
+	 */
+	watch?: CommandAim;
+	vantages: NetworkVantageSpec[];
+	options?: NetworkOptionsSpec;
+	/** Bumps on every change; send it back as `baseRevision` to edit. */
+	revision?: number;
+	/**
+	 * The camera it runs as in this scene, absent where command cameras do
+	 * not run. A saved network keeps the same flight id in every scene.
+	 */
+	flightId?: number;
+	/** The mod that made it in game; absent for a saved network. */
+	owner?: string;
+}
+
+/**
+ * Every tracking network: the saved ones, then those mods made in game.
+ * Sent after `Hello` once known, and whenever one changes.
+ */
+export interface NetworkDefinitionsPayload {
+	networks?: NetworkDefinition[];
+}
+
+/** The outcome of one `SaveNetwork` or `DeleteNetwork`, matched by `token`. */
+export interface NetworkResultPayload {
+	token: string;
+	ok: boolean;
+	/** The network saved or deleted. */
+	networkId?: string;
+	/**
+	 * Why it was refused: `notOwner`, `notFound`, `stale`, `noVantages`,
+	 * `tooManyVantages`, `badVantage`, `badAim`, `badName`, `badNumber`,
+	 * `badToken` or `writeFailed`. New codes may appear.
+	 */
+	code?: string;
+	/** The refusal in words, for a log. */
+	text?: string;
 }
 
 /**
@@ -1327,6 +1446,29 @@ export interface ResumePayload {
 	forced: number[];
 	/** Cameras this client still holds at their size. */
 	held: number[];
+}
+
+/**
+ * Create or replace a saved tracking network. The game answers with a
+ * `NetworkResult` carrying the same token, normally within a second.
+ */
+export interface SaveNetworkPayload {
+	/** Chosen by the client, unique per request (1 to 128 characters). */
+	token: string;
+	/** The network to replace; absent to create one. */
+	networkId?: string;
+	/**
+	 * The `revision` the client edited; refused as `stale` when the network
+	 * has changed since.
+	 */
+	baseRevision?: number;
+	/** 1 to 48 characters; absent or blank for "Tracking network". */
+	name?: string;
+	/** A `vessel` aim, or absent to watch the active vessel. */
+	watch?: CommandAim;
+	/** 1 to 64 vantages. */
+	vantages: NetworkVantageSpec[];
+	options?: NetworkOptionsSpec;
 }
 
 /**
@@ -1548,6 +1690,16 @@ export interface SettingsStatePayload {
  */
 export interface SiteCatalogPayload {
 	stations?: CatalogStation[];
+	/**
+	 * Every craft the game knows, the active one first. Absent from games
+	 * older than 1.12.
+	 */
+	vessels?: CatalogVessel[];
+	/**
+	 * Craft left out of `vessels` to keep the message small, debris and
+	 * space objects first. Absent when none were.
+	 */
+	vesselsOmitted?: number;
 }
 
 /**
@@ -1609,6 +1761,16 @@ export type ClientMessage =
 	| { type: "destroy-command-camera", content: DestroyCommandCameraPayload }
 	/** Point a command camera, or return it to its default. Server-wide. */
 	| { type: "set-command-aim", content: SetCommandAimPayload }
+	/**
+	 * Create or replace a saved tracking network. Server-wide; answered
+	 * with `NetworkResult`.
+	 */
+	| { type: "save-network", content: SaveNetworkPayload }
+	/**
+	 * Delete a saved tracking network. Server-wide; answered with
+	 * `NetworkResult`.
+	 */
+	| { type: "delete-network", content: DeleteNetworkPayload }
 	/**
 	 * Replace or clear this client's anchors on one camera. Per client:
 	 * other clients never see them, and they go when this client does.
@@ -1841,5 +2003,12 @@ export type ServerMessage =
 	 * The ground stations a command camera can stand at. Sent after
 	 * `Hello` once known, and whenever the list changes.
 	 */
-	| { type: "site-catalog", content: SiteCatalogPayload };
+	| { type: "site-catalog", content: SiteCatalogPayload }
+	/**
+	 * Every tracking network. Sent after `Hello` once known, and whenever
+	 * one changes.
+	 */
+	| { type: "network-definitions", content: NetworkDefinitionsPayload }
+	/** The outcome of a `SaveNetwork` or `DeleteNetwork`, by its token. */
+	| { type: "network-result", content: NetworkResultPayload };
 
