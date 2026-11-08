@@ -16,14 +16,18 @@ namespace Kerbcast
        Every layer, clip, occlusion and frame transition is logged once with UT
        and range under [Kerbcast][CMDCAM], so a pop or blank frame in a
        capture can be pinned to its cause. */
-    internal sealed class CommandCameraRig : ICameraRig
+    internal sealed class CommandCameraRig : ICameraRig, IAnchorRig
     {
+        /* The subject's anchor id; its owner is AnchorRegistry.KerbcastOwner. */
+        public const string SubjectAnchorId = "subject";
+        /* Where the aim point lands in the rendered frame: the centre, except while the view slews onto it. */
+        public const string AimAnchorId = "aim";
+
         private const string Tag = "[Kerbcast][CMDCAM]";
         private const double FovTau = 0.4;
         private const double FovSnapAfter = 1.0;
-        private const float RadiusRefreshSeconds = 0.5f;
-        private const double PartPad = 1.5;
-        private const double MinCraftRadius = 2.0;
+        /* The usual rendered frame, for the zoom and the slew; learned in PrepareRender, or in Poll while nothing renders, never from Poll between frames. */
+        private readonly FrameStep _frames = new FrameStep(FovSnapAfter);
         private const float StatusLogSeconds = 1.0f;
         private const float SkyProbeSeconds = 10.0f;
         private const double ModelProxyDistance = 50000.0;
@@ -50,7 +54,11 @@ namespace Kerbcast
 
         private readonly KerbcastCamera _cam;
         private readonly CommandCameraMount _mount;
-        private readonly CommandCameraTarget _target;
+        private readonly SubjectSelection _selection;
+        private readonly IFixSource _known;
+        private readonly Func<double, int, double> _keptToFrame;
+        private CelestialBody _keptFrame;
+        private readonly DrawnSubject _drawn;
         private readonly CommandAuthority _authority;
         private readonly CommandTrackEventRing _events = new CommandTrackEventRing(EventCapacity);
         private readonly CommandCameraOcclusion _occlusion;
@@ -85,11 +93,12 @@ namespace Kerbcast
 
         private CommandClipPlan _plan;
         private double _fov;
+        /* The subject's framing the zoom and the bracket share; reset while the view frames no subject, and for a new subject, aim or vantage. */
+        private readonly SubjectFraming _framing = new SubjectFraming();
+        private CommandAim _framingAim;
+        private uint _framingSubject;
+        private uint _framingVantage;
         private float _lastPrepare = -1f;
-        private double _craftRadius = MinCraftRadius;
-        private float _radiusAt = float.MinValue;
-        private uint _radiusVesselId;
-        private readonly List<DVec3> _partScratch = new List<DVec3>();
 
         private bool _first = true;
         private bool _wasSplit;
@@ -126,39 +135,83 @@ namespace Kerbcast
         public bool HasFix { get; private set; }
         public bool Occluded { get; private set; }
         public string Blocker { get; private set; } = "";
+        /* The UT Occluded last turned on, NaN while it is off. */
+        public double OccludedSinceUt { get; private set; } = double.NaN;
         public double RangeM { get; private set; }
         public double ElevationDeg { get; private set; }
-        public uint SubjectPersistentId => _target.PersistentId;
-        public string SubjectName => _target.Name ?? "";
+        public uint SubjectPersistentId => _known.SubjectPersistentId;
+        public string SubjectName => _known.SubjectName;
         /* Nothing between the target and the Sun but empty space. */
         public bool Sunlit { get; private set; }
         private bool _sunlitLogged;
 
-        /* Under an authority the readings above are taken at the aimed point.
-           The true craft is still drawn where it is, so its own visibility is
-           kept apart for the render. */
-        private bool _trueOk;
-        private DVec3 _truePos;
-        private CelestialBody _trueBody;
-        private double _trueDistance;
-        private bool _trueOccluded;
-        private bool _trueSunlit;
-        private double _trueOffsetRad;
+        /* The readings above are knowledge, taken at the aimed point. The
+           picture draws the craft where it truly is, so how it looks from the
+           lens is kept apart for the render. */
+        private bool _drawnOk;
+        private DVec3 _drawnPos;
+        private CelestialBody _drawnBody;
+        private CelestialBody _drawnAbout;
+        private double _drawnDistance;
+        private bool _drawnOccluded;
+        private bool _drawnSunlit;
 
-        /* The bracket contract (see AppendCommandTrack in KerbcastCore). */
+        /* The lens pose of the frame last rendered, for the anchor projector. */
+        private bool _poseValid;
+        private DVec3 _poseEye, _poseForward, _poseUp;
+        /* From the lens to the aim point the pose turns toward. */
+        private DVec3 _poseAimToward;
+        private readonly AnchorSpec _subjectAnchor = new AnchorSpec { Id = SubjectAnchorId, Kind = AnchorKind.Vessel, Occlusion = true };
+        private readonly AnchorSpec _aimAnchor = new AnchorSpec { Id = AimAnchorId, Kind = AnchorKind.Direction, HasVector = true, NeverObserved = true };
+
+        /* The bracket contract (see AppendCommandTrack in KerbcastCore). Kept
+           for clients older than 1.12; newer ones draw the subject's anchor. */
         public double TrackUt { get; private set; }
         public double BracketHalfPx { get; private set; }
         public int FrameHeightPx => FrameRows();
-        /* Angle between the aim and the true craft as seen from the station, in
-           capture pixels; null without a true fix. */
+        /* Angle between the frame's axis (the aim, once any slew has settled)
+           and the true craft as seen from the station, in capture pixels; null
+           without a true fix. */
         public double? TrueOffsetPx { get; private set; }
+        /* The true craft is in frame and not occluded: the picture shows it. */
+        public bool TrueVisible { get; private set; }
+        private DVec3 _solveEye, _solveForward, _solveUp;
+
+        /* TrueOffsetPx as the status file sends it. Under a held lock it is the
+           true craft's position, so it goes out only while the picture shows
+           the craft, like the subject anchor. */
+        public double? ReportedTrueOffsetPx =>
+            _authority != null && _authority.Registered && !TrueVisible ? null : TrueOffsetPx;
         public bool FramingFits { get; private set; } = true;
         public string Blank { get; private set; }
+        /* No subject to aim at yet: the view holds its placeholder (see SubjectWait). */
+        public bool WaitingForTarget => _placeholder != PlaceholderAim.None;
+        private PlaceholderAim _placeholder;
+        /* What the view followed last solve, and the last subject aim, body-fixed, that a Hold keeps. */
+        private SubjectAimMode _mode;
+        private readonly SubjectWait _wait = new SubjectWait();
+        private AimKey _waitKey;
+        private CelestialBody _heldBody;
+        private double _heldLat, _heldLon, _heldAlt;
+        /* On truth with a light speed, how the aim placed its subject this solve, steadied across picture flicker. */
+        private readonly TruthPlaceFilter _truthPlace = new TruthPlaceFilter();
+        private TruthAimPlace _placed = TruthAimPlace.Source;
+        private AimKey _placeKey;
+        /* The last Drawn place a Kept solve aims at: the body it hangs from, its offset from there in KSP's fixed frame, its own body and instant. */
+        private CelestialBody _keptAbout;
+        private CelestialBody _keptBody;
+        private DVec3 _keptOffset;
+        private double _keptUt;
+        /* The body a Hold is taken against when it is not the aim's own: the one the drawn place hangs from. */
+        private CelestialBody _holdAbout;
+        private bool _waitingLogged;
         public CommandTrackEventRing Events => _events;
         public string AuthorityOwner => _authority != null ? _authority.Owner : null;
         internal CommandFeedOrders CurrentOrders => _authority != null && _authority.Registered ? _authority.Orders(_flightId) : null;
         public string StationNodeName => _mount.Site.NodeName;
         internal CommandCameraSite Site => _mount.Site;
+        /* The widest field the lens opens to, in degrees. */
+        internal double FovMax => _fovMax;
         public string StationDisplayName =>
             string.IsNullOrEmpty(_mount.Site.DisplayName) ? _mount.Site.NodeName : _mount.Site.DisplayName;
 
@@ -170,13 +223,92 @@ namespace Kerbcast
            gone some way other than a merge, which the lens follows). */
         public bool VantageLost => _mount.Site.VantageGone;
 
+        /* The lens rides its vantage craft; a ground site rides none. */
+        public Vessel LensCraft => _mount.Site.HasVantage ? _mount.Site.Vantage : null;
+
+        /* What the frame last prepared shows, taken once its pose, field and
+           bracket are settled, so the frame's metadata carries the state of
+           its own instant rather than whatever a later poll found. */
+        public CommandFrameState FrameState { get; private set; } = CommandFrameState.Empty;
+
+        /* The known subject as the last solve read it; unread when the solve stopped before reaching it. */
+        private bool _subjectRead;
+        private CraftFixState _subjectState;
+        private string _subjectRefusalCode;
+        private string _subjectRefusalText;
+        private double _subjectUt = double.NaN;
+        /* The UT the subject's place was read at, which a place on the lens's own ground takes at render UT, not at _subjectUt. */
+        private double _subjectPlacedUt = double.NaN;
+
+        private void TakeFrameState() => FrameState = StateNow();
+
+        /* The feed's state as the last solve left it. The world model is read at the current UT, never an older solve's, which would read as time running back. */
+        public CommandFrameState StateNow()
+        {
+            double ut = Planetarium.GetUniversalTime();
+            var s = CommandFrameState.Empty;
+            s.HasFix = HasFix;
+            if (HasFix)
+            {
+                s.RangeM = RangeM;
+                s.BracketHalfPx = BracketHalfPx;
+            }
+            s.FrameHeightPx = FrameHeightPx;
+            s.FramingFits = FramingFits;
+            var offset = ReportedTrueOffsetPx;
+            if (offset.HasValue) s.TrueOffsetPx = offset.Value;
+            s.Occluded = Occluded;
+            s.Occluder = Blocker ?? "";
+            s.Sunlit = Sunlit;
+            s.Blank = Blank;
+            s.WaitingForTarget = WaitingForTarget;
+            s.AuthorityOwner = AuthorityOwner;
+            s.SubjectPersistentId = SubjectPersistentId;
+            if (_aim != null) s.AimKind = KerbcastCore.AimKindTag(_aim.Kind);
+            if (_subjectRead)
+            {
+                s.Refusal = CommandFrameState.RefusalFor(SubjectPersistentId, _subjectState, _subjectRefusalCode);
+                if (s.Refusal == CommandCameraMath.EligibleRefused)
+                {
+                    s.RefusalCode = _subjectRefusalCode;
+                    s.RefusalText = _subjectRefusalText;
+                }
+                if (_subjectState == CraftFixState.Positioned) s.SubjectUt = _subjectUt;
+            }
+            var store = _authority != null ? _authority.WorldModel : null;
+            var view = store != null
+                ? store.Capture(Time.frameCount, ut)
+                : new WorldModelView { Mode = WorldModelMode.Truth };
+            s.WorldModel = WorldModelTag(view.Mode);
+            if (view.Snapshot != null)
+            {
+                s.WorldModelSeq = view.Snapshot.Sequence;
+                s.KnowledgeUt = view.Snapshot.KnowledgeUt;
+                s.Scope = view.Snapshot.ScopeForSite(_mount.Site.NodeName);
+            }
+            return s;
+        }
+
+        private static string WorldModelTag(WorldModelMode mode)
+        {
+            switch (mode)
+            {
+                case WorldModelMode.Waiting: return "waiting";
+                case WorldModelMode.Model: return "model";
+                case WorldModelMode.Stale: return "stale";
+                default: return "truth";
+            }
+        }
+
         /* A merge (dock or claw grab) moves both ends: the watched craft and
-           the craft the lens rides each follow into the survivor. */
+           the craft the lens rides each follow into the survivor. Under a
+           world model the watched craft follows the model's aliases instead,
+           so only the lens moves here. */
         private void OnMerged(uint oldPid, uint newPid)
         {
-            _target.Merged(oldPid, newPid);
+            if (_known.IdentityIsKsp) _selection.Merged(oldPid, newPid);
             if (_mount.Site.FollowMerge(oldPid, newPid))
-                Debug.Log($"{Tag} cam={_flightId} vantage merged: persistentId={oldPid} -> {newPid} ('{_mount.Site.Vantage.vesselName}')");
+                Debug.Log($"{Tag} cam={_flightId} vantage merged: persistentId={oldPid} -> {newPid} ('{_mount.Site.VantageName}')");
         }
 
         /* Points the camera by `aim` (null for the default craft) from the
@@ -188,7 +320,7 @@ namespace Kerbcast
             _aim = aim;
             _aimOrbit = orbit;
             uint subject = aim?.SubjectPersistentId ?? 0;
-            if (subject != _target.ChosenPersistentId) _target.Choose(subject);
+            if (subject != _selection.ChosenPersistentId) _selection.Choose(subject);
             Debug.Log($"{Tag} cam={_flightId} aim {(aim == null ? "default (the default craft)" : aim.ToString())}");
         }
 
@@ -212,6 +344,52 @@ namespace Kerbcast
             return _fovMin;
         }
         private double FramingMargin => _aim?.FramingMarginM ?? 0.0;
+
+        /* The subject's radius for framing, bracket and the occlusion test at a craft aim. */
+        private double KnownRadius
+        {
+            get
+            {
+                double r = _known.SubjectRadiusM;
+                return double.IsNaN(r) ? CommandCameraMath.NominalCraftRadiusM : r;
+            }
+        }
+        /* What the view frames: the subject's radius, how far from the aim a
+           craft aim's subject may be (the source's uncertainty, centred on
+           the aim), and the operator's margin. */
+        private double FramingRadius => KnownRadius + (AimIsCraft ? _knownUncertainty : 0.0) + FramingMargin;
+        private double _knownUncertainty;
+
+        /* The subject's framing sphere centre from its CoM, eased; the view looks there, plus any handover offset still easing, while everything else keeps the CoM. */
+        private DVec3 _viewOffset;
+        private DVec3 ViewOffset => _mode == SubjectAimMode.Subject && AimIsCraft ? _viewOffset + HandoverOffset : default;
+        /* The framing the last rendered frame used, for the status log. */
+        private Shape _shape;
+
+        /* A craft aim's subject as its source frames it: a sphere off its CoM, when the source knows its shape. */
+        private struct Shape
+        {
+            public bool Known;
+            public DVec3 Centre;
+            public double Half;
+        }
+
+        private Shape SubjectShape()
+        {
+            var shape = new Shape();
+            if (_mode == SubjectAimMode.Subject && AimIsCraft)
+                shape.Known = _known.SubjectShape(out shape.Centre, out shape.Half)
+                    && CommandCameraMath.Finite(shape.Centre) && CommandCameraMath.Finite(shape.Half);
+            return shape;
+        }
+
+        /* What the view and the bracket frame at `distance` from the CoM: the shape when known, otherwise a sphere of FramingRadius about the CoM. */
+        private void Framed(double distance, Shape shape, out double radius, out double range)
+        {
+            radius = shape.Known ? shape.Half + _knownUncertainty + FramingMargin : FramingRadius;
+            range = shape.Known ? distance + DVec3.Dot(shape.Centre, _solveForward) : distance;
+        }
+
         private bool _blankLogged;
         private string _loggedBlank;
         private string _loggedAim;
@@ -221,17 +399,26 @@ namespace Kerbcast
         private double _frameUt;
         /* The model wins over the marker when both are set. */
         private readonly bool _wantModel;
-        private CommandCameraTargetModel _model;
+        private CommandCameraTargetModel _standIn;
+        /* The model stood in for the subject last frame. */
+        private bool _modelShown;
         private uint _modelFailedPid;
-        private CelestialBody _lastTargetBody;
+        private Composition _modelFailedParts;
+        /* The drawn craft's body, or the aim's without one, for the scaled skew log. */
+        private CelestialBody _frameBody;
 
-        public CommandCameraRig(KerbcastCamera cam, CommandCameraMount mount, CommandCameraTarget target,
+        public CommandCameraRig(KerbcastCamera cam, CommandCameraMount mount, SubjectSelection selection, IFixSource known,
+            DrawnSubject drawn,
             CommandAuthority authority, double frameFraction, Func<double> fovMin, double fovMax, bool targetMarker, bool targetModel,
             bool utStripe)
         {
             _cam = cam;
+            _slew = new AimSlew(_frames);
             _mount = mount;
-            _target = target;
+            _selection = selection;
+            _known = known;
+            _keptToFrame = KeptToFrame;
+            _drawn = drawn;
             _authority = authority;
             _wantModel = targetModel;
             _flightId = cam.FlightId;
@@ -315,36 +502,86 @@ namespace Kerbcast
         {
             TrackUt = ut;
             _solvedAt = now;
+            _subjectRead = false;
             bool governed = _authority != null && _authority.Registered;
             bool timedOut = governed && _authority.TimedOut(Time.realtimeSinceStartup);
             var orders = governed ? _authority.Orders(_flightId) : null;
 
             bool ok = SolveGeometry(ut, out station, out aim, out localUp, out north, out occluder);
-            if (!ok) HasFix = false;
-            FramingFits = !ok || CommandCameraMath.FramingFits(_craftRadius + FramingMargin, RangeM, _fovMax);
-            Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost);
+            NoteWaiting(ut);
+            if (!ok) ForgetHandover();
+            if (!ok || _mode != SubjectAimMode.Subject)
+            {
+                /* Without a fix the readings at the aim describe nothing; kept, they would carry the last solve, perhaps truth from before a lock, into the reports. */
+                HasFix = false;
+                Occluded = false;
+                Blocker = "";
+                Sunlit = false;
+            }
+            if (ok)
+            {
+                /* The pose turns onto a moved aim rather than snapping; everything
+                   projected through the frame (TrueInFrame, anchors) uses it. */
+                bool jumped = AimJumped(ut, out bool changed);
+                double clock = System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+                bool handed = EaseHandover(jumped && !changed, changed, double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt,
+                    double.IsNaN(_slewUt) ? double.NaN : ut - _slewUt, out bool dropped);
+                if (changed)
+                {
+                    /* A new subject or aim starts on its own framing, not eased from the last one's; a publish eases it on. */
+                    var shape = SubjectShape();
+                    _viewOffset = shape.Known ? shape.Centre : default;
+                }
+                var toward = aim + ViewOffset - station;
+                double range = toward.Magnitude;
+                /* A publish the handover eases is no jump for the slew: the eased aim moves on smoothly. An offset it dropped is one. */
+                var view = range > 0
+                    ? _slew.Step(toward * (1.0 / range), double.IsNaN(_slewAt) ? double.MaxValue : clock - _slewAt,
+                        double.IsNaN(_slewUt) ? 0 : ut - _slewUt, (jumped && !handed) || dropped, _fov)
+                    : toward;
+                _slewAt = clock;
+                _slewUt = ut;
+                NoteSlew(ut, now);
+                CommandCameraMath.AimBasis(station, station + view * range, localUp, north, out _solveForward, out _solveUp);
+                _solveEye = station;
+            }
+            Framed(RangeM, SubjectShape(), out double fitRadius, out double fitRange);
+            FramingFits = !HasFix || CommandCameraMath.FramingFits(fitRadius, fitRange, _fovMax);
+            Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost, _authority?.SilentText);
             UpdateBracket(now);
             NoteGovernance(ut, governed);
+            OccludedSinceUt = CommandCameraMath.OccludedSince(Occluded, OccludedSinceUt, ut);
             _events.Record(new CommandTrackEvent(ut, Occluded, Blocker, Sunlit, Blank));
             return ok;
         }
 
-        /* Station, aim point and true craft positions, and the camera-axis
-           readings at the aim point: the true craft for the default or a
+        /* Station, aim point and drawn craft positions, and the camera-axis
+           readings at the aim point: the known craft for the default or a
            Vessel aim, otherwise the point the aim resolves to. */
         private bool SolveGeometry(double ut,
             out DVec3 station, out DVec3 aim, out DVec3 localUp, out DVec3 north, out string occluder)
         {
             station = aim = localUp = north = default;
             occluder = null;
-            _trueOk = false;
+            _aimedBody = null;
+            _placeholder = PlaceholderAim.None;
+            _mode = SubjectAimMode.Subject;
+            ForgetDrawn();
             var site = _mount.Site;
             Vector3d vantage = default;
             string vantageSource = null;
+            /* A solve that places no subject breaks the run a Kept place needs. */
             if (site.HasVantage && !site.TryVantagePosition(ut, out vantage, out vantageSource))
+            {
+                _truthPlace.Reset();
                 return false;
+            }
             var body = site.Body;
-            if (body == null) return false;
+            if (body == null)
+            {
+                _truthPlace.Reset();
+                return false;
+            }
 
             var frame = body.BodyFrame;
             var bodyPos = ToD(body.position);
@@ -359,29 +596,76 @@ namespace Kerbcast
             var z = ToD(frame.Z);
             north = new DVec3(z.X, z.Z, z.Y);
 
-            _trueOk = _target.TryLocate(ut, out _truePos, out _trueBody);
+            var subject = PlacedSubject(ut, station, body);
+            _knownUncertainty = subject.Positioned && subject.UncertaintyM > 0 ? subject.UncertaintyM : 0.0;
+            _subjectRead = true;
+            _subjectState = subject.State;
+            _subjectRefusalCode = subject.RefusalCode;
+            _subjectRefusalText = subject.RefusalText;
             CelestialBody aimBody;
-            bool aimed = _aim != null && _aim.Kind != CommandAimKind.Vessel;
+            bool aimed = !AimIsCraft;
             if (!aimed)
             {
-                if (!_trueOk) return false;
-                aim = _truePos;
-                aimBody = _trueBody;
+                _mode = _wait.Step(WaitKeyChanged(), subject.Positioned);
+                if (_mode != SubjectAimMode.Subject)
+                {
+                    /* With nothing to aim at the view renders on, at its
+                       default framing before the subject is first known and
+                       at its last aim after, so the feed shows the scene (as
+                       its light shows it) rather than freezing on a last frame
+                       it may never have had. */
+                    ForgetDrawn();
+                    if (_mode == SubjectAimMode.Hold)
+                    {
+                        if (_heldBody == null) return false;
+                        aim = ToD(_heldBody.GetWorldSurfacePosition(_heldLat, _heldLon, _heldAlt));
+                    }
+                    else
+                    {
+                        _placeholder = CommandCameraMath.PlaceholderFor(site.HasVantage, site.HasLaunchPoint);
+                        aim = PlaceholderPoint(_placeholder, body, station, localUp);
+                    }
+                    _lastAimPoint = aim;
+                    _lastDistance = (aim - station).Magnitude;
+                    _frameBody = body;
+                    return true;
+                }
+                aim = subject.World;
+                aimBody = subject.Body;
+                if (aimBody != null)
+                {
+                    _aimedBody = aimBody;
+                    _aimedAbout = KinematicsWorld.Now().Zup.FromWorld(aim - ToD(aimBody.position));
+                    _aimedAt = ut;
+                    var w = new Vector3d(aim.X, aim.Y, aim.Z);
+                    /* Against the body the place hangs from, so a Hold stays where the craft was last drawn rather than riding a body drawn elsewhere. */
+                    _heldBody = _holdAbout ?? aimBody;
+                    _heldLat = _heldBody.GetLatitude(w);
+                    _heldLon = _heldBody.GetLongitude(w);
+                    _heldAlt = _heldBody.GetAltitude(w);
+                }
             }
             else if (_aim.Kind == CommandAimKind.Direction)
             {
-                aim = DirectionPoint(body, station, localUp);
+                double range = subject.Positioned ? (subject.World - station).Magnitude : DirectionDefaultRangeM;
+                aim = DirectionPoint(body, station, localUp, _aim.Azimuth, _aim.Elevation, range);
                 aimBody = body;
             }
             else if (!ResolveAim(_aim, _aimOrbit, ut, out aim, out aimBody))
             {
+                ForgetDrawn();
                 return false;
             }
             _lastAimPoint = aim;
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
-            occluder = _occlusion.FindOccluder(station, aim, out string occluderSource);
+            /* An aim at the picture's place, drawn or kept, is read against the bodies where the picture draws them, as it shows the craft. */
+            bool aimDrawn = !aimed && AimFromPicture;
+            string occluderSource;
+            occluder = aimDrawn
+                ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, KnownRadius)
+                : _occlusion.FindOccluder(station, aim, out occluderSource, aimed ? 0 : KnownRadius);
             double distance = (aim - station).Magnitude;
             _lastDistance = distance;
             HasFix = true;
@@ -389,39 +673,570 @@ namespace Kerbcast
             ElevationDeg = CommandCameraMath.ElevationDeg(aim - station, localUp);
             Occluded = occluder != null;
             Blocker = occluder ?? "";
-            UpdateSunlit(ut, distance, aim);
+            UpdateSunlit(ut, distance, aim, aimDrawn);
 
-            _trueOffsetRad = _trueOk ? CommandCameraMath.AngleBetween(aim - station, _truePos - station) : 0.0;
-            if (_trueOk)
-            {
-                if (!aimed || (aim - _truePos).Magnitude < 1e-3)
-                {
-                    _trueDistance = distance;
-                    _trueOccluded = Occluded;
-                    _trueSunlit = Sunlit;
-                }
-                else
-                {
-                    _trueDistance = (_truePos - station).Magnitude;
-                    _trueOccluded = _occlusion.FindOccluder(station, _truePos, out _) != null;
-                    _trueSunlit = IsSunlit(_truePos);
-                }
-            }
-            _lastTargetBody = _trueOk ? _trueBody : aimBody;
+            SolveDrawn(station, aim, distance, !aimed && _known.KnowsWhatIsDrawn, aimDrawn, aimBody);
             double occMs = (System.Diagnostics.Stopwatch.GetTimestamp() - occT0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             _occlusionMs = _occlusionMs > 0 ? _occlusionMs + OcclusionMsAlpha * (occMs - _occlusionMs) : occMs;
 
-            NoteTargetAndOcclusion(ut, distance, aimBody, _trueOk ? _truePos : aim, occluder, occluderSource);
+            NoteTargetAndOcclusion(ut, distance, aimBody, DrawnOrAim(aim), occluder, occluderSource);
             return true;
         }
 
+        private readonly AimHandover _handover = new AimHandover();
+        /* The handover's offset in world axes this frame. */
+        private DVec3 HandoverOffset => _handover.Easing ? KinematicsWorld.Now().Zup.ToWorld(_handover.Offset) : default;
         /*
-         * A Direction aim's point: along the held direction at the subject's
-         * range, so the view is zoomed for the subject as it passes through.
+         * The craft aim's body and its place about that body at the last
+         * solve, in KSP's fixed frame, and the UT it was read at; null body
+         * when the last solve aimed at no craft. The fixed frame, because the
+         * world's axes turn with the body below its inverse-rotation height,
+         * which moves a place 600 km about Kerbin by metres a frame.
+         */
+        private CelestialBody _aimedBody;
+        private DVec3 _aimedAbout;
+        private CelestialBody _handoverBody;
+        private DVec3 _handoverAbout;
+        private double _handoverUt;
+        /* The render UTs the aim and the handover's place were carried round to with the lens's body (PastInstant.Turn). */
+        private double _aimedAt, _handoverAt;
+
+        /*
+         * Eases the aim across a world model publish for a craft aim on the
+         * same body: the old record's place at the last instant against the
+         * new record's at that same instant, both about the body in its fixed
+         * frame, so the body's motion, its turn and any origin shift drop out.
+         * Where the publish also moved the placed instant by more than the
+         * frame's UT step `utStep` (a record read back only to its cap), the
+         * new place at the new instant is taken instead, so the whole move
+         * drawn eases. A correction too wide to ease is left to the slew
+         * instead, and any other cause of a jump resets it. Steps the ease by
+         * `dt` real seconds (a usual frame at most) and returns whether this
+         * publish was eased; `dropped` says an offset still easing was let
+         * go, which the slew must take as a jump.
+         */
+        private bool EaseHandover(bool published, bool changed, double dt, double utStep, out bool dropped)
+        {
+            bool craft = _mode == SubjectAimMode.Subject && AimIsCraft && _aimedBody != null;
+            bool handed = false;
+            bool easing = _handover.Easing;
+            if (!craft || changed || _handoverBody != _aimedBody) _handover.Reset();
+            else if (published)
+            {
+                double widest = AimHandover.WidestRad(_fov * Math.PI / 180.0, AimSlew.MaxRateDegPerS * Math.PI / 180.0);
+                if (AimHandover.InstantStepped(_subjectPlacedUt - _handoverUt, utStep))
+                    handed = _handover.Handover(_handoverAbout, _aimedAbout, _lastDistance, widest);
+                else
+                {
+                    var then = Turned(_known.SubjectAlong(_handoverUt), _lensSpin, _handoverUt, _handoverAt);
+                    if (then.Positioned && then.Body == _aimedBody)
+                    {
+                        var after = KinematicsWorld.Now().Zup.FromWorld(then.World - ToD(_aimedBody.position));
+                        handed = _handover.Handover(_handoverAbout, after, _lastDistance, widest);
+                    }
+                }
+            }
+            dropped = easing && !_handover.Easing && !changed;
+            double floor = _lastDistance * AimSlew.MinOffsetFieldFraction * _fov * Math.PI / 180.0;
+            _handover.Step(_frames.Clip(dt), AimHandover.TauS, AimSlew.SnapAfterS, floor);
+            _handoverBody = craft ? _aimedBody : null;
+            _handoverAbout = _aimedAbout;
+            _handoverAt = _aimedAt;
+            _handoverUt = _subjectPlacedUt;
+            return handed;
+        }
+
+        private void ForgetHandover()
+        {
+            _handover.Reset();
+            _handoverBody = null;
+        }
+
+        private readonly AimSlew _slew;
+        /* Real seconds, double, of the last slew step; NaN before the first. */
+        private double _slewAt = double.NaN;
+        /* UT of the last slew step; NaN before the first. */
+        private double _slewUt = double.NaN;
+        private bool _slewLogged;
+        /* A world model publishing at physics rate can start a slew on every tick, so lines come at most once per SlewLogSeconds and the rest are counted into the next. */
+        private const float SlewLogSeconds = 5f;
+        private float _slewLogAt = float.NegativeInfinity;
+        private bool _slewPending;
+        private int _slewQuiet;
+        private double _slewQuietMaxDeg;
+        private CommandAim _jumpAim;
+        private uint _jumpSubject, _jumpVantage;
+        private long _jumpGeneration;
+        private SubjectAimMode _jumpMode;
+
+        /* Whether the subject, the aim or the vantage changed since the last solve, which makes a craft aim wait for its subject again. */
+        private bool WaitKeyChanged() => _waitKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId);
+
+        /* The aim, subject and vantage a solve was keyed on, to tell when one of them changes. */
+        private struct AimKey
+        {
+            private CommandAim _aim;
+            private uint _subject, _vantage;
+
+            public bool Changed(CommandAim aim, uint subject, uint vantage)
+            {
+                bool changed = !CommandAim.SameAs(aim, _aim) || subject != _subject || vantage != _vantage;
+                _aim = aim;
+                _subject = subject;
+                _vantage = vantage;
+                return changed;
+            }
+        }
+
+        /*
+         * Whether the aim point jumped since the last solve, as its causes say
+         * rather than as its motion suggests: a new aim, a new subject, a new
+         * vantage, a new world-model publish that may correct where the
+         * subject is, or the view taking or leaving a placeholder or a held aim.
+         * Between these the view follows the aim, plus the framing and
+         * handover offsets, exactly. `changed` is every cause but the publish.
+         */
+        private bool AimJumped(double ut, out bool changed)
+        {
+            uint subject = _known.SubjectPersistentId;
+            uint vantage = _mount.Site.VantagePersistentId;
+            var store = _authority != null ? _authority.WorldModel : null;
+            var snap = store != null ? store.Capture(Time.frameCount, ut).Snapshot : null;
+            long generation = snap != null ? snap.Generation : 0;
+            changed = !CommandAim.SameAs(_aim, _jumpAim) || subject != _jumpSubject || vantage != _jumpVantage
+                || _mode != _jumpMode;
+            bool jumped = changed || generation != _jumpGeneration;
+            _jumpMode = _mode;
+            _jumpAim = _aim;
+            _jumpSubject = subject;
+            _jumpVantage = vantage;
+            _jumpGeneration = generation;
+            return jumped;
+        }
+
+        private void NoteSlew(double ut, float now)
+        {
+            bool slewing = _slew.Slewing;
+            bool changed = slewing != _slewLogged;
+            _slewLogged = slewing;
+            double offsetDeg = _slew.OffsetRad * 180.0 / Math.PI;
+            bool due = now - _slewLogAt >= SlewLogSeconds;
+            if (changed && !due)
+            {
+                _slewPending = true;
+                if (slewing)
+                {
+                    _slewQuiet++;
+                    _slewQuietMaxDeg = Math.Max(_slewQuietMaxDeg, offsetDeg);
+                }
+                return;
+            }
+            if (!changed && !(due && _slewPending)) return;
+            _slewLogAt = now;
+            _slewPending = false;
+            string quiet = _slewQuiet > 0 ? $" unloggedStarts={_slewQuiet} unloggedMaxOffsetDeg={_slewQuietMaxDeg:F3}" : "";
+            _slewQuiet = 0;
+            _slewQuietMaxDeg = 0;
+            if (changed)
+                Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(slewing ? "slew-start" : "slew-end")}"
+                    + (slewing ? $" offsetDeg={offsetDeg:F3}" : "") + quiet);
+            else
+                Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=slews slewing={slewing}{quiet}");
+        }
+
+        private void NoteWaiting(double ut)
+        {
+            bool waiting = WaitingForTarget;
+            if (waiting == _waitingLogged) return;
+            _waitingLogged = waiting;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event={(waiting ? $"waiting-for-target placeholder={_placeholder}" : "waiting-end")}");
+        }
+
+        /* Clears the drawn craft, so a failed solve leaves no stale picture readings. */
+        private void ForgetDrawn() => _drawnOk = false;
+
+        /* The lens is placed for the camera's picture pass too, so other craft
+           and anchors are drawn from the same lens. It keeps its solves to
+           itself: the known subject is solved from the station with no spread,
+           and the drawn one must be solved the same way to agree with it. */
+        private void LocateDrawn(double ut, DVec3 station, CelestialBody lensBody)
+        {
+            var lens = new PictureLens
+            {
+                Key = PictureLens.OwnKey(_flightId),
+                Ut = ut,
+                Point = station,
+                Body = lensBody,
+                Rides = _mount.Site.VantagePersistentId,
+            };
+            _cam.Picture.Place(lens);
+            _drawnOk = _drawn.TryLocate(lens, out _drawnPos, out _drawnBody);
+            _drawnAbout = _drawn.ShownAbout;
+            if (!LightTime.LightSpeed.HasValue)
+            {
+                _drawnLight = -1;
+                return;
+            }
+            int light = !_drawnOk ? 0 : _drawn.ShownPast ? 2 : 1;
+            float now = Time.unscaledTime;
+            if (light == _drawnLight || now - _lightLoggedAt < LightLogSeconds) return;
+            _drawnLight = light;
+            _lightLoggedAt = now;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={(light == 2 ? "past" : light == 1 ? "live" : "none")} "
+                + $"lightTimeS={(light == 2 ? (ut - _drawn.ShownUt).ToString("F3", CultureInfo.InvariantCulture) : "0")}");
+        }
+
+        /* Whether the drawn craft was last none, live or at its past instant (0, 1, 2), for the log. */
+        private int _drawnLight = -1;
+        private float _lightLoggedAt = float.MinValue;
+        private const float LightLogSeconds = 5f;
+
+        /* A kept record's speed about its body, bounded in the frame the solve now runs in; NaN for a body the game no longer has. */
+        private double KeptToFrame(double ownSpeed, int bodyIndex)
+        {
+            var body = KinematicsWorld.Now().Body(bodyIndex);
+            return body != null && _keptFrame != null ? CommandCameraForecast.SpeedBound(ownSpeed, body, _keptFrame) : double.NaN;
+        }
+
+        /*
+         * The subject as the source knows it at its own estimate of the past
+         * instant: the latest root of the light-time equation on the source's
+         * positions, never the picture's, in the frame of the common ancestor
+         * of the lens's body and the subject's, as the picture solves it. Render
+         * UT with no light speed. A source that places the subject only from
+         * a later UT (a world model's record from its ValidFromUt) is read back
+         * along that record's own path, as it predicts the craft at the
+         * instant, so a far lens follows the craft between publishes: no
+         * further back than PastInstant.MaxReadBackS and no lower than the
+         * ground under its start (or the start itself, when that is lower or
+         * the craft rests there). Further back the records the source kept
+         * place it as the model published them for the instant, so a lens
+         * whose light time is far longer than a record's age still aims where
+         * the picture draws the craft; it is held only past the earliest
+         * kept record's read-back. Only where it cannot be read
+         * back is the subject taken as it is placed from then. Otherwise a source that cannot be solved back to that
+         * instant has no fix. A world model's place on the lens's own
+         * ground stands where the source puts it now, at the instant of its
+         * light time from there; that instant steps back whenever the range
+         * grows faster than light. Otherwise the instant never steps back while
+         * the subject stays the same, except from a record's start to the root
+         * when a republished record starts earlier: that start's light never
+         * arrived, so nothing holds it.
+         *
+         * Near the lens's body the subject's path is carried round with the
+         * body to render UT and the subject placed there (PastInstant.Turn),
+         * as the picture draws it, so a craft lifting off stays over its own
+         * ground and the aim stays on the drawn craft.
+         */
+        private CraftFix KnownSubject(double ut, DVec3 station, CelestialBody lensBody)
+        {
+            _subjectUt = ut;
+            _subjectPlacedUt = ut;
+            double? c = LightTime.LightSpeed;
+            if (!c.HasValue || lensBody == null)
+            {
+                _knownHold.Reset();
+                return _known.Subject(ut);
+            }
+            var now = _known.Subject(ut);
+            if (!now.Positioned || now.Body == null) return now;
+            if (now.PersistentId != _knownHoldPid)
+            {
+                _knownHold.Reset();
+                _knownHoldPid = now.PersistentId;
+            }
+            var tree = KeplerBodyTree.World;
+            int lensIndex = lensBody.flightGlobalsIndex;
+            _lensSpin = SpinOf(lensBody);
+            bool moves = _known.SubjectMotion(ut, out var motion, out double validFrom, out _) && motion.Body != null;
+            if (moves && motion.Kind == BodyMotionKind.Surface && motion.Body == lensBody && !double.IsInfinity(validFrom))
+            {
+                /* A world model's place on the lens's own ground does not move
+                   against the lens, so the light time changes only the instant and
+                   its uncertainty, never where the subject stands: placed as the
+                   source puts it now. On another body the picture draws the craft
+                   at its past inertial place, so the solve below matches that. */
+                _knownHold.Reset();
+                double fixedAt = PastInstant.BodyFixedInstant((station - now.World).Magnitude, ut, c.Value, validFrom);
+                var then = _known.Subject(fixedAt);
+                if (then.Positioned) now.UncertaintyM = then.UncertaintyM;
+                _subjectUt = fixedAt;
+                return now;
+            }
+            /* The frame from the body the subject is at by now, then again from
+               its body at the solved instant, as the picture chooses it. */
+            int frame = PastInstant.CommonAncestor(ref tree, lensIndex, now.Body.flightGlobalsIndex);
+            double firstTr = double.NaN;
+            int firstFrame = -1;
+            for (int pass = 0; pass < 2; pass++)
+            {
+                var frameBody = tree.Body(frame);
+                if (frameBody == null) break;
+                var path = new KnownPath { Source = _known, Tree = tree, Frame = frame, Along = true, Spin = _lensSpin, T = ut };
+                var windowed = path;
+                windowed.Along = false;
+                /* Read back before the record's start, the root lies no earlier than this while the craft is under half the light speed, and no read goes past the cap. */
+                double kept = _known.SubjectKeptFromUt;
+                double alongFrom = kept < validFrom ? kept : validFrom;
+                double reach = Math.Max(PastInstant.ReadBackFloor(alongFrom), Math.Min(validFrom, ut - 2.0 * (station - now.World).Magnitude / c.Value));
+                double from = double.IsInfinity(reach) ? validFrom : reach;
+                double bound = moves ? CommandCameraForecast.SpeedBound(motion, frameBody, from, ut) : 0;
+                /* The kept records bound the whole span the solve may search, each about its own body; a light time within the newest record's reach asks none. */
+                if (moves && from < validFrom)
+                {
+                    _keptFrame = frameBody;
+                    double keptBound = _known.SubjectKeptSpeedBound(PastInstant.ReadBackFloor(alongFrom), validFrom, _keptToFrame);
+                    if (keptBound > bound) bound = keptBound;
+                }
+                /* A live place is never turned, so adds nothing to the bound. */
+                if (moves && motion.Body == lensBody && !now.Live)
+                {
+                    double span = ut - from;
+                    double lensDistance = (station - ToD(lensBody.position)).Magnitude;
+                    bound += PastInstant.TurnSpeedBoundAbout(_lensSpin, lensIndex, bound, span,
+                        (now.World - ToD(lensBody.position)).Magnitude + bound * span, lensDistance, c.Value,
+                        CommandCameraForecast.BodySpeedBound(lensBody, frameBody));
+                }
+                var lens = station - ToD(frameBody.position);
+                if (PastInstant.SolveAlong(ref path, ref windowed, lens, ut, c.Value, bound, validFrom, ut, out double tr, alongFrom) != PastStatus.Found)
+                {
+                    if (pass == 0) break;
+                    /* The second frame would not solve: keep the first frame's instant. */
+                    tr = firstTr;
+                    frame = firstFrame;
+                    frameBody = tree.Body(frame);
+                    path.Frame = frame;
+                    lens = station - ToD(frameBody.position);
+                    return HeldKnown(ref path, lens, station, ut, c.Value, lensIndex, tr);
+                }
+                var then = _known.SubjectAlong(tr);
+                int next = then.Body != null ? PastInstant.CommonAncestor(ref tree, lensIndex, then.Body.flightGlobalsIndex) : frame;
+                bool settled = next == frame || pass == 1;
+                if (!settled)
+                {
+                    firstTr = tr;
+                    firstFrame = frame;
+                    frame = next;
+                    continue;
+                }
+                if (next != frame && firstTr < tr)
+                {
+                    /* Neither frame agrees with itself across the crossing: the older instant. */
+                    tr = firstTr;
+                    frameBody = tree.Body(firstFrame);
+                    path.Frame = firstFrame;
+                    lens = station - ToD(frameBody.position);
+                }
+                return HeldKnown(ref path, lens, station, ut, c.Value, lensIndex, tr);
+            }
+            _knownHold.Reset();
+            now.State = CraftFixState.Listed;
+            return now;
+        }
+
+        /*
+         * The subject the aim follows, and the picture placed from the same
+         * lens. On truth with a light speed the picture decides first
+         * (CommandCameraMath.TruthAimPlaceFor, steadied by TruthPlaceFilter):
+         * a craft drawn in the past is aimed where and when it is drawn, with
+         * no read back on truth, which knows the craft only as it is now; one
+         * drawn live, or one the picture cannot judge, is solved on truth as
+         * 1.11 did; one whose last light has already arrived has no fix. Truth
+         * reads the subject before the picture so the shared track holds the
+         * craft it resolved.
+         */
+        private CraftFix PlacedSubject(double ut, DVec3 station, CelestialBody body)
+        {
+            _placed = TruthAimPlace.Source;
+            _holdAbout = null;
+            if (!_known.KnowsWhatIsDrawn || !LightTime.LightSpeed.HasValue)
+            {
+                _truthPlace.Reset();
+                var known = KnownSubject(ut, station, body);
+                LocateDrawn(ut, station, body);
+                return known;
+            }
+            if (_placeKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId)) _truthPlace.Reset();
+            var now = _known.Subject(ut);
+            LocateDrawn(ut, station, body);
+            var raw = CommandCameraMath.TruthAimPlaceFor(AimIsCraft, now.PersistentId != 0 && _drawn.PersistentId == now.PersistentId, _drawnOk, _drawn.ShownPast, _drawn.LightGone);
+            _placed = _truthPlace.Step(raw, _drawnOk);
+            switch (_placed)
+            {
+                case TruthAimPlace.Drawn:
+                    _keptAbout = _drawnAbout ?? _drawnBody;
+                    _keptBody = _drawnBody;
+                    _keptOffset = KinematicsWorld.Now().Zup.FromWorld(_drawnPos - ToD(_keptAbout.position));
+                    _keptUt = _drawn.ShownUt;
+                    return AsPictured(now, _drawnPos, _drawnBody, _keptAbout, _drawn.ShownUt);
+                case TruthAimPlace.Kept:
+                    /* Held still about the body the last drawn place hangs from, as the picture holds an instant. */
+                    return AsPictured(now, ToD(_keptAbout.position) + KinematicsWorld.Now().Zup.ToWorld(_keptOffset), _keptBody, _keptAbout, _keptUt);
+                case TruthAimPlace.NoFix:
+                    _knownHold.Reset();
+                    now.State = CraftFixState.Listed;
+                    now.Body = null;
+                    return now;
+                default:
+                    var known = KnownSubject(ut, station, body);
+                    double pathFrom = _known.SubjectPathFromUt;
+                    if (known.Positioned && known.Body != null && _subjectUt < pathFrom && !CommandCameraMath.TruthPathHolds(_subjectUt, pathFrom, known.Body.flightGlobalsIndex,
+                        HistoryBody(known.PersistentId, _subjectUt), HistoryBody(known.PersistentId, pathFrom - PathStartBeforeUt)))
+                    {
+                        /* Solved back past an SOI change into the conic truth gives (an unloaded craft): no fix rather than a place it never was. */
+                        _knownHold.Reset();
+                        known.State = CraftFixState.Listed;
+                        known.Body = null;
+                        return known;
+                    }
+                    if (_drawnOk && !_drawn.ShownPast && _drawn.PersistentId == known.PersistentId)
+                    {
+                        /* Drawn live: placed now, as the picture draws it. */
+                        _subjectUt = _drawn.ShownUt;
+                        _subjectPlacedUt = _drawn.ShownUt;
+                    }
+                    return known;
+            }
+        }
+
+        /* `fix` placed at `world` about `body`, where the picture puts it at `placedUt`, with no read back on truth; a Hold after it is taken against `about`. */
+        private CraftFix AsPictured(CraftFix fix, DVec3 world, CelestialBody body, CelestialBody about, double placedUt)
+        {
+            _knownHold.Reset();
+            fix.State = CraftFixState.Positioned;
+            fix.RefusalCode = null;
+            fix.RefusalText = null;
+            fix.World = world;
+            fix.Body = body;
+            fix.Live = false;
+            _holdAbout = about;
+            _subjectUt = placedUt;
+            _subjectPlacedUt = placedUt;
+            return fix;
+        }
+
+        /* How far before a conic's start the light history is read for the body the craft left: an SOI change's two entries share its UT. */
+        private const double PathStartBeforeUt = 0.001;
+
+        /* The body the light history has craft `pid` about at `ut`, by flightGlobalsIndex, or -1 with no record. */
+        private static int HistoryBody(uint pid, double ut) =>
+            LightHistoryHost.History.TryStateAt(pid, ut, out var state) ? state.Body : -1;
+
+        /* Whether this solve's craft aim is the picture's place, drawn or kept, so its readings are the picture's and truth's forecast does not apply. */
+        private bool AimFromPicture => _placed == TruthAimPlace.Drawn || _placed == TruthAimPlace.Kept;
+
+        /* The subject at its solved instant, held as the picture holds it: an
+           older solution leaves the held instant while its light has arrived
+           in the frame it was solved in. */
+        private CraftFix HeldKnown(ref KnownPath path, DVec3 lens, DVec3 station, double ut, double c, int lensIndex, double tr)
+        {
+            double held = _knownHold.NotBefore(ut, 0, c, lensIndex);
+            if (held > tr)
+            {
+                var kept = path;
+                var heldBody = path.Tree.Body(_knownHold.Frame);
+                if (heldBody != null) kept.Frame = _knownHold.Frame;
+                var keptLens = heldBody != null ? station - ToD(heldBody.position) : lens;
+                if (PastInstant.Arrived(ref kept, keptLens, ut, c, held))
+                {
+                    path = kept;
+                    tr = held;
+                }
+            }
+            _knownHold.Shown(ut, tr, 0, c, lensIndex, path.Frame);
+            _subjectUt = tr;
+            _subjectPlacedUt = tr;
+            return Turned(_known.SubjectAlong(tr), path.Spin, tr, ut);
+        }
+
+        private InstantHold _knownHold;
+        private uint _knownHoldPid;
+        private BodySpin _lensSpin;
+
+        /* Body `b`'s spin as PastInstant.Turn carries a craft about it, in world axes, its band ending at its sphere of influence as the ring's does. */
+        internal static BodySpin SpinOf(CelestialBody b)
+        {
+            if (b == null) return default;
+            bool root = b.referenceBody == null || b.referenceBody == b;
+            double soi = root || double.IsNaN(b.sphereOfInfluence) ? double.PositiveInfinity : b.sphereOfInfluence;
+            return BodySpin.Of(b.flightGlobalsIndex, CommandCameraOcclusion.Spin(b), b.Radius, b.inverseRotThresholdAltitude, soi);
+        }
+
+        /* A fix at `ut` placed as KnownPath solves it at `t`. */
+        private static CraftFix Turned(CraftFix fix, in BodySpin spin, double ut, double t)
+        {
+            if (!fix.Positioned || fix.Body == null) return fix;
+            var centre = ToD(fix.Body.position);
+            fix.World = centre + PastInstant.KnownTurned(spin, fix.Body.flightGlobalsIndex, fix.World - centre, fix.Live, ut, t);
+            return fix;
+        }
+
+        /* The subject's known positions about the frame body as a path back in
+           time. A fix's World is its body's present position plus its offset at
+           the UT asked, as Orbit.getPositionAtUT gives it. */
+        private struct KnownPath : IPastPath
+        {
+            public IFixSource Source;
+            public KeplerBodyTree Tree;
+            public int Frame;
+            /* Read along the subject's motion before the start its source vouches from. */
+            public bool Along;
+            /* About the lens's body the path is carried round with it to render UT `T`, as the picture's is. */
+            public BodySpin Spin;
+            public double T;
+
+            public bool TryAt(double ut, out DVec3 position)
+            {
+                position = default;
+                var fix = Along ? Source.SubjectAlong(ut) : Source.Subject(ut);
+                if (!fix.Positioned || fix.Body == null) return false;
+                int index = fix.Body.flightGlobalsIndex;
+                if (!PastInstant.TryAbout(ref Tree, index, Frame, ut, out var body)) return false;
+                position = body + PastInstant.KnownTurned(Spin, index, fix.World - ToD(fix.Body.position), fix.Live, ut, T);
+                return true;
+            }
+        }
+
+        /*
+         * How the drawn craft looks from the lens. A craft drawn at the aimed
+         * point is seen as the aim's readings say: `aimIsDrawn` when the fix
+         * source reads the same truth the picture draws and the aim is the
+         * craft, otherwise when the two points coincide. The aim's occlusion
+         * and sunlight read the bodies as they are now, so they stand for the
+         * picture's only while the picture draws every body there too, or
+         * when `readDrawn` says they were read where the picture draws them.
+         */
+        private void SolveDrawn(DVec3 station, DVec3 aim, double distance, bool aimIsDrawn, bool readDrawn, CelestialBody aimBody)
+        {
+            if (_drawnOk)
+            {
+                if (aimIsDrawn || (aim - _drawnPos).Magnitude < 1e-3)
+                {
+                    _drawnDistance = distance;
+                    bool moved = !readDrawn && _cam.Picture.MovesBodies();
+                    _drawnOccluded = moved ? _occlusion.FindDrawnOccluder(_cam.Picture, station, _drawnPos, out _, _drawn.Radius) != null : Occluded;
+                    _drawnSunlit = moved ? IsDrawnSunlit(_drawnPos) : Sunlit;
+                }
+                else
+                {
+                    _drawnDistance = (_drawnPos - station).Magnitude;
+                    _drawnOccluded = _occlusion.FindDrawnOccluder(_cam.Picture, station, _drawnPos, out _, _drawn.Radius) != null;
+                    _drawnSunlit = IsDrawnSunlit(_drawnPos);
+                }
+            }
+            _frameBody = _drawnOk ? _drawnBody : aimBody;
+        }
+
+        private DVec3 DrawnOrAim(DVec3 aim) => _drawnOk ? _drawnPos : aim;
+
+        /*
+         * The point `range` metres along a compass direction from the lens. A
+         * Direction aim passes the subject's range, so the view is zoomed for
+         * the subject as it passes through.
          * North and east come from stepping the station's own latitude and
          * longitude, which holds for any body and any vantage.
          */
-        private DVec3 DirectionPoint(CelestialBody body, DVec3 station, DVec3 localUp)
+        private DVec3 DirectionPoint(CelestialBody body, DVec3 station, DVec3 localUp, double azimuth, double elevation, double range)
         {
             var st = new Vector3d(station.X, station.Y, station.Z);
             double lat = body.GetLatitude(st), lon = body.GetLongitude(st), alt = body.GetAltitude(st);
@@ -430,16 +1245,27 @@ namespace Kerbcast
             var p0 = ToD(body.GetWorldSurfacePosition(lat, lon, alt));
             var towardNorth = (ToD(body.GetWorldSurfacePosition(lat + northSign * Step, lon, alt)) - p0) * northSign;
             var towardEast = ToD(body.GetWorldSurfacePosition(lat, lon + Step, alt)) - p0;
-            var dir = CommandCameraMath.DirectionVector(localUp, towardNorth, towardEast, _aim.Azimuth, _aim.Elevation);
-            double range = _trueOk ? (_truePos - station).Magnitude : DirectionDefaultRangeM;
+            var dir = CommandCameraMath.DirectionVector(localUp, towardNorth, towardEast, azimuth, elevation);
             if (!(range > 1.0)) range = DirectionDefaultRangeM;
             return station + dir * range;
+        }
+
+        /* The point a placeholder looks at. A craft's forward axis that cannot be read falls back to the horizon. */
+        private DVec3 PlaceholderPoint(PlaceholderAim placeholder, CelestialBody body, DVec3 station, DVec3 localUp)
+        {
+            var site = _mount.Site;
+            if (placeholder == PlaceholderAim.LaunchSite)
+                return ToD(body.GetWorldSurfacePosition(site.LaunchLatitude, site.LaunchLongitude,
+                    site.LaunchAltitude + CommandCameraMath.PlaceholderSiteHeightM));
+            if (placeholder == PlaceholderAim.MountForward && site.TryVantageForward(out var forward))
+                return station + ToD(forward).Normalized * DirectionDefaultRangeM;
+            return DirectionPoint(body, station, localUp, CommandCameraMath.PlaceholderAzimuthDeg, 0, DirectionDefaultRangeM);
         }
 
         /* An Orbit, Surface or PositionAt aim's point in world space, on the
            same UT (and so the same physics tick) as the station and the
            scaled bodies. */
-        private static bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, out DVec3 world, out CelestialBody body)
+        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, out DVec3 world, out CelestialBody body)
         {
             world = default;
             body = null;
@@ -463,19 +1289,35 @@ namespace Kerbcast
                 case CommandAimKind.PositionAt:
                 {
                     body = FlightGlobals.GetBodyByName(aim.Body);
-                    if (body == null) return false;
-                    /* Orbit.getPositionAtUT's conversion: body-relative z-up to
-                       Unity's y-up by the xzy swizzle, offset by the body centre. */
-                    var rel = aim.BodyRelativePosition + aim.BodyRelativeVelocity * (ut - aim.Ut);
-                    world = ToD(body.position + rel.xzy);
+                    if (body == null || !AimPath(aim, body, out var path) || !path.TryAt(ut, out var rel, out _)) return false;
+                    world = KinematicsWorld.Now().ToWorld(body, rel);
                     return true;
                 }
             }
             return false;
         }
 
-        /* In pixels of the delivered frame: the field just rendered, or, with
-           nothing rendering, the field the next frame would snap to. */
+        /* A PositionAt aim's ballistic path under its body's gravity, built once per aim. */
+        private bool AimPath(CommandAim aim, CelestialBody body, out KeplerPath path)
+        {
+            if (!ReferenceEquals(_aimPathFor, aim))
+            {
+                _aimPathFor = aim;
+                var kb = KinematicsWorld.Now().Of(body);
+                _aimPathOk = kb.Known && KeplerPath.TryFromState(ToD(aim.BodyRelativePosition), ToD(aim.BodyRelativeVelocity),
+                    aim.Ut, kb.Mu, out _aimPath, kb.Radius);
+            }
+            path = _aimPath;
+            return _aimPathOk;
+        }
+
+        private CommandAim _aimPathFor;
+        private KeplerPath _aimPath;
+        private bool _aimPathOk;
+
+        /* In pixels of the delivered frame: the field just rendered and the
+           framing it was eased to, or, with nothing rendering, the field the
+           next frame would snap to. */
         private void UpdateBracket(float now)
         {
             if (!HasFix)
@@ -484,14 +1326,33 @@ namespace Kerbcast
                 TrueOffsetPx = null;
                 return;
             }
-            double radius = _craftRadius + FramingMargin;
+            Framed(RangeM, SubjectShape(), out double radius, out double range);
             bool rendering = _lastPrepare >= 0 && now - _lastPrepare <= FovSnapAfter;
-            double fov = rendering
-                ? _fov
-                : CommandCameraMath.FovForFraction(radius, RangeM, _frameFraction, FovMinNow(), _fovMax);
+            double fov = rendering ? _fov : CommandCameraMath.FovForFraction(radius, range, _frameFraction, FovMinNow(), _fovMax);
             int rows = FrameRows();
-            BracketHalfPx = CommandCameraMath.BracketHalfPx(radius, RangeM, fov, rows);
-            TrueOffsetPx = _trueOk ? CommandCameraMath.AngleInPixels(_trueOffsetRad, fov, rows) : (double?)null;
+            BracketHalfPx = rendering && _framing.Started
+                ? _framing.BracketHalfPx(fov, rows)
+                : CommandCameraMath.BracketHalfPx(radius, range, fov, rows);
+            UpdateDrawnOffset(fov, rows);
+        }
+
+        /* Where the drawn craft's CoM sits against the frame's axis, which is the aim but for the craft's framing centre and a slew, in the frame `fov` gives. */
+        private void UpdateDrawnOffset(double fov, int rows)
+        {
+            TrueOffsetPx = _drawnOk
+                ? CommandCameraMath.AngleInPixels(CommandCameraMath.AngleBetween(_solveForward, _drawnPos - _solveEye), fov, rows)
+                : (double?)null;
+            TrueVisible = _drawnOk && !_drawnOccluded && TrueInFrame(fov, rows);
+        }
+
+        /* Whether the drawn craft lands inside the frame the aim gives. */
+        private bool TrueInFrame(double fov, int rows)
+        {
+            var rt = _cam.NearLayer != null ? _cam.NearLayer.targetTexture : null;
+            int cols = rt != null ? rt.width : _cam.RenderWidth;
+            if (cols <= 0 || rows <= 0) return false;
+            CommandCameraMath.PerspectiveTerms(fov, (double)cols / rows, out double m00, out double m11);
+            return CommandCameraMath.Project(_solveEye, _solveForward, _solveUp, m00, m11, 0, 0, cols, rows, _drawnPos).InFrame;
         }
 
         private int FrameRows()
@@ -533,36 +1394,83 @@ namespace Kerbcast
             return true;
         }
 
-        private void UpdateSunlit(double ut, double d, DVec3 target)
+        /* IsSunlit with each body where this camera draws it. The Sun is the root, and never moves. */
+        private bool IsDrawnSunlit(DVec3 point)
         {
-            bool lit = IsSunlit(target);
+            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (sun == null) return false;
+            var sunPos = ToD(sun.position);
+            var bodies = FlightGlobals.Bodies;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null || b == sun || _cam.Picture.HidesBody(b)) continue;
+                var centre = _cam.Picture.TryDrawnBody(b, out var drawn, out _) ? drawn : ToD(b.position);
+                if (!CommandCameraMath.SegmentClearOfSphere(point, sunPos, centre, b.Radius)) return false;
+            }
+            return true;
+        }
+
+        /* `drawn`: the target is the picture's place, lit past the bodies where the picture draws them. */
+        private void UpdateSunlit(double ut, double d, DVec3 target, bool drawn)
+        {
+            bool lit = drawn ? IsDrawnSunlit(target) : IsSunlit(target);
             if (!_sunlitLogged || lit != Sunlit)
             {
                 _sunlitLogged = true;
-                Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={d:F0} event={(lit ? "sunlit" : "eclipsed")} target='{_target.Name}'");
+                Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={d:F0} event={(lit ? "sunlit" : "eclipsed")} target='{_known.SubjectName}'");
             }
             Sunlit = lit;
         }
 
-        /* Built once per target; a craft that cannot be built is not retried. */
+        /* Built once per target, or, drawn at its past instant, once per set
+           of parts the history holds for it then (a dock, an undock, a part
+           lost). A craft that cannot be built is not retried. */
         private void EnsureModel(KerbcastCamera cam)
         {
-            uint pid = _target.PersistentId;
-            if (_model != null && _model.PersistentId == pid) return;
-            if (_modelFailedPid == pid && pid != 0) return;
-            _model?.Dispose();
-            _model = null;
+            var parts = _drawn.ShownParts;
+            if (_drawn.ShownPast && parts == null)
+            {
+                /* The save's record is the craft now, not as its light shows it: no model at all. */
+                _standIn?.Dispose();
+                _standIn = null;
+                return;
+            }
+            uint pid = parts != null ? _drawn.ShownPid : _drawn.PersistentId;
+            if (_standIn != null && _standIn.PersistentId == pid && _standIn.Parts == parts) return;
+            if (_modelFailedPid == pid && _modelFailedParts == parts && pid != 0)
+            {
+                /* Another craft's model must not stand in for this one. */
+                _standIn?.Dispose();
+                _standIn = null;
+                return;
+            }
+            if (_standIn != null && parts != null && _standIn.PersistentId == pid && _standIn.Update(parts, out int added, out int removed))
+            {
+                /* A moved centre of mass alone changes no part. */
+                if (added > 0 || removed > 0)
+                    Debug.Log($"{Tag} cam={_flightId} target model parts changed: pid={pid} partsUt={parts.Ut:F1} added={added} removed={removed} radius={_standIn.Radius:F1}m");
+                return;
+            }
+            _standIn?.Dispose();
+            _standIn = null;
             try
             {
-                _model = CommandCameraTargetModel.Build(_target.Proto, _flightId,
-                    new[] { cam.NearLayer, cam.FarLayer, _midCam });
+                var layers = new[] { cam.NearLayer, cam.FarLayer, _midCam };
+                _standIn = parts != null
+                    ? CommandCameraTargetModel.Build(pid, parts, _flightId, layers)
+                    : CommandCameraTargetModel.Build(_drawn.Proto, _flightId, layers);
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"{Tag} cam={_flightId} target model build threw: {ex}");
             }
-            if (_model == null) _modelFailedPid = pid;
-            else if (_subpixel != null) _model.AttachSubpixel(_subpixel.Camera);
+            if (_standIn == null)
+            {
+                _modelFailedPid = pid;
+                _modelFailedParts = parts;
+            }
+            else if (_subpixel != null) _standIn.AttachSubpixel(_subpixel.Camera);
         }
 
         /* Keeps the status geometry and the occlusion log live while nobody is
@@ -571,6 +1479,7 @@ namespace Kerbcast
         {
             float now = Time.unscaledTime;
             if (now - _solvedAt < PollStaleSeconds) return;
+            if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
             Solve(Planetarium.GetUniversalTime(), now, out _, out _, out _, out _, out _);
         }
 
@@ -588,11 +1497,18 @@ namespace Kerbcast
             {
                 double now = Planetarium.GetUniversalTime();
                 double horizon = Math.Min(ForecastRealSeconds * Math.Max(1.0, TimeWarp.CurrentRate), ForecastMaxUt);
+                /* Truth's motion is the craft now: an aim at a place drawn further in the past than the forecast resolves has no forecast. */
+                if (AimIsCraft && AimFromPicture && !CommandCameraMath.ForecastHoldsAtLightTime(TrackUt - _subjectUt, horizon, ForecastSamples))
+                    return _trackEvents;
                 _occlusion.UseSite(_mount.Site);
-                if (TryMotions(now, out var station, out var aim) && _forecast.Begin(now, horizon, station, aim))
+                /* A world model's motion holds only until its record's window ends. */
+                bool moving = TryMotions(now, out var station, out var aim, out double until);
+                if (moving) horizon = Math.Min(horizon, until - now);
+                if (moving && horizon > 0 && _forecast.Begin(now, horizon, station, aim, AimIsCraft ? KnownRadius : 0))
                 {
                     CommandCameraMath.FindEdges(now, now + horizon, ForecastSamples, ForecastBisectSteps, ForecastToleranceUt,
                         _forecast.StateAt, (a, b) => a.SameCameraAxisAs(b), _edges);
+                    if (_forecast.Unplaced) _edges.Clear();
                     var last = _events[_events.Count - 1];
                     int before = _trackEvents.Count;
                     CommandTrackEvent.AppendPredicted(_trackEvents, _edges, TrackUt, last.Blank);
@@ -612,34 +1528,23 @@ namespace Kerbcast
         }
 
         /* How the station and the aim point move from now on, read fresh so
-           both are in this frame's world. Mirrors SolveGeometry and ResolveAim. */
-        private bool TryMotions(double ut, out BodyMotion station, out BodyMotion aim)
+           both are in this frame's world, and the UT that holds until.
+           Mirrors SolveGeometry and ResolveAim. */
+        private bool TryMotions(double ut, out BodyMotion station, out BodyMotion aim, out double validUntilUt)
         {
-            station = aim = default;
+            aim = default;
+            validUntilUt = double.PositiveInfinity;
             var site = _mount.Site;
-            var v = site.Vantage;
-            if (site.HasVantage)
-            {
-                if (!site.TryVantagePosition(ut, out var vantage, out _)) return false;
-                if (v.LandedOrSplashed) station = BodyMotion.OnSurface(v.mainBody, vantage);
-                else if (v.orbit != null) station = BodyMotion.OnOrbit(v.orbit);
-                else return false;
-            }
-            else
-            {
-                var body = site.Body;
-                if (body == null) return false;
-                station = BodyMotion.OnSurface(body, body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude));
-            }
+            if (!site.TryStationMotion(ut, out station)) return false;
 
             var a = _aim;
-            if (a == null || a.Kind == CommandAimKind.Vessel) return TargetMotion(ut, out aim);
+            if (a == null || a.Kind == CommandAimKind.Vessel) return _known.SubjectMotion(ut, out aim, out _, out validUntilUt);
             switch (a.Kind)
             {
                 case CommandAimKind.Direction:
                 {
                     /* Held still against the ground, as near as the forecast needs. */
-                    var body = site.HasVantage ? (site.Vantage != null ? site.Vantage.mainBody : null) : site.Body;
+                    var body = site.StationBody;
                     if (body == null) return false;
                     aim = BodyMotion.OnSurface(body, new Vector3d(_lastAimPoint.X, _lastAimPoint.Y, _lastAimPoint.Z));
                     return true;
@@ -661,27 +1566,12 @@ namespace Kerbcast
                 case CommandAimKind.PositionAt:
                 {
                     var body = FlightGlobals.GetBodyByName(a.Body);
-                    if (body == null) return false;
-                    aim = BodyMotion.Linear(body, a.BodyRelativePosition, a.BodyRelativeVelocity, a.Ut);
+                    if (body == null || !AimPath(a, body, out var path)) return false;
+                    aim = BodyMotion.OnPath(body, path, KinematicsWorld.Now().Zup);
                     return true;
                 }
             }
             return false;
-        }
-
-        private bool TargetMotion(double ut, out BodyMotion aim)
-        {
-            aim = default;
-            if (!_target.TryMotion(out var orbit, out bool onSurface)) return false;
-            if (orbit != null)
-            {
-                if (orbit.referenceBody == null) return false;
-                aim = BodyMotion.OnOrbit(orbit);
-                return true;
-            }
-            if (!onSurface || !_target.TryLocate(ut, out var world, out var body) || body == null) return false;
-            aim = BodyMotion.OnSurface(body, new Vector3d(world.X, world.Y, world.Z));
-            return true;
         }
 
         public RigFrame PrepareRender(KerbcastCamera cam)
@@ -695,67 +1585,67 @@ namespace Kerbcast
             _lastPrepare = now;
             double ut = Planetarium.GetUniversalTime();
             _frameUt = ut;
+            _poseValid = false;
 
             bool solved = Solve(ut, now, out var station, out var aim, out var localUp, out var north, out var occluder);
-            if (Blank != null) return RigFrame.Blank;
+            if (Blank != null)
+            {
+                TakeFrameState();
+                return RigFrame.Blank;
+            }
             if (!solved) return RigFrame.Skip;
 
-            CommandCameraMath.AimBasis(station, aim, localUp, north, out var fwd, out var up);
+            var fwd = _solveForward;
+            var up = _solveUp;
             anchor.position = new Vector3((float)station.X, (float)station.Y, (float)station.Z);
             anchor.rotation = Quaternion.LookRotation(ToF(fwd), ToF(up));
+            _poseValid = true;
+            _poseEye = station;
+            _poseForward = fwd;
+            _poseAimToward = aim + ViewOffset - station;
+            _poseUp = up;
             SyncScaledBodies(cam, anchor.position);
             SyncScaledPose(cam);
             UpdateStationBodyMesh(cam, ut, _lastDistance);
 
             double distance = _lastDistance;
-            /* The aim frames the view; the true craft, wherever it really is,
-               decides what is drawn and how the layers are clipped around it. */
-            bool trueOk = _trueOk;
-            double trueDistance = trueOk ? _trueDistance : distance;
-            bool trueOccluded = trueOk ? _trueOccluded : occluder != null;
-            bool trueLit = trueOk ? _trueSunlit : Sunlit;
-            RefreshCraftRadius(trueOk ? _target.Loaded : null, _truePos, now);
+            var drawn = PlaceDrawn(cam, ut, now, station, aim, occluder, distance);
 
-            /* A loaded craft draws itself; the model and the marker stand in only
-               for an unloaded one, and only where a real craft would be seen. */
-            bool standIn = trueOk && _target.Loaded == null;
-            var towardTrue = ((trueOk ? _truePos : aim) - station).Normalized;
-            double planDistance = trueDistance;
-            double planScale = 1.0;
-            if (_wantModel && standIn)
+            var shape = SubjectShape();
+            Framed(distance, shape, out double framedRadius, out double framedRange);
+            double step = _frames.Next(dt);
+            if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None)
             {
-                EnsureModel(cam);
-                if (_model != null)
-                {
-                    _craftRadius = _model.Radius;
-                    /* Beyond ModelProxyDistance the model stands in at that
-                       distance on the true ray, shrunk by the same ratio: the
-                       same angular size and perspective, with local-space
-                       precision and clip planes that stay simple. */
-                    planDistance = Math.Min(trueDistance, ModelProxyDistance);
-                    planScale = planDistance / trueDistance;
-                    var at = station + towardTrue * planDistance;
-                    _model.Place(trueLit && !trueOccluded, at, _target.SavedRotation(_lastTargetBody), (float)planScale);
-                    NoteModelMode(ut, trueDistance, planDistance, planScale);
-                }
+                /* Not AimJumped, which also fires on every world model publish: the box would start over on each record and pump again. */
+                uint subject = _known.SubjectPersistentId, vantage = site.VantagePersistentId;
+                if (!CommandAim.SameAs(_aim, _framingAim) || subject != _framingSubject || vantage != _framingVantage)
+                    _framing.Reset();
+                _framingAim = _aim;
+                _framingSubject = subject;
+                _framingVantage = vantage;
+                double certain = framedRadius - (AimIsCraft ? _knownUncertainty : 0.0);
+                _fov = _framing.Step(CommandCameraMath.FramingTan(framedRadius, framedRange),
+                    CommandCameraMath.FramingTan(certain, framedRange), _fov, _frameFraction,
+                    FovMinNow(), _fovMax, step, FovTau, FovSnapAfter);
             }
-
-            double fovTarget = CommandCameraMath.FovForFraction(_craftRadius + FramingMargin, distance, _frameFraction, FovMinNow(), _fovMax);
-            _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, dt, FovTau, FovSnapAfter);
+            else
+            {
+                _framing.Reset();
+                double fovTarget = _mode == SubjectAimMode.Hold ? _fov
+                    : _placeholder == PlaceholderAim.LaunchSite
+                        ? CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, distance,
+                            CommandCameraMath.PlaceholderSiteFraction, FovMinNow(), _fovMax)
+                        : _fovMax;
+                _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, step, FovTau, FovSnapAfter);
+            }
+            /* This eases on real time, between physics ticks too, so it is the one part of the aim the slew's per UT rate does not describe exactly. */
+            _viewOffset = _mode == SubjectAimMode.Subject && AimIsCraft
+                ? CommandCameraMath.EaseToward(_viewOffset, shape.Known ? shape.Centre : default, step, FovTau, FovSnapAfter)
+                : default;
+            _shape = shape;
             cam.SetRigFov((float)_fov);
             UpdateBracket(now);
-            UpdateSubpixel(cam, ut, trueDistance, planDistance, planScale, trueOccluded, trueLit, standIn);
-
-            _plan = CommandCameraMath.PlanClips(planDistance, _craftRadius * planScale, trueOccluded, _hasFar, _wasSplit,
-                _nearNativeNear, _nearNativeFar, _farNativeNear, _farNativeFar);
-            ApplyPlan(cam);
-
-            if (_marker != null)
-            {
-                var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
-                _marker.Place(trueLit && standIn && !trueOccluded, station, towardTrue, trueDistance, anchor.rotation,
-                    (float)_fov, rt != null ? rt.height : cam.RenderHeight);
-            }
+            FinishDrawn(cam, ut, station, anchor.rotation, drawn);
 
             if (_first)
             {
@@ -763,7 +1653,7 @@ namespace Kerbcast
                 var ksp = site.Body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
                 double err = (ToD(ksp) - station).Magnitude;
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={distance:F0} event=first-frame "
-                    + $"station={station} aim={aim} kspSurfaceCheckErr={err:F4}m craftRadius={_craftRadius:F1} fov={_fov:F3}");
+                    + $"station={station} aim={aim} kspSurfaceCheckErr={err:F4}m craftRadius={KnownRadius:F1} fov={_fov:F3}");
             }
 
             if (now - _skyProbeAt >= SkyProbeSeconds)
@@ -772,8 +1662,212 @@ namespace Kerbcast
                 cam.RigScaledProbe = true;
             }
 
+            TakeFrameState();
             LogTransitions(ut, distance, aim, fwd, localUp, now);
             return RigFrame.Render;
+        }
+
+        /* What PlaceDrawn settles for the rest of the frame's picture. */
+        private struct DrawnPlan
+        {
+            public double Distance;
+            public bool Blocked;
+            public bool Lit;
+            public bool StandIn;
+            /* The stand-in is the model rather than the marker's point of light. */
+            public bool Model;
+            public DVec3 Toward;
+            public double PlanDistance;
+            public double PlanScale;
+        }
+
+        /* The aim frames the view; the drawn craft, wherever it really is,
+           decides what is drawn and how the layers are clipped around it.
+           With no craft drawn, the layers are clipped around the aim. Runs
+           before the field is chosen, since a stand-in model sets the radius. */
+        private DrawnPlan PlaceDrawn(KerbcastCamera cam, double ut, float now, DVec3 station, DVec3 aim, string occluder,
+            double distance)
+        {
+            bool drawnOk = _drawnOk;
+            var p = new DrawnPlan
+            {
+                Distance = drawnOk ? _drawnDistance : distance,
+                Blocked = drawnOk ? _drawnOccluded : occluder != null,
+                Lit = drawnOk ? _drawnSunlit : Sunlit,
+            };
+            _drawn.Measure(drawnOk, _drawnPos, now);
+
+            /* A loaded craft draws itself; the model and the marker stand in only
+               for an unloaded one, or one this camera hides beyond the boundary,
+               and only where a real craft would be seen. The rig draws its
+               subject's stand-in itself, so its clip plan covers it. */
+            p.StandIn = drawnOk && (_drawn.Loaded == null || _drawn.Hidden);
+            p.Toward = ((drawnOk ? _drawnPos : aim) - station).Normalized;
+            p.PlanDistance = p.Distance;
+            p.PlanScale = 1.0;
+            /* The field is chosen before this frame decides between marker and model, so last frame's model sizes it. */
+            if (p.StandIn && (_wantModel || _modelShown))
+            {
+                EnsureModel(cam);
+                if (ModelMatches()) _drawn.Radius = _standIn.Radius;
+            }
+            return p;
+        }
+
+        /*
+         * Marker or model, judged at the field this frame renders with, by a
+         * size the rig knows (SubjectSizeM), then the model placed.
+         */
+        private void DecideStandIn(KerbcastCamera cam, double ut, DVec3 station, ref DrawnPlan p)
+        {
+            double size = SubjectSizeM(out bool guessed);
+            p.Model = p.StandIn
+                && CommandCameraMath.SubjectAsModel(_wantModel, _marker != null, _modelShown, size, p.Distance, _fov, RenderRows(cam));
+            if (p.Model) EnsureModel(cam);
+            _modelShown = CommandCameraMath.ShowsModel(p.Model, ModelMatches(), _wantModel, guessed);
+            /* With no model to show the marker stands in, rather than nothing; the model setting has no marker. */
+            if (!_wantModel) p.Model = _modelShown;
+            if (!_modelShown && _standIn != null) _standIn.Place(false, default, Quaternion.identity, 1f);
+            if (_modelShown)
+            {
+                _drawn.Radius = _standIn.Radius;
+                /* Beyond ModelProxyDistance the model stands in at that
+                   distance on the true ray, shrunk by the same ratio: the
+                   same angular size and perspective, with local-space
+                   precision and clip planes that stay simple. */
+                p.PlanDistance = Math.Min(p.Distance, ModelProxyDistance);
+                p.PlanScale = p.PlanDistance / p.Distance;
+                var at = station + p.Toward * p.PlanDistance;
+                var rotation = _drawn.SavedRotation(_drawnBody);
+                var parts = _standIn.Parts;
+                if (parts != null)
+                {
+                    /* The history follows the centre of mass; the model hangs from its root part. */
+                    rotation = _drawn.ShownRotation;
+                    var com = rotation * new Vector3(parts.ComX, parts.ComY, parts.ComZ) * (float)p.PlanScale;
+                    at = at - new DVec3(com.x, com.y, com.z);
+                }
+                _standIn.Place(p.Lit && !p.Blocked, at, rotation, (float)p.PlanScale);
+                NoteModelMode(ut, p.Distance, p.PlanDistance, p.PlanScale);
+            }
+            /* The pass leaves the subject to the rig only when the rig has something to draw it with. */
+            if (p.StandIn && (p.Model ? _modelShown : _marker != null)) _cam.Picture.RigDraws(new RigDrawn(_drawn.PersistentId, _drawn.ShownPast ? _drawn.ShownPid : 0));
+        }
+
+        /* The model built for the parts shown, else the history's size for them, else a generous guess. */
+        private double SubjectSizeM(out bool guessed)
+        {
+            var parts = _drawn.ShownParts;
+            double model = ModelMatches() ? _standIn.Radius : 0;
+            double recorded = parts != null ? parts.SizeM : 0;
+            guessed = !(model > 0) && !(recorded > 0);
+            return CommandCameraMath.SubjectSizeM(model, recorded, PictureCull.UnknownSizeM);
+        }
+
+        /* Whether the model built is the subject's, for the parts it is drawn with. */
+        private bool ModelMatches()
+        {
+            var parts = _drawn.ShownParts;
+            uint pid = parts != null ? _drawn.ShownPid : _drawn.PersistentId;
+            return _standIn != null && _standIn.PersistentId == pid && _standIn.Parts == parts;
+        }
+
+        private static int RenderRows(KerbcastCamera cam)
+        {
+            var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+            return rt != null ? rt.height : cam.RenderHeight;
+        }
+
+        /* Marker or model, the sub-pixel camera, the clip plan and the marker, once the field is set. */
+        private void FinishDrawn(KerbcastCamera cam, double ut, DVec3 station, Quaternion lensRotation, DrawnPlan p)
+        {
+            DecideStandIn(cam, ut, station, ref p);
+            UpdateSubpixel(cam, ut, p.Distance, p.PlanDistance, p.PlanScale, p.Blocked, p.Lit, p.Model);
+
+            _plan = CommandCameraMath.PlanClips(p.PlanDistance, _drawn.Radius * p.PlanScale, p.Blocked, _hasFar, _wasSplit,
+                _nearNativeNear, _nearNativeFar, _farNativeNear, _farNativeFar);
+            ApplyPlan(cam);
+
+            if (_marker != null)
+            {
+                var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+                _marker.Place(p.Lit && p.StandIn && !p.Model && !p.Blocked, station, p.Toward, p.Distance, lensRotation,
+                    (float)_fov, rt != null ? rt.height : cam.RenderHeight);
+            }
+        }
+
+        public bool TryRenderPose(out DVec3 eye, out DVec3 forward, out DVec3 up)
+        {
+            eye = _poseEye;
+            forward = _poseForward;
+            up = _poseUp;
+            return _poseValid;
+        }
+
+        /* The aim point, as a direction from the lens, so a client can put the
+           bracket where the aim lands while the view slews onto it. While the
+           view slews it says where the aim is apart from the pose: knowledge
+           the operator holds, so it is never observed-only, and it is always
+           placed, in frame or not. Then the subject as a vessel anchor with
+           occlusion on: where the craft really is in each frame, wherever the
+           camera aims, sized by its radius plus the framing margin. Kerbcast's
+           other anchors are observed-only (AnchorRules), so they carry only
+           what the picture shows. Under a held lock the owner can withhold
+           both. */
+        public void AddOwnAnchors(List<KeyValuePair<string, AnchorSpec>> into)
+        {
+            bool withheld = _authority != null && _authority.Registered && !_authority.SubjectAnchorVisible;
+            if (_poseValid && !withheld)
+            {
+                /* A direction from the lens projects where the point along it does; the vector is z up. */
+                _aimAnchor.VectorX = _poseAimToward.X;
+                _aimAnchor.VectorY = _poseAimToward.Z;
+                _aimAnchor.VectorZ = _poseAimToward.Y;
+                into.Add(new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, _aimAnchor));
+            }
+            uint pid = _drawn.PersistentId;
+            if (pid == 0 || !_drawnOk) return;
+            if (withheld) return;
+            _subjectAnchor.Vessel = pid;
+            _subjectAnchor.MarginM = FramingMargin;
+            into.Add(new KeyValuePair<string, AnchorSpec>(AnchorRegistry.KerbcastOwner, _subjectAnchor));
+        }
+
+        /* The subject where this rig solved it for the frame, with the radius
+           it frames and the terrain-aware occlusion it already ran. Unloaded
+           craft (the Space Center, or beyond physics range) are located from
+           their orbit, which the generic projector can not do. */
+        /* The default and Vessel aims point at the craft itself, so its size counts. */
+        private bool AimIsCraft => _aim == null || _aim.Kind == CommandAimKind.Vessel;
+
+        public bool TryLocateVessel(uint pid, out DVec3 world, out double radius, out bool occluded, out bool unseen)
+        {
+            unseen = false;
+            if (_drawnOk && pid != 0 && pid == _drawn.PersistentId)
+            {
+                world = _drawnPos;
+                radius = _drawn.AnchorRadius;
+                occluded = _drawnOccluded;
+                return true;
+            }
+            world = default;
+            radius = 0;
+            occluded = false;
+            if (pid == 0 || !_poseValid) return false;
+            /* Any other craft, or the subject while it is not drawn, is placed
+               where its arriving light shows it, so an anchor never names a
+               place the picture would not. */
+            switch (_cam.Picture.Locate(pid, out world, out radius))
+            {
+                case OtherSight.Past:
+                    occluded = _occlusion.FindDrawnOccluder(_cam.Picture, _poseEye, world, out _, radius) != null;
+                    return true;
+                case OtherSight.Unseen:
+                    unseen = true;
+                    return false;
+                default:
+                    return false;
+            }
         }
 
         private void NoteModelMode(double ut, double d, double proxy, double scale)
@@ -807,7 +1901,7 @@ namespace Kerbcast
                 if (t == null) continue;
                 Vector3 was = t.position;
                 Vector3 now = ScaledSpace.LocalToScaledSpace(b.position);
-                if (b == _lastTargetBody && perPx > 0)
+                if (b == _frameBody && perPx > 0)
                 {
                     var a = new Vector3d(was.x - eye.x, was.y - eye.y, was.z - eye.z);
                     var c = new Vector3d(now.x - eye.x, now.y - eye.y, now.z - eye.z);
@@ -1123,19 +2217,19 @@ namespace Kerbcast
             bool occluded, bool lit, bool standIn)
         {
             _subpixelActive = false;
-            if (_model == null || _subpixel == null || !standIn)
+            if (_standIn == null || _subpixel == null || !standIn)
             {
-                if (_model != null) _model.SubpixelMode = false;
+                if (_standIn != null) _standIn.SubpixelMode = false;
                 return;
             }
             var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
             int rows = rt != null ? rt.height : cam.RenderHeight;
             double perPx = CommandCameraMath.PixelSizeAtUnit(_fov, rows);
-            double across = perPx > 0 && distance > 0 ? 2.0 * _model.Radius / (distance * perPx) : 0;
+            double across = perPx > 0 && distance > 0 ? 2.0 * _standIn.Radius / (distance * perPx) : 0;
             bool sub = across < SubpixelBelowPx;
-            _model.SubpixelMode = sub;
+            _standIn.SubpixelMode = sub;
             _subpixelActive = sub && across >= SubpixelFloorPx && lit && !occluded;
-            double span = CommandCameraMath.ClipSpan(_model.Radius * planScale);
+            double span = CommandCameraMath.ClipSpan(_standIn.Radius * planScale);
             _subpixelNear = (float)Math.Max(0.05, planDistance - span);
             _subpixelFar = (float)(planDistance + span);
             if (!_subpixelActive) _subpixel.Reset();
@@ -1148,55 +2242,18 @@ namespace Kerbcast
             }
         }
 
-        /* Bounding radius about the CoM from part origins, refreshed twice a
-           second (staging changes it) and immediately on a vessel switch. An
-           unloaded craft has no parts, so it gets the minimum. */
-        private void RefreshCraftRadius(Vessel v, DVec3 com, float now)
-        {
-            if (v == null)
-            {
-                _craftRadius = MinCraftRadius;
-                _radiusVesselId = 0;
-                return;
-            }
-            if (v.persistentId == _radiusVesselId && now - _radiusAt < RadiusRefreshSeconds) return;
-            _radiusVesselId = v.persistentId;
-            _radiusAt = now;
-            _partScratch.Clear();
-            var parts = v.parts;
-            if (parts != null)
-            {
-                for (int i = 0; i < parts.Count; i++)
-                {
-                    var p = parts[i];
-                    if (p != null && p.transform != null) _partScratch.Add(ToD(p.transform.position));
-                }
-            }
-            _craftRadius = CommandCameraMath.BoundingRadius(_partScratch, com, PartPad, MinCraftRadius);
-        }
-
         private void NoteTargetAndOcclusion(double ut, double d, CelestialBody targetBody, DVec3 target, string occluder,
             string source)
         {
             string at = $"{Tag} cam={_flightId} UT={F(ut)} d={d:F0}";
 
-            if (!_targetLogged || _target.PersistentId != _targetPid)
+            if (!_targetLogged || _known.SubjectPersistentId != _targetPid)
             {
                 _targetLogged = true;
-                _targetPid = _target.PersistentId;
-                Debug.Log($"{at} event=target vessel='{_target.Name}' persistentId={_target.PersistentId} "
-                    + $"situation={_target.Situation} loaded={_target.Loaded != null} elev={ElevationDeg:F2}");
-                /* Once per rig: the orbit-derived position against stock's own,
-                   to show the floating-origin conversion is right. */
-                if (!_stockCheckLogged && _target.Loaded == null)
-                {
-                    var stock = _target.StockWorldPosition();
-                    if (stock.HasValue)
-                    {
-                        _stockCheckLogged = true;
-                        Debug.Log($"{at} event=target-position-check orbit={target} stock={stock.Value} err={(stock.Value - target).Magnitude:F1}m");
-                    }
-                }
+                _targetPid = _known.SubjectPersistentId;
+                Debug.Log($"{at} event=target vessel='{_known.SubjectName}' persistentId={_known.SubjectPersistentId} "
+                    + $"{DrawnLogFields()} elev={ElevationDeg:F2}");
+                NoteStockCheck(at, target);
             }
             string tb = targetBody != null ? targetBody.bodyName : "?";
             if (tb != _targetBody)
@@ -1208,12 +2265,25 @@ namespace Kerbcast
             if (occluded != _wasOccluded || (occluded && (occluder != _occluderName || source != _occluderSource)))
             {
                 Debug.Log(occluded
-                    ? $"{at} event=occluded-on by={occluder} occluderSource={source} elev={ElevationDeg:F2} target='{_target.Name}' occlusionMs={_occlusionMs:F3}"
-                    : $"{at} event=occluded-off was={_occluderName} occluderSource={_occluderSource} elev={ElevationDeg:F2} target='{_target.Name}' occlusionMs={_occlusionMs:F3}");
+                    ? $"{at} event=occluded-on by={occluder} occluderSource={source} elev={ElevationDeg:F2} target='{_known.SubjectName}' occlusionMs={_occlusionMs:F3}"
+                    : $"{at} event=occluded-off was={_occluderName} occluderSource={_occluderSource} elev={ElevationDeg:F2} target='{_known.SubjectName}' occlusionMs={_occlusionMs:F3}");
                 _wasOccluded = occluded;
                 _occluderName = occluder;
                 _occluderSource = source;
             }
+        }
+
+        private string DrawnLogFields() => $"situation={_drawn.Situation} loaded={_drawn.Loaded != null}";
+
+        /* Once per rig: the orbit-derived position against stock's own, to
+           show the floating-origin conversion is right. */
+        private void NoteStockCheck(string at, DVec3 target)
+        {
+            if (_stockCheckLogged || _drawn.Loaded != null) return;
+            var stock = _drawn.StockWorldPosition();
+            if (!stock.HasValue) return;
+            _stockCheckLogged = true;
+            Debug.Log($"{at} event=target-position-check orbit={target} stock={stock.Value} err={(stock.Value - target).Magnitude:F1}m");
         }
 
         private void LogTransitions(double ut, double d, DVec3 target, DVec3 fwd, DVec3 localUp, float now)
@@ -1238,7 +2308,7 @@ namespace Kerbcast
             if (atFloor != _wasFovFloor)
             {
                 _wasFovFloor = atFloor;
-                Debug.Log($"{at} event={(atFloor ? "fov-floor-reached" : "fov-floor-left")} fov={_fov:F4} craftRadius={_craftRadius:F1}");
+                Debug.Log($"{at} event={(atFloor ? "fov-floor-reached" : "fov-floor-left")} fov={_fov:F4} craftRadius={KnownRadius:F1}");
             }
             bool atCeiling = _fov >= _fovMax * 0.9999;
             if (atCeiling != _wasFovCeiling)
@@ -1282,8 +2352,9 @@ namespace Kerbcast
             {
                 _statusAt = now;
                 double elev = CommandCameraMath.ElevationDeg(fwd, localUp);
-                Debug.Log($"{at} event=status elev={elev:F2} fov={_fov:F4} craftRadius={_craftRadius:F1} "
-                    + $"split={_plan.Split} occluded={Occluded} "
+                Debug.Log($"{at} event=status elev={elev:F2} fov={_fov:F4} craftRadius={KnownRadius:F1} "
+                    + (_shape.Known ? $"shapeHalf={_shape.Half:F1} shapeCentreM={_shape.Centre.Magnitude:F1} viewOffsetM={_viewOffset.Magnitude:F1} " : "shape=none ")
+                    + $"handoverM={_handover.Offset.Magnitude:F2} split={_plan.Split} occluded={Occluded} "
                     + (_hasFar ? $"far={(_plan.FarRender ? $"[{_plan.FarNear:F0},{_plan.FarFar:F0}]" : "skipped")} mid={(_plan.MidActive ? $"[{_plan.MidNear:F0},{_plan.MidFar:F0}]" : "off")} " : "")
                     + (_subpixelActive && _subpixel != null ? $"subpixelEnergy={_subpixel.LastEnergy:G3} subpixelCoverPx={_subpixel.LastCoverage:G3} subpixelPeak={_subpixel.LastPeak:G3} " : "")
                     + $"nearFar={_plan.NearFar:F0} originShifts={_originShifts} scaledSkewMaxPx={_scaledSkewMaxPx:F2} scaledSkewFrames={_scaledSkewFrames} "
@@ -1334,8 +2405,8 @@ namespace Kerbcast
             _marker = null;
             _utStripe?.Dispose();
             _utStripe = null;
-            _model?.Dispose();
-            _model = null;
+            _standIn?.Dispose();
+            _standIn = null;
             if (_midCam != null) UnityEngine.Object.Destroy(_midCam.gameObject);
             _midCam = null;
             _subpixel?.Dispose();

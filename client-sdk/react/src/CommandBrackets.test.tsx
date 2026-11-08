@@ -1,4 +1,4 @@
-import { effectiveCommandTrack, type CommandTrackState } from "@ksp-gonogo/kerbcast";
+import { effectiveCommandTrack, type CommandTrackState, type FrameAnchor } from "@ksp-gonogo/kerbcast";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -33,7 +33,7 @@ function track(overrides: Partial<CommandTrackState> = {}): CommandTrackState {
   };
 }
 
-const AUTHORITY = { owner: "gonogo" };
+const AUTHORITY = { owner: "mission-control" };
 
 describe("containedContentRect", () => {
   it("letterboxes wide media in a tall box", () => {
@@ -154,6 +154,19 @@ describe("CommandBrackets", () => {
     expect(container.querySelector("svg")).toBeNull();
     expect(screen.getByText("NO FIX")).toBeTruthy();
   });
+
+  it("leaves NO FIX out while the feed says it is waiting for a target", () => {
+    render(
+      <CommandBrackets
+        state={{ ...effectiveCommandTrack(track({ hasFix: false, rangeM: undefined }), 1000), waitingForTarget: true }}
+        displayUt={1000}
+        utSource="override"
+        video={null}
+        fallbackSize={{ width: 1024, height: 576 }}
+      />,
+    );
+    expect(screen.queryByText("NO FIX")).toBeNull();
+  });
 });
 
 describe("CommandBrackets overlay", () => {
@@ -249,11 +262,198 @@ describe("CommandBrackets overlay", () => {
   });
 });
 
+/** A video element with a laid-out box and a decoded size, as a browser reports them. */
+function sizedVideo(boxW: number, boxH: number, mediaW = boxW, mediaH = boxH): HTMLVideoElement {
+  const v = document.createElement("video");
+  Object.defineProperty(v, "clientWidth", { value: boxW });
+  Object.defineProperty(v, "clientHeight", { value: boxH });
+  Object.defineProperty(v, "videoWidth", { value: mediaW });
+  Object.defineProperty(v, "videoHeight", { value: mediaH });
+  return v;
+}
+
+function subjectAnchor(overrides: Partial<FrameAnchor> = {}): FrameAnchor {
+  return {
+    id: "subject",
+    owner: "kerbcast",
+    x: 256,
+    y: 144,
+    inFrame: true,
+    behind: false,
+    distanceM: 4200,
+    apparentRadiusPx: 40,
+    angleOffAxis: 12,
+    occluded: false,
+    ...overrides,
+  };
+}
+
+describe("CommandBrackets on the subject anchor", () => {
+  function renderOnSubject(
+    subject: FrameAnchor | null,
+    t: CommandTrackState = track(),
+    overlay?: CommandBracketOverlay,
+    frame = { width: 1024, height: 576 },
+  ) {
+    return render(
+      <CommandBrackets
+        state={effectiveCommandTrack(t, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={overlay}
+        subject={subject}
+        subjectFrameSize={frame}
+      />,
+    );
+  }
+
+  function seenWith(subject: FrameAnchor | null, t: CommandTrackState = track()) {
+    let seen: CommandBracketContext | null = null;
+    const view = renderOnSubject(subject, t, { render: (ctx) => ((seen = ctx), null) });
+    return { ctx: seen as unknown as CommandBracketContext, view };
+  }
+
+  /* An observed result out of frame or occluded: no coordinates at all. */
+  const unseen = (o: Partial<FrameAnchor>): FrameAnchor => ({
+    id: "subject",
+    owner: "kerbcast",
+    observed: true,
+    inFrame: true,
+    ...o,
+  });
+
+  it("brackets the subject where it really is, not the frame centre", () => {
+    const { ctx, view } = seenWith(subjectAnchor());
+    expect([ctx.geometry.cx, ctx.geometry.cy, ctx.geometry.half]).toEqual([256, 144, 40]);
+    expect(ctx.subject?.id).toBe("subject");
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("placed");
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBeNull();
+  });
+
+  it("maps a capture frame larger than the decoded video by the frame's own size", () => {
+    let seen: CommandBracketContext | null = null;
+    renderOnSubject(
+      subjectAnchor({ x: 512, y: 288, apparentRadiusPx: 80 }),
+      track(),
+      { render: (ctx) => ((seen = ctx), null) },
+      { width: 2048, height: 1152 },
+    );
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy, g.half]).toEqual([256, 144, 40]);
+  });
+
+  it("falls back to the 1.11 box when the subject is occluded: centred, aimed range, aim-line colour", () => {
+    const t = track({ occluded: true, occluder: "Mun" });
+    const { ctx, view } = seenWith(unseen({ occluded: true }), t);
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 20, 576));
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("centred");
+    expect(ctx.subject?.occluded).toBe(true);
+  });
+
+  it("falls back to the 1.11 box, corners drawn, when the subject is out of frame", () => {
+    const { ctx, view } = seenWith(unseen({ inFrame: false, occluded: false }));
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(view.container.querySelectorAll("path")).toHaveLength(2);
+    expect(screen.getByText("IN VIEW · 4.2 km")).toBeTruthy();
+  });
+
+  it("keeps the 1.11 box under the command lock even with the subject in view", () => {
+    /* The authority aims somewhere else; the box is its aim, the anchor a second mark for the consumer. */
+    const locked = track({ authority: AUTHORITY, occluded: true, occluder: "Mun", bracketHalfPx: 30 });
+    const { ctx, view } = seenWith(subjectAnchor(), locked);
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 30, 576));
+    expect(corner(view.container, "topLeft")!.getAttribute("stroke-dasharray")).toBe("3 2");
+    expect(ctx.subject).toMatchObject({ id: "subject", x: 256, y: 144 });
+    expect(screen.getByText("OCCLUDED MUN · 4.2 km")).toBeTruthy();
+  });
+
+  it("puts the aimed box on the aim anchor while the view turns onto a moved aim", () => {
+    const locked = track({ authority: AUTHORITY, bracketHalfPx: 30 });
+    let seen: CommandBracketContext | null = null;
+    render(
+      <CommandBrackets
+        state={effectiveCommandTrack(locked, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subject={subjectAnchor()}
+        subjectFrameSize={{ width: 1024, height: 576 }}
+        aim={{ id: "aim", owner: "kerbcast", observed: true, inFrame: true, x: 700, y: 200 }}
+      />,
+    );
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    expect([g.cx, g.cy]).toEqual([700, 200]);
+    expect(g).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 30, 576, { x: 700, y: 200 }));
+  });
+
+  it("keeps the aimed box on the edge nearest an aim off the frame, with a cue toward it", () => {
+    const locked = track({ authority: AUTHORITY, bracketHalfPx: 30 });
+    let seen: CommandBracketContext | null = null;
+    const view = render(
+      <CommandBrackets
+        state={effectiveCommandTrack(locked, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subjectFrameSize={{ width: 1024, height: 576 }}
+        aim={{ id: "aim", owner: "kerbcast", inFrame: false, behind: false, x: 1500, y: 200, observed: false }}
+      />,
+    );
+    const ctx = seen as CommandBracketContext | null;
+    expect(ctx!.aimOffscreen).toBe(true);
+    expect(ctx!.geometry.bottomRight.x).toBeLessThanOrEqual(1024);
+    expect(ctx!.geometry.cy).toBe(200);
+    expect(view.container.querySelector("path[data-aim-cue]")).toBeTruthy();
+  });
+
+  function renderAimed(aimAt: { x: number; y: number }, t: CommandTrackState) {
+    let seen: CommandBracketContext | null = null;
+    const view = render(
+      <CommandBrackets
+        state={effectiveCommandTrack(t, 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(1024, 576)}
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subject={subjectAnchor()}
+        subjectFrameSize={{ width: 1024, height: 576 }}
+        aim={{ id: "aim", owner: "kerbcast", observed: false, inFrame: true, behind: false, ...aimAt }}
+      />,
+    );
+    return { ctx: seen as unknown as CommandBracketContext, view };
+  }
+
+  it("draws the aimed box when it holds the subject, so a craft and its parachute are framed whole", () => {
+    /* The view aims between a capsule and the canopy above it; the subject anchor stays on the centre of mass. */
+    const { ctx, view } = renderAimed({ x: 256, y: 100 }, track({ bracketHalfPx: 60 }));
+    expect(ctx.geometry).toEqual(bracketGeometry({ x: 0, y: 0, width: 1024, height: 576 }, 60, 576, { x: 256, y: 100 }));
+    expect(ctx.subject).toMatchObject({ id: "subject", x: 256, y: 144 });
+    expect(view.container.querySelector("svg")!.getAttribute("data-subject")).toBe("placed");
+  });
+
+  it("keeps the box on the subject when the aimed box does not hold it", () => {
+    const { ctx } = renderAimed({ x: 700, y: 400 }, track({ bracketHalfPx: 60 }));
+    expect([ctx.geometry.cx, ctx.geometry.cy, ctx.geometry.half]).toEqual([256, 144, 40]);
+    expect(ctx.aimOffscreen).toBe(false);
+  });
+
+  it("centres on the frame as before without a subject anchor", () => {
+    const { ctx } = seenWith(null);
+    expect([ctx.geometry.cx, ctx.geometry.cy]).toEqual([512, 288]);
+    expect(ctx.subject).toBeNull();
+  });
+});
+
 describe("CommandBlank", () => {
   it("labels the blank with its reason", () => {
-    render(<CommandBlank reason="Waiting for gonogo" />);
+    render(<CommandBlank reason="Waiting for mission control" />);
     expect(screen.getByRole("status", { name: "Feed blanked" }).textContent).toBe(
-      "Waiting for gonogo",
+      "Waiting for mission control",
     );
   });
 });

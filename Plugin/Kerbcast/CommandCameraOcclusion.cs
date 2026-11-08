@@ -97,8 +97,9 @@ namespace Kerbcast
         public int MaskBinsBuilt => _mask?.BinsBuilt ?? 0;
         public int MaskFallbacks => _mask?.Fallbacks ?? 0;
 
-        /* The first body hiding `target` from `station` now, or null. */
-        public string FindOccluder(DVec3 station, DVec3 target, out string source)
+        /* The first body hiding `target` from `station` now, or null. A
+           target radius counts against the station's own skyline only. */
+        public string FindOccluder(DVec3 station, DVec3 target, out string source, double targetRadius = 0)
         {
             source = null;
             var bodies = FlightGlobals.Bodies;
@@ -107,7 +108,26 @@ namespace Kerbcast
                 var b = bodies[i];
                 if (b == null) continue;
                 var c = ToD(b.position);
-                if (Blocks(b, station, target, c, c, Spin(b), 0, out source)) return b.bodyName;
+                if (Blocks(b, station, target, c, c, Spin(b), 0, out source, targetRadius)) return b.bodyName;
+            }
+            return null;
+        }
+
+        /* The picture's FindOccluder: the first body hiding `target` from
+           `station` with each body where `picture` draws it, at its past
+           instant and turned back by its spin, and none the picture leaves
+           out. For what a frame shows, never for what the camera knows. */
+        public string FindDrawnOccluder(PicturePass picture, DVec3 station, DVec3 target, out string source, double targetRadius = 0)
+        {
+            source = null;
+            var bodies = FlightGlobals.Bodies;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null || picture.HidesBody(b)) continue;
+                var c = ToD(b.position);
+                var at = picture.TryDrawnBody(b, out var drawn, out double dt) ? drawn : c;
+                if (Blocks(b, station, target, at, c, Spin(b), dt, out source, targetRadius)) return b.bodyName;
             }
             return null;
         }
@@ -129,7 +149,7 @@ namespace Kerbcast
          * and now at centreNow, spinning at `spin`.
          */
         public bool Blocks(CelestialBody b, DVec3 station, DVec3 target, DVec3 centreAtT, DVec3 centreNow, DVec3 spin,
-            double dt, out string source)
+            double dt, out string source, double targetRadius = 0)
         {
             source = null;
             if (_maskWanted && b == _maskBody && _mask != null)
@@ -137,7 +157,7 @@ namespace Kerbcast
                 var relS = CommandCameraMath.ToBodyFrameNow(station, centreAtT, centreNow, spin, dt) - centreNow;
                 var relT = CommandCameraMath.ToBodyFrameNow(target, centreAtT, centreNow, spin, dt) - centreNow;
                 var z = b.BodyFrame.Z;
-                if (!_mask.Blocks(relS, relT, new DVec3(z.x, z.z, z.y))) return false;
+                if (!_mask.Blocks(relS, relT, new DVec3(z.x, z.z, z.y), targetRadius)) return false;
                 source = SourceTerrain;
                 return true;
             }
