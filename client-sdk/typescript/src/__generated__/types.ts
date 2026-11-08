@@ -854,6 +854,17 @@ export interface CommandVantage {
 }
 
 /**
+ * Sent after the browser applies a re-offer's answer, before it subscribes
+ * any camera to the new slots. A re-offer whose answer the browser never
+ * applies is never confirmed, so its slots stay idle instead of carrying a
+ * camera the browser cannot play.
+ */
+export interface ConfirmSlotsPayload {
+	/** The pool size the applied answer covers, old slots and new. */
+	slots: number;
+}
+
+/**
  * Create a command camera for the rest of the current scene. Server-wide:
  * the camera appears in every consumer's camera list (kind `command`) with
  * `commandCentre.token` set to `token` once the game has built it,
@@ -1255,17 +1266,6 @@ export interface SceneStateChangedPayload {
 export interface SetAnchorsPayload {
 	flightId: number;
 	anchors?: Anchor[];
-}
-
-/**
- * Sent after the browser applies a re-offer's answer, before it subscribes
- * any camera to the new slots. A re-offer whose answer the browser never
- * applies is never confirmed, so its slots stay idle instead of carrying a
- * camera the browser cannot play.
- */
-export interface ConfirmSlotsPayload {
-	/** The pool size the applied answer covers, old slots and new. */
-	slots: number;
 }
 
 /**
