@@ -1992,6 +1992,35 @@ namespace Kerbcast
             };
         }
 
+        /*
+         * AfgInputsFor for this lens, from its offset from the body's centre
+         * in metres. With the origin far away the scaled positions are
+         * rounded to hundreds of metres, more than the lens stands above the
+         * ground, so its height read from them can land underwater. The
+         * camera position is placed from the same offset so it agrees with
+         * the height.
+         */
+        private static AfgInputs AfgInputsForLens(AtmosphereFromGround afg, DVec3 centreToLens)
+        {
+            double k = ScaledSpace.ScaleFactor;
+            var centre = afg.planet.scaledBody.transform.position;
+            var offset = centreToLens * (1.0 / k);
+            var camPos = centre + ToF(offset);
+            double h = offset.Magnitude;
+            double depth = CommandCameraMath.LensDepthM(centreToLens.Magnitude, afg.pRadius, k);
+            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            float dot = sun != null
+                ? Mathf.Clamp01(Vector3.Dot(ToF(offset * -1.0), camPos - sun.scaledBody.transform.position) * afg.dawnFactor)
+                : afg.lightDot;
+            return new AfgInputs
+            {
+                CameraPos = camPos,
+                Height = (float)h,
+                Underwater = depth >= 0 ? Mathf.Min((float)depth * afg.oceanDepthRecip, 1f) : 0f,
+                LightDot = dot,
+            };
+        }
+
         private static void ApplyAfg(MaterialPropertyBlock mpb, AfgInputs v)
         {
             mpb.SetVector(CameraPosId, new Vector4(v.CameraPos.x, v.CameraPos.y, v.CameraPos.z, 0f));
@@ -2045,7 +2074,9 @@ namespace Kerbcast
             if (_afgRenderer == null || _afgRenderer.gameObject != afg.gameObject) _afgRenderer = afg.GetComponent<Renderer>();
             if (_afgRenderer == null) return;
             _afgStock = AfgInputsFor(afg, afg.mainCamera.position);
-            _afgOurs = AfgInputsFor(afg, scaled.transform.position);
+            _afgOurs = _poseValid
+                ? AfgInputsForLens(afg, _poseEye - ToD(body.position))
+                : AfgInputsFor(afg, scaled.transform.position);
             if (!_afgOverride) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
             ApplyAfg(_afgBlock, _afgOurs);
@@ -2181,15 +2212,17 @@ namespace Kerbcast
             if (afg == null || scaled == null || body.scaledBody == null) return;
             var t = scaled.transform;
             var centre = body.scaledBody.transform.position;
-            var up = (t.position - centre).normalized;
-            float camAltM = ((t.position - centre).magnitude - afg.pRadius) * ScaledSpace.ScaleFactor;
+            var lens = _poseEye - ToD(body.position);
+            var up = _poseValid ? ToF(lens.Normalized) : (t.position - centre).normalized;
+            double camAltM = _poseValid ? lens.Magnitude - body.Radius : ((t.position - centre).magnitude - afg.pRadius) * ScaledSpace.ScaleFactor;
+            float scaledAltM = ((t.position - centre).magnitude - afg.pRadius) * ScaledSpace.ScaleFactor;
             float fwdElev = Mathf.Asin(Mathf.Clamp(Vector3.Dot(t.forward, up), -1f, 1f)) * Mathf.Rad2Deg;
             var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
             var toSun = sun != null ? (sun.scaledBody.transform.position - t.position).normalized : Vector3.zero;
             float sunElev = Mathf.Asin(Mathf.Clamp(Vector3.Dot(toSun, up), -1f, 1f)) * Mathf.Rad2Deg;
             float sunAngle = Vector3.Angle(t.forward, toSun);
             float stockAltM = (_afgStock.Height - afg.pRadius) * ScaledSpace.ScaleFactor;
-            Debug.Log($"{Tag} cam={_flightId} event=sky-inputs ours: camAlt={camAltM:F0}m height={_afgOurs.Height:F4} lightDot={_afgOurs.LightDot:F3} "
+            Debug.Log($"{Tag} cam={_flightId} event=sky-inputs ours: camAlt={camAltM:F0}m scaledCamAlt={scaledAltM:F0}m height={_afgOurs.Height:F4} lightDot={_afgOurs.LightDot:F3} "
                 + $"underwater={_afgOurs.Underwater:F3} | stock: camAlt={stockAltM:F0}m height={_afgStock.Height:F4} lightDot={_afgStock.LightDot:F3} "
                 + $"camGap={(_afgOurs.CameraPos - _afgStock.CameraPos).magnitude * ScaledSpace.ScaleFactor:F0}m | "
                 + $"shell outer={afg.outerRadius:F3} inner={afg.innerRadius:F3} pRadius={afg.pRadius:F3} bodyCentre={centre} | "
