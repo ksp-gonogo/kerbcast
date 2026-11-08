@@ -32,5 +32,12 @@ Check(epoch.Value == start + 3, "successive bumps accumulate");
 uint held = epoch.Value;
 Check(epoch.Value == held, "Value is stable between bumps");
 
+// The game's epoch is one counter however many scene addons read it, so a
+// scene that bumps it on its way out hands the next scene the new value.
+uint before = CaptureEpoch.Game.Value;
+CaptureEpoch.Game.Bump();
+Check(CaptureEpoch.Game.Value == before + 1, "a bump on the game's epoch carries to the next reader");
+Check(ReferenceEquals(CaptureEpoch.Game, CaptureEpoch.Game), "the game's epoch is one instance");
+
 if (failures == 0) { Console.WriteLine("CaptureEpoch: all checks passed"); return 0; }
 Console.Error.WriteLine($"CaptureEpoch: {failures} check(s) failed"); return 1;

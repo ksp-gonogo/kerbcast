@@ -5,7 +5,9 @@ import {
   addTile,
   cameraKey,
   loadPerfNoteDismissed,
+  isCameraShown,
   loadTiles,
+  pruneCommandTiles,
   pruneCrewTiles,
   reconcileTiles,
   removeAllCameras,
@@ -98,6 +100,31 @@ describe("seedTiles", () => {
 // ---------------------------------------------------------------------------
 
 describe("reconcileTiles", () => {
+  it("puts a repurposed tile back on its own camera when that camera returns", () => {
+    const fwd = cameraKey(cam(1, "Kerbal X", "hull.cam", "FwdCam"));
+    const tiles = [tile(1, true, fwd)];
+    // Another vessel's camera is the only one live while the tile's own is away.
+    const other = cam(9, "Probe", "p.cam", "Eye");
+    const repurposed = reconcileTiles(tiles, [other]);
+    expect(repurposed[0].flightId).toBe(9);
+    // Its camera comes back (new flightId after a scene change).
+    const back = reconcileTiles(repurposed, [other, cam(4, "Kerbal X", "hull.cam", "FwdCam")]);
+    expect(back[0].flightId).toBe(4);
+    expect(back[0].key).toBe(fwd);
+    expect(back[0].spotlit).toBe(true);
+    expect(back[0].homeKey).toBeNull();
+  });
+
+  it("does not restore onto a camera another tile already shows", () => {
+    const fwd = cameraKey(cam(1, "Kerbal X", "hull.cam", "FwdCam"));
+    const other = cam(9, "Probe", "p.cam", "Eye");
+    const repurposed = reconcileTiles([tile(1, false, fwd)], [other]);
+    const home = cam(4, "Kerbal X", "hull.cam", "FwdCam");
+    const withManual = [...repurposed, tile(4, false, fwd)];
+    const result = reconcileTiles(withManual, [other, home]);
+    expect(result[0].flightId).toBe(9);
+  });
+
   it("returns the same array reference when nothing needs rebinding", () => {
     const tiles = [tile(1, false, "Ship|part|Cam"), tile(2, false, "Ship|part|Cam2")];
     const liveCameras = [cam(1), cam(2)];
@@ -508,5 +535,35 @@ describe("performance note persistence", () => {
   it("remembers dismissal", () => {
     savePerfNoteDismissed();
     expect(loadPerfNoteDismissed()).toBe(true);
+  });
+});
+
+describe("pruneCommandTiles", () => {
+  const commandCam = (flightId: number) => ({ flightId, kind: CameraKind.Command, cameraName: "Launchpad" });
+
+  it("drops a tile bound to a command camera and keeps the rest", () => {
+    const partTile = tile(1);
+    const tiles = [partTile, tile(null), tile(301)];
+    const result = pruneCommandTiles(tiles, [partCam(1), commandCam(301)]);
+    expect(result.map((t) => t.flightId)).toEqual([1, null]);
+    expect(result[0]).toBe(partTile);
+  });
+
+  it("returns the same array when no command tile is present", () => {
+    const tiles = [tile(1), tile(null)];
+    expect(pruneCommandTiles(tiles, [partCam(1), commandCam(301)])).toBe(tiles);
+  });
+});
+
+describe("isCameraShown", () => {
+  it("gates kerbal cams on merge and command cams on the Launchpad toggle", () => {
+    const on = { mergeCrew: true, showLaunchpad: true };
+    const off = { mergeCrew: false, showLaunchpad: false };
+    expect(isCameraShown({ kind: CameraKind.Kerbal }, on)).toBe(true);
+    expect(isCameraShown({ kind: CameraKind.Kerbal }, off)).toBe(false);
+    expect(isCameraShown({ kind: CameraKind.Command }, on)).toBe(true);
+    expect(isCameraShown({ kind: CameraKind.Command }, off)).toBe(false);
+    expect(isCameraShown({ kind: CameraKind.Part }, off)).toBe(true);
+    expect(isCameraShown({ kind: undefined }, off)).toBe(true);
   });
 });

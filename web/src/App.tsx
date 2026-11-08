@@ -1,4 +1,3 @@
-import { CameraKind } from "@ksp-gonogo/kerbcast";
 import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
 import { KerbcastProvider, useKerbcastCameras } from "@ksp-gonogo/kerbcast-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
@@ -20,6 +19,7 @@ import {
   loadClosedCrew,
   loadCrewBarPlacement,
   loadCrewMerge,
+  loadShowLaunchpad,
   loadCrewSpotlight,
   loadDebug,
   loadRecordFullResolution,
@@ -29,6 +29,7 @@ import {
   saveClosedCrew,
   saveCrewBarPlacement,
   saveCrewMerge,
+  saveShowLaunchpad,
   saveCrewSpotlight,
   saveDebug,
   saveRecordFullResolution,
@@ -37,7 +38,7 @@ import {
   saveTheme,
 } from "./settings";
 import type { CrewBarPlacement, ThemePreference } from "./settings";
-import { loadTiles, pruneCrewTiles, reconcileTiles, saveTiles, seedTiles } from "./tiles";
+import { isCameraShown, loadTiles, pruneCommandTiles, pruneCrewTiles, reconcileTiles, saveTiles, seedTiles } from "./tiles";
 import type { Tile as TileData } from "./tiles";
 
 interface AppProps {
@@ -144,6 +145,7 @@ export function App({ client }: AppProps): React.JSX.Element {
   // flow through the SAME grid/add-camera path as part cams, no crew bar.
   const [crewPlacement, setCrewPlacement] = useState<CrewBarPlacement>(() => loadCrewBarPlacement());
   const [crewMerge, setCrewMerge] = useState<boolean>(() => loadCrewMerge());
+  const [showLaunchpad, setShowLaunchpad] = useState<boolean>(() => loadShowLaunchpad());
   const [crewMinimised, setCrewMinimised] = useState(false);
   // Closed crew faces (persisted). Default (empty) = all open; a new kerbal is
   // open by default. Keyed on the name-stable wire-id, so closed-ness survives
@@ -206,6 +208,7 @@ export function App({ client }: AppProps): React.JSX.Element {
             recordFullResolution={recordFullResolution}
             crewPlacement={crewPlacement}
             crewMerge={crewMerge}
+            showLaunchpad={showLaunchpad}
             onThemeChange={(t: ThemePreference) => { saveTheme(t); applyTheme(t); setTheme(t); }}
             onDebugChange={(d: boolean) => { saveDebug(d); setDebug(d); }}
             onShowStaticChange={(s: boolean) => { saveShowStatic(s); setShowStaticExplicit(s); }}
@@ -213,6 +216,7 @@ export function App({ client }: AppProps): React.JSX.Element {
             onRecordFullResolutionChange={(v: boolean) => { saveRecordFullResolution(v); setRecordFullResolution(v); }}
             onCrewPlacementChange={(p: CrewBarPlacement) => { saveCrewBarPlacement(p); setCrewPlacement(p); }}
             onCrewMergeChange={(m: boolean) => { saveCrewMerge(m); setCrewMerge(m); }}
+            onShowLaunchpadChange={(v: boolean) => { saveShowLaunchpad(v); setShowLaunchpad(v); }}
             onClose={() => setSettingsOpen(false)}
           />
         )}
@@ -236,6 +240,7 @@ export function App({ client }: AppProps): React.JSX.Element {
               {/* CameraSeeder and CameraReconciler use useKerbcastCameras inside KerbcastProvider */}
               <CameraSeeder
                 mergeCrew={crewMerge}
+                showLaunchpad={showLaunchpad}
                 tilesSeeded={tilesSeeded}
                 onSeed={(seeded) => {
                   setTiles(seeded);
@@ -245,11 +250,13 @@ export function App({ client }: AppProps): React.JSX.Element {
               />
               <CameraReconciler
                 mergeCrew={crewMerge}
+                showLaunchpad={showLaunchpad}
                 tiles={tiles}
                 onReconcile={handleReconcile}
               />
               <Grid
                 mergeCrew={crewMerge}
+                showLaunchpad={showLaunchpad}
                 tiles={tiles}
                 onTilesChange={setTiles}
                 showDebugInfo={debug}
@@ -304,18 +311,19 @@ function UnloadGuard(): null {
 
 interface CameraSeederProps {
   mergeCrew: boolean;
+  showLaunchpad: boolean;
   tilesSeeded: boolean;
   onSeed: (tiles: TileData[]) => void;
 }
 
-function CameraSeeder({ mergeCrew, tilesSeeded, onSeed }: CameraSeederProps): null {
+function CameraSeeder({ mergeCrew, showLaunchpad, tilesSeeded, onSeed }: CameraSeederProps): null {
   // Merge OFF: every camera except kerbal face cams (those live in the crew
   // bar), so part and command cams seed the grid. Merge ON:
   // kerbal cams are seedable/addable grid tiles like part cams.
   const all = useKerbcastCameras();
   const cameras = useMemo(
-    () => (mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal)),
-    [all, mergeCrew],
+    () => all.filter((c) => isCameraShown(c, { mergeCrew, showLaunchpad })),
+    [all, mergeCrew, showLaunchpad],
   );
 
   useEffect(() => {
@@ -334,6 +342,7 @@ function CameraSeeder({ mergeCrew, tilesSeeded, onSeed }: CameraSeederProps): nu
 
 interface CameraReconcilerProps {
   mergeCrew: boolean;
+  showLaunchpad: boolean;
   tiles: TileData[];
   onReconcile: (tiles: TileData[]) => void;
 }
@@ -347,14 +356,14 @@ interface CameraReconcilerProps {
  * Tiles without a key (stored before this feature shipped) are left as
  * "reconnecting" until the user manually rebinds them.
  */
-function CameraReconciler({ mergeCrew, tiles, onReconcile }: CameraReconcilerProps): null {
+function CameraReconciler({ mergeCrew, showLaunchpad, tiles, onReconcile }: CameraReconcilerProps): null {
   // Merge OFF: non-kerbal cams only (never rebind a grid tile onto a kerbal). Merge
   // ON: kerbal cams reconcile like part cams. Memoised so a new filtered-array
   // identity doesn't re-run the effect every commit.
   const all = useKerbcastCameras();
   const cameras = useMemo(
-    () => (mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal)),
-    [all, mergeCrew],
+    () => all.filter((c) => isCameraShown(c, { mergeCrew, showLaunchpad })),
+    [all, mergeCrew, showLaunchpad],
   );
 
   useEffect(() => {
@@ -364,10 +373,12 @@ function CameraReconciler({ mergeCrew, tiles, onReconcile }: CameraReconcilerPro
     // Merge OFF: evict any kerbal tile stranded by a prior merge-ON session
     // (kerbals belong in the crew bar, not the grid) before reconciling. Needs
     // the unfiltered `all` to see kerbal ids. Merge ON: kerbals stay grid tiles.
-    const pruned = mergeCrew ? tiles : pruneCrewTiles(tiles, all);
+    const crewPruned = mergeCrew ? tiles : pruneCrewTiles(tiles, all);
+    // Launchpad hidden: its tile goes away (unmounting the feed unsubscribes it).
+    const pruned = showLaunchpad ? crewPruned : pruneCommandTiles(crewPruned, all);
     const reconciled = reconcileTiles(pruned, cameras);
     if (reconciled !== tiles) onReconcile(reconciled);
-  }, [all, cameras, tiles, mergeCrew, onReconcile]);
+  }, [all, cameras, tiles, mergeCrew, showLaunchpad, onReconcile]);
 
   return null;
 }

@@ -10,6 +10,7 @@ import {
   cameraKey,
   loadPerfNoteDismissed,
   PERF_NOTE_TILE_THRESHOLD,
+  isCameraShown,
   removeAllCameras,
   removeAllLostCameras,
   removeTile,
@@ -25,6 +26,8 @@ interface GridProps {
   /** When true, kerbal face cams are regular grid cameras (merged). When false
    *  they are filtered out (shown only in the crew bar). */
   mergeCrew: boolean;
+  /** When false, the command (Launchpad) camera is left out of every list. */
+  showLaunchpad?: boolean;
   tiles: TileData[];
   onTilesChange: (tiles: TileData[]) => void;
   showDebugInfo: boolean;
@@ -42,6 +45,7 @@ const GAP = 16; // 1rem; keep in sync with Root `gap`
 
 export function Grid({
   mergeCrew,
+  showLaunchpad = true,
   tiles,
   onTilesChange,
   showDebugInfo,
@@ -56,7 +60,10 @@ export function Grid({
   // are regular grid cameras, indistinguishable from part cams. Every other kind
   // (part, command) is a grid camera either way.
   const all = useKerbcastCameras();
-  const cameras = mergeCrew ? all : all.filter((c) => c.kind !== CameraKind.Kerbal);
+  const cameras = useMemo(
+    () => all.filter((c) => isCameraShown(c, { mergeCrew, showLaunchpad })),
+    [all, mergeCrew, showLaunchpad],
+  );
   const [showPerfNote, setShowPerfNote] = useState(false);
 
   const commit = (next: TileData[]) => {
@@ -199,6 +206,7 @@ export function Grid({
           variant={spotlightActive ? "cell" : "grid"}
           spotlightActive={spotlightActive}
           mergeCrew={mergeCrew}
+          showLaunchpad={showLaunchpad}
           showDebugInfo={showDebugInfo}
           showStatic={showStatic}
           recordFullResolution={recordFullResolution}

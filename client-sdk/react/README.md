@@ -52,7 +52,10 @@ Commonly used props (`CameraFeedProps` has the full set with doc
 comments):
 
 - `flightId: number | null`. The camera to show. `null` latches the
-  first live camera and re-picks if it dies.
+  first live camera and re-picks if it dies. A shown camera that drops
+  out of the camera list stays on screen for `KERBCAST_RELEASE_GRACE_MS`
+  before the feed falls back. A recording of it still ends at once
+  (`camera-gone`)
 - `onSelectCamera` / `onDisplayedCameraChange`. The user picked a
   camera, or the resolved camera changed (including auto-latch).
 - `enableFullscreen`, `enablePictureInPicture`, `enableQualityControl`.
@@ -82,6 +85,18 @@ cannot loop with the request. A resize within about a second of the stream
 changing that matches its new shape counts as following it. Layout changes
 outside that window always report.
 
+The feed frame (the element fullscreen targets) carries two attributes for
+hosts and tests:
+
+- `data-kc-signal`: `live`, `stalled` (no frame has left the decoder for
+  half a second, or none yet since the source attached) or `none` (no
+  source). It is measured after any encoded transform the host installs, so
+  a transform that holds frames back shows as `stalled` while it holds them.
+  The video keeps presenting frames while it shows static, so its frame
+  counts cannot tell a picture from static, and inbound-rtp `framesDecoded`
+  averaged over seconds misses gaps this short; this attribute can
+- `data-fullscreen`: present while the feed is fullscreen
+
 An imperative `CameraFeedHandle` (via `ref`) exposes `stepCamera`,
 `setPanAxis`, `setZoomRate`, `nudgePan`, and `nudgeZoom` for wiring feeds
 to a gamepad or keyboard.
@@ -91,6 +106,65 @@ target) on pan+zoom cameras, and `CameraFeed` disables its manual pan/zoom
 while a camera is tracking. `cameraFilter` narrows the selectable cameras
 (picker, stepper, auto-latch). `showActions={false}` hides the whole action
 bar without affecting resolution reporting.
+
+## Anchored markers
+
+`anchors` marks things in the game on the feed's picture (see the core
+SDK's "Anchored markers" for the kinds and fields). The feed sets them on
+the camera it shows, clears them when it moves on or unmounts, and draws a
+marker where each one lands in every displayed frame: four corner marks
+sized from `apparentRadiusPx` (never below 14 px), green when clear, red and
+dashed when occluded.
+
+`anchorOverlay` has the same shape as `targetBracketOverlay`: `corners`
+restyles the four marks (`top`, `right`, `bottom`, `left`, each
+`{ colour, dashed, hidden, shape }`), `render` adds SVG in screen pixels,
+`readout` puts text under the marker, and `shape` sets every mark to
+`"corners"` or `"triangles"`. Each is called per anchor with the raw result
+and a context: its screen geometry, the fitted content rect, the displayed
+frame's UT and the screen position of every drawn anchor. `owners` also
+draws anchors set in game by those owners. What a colour means is yours to
+decide; Kerbcast only reports geometry.
+
+A direction reticle on a docking port: four triangles, each side coloured
+from the port's axes.
+
+```tsx
+const anchors = useMemo(
+  () => [{ id: "port", kind: AnchorKind.Part, vessel: targetPid, part: portPid, orientation: true }],
+  [targetPid, portPid],
+);
+
+<CameraFeed
+  flightId={dockingCam}
+  anchors={anchors}
+  anchorOverlay={{
+    shape: "triangles",
+    corners: (a) => {
+      /* The port faces the lens along -z; tilt shows in its forward's x and y. */
+      const [fx = 0, fy = 0] = a.forward ?? [];
+      const side = (off: number) => ({ colour: Math.abs(off) < 0.02 ? "lime" : "orange" });
+      return { top: side(fy), bottom: side(fy), left: side(fx), right: side(fx) };
+    },
+    readout: (a) => (a.distanceM != null ? `${a.distanceM.toFixed(1)} m` : null),
+  }}
+/>
+```
+
+For a video of your own, `AnchorMarkers` draws a frame's anchors over any
+`<video>` and `useDisplayedFrame(enabled, flightId, video)` gives the
+displayed frame with its results.
+
+On command feeds the target brackets follow the subject's anchor while it
+is visible and no command lock is held, so the box stays on the craft where
+the picture shows it even while an aim points elsewhere. With the craft out
+of frame or occluded, or under the lock, the box is the 1.11 one: centred on
+the aim, sized from the aimed range, red and dashed when the aim line is
+occluded. `targetBracketOverlay` is unchanged; its context gains `subject`,
+the observed anchor, so you can draw it as a second mark.
+
+An observed anchor out of view (see the core SDK) carries no position and
+draws no marker; it is still in `ctx.frame.anchors`.
 
 ## `KerbalFaceFeed`
 
@@ -107,13 +181,22 @@ quality follows how large it is shown (pass `reportSize={false}` to opt out).
   feed primitives use it internally; multiple views of one camera from a
   client collapse to a single MAX report. Pass `aspect` for the shape to ask
   for (default 16:9), and `videoRef` / `streamSize` so a resize that follows
-  the stream is not reported.
+  the stream is not reported. A request is never under `MIN_DISPLAY_REPORT_PX`
+  (128) on either axis: a smaller box asks for that much at the camera's
+  shape. An empty box (a hidden or not yet laid out tile) reports nothing.
+  When the last feed of a camera empties, the client tells the sidecar it no
+  longer needs a size, so the camera stops rendering for a box nobody sees.
 
 - `useKerbcastCameras(): CameraState[]`. The live camera registry,
   re-rendering as cameras appear, change, or are destroyed.
 - `useKerbcastStream(flightId): MediaStream | null`. The video stream
   for one camera, acquiring and releasing its subscription slot. This is
-  what `CameraFeed` uses internally.
+  what `CameraFeed` uses internally. A released slot is kept for
+  `KERBCAST_RELEASE_GRACE_MS` (2000 ms), so a feed that remounts inside
+  that window picks up the running stream instead of starting it again.
+  It is let go at once when a feed switches to another camera, or when a
+  feed is waiting for a slot. Pass `releaseGraceMs` to `KerbcastProvider`
+  (or to `createClientSubscriptions`) for a different grace, or 0 for none
 - `useKerbcastInFlight(): boolean | undefined`. Whether KSP is in a
   flight scene. `undefined` until the first signal arrives, so you can
   avoid flashing an out-of-flight state on connect.

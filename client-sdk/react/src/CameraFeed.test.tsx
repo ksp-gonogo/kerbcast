@@ -23,6 +23,7 @@
  */
 
 import {
+  AnchorKind,
   CameraKind,
   CommandTargetEligibility,
   KerbcastClient,
@@ -30,10 +31,12 @@ import {
   TrackMode,
 } from "@ksp-gonogo/kerbcast";
 import type {
+  Anchor,
   CameraLifecycle,
   ClientMessage,
   CommandCentreInfo,
   CommandTrackState,
+  DisplayedFrameUt,
 } from "@ksp-gonogo/kerbcast";
 import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
@@ -44,7 +47,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { createRef, useEffect } from "react";
+import { StrictMode, createRef, useEffect } from "react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -54,7 +57,7 @@ import {
   type CameraStreamHook,
   type FeedAction,
 } from "./CameraFeed";
-import { KerbcastProvider } from "./context";
+import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider } from "./context";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 
 /*
@@ -570,16 +573,24 @@ describe("CameraFeed - camera selection", () => {
   it("falls back to the first camera when the configured one disappears", async () => {
     const { client, sidecar } = await buildConnectedSource(THREE_CAMERAS);
 
-    renderFeed(client, { flightId: 44 });
-    expect(screen.getByRole("heading", { name: "Tail Cam" })).toBeTruthy();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      renderFeed(client, { flightId: 44 });
+      expect(screen.getByRole("heading", { name: "Tail Cam" })).toBeTruthy();
 
-    await act(async () => {
-      sidecar.setCameras([
-        toInit(makeCamera({ flightId: 42, cameraName: "Starboard Cam" })),
-      ]);
-    });
+      await act(async () => {
+        sidecar.setCameras([
+          toInit(makeCamera({ flightId: 42, cameraName: "Starboard Cam" })),
+        ]);
+      });
+      act(() => {
+        vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
+      });
 
-    expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("step buttons are disabled when only one camera is available", async () => {
@@ -990,6 +1001,189 @@ describe("CameraFeed - stall presentation (showStatic)", () => {
       // but the chrome stays clean.
       expect(client.camera(42).stalled).toBe(true);
       expect(screen.queryByRole("status", { name: /feed stale/i })).toBeNull();
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("data-kc-signal follows a feed into and out of a stall without remounting its video", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      const { container } = renderFeed(client, { flightId: 42 });
+      const signal = () => container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+      expect(signal()).toBe("none");
+
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+      const video = container.querySelector("video");
+
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+      expect(container.querySelector("video")).toBe(video);
+
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+      expect(container.querySelector("video")).toBe(video);
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("data-kc-signal reads none while an auto-reconnect rebuilds the peer, then stalled, then live", async () => {
+    const env = installStallEnv();
+    try {
+      const sidecar = new MockSidecar();
+      sidecar.addCamera(toInit(makeCamera({ flightId: 42, cameraName: "Starboard Cam" })));
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), autoReconnect: { initialDelayMs: 1 } },
+        sidecar.createTransport(),
+      );
+      createdClients.push(client);
+      await act(async () => {
+        await client.connect([], { slots: 4 });
+      });
+      await act(async () => {
+        sidecar.open();
+        sidecar.setConnectionState("connected");
+      });
+      const { container } = renderFeed(client, { flightId: 42 });
+      const signal = () => container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+
+      const reconnected = new Promise<void>((resolve) => {
+        const off = client.on("reconnect-attempt", () => {
+          off();
+          resolve();
+        });
+      });
+      await act(async () => {
+        sidecar.setConnectionState("failed");
+      });
+      expect(signal()).toBe("none");
+      await act(async () => {
+        await reconnected;
+      });
+      expect(signal()).toBe("none");
+
+      /* The mock outlives the peer, so the re-subscribe binds a slot of its own. */
+      let reboundMid: string | undefined;
+      sidecar.onSubscribe((flightId, mid) => {
+        if (flightId === 42) reboundMid = mid;
+      });
+      await act(async () => {
+        sidecar.open();
+        sidecar.setConnectionState("connected");
+      });
+      expect(signal()).toBe("none");
+      await act(async () => {
+        sidecar.deliverTrack(reboundMid as string, {} as MediaStreamTrack);
+      });
+      env.setNow(2000);
+      await act(async () => {
+        env.drawOnce();
+      });
+      /* A fresh source with no frame yet never reads live. */
+      expect(signal()).toBe("stalled");
+      env.setNow(2601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("data-kc-signal reads stalled for a source that never delivers a frame", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource();
+      const { container } = renderFeed(client, { flightId: 42 });
+      const signal = () => container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+
+      env.setNow(1000);
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+        env.drawOnce();
+      });
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("data-kc-signal reads stalled after a camera switch until the new camera's first frame", async () => {
+    const env = installStallEnv();
+    try {
+      const { client, sidecar } = await buildConnectedSource([
+        makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+        makeCamera({ flightId: 43, cameraName: "Port Cam" }),
+      ]);
+      const view = renderFeed(client, { flightId: 42 });
+      const signal = () => view.container.querySelector("[data-kc-signal]")?.getAttribute("data-kc-signal");
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(42) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1000);
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
+
+      /* The old camera keeps its slot through the release grace, so the new
+         one binds a slot of its own: a source at once but no frame of it yet. */
+      view.rerender(
+        <KerbcastProvider client={client}>
+          <CameraFeed flightId={43} />
+        </KerbcastProvider>,
+      );
+      await act(async () => {
+        sidecar.deliverTrack(sidecar.slotMidFor(43) as string, {} as MediaStreamTrack);
+      });
+      env.setNow(1601);
+      await act(async () => {
+        env.drawOnce();
+      });
+      expect(signal()).toBe("stalled");
+
+      await act(async () => {
+        env.fireFrame();
+        env.drawOnce();
+      });
+      expect(signal()).toBe("live");
     } finally {
       env.restore();
     }
@@ -1733,7 +1927,8 @@ describe("CameraFeed - render size in a narrow, tall tile", () => {
     const { client, sidecar } = await connect();
     renderFeed(client, { flightId: 42 });
     await run(500);
-    expect(sizeReports(sidecar)).toEqual([{ flightId: 42, width: 176, height: 100 }]);
+    /* 176x99 at 16:9, raised so the height meets the floor. */
+    expect(sizeReports(sidecar)).toEqual([{ flightId: 42, width: 240, height: 136 }]);
   });
 
   it("sends no request when the stream comes back smaller, larger or another shape", async () => {
@@ -2747,9 +2942,54 @@ describe("CameraFeed - recording locks source and close", () => {
 // Command camera target brackets
 // ---------------------------------------------------------------------------
 
+
+describe("CameraFeed: no video slot", () => {
+  const NOTICE = /Not streaming: too many feeds are open/;
+  const ids = [1, 2, 3, 4, 5];
+  const feeds = (client: KerbcastClient, shown: number[], label?: string | null) => (
+    <KerbcastProvider client={client}>
+      {shown.map((id) => (
+        <CameraFeed
+          key={id}
+          flightId={id}
+          {...(label !== undefined ? { noSlotLabel: label } : {})}
+        />
+      ))}
+    </KerbcastProvider>
+  );
+
+  it("says so on the feed that found every slot taken, until another feed closes", async () => {
+    const { client } = await buildConnectedSource(
+      ids.map((id) => makeCamera({ flightId: id, cameraName: `Cam ${id}` })),
+    );
+    const view = render(feeds(client, ids));
+    await act(async () => {});
+    expect(screen.getAllByText(NOTICE)).toHaveLength(1);
+    expect(client.camera(5).waitingForSlot).toBe(true);
+
+    view.rerender(feeds(client, [2, 3, 4, 5]));
+    await act(async () => {});
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    expect(client.camera(5).waitingForSlot).toBe(false);
+  });
+
+  it("takes a host's own words, or none", async () => {
+    const { client } = await buildConnectedSource(
+      ids.map((id) => makeCamera({ flightId: id, cameraName: `Cam ${id}` })),
+    );
+    const view = render(feeds(client, ids, "No room"));
+    await act(async () => {});
+    expect(screen.getByText("No room")).toBeTruthy();
+    view.rerender(feeds(client, ids, null));
+    expect(screen.queryByText("No room")).toBeNull();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+  });
+});
+
 describe("CameraFeed - command camera target brackets", () => {
   const STATION: CommandCentreInfo = {
     stationId: "ground:KSC",
+    siteKey: "KSC",
     nodeName: "KSC",
     displayName: "Kerbal Space Center",
     body: "Kerbin",
@@ -2809,7 +3049,7 @@ describe("CameraFeed - command camera target brackets", () => {
     const first = renderFeed(client, { flightId: 301 });
     fireEvent.click(screen.getByRole("button", { name: "Target brackets" }));
     expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
-    expect(localStorage.getItem("kerbcast:target-brackets:ground:KSC")).toBe("0");
+    expect(localStorage.getItem("kerbcast:target-brackets:KSC")).toBe("0");
     first.unmount();
 
     renderFeed(client, { flightId: 301 });
@@ -2819,22 +3059,87 @@ describe("CameraFeed - command camera target brackets", () => {
     ).toBe("false");
   });
 
-  it("still labels a blanked feed with the brackets toggled off", async () => {
+  it("carries a brackets-off choice saved under the 1.11 key over to the site key", async () => {
     localStorage.setItem("kerbcast:target-brackets:ground:KSC", "0");
+    const { client } = await buildConnectedSource([commandCamera()]);
+    renderFeed(client, { flightId: 301 });
+    expect(
+      screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(localStorage.getItem("kerbcast:target-brackets:KSC")).toBe("0");
+    expect(localStorage.getItem("kerbcast:target-brackets:ground:KSC")).toBeNull();
+  });
+
+  it("still labels a blanked feed with the brackets toggled off", async () => {
+    localStorage.setItem("kerbcast:target-brackets:KSC", "0");
     const { client, sidecar } = await buildConnectedSource([commandCamera()]);
     renderFeed(client, { flightId: 301 });
     expect(screen.queryByRole("status", { name: "Feed blanked" })).toBeNull();
     await act(async () => {
-      sidecar.updateCamera(301, { commandTrack: commandTrack({ blank: "Waiting for gonogo" }) });
+      sidecar.updateCamera(301, { commandTrack: commandTrack({ blank: "Waiting for mission control" }) });
     });
     expect(screen.getByRole("status", { name: "Feed blanked" }).textContent).toBe(
-      "Waiting for gonogo",
+      "Waiting for mission control",
     );
+  });
+
+  describe("waiting for a target", () => {
+    const waitingFrame = (waitingForTarget: boolean): DisplayedFrameUt => ({
+      flightId: 301,
+      ut: 1000,
+      epoch: 0,
+      source: "exact",
+      rtpTimestamp: 1,
+      presentedAt: 0,
+      command: {
+        hasFix: false,
+        frameHeightPx: 576,
+        framingFits: true,
+        occluded: false,
+        occluder: "",
+        sunlit: false,
+        subjectPersistentId: 0,
+        waitingForTarget,
+      },
+    });
+    const feed = (client: KerbcastClient, frame: DisplayedFrameUt, label?: string | null) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed
+          flightId={301}
+          displayFrame={frame}
+          {...(label !== undefined ? { waitingForTargetLabel: label } : {})}
+        />
+      </KerbcastProvider>
+    );
+
+    it("says so while the frame does, and stops once the target arrives", async () => {
+      const { client } = await buildConnectedSource([commandCamera()]);
+      const view = render(feed(client, waitingFrame(true)));
+      expect(screen.getByText("Waiting for target")).toBeTruthy();
+      view.rerender(feed(client, waitingFrame(false)));
+      expect(screen.queryByText("Waiting for target")).toBeNull();
+    });
+
+    it("takes a host's own words, or none", async () => {
+      const { client } = await buildConnectedSource([commandCamera()]);
+      const view = render(feed(client, waitingFrame(true), "Acquiring"));
+      expect(screen.getByText("Acquiring")).toBeTruthy();
+      view.rerender(feed(client, waitingFrame(true), null));
+      expect(screen.queryByText("Acquiring")).toBeNull();
+      expect(screen.queryByText("Waiting for target")).toBeNull();
+    });
+
+    it("gives way to a blank", async () => {
+      const { client } = await buildConnectedSource([commandCamera()]);
+      const frame = waitingFrame(true);
+      render(feed(client, { ...frame, command: { ...frame.command!, blank: "Held" } }));
+      expect(screen.getByRole("status", { name: "Feed blanked" })).toBeTruthy();
+      expect(screen.queryByText("Waiting for target")).toBeNull();
+    });
   });
 
   it("shows the transition in force at the displayed UT", async () => {
     const track = commandTrack({
-      authority: { owner: "gonogo" },
       events: [
         { ut: 990, occluded: true, occluder: "Mun", sunlit: true },
         { ut: 999, occluded: false, occluder: "", sunlit: true },
@@ -2871,6 +3176,179 @@ describe("CameraFeed - command camera target brackets", () => {
     expect(container.querySelector('path[data-corner="bottomRight"]')).toBeNull();
     expect(container.querySelector('path[data-corner="topLeft"]')).not.toBeNull();
     expect(screen.getByText(/ · T\+1060$/)).toBeTruthy();
+  });
+
+  it("gives the brackets the subject's anchor from the displayed frame's stamp", async () => {
+    const { client, sidecar } = await buildConnectedSource([commandCamera()]);
+    const subjects: (string | undefined)[] = [];
+    renderFeed(client, {
+      flightId: 301,
+      targetBracketOverlay: {
+        render: (ctx) => {
+          subjects.push(ctx.subject ? `${ctx.subject.owner}/${ctx.subject.id}` : undefined);
+          return null;
+        },
+      },
+    });
+    await act(async () => {
+      sidecar.fireFrameStamp({
+        flightId: 301,
+        rtpTimestamp: 1,
+        captureUt: 1000,
+        captureEpoch: 0,
+        width: 1024,
+        height: 576,
+        anchors: [
+          {
+            id: "subject",
+            owner: "kerbcast",
+            x: 100,
+            y: 100,
+            inFrame: true,
+            behind: false,
+            distanceM: 11_507_905,
+            apparentRadiusPx: 4,
+            angleOffAxis: 3,
+            occluded: false,
+          },
+        ],
+      });
+    });
+    /* Without frame callbacks (jsdom) a stamp is taken as on screen once it is old enough. */
+    await waitFor(() => expect(subjects).toContain("kerbcast/subject"), { timeout: 2000 });
+  });
+
+  describe("under a host's own delay", () => {
+    const anchorAt = (id: string, x: number, owner?: string) => ({
+      id,
+      ...(owner ? { owner } : {}),
+      x,
+      y: 100,
+      inFrame: true,
+      behind: false,
+      distanceM: 1000,
+      apparentRadiusPx: 4,
+      angleOffAxis: 3,
+      occluded: false,
+    });
+    const frameState = (rangeM: number, bracketHalfPx: number) => ({
+      hasFix: true,
+      rangeM,
+      bracketHalfPx,
+      frameHeightPx: 576,
+      framingFits: true,
+      occluded: false,
+      occluder: "",
+      sunlit: true,
+      subjectPersistentId: 11,
+    });
+
+    /*
+     * The picture shows UT 995, the frame stamped at 990. The game has moved
+     * on: the newest stamp (1000) and the snapshot each give another range,
+     * bracket and subject position.
+     */
+    async function delayedSource() {
+      const source = await buildConnectedSource([commandCamera()]);
+      await act(async () => {
+        source.sidecar.fireFrameStamp({
+          flightId: 301,
+          rtpTimestamp: 1,
+          captureUt: 990,
+          captureEpoch: 0,
+          width: 1024,
+          height: 576,
+          command: frameState(2_000_000, 40),
+          anchors: [anchorAt("subject", 100, "kerbcast"), anchorAt("pad", 111)],
+        });
+        source.sidecar.fireFrameStamp({
+          flightId: 301,
+          rtpTimestamp: 2,
+          captureUt: 1000,
+          captureEpoch: 0,
+          width: 1024,
+          height: 576,
+          command: frameState(8_000_000, 4),
+          anchors: [anchorAt("subject", 500, "kerbcast"), anchorAt("pad", 555)],
+        });
+      });
+      return source;
+    }
+
+    function DelayedFeed({ client, displayUt, seen }: { client: KerbcastClient; displayUt: number; seen: Map<string, unknown> }) {
+      return (
+        <KerbcastProvider client={client}>
+          <CameraFeed
+            flightId={301}
+            displayUt={displayUt}
+            anchors={[{ id: "pad", kind: AnchorKind.Vessel, vessel: 11 }]}
+            anchorOverlay={{
+              render: (a) => {
+                seen.set(`anchor:${a.id}`, a.x);
+                return null;
+              },
+            }}
+            targetBracketOverlay={{
+              render: (ctx) => {
+                seen.set("bracketHalfPx", ctx.state.bracketHalfPx);
+                seen.set("subjectX", ctx.subject?.x);
+                return null;
+              },
+            }}
+          />
+        </KerbcastProvider>
+      );
+    }
+
+    it("draws the brackets, readout and markers of the frame at the displayed UT", async () => {
+      /* Markers need a laid-out box, which jsdom never gives. */
+      const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1024);
+      const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(576);
+      try {
+        const { client } = await delayedSource();
+        const seen = new Map<string, unknown>();
+        render(<DelayedFeed client={client} displayUt={995} seen={seen} />);
+        expect(screen.getByText("IN VIEW · 2,000 km")).toBeTruthy();
+        expect(seen.get("bracketHalfPx")).toBe(40);
+        expect(seen.get("subjectX")).toBe(100);
+        expect(seen.get("anchor:pad")).toBe(111);
+      } finally {
+        width.mockRestore();
+        height.mockRestore();
+      }
+    });
+
+    it("keeps the subject box on a host's displayFrame rather than the newest stamp", async () => {
+      const { client } = await delayedSource();
+      const shown = client.frameAt(301, 995)!;
+      const subjects: (number | undefined)[] = [];
+      render(
+        <KerbcastProvider client={client}>
+          <CameraFeed
+            flightId={301}
+            displayFrame={shown}
+            targetBracketOverlay={{
+              render: (ctx) => {
+                subjects.push(ctx.subject?.x);
+                return null;
+              },
+            }}
+          />
+        </KerbcastProvider>,
+      );
+      /* Long enough for the newest stamp to count as on screen, had the video been watched. */
+      await act(() => new Promise((r) => setTimeout(r, 400)));
+      expect(subjects.length).toBeGreaterThan(0);
+      expect(new Set(subjects)).toEqual(new Set([100]));
+    });
+
+    it("behaves as without a frame before any frame that old is known", async () => {
+      const { client } = await delayedSource();
+      const seen = new Map<string, unknown>();
+      render(<DelayedFeed client={client} displayUt={985} seen={seen} />);
+      expect(screen.getByText("IN VIEW · 11,508 km")).toBeTruthy();
+      expect(seen.get("bracketHalfPx")).toBe(4);
+    });
   });
 
   describe("target picker", () => {
@@ -2993,7 +3471,7 @@ describe("CameraFeed - command camera target brackets", () => {
           kind: CameraKind.Command,
           cameraName: "KSC tracking",
           commandCentre: TARGETS,
-          commandTrack: commandTrack({ authority: { owner: "gonogo" } }),
+          commandTrack: commandTrack({ authority: { owner: "mission-control" } }),
         }),
       ]);
       const lockedView = renderFeed(locked.client, { flightId: 301 });
@@ -3011,5 +3489,753 @@ describe("CameraFeed - command camera target brackets", () => {
     renderFeed(client, { flightId: 301, enableTargetBrackets: false });
     expect(screen.queryByText("IN VIEW · 11,508 km")).toBeNull();
     expect(screen.queryByRole("button", { name: "Target brackets" })).toBeNull();
+  });
+});
+
+describe("CameraFeed - anchors", () => {
+  const port = { id: "port", kind: AnchorKind.Part, vessel: 11, part: 22, orientation: true };
+
+  function Feed({ client, flightId, anchors }: { client: KerbcastClient; flightId: number; anchors?: Anchor[] }) {
+    return (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={flightId} anchors={anchors} />
+      </KerbcastProvider>
+    );
+  }
+
+  it("sets its anchors on the displayed camera and clears them when it moves or unmounts", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+      makeCamera({ flightId: 43, cameraName: "Port Cam" }),
+    ]);
+    const view = render(<Feed client={client} flightId={42} anchors={[port]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port]));
+
+    /* A new array with the same anchors is no change. */
+    const sent = () => sidecar.commands.filter((c) => c.type === "set-anchors").length;
+    const before = sent();
+    view.rerender(<Feed client={client} flightId={42} anchors={[{ ...port }]} />);
+    expect(sent()).toBe(before);
+
+    view.rerender(<Feed client={client} flightId={43} anchors={[port]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(43)).toEqual([port]));
+    expect(sidecar.anchorsFor(42)).toEqual([]);
+
+    view.unmount();
+    await waitFor(() => expect(sidecar.anchorsFor(43)).toEqual([]));
+  });
+
+  it("gives two feeds on one camera both their anchors, until each unmounts", async () => {
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+    ]);
+    const dock = { id: "dock", kind: AnchorKind.Vessel, vessel: 12 };
+    const first = render(<Feed client={client} flightId={42} anchors={[port]} />);
+    const second = render(<Feed client={client} flightId={42} anchors={[port, dock]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port, dock]));
+
+    first.unmount();
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port, dock]));
+    second.rerender(<Feed client={client} flightId={42} anchors={[dock]} />);
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([dock]));
+    second.unmount();
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([]));
+  });
+
+  it("warns when two feeds on one camera use one anchor id for different things", async () => {
+    const { client, sidecar } = await buildConnectedSource([makeCamera({ flightId: 42 })]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const other = { ...port, part: 23 };
+    render(<Feed client={client} flightId={42} anchors={[port]} />);
+    render(<Feed client={client} flightId={42} anchors={[port]} />);
+    expect(warn).not.toHaveBeenCalled();
+    render(<Feed client={client} flightId={42} anchors={[other]} />);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("id port"));
+    await waitFor(() => expect(sidecar.anchorsFor(42)).toEqual([port]));
+    warn.mockRestore();
+  });
+});
+
+describe("CameraFeed - fullscreen exit without a mouse", () => {
+  type FsDoc = Document & {
+    fullscreenEnabled?: boolean;
+    fullscreenElement?: Element | null;
+    exitFullscreen?: () => Promise<void>;
+  };
+  const fsDoc = document as FsDoc;
+  let fsElement: Element | null = null;
+  const exitSpy = vi.fn(async () => {
+    fsElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+  });
+
+  beforeEach(() => {
+    fsElement = null;
+    exitSpy.mockClear();
+    Object.defineProperty(fsDoc, "fullscreenEnabled", { value: true, configurable: true });
+    Object.defineProperty(fsDoc, "fullscreenElement", {
+      get: () => fsElement,
+      configurable: true,
+    });
+    Object.defineProperty(fsDoc, "exitFullscreen", { value: exitSpy, configurable: true });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      value: async function (this: HTMLElement) {
+        fsElement = this;
+        document.dispatchEvent(new Event("fullscreenchange"));
+      },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    delete (fsDoc as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+    delete (fsDoc as { fullscreenElement?: Element | null }).fullscreenElement;
+    delete (fsDoc as { exitFullscreen?: unknown }).exitFullscreen;
+    delete (HTMLElement.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+    delete (document as { pictureInPictureEnabled?: boolean }).pictureInPictureEnabled;
+  });
+
+  async function enterFullscreen() {
+    const pipDoc = document as Document & { pictureInPictureEnabled?: boolean };
+    Object.defineProperty(pipDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+    const { client } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        cameraName: "Launchpad Cam",
+        supportsPan: true,
+        supportsZoom: true,
+        panPitchMin: -90,
+        panPitchMax: 90,
+      }),
+    ]);
+    /* Crowded enough (REC + tracking + PiP + fullscreen) that fullscreen
+       starts out in the ⋮ overflow. */
+    const utils = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      enableTracking: true,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+    });
+    fireEvent.click(utils.getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(utils.getByLabelText("Enter fullscreen"));
+    });
+    return utils;
+  }
+
+  it("keeps the exit inline and marked as the always-visible control", async () => {
+    const { getByLabelText } = await enterFullscreen();
+    const exit = getByLabelText("Exit fullscreen");
+    expect(exit.hasAttribute("data-kc-fullscreen-exit")).toBe(true);
+    expect(exit.closest("[role=menu]")).toBeNull();
+    expect(exit.closest("[data-fullscreen]")).toBe(fsElement);
+    expect(exit.tabIndex).toBe(0);
+    /* The ⋮ menu hands focus back to its trigger, which reveals the whole
+       bar by focus-within; at rest only the exit shows. */
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(getComputedStyle(exit).opacity).not.toBe("0");
+    expect(getComputedStyle(exit).pointerEvents).not.toBe("none");
+    expect(getComputedStyle(getByLabelText("Auto-track")).opacity).toBe("0");
+
+    await act(async () => {
+      fireEvent.click(exit);
+    });
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(document.querySelector("[data-kc-fullscreen-exit]")).toBeNull();
+    expect(document.querySelector("[data-fullscreen]")).toBeNull();
+  });
+
+  it("entering fullscreen adds the exit without moving the rest of the bar", async () => {
+    const barLabels = () => {
+      const row = screen.getByLabelText("More actions").parentElement as HTMLElement;
+      return Array.from(row.children).map((c) => c.getAttribute("aria-label") ?? "steps");
+    };
+    const pipDoc = document as Document & { pictureInPictureEnabled?: boolean };
+    Object.defineProperty(pipDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+    const { client } = await buildConnectedSource([
+      makeCamera({
+        flightId: 42,
+        cameraName: "Launchpad Cam",
+        supportsPan: true,
+        supportsZoom: true,
+        panPitchMin: -90,
+        panPitchMax: 90,
+      }),
+    ]);
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      enableTracking: true,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      trailingActions: [{ id: "x", label: "Close", icon: null, onClick: () => {} }],
+    });
+    const before = barLabels();
+    expect(before).toContain("More actions");
+    expect(before).not.toContain("Picture in picture");
+
+    fireEvent.click(getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Enter fullscreen"));
+    });
+    const after = barLabels();
+    expect(after.filter((l) => l !== "Exit fullscreen")).toEqual(before);
+    expect(after.indexOf("Exit fullscreen")).toBe(after.indexOf("More actions") - 1);
+  });
+
+  it("leaves an Escape another handler already consumed alone", async () => {
+    await enterFullscreen();
+    const consumed = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    consumed.preventDefault();
+    await act(async () => {
+      document.dispatchEvent(consumed);
+    });
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it("a tap on the video reveals the rest of the bar", async () => {
+    const { getByLabelText } = await enterFullscreen();
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(getComputedStyle(getByLabelText("Auto-track")).opacity).toBe("0");
+    const video = document.querySelector("video") as HTMLVideoElement;
+    fireEvent.click(video);
+    expect(getComputedStyle(getByLabelText("Auto-track")).opacity).not.toBe("0");
+  });
+
+  it("Escape leaves fullscreen", async () => {
+    const { queryByLabelText } = await enterFullscreen();
+    await act(async () => {
+      fireEvent.keyDown(document, { key: "Escape" });
+    });
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(queryByLabelText("Exit fullscreen")).toBeNull();
+  });
+});
+
+describe("CameraFeed - video source on camera switch", () => {
+  const TWO_CAMERAS = [
+    makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+    makeCamera({ flightId: 43, cameraName: "Nose Cam" }),
+  ];
+
+  it("clears the previous frame when the new camera has no stream yet", async () => {
+    const { client } = await buildConnectedSource(TWO_CAMERAS);
+    const sentinel = {} as MediaStream;
+    const useCustom: CameraStreamHook = (id) => (id === 42 ? sentinel : null);
+    const view = (flightId: number) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={flightId} useStream={useCustom} />
+      </KerbcastProvider>
+    );
+    const { rerender } = render(view(42));
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.srcObject).toBe(sentinel);
+
+    rerender(view(43));
+    expect(document.querySelector("video")).toBe(video);
+    expect(video.srcObject).toBeNull();
+  });
+
+  it("keeps the element bound when a rebind wraps the same track in a new stream", async () => {
+    const { client } = await buildConnectedSource(TWO_CAMERAS);
+    const track = { id: "track-1", kind: "video" } as MediaStreamTrack;
+    const wrap = () =>
+      ({ getVideoTracks: () => [track] }) as unknown as MediaStream;
+    const first = wrap();
+    const second = wrap();
+    const view = (stream: MediaStream) => {
+      const useFixed: CameraStreamHook = () => stream;
+      return (
+        <KerbcastProvider client={client}>
+          <CameraFeed flightId={42} useStream={useFixed} />
+        </KerbcastProvider>
+      );
+    };
+    const { rerender } = render(view(first));
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.srcObject).toBe(first);
+
+    rerender(view(second));
+    expect(video.srcObject).toBe(first);
+
+    const other = { getVideoTracks: () => [{ id: "track-2" }] } as unknown as MediaStream;
+    rerender(view(other));
+    expect(video.srcObject).toBe(other);
+  });
+
+  it("never reassigns a live stream on a re-render", async () => {
+    const { client } = await buildConnectedSource(TWO_CAMERAS);
+    const sentinel = {} as MediaStream;
+    const useCustom: CameraStreamHook = () => sentinel;
+    const view = (debug: boolean) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={42} useStream={useCustom} showDebugInfo={debug} />
+      </KerbcastProvider>
+    );
+    const { rerender } = render(view(false));
+    const video = document.querySelector("video") as HTMLVideoElement;
+    expect(video.srcObject).toBe(sentinel);
+
+    let current: MediaProvider | null = sentinel;
+    const sets: (MediaProvider | null)[] = [];
+    Object.defineProperty(video, "srcObject", {
+      get: () => current,
+      set: (v: MediaProvider | null) => {
+        sets.push(v);
+        current = v;
+      },
+      configurable: true,
+    });
+    rerender(view(true));
+    rerender(view(false));
+    expect(sets).toEqual([]);
+    expect(video.srcObject).toBe(sentinel);
+  });
+});
+
+describe("CameraFeed - menus in fullscreen", () => {
+  type FsDoc = Document & {
+    fullscreenEnabled?: boolean;
+    fullscreenElement?: Element | null;
+    pictureInPictureEnabled?: boolean;
+  };
+  const fsDoc = document as FsDoc;
+  let fsElement: Element | null = null;
+
+  beforeEach(() => {
+    fsElement = null;
+    Object.defineProperty(fsDoc, "fullscreenEnabled", { value: true, configurable: true });
+    Object.defineProperty(fsDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+    Object.defineProperty(fsDoc, "fullscreenElement", {
+      get: () => fsElement,
+      configurable: true,
+    });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      value: async function (this: HTMLElement) {
+        fsElement = this;
+        document.dispatchEvent(new Event("fullscreenchange"));
+      },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    delete (fsDoc as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+    delete (fsDoc as { pictureInPictureEnabled?: boolean }).pictureInPictureEnabled;
+    delete (fsDoc as { fullscreenElement?: Element | null }).fullscreenElement;
+    delete (HTMLElement.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+  });
+
+  it("opens the more actions menu inside the fullscreen feed on the first tap", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      actions: [
+        { id: "a", label: "Spotlight", icon: null, onClick: () => {} },
+        { id: "b", label: "Snapshot", icon: null, onClick: () => {} },
+      ],
+      trailingActions: [{ id: "x", label: "Close", icon: null, onClick: () => {} }],
+    });
+    /* Crowded enough that ⋮ stays even once fullscreen pins its exit inline. */
+    fireEvent.click(getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Enter fullscreen"));
+    });
+    expect(fsElement).not.toBeNull();
+
+    const trigger = getByLabelText("More actions");
+    fireEvent.pointerDown(trigger);
+    fireEvent.click(trigger);
+    const menu = getByRole("menu", { name: "More actions" });
+    expect(fsElement?.contains(menu)).toBe(true);
+
+    fireEvent.pointerDown(menu);
+    expect(getByRole("menu", { name: "More actions" })).toBe(menu);
+  });
+
+  async function openMenuInFullscreen() {
+    const { client } = await buildConnectedSource();
+    const utils = renderFeed(client, {
+      flightId: 42,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      actions: [
+        { id: "a", label: "Spotlight", icon: null, onClick: () => {} },
+        { id: "b", label: "Snapshot", icon: null, onClick: () => {} },
+      ],
+    });
+    fireEvent.click(utils.getByLabelText("More actions"));
+    await act(async () => {
+      fireEvent.click(utils.getByLabelText("Enter fullscreen"));
+    });
+    fireEvent.click(utils.getByLabelText("More actions"));
+    expect(utils.getByRole("menu", { name: "More actions" })).toBeTruthy();
+    return utils;
+  }
+
+  it("Escape with a menu open closes the menu and stays fullscreen", async () => {
+    const exitSpy = vi.fn();
+    Object.defineProperty(fsDoc, "exitFullscreen", { value: exitSpy, configurable: true });
+    try {
+      const { queryByRole, getByLabelText, getByRole } = await openMenuInFullscreen();
+      await act(async () => {
+        fireEvent.keyDown(getByRole("button", { name: "More actions" }), { key: "Escape" });
+      });
+      expect(queryByRole("menu", { name: "More actions" })).toBeNull();
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(getByLabelText("More actions"));
+    } finally {
+      delete (fsDoc as { exitFullscreen?: unknown }).exitFullscreen;
+    }
+  });
+
+  it("closes an open menu when fullscreen ends", async () => {
+    const { queryByRole, getByLabelText } = await openMenuInFullscreen();
+    await act(async () => {
+      fsElement = null;
+      document.dispatchEvent(new Event("fullscreenchange"));
+    });
+    expect(queryByRole("menu", { name: "More actions" })).toBeNull();
+    expect(document.activeElement).toBe(getByLabelText("More actions"));
+  });
+
+  it("still portals menus to the body when not fullscreen", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableFullscreen: true,
+      enablePictureInPicture: true,
+      actions: [
+        { id: "a", label: "Spotlight", icon: null, onClick: () => {} },
+        { id: "b", label: "Snapshot", icon: null, onClick: () => {} },
+      ],
+    });
+    fireEvent.click(getByLabelText("More actions"));
+    const menu = getByRole("menu", { name: "More actions" });
+    expect(menu.parentElement).toBe(document.body);
+  });
+});
+
+describe("CameraFeed - remount inside the release grace", () => {
+  function countFor(sidecar: MockSidecar, type: string, flightId: number): number {
+    return sidecar.commands.filter(
+      (c) => c.type === type && (c.content as { flightId?: number }).flightId === flightId,
+    ).length;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps the slot and binds the flowing stream at once on remount", async () => {
+    const { client, sidecar } = await buildConnectedSource();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const first = renderFeed(client, { flightId: 42 });
+    const mid = sidecar.slotMidFor(42);
+    expect(mid).toBeDefined();
+    await act(async () => {
+      sidecar.deliverTrack(mid as string, {} as MediaStreamTrack);
+    });
+    const stream = client.camera(42).mediaStream;
+    expect(stream).not.toBeNull();
+    act(() => {
+      first.unmount();
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS / 2);
+    });
+
+    renderFeed(client, { flightId: 42 });
+    expect(document.querySelector("video")?.srcObject).toBe(stream);
+
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(sidecar.slotMidFor(42)).toBe(mid);
+    expect(countFor(sidecar, "subscribe", 42)).toBe(1);
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+  });
+
+  it("frees the slot with one unsubscribe once the grace runs out", async () => {
+    const { client, sidecar } = await buildConnectedSource();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const feed = renderFeed(client, { flightId: 42 });
+    act(() => {
+      feed.unmount();
+    });
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS + 50);
+    });
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(1);
+    expect(sidecar.slotMidFor(42)).toBeUndefined();
+  });
+
+  async function fullPool(growable: boolean) {
+    const sidecar = new MockSidecar().withSlots(["0", "1"]);
+    if (growable) sidecar.withRenegotiation();
+    for (const id of [1, 2, 3]) sidecar.addCamera(toInit(makeCamera({ flightId: id, cameraName: `Cam ${id}` })));
+    const renegotiate = vi.fn((o: { session: string; sdp: string; slots: number }) => sidecar.renegotiate(o));
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o), renegotiate },
+      sidecar.createTransport(),
+    );
+    createdClients.push(client);
+    await act(async () => {
+      await client.connect([], { slots: 2 });
+    });
+    await act(async () => {
+      sidecar.open();
+      sidecar.setConnectionState("connected");
+    });
+    const errors: unknown[] = [];
+    client.on("error", (e) => errors.push(e));
+    return { client, sidecar, renegotiate, errors };
+  }
+
+  function twoFeeds(client: KerbcastClient, second: number) {
+    return (
+      <KerbcastProvider client={client}>
+        <CameraFeed key="a" flightId={1} />
+        <CameraFeed key="b" flightId={second} />
+      </KerbcastProvider>
+    );
+  }
+
+  function commandIndex(sidecar: MockSidecar, type: string, flightId: number): number {
+    return sidecar.commands.findIndex(
+      (c) => c.type === type && (c.content as { flightId?: number }).flightId === flightId,
+    );
+  }
+
+  it("frees the old slot before asking for the new camera on a swap in a full pool", async () => {
+    const { client, sidecar, errors } = await fullPool(false);
+    const view = render(twoFeeds(client, 2));
+    await act(async () => {});
+    const mid = sidecar.slotMidFor(2);
+    expect(mid).toBeDefined();
+
+    await act(async () => {
+      view.rerender(twoFeeds(client, 3));
+    });
+
+    const unsub = commandIndex(sidecar, "unsubscribe", 2);
+    expect(unsub).toBeGreaterThanOrEqual(0);
+    expect(unsub).toBeLessThan(commandIndex(sidecar, "subscribe", 3));
+    expect(sidecar.slotMidFor(3)).toBe(mid);
+    expect(client.camera(3).waitingForSlot).toBe(false);
+    expect(errors).toEqual([]);
+    expect(screen.queryByText(/Not streaming: too many feeds are open/)).toBeNull();
+  });
+
+  it("swaps in a full growable pool without a re-offer", async () => {
+    const { client, sidecar, renegotiate, errors } = await fullPool(true);
+    const view = render(twoFeeds(client, 2));
+    await act(async () => {});
+    const mid = sidecar.slotMidFor(2);
+
+    await act(async () => {
+      view.rerender(twoFeeds(client, 3));
+    });
+
+    expect(renegotiate).not.toHaveBeenCalled();
+    expect(sidecar.slotMids).toHaveLength(2);
+    expect(sidecar.slotMidFor(3)).toBe(mid);
+    expect(errors).toEqual([]);
+  });
+
+  it("subscribes on the new client when the provider is handed one", async () => {
+    const a = await buildConnectedSource();
+    const b = await buildConnectedSource();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const feed = renderFeed(a.client, { flightId: 42 });
+    expect(a.sidecar.slotMidFor(42)).toBeDefined();
+    feed.rerender(
+      <KerbcastProvider client={b.client}>
+        <CameraFeed flightId={42} />
+      </KerbcastProvider>,
+    );
+    expect(b.sidecar.slotMidFor(42)).toBeDefined();
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS + 50);
+    });
+    expect(countFor(a.sidecar, "unsubscribe", 42)).toBe(1);
+    expect(countFor(b.sidecar, "unsubscribe", 42)).toBe(0);
+  });
+});
+
+describe("CameraFeed - camera briefly missing from the list", () => {
+  const A = makeCamera({ flightId: 42, cameraName: "Starboard Cam" });
+  const B = makeCamera({ flightId: 43, cameraName: "Nose Cam" });
+
+  function countFor(sidecar: MockSidecar, type: string, flightId: number): number {
+    return sidecar.commands.filter(
+      (c) => c.type === type && (c.content as { flightId?: number }).flightId === flightId,
+    ).length;
+  }
+
+  function feed(client: KerbcastClient, flightId: number | null, onShown: (id: number | null) => void) {
+    return (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={flightId} onDisplayedCameraChange={onShown} />
+      </KerbcastProvider>
+    );
+  }
+
+  async function setup() {
+    const src = await buildConnectedSource([A, B]);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    return src;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stays on the requested camera through a gap shorter than the hold", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS / 2);
+    });
+    expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+
+    expect(shown).toEqual([42]);
+    expect(countFor(sidecar, "subscribe", 42)).toBe(1);
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+    expect(countFor(sidecar, "subscribe", 43)).toBe(0);
+  });
+
+  it("keeps the tile and its last state through an empty snapshot", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([]);
+    });
+    expect(screen.getByRole("heading", { name: "Starboard Cam" })).toBeTruthy();
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    expect(shown).toEqual([42]);
+  });
+
+  it("falls back once when the gap outlasts the hold", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS - 1);
+    });
+    expect(shown).toEqual([42]);
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(shown).toEqual([42, 43]);
+    expect(screen.getByRole("heading", { name: "Nose Cam" })).toBeTruthy();
+  });
+
+  it("switches at once when the requested camera changes", async () => {
+    const { client } = await setup();
+    const shown: Array<number | null> = [];
+    const view = render(feed(client, 42, (id) => shown.push(id)));
+
+    view.rerender(feed(client, 43, (id) => shown.push(id)));
+    expect(shown).toEqual([42, 43]);
+    expect(screen.getByRole("heading", { name: "Nose Cam" })).toBeTruthy();
+  });
+
+  it("switches at once to a newly requested camera that is not listed yet", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    const view = render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    view.rerender(feed(client, 99, (id) => shown.push(id)));
+    expect(shown).toEqual([42, 43]);
+  });
+
+  it("holds an auto-latched camera through a gap", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, null, (id) => shown.push(id)));
+    expect(shown).toEqual([42]);
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(shown).toEqual([42]);
+  });
+
+  it("holds a second gap after the camera came back from an expired one", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(feed(client, 42, (id) => shown.push(id)));
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS);
+    });
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    expect(shown).toEqual([42, 43, 42]);
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    expect(shown).toEqual([42, 43, 42]);
+  });
+
+  it("holds under StrictMode", async () => {
+    const { client, sidecar } = await setup();
+    const shown: Array<number | null> = [];
+    render(<StrictMode>{feed(client, 42, (id) => shown.push(id))}</StrictMode>);
+
+    await act(async () => {
+      sidecar.setCameras([toInit(B)]);
+    });
+    await act(async () => {
+      sidecar.setCameras([toInit(A), toInit(B)]);
+    });
+    act(() => {
+      vi.advanceTimersByTime(KERBCAST_RELEASE_GRACE_MS * 3);
+    });
+    expect(new Set(shown)).toEqual(new Set([42]));
+    expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
   });
 });

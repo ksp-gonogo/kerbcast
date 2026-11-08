@@ -1,4 +1,4 @@
-import type { CameraState, KerbcastClient } from "@ksp-gonogo/kerbcast";
+import type { Anchor, CameraState, DisplayedFrameUt, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import {
   CameraKind,
   CommandAimKind,
@@ -23,7 +23,7 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
-import { KerbcastProvider, useKerbcastClient } from "./context";
+import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider, useKerbcastClient } from "./context";
 import {
   ActionBarRow,
   FeedActionBar,
@@ -32,17 +32,20 @@ import {
   type FeedAction,
   type FeedActionBarEntry,
 } from "./FeedActionBar";
-import { CommandBlank, CommandBrackets, type CommandBracketOverlay } from "./CommandBrackets";
+import { CommandBlank, LiveCommandBrackets, type CommandBracketOverlay } from "./CommandBrackets";
+import { LiveAnchorMarkers, type AnchorOverlay } from "./AnchorMarkers";
 import { useCommandDisplayUt } from "./hooks/useCommandDisplayUt";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
+import { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
 import { useRecordings } from "./hooks/useRecordings";
 import { DEFAULT_FEED_ASPECT, useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
-import { usePortalMenu } from "./menuPositioning";
+import { claimAnchors } from "./sharedAnchors";
+import { menuPortalRoot, usePortalMenu } from "./menuPositioning";
 import { formatElapsed, nowMs } from "./timing";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +76,16 @@ const QUALITY_PRESETS: ReadonlyArray<{
 function presetDim(operatorDim: number, scale: number): number {
   const v = Math.trunc(operatorDim * scale) & ~1;
   return v < 2 ? 2 : v;
+}
+
+function videoTrackId(source: MediaProvider | null): string | undefined {
+  if (!source || !("getVideoTracks" in source)) return undefined;
+  return source.getVideoTracks()[0]?.id;
+}
+
+function sameVideoTrack(a: MediaProvider | null, b: MediaStream | null): boolean {
+  const id = videoTrackId(a);
+  return id !== undefined && id === videoTrackId(b);
 }
 
 /*
@@ -142,7 +155,11 @@ export interface CameraFeedProps {
   client?: KerbcastClient;
   /**
    * KSP `Part.flightID` of the camera to display. `null` triggers
-   * auto-selection: the first live camera in the registry is latched.
+   * auto-selection: the first live camera in the registry is latched. A
+   * displayed camera that drops out of the list stays on screen, with its
+   * last known state, for `KERBCAST_RELEASE_GRACE_MS` before the feed falls
+   * back, so a momentary gap does not restart its stream. A recording of
+   * that camera still ends at once (`camera-gone`).
    */
   flightId: number | null;
   /**
@@ -265,8 +282,9 @@ export interface CameraFeedProps {
   enableRecording?: boolean;
   /**
    * Record this feed at the operator's full render size for the duration of
-   * the built-in REC control's recording (overrides only the display-size
-   * demand; still yields to the adaptive framerate shed). Off by default.
+   * the built-in REC control's recording (overrides the display-size
+   * demand and any viewer quality preset; still capped by an operator
+   * render-size cap and the adaptive shed). Off by default.
    * Threaded straight into `start(flightId, { forceFullResolution })`; has
    * no effect unless `enableRecording` is also set. While the feed is armed
    * (force sent, waiting for the resolution bump) the tile shows an
@@ -315,13 +333,55 @@ export interface CameraFeedProps {
    */
   targetBracketOverlay?: CommandBracketOverlay;
   /**
+   * What a command camera feed says while the camera has no subject to aim
+   * at yet and shows its placeholder framing (a launch site camera on its
+   * pad, a station looking at the horizon). Drawn over the picture, never
+   * into the video, so recordings stay clean. Default "Waiting for target";
+   * `null` or an empty string shows nothing.
+   */
+  waitingForTargetLabel?: string | null;
+  /**
+   * What the feed says while its camera has no video slot on this connection
+   * (`KerbcastCameraHandle.waitingForSlot`): the pool is at its ceiling or
+   * cannot grow. The feed takes the next slot another feed gives up. Drawn
+   * over the picture; `null` or an empty string shows nothing.
+   */
+  noSlotLabel?: string | null;
+  /**
    * Mission UT the displayed video was captured at, for a host running its
-   * own delayed playout. Picks which command-track transition is in force and
-   * ages the readout. Defaults to the displayed frame's own capture UT where
-   * the browser reports frame RTP timestamps, else the client's capture
-   * clock interpolated to now.
+   * own delayed playout: the capture UT of the frame its buffer last
+   * released. Picks which command-track transition is in force and ages the
+   * readout, and the brackets, readout and anchor markers come from the
+   * newest frame at or before it (`KerbcastClient.frameAt`), so they never
+   * run ahead of the picture. Before any frame that old is known they behave
+   * as without it. Defaults to the displayed frame's own capture UT where the
+   * browser reports frame RTP timestamps, else the client's capture clock
+   * interpolated to now.
    */
   displayUt?: number;
+  /**
+   * The frame a host's own delayed playout is showing, as
+   * `watchDisplayedFrames` reported it when it arrived. Wins over
+   * `displayUt`: its `ut` picks the transition in force, its `command`
+   * draws the brackets and readout and its `anchors` the markers, so they
+   * never run ahead of the picture.
+   */
+  displayFrame?: DisplayedFrameUt | null;
+  /**
+   * Things to mark on this feed's picture: parts, craft, points on a body or
+   * directions. Set for the displayed camera as this client's anchors and
+   * cleared when the feed shows another camera or unmounts; the game
+   * projects each through the camera that rendered every frame, and a
+   * default marker is drawn where it lands. One set per camera per client:
+   * two feeds on the same camera share it, the last to set winning. At
+   * most 16. Pass a stable or memoised array; it is compared by value.
+   */
+  anchors?: Anchor[];
+  /**
+   * Restyle the anchor markers, add SVG of your own, put text under them,
+   * or draw anchors set in game too. See {@link AnchorOverlay}.
+   */
+  anchorOverlay?: AnchorOverlay;
 }
 
 export interface CameraFeedHandle {
@@ -362,7 +422,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       useStream,
       enableTargetBrackets = true,
       targetBracketOverlay,
+      waitingForTargetLabel = "Waiting for target",
+      noSlotLabel = "Not streaming: too many feeds are open. Close a feed to watch this one.",
       displayUt: displayUtProp,
+      displayFrame,
+      anchors,
+      anchorOverlay,
     },
     ref,
   ) {
@@ -402,28 +467,53 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const effectiveShowStatic = showStatic === undefined ? !reducedMotion : showStatic;
 
     // -------------------------------------------------------------------------
-    // Selection model (mirrors gonogo's CameraFeed)
+    // Selection model
     //
     // Resolution order:
     //   1. Explicit pick, if still present in the list (destroyed or not).
-    //   2. Auto: latch the currently-displayed camera. Keep showing it even if
+    //   2. Hold: the displayed camera, briefly missing from the list.
+    //   3. Auto: latch the currently-displayed camera. Keep showing it even if
     //      destroyed, but only while no other live camera exists (destroyed
     //      tombstones never leave the list on their own, so a destroyed latch
     //      would otherwise never release). Once a live camera is available,
     //      release the latch and auto-pick it.
-    //   3. Fresh auto-pick: prefer the first live camera; fall back to first
+    //   4. Fresh auto-pick: prefer the first live camera; fall back to first
     //      overall only when every camera is destroyed.
     // -------------------------------------------------------------------------
     const displayedRef = useRef<number | null>(null);
+    const requestedRef = useRef<number | null>(requestedFlightId);
+    const lastCameraRef = useRef<CameraState | null>(null);
+    /* The camera whose hold ran out, so it is let go until it is listed again. */
+    const [expiredHold, setExpiredHold] = useState<number | null>(null);
+
+    /*
+     * The displayed camera dropping out of the list for an update or two (an
+     * empty snapshot at launch or revert, a host filter that skips it once)
+     * would otherwise switch the feed away and back, restarting the stream
+     * both times. Keep showing it, with its last known state, for
+     * KERBCAST_RELEASE_GRACE_MS. A new `flightId` prop is a real choice and
+     * switches at once, and a requested camera that is listed wins over a
+     * held one. The hold is the feed's alone: a recording of the camera
+     * still ends at once as camera-gone.
+     */
     const requestedStillPresent =
       requestedFlightId !== null &&
       cameras.some((c) => c.flightId === requestedFlightId);
+    const displayed = displayedRef.current;
+    const holding =
+      !requestedStillPresent &&
+      displayed !== null &&
+      expiredHold !== displayed &&
+      requestedFlightId === requestedRef.current &&
+      !cameras.some((c) => c.flightId === displayed);
 
     let flightId: number | null;
     if (requestedStillPresent) {
       flightId = requestedFlightId;
+    } else if (holding) {
+      flightId = displayed;
     } else {
-      const latched = displayedRef.current;
+      const latched = displayed;
       const latchedCamera =
         latched !== null ? cameras.find((c) => c.flightId === latched) : undefined;
       const anyLive = cameras.some((c) => !isCameraDestroyed(c));
@@ -437,10 +527,35 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
           null);
     }
 
-    const camera =
+    const listedCamera =
       flightId !== null
         ? (cameras.find((c) => c.flightId === flightId) ?? null)
         : null;
+    const camera =
+      holding && lastCameraRef.current?.flightId === flightId
+        ? lastCameraRef.current
+        : listedCamera;
+
+    useEffect(() => {
+      if (listedCamera) lastCameraRef.current = listedCamera;
+    }, [listedCamera]);
+
+    useEffect(() => {
+      if (!holding || displayed === null) return;
+      const timer = setTimeout(() => setExpiredHold(displayed), KERBCAST_RELEASE_GRACE_MS);
+      return () => clearTimeout(timer);
+    }, [holding, displayed]);
+
+    /* Listed again, so a later gap gets a hold of its own. */
+    useEffect(() => {
+      if (expiredHold !== null && cameras.some((c) => c.flightId === expiredHold)) {
+        setExpiredHold(null);
+      }
+    }, [expiredHold, cameras]);
+
+    useEffect(() => {
+      requestedRef.current = requestedFlightId;
+    }, [requestedFlightId]);
 
     // Latest onDisplayedCameraChange, held in a ref so the commit effect below
     // fires only on a resolved-flightId change, not on every render when the
@@ -472,10 +587,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     }, []);
     // The feed frame; fullscreen targets this and ResizeObserver measures it.
     const wrapRef = useRef<HTMLDivElement>(null);
+    /* Clearing to null on a switch to a camera with no stream yet stops the
+       previous camera's last frame lingering. A rebind can hand over a new
+       MediaStream around the same track; reassigning that would reset the
+       element and flash black, so it is skipped. */
     useEffect(() => {
-      if (videoRef.current && stream) {
-        videoRef.current.srcObject = stream;
-      }
+      const video = videoRef.current;
+      if (!video || video.srcObject === stream) return;
+      if (sameVideoTrack(video.srcObject, stream)) return;
+      video.srcObject = stream;
     }, [stream]);
 
     // -------------------------------------------------------------------------
@@ -498,6 +618,20 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       setIsStale(cam.stalled);
       return cam.on("stall", setIsStale);
     }, [client, flightId]);
+
+    const [hasSource, setHasSource] = useState(false);
+    useEffect(() => {
+      if (flightId === null) {
+        setHasSource(false);
+        return;
+      }
+      const cam = client.camera(flightId);
+      setHasSource(cam.hasSource);
+      return cam.on("source", setHasSource);
+    }, [client, flightId]);
+    /* The in-stream static keeps the video element presenting frames, so a
+       frame count cannot tell a picture from static; this attribute can. */
+    const signal = flightId === null ? undefined : !hasSource ? "none" : isStale ? "stalled" : "live";
 
     // -------------------------------------------------------------------------
     // Fullscreen + Picture-in-Picture (opt-in, feature-detected)
@@ -540,6 +674,23 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       };
     }, [pipAvailable, flightId]);
 
+    /* Browsers usually consume Escape to leave fullscreen themselves; this
+       covers hosts and embedded views that hand the key to the page instead. */
+    useEffect(() => {
+      if (!isFullscreen) return;
+      const onKey = (e: KeyboardEvent) => {
+        if (
+          e.key === "Escape" &&
+          !e.defaultPrevented &&
+          currentFullscreenElement() === wrapRef.current
+        ) {
+          exitFullscreen();
+        }
+      };
+      document.addEventListener("keydown", onKey);
+      return () => document.removeEventListener("keydown", onKey);
+    }, [isFullscreen]);
+
     const toggleFullscreen = useCallback(() => {
       const el = wrapRef.current;
       if (!el) return;
@@ -558,6 +709,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     }, []);
 
     const isDestroyed = camera ? isCameraDestroyed(camera) : false;
+    const waitingForSlot = useKerbcastWaitingForSlot(flightId);
     /* Gating here rather than at the render sites covers the whole manual
        path at once: the controls unmount, the effects below zero any in-flight
        rate, and the imperative handle's pan/zoom methods no-op. */
@@ -580,18 +732,35 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       camera?.kind === CameraKind.Command && !isDestroyed ? camera : null;
     const isCommandFeed = commandCamera !== null;
     const commandTrack = commandCamera?.commandTrack ?? null;
+    /* A host on its own delay names the frame it shows, or its UT for the client to look the frame up by. */
+    const hostFrame =
+      displayFrame ??
+      (displayUtProp !== undefined && flightId !== null ? client.frameAt(flightId, displayUtProp) : null);
     const commandDisplayUt = useCommandDisplayUt(
       commandTrack !== null,
-      displayUtProp,
+      displayFrame ? displayFrame.ut : displayUtProp,
       commandTrack?.events,
       commandCamera?.flightId ?? null,
       videoEl,
+      hostFrame?.command,
     );
     const commandState = commandTrack
-      ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut)
+      ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut, commandDisplayUt?.command)
       : null;
+    /* This feed's anchors go to the camera it displays, and leave with it. */
+    const anchorsKey = anchors?.length ? JSON.stringify(anchors) : "";
+    useEffect(() => {
+      if (flightId === null || !anchorsKey) return;
+      return claimAnchors(client, flightId, JSON.parse(anchorsKey) as Anchor[]);
+    }, [client, flightId, anchorsKey]);
+    const drawsAnchors = !!anchorsKey || !!anchorOverlay?.owners?.length;
+
     const [bracketsOn, toggleBrackets] = useTargetBracketsPreference(
-      commandCamera ? (commandCamera.commandCentre?.stationId ?? String(commandCamera.flightId)) : null,
+      commandCamera
+        ? (commandCamera.commandCentre?.siteKey || commandCamera.commandCentre?.nodeName || String(commandCamera.flightId))
+        : null,
+      // 1.11 keyed the preference by stationId; carry a saved choice over.
+      commandCamera?.commandCentre?.stationId ?? null,
     );
     const targetBracketsAvailable = enableTargetBrackets && isCommandFeed;
 
@@ -861,8 +1030,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // one aims the camera at it. Hidden while a command authority holds the
     // aim lock, since only it can aim then.
     // -------------------------------------------------------------------------
-    const commandTargets = commandCamera?.commandCentre?.targets ?? [];
-    const commandTargetId = commandCamera?.commandCentre?.subjectPersistentId ?? 0;
+    /* The list as it stood at the displayed frame, so a delayed feed never offers what its picture has not reached. */
+    const shownCentre = commandCamera
+      ? client.commandCentreAt(commandCamera.flightId, commandDisplayUt?.ut)
+      : null;
+    const commandTargets = shownCentre?.targets ?? [];
+    const commandTargetId = shownCentre?.subjectPersistentId ?? 0;
     const commandLocked = commandCamera?.commandTrack?.authority != null;
     const commandTargetAvailable =
       isCommandFeed && !disableManualControls && !commandLocked && commandTargets.length > 0;
@@ -900,6 +1073,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
        yet (see ActiveRecordingInfo.arming). Drives the ARMING pill below in
        place of the REC badge. */
     const armingActive = activeRecording?.arming === true;
+    /* Stopped, clip not in the store yet (ActiveRecordingInfo.stopping). */
+    const savingActive = activeRecording?.stopping === true;
 
     // Ticks once a second while recording so the elapsed timer stays live;
     // the timer itself is derived from activeRecording.startedAt each render.
@@ -985,7 +1160,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 </CameraMenuItem>
               ))}
             </CameraMenu>,
-            document.body,
+            menuPortalRoot(),
           )}
 
         {showDebugInfo &&
@@ -1175,10 +1350,14 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             {
               id: "fullscreen",
               label: fullscreenLabel,
+              /* While fullscreen the exit stays inline, never in the ⋮ menu,
+                 so it can be the one control the Stage keeps visible. */
               stateful: false,
+              inline: isFullscreen,
               render: () => (
                 <OverlayIconButton
                   type="button"
+                  data-kc-fullscreen-exit={isFullscreen || undefined}
                   aria-label={fullscreenLabel}
                   aria-pressed={isFullscreen}
                   title={fullscreenLabel}
@@ -1259,7 +1438,13 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     return (
       <FeedBox style={feedShape}>
-        <Stage ref={wrapRef} $pinned={chromePinned}>
+        <Stage
+          ref={wrapRef}
+          $pinned={chromePinned}
+          $fullscreen={isFullscreen}
+          data-fullscreen={isFullscreen || undefined}
+          data-kc-signal={signal}
+        >
           {flightId === null ? (
             <>
               <Empty>{emptyMessage}</Empty>
@@ -1317,7 +1502,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       {qualityThrottled ? " · throttled" : ""}
                     </QualityMeta>
                   </QualityMenu>,
-                  document.body,
+                  menuPortalRoot(),
                 )}
               {trackingAvailable &&
                 trackingMenu.open &&
@@ -1350,7 +1535,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       Track target
                     </CameraMenuItem>
                   </QualityMenu>,
-                  document.body,
+                  menuPortalRoot(),
                 )}
               {commandTargetAvailable &&
                 commandTargetMenu.open &&
@@ -1384,15 +1569,20 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       );
                     })}
                   </CameraMenu>,
-                  document.body,
+                  menuPortalRoot(),
                 )}
               {commandState &&
                 !outOfFlight &&
                 (
                   <>
                     {commandState.blank && <CommandBlank reason={commandState.blank} />}
+                    {commandState.waitingForTarget && !commandState.blank && !isDestroyed && waitingForTargetLabel && (
+                      <WaitingBadge role="status">{waitingForTargetLabel}</WaitingBadge>
+                    )}
                     {targetBracketsAvailable && bracketsOn && (
-                      <CommandBrackets
+                      <LiveCommandBrackets
+                        flightId={commandCamera?.flightId ?? null}
+                        frame={hostFrame}
                         state={commandState}
                         displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
                         utSource={commandDisplayUt?.source ?? null}
@@ -1405,6 +1595,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
+              {waitingForSlot && !outOfFlight && !isDestroyed && noSlotLabel && (
+                <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
+              )}
+              {drawsAnchors && !outOfFlight && !isDestroyed && !commandState?.blank && (
+                <LiveAnchorMarkers flightId={flightId} video={videoEl} overlay={anchorOverlay} frame={hostFrame} />
+              )}
               {outOfFlight ? (
                 showStandbyIcon && (
                   <StandbyOverlay role="status" aria-label="Standby, no active flight">
@@ -1437,10 +1633,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   ARMING
                 </ArmingBadge>
               )}
-              {recordingActive && !armingActive && (
+              {recordingActive && !armingActive && !savingActive && (
                 <RecBadge role="status" aria-label="Recording">
                   <RecDot aria-hidden="true" />
                   REC {formatElapsed(recordingElapsedMs)}
+                </RecBadge>
+              )}
+              {recordingActive && savingActive && (
+                <RecBadge role="status" aria-label="Saving recording">
+                  SAVING
                 </RecBadge>
               )}
               {showZoom && (
@@ -1588,7 +1789,7 @@ export const CameraFeed = forwardRef<CameraFeedHandle, CameraFeedProps>(
 );
 
 // ---------------------------------------------------------------------------
-// Inline UI primitives (replacing @gonogo/ui dependencies)
+// Inline UI primitives
 // ---------------------------------------------------------------------------
 
 function ChevronDownIcon(props: React.SVGProps<SVGSVGElement>) {
@@ -1944,8 +2145,9 @@ const StepButtons = styled.div`
 `;
 
 const CameraMenu = styled.div`
-  /* Portaled to document.body: fixed position (set inline from the trigger
-     rect) keeps it clear of the tile's overflow clipping. */
+  /* Portaled to document.body (the fullscreen element while fullscreen):
+     fixed position (set inline from the trigger rect) keeps it clear of the
+     tile's overflow clipping. */
   position: fixed;
   z-index: 1000;
   max-width: min(260px, calc(100vw - 16px));
@@ -2005,7 +2207,7 @@ const TopMeta = styled.div`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
-/* The quality picker: portaled to document.body like CameraMenu, hung from
+/* The quality picker: portaled like CameraMenu, hung from
    its action-bar trigger (fixed position set inline from the trigger rect)
    so tile clipping cannot cut it off and it survives the hover-revealed
    chrome fading while the pointer is over the menu. */
@@ -2191,7 +2393,7 @@ const FeedBox = styled.div`
   justify-content: center;
 `;
 
-const Stage = styled(Panel)<{ $pinned: boolean }>`
+const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean }>`
   width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
   height: auto;
   aspect-ratio: var(--kc-feed-w) / var(--kc-feed-h);
@@ -2234,6 +2436,31 @@ const Stage = styled(Panel)<{ $pinned: boolean }>`
       ${ZoomControlsWrap},
       ${PanControl} {
         opacity: 1;
+      }
+    `}
+
+  /* Fullscreen has no hover on touch and may have no pointer at all, so the
+     exit button stays visible in its usual slot while the rest of the bar
+     keeps its hover/focus/tap reveal. */
+  ${(p) =>
+    p.$fullscreen &&
+    !p.$pinned &&
+    css`
+      ${ActionBarRow} {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      ${ActionBarRow} > * {
+        transition: opacity 0.15s;
+      }
+      &:not(:hover):not(:focus-within) ${ActionBarRow} > :not([data-kc-fullscreen-exit]) {
+        opacity: 0;
+        pointer-events: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        ${ActionBarRow} > * {
+          transition: none;
+        }
       }
     `}
 `;
@@ -2323,6 +2550,54 @@ const StaleScrim = styled.div`
   inset: 0;
   z-index: 1;
   background: rgba(0, 0, 0, 0.32);
+  pointer-events: none;
+`;
+
+/* Centred in the picture, clear of the chrome along the edges, and wrapping so
+   a small tile still shows the whole sentence. */
+const NoSlotNotice = styled.div`
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  max-width: calc(100% - 32px);
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+`;
+
+/* Bottom centre: the zoom controls take the bottom left, pan and the stale
+   badge the bottom right, the title and REC badge the top left and the
+   action bar the top right. */
+const WaitingBadge = styled.div`
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  /* Clear of the stale badge on the bottom right, even on a small tile. */
+  max-width: calc(100% - 180px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
   pointer-events: none;
 `;
 

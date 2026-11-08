@@ -29,7 +29,7 @@
 import { Fragment, useId } from "react";
 import { createPortal } from "react-dom";
 import styled from "styled-components";
-import { usePortalMenu } from "./menuPositioning";
+import { menuPortalRoot, usePortalMenu } from "./menuPositioning";
 
 /**
  * A consumer-supplied action rendered into a feed's action bar. Lets a host
@@ -82,6 +82,7 @@ const OVERFLOW_MIN_NON_STATEFUL = 2;
 
 interface Partitionable {
   stateful?: boolean;
+  inline?: boolean;
   order?: number;
   pinnedTrailing?: boolean;
 }
@@ -113,8 +114,8 @@ export function partitionActionBarEntries<T extends Partitionable>(
     return { primary: overflowable, overflow: [], pinnedTrailing };
   }
   return {
-    primary: overflowable.filter((e) => e.stateful),
-    overflow: nonStateful,
+    primary: overflowable.filter((e) => e.stateful || e.inline),
+    overflow: nonStateful.filter((e) => !e.inline),
     pinnedTrailing,
   };
 }
@@ -133,6 +134,12 @@ export interface FeedActionBarEntry {
   id: string;
   label: string;
   stateful?: boolean;
+  /**
+   * Keeps a non-stateful entry out of the ⋮ menu without changing the split:
+   * it still counts as non-stateful toward the overflow threshold, so the
+   * rest of the bar lays out exactly as it would without the flag.
+   */
+  inline?: boolean;
   order?: number;
   pinnedTrailing?: boolean;
   render: () => React.ReactNode;
@@ -244,7 +251,7 @@ export function FeedActionBar({ leading, entries, className }: FeedActionBarProp
               </OverflowMenuItem>
             ))}
           </OverflowMenu>,
-          document.body,
+          menuPortalRoot(),
         )}
       {pinnedTrailing.map((e) => (
         <Fragment key={e.id}>{e.render()}</Fragment>

@@ -20,6 +20,7 @@ const KEY_CREW_BAR_PLACEMENT = "kerbcast:crewBarPlacement";
 const KEY_CREW_MERGE = "kerbcast:crewBarDissolve";
 const KEY_CREW_CLOSED = "kerbcast:crewClosed";
 const KEY_CREW_SPOTLIGHT = "kerbcast:crewSpotlight";
+const KEY_SHOW_LAUNCHPAD = "kerbcast:showLaunchpadCamera";
 const KEY_RECORD_FULL_RESOLUTION = "kerbcast:recordFullResolution";
 
 export function loadTheme(): ThemePreference {
@@ -101,6 +102,18 @@ export function loadCrewMerge(): boolean {
 
 export function saveCrewMerge(merge: boolean): void {
   localStorage.setItem(KEY_CREW_MERGE, String(merge));
+}
+
+/**
+ * Show-Launchpad-camera preference. Returns `true` when the key is absent
+ * (default on) and `false` only when explicitly stored as "false".
+ */
+export function loadShowLaunchpad(): boolean {
+  return localStorage.getItem(KEY_SHOW_LAUNCHPAD) !== "false";
+}
+
+export function saveShowLaunchpad(show: boolean): void {
+  localStorage.setItem(KEY_SHOW_LAUNCHPAD, String(show));
 }
 
 /**

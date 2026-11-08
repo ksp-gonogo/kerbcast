@@ -11,6 +11,11 @@ namespace Kerbcast
      */
     public sealed class CaptureEpoch
     {
+        /* The game's one epoch. It outlives the per-scene addons that bump and
+         * stamp it, so a scene load or revert moves it on rather than starting
+         * the next scene back at the value the last one began with. */
+        public static readonly CaptureEpoch Game = new CaptureEpoch();
+
         private uint _value;
 
         /* Current epoch. Stable until the next Bump(). */
