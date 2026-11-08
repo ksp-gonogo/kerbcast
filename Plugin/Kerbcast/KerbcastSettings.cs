@@ -175,6 +175,8 @@ namespace Kerbcast
         public double OpticsBrightnessHold { get; private set; } = 1.0;
         /* How strongly a daylit sky washes out faint things. */
         public double OpticsDaySky { get; private set; } = 0.3;
+        /* What full daylight at a lens costs a tracking network's vantage, in stops of picture quality. */
+        public double NetworkDaylightStops { get; private set; } = OpticsModel.DaySkyStops;
 
         /* The settings' optics knobs for a lens of `resolutionArcsec`. */
         internal OpticsKnobs OpticsDefaults(double resolutionArcsec) => new OpticsKnobs
@@ -581,6 +583,7 @@ namespace Kerbcast
             ApplyFloat(node, "OpticsSeeingAirmassPower", v => settings.OpticsSeeingAirmassPower = Mathf.Clamp(v, 0f, 3f));
             ApplyFloat(node, "OpticsBrightnessHold", v => settings.OpticsBrightnessHold = Mathf.Clamp01(v));
             ApplyFloat(node, "OpticsDaySky", v => settings.OpticsDaySky = Mathf.Max(0f, v));
+            ApplyFloat(node, "NetworkDaylightStops", v => settings.NetworkDaylightStops = Mathf.Max(0f, v));
             ApplyString(node, "CommandCameraAnchor", v =>
             {
                 var a = v.Trim().ToLowerInvariant();

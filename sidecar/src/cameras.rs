@@ -34,7 +34,7 @@ use crate::feed_watch::{FeedVerdict, FeedWatch};
 use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
-    CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
+    CommandAimKind, CommandCentreInfo, CommandNetworkInfo, CommandTarget, CommandTrackState,
     CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
     ErrorCode, Layer, QualityPreset, ResumePayload, SetCommandAimPayload, SettingsStatePayload,
     SiteKind, TrackMode,
@@ -203,6 +203,61 @@ struct CommandTargetsStatus {
     targets: Vec<CommandTarget>,
     #[serde(default)]
     vantage_persistent_id: u32,
+    /// Where a tracking network camera stands now; the manifest only has
+    /// the site it was built at. Absent on every other camera, and dropped
+    /// alone when malformed.
+    #[serde(
+        default,
+        deserialize_with = "lenient_part",
+        skip_serializing_if = "Option::is_none"
+    )]
+    site: Option<CommandSiteStatus>,
+    /// A tracking network camera's vantages; dropped alone when malformed.
+    #[serde(
+        default,
+        deserialize_with = "lenient_part",
+        skip_serializing_if = "Option::is_none"
+    )]
+    network: Option<CommandNetworkInfo>,
+}
+
+/// The site a tracking network camera stands at now, as the plugin writes it
+/// beside the camera's targets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandSiteStatus {
+    site_key: String,
+    #[serde(default)]
+    site_kind: SiteKind,
+    display_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    latitude: f64,
+    #[serde(default)]
+    longitude: f64,
+    #[serde(default)]
+    altitude: f64,
+}
+
+/// One optional part of a command camera's status, `None` when it is
+/// malformed, so a bad part never costs the rest of the status.
+fn lenient_part<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value(value) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            tracing::debug!(error = %e, "command status part parse failed; dropping it");
+            Ok(None)
+        }
+    }
 }
 
 /// Whether a command camera's subject, range or targets moved. A later `ut`
@@ -665,6 +720,9 @@ pub struct CameraState {
     /// (a fresh attach is never triggered by the switch). Read via
     /// `crew_location()`.
     crew_location: std::sync::Mutex<Option<CrewLocation>>,
+    /// The site key on the last frame read from a command camera's ring, to
+    /// notice a tracking network's cut.
+    frame_site: std::sync::Mutex<Option<String>>,
     /// Station identity for a command camera. Static for the
     /// camera's life (the station does not move).
     pub command_centre: Option<CommandCentreInfo>,
@@ -1037,6 +1095,19 @@ impl CameraState {
     /// part cameras. Cheap copy out of the interior-mutable cell.
     pub fn crew_location(&self) -> Option<CrewLocation> {
         *self.crew_location.lock().unwrap()
+    }
+
+    /// Notes the site key a frame was seen from; true when it differs from
+    /// the last frame's, which is a tracking network's cut. The first frame
+    /// and a frame without a key are no cut.
+    pub fn note_frame_site(&self, key: Option<&str>) -> bool {
+        let Some(key) = key else { return false };
+        let mut last = self.frame_site.lock().unwrap();
+        let cut = last.as_deref().is_some_and(|k| k != key);
+        if last.as_deref() != Some(key) {
+            *last = Some(key.to_string());
+        }
+        cut
     }
 
     /// Current published auto-track mode (lock-free read of the atomic mirror).
@@ -2152,6 +2223,7 @@ impl CameraRegistry {
                             crew_location: std::sync::Mutex::new(crew_location_from_manifest(
                                 manifest.crew_location.as_deref(),
                             )),
+                            frame_site: std::sync::Mutex::new(None),
                             part_name: manifest.part_name,
                             part_title: manifest.part_title,
                             camera_name: manifest.camera_name,
@@ -3830,6 +3902,7 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         targets_omitted: None,
         created: m.command_created.unwrap_or(false),
         token: m.command_token.clone().filter(|t| !t.is_empty()),
+        network: None,
     })
 }
 
@@ -3848,6 +3921,22 @@ fn command_centre_with(
         out.ut = s.ut;
         out.targets = s.targets.clone();
         out.vantage_persistent_id = s.vantage_persistent_id;
+        if let Some(site) = &s.site {
+            out.station_id = format!("ground:{}", site.site_key);
+            out.node_name = site.site_key.clone();
+            out.site_key = site.site_key.clone();
+            out.site_kind = site.site_kind;
+            out.display_name = if site.display_name.is_empty() {
+                site.site_key.clone()
+            } else {
+                site.display_name.clone()
+            };
+            out.body = site.body.clone();
+            out.latitude = site.latitude;
+            out.longitude = site.longitude;
+            out.altitude = site.altitude;
+        }
+        out.network = s.network.clone();
     }
     Some(out)
 }
@@ -5609,6 +5698,66 @@ mod tests {
                 "a 1.11 manifest's kind comes from its key"
             );
         }
+    }
+
+    /// A tracking network camera's status names where it stands now, which
+    /// the camera list shows over the site it was built at, so a cut
+    /// relabels it; a malformed network part is dropped alone.
+    #[test]
+    fn a_network_cut_relabels_the_camera_list() {
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":9,"kind":"command","site_key":"KSC","site_kind":"station","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center","command_created":true}"#,
+        )
+        .unwrap();
+        let built = command_centre_from_manifest(&m);
+        let status = |site: &str, label: &str| -> Option<CommandTargetsStatus> {
+            let per: PerCameraStatus = serde_json::from_str(&format!(
+                r#"{{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{{"subjectPersistentId":42,"trackingLevel":3,"targets":[],"site":{{"siteKey":"{site}","siteKind":"station","displayName":"{label}","body":"Kerbin","latitude":-6.5,"longitude":-141.6,"altitude":3000.0}},"network":{{"name":"Ground net","state":"ok","vantages":[{{"siteKey":"KSC","label":"Kerbal Space Center","state":"belowHorizon","active":false,"fallback":false}},{{"siteKey":"{site}","label":"{label}","state":"ok","active":true,"fallback":true}}]}}}}}}"#
+            ))
+            .unwrap();
+            per.command_targets
+        };
+        let at_rim = status("Crater Rim", "North dish");
+        let merged = command_centre_with(&built, at_rim.as_ref()).expect("merged");
+        assert_eq!(merged.site_key, "Crater Rim");
+        assert_eq!(merged.node_name, "Crater Rim");
+        assert_eq!(merged.station_id, "ground:Crater Rim");
+        assert_eq!(
+            merged.display_name, "North dish",
+            "the host's label names the camera's site"
+        );
+        assert_eq!((merged.latitude, merged.altitude), (-6.5, 3000.0));
+        let network = merged.network.as_ref().expect("network");
+        assert_eq!(network.name, "Ground net");
+        assert_eq!(network.state, "ok");
+        assert_eq!(network.vantages.len(), 2);
+        assert!(network.vantages[1].active && network.vantages[1].fallback);
+        assert_eq!(network.vantages[0].state, "belowHorizon");
+
+        let json = serde_json::to_value(&merged).unwrap();
+        assert_eq!(json["network"]["vantages"][1]["siteKey"], "Crater Rim");
+        assert_eq!(json["displayName"], "North dish");
+
+        assert!(
+            command_targets_changed(&at_rim, &status("Nye Island", "Nye Island")),
+            "a cut is a change viewers hear about"
+        );
+
+        let plain = command_centre_with(&built, None).expect("identity");
+        assert!(
+            plain.network.is_none() && plain.site_key == "KSC",
+            "before any status, the manifest's site"
+        );
+
+        let per: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"subjectPersistentId":42,"trackingLevel":3,"targets":[],"network":{"name":7},"site":"nope"}}"#,
+        )
+        .unwrap();
+        let kept = per
+            .command_targets
+            .expect("the rest of the status survives");
+        assert!(kept.network.is_none() && kept.site.is_none());
+        assert_eq!(kept.subject_persistent_id, 42);
     }
 
     /// Station fields on a manifest of another kind are ignored.

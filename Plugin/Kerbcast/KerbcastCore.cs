@@ -889,7 +889,7 @@ namespace Kerbcast
             if (_commandProvider == null || _teardown.LostCameraDisposal != CameraDisposal.Destroyed) return;
             List<KerbcastCamera> lost = null;
             foreach (var cam in _cameras)
-                if (cam is KerbcastCamera kc && kc.Rig is CommandCameraRig gr && gr.VantageLost)
+                if (cam is KerbcastCamera kc && kc.Rig is CommandCameraRig gr && gr.VantageLost && gr.Network == null)
                     (lost ?? (lost = new List<KerbcastCamera>())).Add(kc);
             if (lost == null) return;
             foreach (var kc in lost)
@@ -1672,6 +1672,7 @@ namespace Kerbcast
             sb.Append($"        \"subjectPersistentId\": {pid},\n");
             sb.Append($"        \"rangeM\": {Range(range)},\n");
             sb.Append($"        \"trackingLevel\": {CommandCameraTargets.TrackingLevel()},\n");
+            if (gr.Network != null) AppendNetwork(sb, gr);
             sb.Append("        \"targets\": [");
             for (int i = 0; i < targets.Count; i++)
             {
@@ -1683,6 +1684,38 @@ namespace Kerbcast
             }
             sb.Append(targets.Count > 0 ? "\n        ]\n" : "]\n");
             sb.Append("      },\n");
+        }
+
+        private static readonly List<NetworkVantageReading> NetworkReadings = new List<NetworkVantageReading>();
+
+        /*
+         * A tracking network's site and vantages. The manifest describes the
+         * site the camera was built at; `site` here is where it stands now,
+         * which the sidecar lays over the manifest's so the camera list
+         * follows each cut.
+         */
+        private static void AppendNetwork(System.Text.StringBuilder sb, CommandCameraRig gr)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var s = gr.Site;
+            sb.Append("        \"site\": { ");
+            sb.Append($"\"siteKey\": \"{JsonEsc(s.NodeName)}\", \"siteKind\": \"{CommandCameraProvider.SiteKindTag(s.Kind)}\", ");
+            sb.Append($"\"displayName\": \"{JsonEsc(gr.SiteLabel)}\", \"body\": \"{JsonEsc(s.Body != null ? s.Body.bodyName : "")}\", ");
+            sb.Append($"\"latitude\": {s.Latitude.ToString("R", ci)}, \"longitude\": {s.Longitude.ToString("R", ci)}, \"altitude\": {s.Altitude.ToString("R", ci)}");
+            sb.Append(" },\n");
+            NetworkReadings.Clear();
+            gr.Network.Readings(NetworkReadings);
+            sb.Append("        \"network\": { ");
+            sb.Append($"\"name\": \"{JsonEsc(gr.Network.Name)}\", \"state\": \"{(gr.Network.NoView ? CommandFrameState.NetworkNoView : CommandFrameState.NetworkOk)}\", \"vantages\": [");
+            for (int i = 0; i < NetworkReadings.Count; i++)
+            {
+                var r = NetworkReadings[i];
+                sb.Append(i == 0 ? "" : ", ");
+                sb.Append($"{{ \"siteKey\": \"{JsonEsc(r.SiteKey)}\", \"label\": \"{JsonEsc(r.Label)}\", \"state\": \"{NetworkMath.Code(r.State)}\", "
+                    + $"\"active\": {(r.Active ? "true" : "false")}, \"fallback\": {(r.Fallback ? "true" : "false")} }}");
+            }
+            NetworkReadings.Clear();
+            sb.Append("] },\n");
         }
 
         /* The bracket contract for clients older than 1.12 (CommandTrackJson). Newer clients read the state from each frame. */

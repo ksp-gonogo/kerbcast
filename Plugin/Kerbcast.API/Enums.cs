@@ -24,6 +24,8 @@ namespace Kerbcast.Api
         WorldModel = 7,
         /** <summary><see cref="ICommand.SetOptics"/>. Added in API 1.3.</summary> */
         Optics = 8,
+        /** <summary><see cref="ICommand.CreateNetworkCamera"/>, <see cref="ICommand.SetNetworkVantages"/>, <see cref="ICommand.DestroyNetworkCamera"/> and <see cref="ICommand.NetworkStatus"/>. Added in API 1.4.</summary> */
+        NetworkCameras = 9,
     }
 
     public enum CameraKind
@@ -182,6 +184,26 @@ namespace Kerbcast.Api
         BadNumber = 4,
         /** <summary>Kerbcast is not running in this scene, so there is no feed to set.</summary> */
         NotRunning = 5,
+    }
+
+    public enum NetworkResult
+    {
+        /** <summary>Never returned: the value of a result nobody set.</summary> */
+        Unknown = 0,
+        Ok = 1,
+        NotLockHolder = 2,
+        /** <summary>The flightId is no tracking network camera, built or waiting to be.</summary> */
+        NotCommandFeed = 3,
+        /** <summary>The list is null or empty: a network always has at least one vantage.</summary> */
+        NoVantages = 4,
+        /** <summary>Kerbcast is not running in this scene.</summary> */
+        NotRunning = 5,
+        /** <summary>A vantage is malformed (a missing name, a number out of range, an unknown body), or there are more than 64.</summary> */
+        BadVantage = 6,
+        /** <summary>The aim is unusable, as <see cref="ICommand.SetAim"/> would refuse it.</summary> */
+        BadAim = 7,
+        /** <summary>An option is negative, infinite or NaN.</summary> */
+        BadNumber = 8,
     }
 
     /** <summary>How a positioned world-model record moves.</summary> */

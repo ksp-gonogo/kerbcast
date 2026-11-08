@@ -71,6 +71,8 @@ var trackPins = new[]
         "the launch site a created lens is placed at, from the Space Center's chosen craft"),
     Pin.Line("CommandCameraSite.cs", "CommandCameraSite.VantageExists", "if (SubjectTrack.RecordCounts(protos[i]) && protos[i].persistentId == persistentId) return true;", 1,
         "the shared saved-record rule"),
+    Pin.Line("CommandCameraProvider.cs", "Feed.NetworkLaunchedFrom", "return _p._spaceCenter ? _track.LaunchedFrom : FlightGlobals.ActiveVessel?.launchedFrom;", 1,
+        "the launch site a network's unnamed launch site vantage is placed at, from the Space Center's chosen craft"),
 };
 
 /* The light-time history holds truth about every craft, so only the picture reads it. The solve itself is pure and anyone may run it on their own positions. */
@@ -154,6 +156,10 @@ var truthPins = new[]
         "warns that the default lens sits inside its own loaded craft"),
     Pin.Line("CommandCameraProvider.cs", "Feed.ResolveCreated", "if (_site.HasVantage && _site.Vantage.loaded)", 1,
         "warns that a created lens sits inside its own loaded craft"),
+    Pin.Line("CommandCameraProvider.cs", "Feed.NetworkLaunchedFrom", "return _p._spaceCenter ? _track.LaunchedFrom : FlightGlobals.ActiveVessel?.launchedFrom;", 1,
+        "the launch site a network's unnamed launch site vantage is placed at"),
+    Pin.Line("CommandCameraNetwork.cs", "CommandCameraNetwork.Gather", "v.Loaded = site.HasVantage && site.Vantage != null && site.Vantage.loaded;", 1,
+        "a network vantage riding a loaded craft would sit inside its parts, so it is passed over"),
     Pin.Line("CommandCameraMarker.cs", "CommandCameraMarker.Place", "_go.transform.position = new Vector3((float)p.X, (float)p.Y, (float)p.Z);", 1, "places the marker object, not a craft read"),
     Pin.Line("PicturePass.cs", "PicturePass.BeforeScaledLayer", "_afgBlock.SetVector(AfgOffsetId, b.afg.transform.position);", 1, "a moved body's atmosphere shell"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SyncScaledPose", "t.position = ScaledSpace.LocalToScaledSpace(near.transform.position);", 1, "the lens's own layer cameras"),

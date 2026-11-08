@@ -5,6 +5,28 @@ using UnityEngine;
 
 namespace Kerbcast
 {
+    /* The game's switches that decide which ground stations exist, read once per use. */
+    internal struct GameStationRules
+    {
+        public bool ExtraStationsOn;
+        public bool OtherLaunchSites;
+
+        /* Stock's defaults with no game loaded. */
+        public static GameStationRules Now()
+        {
+            var rules = new GameStationRules { ExtraStationsOn = true, OtherLaunchSites = true };
+            var p = HighLogic.CurrentGame?.Parameters;
+            if (p == null) return rules;
+            try
+            {
+                rules.ExtraStationsOn = p.CustomParams<CommNetParams>().enableGroundStations;
+                rules.OtherLaunchSites = p.Difficulty.AllowOtherLaunchSites;
+            }
+            catch (Exception) { /* a game without the CommNet parameters: stock's defaults */ }
+            return rules;
+        }
+    }
+
     /* Where a command camera stands: the body it sits on and body-fixed
        lat/lon/alt, which stay valid through floating-origin shifts and body
        rotation (the world position is recomputed from them every tick). */
@@ -18,6 +40,10 @@ namespace Kerbcast
         /* Altitude of the lens: the station's own altitude plus the configured offset. */
         public double Altitude { get; private set; }
         public bool IsHome { get; private set; }
+        /* A CommNet ground station's own flags, which decide whether the game has it switched on (StationEnabled). */
+        public bool IsCommNetHome { get; private set; }
+        public bool StationIsKsc { get; private set; }
+        public bool StationIsPermanent { get; private set; }
         /* Set for a lens standing beside a launch site rather than at a station. */
         public bool IsLaunchSite { get; private set; }
         /* How the site was found, for the log: launchsite, launchsite-transform,
@@ -269,6 +295,7 @@ namespace Kerbcast
                     NodeName = node, DisplayName = display, Body = body,
                     Latitude = lat, Longitude = lon, Altitude = OnGround(body, node, lat, lon, alt) + altitudeOffset,
                     IsHome = home.isKSC, Source = "commnet-fields",
+                    IsCommNetHome = true, StationIsKsc = home.isKSC, StationIsPermanent = home.isPermanent,
                 };
             }
 
@@ -285,6 +312,7 @@ namespace Kerbcast
                         NodeName = node, DisplayName = display, Body = body,
                         Latitude = tlat, Longitude = tlon, Altitude = OnGround(body, node, tlat, tlon, talt) + altitudeOffset,
                         IsHome = home.isKSC, Source = "commnet-transform",
+                        IsCommNetHome = true, StationIsKsc = home.isKSC, StationIsPermanent = home.isPermanent,
                     };
                 }
             }
@@ -341,6 +369,16 @@ namespace Kerbcast
                     return FromHome(h, height);
             return null;
         }
+
+        /*
+         * Whether the game has this ground station switched on. Stock leaves a
+         * station it has turned off in the scene (with "Enable Extra
+         * Groundstations" off it only skips building its network node), so
+         * ResolveStation still finds and places it; this applies the rule
+         * stock's CommNetHome.CreateNode uses. Any other site is always on.
+         */
+        public bool StationEnabled(GameStationRules rules) =>
+            !IsCommNetHome || NetworkMath.StationEnabled(rules.ExtraStationsOn, StationIsKsc, StationIsPermanent, rules.OtherLaunchSites);
 
         /* A lens `height` metres above the ground (or the sea) at a point on `body`. */
         public static CommandCameraSite ResolveSurface(CelestialBody body, double lat, double lon, double height)

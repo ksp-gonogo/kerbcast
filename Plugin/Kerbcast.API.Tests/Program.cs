@@ -35,13 +35,14 @@ var guidB = Guid.NewGuid();
 
 // Entry point with nothing installed.
 Check(KerbcastApi.Instance == null, "Instance is null without Kerbcast");
-Check(KerbcastApi.ApiMinor == 3, "ApiMinor is 3 for API 1.3");
+Check(KerbcastApi.ApiMinor == 4, "ApiMinor is 4 for API 1.4");
 Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(ApiFeature.CraftIdentity)
     && KerbcastApi.Supports(ApiFeature.Throttle) && KerbcastApi.Supports(ApiFeature.CommandFeeds)
     && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
     && KerbcastApi.Supports(ApiFeature.CommandAim) && KerbcastApi.Supports(ApiFeature.WorldModel),
     "shipped: every feature of API 1.0");
 Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.3");
+Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras, from API 1.4");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
 
 // Enum numbers are part of the contract.
@@ -56,6 +57,22 @@ Check((int)AimResult.BadNumber == 10 && (int)PublishResult.Invalid == 6 && (byte
 Check(default(OpticsResult) == OpticsResult.Unknown && (int)OpticsResult.Ok == 1 && (int)OpticsResult.NotLockHolder == 2
     && (int)OpticsResult.NotCommandFeed == 3 && (int)OpticsResult.BadNumber == 4 && (int)OpticsResult.NotRunning == 5
     && (int)ApiFeature.Optics == 8, "optics numbers are pinned");
+Check(default(NetworkResult) == NetworkResult.Unknown && (int)NetworkResult.Ok == 1 && (int)NetworkResult.NotLockHolder == 2
+    && (int)NetworkResult.NotCommandFeed == 3 && (int)NetworkResult.NoVantages == 4 && (int)NetworkResult.NotRunning == 5
+    && (int)NetworkResult.BadVantage == 6 && (int)NetworkResult.BadAim == 7 && (int)NetworkResult.BadNumber == 8
+    && (int)ApiFeature.NetworkCameras == 9, "network numbers are pinned");
+{
+    var opts = new NetworkOptions();
+    Check(opts.MinHoldUt == 10 && opts.MinHoldRealSeconds == 3 && opts.MarginStops == 0.5, "network options default to a 10 s hold, 3 real seconds and half a stop");
+    var st = NetworkVantage.Station("Crater Rim", "North dish");
+    Check(st.Kind == SiteKind.Station && st.Name == "Crater Rim" && st.Label == "North dish" && !st.Fallback
+        && st.Height == NetworkVantage.DefaultStationHeight, "a station vantage keeps its name, label and height");
+    var fb = st.AsFallback();
+    Check(fb.Fallback && fb.Label == "North dish" && fb.Name == "Crater Rim" && !st.Fallback, "AsFallback marks a copy, leaving the original");
+    Check(NetworkVantage.Vessel(42).PersistentId == 42 && NetworkVantage.Vessel(42).Label == null
+        && NetworkVantage.Surface(1, -0.1, -74.5).BodyIndex == 1 && NetworkVantage.LaunchSite("Runway").Distance == NetworkVantage.DefaultLaunchSiteDistance,
+        "every vantage kind fills its own fields");
+}
 var unset = new OpticsSettings();
 Check(double.IsNaN(unset.ResolutionArcsec) && double.IsNaN(unset.SeeingArcsec) && double.IsNaN(unset.SeeingAirmassPower)
     && double.IsNaN(unset.BrightnessHold) && double.IsNaN(unset.DaySkyStrength), "new optics settings keep every default (NaN)");
@@ -176,6 +193,49 @@ using (var kc = RecordingKerbcast.Install())
     Check(cmd.SetOptics(500, new OpticsSettings { SeeingArcsec = 2 }, "modA") == OpticsResult.Ok
         && cmd.SetOptics(500, new OpticsSettings(), "modA") == OpticsResult.Ok && kc.Command.Optics.Count == 0,
         "settings with every value NaN are no override, as null");
+    // Network cameras, under the same lock.
+    {
+        var stations = new[] { NetworkVantage.Station("KSC"), NetworkVantage.Station("Crater Rim", "North dish").AsFallback() };
+        Check(cmd.CreateNetworkCamera(stations, null, null, null, "modB", out uint none) == NetworkResult.NotLockHolder && none == 0,
+            "only the holder creates a network camera");
+        int before = kc.Command.Heartbeats;
+        Check(cmd.CreateNetworkCamera(new NetworkVantage[0], null, null, null, "modA", out _) == NetworkResult.NoVantages
+            && cmd.CreateNetworkCamera(null, null, null, null, "modA", out _) == NetworkResult.NoVantages,
+            "there is no default list: an empty or null one is refused");
+        Check(kc.Command.Heartbeats == before + 2, "and each holder's call is a heartbeat");
+        Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Station("") }, null, null, null, "modA", out _) == NetworkResult.BadVantage
+            && cmd.CreateNetworkCamera(new[] { NetworkVantage.Vessel(0) }, null, null, null, "modA", out _) == NetworkResult.BadVantage
+            && cmd.CreateNetworkCamera(new NetworkVantage[] { null }, null, null, null, "modA", out _) == NetworkResult.BadVantage,
+            "a malformed vantage is refused");
+        Check(cmd.CreateNetworkCamera(stations, null, null, new NetworkOptions { MarginStops = -1 }, "modA", out _) == NetworkResult.BadNumber,
+            "a negative option is refused");
+        Check(cmd.CreateNetworkCamera(stations, "Ground net", null, null, "modA", out uint net) == NetworkResult.Ok && net != 0,
+            "the holder creates one");
+        var feed = cmd.Feeds().FirstOrDefault(f => f.FlightId == net);
+        Check(feed != null && feed.Network && feed.Created && feed.SiteKey == "KSC", "Feeds lists it as a network camera at its first vantage");
+        var status = cmd.NetworkStatus(net);
+        Check(status.Count == 2 && status[0].Active && !status[1].Active && status[1].Fallback && status[1].Label == "North dish",
+            "NetworkStatus lists every vantage in order");
+        Check(cmd.NetworkStatus(500).Count == 0, "a feed at one site has no network status");
+        Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Surface(2, 1.5, 2.25) }, null, null, null, "modA", out uint mun) == NetworkResult.Ok
+            && cmd.Feeds().First(f => f.FlightId == mun).SiteKey == "surface:Mun:1.50000:2.25000", "a surface vantage's key names its body as Kerbcast does");
+        Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Surface(99, 0, 0) }, null, null, null, "modA", out _) == NetworkResult.BadVantage,
+            "an unknown body is refused");
+        cmd.DestroyNetworkCamera(mun, "modA");
+        Check(cmd.SetNetworkVantages(500, stations, null, "modA") == NetworkResult.NotCommandFeed, "only a network camera takes a list");
+        Check(cmd.SetNetworkVantages(net, new[] { NetworkVantage.Station("KSC") }, null, "modB") == NetworkResult.NotLockHolder, "only the holder replaces it");
+        Check(cmd.SetNetworkVantages(net, new[] { NetworkVantage.Station("Nye Island") }, new NetworkOptions { MinHoldUt = 30 }, "modA") == NetworkResult.Ok
+            && kc.Command.Networks[net].Count == 1 && kc.Command.NetworkOptionsSet[net].MinHoldUt == 30, "the holder replaces the list and options");
+        Check(cmd.SetNetworkVantages(net, new NetworkVantage[0], null, "modA") == NetworkResult.NoVantages && kc.Command.Networks[net].Count == 1,
+            "an empty replacement is refused and the list kept");
+        kc.Command.SetNetworkStatus(net, new[] { new NetworkVantageStatus { SiteKey = "Nye Island", Label = "Nye Island", Active = true, State = "occluded", Score = double.NaN } });
+        Check(cmd.NetworkStatus(net)[0].State == "occluded", "a test sets the status it wants to read");
+        Check(cmd.DestroyNetworkCamera(net, "modB") == NetworkResult.NotLockHolder, "only the holder removes it");
+        Check(cmd.DestroyNetworkCamera(500, "modA") == NetworkResult.NotCommandFeed, "a feed at one site is no network to remove");
+        Check(cmd.DestroyNetworkCamera(net, "modA") == NetworkResult.Ok && cmd.Feeds().All(f => f.FlightId != net)
+            && cmd.NetworkStatus(net).Count == 0 && cmd.DestroyNetworkCamera(net, "modA") == NetworkResult.NotCommandFeed,
+            "the holder removes it, once");
+    }
     Check(cmd.TakeLock("modA", LockOptions.WorldModelRequired) == LockResult.Renewed, "the holder renews");
     Check(cmd.TakeLock("modB", LockOptions.None) == LockResult.HeldByOther, "another owner is refused");
     Check(Throws<ArgumentException>(() => cmd.TakeLock("", LockOptions.None)), "an empty owner throws");
@@ -188,7 +248,7 @@ using (var kc = RecordingKerbcast.Install())
         "an aim that allows an uncertain craft reaches the implementation with the flag");
     Check(cmd.SetAim(500, Aim.Orbit(1, 0, 0.01, 700000, 0, 0, 0, 0, 42), "modA") == AimResult.Ok
         && kc.Command.Aims[500].Kind == AimKind.Orbit && kc.Command.Aims[500].SemiMajorAxis == 700000, "the holder's aim is kept");
-    Check(cmd.Feeds().Single().SiteKey == "KSC" && cmd.Targets(500).Count == 0, "feeds and targets as arranged");
+    Check(cmd.Feeds().Single(f => !f.Network).SiteKey == "KSC" && cmd.Targets(500).Count == 0, "feeds and targets as arranged");
     Check(Throws<ArgumentOutOfRangeException>(() => cmd.SetLightSpeed("modA", 0)) && Throws<ArgumentOutOfRangeException>(() => cmd.SetLightSpeed("modA", double.PositiveInfinity))
         && kc.Command.LightSpeed == null, "SetLightSpeed refuses zero and infinity; no delay until set");
     Check(!cmd.SetLightSpeed("modB", 3e8) && kc.Command.LightSpeed == null, "only the lock holder sets the light speed");

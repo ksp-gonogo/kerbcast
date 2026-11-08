@@ -32,6 +32,7 @@ namespace Kerbcast
         private readonly string _siteKey;
         private readonly SubjectSelection _selection;
         private readonly uint _flightId;
+        private readonly bool _recordsSubject;
 
         private long _scopeFrame = long.MinValue;
         private long _scopeGeneration = -1;
@@ -50,9 +51,11 @@ namespace Kerbcast
         private bool _threwLogged;
 
         /* A feed's source: its site as it is now, its subject request, and its flightId for the log. */
+        /* `recordsSubject` false keeps the craft it resolves out of the selection, for a source that only scores, beside the feed's own. */
         public ProviderFixSource(WorldModelStore store, SiteBindings sites, Func<CommandCameraSite> site,
-            SubjectSelection selection, uint flightId)
+            SubjectSelection selection, uint flightId, bool recordsSubject = true)
         {
+            _recordsSubject = recordsSubject;
             _store = store;
             _sites = sites;
             _site = site;
@@ -121,7 +124,7 @@ namespace Kerbcast
             }
             _subjectPid = fix.State == CraftFixState.Unknown ? 0 : fix.PersistentId;
             _subjectName = _subjectPid == 0 ? "" : fix.Name ?? "";
-            _selection.ResolvedPersistentId = _subjectPid;
+            if (_recordsSubject) _selection.ResolvedPersistentId = _subjectPid;
             return fix;
         }
 

@@ -78,13 +78,7 @@ namespace Kerbcast
                 error = $"no craft with persistentId={vantage.PersistentId}";
                 return 0;
             }
-            uint flightId;
-            do
-            {
-                flightId = CameraId.CommandCameraWireId(CameraId.CreatedCommandCameraKey(_nextSerial++));
-            }
-            while (taken.Contains(flightId) || _feeds.Any(f => f.FlightId == flightId));
-
+            uint flightId = NextFlightId(taken);
             var feed = new Feed(this, vantage, name, token, flightId);
             if (aim != null) feed.SetAim(aim, aimOrbit);
             _feeds.Add(feed);
@@ -94,12 +88,70 @@ namespace Kerbcast
             return flightId;
         }
 
+        /* Queues a tracking network camera over `vantages` (see CommandCameraNetwork), built once one of them resolves. Returns its flightId, or 0 with `error` set. */
+        public uint CreateNetwork(IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning, CommandAim aim, Orbit aimOrbit,
+            IReadOnlyCollection<uint> taken, out string error)
+        {
+            error = NetworkInvalid(vantages, tuning);
+            if (error != null) return 0;
+            uint flightId = NextFlightId(taken);
+            var feed = new Feed(this, null, name, "", flightId, new List<NetworkVantageSpec>(vantages), tuning);
+            if (aim != null) feed.SetAim(aim, aimOrbit);
+            _feeds.Add(feed);
+            Debug.Log($"[Kerbcast][CMDCAM] network camera cam={flightId} requested over {vantages.Count} vantage(s)"
+                + (string.IsNullOrEmpty(name) ? "" : $" name='{name}'"));
+            return flightId;
+        }
+
+        /* Replaces a network camera's list, built or not. False when `flightId` is no network camera; `error` says why the list is refused. */
+        public bool SetNetworkVantages(uint flightId, IList<NetworkVantageSpec> vantages, NetworkTuning? tuning, out string error)
+        {
+            var feed = _feeds.FirstOrDefault(f => f.IsNetwork && f.FlightId == flightId);
+            error = feed == null ? "not a network camera" : NetworkInvalid(vantages, tuning ?? feed.Tuning);
+            if (error != null) return false;
+            feed.SetVantages(new List<NetworkVantageSpec>(vantages), tuning ?? feed.Tuning);
+            return true;
+        }
+
+        public bool IsNetwork(uint flightId) => _feeds.Any(f => f.IsNetwork && f.FlightId == flightId);
+
+        /* Every site key a network camera's vantages have or will have, null when `flightId` is no network camera. */
+        public List<string> NetworkSiteKeys(uint flightId) => _feeds.FirstOrDefault(f => f.IsNetwork && f.FlightId == flightId)?.NetworkSiteKeys();
+
+        /* Null when the list is usable, else why not: a network needs at least one vantage, at most NetworkMath.MaxVantages, each well formed. */
+        internal static string NetworkInvalid(IList<NetworkVantageSpec> vantages, NetworkTuning tuning)
+        {
+            if (vantages == null || vantages.Count == 0) return "a network needs at least one vantage";
+            if (vantages.Count > NetworkMath.MaxVantages) return $"a network takes at most {NetworkMath.MaxVantages} vantages";
+            if (!tuning.Valid) return "hold times and margin must be finite, 0 or more";
+            for (int i = 0; i < vantages.Count; i++)
+            {
+                var v = vantages[i]?.Vantage;
+                string why = v == null ? "no vantage" : v.Invalid();
+                if (why != null) return $"vantage {i}: {why}";
+                if (v.Kind == CommandVantageKind.Surface && FlightGlobals.GetBodyByName(v.Body) == null) return $"vantage {i}: no body named '{v.Body}'";
+            }
+            return null;
+        }
+
+        private uint NextFlightId(IReadOnlyCollection<uint> taken)
+        {
+            uint flightId;
+            do
+            {
+                flightId = CameraId.CommandCameraWireId(CameraId.CreatedCommandCameraKey(_nextSerial++));
+            }
+            while (taken.Contains(flightId) || _feeds.Any(f => f.FlightId == flightId));
+            return flightId;
+        }
+
         /* Forgets a created camera, built or not. False for the default camera
            or an unknown id. The caller disposes the built camera. */
         public bool Destroy(uint flightId)
         {
             int i = _feeds.FindIndex(f => f.Created && f.FlightId == flightId);
             if (i < 0) return false;
+            _feeds[i].Forget();
             _feeds.RemoveAt(i);
             Debug.Log($"[Kerbcast][CMDCAM] command camera cam={flightId} destroyed");
             return true;
@@ -160,7 +212,11 @@ namespace Kerbcast
             foreach (var feed in _feeds.ToList())
             {
                 feed.Enumerate(vessel, existingFlightIds, result);
-                if (feed.Dropped) _feeds.Remove(feed);
+                if (feed.Dropped)
+                {
+                    feed.Forget();
+                    _feeds.Remove(feed);
+                }
             }
             return result;
         }
@@ -173,9 +229,17 @@ namespace Kerbcast
             public readonly CommandVantage Vantage;
             public readonly string Name;
             public readonly string Token;
-            public bool Created => Vantage != null;
+            public bool Created => Vantage != null || IsNetwork;
 
-            public string SiteKey => _site != null ? _site.NodeName : CommandCameraSite.KeyFor(Vantage);
+            /* A tracking network's list as the host last gave it, and the network once the feed is first enumerated. */
+            private List<NetworkVantageSpec> _networkSpecs;
+            private CommandCameraNetwork _network;
+            public bool IsNetwork { get; }
+            public NetworkTuning Tuning { get; private set; }
+
+            public string SiteKey => _site != null ? _site.NodeName
+                : IsNetwork ? (_networkSpecs != null && _networkSpecs.Count > 0 ? _networkSpecs[0].Key : null)
+                : CommandCameraSite.KeyFor(Vantage);
             /* Fixed at creation for a created camera; the default's comes from its site. */
             public uint FlightId { get; private set; }
             public bool Built { get; private set; }
@@ -203,13 +267,17 @@ namespace Kerbcast
             private KerbcastSettings S => _p._settings;
             private string Label => Created ? $"command camera cam={FlightId}" : "command camera";
 
-            public Feed(CommandCameraProvider p, CommandVantage vantage, string name, string token, uint flightId)
+            public Feed(CommandCameraProvider p, CommandVantage vantage, string name, string token, uint flightId,
+                List<NetworkVantageSpec> network = null, NetworkTuning tuning = default)
             {
                 _p = p;
                 Vantage = vantage;
                 Name = name;
                 Token = token ?? "";
                 FlightId = flightId;
+                IsNetwork = network != null;
+                _networkSpecs = network;
+                Tuning = tuning;
                 if (Created)
                 {
                     RetryPending = true;
@@ -240,6 +308,27 @@ namespace Kerbcast
                 if (result == Api.AimResult.Ok) return true;
                 Debug.LogWarning($"[Kerbcast][CMDCAM] {Label}: aim {_pendingAim} dropped once its site resolved ({result}); the camera starts at its default");
                 return false;
+            }
+
+            public List<string> NetworkSiteKeys()
+            {
+                var keys = new List<string>();
+                if (_network != null) _network.SiteKeys(keys);
+                else if (_networkSpecs != null) foreach (var s in _networkSpecs) keys.Add(s.Key);
+                return keys;
+            }
+
+            public void SetVantages(List<NetworkVantageSpec> specs, NetworkTuning tuning)
+            {
+                Tuning = tuning;
+                _networkSpecs = specs;
+                _network?.SetVantages(specs, tuning);
+            }
+
+            /* The feed is gone; a network not handed to a rig lets go of its game events here. */
+            public void Forget()
+            {
+                if (!Built) _network?.Dispose();
             }
 
             /* The lock changed: the request may now resolve differently, and under the lock a default names no craft. */
@@ -291,7 +380,11 @@ namespace Kerbcast
                     uint subject = _pendingAim?.SubjectPersistentId ?? 0;
                     if (subject != 0) _selection.Choose(subject);
                 }
-                if (_site == null && !(Created ? ResolveCreated(vessel) : ResolveDefault(vessel))) return;
+                if (IsNetwork && _network == null)
+                {
+                    _network = _p.NewNetwork(FlightId, Name, _networkSpecs, Tuning, _selection, _known, NetworkLaunchedFrom);
+                }
+                if (_site == null && !(IsNetwork ? ResolveNetwork() : Created ? ResolveCreated(vessel) : ResolveDefault(vessel))) return;
 
                 uint flightId = Created ? FlightId : CameraId.CommandCameraWireId(_site.NodeName);
                 FlightId = flightId;
@@ -319,8 +412,8 @@ namespace Kerbcast
                 }
                 RetryPending = false;
 
-                string name = Created
-                    ? CommandCameraNaming.FeedName(Name, Vantage.Kind, _site.NodeName, _site.DisplayName, _site.Body?.bodyName)
+                string name = IsNetwork ? _network.Name
+                    : Created ? CommandCameraNaming.FeedName(Name, Vantage.Kind, _site.NodeName, _site.DisplayName, _site.Body?.bodyName)
                     : null;
                 CommandCameraMount mount = null;
                 try
@@ -357,7 +450,9 @@ namespace Kerbcast
                             S.CommandCameraDebugUtStripe,
                             _p.LensOptics(_site));
                         cam.Rig = rig;
-                        if (_pendingAim != null && store.Governed && !PendingAimStands(_site.NodeName)) SetAim(null, null);
+                        if (IsNetwork) rig.AttachNetwork(_network);
+                        /* A network's aim was checked against every vantage when it was set; one site's verdict never drops it. */
+                        if (_pendingAim != null && store.Governed && !IsNetwork && !PendingAimStands(_site.NodeName)) SetAim(null, null);
                         if (_pendingAim != null) rig.SetAim(_pendingAim, _pendingOrbit);
                         /* Applied once: a rebuilt camera must not bring back an aim from before a lock. */
                         _pendingAim = null;
@@ -370,7 +465,9 @@ namespace Kerbcast
                     }
                     result.Add(cam);
                     Built = true;
-                    Debug.Log(Created
+                    Debug.Log(IsNetwork
+                        ? $"[Kerbcast][CMDCAM] network camera cam={flightId} created as '{name}' over {_network.Count} vantage(s), first at {_site}"
+                        : Created
                         ? $"[Kerbcast][CMDCAM] command camera cam={flightId} created at {Vantage} as '{name}' ({_site})"
                         : $"[Kerbcast][CMDCAM] command camera cam={flightId} created for site {_site.NodeName}");
                 }
@@ -488,37 +585,11 @@ namespace Kerbcast
                 if (_siteAttempts == 0) _siteFirstAttemptAt = now;
                 _siteAttempts++;
                 var v = Vantage;
-                string pending = null;
-                switch (v.Kind)
-                {
-                    case CommandVantageKind.LaunchSite:
-                    {
-                        bool explicitSite = v.Name.Length > 0;
-                        string from = explicitSite ? v.Name
-                            : _p._spaceCenter ? _track.LaunchedFrom
-                            : (FlightGlobals.ActiveVessel ?? vessel)?.launchedFrom;
-                        _site = CommandCameraSite.ResolveLaunchSite(from, v.Distance, v.Bearing, v.Height,
-                            out pending, fallbackToPad: !explicitSite);
-                        if (_site == null && pending == null)
-                            return Drop(explicitSite ? $"no launch site named '{v.Name}'" : "no launch site found");
-                        break;
-                    }
-                    case CommandVantageKind.Station:
-                        _site = CommandCameraSite.ResolveStation(v.Name, v.Height);
-                        if (_site == null) pending = $"no ground station '{v.Name}' placed yet";
-                        break;
-                    case CommandVantageKind.Surface:
-                    {
-                        var body = FlightGlobals.GetBodyByName(v.Body);
-                        if (body == null) return Drop($"no body named '{v.Body}'");
-                        _site = CommandCameraSite.ResolveSurface(body, v.Latitude, v.Longitude, v.Height);
-                        break;
-                    }
-                    case CommandVantageKind.Vessel:
-                        _site = CommandCameraSite.ResolveVessel(v.PersistentId);
-                        if (_site == null) pending = $"no craft with persistentId={v.PersistentId}";
-                        break;
-                }
+                string from = v.Kind != CommandVantageKind.LaunchSite || v.Name.Length > 0 ? v.Name
+                    : _p._spaceCenter ? _track.LaunchedFrom
+                    : (FlightGlobals.ActiveVessel ?? vessel)?.launchedFrom;
+                _site = ResolveVantage(v, from, out string pending, out string fatal);
+                if (fatal != null) return Drop(fatal);
                 if (_site != null)
                 {
                     RetryPending = false;
@@ -536,13 +607,94 @@ namespace Kerbcast
                 return false;
             }
 
+            /* The launch site a network's LaunchSite vantage stands beside: the one it names, else the one a created lens would take. */
+            private string NetworkLaunchedFrom(CommandVantage v)
+            {
+                if (v.Name.Length > 0) return v.Name;
+                return _p._spaceCenter ? _track.LaunchedFrom : FlightGlobals.ActiveVessel?.launchedFrom;
+            }
+
+            /* A network camera stands at the first of its vantages that resolves; it is dropped only when none does. */
+            private bool ResolveNetwork()
+            {
+                float now = Time.realtimeSinceStartup;
+                _site = _network.FirstSite(now);
+                if (_site != null)
+                {
+                    RetryPending = false;
+                    return true;
+                }
+                if (_network.AllGaveUp) return Drop("no vantage resolved");
+                Retry(now);
+                return false;
+            }
+
             private bool Drop(string why)
             {
                 RetryPending = false;
                 Dropped = true;
-                Debug.LogWarning($"[Kerbcast][CMDCAM] {Label} at {Vantage} not created: {why}");
+                Debug.LogWarning($"[Kerbcast][CMDCAM] {Label} at {(IsNetwork ? (object)"its vantages" : Vantage)} not created: {why}");
                 return false;
             }
+        }
+
+        /*
+         * The site `v` names, exactly where asked or nowhere. `launchedFrom`
+         * names the launch site for a LaunchSite vantage. Null with `pending`
+         * set while the place may not be loaded yet, or with `fatal` set when
+         * it never will be.
+         */
+        internal static CommandCameraSite ResolveVantage(CommandVantage v, string launchedFrom, out string pending, out string fatal)
+        {
+            pending = null;
+            fatal = null;
+            CommandCameraSite site = null;
+            switch (v.Kind)
+            {
+                case CommandVantageKind.LaunchSite:
+                {
+                    bool explicitSite = v.Name.Length > 0;
+                    site = CommandCameraSite.ResolveLaunchSite(launchedFrom, v.Distance, v.Bearing, v.Height,
+                        out pending, fallbackToPad: !explicitSite);
+                    if (site == null && pending == null) fatal = explicitSite ? $"no launch site named '{v.Name}'" : "no launch site found";
+                    break;
+                }
+                case CommandVantageKind.Station:
+                    site = CommandCameraSite.ResolveStation(v.Name, v.Height);
+                    if (site == null) pending = $"no ground station '{v.Name}' placed yet";
+                    break;
+                case CommandVantageKind.Surface:
+                {
+                    var body = FlightGlobals.GetBodyByName(v.Body);
+                    if (body == null) fatal = $"no body named '{v.Body}'";
+                    else site = CommandCameraSite.ResolveSurface(body, v.Latitude, v.Longitude, v.Height);
+                    break;
+                }
+                case CommandVantageKind.Vessel:
+                    site = CommandCameraSite.ResolveVessel(v.PersistentId);
+                    if (site == null) pending = $"no craft with persistentId={v.PersistentId}";
+                    break;
+            }
+            return site;
+        }
+
+        private CommandCameraNetwork NewNetwork(uint flightId, string name, List<NetworkVantageSpec> specs, NetworkTuning tuning,
+            SubjectSelection selection, IFixSource truth, Func<CommandVantage, string> launchedFrom)
+        {
+            var wiring = new NetworkWiring
+            {
+                FlightId = flightId,
+                Selection = selection,
+                Truth = truth,
+                Authority = _authority,
+                LaunchedFrom = launchedFrom,
+                FovMin = LensFovMin,
+                Lens = LensOptics,
+                ScoreKnobs = LensKnobs,
+                DaylightStops = () => _settings.NetworkDaylightStops,
+                TerrainSamples = CommandCameraRig.TerrainSampleCount,
+            };
+            return new CommandCameraNetwork(wiring, name, specs, tuning);
         }
 
         /* Tightest zoom for the lens at `site`. A launch-site camera is a
@@ -592,6 +744,19 @@ namespace Kerbcast
             };
         }
 
+        /*
+         * The lens knobs LensOptics gives `site`, with deep-space optics on or
+         * off and without its label, for scoring a network's vantages: with
+         * the effect off the score still ranks them as the effect would.
+         */
+        private OpticsKnobs LensKnobs(CommandCameraSite site)
+        {
+            var s = _settings;
+            double l1 = s.OpticsResolutionLevel1, l2 = s.OpticsResolutionLevel2, l3 = s.OpticsResolutionLevel3;
+            double level = site.IsLaunchSite ? 0 : CommandCameraTargets.Gated() ? CommandCameraTargets.NormLevel() : 1;
+            return s.OpticsDefaults(OpticsModel.ResolutionForLevel(level, l1, l2, l3));
+        }
+
         /* Site identity for /cameras: its stable key and kind, its vantage
            craft, and where it stands. station_id is what a 1.11 sidecar needs
            to list the camera at all. A created camera also carries the token
@@ -614,7 +779,7 @@ namespace Kerbcast
         }
 
         /* The wire's camelCase names for SiteKind. */
-        private static string SiteKindTag(Api.SiteKind kind)
+        internal static string SiteKindTag(Api.SiteKind kind)
         {
             switch (kind)
             {

@@ -23,7 +23,13 @@ namespace Kerbcast.Api
         public uint FlightId { get; set; }
         public string DisplayName { get; set; }
 
-        /** <summary>Stable name of the place the lens stands, unchanged when its craft docks.</summary> */
+        /**
+         * <summary>
+         * Stable name of the place the lens stands, unchanged when its craft docks. On a tracking network camera
+         * (<see cref="Network"/>) it names the vantage the camera shows now, and changes on every cut: key a
+         * network camera by its FlightId.
+         * </summary>
+         */
         public string SiteKey { get; set; }
         public SiteKind SiteKind { get; set; }
 
@@ -38,6 +44,9 @@ namespace Kerbcast.Api
 
         /** <summary>Whether a client or a mod created the feed, rather than settings.</summary> */
         public bool Created { get; set; }
+
+        /** <summary>A tracking network camera, which moves between vantages (see <see cref="ICommand.NetworkStatus"/>). Added in API 1.4.</summary> */
+        public bool Network { get; set; }
     }
 
     /**

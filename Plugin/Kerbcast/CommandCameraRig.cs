@@ -32,6 +32,7 @@ namespace Kerbcast
         private const float SkyProbeSeconds = 10.0f;
         private const double ModelProxyDistance = 50000.0;
         private const int TerrainSamples = 48;
+        internal const int TerrainSampleCount = TerrainSamples;
         /* Below this many pixels across, the model is drawn by the supersampled
            sub-pixel camera, because a direct render this small aliases and
            flickers; below the floor its light is too faint to register. */
@@ -61,8 +62,8 @@ namespace Kerbcast
         private readonly DrawnSubject _drawn;
         private readonly CommandAuthority _authority;
         private readonly CommandTrackEventRing _events = new CommandTrackEventRing(EventCapacity);
-        private readonly CommandCameraOcclusion _occlusion;
-        private readonly CommandCameraForecast _forecast;
+        private CommandCameraOcclusion _occlusion;
+        private CommandCameraForecast _forecast;
         /* Per-frame occlusion test cost, smoothed over about ten solves. */
         private double _occlusionMs;
         private const double OcclusionMsAlpha = 0.1;
@@ -74,7 +75,7 @@ namespace Kerbcast
         private bool _forecastFailLogged;
         private readonly uint _flightId;
         private readonly double _frameFraction;
-        private readonly Func<double> _fovMinSource;
+        private Func<double> _fovMinSource;
         private double _fovMin;
         private float _fovMinCheckedAt;
         private readonly double _fovMax;
@@ -94,7 +95,7 @@ namespace Kerbcast
         private double _subpixelAcross;
 
         /* Deep-space optics: null with the setting off or no shaders for it. */
-        private readonly Func<OpticsLens> _opticsLens;
+        private Func<OpticsLens> _opticsLens;
         private readonly CommandCameraOptics _optics;
         private readonly SeeingNoise _seeingNoise;
         private OpticsLens _lens;
@@ -118,6 +119,7 @@ namespace Kerbcast
         private CommandAim _framingAim;
         private uint _framingSubject;
         private uint _framingVantage;
+        private int _framingSite;
         private float _lastPrepare = -1f;
 
         private bool _first = true;
@@ -229,6 +231,15 @@ namespace Kerbcast
         public string AuthorityOwner => _authority != null ? _authority.Owner : null;
         internal CommandFeedOrders CurrentOrders => _authority != null && _authority.Registered ? _authority.Orders(_flightId) : null;
         public string StationNodeName => _mount.Site.NodeName;
+        /* Counts the cuts that moved the lens to another site, so every key that notes "the vantage changed" sees a station-to-station move too. */
+        private int _siteGeneration;
+        /* The next frame snaps its framing and zoom instead of easing them from the last site's. */
+        private bool _snapNext;
+        /* The site's label as the feed shows it: a network vantage's own label, else the site's name. */
+        public string SiteLabel => _siteLabel ?? StationDisplayName;
+        private string _siteLabel;
+        /* The tracking network that moves this lens between its vantages; null for a camera at one site. */
+        internal CommandCameraNetwork Network { get; private set; }
         internal CommandCameraSite Site => _mount.Site;
         /* The widest field the lens opens to, in degrees. */
         internal double FovMax => _fovMax;
@@ -282,6 +293,9 @@ namespace Kerbcast
             s.Sunlit = Sunlit;
             s.Blank = Blank;
             s.WaitingForTarget = WaitingForTarget;
+            s.SiteKey = _mount.Site.NodeName;
+            s.SiteLabel = SiteLabel;
+            if (Network != null) s.NetworkState = Network.NoView ? CommandFrameState.NetworkNoView : CommandFrameState.NetworkOk;
             s.AuthorityOwner = AuthorityOwner;
             s.SubjectPersistentId = SubjectPersistentId;
             if (_aim != null) s.AimKind = KerbcastCore.AimKindTag(_aim.Kind);
@@ -574,6 +588,7 @@ namespace Kerbcast
             Framed(RangeM, SubjectShape(), out double fitRadius, out double fitRange);
             FramingFits = !HasFix || CommandCameraMath.FramingFits(fitRadius, fitRange, _fovMax);
             Blank = CommandCameraMath.BlankReason(governed, timedOut, orders?.Blank, VantageLost, _authority?.SilentText);
+            if (Blank == null && Network != null && Network.NothingPlaceable) Blank = CommandCameraMath.BlankNoVantage;
             UpdateBracket(now);
             NoteGovernance(ut, governed);
             OccludedSinceUt = CommandCameraMath.OccludedSince(Occluded, OccludedSinceUt, ut);
@@ -792,24 +807,27 @@ namespace Kerbcast
         private double _slewQuietMaxDeg;
         private CommandAim _jumpAim;
         private uint _jumpSubject, _jumpVantage;
+        private int _jumpSite;
         private long _jumpGeneration;
         private SubjectAimMode _jumpMode;
 
         /* Whether the subject, the aim or the vantage changed since the last solve, which makes a craft aim wait for its subject again. */
-        private bool WaitKeyChanged() => _waitKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId);
+        private bool WaitKeyChanged() => _waitKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId, _siteGeneration);
 
         /* The aim, subject and vantage a solve was keyed on, to tell when one of them changes. */
         private struct AimKey
         {
             private CommandAim _aim;
             private uint _subject, _vantage;
+            private int _site;
 
-            public bool Changed(CommandAim aim, uint subject, uint vantage)
+            public bool Changed(CommandAim aim, uint subject, uint vantage, int site)
             {
-                bool changed = !CommandAim.SameAs(aim, _aim) || subject != _subject || vantage != _vantage;
+                bool changed = !CommandAim.SameAs(aim, _aim) || subject != _subject || vantage != _vantage || site != _site;
                 _aim = aim;
                 _subject = subject;
                 _vantage = vantage;
+                _site = site;
                 return changed;
             }
         }
@@ -830,12 +848,13 @@ namespace Kerbcast
             var snap = store != null ? store.Capture(Time.frameCount, ut).Snapshot : null;
             long generation = snap != null ? snap.Generation : 0;
             changed = !CommandAim.SameAs(_aim, _jumpAim) || subject != _jumpSubject || vantage != _jumpVantage
-                || _mode != _jumpMode;
+                || _siteGeneration != _jumpSite || _mode != _jumpMode;
             bool jumped = changed || generation != _jumpGeneration;
             _jumpMode = _mode;
             _jumpAim = _aim;
             _jumpSubject = subject;
             _jumpVantage = vantage;
+            _jumpSite = _siteGeneration;
             _jumpGeneration = generation;
             return jumped;
         }
@@ -1082,7 +1101,7 @@ namespace Kerbcast
                 LocateDrawn(ut, station, body);
                 return known;
             }
-            if (_placeKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId)) _truthPlace.Reset();
+            if (_placeKey.Changed(_aim, _known.SubjectPersistentId, _mount.Site.VantagePersistentId, _siteGeneration)) _truthPlace.Reset();
             var now = _known.Subject(ut);
             LocateDrawn(ut, station, body);
             var raw = CommandCameraMath.TruthAimPlaceFor(AimIsCraft, now.PersistentId != 0 && _drawn.PersistentId == now.PersistentId, _drawnOk, _drawn.ShownPast, _drawn.LightGone);
@@ -1499,12 +1518,64 @@ namespace Kerbcast
             else if (_subpixel != null) _standIn.AttachSubpixel(_subpixel.Camera);
         }
 
+        /* Hands the lens to `network`, which takes its first pass at once so the camera starts at the clearest vantage. */
+        internal void AttachNetwork(CommandCameraNetwork network)
+        {
+            Network = network;
+            network.Attach();
+            network.Step(this, true);
+        }
+
+        /*
+         * Moves the lens to another site in one step, for a tracking network's
+         * cut. The site's own skyline, forecast, zoom limit and lens come with
+         * it, as a camera standing there alone would have them. Nothing eased
+         * on the old site carries over: the aim, the handover and the place a
+         * light-delayed aim held start afresh, and the next frame snaps its
+         * framing to the new range.
+         */
+        internal void Resite(CommandCameraSite site, CommandCameraOcclusion occlusion, CommandCameraForecast forecast,
+            Func<double> fovMin, Func<OpticsLens> opticsLens, string label)
+        {
+            _mount.Site = site;
+            _siteLabel = label;
+            _siteGeneration++;
+            _occlusion = occlusion;
+            _forecast = forecast;
+            _fovMinSource = fovMin;
+            _fovMin = fovMin();
+            _fovMinCheckedAt = Time.realtimeSinceStartup;
+            if (_optics != null && opticsLens != null)
+            {
+                _opticsLens = opticsLens;
+                _lensCheckedAt = float.MinValue;
+            }
+            _slew.Reset();
+            _slewAt = double.NaN;
+            _slewUt = double.NaN;
+            ForgetHandover();
+            _framing.Reset();
+            _truthPlace.Reset();
+            _knownHold.Reset();
+            _snapNext = true;
+            _first = true;
+            /* An occlusion at the new site starts when it is first seen there, and its ground is drawn by its own test. */
+            OccludedSinceUt = double.NaN;
+            _groundDrawn = false;
+            /* The frame state still names the old site until the next solve; a status read in between must not pair them. */
+            _solvedAt = float.MinValue;
+        }
+
+        /* A label change with no move, when a host relabels the vantage the lens stands at. */
+        internal void Relabel(string label) => _siteLabel = label;
+
         /* Keeps the status geometry and the occlusion log live while nobody is
            watching the feed (PrepareRender only runs for a granted capture). */
         public void Poll()
         {
             _optics?.Idle();
             float now = Time.unscaledTime;
+            Network?.Step(this, false);
             if (now - _solvedAt < PollStaleSeconds) return;
             if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
             Solve(Planetarium.GetUniversalTime(), now, out _, out _, out _, out _, out _);
@@ -1608,6 +1679,9 @@ namespace Kerbcast
             if (anchor == null) return RigFrame.Skip;
 
             float now = Time.unscaledTime;
+            /* Before the solve, so a cut lands whole on this frame: the pose, the picture and the label all come from the new site. */
+            Network?.Step(this, false);
+            site = _mount.Site;
             double dt = _lastPrepare < 0 ? double.MaxValue : now - _lastPrepare;
             _lastPrepare = now;
             double ut = Planetarium.GetUniversalTime();
@@ -1641,15 +1715,23 @@ namespace Kerbcast
             var shape = SubjectShape();
             Framed(distance, shape, out double framedRadius, out double framedRange);
             double step = _frames.Next(dt);
+            if (_snapNext)
+            {
+                /* A cut shows the new site at its own framing from its first frame. */
+                _snapNext = false;
+                step = double.MaxValue;
+            }
             if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None)
             {
                 /* Not AimJumped, which also fires on every world model publish: the box would start over on each record and pump again. */
                 uint subject = _known.SubjectPersistentId, vantage = site.VantagePersistentId;
-                if (!CommandAim.SameAs(_aim, _framingAim) || subject != _framingSubject || vantage != _framingVantage)
+                if (!CommandAim.SameAs(_aim, _framingAim) || subject != _framingSubject || vantage != _framingVantage
+                    || _siteGeneration != _framingSite)
                     _framing.Reset();
                 _framingAim = _aim;
                 _framingSubject = subject;
                 _framingVantage = vantage;
+                _framingSite = _siteGeneration;
                 double certain = framedRadius - (AimIsCraft ? _knownUncertainty : 0.0);
                 _fov = _framing.Step(CommandCameraMath.FramingTan(framedRadius, framedRange),
                     CommandCameraMath.FramingTan(certain, framedRange), _fov, _frameFraction,
@@ -2542,6 +2624,8 @@ namespace Kerbcast
             _subpixel?.Dispose();
             _subpixel = null;
             _optics?.Dispose();
+            Network?.Dispose();
+            Network = null;
             _mount.DestroyAnchor();
             Debug.Log($"{Tag} cam={_flightId} rig down");
         }

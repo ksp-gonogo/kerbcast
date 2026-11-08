@@ -148,6 +148,7 @@
     <Compile Remove="AimSourceRegistry.Tests/**/*.cs" />
     <Compile Remove="TrackAim.Tests/**/*.cs" />
     <Compile Remove="CommandCameraMath.Tests/**/*.cs" />
+    <Compile Remove="CommandCameraNetwork.Tests/**/*.cs" />
     <Compile Remove="CommandCameraRequests.Tests/**/*.cs" />
     <Compile Remove="TruthReads.Tests/**/*.cs" />
     <Compile Remove="SubjectSelection.Tests/**/*.cs" />

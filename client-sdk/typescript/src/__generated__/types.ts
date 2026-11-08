@@ -298,6 +298,40 @@ export interface CommandTarget {
 	eligibilityText: string;
 }
 
+/** One vantage of a tracking network camera. */
+export interface CommandNetworkVantage {
+	/** The site key the camera reports while it stands here. */
+	siteKey: string;
+	/** The host's label for it, or the site's own name. */
+	label: string;
+	/**
+	 * `ok`, or why it cannot show the craft: `occluded`, `belowHorizon`,
+	 * `tooFar`, `unknown`, `loaded`, `subject`, `gone`, `disabled` (a ground
+	 * station the game has turned off), `unresolved`, `unplaced`, `pending`
+	 * or `noSubject`. New
+	 * values may appear; treat one you do not recognise as unable to see.
+	 */
+	state: string;
+	/** The camera stands here now. */
+	active: boolean;
+	/** Where the camera stands when no vantage can see the craft. */
+	fallback?: boolean;
+}
+
+/** A tracking network camera's vantages, as its last scoring pass left them. */
+export interface CommandNetworkInfo {
+	/** The camera's own name, which stays the same through every cut. */
+	name: string;
+	/**
+	 * `ok`, or `noView` when no vantage can see the craft and the camera
+	 * stays on its last vantage (or the host's fallback). Treat an
+	 * unrecognised value as `noView`.
+	 */
+	state: string;
+	/** Every vantage in the host's order. */
+	vantages: CommandNetworkVantage[];
+}
+
 /**
  * Where a command camera stands, what it watches and what it could watch.
  * Present only when `CameraState.kind == Command`.
@@ -397,6 +431,14 @@ export interface CommandCentreInfo {
 	 * settings camera and for cameras created in game.
 	 */
 	token?: string;
+	/**
+	 * A tracking network camera's vantages, which it cuts between to keep
+	 * the clearest view of its craft. On such a camera `site_key`,
+	 * `display_name` and the coordinates describe the vantage it shows now
+	 * and change on every cut; key it by its flight id. Absent on every
+	 * other camera.
+	 */
+	network?: CommandNetworkInfo;
 }
 
 /** The registered command authority. */
@@ -854,6 +896,17 @@ export interface CommandVantage {
 }
 
 /**
+ * Sent after the browser applies a re-offer's answer, before it subscribes
+ * any camera to the new slots. A re-offer whose answer the browser never
+ * applies is never confirmed, so its slots stay idle instead of carrying a
+ * camera the browser cannot play.
+ */
+export interface ConfirmSlotsPayload {
+	/** The pool size the applied answer covers, old slots and new. */
+	slots: number;
+}
+
+/**
  * Create a command camera for the rest of the current scene. Server-wide:
  * the camera appears in every consumer's camera list (kind `command`) with
  * `commandCentre.token` set to `token` once the game has built it,
@@ -1074,6 +1127,18 @@ export interface FrameCommandState {
 	 * it is waiting for a target. False from a game that does not send it.
 	 */
 	waitingForTarget?: boolean;
+	/**
+	 * The site the frame was seen from and its label as the feed shows it.
+	 * On a tracking network camera both change on exactly the frame of a
+	 * cut. Absent from a game older than 1.12.
+	 */
+	siteKey?: string;
+	siteLabel?: string;
+	/**
+	 * A tracking network camera's state on this frame: `ok`, or `noView`
+	 * when no vantage can see the craft. Absent on every other camera.
+	 */
+	networkState?: string;
 }
 
 /**
@@ -1255,17 +1320,6 @@ export interface SceneStateChangedPayload {
 export interface SetAnchorsPayload {
 	flightId: number;
 	anchors?: Anchor[];
-}
-
-/**
- * Sent after the browser applies a re-offer's answer, before it subscribes
- * any camera to the new slots. A re-offer whose answer the browser never
- * applies is never confirmed, so its slots stay idle instead of carrying a
- * camera the browser cannot play.
- */
-export interface ConfirmSlotsPayload {
-	/** The pool size the applied answer covers, old slots and new. */
-	slots: number;
 }
 
 /**

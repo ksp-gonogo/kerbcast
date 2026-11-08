@@ -174,6 +174,38 @@ namespace Kerbcast.Api
          */
         OpticsResult SetOptics(uint flightId, OpticsSettings optics, string owner);
 
+        /**
+         * <summary>
+         * Creates a tracking network camera: one command feed that follows its craft through <paramref name="vantages"/>
+         * and shows whichever has the clearest view, cutting between them (see <see cref="NetworkOptions"/> for when).
+         * Each vantage has the lens it would have standing alone, and under a world model is scored only on what its
+         * own site knows. <paramref name="name"/> names the feed ("Tracking network" when null); its label, in every
+         * frame, is the current vantage's. It aims by <paramref name="aim"/>, or at the default craft when null. The
+         * feed appears in <see cref="Feeds"/> once a vantage resolves, normally on the next frame, and is dropped if
+         * none has within 30 s. Like any created camera it lasts until destroyed or the scene ends, a revert or quickload
+         * included, so a host makes it again in the next scene. There is no default list: the host passes every vantage. While the lock is held only
+         * its owner may create one, and the call is a heartbeat; without the lock anyone may. Check
+         * <see cref="KerbcastApi.Supports"/> with <see cref="ApiFeature.NetworkCameras"/> first.
+         * </summary>
+         */
+        NetworkResult CreateNetworkCamera(IReadOnlyList<NetworkVantage> vantages, string name, Aim aim, NetworkOptions options,
+            string owner, out uint flightId);
+
+        /**
+         * <summary>
+         * Replaces a network camera's vantages, and its options unless <paramref name="options"/> is null. A vantage
+         * kept in the list keeps its place; if the camera's current vantage is removed it cuts on its next pass. The
+         * lock applies as for <see cref="CreateNetworkCamera"/>.
+         * </summary>
+         */
+        NetworkResult SetNetworkVantages(uint flightId, IReadOnlyList<NetworkVantage> vantages, NetworkOptions options, string owner);
+
+        /** <summary>Removes a network camera, built or not; its feed ends. The lock applies as for <see cref="CreateNetworkCamera"/>.</summary> */
+        NetworkResult DestroyNetworkCamera(uint flightId, string owner);
+
+        /** <summary>Every vantage of a network camera as its last pass scored them, in list order; empty when it is no network camera or not built yet.</summary> */
+        IReadOnlyList<NetworkVantageStatus> NetworkStatus(uint flightId);
+
         /** <summary>Every craft a command feed could watch, empty when it is not a command feed.</summary> */
         IReadOnlyList<CommandTarget> Targets(uint flightId);
 

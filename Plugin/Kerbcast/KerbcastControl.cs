@@ -261,7 +261,9 @@ namespace Kerbcast
             if (aim != null)
             {
                 string siteKey = gr != null ? gr.Site.NodeName : provider.PendingSiteKey(flightId);
-                var resolved = TryResolveAim(flightId, siteKey, gr, aim, out orbit);
+                var network = provider?.NetworkSiteKeys(flightId);
+                var resolved = network != null ? TryResolveNetworkAim(flightId, network, gr, aim, out orbit)
+                    : TryResolveAim(flightId, siteKey, gr, aim, out orbit);
                 if (resolved != AimResult.Ok) return resolved;
             }
             if (gr != null) gr.SetAim(aim, orbit);
@@ -464,6 +466,76 @@ namespace Kerbcast
             return provider.Create(vantage, name, aim, orbit, token, core.CameraFlightIds(), out error);
         }
 
+        /*
+         * Kerbcast.API's CreateNetworkCamera and SetNetworkVantages: the lock
+         * (a heartbeat for the holder), then the list, then the aim, as
+         * SetAimCore orders its checks.
+         */
+        internal static Api.NetworkResult CreateNetworkCore(IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning,
+            CommandAim aim, string owner, out uint flightId)
+        {
+            flightId = 0;
+            var core = KerbcastCore.Instance;
+            var provider = core?.CommandProvider;
+            if (core == null || provider == null) return Api.NetworkResult.NotRunning;
+            var refused = NetworkLock(core, owner);
+            if (refused != Api.NetworkResult.Unknown) return refused;
+            var listed = NetworkListResult(vantages, tuning);
+            if (listed != Api.NetworkResult.Ok) return listed;
+            Orbit orbit = null;
+            if (aim != null)
+            {
+                var keys = new List<string>(vantages.Count);
+                for (int i = 0; i < vantages.Count; i++) keys.Add(vantages[i].Key);
+                if (TryResolveNetworkAim(0, keys, null, aim, out orbit) != AimResult.Ok) return Api.NetworkResult.BadAim;
+            }
+            flightId = provider.CreateNetwork(vantages, name, tuning, aim, orbit, core.CameraFlightIds(), out string error);
+            if (flightId != 0) return Api.NetworkResult.Ok;
+            Debug.LogWarning($"[Kerbcast][CMDCAM] network camera refused: {error}");
+            return Api.NetworkResult.BadVantage;
+        }
+
+        internal static Api.NetworkResult SetNetworkCore(uint flightId, IList<NetworkVantageSpec> vantages, NetworkTuning? tuning, string owner)
+        {
+            var core = KerbcastCore.Instance;
+            var provider = core?.CommandProvider;
+            if (core == null || provider == null) return Api.NetworkResult.NotRunning;
+            var refused = NetworkLock(core, owner);
+            if (refused != Api.NetworkResult.Unknown) return refused;
+            if (!provider.IsNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
+            var listed = NetworkListResult(vantages, tuning ?? NetworkTuning.Default);
+            if (listed != Api.NetworkResult.Ok) return listed;
+            return provider.SetNetworkVantages(flightId, vantages, tuning, out _) ? Api.NetworkResult.Ok : Api.NetworkResult.BadVantage;
+        }
+
+        internal static Api.NetworkResult DestroyNetworkCore(uint flightId, string owner)
+        {
+            var core = KerbcastCore.Instance;
+            var provider = core?.CommandProvider;
+            if (core == null || provider == null) return Api.NetworkResult.NotRunning;
+            var refused = NetworkLock(core, owner);
+            if (refused != Api.NetworkResult.Unknown) return refused;
+            if (!provider.IsNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
+            return core.DestroyCommandCamera(flightId) ? Api.NetworkResult.Ok : Api.NetworkResult.NotCommandFeed;
+        }
+
+        /* NotLockHolder for anyone but a held lock's owner, else Unknown, after the holder's heartbeat. */
+        static Api.NetworkResult NetworkLock(KerbcastCore core, string owner)
+        {
+            var auth = core.CommandAuthority;
+            if (auth == null || !auth.Registered) return Api.NetworkResult.Unknown;
+            if (!string.Equals(owner, auth.Owner, System.StringComparison.Ordinal)) return Api.NetworkResult.NotLockHolder;
+            auth.Heartbeat(Time.realtimeSinceStartup);
+            return Api.NetworkResult.Unknown;
+        }
+
+        static Api.NetworkResult NetworkListResult(IList<NetworkVantageSpec> vantages, NetworkTuning tuning)
+        {
+            if (vantages == null || vantages.Count == 0) return Api.NetworkResult.NoVantages;
+            if (!tuning.Valid) return Api.NetworkResult.BadNumber;
+            return CommandCameraProvider.NetworkInvalid(vantages, tuning) == null ? Api.NetworkResult.Ok : Api.NetworkResult.BadVantage;
+        }
+
         /* Removes a command camera CreateCommandCamera (or a client) made,
            built or not; its feed ends. False for the settings-driven camera or
            an unknown id, so a repeated call is harmless. */
@@ -508,6 +580,30 @@ namespace Kerbcast
            Orbit aim. Its craft is checked against what the feed at `siteKey`
            knows, and against what `rig` (null for a camera not built yet)
            could frame. */
+        /*
+         * TryResolveAim for a tracking network: the aim stands when any
+         * vantage's site would accept it. That only allows the aim; each
+         * vantage still sees the craft only by what its own site knows. The
+         * first refusal is returned when none accepts it.
+         */
+        static AimResult TryResolveNetworkAim(uint flightId, IList<string> siteKeys, CommandCameraRig rig, CommandAim aim, out Orbit orbit)
+        {
+            orbit = null;
+            var first = AimResult.Unknown;
+            if (rig != null)
+            {
+                first = TryResolveAim(flightId, rig.Site.NodeName, rig, aim, out orbit);
+                if (first == AimResult.Ok) return first;
+            }
+            for (int i = 0; i < siteKeys.Count; i++)
+            {
+                var r = TryResolveAim(flightId, siteKeys[i], null, aim, out orbit);
+                if (r == AimResult.Ok) return r;
+                if (first == AimResult.Unknown) first = r;
+            }
+            return first == AimResult.Unknown ? AimResult.UnknownCraft : first;
+        }
+
         static AimResult TryResolveAim(uint flightId, string siteKey, CommandCameraRig rig, CommandAim aim, out Orbit orbit)
         {
             orbit = null;

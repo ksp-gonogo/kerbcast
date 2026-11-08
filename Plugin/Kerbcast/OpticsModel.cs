@@ -201,7 +201,8 @@ namespace Kerbcast
             return t * t * (3.0 - 2.0 * t) * Math.Min(1.0, airFactor);
         }
 
-        public static OpticsReading Assess(OpticsSite site, double rangeM)
+        /* `daySkyStops` is what full daylight at the lens costs the clarity score; a tracking network tunes it. */
+        public static OpticsReading Assess(OpticsSite site, double rangeM, double daySkyStops = DaySkyStops)
         {
             double airmass = site.AirFactor > 0 ? Airmass(site.ElevationDeg) : 1.0;
             double seeing = Seeing(site.ZenithSeeingArcsec, airmass, site.SeeingAirmassPower, site.AirFactor);
@@ -218,7 +219,7 @@ namespace Kerbcast
                 BlurOnTargetM = onTarget,
                 ExtinctionStops = extinction,
                 DaySky = day,
-                ClarityStops = -Math.Log(Math.Max(double.IsNaN(onTarget) ? 1.0 : onTarget, 1e-9), 2.0) - extinction - DaySkyStops * day,
+                ClarityStops = -Math.Log(Math.Max(double.IsNaN(onTarget) ? 1.0 : onTarget, 1e-9), 2.0) - extinction - daySkyStops * day,
             };
         }
 

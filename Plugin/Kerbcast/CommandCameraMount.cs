@@ -13,7 +13,8 @@ namespace Kerbcast
         private readonly float _defaultFov;
         private readonly string _name;
 
-        public CommandCameraSite Site { get; }
+        /* Set again only by a tracking network's cut; everything that reads the site reads it fresh. */
+        public CommandCameraSite Site { get; set; }
 
         /* `name` replaces the feed name the site would give it. */
         public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, string name = null)

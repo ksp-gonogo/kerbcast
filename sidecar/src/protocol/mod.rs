@@ -227,6 +227,50 @@ pub struct CommandCentreInfo {
     /// settings camera and for cameras created in game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// A tracking network camera's vantages, which it cuts between to keep
+    /// the clearest view of its craft. On such a camera `site_key`,
+    /// `display_name` and the coordinates describe the vantage it shows now
+    /// and change on every cut; key it by its flight id. Absent on every
+    /// other camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<CommandNetworkInfo>,
+}
+
+/// A tracking network camera's vantages, as its last scoring pass left them.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandNetworkInfo {
+    /// The camera's own name, which stays the same through every cut.
+    pub name: String,
+    /// `ok`, or `noView` when no vantage can see the craft and the camera
+    /// stays on its last vantage (or the host's fallback). Treat an
+    /// unrecognised value as `noView`.
+    pub state: String,
+    /// Every vantage in the host's order.
+    pub vantages: Vec<CommandNetworkVantage>,
+}
+
+/// One vantage of a tracking network camera.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandNetworkVantage {
+    /// The site key the camera reports while it stands here.
+    pub site_key: String,
+    /// The host's label for it, or the site's own name.
+    pub label: String,
+    /// `ok`, or why it cannot show the craft: `occluded`, `belowHorizon`,
+    /// `tooFar`, `unknown`, `loaded`, `subject`, `gone`, `disabled` (a ground
+    /// station the game has turned off), `unresolved`, `unplaced`, `pending`
+    /// or `noSubject`. New
+    /// values may appear; treat one you do not recognise as unable to see.
+    pub state: String,
+    /// The camera stands here now.
+    pub active: bool,
+    /// Where the camera stands when no vantage can see the craft.
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 /// What kind of place a command camera's site is.
@@ -1227,6 +1271,17 @@ pub struct FrameCommandState {
     /// it is waiting for a target. False from a game that does not send it.
     #[serde(default)]
     pub waiting_for_target: bool,
+    /// The site the frame was seen from and its label as the feed shows it.
+    /// On a tracking network camera both change on exactly the frame of a
+    /// cut. Absent from a game older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_label: Option<String>,
+    /// A tracking network camera's state on this frame: `ok`, or `noView`
+    /// when no vantage can see the craft. Absent on every other camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_state: Option<String>,
 }
 
 /// A consumer reporting its OWN current display size in px for one camera.
@@ -2011,6 +2066,22 @@ mod tests {
         )
         .unwrap();
         assert!(waiting.waiting_for_target);
+        assert!(
+            waiting.site_key.is_none() && waiting.network_state.is_none(),
+            "a game before 1.12 sends no site"
+        );
+        let cut: FrameCommandState = serde_json::from_str(
+            r#"{"hasFix":true,"frameHeightPx":720,"framingFits":true,"occluded":false,"occluder":"","sunlit":true,"subjectPersistentId":42,"siteKey":"Crater Rim","siteLabel":"North dish","networkState":"noView"}"#,
+        )
+        .unwrap();
+        assert_eq!(cut.site_key.as_deref(), Some("Crater Rim"));
+        assert_eq!(cut.site_label.as_deref(), Some("North dish"));
+        assert_eq!(cut.network_state.as_deref(), Some("noView"));
+        let json = serde_json::to_string(&cut).unwrap();
+        assert!(
+            json.contains(r#""siteLabel":"North dish""#)
+                && json.contains(r#""networkState":"noView""#)
+        );
         assert!(serde_json::to_string(&waiting)
             .unwrap()
             .contains(r#""waitingForTarget":true"#));
