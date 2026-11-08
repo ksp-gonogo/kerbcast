@@ -2,7 +2,8 @@
 
   <!--
     Standalone unit test for MmapFrameRing.cs — the Unity-free single-writer
-    seqlock frame ring. Compiles ONLY the ring (no KSP/Unity assemblies). Run:
+    seqlock frame ring, plus the metadata encoder its fixture is written with
+    (no KSP/Unity assemblies). Run:
     `dotnet run`. Mirrors the ControlBlock.Tests / ShedController.Tests pattern.
   -->
   <PropertyGroup>
@@ -16,6 +17,15 @@
 
   <ItemGroup>
     <Compile Include="../Kerbcast/MmapFrameRing.cs" />
+    <!-- The metadata fixture is written by the plugin's own encoder. -->
+    <Compile Include="../Kerbcast/CommandFrameState.cs" />
+    <Compile Include="../Kerbcast/Anchors.cs" />
+    <Compile Include="../Kerbcast/Kinematics.cs" />
+    <Compile Include="../Kerbcast/CommandCameraMath.cs" />
+    <Compile Include="../Kerbcast/CraftFixState.cs" />
+    <Compile Include="../Kerbcast/CameraId.cs" />
+    <Compile Include="../Kerbcast/CommandVantage.cs" />
+    <Compile Include="../Kerbcast/CommandCameraRequests.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,6 +33,9 @@
          same file. Copied next to the binary for the regen comparison. -->
     <None Include="../../sidecar/testdata/frame_ring_v2.ring"
           Link="frame_ring_v2.ring"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../sidecar/testdata/frame_ring_v2_meta.ring"
+          Link="frame_ring_v2_meta.ring"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

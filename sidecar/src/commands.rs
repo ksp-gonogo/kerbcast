@@ -1,8 +1,9 @@
 //! Global requests a client makes of the plugin that are not about one
 //! existing camera's control block: creating, destroying and aiming command
 //! cameras. The sidecar validates each, then
-//! appends it to `global.commands.json`, which the plugin re-reads a few
-//! times a second.
+//! appends it to `global.commands.json`, which the plugin re-reads on the
+//! game frame after it changes. Each write bumps the counter in
+//! `COMMANDS_SIGNAL_FILE`, which is how the plugin knows.
 //!
 //! Every request gets an id one above the last, seeded from the file on the
 //! first write so a restarted sidecar never reuses one. The plugin applies a
@@ -10,20 +11,29 @@
 //! file (or a replay of it) applies nothing twice, and a new game scene skips
 //! everything already in the file. The file keeps the most recent
 //! `MAX_KEPT` requests, enough to bridge the plugin's poll interval.
+//!
+//! Beside the requests the file carries `anchors`, every browser client's
+//! anchors as a whole table rather than a queue: the plugin replaces its copy
+//! on every read, so a client's anchors survive a scene change and vanish
+//! the moment the sidecar drops them. A restarted sidecar starts the table
+//! empty, since the clients that set it went with the old process.
 
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
+use crate::anchors::AnchorSet;
 use crate::protocol::{
     CommandAim, CommandAimKind, CommandVantage, CommandVantageKind, CreateCommandCameraPayload,
     DestroyCommandCameraPayload, SetCommandAimPayload,
 };
 
 pub const COMMANDS_FILE: &str = "global.commands.json";
+pub const COMMANDS_SIGNAL_FILE: &str = "global.commands.signal";
 
-/// Requests kept in the file. The plugin reads it every 0.25 s, so this only
-/// runs out if a client sends more than this many in that window.
+/// Requests kept in the file. The plugin reads it the frame after it changes,
+/// and at least every 0.25 s, so this only runs out if a client sends more
+/// than this many in that window.
 pub const MAX_KEPT: usize = 32;
 
 const MAX_TOKEN_LEN: usize = 128;
@@ -51,6 +61,9 @@ pub enum CommandOp {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CommandFile {
     pub requests: Vec<CommandRequest>,
+    /// Every browser client's anchors. Plugins before 1.12 ignore it.
+    #[serde(default)]
+    pub anchors: Vec<AnchorSet>,
 }
 
 /// The sidecar's copy of the file, seeded from disk on first use.
@@ -59,6 +72,7 @@ pub struct CommandQueue {
     seeded: bool,
     last_id: u64,
     kept: VecDeque<CommandRequest>,
+    anchors: Vec<AnchorSet>,
 }
 
 impl CommandQueue {
@@ -67,7 +81,7 @@ impl CommandQueue {
     }
 
     /// Adopt what a previous sidecar left on disk, so ids carry on from it.
-    /// Unreadable bytes start again from id 1.
+    /// Unreadable bytes start again from id 1. Its anchors are not adopted.
     pub fn seed(&mut self, on_disk: Option<&[u8]>) {
         self.seeded = true;
         let Some(bytes) = on_disk else { return };
@@ -95,9 +109,15 @@ impl CommandQueue {
         self.last_id
     }
 
+    /// Replace the anchor table written with the requests.
+    pub fn set_anchors(&mut self, anchors: Vec<AnchorSet>) {
+        self.anchors = anchors;
+    }
+
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(&CommandFile {
             requests: self.kept.iter().cloned().collect(),
+            anchors: self.anchors.clone(),
         })
     }
 }
@@ -308,6 +328,7 @@ mod tests {
             elevation: None,
             subject_persistent_id: None,
             framing_margin_m: None,
+            allow_uncertain: None,
         }
     }
 
@@ -362,6 +383,21 @@ mod tests {
     #[test]
     fn aim_validation() {
         assert!(validate_aim(&aim(CommandAimKind::Vessel)).is_err());
+
+        let search: CommandAim =
+            serde_json::from_str(r#"{"kind":"vessel","persistentId":7,"allowUncertain":true}"#)
+                .unwrap();
+        assert_eq!(search.allow_uncertain, Some(true));
+        assert!(validate_aim(&search).is_ok());
+        let json = serde_json::to_string(&search).unwrap();
+        assert!(json.contains(r#""allowUncertain":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<CommandAim>(&json).unwrap(), search);
+        let plain: CommandAim =
+            serde_json::from_str(r#"{"kind":"vessel","persistentId":7}"#).unwrap();
+        assert_eq!(plain.allow_uncertain, None, "absent is false");
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("allowUncertain"));
         assert!(validate_aim(&CommandAim {
             persistent_id: Some(7),
             ..aim(CommandAimKind::Vessel)
@@ -451,6 +487,50 @@ mod tests {
         assert_eq!(reqs[1]["flightId"], 2147483905u32);
         assert_eq!(reqs[2]["op"], "aim");
         assert!(reqs[2]["aim"].is_null());
+        assert_eq!(json["anchors"], serde_json::json!([]));
+    }
+
+    /// Anchors left on disk belong to clients of the sidecar that wrote them,
+    /// so a restarted sidecar keeps the request ids and drops the anchors.
+    #[test]
+    fn anchors_ride_beside_the_requests_and_do_not_survive_a_restart() {
+        use crate::protocol::{Anchor, AnchorKind};
+        let mut first = CommandQueue::default();
+        first.seed(None);
+        first.push(CommandOp::Destroy(DestroyCommandCameraPayload {
+            flight_id: 1,
+        }));
+        first.set_anchors(vec![AnchorSet {
+            owner: "peer:1:1".into(),
+            flight_id: 1,
+            anchors: vec![Anchor {
+                id: "a".into(),
+                kind: AnchorKind::Vessel,
+                vessel: Some(5),
+                part: None,
+                offset: None,
+                body: None,
+                latitude: None,
+                longitude: None,
+                altitude: None,
+                direction: None,
+                vector: None,
+                orientation: None,
+                occlusion: None,
+                kinematics: None,
+                margin_m: None,
+            }],
+        }]);
+        let on_disk = first.to_json().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(json["anchors"][0]["owner"], "peer:1:1");
+        assert_eq!(json["anchors"][0]["anchors"][0]["kind"], "vessel");
+
+        let mut restarted = CommandQueue::default();
+        restarted.seed(Some(on_disk.as_bytes()));
+        let json: serde_json::Value = serde_json::from_str(&restarted.to_json().unwrap()).unwrap();
+        assert_eq!(json["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(json["anchors"], serde_json::json!([]));
     }
 
     #[test]
