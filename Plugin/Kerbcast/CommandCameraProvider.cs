@@ -354,7 +354,8 @@ namespace Kerbcast
                             S.CommandCameraFovMax,
                             S.CommandCameraTargetMarker,
                             S.CommandCameraTargetModel,
-                            S.CommandCameraDebugUtStripe);
+                            S.CommandCameraDebugUtStripe,
+                            _p.LensOptics(_site));
                         cam.Rig = rig;
                         if (_pendingAim != null && store.Governed && !PendingAimStands(_site.NodeName)) SetAim(null, null);
                         if (_pendingAim != null) rig.SetAim(_pendingAim, _pendingOrbit);
@@ -552,6 +553,8 @@ namespace Kerbcast
         private Func<double> LensFovMin(CommandCameraSite site)
         {
             double top = _settings.CommandCameraFovMin;
+            /* Under deep-space optics the blur, not the zoom, holds a low level back; without the shaders for it the level's zoom stays. */
+            if (_settings.DeepSpaceOptics && CommandCameraOptics.Available()) return () => top;
             double middle = Math.Max(_settings.CommandCameraFovMinLevel2, top);
             double lowest = Math.Max(_settings.CommandCameraFovMinLevel1, middle);
             if (site.HasVantage || site.IsSurfacePoint) return () => top;
@@ -559,6 +562,34 @@ namespace Kerbcast
             return () => CommandCameraTargets.Gated()
                 ? CommandCameraMath.LensFovMin(CommandCameraTargets.NormLevel(), lowest, middle, top)
                 : top;
+        }
+
+        /* The lens's optics at `site`, null with deep-space optics off. The
+           camera beside the launch site has level 1's lens, as it has level
+           1's zoom without optics. Every other site, a craft vantage included,
+           follows the Tracking Station in career with the tracking rules on;
+           sandbox, science and career without the rules get the top lens. */
+        private Func<OpticsLens> LensOptics(CommandCameraSite site)
+        {
+            var s = _settings;
+            if (!s.DeepSpaceOptics) return null;
+            double l1 = s.OpticsResolutionLevel1, l2 = s.OpticsResolutionLevel2, l3 = s.OpticsResolutionLevel3;
+            if (site.IsLaunchSite)
+            {
+                var lens = new OpticsLens(s.OpticsDefaults(OpticsModel.ResolutionForLevel(0, l1, l2, l3)), "launch site, level 1 lens");
+                return () => lens;
+            }
+            return () =>
+            {
+                if (CommandCameraTargets.Gated())
+                    return new OpticsLens(s.OpticsDefaults(OpticsModel.ResolutionForLevel(CommandCameraTargets.NormLevel(), l1, l2, l3)),
+                        $"Tracking Station level {CommandCameraTargets.TrackingLevel()}");
+                var game = HighLogic.CurrentGame;
+                string why = game == null ? "no game"
+                    : game.Mode == Game.Modes.CAREER ? "tracking rules off"
+                    : game.Mode.ToString().ToLowerInvariant();
+                return new OpticsLens(s.OpticsDefaults(OpticsModel.ResolutionForLevel(1, l1, l2, l3)), $"top lens ({why})");
+            };
         }
 
         /* Site identity for /cameras: its stable key and kind, its vantage

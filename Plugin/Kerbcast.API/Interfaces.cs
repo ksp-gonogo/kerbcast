@@ -164,6 +164,16 @@ namespace Kerbcast.Api
 
         IReadOnlyList<CommandFeed> Feeds();
 
+        /**
+         * <summary>
+         * Overrides a command feed's optics (see <see cref="OpticsSettings"/>), or returns it to Kerbcast's own
+         * with null. While the lock is held only its owner may, and the call is a heartbeat; without the lock anyone
+         * may. The values last until replaced, the lock is taken or released, or the scene changes. Check
+         * <see cref="KerbcastApi.Supports"/> with <see cref="ApiFeature.Optics"/> first.
+         * </summary>
+         */
+        OpticsResult SetOptics(uint flightId, OpticsSettings optics, string owner);
+
         /** <summary>Every craft a command feed could watch, empty when it is not a command feed.</summary> */
         IReadOnlyList<CommandTarget> Targets(uint flightId);
 

@@ -90,6 +90,26 @@ namespace Kerbcast
         private bool _subpixelLogged;
         private bool _subpixelWas;
         private float _subpixelNear, _subpixelFar;
+        private int _subpixelWindow = CommandCameraSubpixel.WindowPx;
+        private double _subpixelAcross;
+
+        /* Deep-space optics: null with the setting off or no shaders for it. */
+        private readonly Func<OpticsLens> _opticsLens;
+        private readonly CommandCameraOptics _optics;
+        private readonly SeeingNoise _seeingNoise;
+        private OpticsLens _lens;
+        private float _lensCheckedAt = float.MinValue;
+        private OpticsFrame _opticsFrame;
+        private OpticsReading _opticsReading;
+        private double _opticsBlurPx;
+        private bool _opticsBegun;
+        private bool _opticsLogged;
+        private bool _opticsWasActive;
+        private string _opticsLoggedLens;
+        private OpticsKnobs _opticsLoggedOver;
+        private int _opticsLoggedBucket;
+        private bool _opticsLoggedAir;
+        private float _opticsLoggedAt = float.MinValue;
 
         private CommandClipPlan _plan;
         private double _fov;
@@ -410,7 +430,7 @@ namespace Kerbcast
         public CommandCameraRig(KerbcastCamera cam, CommandCameraMount mount, SubjectSelection selection, IFixSource known,
             DrawnSubject drawn,
             CommandAuthority authority, double frameFraction, Func<double> fovMin, double fovMax, bool targetMarker, bool targetModel,
-            bool utStripe)
+            bool utStripe, Func<OpticsLens> opticsLens = null)
         {
             _cam = cam;
             _slew = new AimSlew(_frames);
@@ -448,6 +468,12 @@ namespace Kerbcast
                 _marker = CommandCameraMarker.Create(new[] { cam.NearLayer, cam.FarLayer, _midCam }, cam.FlightId);
             if (utStripe)
                 _utStripe = CommandCameraUtStripe.Create(cam.FlightId);
+            _opticsLens = opticsLens;
+            if (opticsLens != null)
+            {
+                _optics = CommandCameraOptics.Create(cam.FlightId);
+                _seeingNoise = new SeeingNoise(unchecked((int)cam.FlightId));
+            }
 
             var scaled = cam.ScaledLayer;
             if (scaled != null)
@@ -1477,6 +1503,7 @@ namespace Kerbcast
            watching the feed (PrepareRender only runs for a granted capture). */
         public void Poll()
         {
+            _optics?.Idle();
             float now = Time.unscaledTime;
             if (now - _solvedAt < PollStaleSeconds) return;
             if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
@@ -1645,6 +1672,7 @@ namespace Kerbcast
             _shape = shape;
             cam.SetRigFov((float)_fov);
             UpdateBracket(now);
+            UpdateOptics(ut, station, localUp, distance, now);
             FinishDrawn(cam, ut, station, anchor.rotation, drawn);
 
             if (_first)
@@ -1791,8 +1819,9 @@ namespace Kerbcast
             if (_marker != null)
             {
                 var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+                var optics = _optics != null && _opticsFrame.Active ? _optics.Marker(_opticsFrame, CommandCameraMarker.DotSizePixels) : default;
                 _marker.Place(p.Lit && p.StandIn && !p.Model && !p.Blocked, station, p.Toward, p.Distance, lensRotation,
-                    (float)_fov, rt != null ? rt.height : cam.RenderHeight);
+                    (float)_fov, rt != null ? rt.height : cam.RenderHeight, optics);
             }
         }
 
@@ -2065,6 +2094,15 @@ namespace Kerbcast
 
         public void BeforeScaledRender(KerbcastCamera cam)
         {
+            if (_optics != null && _opticsFrame.Active && !_opticsBegun)
+            {
+                var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+                if (rt != null)
+                {
+                    _optics.BeginScaled(cam.ScaledLayer, rt.width, rt.height);
+                    _opticsBegun = true;
+                }
+            }
             DrawStationGround(cam);
             _afgOverridden = null;
             var body = _mount.Site.Body;
@@ -2086,6 +2124,11 @@ namespace Kerbcast
 
         public void AfterScaledRender(KerbcastCamera cam)
         {
+            if (_opticsBegun)
+            {
+                _opticsBegun = false;
+                _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame);
+            }
             _ground?.Hide();
             if (_afgOverridden == null || _afgRenderer == null) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
@@ -2267,8 +2310,12 @@ namespace Kerbcast
             {
                 var rt = near.targetTexture;
                 var pose = cam.FarLayer != null ? cam.FarLayer.transform : near.transform;
-                _subpixel.Render(pose, (float)_fov, rt != null ? rt.height : cam.RenderHeight, _subpixelNear, _subpixelFar);
-                _subpixel.Composite(rt);
+                _subpixel.Render(pose, (float)_fov, rt != null ? rt.height : cam.RenderHeight, _subpixelNear, _subpixelFar, _subpixelWindow);
+                if (_optics != null && _opticsFrame.Active)
+                {
+                    if (_subpixel.HasLight) _optics.DrawCraft(rt, _subpixel.LastLight, _subpixel.LastCoverage, _subpixelAcross, _opticsFrame);
+                }
+                else _subpixel.Composite(rt);
             }
         }
 
@@ -2294,7 +2341,17 @@ namespace Kerbcast
             int rows = rt != null ? rt.height : cam.RenderHeight;
             double perPx = CommandCameraMath.PixelSizeAtUnit(_fov, rows);
             double across = perPx > 0 && distance > 0 ? 2.0 * _standIn.Radius / (distance * perPx) : 0;
-            bool sub = across < SubpixelBelowPx;
+            /* Under optics a craft the blur covers is drawn as the blur, through a window wide enough for its light. */
+            double below = SubpixelBelowPx;
+            int window = CommandCameraSubpixel.WindowPx;
+            if (_opticsFrame.Active)
+            {
+                below = Math.Max(SubpixelBelowPx, Math.Min(_opticsFrame.BlurFwhmPx, CommandCameraSubpixel.MaxWindowPx * 0.75));
+                if (across >= SubpixelBelowPx) window = Math.Min(CommandCameraSubpixel.MaxWindowPx, (int)Math.Ceiling(across * 1.3) + 4);
+            }
+            _subpixelWindow = window;
+            _subpixelAcross = across;
+            bool sub = across < below;
             _standIn.SubpixelMode = sub;
             _subpixelActive = sub && across >= SubpixelFloorPx && lit && !occluded;
             double span = CommandCameraMath.ClipSpan(_standIn.Radius * planScale);
@@ -2306,7 +2363,8 @@ namespace Kerbcast
                 _subpixelLogged = true;
                 _subpixelWas = sub;
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={distance:F0} event=model-{(sub ? "subpixel" : "direct")} "
-                    + $"across={across:G3}px fov={_fov:F4} rows={rows} clip=[{_subpixelNear:F1},{_subpixelFar:F1}]");
+                    + $"across={across:G3}px fov={_fov:F4} rows={rows} clip=[{_subpixelNear:F1},{_subpixelFar:F1}]"
+                    + (_opticsFrame.Active ? $" opticsBlurPx={_opticsFrame.BlurFwhmPx:F2} window={window}px" : ""));
             }
         }
 
@@ -2425,6 +2483,8 @@ namespace Kerbcast
                     + $"handoverM={_handover.Offset.Magnitude:F2} split={_plan.Split} occluded={Occluded} "
                     + (_hasFar ? $"far={(_plan.FarRender ? $"[{_plan.FarNear:F0},{_plan.FarFar:F0}]" : "skipped")} mid={(_plan.MidActive ? $"[{_plan.MidNear:F0},{_plan.MidFar:F0}]" : "off")} " : "")
                     + (_subpixelActive && _subpixel != null ? $"subpixelEnergy={_subpixel.LastEnergy:G3} subpixelCoverPx={_subpixel.LastCoverage:G3} subpixelPeak={_subpixel.LastPeak:G3} " : "")
+                    + (_optics != null ? $"optics={(_opticsFrame.Active ? "on" : "off")} opticsBlurPx={_opticsBlurPx:F2} opticsLevel={_optics.LastLevel} "
+                        + $"opticsBodies={_optics.LastBodies} opticsCraftGain={_optics.LastCraftGain:F2} opticsMs={_optics.CpuMs:F3} " : "")
                     + $"nearFar={_plan.NearFar:F0} originShifts={_originShifts} scaledSkewMaxPx={_scaledSkewMaxPx:F2} scaledSkewFrames={_scaledSkewFrames} "
                     + $"trueOffsetPx={(TrueOffsetPx.HasValue ? TrueOffsetPx.Value.ToString("F2", CultureInfo.InvariantCulture) : "none")} "
                     + $"forecast={_forecastCount} forecastMs={_forecastMs:F2} forecastSamples={_forecast.LastSamples} "
@@ -2481,8 +2541,117 @@ namespace Kerbcast
             _midCam = null;
             _subpixel?.Dispose();
             _subpixel = null;
+            _optics?.Dispose();
             _mount.DestroyAnchor();
             Debug.Log($"{Tag} cam={_flightId} rig down");
+        }
+
+        /*
+         * Settles this frame's optics from the lens, the air at the lens and
+         * the field: the blur in pixels, seeing's shift and flicker, the
+         * colour the air leaves and the daylight. Under a pixel of blur the
+         * frame renders exactly as without optics.
+         */
+        private void UpdateOptics(double ut, DVec3 station, DVec3 localUp, double rangeM, float now)
+        {
+            _opticsFrame = default;
+            if (_optics == null) return;
+            float real = Time.realtimeSinceStartup;
+            if (real - _lensCheckedAt >= 1f || _lens.Label == null)
+            {
+                _lensCheckedAt = real;
+                _lens = _opticsLens();
+            }
+            var over = _authority != null ? _authority.OpticsFor(_flightId) : OpticsKnobs.Unset;
+            var knobs = over.Over(_lens.Defaults);
+
+            var body = _mount.Site.StationBody;
+            double air = 0;
+            if (body != null && body.atmosphere)
+            {
+                double alt = (station - ToD(body.position)).Magnitude - body.Radius;
+                if (alt < body.atmosphereDepth) air = OpticsModel.AirFactor(body.GetPressure(Math.Max(0.0, alt)));
+            }
+            double sunElev = double.NaN;
+            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (sun != null && sun != body)
+            {
+                var toSun = (ToD(sun.position) - station).Normalized;
+                sunElev = Math.Asin(Math.Max(-1.0, Math.Min(1.0, DVec3.Dot(toSun, localUp)))) * 180.0 / Math.PI;
+            }
+            var r = OpticsModel.Assess(new OpticsSite
+            {
+                ResolutionArcsec = knobs.ResolutionArcsec,
+                ZenithSeeingArcsec = knobs.SeeingArcsec,
+                SeeingAirmassPower = knobs.SeeingAirmassPower,
+                AirFactor = air,
+                ElevationDeg = ElevationDeg,
+                SunElevationDeg = sunElev,
+            }, rangeM);
+            _opticsReading = r;
+            int rows = FrameRows();
+            double pixArc = OpticsModel.PixelArcsec(_fov, rows);
+            double blurPx = r.BlurArcsec / pixArc;
+            _opticsBlurPx = double.IsNaN(blurPx) ? 0 : blurPx;
+            bool active = OpticsModel.Worthwhile(blurPx);
+            if (active)
+            {
+                /* The pyramid's deepest level caps the blur the picture can show, so the masks and the craft are capped with it. */
+                var rt = _cam.NearLayer != null ? _cam.NearLayer.targetTexture : null;
+                int cols = rt != null ? rt.width : _cam.RenderWidth;
+                double capPx = OpticsModel.PyramidSigma(OpticsModel.MaxLevelFor(cols, rows)) * OpticsModel.FwhmPerSigma;
+                double scale = blurPx > capPx ? capPx / blurPx : 1.0;
+                double shownPx = blurPx * scale;
+                double ramp = OpticsModel.Ramp(blurPx);
+                double seeingPx = r.SeeingArcsec / pixArc * scale;
+                OpticsModel.SeeingMotion(r.ResolutionArcsec, out double wobble, out double boil, out double twinkle);
+                double amp = air > 0 ? 0.5 * seeingPx * Math.Sqrt(wobble * wobble + 0.31 * boil * boil) * ramp : 0;
+                _opticsFrame = new OpticsFrame
+                {
+                    Active = true,
+                    SigmaPx = shownPx / OpticsModel.FwhmPerSigma,
+                    BlurFwhmPx = shownPx,
+                    DiffFwhmPx = r.ResolutionArcsec / pixArc * scale,
+                    SeeingFwhmPx = seeingPx,
+                    OffsetX = (float)(amp * _seeingNoise.At(real, 0)),
+                    OffsetY = (float)(amp * _seeingNoise.At(real, 1)),
+                    Twinkle = air > 0 ? Mathf.Max(0f, (float)(1.0 + twinkle * ramp * _seeingNoise.At(real, 2))) : 1f,
+                    Tint = new Color(Faded(OpticsModel.Transmission(r.Airmass, air, 0), ramp), Faded(OpticsModel.Transmission(r.Airmass, air, 1), ramp),
+                        Faded(OpticsModel.Transmission(r.Airmass, air, 2), ramp), 1f),
+                    BrightnessHold = knobs.BrightnessHold,
+                    DaySky = r.DaySky,
+                    DaySkyStrength = knobs.DaySkyStrength * ramp,
+                    PixelRad = pixArc / OpticsModel.ArcsecPerRadian,
+                    Ramp = ramp,
+                };
+            }
+            else _optics.Idle();
+            NoteOptics(ut, active, blurPx, over, air, now);
+        }
+
+        /* A transmission faded in from none (1) by `ramp`. */
+        private static float Faded(double transmission, double ramp) => (float)(1.0 + (transmission - 1.0) * ramp);
+
+        /* One line each time the feed's optics turn on or off, its lens or override changes, or the blur moves by half a stop. */
+        private void NoteOptics(double ut, bool active, double blurPx, OpticsKnobs over, double air, float now)
+        {
+            int bucket = active ? (int)Math.Round(Math.Log(blurPx, 2.0) * 2.0) : 0;
+            if (_opticsLogged && active == _opticsWasActive && _lens.Label == _opticsLoggedLens && over.SameAs(_opticsLoggedOver)
+                && bucket == _opticsLoggedBucket && (air > 0) == _opticsLoggedAir) return;
+            bool flip = !_opticsLogged || active != _opticsWasActive;
+            if (!flip && now - _opticsLoggedAt < 1f) return;
+            _opticsLogged = true;
+            _opticsWasActive = active;
+            _opticsLoggedLens = _lens.Label;
+            _opticsLoggedOver = over;
+            _opticsLoggedBucket = bucket;
+            _opticsLoggedAir = air > 0;
+            _opticsLoggedAt = now;
+            var r = _opticsReading;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={_lastDistance:F0} event=optics state={(active ? "on" : "off")} lens='{_lens.Label}' "
+                + $"res={r.ResolutionArcsec:F2}arcsec seeing={r.SeeingArcsec:F2}arcsec air={air:F2} airmass={r.Airmass:F2} elev={ElevationDeg:F1} "
+                + $"blur={r.BlurArcsec:F2}arcsec blurPx={blurPx:F2} onTargetM={r.BlurOnTargetM:G3} day={r.DaySky:F2} fov={_fov:F4} "
+                + $"override={(over.IsUnset ? "none" : over.ToString())}");
         }
 
         private static string F(double ut) => ut.ToString("F2", CultureInfo.InvariantCulture);

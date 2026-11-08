@@ -26,6 +26,8 @@ namespace Kerbcast
         private const int Supersample = 4;
         private const int Msaa = 8;
         private const int RtSize = WindowPx * Supersample;
+        /* The widest window, for a craft that deep-space optics blur more than its own size: the same target at one sample a pixel. */
+        internal const int MaxWindowPx = RtSize;
 
         private readonly Camera _cam;
         private readonly RenderTexture _rt;
@@ -41,11 +43,16 @@ namespace Kerbcast
         private bool _disposed;
 
         internal Camera Camera => _cam;
+        internal bool HasLight => _has;
         /* Sum of the last window's light, for the status log. */
         internal float LastEnergy { get; private set; }
         /* Frame pixels' worth of supersamples the model touched, and the brightest one, to tell thin geometry from dim lighting. */
         internal float LastCoverage { get; private set; }
         internal float LastPeak { get; private set; }
+        /* Each channel's light summed over the last window, in frame pixels. */
+        internal Color LastLight { get; private set; }
+        private int _reqWindow = WindowPx;
+        private int _drainedWindow = WindowPx;
 
         private CommandCameraSubpixel(Camera source, uint flightId, Material add)
         {
@@ -105,16 +112,19 @@ namespace Kerbcast
             LastEnergy = 0f;
             LastCoverage = 0f;
             LastPeak = 0f;
+            LastLight = Color.clear;
             _discardPending = _inFlight;
         }
 
         /* Renders the window around the view axis of `pose`, with the frame's
-           vertical FOV and height, between `near` and `far`. */
-        public void Render(Transform pose, float frameFovDeg, int frameHeight, float near, float far)
+           vertical FOV and height, between `near` and `far`. A wider window
+           than WindowPx only measures the light (LastLight), for optics. */
+        public void Render(Transform pose, float frameFovDeg, int frameHeight, float near, float far, int windowPx = WindowPx)
         {
             if (_disposed || pose == null || frameHeight <= 0) return;
+            windowPx = Math.Max(WindowPx, Math.Min(MaxWindowPx, windowPx));
             _cam.transform.SetPositionAndRotation(pose.position, pose.rotation);
-            double half = Math.Tan(frameFovDeg * 0.5 * Math.PI / 180.0) * WindowPx / frameHeight;
+            double half = Math.Tan(frameFovDeg * 0.5 * Math.PI / 180.0) * windowPx / frameHeight;
             _cam.fieldOfView = (float)(2.0 * Math.Atan(half) * 180.0 / Math.PI);
             _cam.aspect = 1f;
             _cam.nearClipPlane = Mathf.Max(0.01f, near);
@@ -123,17 +133,18 @@ namespace Kerbcast
             if (_inFlight && _req.done)
             {
                 _inFlight = false;
-                if (!_discardPending) Drain(_req);
+                if (!_discardPending) Drain(_req, _reqWindow);
                 _discardPending = false;
             }
             _cam.Render();
             Graphics.Blit(_rt, _resolve);
             if (_inFlight) return;
             _req = UniversalAsyncGPUReadbackRequest.Request(_resolve, 0);
+            _reqWindow = windowPx;
             _inFlight = true;
         }
 
-        private void Drain(UniversalAsyncGPUReadbackRequest req)
+        private void Drain(UniversalAsyncGPUReadbackRequest req, int window)
         {
             if (_disposed || req.hasError) return;
             var data = req.GetData<Color>();
@@ -146,7 +157,14 @@ namespace Kerbcast
                 }
                 return;
             }
+            _drainedWindow = window;
+            if (window != WindowPx)
+            {
+                DrainLight(data, window);
+                return;
+            }
             const float norm = 1f / (Supersample * Supersample);
+            float lr = 0f, lg = 0f, lb = 0f;
             float energy = 0f, peak = 0f;
             int lit = 0;
             for (int y = 0; y < WindowPx; y++)
@@ -169,10 +187,33 @@ namespace Kerbcast
                     var px = new Color(r * norm, g * norm, b * norm, 1f);
                     _px[y * WindowPx + x] = px;
                     energy += px.r + px.g + px.b;
+                    lr += px.r; lg += px.g; lb += px.b;
                 }
             }
             LastEnergy = energy;
             LastCoverage = lit * norm;
+            LastPeak = peak;
+            LastLight = new Color(lr, lg, lb, 1f);
+            _has = true;
+        }
+
+        /* Light totals only, for a window of `window` frame pixels across the whole target. */
+        private void DrainLight(Unity.Collections.NativeArray<Color> data, int window)
+        {
+            float area = (window / (float)RtSize) * (window / (float)RtSize);
+            float r = 0f, g = 0f, b = 0f, peak = 0f;
+            int lit = 0;
+            for (int i = 0; i < RtSize * RtSize; i++)
+            {
+                var c = data[i];
+                r += c.r; g += c.g; b += c.b;
+                float m = Mathf.Max(c.r, Mathf.Max(c.g, c.b));
+                if (m > 1e-4f) lit++;
+                if (m > peak) peak = m;
+            }
+            LastLight = new Color(r * area, g * area, b * area, 1f);
+            LastEnergy = (r + g + b) * area;
+            LastCoverage = lit * area;
             LastPeak = peak;
             _has = true;
         }
@@ -180,7 +221,7 @@ namespace Kerbcast
         /* Adds the last window onto the centre of `target`. */
         public void Composite(RenderTexture target)
         {
-            if (!_has || _disposed || target == null) return;
+            if (!_has || _disposed || target == null || _drainedWindow != WindowPx) return;
             var prev = RenderTexture.active;
             RenderTexture.active = target;
             try

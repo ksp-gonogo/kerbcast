@@ -35,12 +35,13 @@ var guidB = Guid.NewGuid();
 
 // Entry point with nothing installed.
 Check(KerbcastApi.Instance == null, "Instance is null without Kerbcast");
-Check(KerbcastApi.ApiMinor == 2, "ApiMinor is 2 for API 1.2");
+Check(KerbcastApi.ApiMinor == 3, "ApiMinor is 3 for API 1.3");
 Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(ApiFeature.CraftIdentity)
     && KerbcastApi.Supports(ApiFeature.Throttle) && KerbcastApi.Supports(ApiFeature.CommandFeeds)
     && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
     && KerbcastApi.Supports(ApiFeature.CommandAim) && KerbcastApi.Supports(ApiFeature.WorldModel),
     "shipped: every feature of API 1.0");
+Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.3");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
 
 // Enum numbers are part of the contract.
@@ -52,6 +53,12 @@ Check((int)AimResult.Ok == 1 && (int)PublishResult.Accepted == 1 && (int)LockRes
 Check((int)AimResult.BadNumber == 10 && (int)PublishResult.Invalid == 6 && (byte)CraftFixState.Listed == 3
     && (int)SiteKind.Vessel == 3 && (int)LockOptions.WorldModelRequired == 1 && (int)ApiFeature.WorldModel == 7
     && (int)IdentityChange.Recover == 3 && (int)IdentityChange.Renumber == 4 && (int)TrackMode.Target == 2, "enum values are pinned");
+Check(default(OpticsResult) == OpticsResult.Unknown && (int)OpticsResult.Ok == 1 && (int)OpticsResult.NotLockHolder == 2
+    && (int)OpticsResult.NotCommandFeed == 3 && (int)OpticsResult.BadNumber == 4 && (int)OpticsResult.NotRunning == 5
+    && (int)ApiFeature.Optics == 8, "optics numbers are pinned");
+var unset = new OpticsSettings();
+Check(double.IsNaN(unset.ResolutionArcsec) && double.IsNaN(unset.SeeingArcsec) && double.IsNaN(unset.SeeingAirmassPower)
+    && double.IsNaN(unset.BrightnessHold) && double.IsNaN(unset.DaySkyStrength), "new optics settings keep every default (NaN)");
 
 // Registration.
 var first = new RecordingKerbcast();
@@ -150,8 +157,25 @@ using (var kc = RecordingKerbcast.Install())
     ICommand cmd = kc.Command;
     kc.Command.AddFeed(new CommandFeed { FlightId = 500, SiteKey = "KSC", SiteKind = SiteKind.LaunchSite });
     Check(cmd.SetAim(500, Aim.Vessel(42), null) == AimResult.Ok, "without a lock anyone aims");
+    Check(cmd.SetOptics(500, new OpticsSettings { ResolutionArcsec = 30 }, null) == OpticsResult.Ok
+        && kc.Command.Optics[500].ResolutionArcsec == 30, "without a lock anyone sets a feed's optics");
     Check(cmd.TakeLock("modA", LockOptions.WorldModelRequired, "Authority silent") == LockResult.Taken, "TakeLock takes a free lock");
     Check(kc.Command.Aims.Count == 0, "taking the lock drops aims set before it");
+    Check(kc.Command.Optics.Count == 0, "and optics set before it");
+    Check(cmd.SetOptics(500, new OpticsSettings { SeeingArcsec = 2 }, "modB") == OpticsResult.NotLockHolder, "only the holder sets optics");
+    Check(cmd.SetOptics(501, new OpticsSettings(), "modA") == OpticsResult.NotCommandFeed, "optics on an unknown feed are refused");
+    Check(cmd.SetOptics(500, new OpticsSettings { BrightnessHold = 1.5 }, "modA") == OpticsResult.BadNumber
+        && cmd.SetOptics(500, new OpticsSettings { ResolutionArcsec = -1 }, "modA") == OpticsResult.BadNumber
+        && cmd.SetOptics(500, new OpticsSettings { SeeingArcsec = double.PositiveInfinity }, "modA") == OpticsResult.BadNumber
+        && kc.Command.Optics.Count == 0, "out of range optics are refused and not kept");
+    int beats = kc.Command.Heartbeats;
+    Check(cmd.SetOptics(500, new OpticsSettings { ResolutionArcsec = 0, SeeingArcsec = 2 }, "modA") == OpticsResult.Ok
+        && kc.Command.Optics[500].SeeingArcsec == 2 && double.IsNaN(kc.Command.Optics[500].BrightnessHold)
+        && kc.Command.Heartbeats == beats + 1, "the holder's optics are kept, NaN fields stay default, and the call is a heartbeat");
+    Check(cmd.SetOptics(500, null, "modA") == OpticsResult.Ok && kc.Command.Optics.Count == 0, "null returns the feed to its own optics");
+    Check(cmd.SetOptics(500, new OpticsSettings { SeeingArcsec = 2 }, "modA") == OpticsResult.Ok
+        && cmd.SetOptics(500, new OpticsSettings(), "modA") == OpticsResult.Ok && kc.Command.Optics.Count == 0,
+        "settings with every value NaN are no override, as null");
     Check(cmd.TakeLock("modA", LockOptions.WorldModelRequired) == LockResult.Renewed, "the holder renews");
     Check(cmd.TakeLock("modB", LockOptions.None) == LockResult.HeldByOther, "another owner is refused");
     Check(Throws<ArgumentException>(() => cmd.TakeLock("", LockOptions.None)), "an empty owner throws");

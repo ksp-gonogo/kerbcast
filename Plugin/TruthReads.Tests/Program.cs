@@ -166,6 +166,7 @@ var truthPins = new[]
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.LogSkyBlockers", "var ray = new Ray(scaled.transform.position, scaled.transform.forward);", 1, "the lens's own scaled camera"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.LogSkyInputs", "var centre = body.scaledBody.transform.position;", 1, "a body's scaled mesh"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.LogSkyInputs", "var toSun = sun != null ? (sun.scaledBody.transform.position - t.position).normalized : Vector3.zero;", 1, "the Sun's scaled mesh"),
+    Pin.Line("CommandCameraOptics.cs", "CommandCameraOptics.CollectBodies", "var c = body.scaledBody.transform.position - eye;", 1, "a body's scaled mesh as drawn"),
     Pin.Line("CommandCameraSite.cs", "CommandCameraSite.PickHome", "float d = (t.position - sc.transform.position).sqrMagnitude;", 1, "the Space Center's own transform"),
     Pin.Line("CommandCameraForecast.cs", "CommandCameraForecast.BodySpeedBound", "if (b.orbit == null) break;", 1, "a body's own conic, not a craft's"),
     Pin.Line("CommandCameraForecast.cs", "CommandCameraForecast.BodySpeedBound", "v += PeriapsisSpeed(b.orbit) * SpeedMargin;", 1, "a body's own conic, not a craft's"),

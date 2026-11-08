@@ -22,6 +22,8 @@ namespace Kerbcast.Api
         CommandFeeds = 6,
         /** <summary><see cref="ICommand.AttachWorldModel"/> and the publisher.</summary> */
         WorldModel = 7,
+        /** <summary><see cref="ICommand.SetOptics"/>. Added in API 1.3.</summary> */
+        Optics = 8,
     }
 
     public enum CameraKind
@@ -167,6 +169,19 @@ namespace Kerbcast.Api
         Surface = 2,
         PositionAt = 3,
         Direction = 4,
+    }
+
+    public enum OpticsResult
+    {
+        /** <summary>Never returned: the value of a result nobody set.</summary> */
+        Unknown = 0,
+        Ok = 1,
+        NotLockHolder = 2,
+        NotCommandFeed = 3,
+        /** <summary>A value is infinite, negative, or (BrightnessHold) above 1.</summary> */
+        BadNumber = 4,
+        /** <summary>Kerbcast is not running in this scene, so there is no feed to set.</summary> */
+        NotRunning = 5,
     }
 
     /** <summary>How a positioned world-model record moves.</summary> */

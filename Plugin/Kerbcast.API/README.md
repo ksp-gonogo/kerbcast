@@ -29,6 +29,7 @@ if (kerbcast != null && KerbcastApi.Supports(ApiFeature.CraftIdentity))
 - `IWorldModelPublisher` is safe on any thread
 - `ICameras` controls part cameras. `View` also shows command feeds (`Kind == CameraKind.Command`), which only `ICommand` controls
 - A command feed's view says whether its target is occluded (`Occluded`), since when in game time (`OccludedSinceUt`, NaN while clear) and by what (`Occluder`, a body's name). It is the raw reading with no smoothing, so ease it yourself. Part cameras always read as clear. Added in 1.2
+- `ICommand.SetOptics` overrides how blurred a command feed's far planets and craft look (`OpticsSettings`: the lens's blur, the air's blur and the rest, NaN keeping Kerbcast's own value), and null returns the feed to its own. The lock applies as for `SetAim`. It takes effect only while the player's `DeepSpaceOptics` setting is on. Added in 1.3, behind `ApiFeature.Optics`
 - `KerbcastApi.Identity` reports merges, splits, destructions, recoveries and renumbers. A subscription lasts for the whole process, whatever the scene and whether or not `Instance` is set
 - `ICameras.TryVessel` and `TryPersistentId` translate between a craft's persistentId and Vessel.id, even after KSP has dropped the craft
 - `KerbcastApi.LockLost` says when the command lock left its holder without a `ReleaseLock`: the scene is ending, or the player released it in game. Take the lock again once the next scene starts; the dying scene refuses a take from the handler. Like `Identity`, a subscription lasts for the whole process
