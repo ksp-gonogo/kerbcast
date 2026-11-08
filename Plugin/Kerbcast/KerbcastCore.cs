@@ -343,9 +343,6 @@ namespace Kerbcast
                 _commandsSignalPath = Path.Combine(RingDir, CommandsSignalFileName);
                 ReopenCommandsSignal();
                 SeedCommandRequests();
-                _networks = new NetworkStore(RingDir);
-                _networks.Load();
-                _networks.StartCameras();
                 Debug.Log($"[Kerbcast] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
             }
             catch (Exception ex)
@@ -354,6 +351,20 @@ namespace Kerbcast
                 enabled = false;
                 return;
             }
+
+            /* Its own guard: a network that will not start must not take the rest of Kerbcast down with it. */
+            try
+            {
+                _networks = new NetworkStore(RingDir);
+                _networks.Load();
+                _networks.StartCameras();
+                foreach (var r in _carriedNetworkRequests) ApplyCommandRequest(r);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Kerbcast][NETWORK] saved networks failed to start: {ex}");
+            }
+            _carriedNetworkRequests.Clear();
 
             GameEvents.onVesselChange.Add(OnVesselChange);
             GameEvents.onPartDestroyed.Add(OnPartDestroyed);
@@ -667,6 +678,7 @@ namespace Kerbcast
         private readonly CommandFilePoll _commandsPoll = new CommandFilePoll();
         private readonly CommandRequestLedger _commandLedger = new CommandRequestLedger();
         private NetworkStore _networks;
+        private readonly List<CommandCameraRequest> _carriedNetworkRequests = new List<CommandCameraRequest>();
 
         /* A network a player saved with the game, which no mod may change. */
         internal bool IsSavedNetwork(uint flightId) => _networks != null && _networks.IsSaved(flightId);
@@ -677,7 +689,11 @@ namespace Kerbcast
             {
                 if (!File.Exists(_commandsPath)) return;
                 _commandsLastJson = ReadCommandsFile();
-                _commandLedger.SeedFrom(CommandCameraRequest.ParseFile(_commandsLastJson, null));
+                var queued = CommandCameraRequest.ParseFile(_commandsLastJson, null);
+                _commandLedger.SeedFrom(queued);
+                _carriedNetworkRequests.AddRange(CommandRequestLedger.CarriedOver(queued, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                if (_carriedNetworkRequests.Count > 0)
+                    Debug.Log($"[Kerbcast][NETWORK] {_carriedNetworkRequests.Count} network request(s) sent while the scene loaded are applied now");
                 /* Anchors are state, not requests: the table on disk applies to this scene too. */
                 ApplyRemoteAnchors(_commandsLastJson);
                 if (_commandLedger.LastAppliedId > 0)
@@ -831,10 +847,10 @@ namespace Kerbcast
         private void ApplyCommandRequest(CommandCameraRequest r)
         {
             /* Saved networks are the player's setup, not a live request, so a held lock does not refuse them. */
-            if (r.Op == CommandRequestOp.SaveNetwork || r.Op == CommandRequestOp.DeleteNetwork)
+            if (r.IsNetworkOp)
             {
-                if (!_commandLedger.ClaimToken(r.Token))
-                    Debug.Log($"[Kerbcast][NETWORK] client request {r.Id}: token {r.Token} already used this scene; ignored");
+                if (!NetworkStore.Claim(r.Token))
+                    Debug.Log($"[Kerbcast][NETWORK] client request {r.Id}: token {r.Token} already applied; ignored");
                 else _networks?.Apply(r, this);
                 return;
             }

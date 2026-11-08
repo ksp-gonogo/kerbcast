@@ -96,6 +96,19 @@ pub const NETWORKS_FILE: &str = "global.networks.json";
 /// the few the plugin keeps in the file.
 const SEEN_RESULTS_KEPT: usize = 256;
 
+/// An outcome the plugin wrote this long ago is still sent to the peers
+/// connected when the sidecar first reads the file: a sidecar that restarted
+/// while a request was in flight must not lose its answer.
+const RECENT_RESULT_MS: u64 = 30_000;
+
+/// Milliseconds since the Unix epoch, as the plugin stamps its outcomes.
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// On-disk shape of `global.networks.json`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,7 +116,18 @@ struct NetworksFile {
     #[serde(default)]
     networks: Vec<crate::protocol::NetworkDefinition>,
     #[serde(default)]
-    results: Vec<NetworkResultPayload>,
+    editable: Option<bool>,
+    #[serde(default)]
+    results: Vec<FileResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileResult {
+    #[serde(flatten)]
+    result: NetworkResultPayload,
+    #[serde(default)]
+    at_ms: Option<u64>,
 }
 
 /// What one read of `global.networks.json` brought that clients have not seen.
@@ -118,8 +142,8 @@ pub struct NetworksNews {
 #[derive(Debug, Default)]
 struct NetworksSeen {
     definitions: Option<NetworkDefinitionsPayload>,
-    /// None until the first read, whose results predate this process's
-    /// clients and are not sent.
+    /// None until the first read, which sends only outcomes from the last
+    /// `RECENT_RESULT_MS`: older ones predate this process's clients.
     results: Option<std::collections::VecDeque<String>>,
 }
 
@@ -2042,27 +2066,31 @@ impl CameraRegistry {
         let mut news = NetworksNews::default();
         let defs = NetworkDefinitionsPayload {
             networks: file.networks,
+            editable: file.editable,
+            networks_omitted: None,
         };
         if seen.definitions.as_ref() != Some(&defs) {
             seen.definitions = Some(defs.clone());
             news.definitions = Some(defs);
         }
-        match seen.results.as_mut() {
-            None => {
-                seen.results = Some(file.results.into_iter().map(|r| r.token).collect());
+        let first = seen.results.is_none();
+        let now = unix_ms();
+        let sent = seen.results.get_or_insert_with(Default::default);
+        for FileResult { result: r, at_ms } in file.results {
+            if sent.contains(&r.token) {
+                continue;
             }
-            Some(sent) => {
-                for r in file.results {
-                    if sent.contains(&r.token) {
-                        continue;
-                    }
-                    sent.push_back(r.token.clone());
-                    while sent.len() > SEEN_RESULTS_KEPT {
-                        sent.pop_front();
-                    }
-                    news.results.push(r);
-                }
+            /* On the first read only outcomes from the last moments are news. */
+            let recent = at_ms.is_some_and(|at| now.saturating_sub(at) <= RECENT_RESULT_MS);
+            if first && !recent {
+                sent.push_back(r.token);
+                continue;
             }
+            sent.push_back(r.token.clone());
+            news.results.push(r);
+        }
+        while sent.len() > SEEN_RESULTS_KEPT {
+            sent.pop_front();
         }
         news
     }
@@ -4207,10 +4235,14 @@ mod tests {
         assert_eq!(reg.poll_networks().await, NetworksNews::default());
 
         let def = r#"{"networkId":"n1","name":"Polar net","vantages":[{"vantage":{"kind":"station","station":"KSC"},"fallback":true}],"revision":2,"flightId":4294901761}"#;
-        let old = r#"{"token":"old","ok":true,"networkId":"n1"}"#;
+        let old = r#"{"token":"old","ok":true,"networkId":"n1","atMs":1000}"#;
+        let recent = format!(
+            r#"{{"token":"recent","ok":true,"networkId":"n1","atMs":{}}}"#,
+            unix_ms() - 5_000
+        );
         tokio::fs::write(
             &path,
-            format!(r#"{{"networks":[{def}],"results":[{old}]}}"#),
+            format!(r#"{{"networks":[{def}],"editable":true,"results":[{old},{recent}]}}"#),
         )
         .await
         .unwrap();
@@ -4219,15 +4251,21 @@ mod tests {
         assert_eq!(defs.networks[0].network_id, "n1");
         assert_eq!(defs.networks[0].flight_id, Some(0xFFFF_0001));
         assert!(defs.networks[0].vantages[0].fallback);
-        assert!(
-            first.results.is_empty(),
-            "outcomes from before this process are not sent"
+        assert_eq!(defs.editable, Some(true));
+        assert_eq!(
+            first
+                .results
+                .iter()
+                .map(|r| r.token.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent"],
+            "on the first read only an outcome from the last moments is sent"
         );
 
         let fresh = r#"{"token":"t2","ok":false,"code":"stale","text":"changed"}"#;
         tokio::fs::write(
             &path,
-            format!(r#"{{"networks":[{def}],"results":[{old},{fresh}]}}"#),
+            format!(r#"{{"networks":[{def}],"editable":true,"results":[{old},{recent},{fresh}]}}"#),
         )
         .await
         .unwrap();

@@ -214,6 +214,11 @@ pub struct SentFrame {
  */
 pub fn fitted_messages(msg: &ServerMessage, limit: usize) -> serde_json::Result<Vec<String>> {
     let body = serde_json::to_string(msg)?;
+    if body.len() > limit {
+        if let Some(cut) = fitted_list(msg, limit)? {
+            return Ok(vec![cut]);
+        }
+    }
     let snapshot = match msg {
         ServerMessage::CameraSnapshot(s) if body.len() > limit && s.cameras.len() > 1 => s,
         _ if body.len() <= limit => return Ok(vec![body]),
@@ -252,6 +257,60 @@ pub fn fitted_messages(msg: &ServerMessage, limit: usize) -> serde_json::Result<
         )?);
     }
     Ok(out)
+}
+
+/**
+ * Tracking networks or a site catalog over `limit`, cut from the end of the
+ * list until it fits, with the cut counted (`networksOmitted`,
+ * `vesselsOmitted`) and logged. None for any other message, which
+ * `fitted_json` handles.
+ */
+fn fitted_list(msg: &ServerMessage, limit: usize) -> serde_json::Result<Option<String>> {
+    match msg {
+        ServerMessage::NetworkDefinitions(p) => {
+            let mut p = p.clone();
+            let before = p.networks.len();
+            let omitted = p.networks_omitted.unwrap_or(0);
+            loop {
+                let body = serde_json::to_string(&ServerMessage::NetworkDefinitions(p.clone()))?;
+                if body.len() <= limit || p.networks.is_empty() {
+                    let cut = before - p.networks.len();
+                    warn!(
+                        cut,
+                        limit,
+                        "tracking networks over the control message limit; the last are left out"
+                    );
+                    return Ok(Some(body));
+                }
+                p.networks.pop();
+                p.networks_omitted = Some(omitted + (before - p.networks.len()) as u32);
+            }
+        }
+        ServerMessage::SiteCatalog(p) => {
+            let mut p = p.clone();
+            let before = p.vessels.len();
+            let omitted = p.vessels_omitted.unwrap_or(0);
+            loop {
+                let body = serde_json::to_string(&ServerMessage::SiteCatalog(p.clone()))?;
+                if body.len() <= limit || p.vessels.is_empty() {
+                    let cut = before - p.vessels.len();
+                    warn!(
+                        cut,
+                        limit,
+                        "site catalog over the control message limit; the last craft are left out"
+                    );
+                    return Ok(Some(body));
+                }
+                /* Cut about as many craft as the excess takes, by their mean size, then check again. */
+                let per = serde_json::to_string(&p.vessels)?.len() / p.vessels.len();
+                let cut = (body.len() - limit).div_ceil(per.max(1)).max(1);
+                let keep = p.vessels.len().saturating_sub(cut);
+                p.vessels.truncate(keep);
+                p.vessels_omitted = Some(omitted + (before - p.vessels.len()) as u32);
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /**
@@ -601,5 +660,87 @@ mod tests {
             assert!(kept > 300, "kept {kept}");
             assert_eq!(kept + omitted.unwrap_or(0) as usize, 530);
         }
+    }
+
+    /// A network list or a site catalog too big for one message is cut from
+    /// the end, counted, and never sent over the limit.
+    #[test]
+    fn network_and_catalog_lists_are_cut_to_fit() {
+        use crate::protocol::{
+            CatalogVessel, CommandVantage, CommandVantageKind, NetworkDefinition,
+            NetworkDefinitionsPayload, NetworkVantageSpec, SiteCatalogPayload,
+        };
+        let vantage = NetworkVantageSpec {
+            vantage: CommandVantage {
+                kind: CommandVantageKind::Station,
+                site: None,
+                distance: None,
+                bearing: None,
+                height: Some(30.0),
+                station: Some("Harvester Massif".into()),
+                body: None,
+                latitude: None,
+                longitude: None,
+                persistent_id: None,
+            },
+            label: Some("a label of some length".into()),
+            fallback: false,
+        };
+        let networks = (0..64)
+            .map(|i| NetworkDefinition {
+                network_id: format!("n{i}"),
+                name: format!("Network {i}"),
+                watch: None,
+                vantages: vec![vantage.clone(); 64],
+                options: None,
+                revision: 1,
+                flight_id: Some(0xFFFF_0000 + i),
+                owner: None,
+                create_token: None,
+            })
+            .collect();
+        let msg = ServerMessage::NetworkDefinitions(NetworkDefinitionsPayload {
+            networks,
+            editable: Some(true),
+            networks_omitted: None,
+        });
+        let out = fitted_messages(&msg, MAX_CONTROL_MESSAGE).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].len() <= MAX_CONTROL_MESSAGE,
+            "{} bytes",
+            out[0].len()
+        );
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        let kept = v["content"]["networks"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 64);
+        assert_eq!(v["content"]["networksOmitted"], 64 - kept as u64);
+
+        let vessels = (0..2000)
+            .map(|i| CatalogVessel {
+                persistent_id: i,
+                name: format!("Craft {i}"),
+                vessel_type: "Debris".into(),
+                body: "Kerbin".into(),
+                situation: "ORBITING".into(),
+                loaded: false,
+                active: false,
+            })
+            .collect();
+        let msg = ServerMessage::SiteCatalog(SiteCatalogPayload {
+            stations: Vec::new(),
+            vessels,
+            vessels_omitted: Some(3),
+        });
+        let out = fitted_messages(&msg, MAX_CONTROL_MESSAGE).unwrap();
+        assert!(
+            out[0].len() <= MAX_CONTROL_MESSAGE,
+            "{} bytes",
+            out[0].len()
+        );
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        let kept = v["content"]["vessels"].as_array().unwrap().len();
+        assert!(kept > 300, "only the excess is cut ({kept} kept)");
+        assert_eq!(v["content"]["vesselsOmitted"], 3 + 2000 - kept as u64);
     }
 }

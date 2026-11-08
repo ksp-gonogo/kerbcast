@@ -1388,6 +1388,12 @@ export interface NetworkDefinition {
 	flightId?: number;
 	/** The mod that made it in game; absent for a saved network. */
 	owner?: string;
+	/**
+	 * The `token` of the `SaveNetwork` that created it, so a client whose
+	 * answer was lost can still find the network it made. A save repeating
+	 * that token returns this network rather than making another.
+	 */
+	createToken?: string;
 }
 
 /**
@@ -1396,6 +1402,17 @@ export interface NetworkDefinition {
  */
 export interface NetworkDefinitionsPayload {
 	networks?: NetworkDefinition[];
+	/**
+	 * False while the game cannot apply `SaveNetwork` or `DeleteNetwork`
+	 * (no scene where command cameras run, or a scene loading); show the
+	 * networks read only then. Absent when unknown.
+	 */
+	editable?: boolean;
+	/**
+	 * Networks left off the end of `networks` to keep the message small.
+	 * Absent when none were.
+	 */
+	networksOmitted?: number;
 }
 
 /** The outcome of one `SaveNetwork` or `DeleteNetwork`, matched by `token`. */
@@ -1407,7 +1424,9 @@ export interface NetworkResultPayload {
 	/**
 	 * Why it was refused: `notOwner`, `notFound`, `stale`, `noVantages`,
 	 * `tooManyVantages`, `badVantage`, `badAim`, `badName`, `badNumber`,
-	 * `badToken` or `writeFailed`. New codes may appear.
+	 * `badToken`, `full`, `notRunning` (the game could not start its
+	 * camera) or `writeFailed`. A refusal changes nothing. New codes may
+	 * appear.
 	 */
 	code?: string;
 	/** The refusal in words, for a log. */

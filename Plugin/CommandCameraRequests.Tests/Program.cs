@@ -229,8 +229,11 @@ finally { Directory.Delete(signalDir, true); }
 
 /* Saved tracking networks: requests, validation, slots, revisions, the file and the JSON. */
 {
-    string Save(string id = null, int rev = -1, string name = "Polar net", string vantages = null, string watch = null, string options = null) =>
-        "{\"requests\":[{\"id\":1,\"op\":\"saveNetwork\",\"token\":\"t1\""
+    int tokens = 0;
+    string Save(string id = null, int rev = -1, string name = "Polar net", string vantages = null, string watch = null, string options = null,
+        string token = null, string queuedAt = null) =>
+        "{\"requests\":[{\"id\":1,\"op\":\"saveNetwork\",\"token\":\"" + (token ?? "t" + (++tokens)) + "\""
+        + (queuedAt != null ? $",\"queuedAtMs\":{queuedAt}" : "")
         + (id != null ? $",\"networkId\":\"{id}\"" : "")
         + (rev >= 0 ? $",\"baseRevision\":{rev}" : "")
         + (name != null ? $",\"name\":\"{name}\"" : "")
@@ -247,7 +250,7 @@ finally { Directory.Delete(signalDir, true); }
     }
 
     var req = One(Save());
-    Check(req.Op == CommandRequestOp.SaveNetwork && req.Token == "t1" && req.NetworkId == "" && req.BaseRevision == -1,
+    Check(req.Op == CommandRequestOp.SaveNetwork && req.Token == "t1" && req.NetworkId == "" && req.BaseRevision == -1 && double.IsNaN(req.QueuedAtMs),
         "a create carries its token and no id or revision");
     Check(req.Vantages.Count == 2 && req.Vantages[0].Fallback && req.Vantages[0].Vantage.Name == "KSC"
         && req.Vantages[1].Vantage.PersistentId == 77 && req.Vantages[1].Label == "Relay 1", "vantages, labels and fallback are read");
@@ -282,8 +285,8 @@ finally { Directory.Delete(signalDir, true); }
     Check(set.Save(One(Save(vantages: many)), newId, out _, out _).Code == "tooManyVantages", "65 vantages refused");
     Check(set.Networks.Count == 2, "refusals change nothing");
 
-    Check(set.SetWatch(0xFFFF0000u, 0) && set.Find("n1").WatchPersistentId == 0 && set.Find("n1").Revision == 3,
-        "a viewer's retarget writes back and bumps the revision");
+    Check(set.SetWatch(0xFFFF0000u, 0) && set.Find("n1").WatchPersistentId == 0 && set.Find("n1").Revision == 3
+        && set.Find("n1").ContentRevision == 2, "a viewer's retarget writes back and bumps the revision, not the content revision");
     Check(!set.SetWatch(0xFFFF0000u, 0), "the same watch again is no change");
     Check(!set.SetWatch(12345u, 7), "a camera that is no saved network is left alone");
 
@@ -298,40 +301,125 @@ finally { Directory.Delete(signalDir, true); }
 
     var skippedCfg = new List<string>();
     string cfg = set.ToCfg();
-    var loaded = SavedNetworkSet.FromCfg(cfg, skippedCfg);
+    Check(SavedNetworkSet.TryFromCfg(cfg, skippedCfg, out var loaded), "the written file reads back");
     Check(skippedCfg.Count == 0 && loaded.Networks.Count == set.Networks.Count, "networks.cfg round trips");
     var n1 = loaded.Find("n1");
-    Check(n1 != null && n1.Name == "Renamed" && n1.Revision == 3 && n1.Slot == 0 && n1.Vantages.Count == 2
+    Check(n1 != null && n1.Name == "Renamed" && n1.Revision == 3 && n1.ContentRevision == 2 && n1.CreateToken == "t1" && n1.Slot == 0 && n1.Vantages.Count == 2
         && n1.Vantages[0].Fallback && n1.Vantages[1].Label == "Relay 1" && n1.Vantages[1].Vantage.PersistentId == 77,
         "a loaded network keeps every field");
     Check(loaded.Find("n3").MinHoldUt == 20 && double.IsNaN(loaded.Find("n3").MarginStops), "options round trip, unset stays unset");
     var after = loaded.Save(One(Save()), newId, out _, out var nextAfterLoad);
     Check(after.Ok && nextAfterLoad.Slot == 4, "the next slot survives a reload");
-    var broken = SavedNetworkSet.FromCfg("KERBCAST_NETWORKS\n{\n\tNETWORK\n\t{\n\t\tid = a\n\t\tslot = 2\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = station\n\t\t}\n\t}\n"
-        + "\tNETWORK\n\t{\n\t\tid = b\n\t\tslot = 2\n\t}\n\tNETWORK\n\t{\n\t\tid = c\n\t\tslot = 5\n\t\tname = Ok { net }\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = vessel\n\t\t\tpersistentId = 4\n\t\t}\n\t}\n}\n", skippedCfg);
+    string brokenText = "KERBCAST_NETWORKS\n{\n\tNETWORK\n\t{\n\t\tid = a\n\t\tslot = 2\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = telescope\n\t\t\tmirror = 8\n\t\t}\n\t}\n"
+        + "\tNETWORK\n\t{\n\t\tid = b\n\t\tslot = 2\n\t}\n\tNETWORK\n\t{\n\t\tid = c\n\t\tslot = 5\n\t\tname = Ok { net }\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = vessel\n\t\t\tpersistentId = 4\n\t\t}\n\t}\n}\n";
+    skippedCfg.Clear();
+    Check(SavedNetworkSet.TryFromCfg(brokenText, skippedCfg, out var broken), "a file with networks this version can not read still loads");
     Check(broken.Networks.Count == 1 && broken.Networks[0].NetworkId == "c" && broken.Networks[0].Name == "Ok { net }" && skippedCfg.Count == 2,
-        "a network that no longer parses is skipped alone");
-    Check(SavedNetworkSet.FromCfg("", null).Networks.Count == 0, "an empty file is no networks");
+        "a network that does not parse is set aside alone");
+    string rewritten = broken.ToCfg();
+    Check(rewritten.Contains("kind = telescope") && rewritten.Contains("mirror = 8") && rewritten.Contains("id = b"),
+        "networks set aside are written back as they were, not erased");
+    var afterBroken = broken.Save(One(Save()), newId, out _, out var notOnKept);
+    Check(afterBroken.Ok && notOnKept.Slot != 2 && notOnKept.Slot != 5, "a set-aside network's slot is never handed out");
+    Check(SavedNetworkSet.TryFromCfg("", null, out var emptySet) && emptySet.Networks.Count == 0, "an empty file is no networks");
+    Check(!SavedNetworkSet.TryFromCfg("garbage \u0001 not a cfg", null, out _), "a file that is not a networks file is unreadable");
+    Check(!SavedNetworkSet.TryFromCfg(cfg.Substring(0, cfg.Length / 2), null, out _), "a file cut off part way is unreadable");
+    Check(!SavedNetworkSet.TryFromCfg("OTHER\n{\n}\n", null, out _), "a cfg with no KERBCAST_NETWORKS node is unreadable");
 
-    set.Record(made);
-    set.Record(stale);
+    /* The same create token twice is one network: a retry or a carried-over request finds the first. */
+    var firstMade = set.Save(One(Save(token: "dup")), newId, out _, out var dupNet);
+    var repeat = set.Save(One(Save(token: "dup", name: "Other")), newId, out var repBefore, out var repSaved);
+    Check(firstMade.Ok && repeat.Ok && repeat.NetworkId == dupNet.NetworkId && repSaved == null && repBefore == null && dupNet.Name == "Polar net",
+        "a repeated create token returns the network it made and changes nothing");
+
+    /* A retarget since the form opened does not make the form stale; a content edit does. */
+    var n1Now = set.Find("n1");
+    Check(set.Save(One(Save(id: "n1", rev: 2, name: "Renamed")), newId, out _, out _).Ok, "an edit based before a retarget is accepted");
+    Check(set.Save(One(Save(id: "n1", rev: 3, name: "Again")), newId, out _, out _).Code == "stale", "an edit based before another edit is stale");
+    Check(set.Save(One(Save(id: "n1", rev: 99, name: "Again")), newId, out _, out _).Code == "stale", "a revision from the future is stale");
+
+    /* Undo puts a refused save or delete back exactly. */
+    uint revBefore = n1Now.Revision;
+    var edit2 = set.Save(One(Save(id: "n1", rev: (int)revBefore, name: "Changed")), newId, out var b2, out var s2);
+    set.Undo(b2, s2);
+    Check(edit2.Ok && set.Find("n1").Name == "Renamed" && set.Find("n1").Revision == revBefore, "an undone edit restores the network");
+    int netCount = set.Networks.Count;
+    set.Save(One(Save()), newId, out var b3, out var s3);
+    set.Undo(b3, s3);
+    Check(set.Networks.Count == netCount && set.Find(s3.NetworkId) == null, "an undone create removes the network");
+    var victim = set.Networks[1];
+    int at = set.IndexOf(victim);
+    set.Delete(One("{\"requests\":[{\"id\":1,\"op\":\"deleteNetwork\",\"token\":\"t9\",\"networkId\":\"" + victim.NetworkId + "\"}]}"), out var gone);
+    set.Undo(null, null, gone, at);
+    Check(set.Networks.Count == netCount && set.IndexOf(victim) == at, "an undone delete puts the network back in its place");
+
+    /* Saves and deletes queued while a scene loaded are carried into the next; anything else, or older, is not. */
+    var queuedFile = CommandCameraRequest.ParseFile("{\"requests\":["
+        + "{\"id\":5,\"queuedAtMs\":100000,\"op\":\"saveNetwork\",\"token\":\"a\",\"vantages\":[]},"
+        + "{\"id\":6,\"queuedAtMs\":30000,\"op\":\"deleteNetwork\",\"token\":\"b\",\"networkId\":\"n1\"},"
+        + "{\"id\":7,\"queuedAtMs\":100000,\"op\":\"destroy\",\"flightId\":3},"
+        + "{\"id\":8,\"op\":\"deleteNetwork\",\"token\":\"c\",\"networkId\":\"n1\"},"
+        + "{\"id\":4,\"queuedAtMs\":95000,\"op\":\"deleteNetwork\",\"token\":\"d\",\"networkId\":\"n1\"}]}", null);
+    var carried = CommandRequestLedger.CarriedOver(queuedFile, 110000);
+    Check(carried.Count == 2 && carried[0].Token == "d" && carried[1].Token == "a",
+        "only recent network requests carry over, in id order");
+
+    set.Record(made, 1234);
+    set.Record(stale, 0);
     var host = new SavedNetwork { NetworkId = "host-5", Name = "Mod net", Owner = "some-mod", HostFlightId = 5,
         Vantages = new List<SavedVantage> { new SavedVantage { Vantage = CommandVantage.Station("KSC") } } };
-    string json = set.Json(id => id == 0xFFFF0000u, new[] { host });
+    string json = set.Json(id => id == 0xFFFF0000u, new[] { host }, editable: true);
     var root = (Dictionary<string, object>)MiniJson.Parse(json);
     var nets = (List<object>)root["networks"];
     var j1 = (Dictionary<string, object>)nets[0];
-    Check(nets.Count == 4, "every saved network and the mod's are listed");
-    Check((string)j1["networkId"] == "n1" && (double)j1["flightId"] == 0xFFFF0000u && (double)j1["revision"] == 3 && !j1.ContainsKey("watch"),
+    Check(nets.Count == set.Networks.Count + 1 && (bool)root["editable"], "every saved network and the mod's are listed, and whether saves apply");
+    Check((string)j1["networkId"] == "n1" && (double)j1["flightId"] == 0xFFFF0000u && (double)j1["revision"] == set.Find("n1").Revision && !j1.ContainsKey("watch"),
         "a running network has its flightId; an active vessel watch is absent");
     var jv = (Dictionary<string, object>)((List<object>)j1["vantages"])[1];
     Check((string)((Dictionary<string, object>)jv["vantage"])["kind"] == "vessel" && (string)jv["label"] == "Relay 1" && !(bool)jv["fallback"],
         "a vantage is written in the wire's shape");
     Check(!((Dictionary<string, object>)nets[1]).ContainsKey("flightId"), "a network not running has no flightId");
-    var jh = (Dictionary<string, object>)nets[3];
+    Check((string)((Dictionary<string, object>)nets[0])["createToken"] == "t1", "a network carries the token that made it");
+    var jh = (Dictionary<string, object>)nets[nets.Count - 1];
     Check((string)jh["owner"] == "some-mod" && (double)jh["flightId"] == 5, "a mod's network carries its owner and camera");
     var results = (List<object>)root["results"];
     Check(results.Count == 2 && (string)((Dictionary<string, object>)results[1])["code"] == "stale", "outcomes ride beside the networks");
+    Check((double)((Dictionary<string, object>)results[0])["atMs"] == 1234 && !((Dictionary<string, object>)results[1]).ContainsKey("atMs"),
+        "an outcome carries when it was decided");
+    Check(!((bool)((Dictionary<string, object>)MiniJson.Parse(set.Json(_ => false, null, editable: false)))["editable"]),
+        "a scene leaving says saves do not apply");
+
+    /* networks.cfg on disk: a save keeps the last file as .bak, and a missing or empty file is recovered. */
+    string netDir = Path.Combine(Path.GetTempPath(), "kerbcast-networks-" + Guid.NewGuid().ToString("N"));
+    string path = Path.Combine(netDir, "Kerbcast", "networks.cfg");
+    var diskLog = new List<string>();
+    Check(SavedNetworkFile.Load(path, diskLog, out var noFile) == SavedNetworkFile.LoadResult.Ok && noFile.Networks.Count == 0 && diskLog.Count == 0,
+        "no file yet is no networks, and saves may go ahead");
+    SavedNetworkFile.Save(path, set.ToCfg());
+    Check(File.Exists(path) && !File.Exists(path + ".tmp") && !File.Exists(path + ".bak"), "the first save writes the file alone");
+    string firstText = File.ReadAllText(path);
+    set.Save(One(Save(name: "Later")), newId, out _, out _);
+    SavedNetworkFile.Save(path, set.ToCfg());
+    Check(File.ReadAllText(path + ".bak") == firstText && File.ReadAllText(path).Contains("Later"), "the next save keeps the last file as .bak");
+    Check(SavedNetworkFile.Load(path, diskLog, out var reread) == SavedNetworkFile.LoadResult.Ok && reread.Networks.Count == set.Networks.Count,
+        "the saved file loads");
+
+    File.WriteAllText(path, "");
+    diskLog.Clear();
+    Check(SavedNetworkFile.Load(path, diskLog, out var fromBak) == SavedNetworkFile.LoadResult.Ok && fromBak.Networks.Count == set.Networks.Count - 1
+        && diskLog.Count == 1 && diskLog[0].Contains(".bak"), "an empty file is recovered from .bak");
+    File.Delete(path);
+    File.WriteAllText(path + ".tmp", set.ToCfg());
+    diskLog.Clear();
+    Check(SavedNetworkFile.Load(path, diskLog, out var fromTmp) == SavedNetworkFile.LoadResult.Ok && fromTmp.Networks.Count == set.Networks.Count
+        && diskLog[0].Contains(".tmp"), "a save cut off before its swap is recovered from .tmp");
+    File.WriteAllText(path, firstText.Substring(0, firstText.Length - 20));
+    diskLog.Clear();
+    Check(SavedNetworkFile.Load(path, diskLog, out var cut) == SavedNetworkFile.LoadResult.Unreadable && cut.Networks.Count == 0 && diskLog.Count == 1,
+        "a truncated file is unreadable, so nothing saves over it");
+    File.WriteAllText(path, "just some text");
+    Check(SavedNetworkFile.Load(path, null, out _) == SavedNetworkFile.LoadResult.Unreadable, "a garbage file is unreadable");
+    Directory.Delete(netDir, true);
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

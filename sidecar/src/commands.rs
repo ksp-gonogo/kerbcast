@@ -51,6 +51,15 @@ const MAX_NETWORK_ID_LEN: usize = 64;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub id: u64,
+    /// Wall clock milliseconds when the sidecar queued it. The plugin skips
+    /// requests queued before its scene began, except network saves and
+    /// deletes from the last moments, which a scene change must not lose.
+    #[serde(
+        default,
+        rename = "queuedAtMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub queued_at_ms: Option<u64>,
     #[serde(flatten)]
     pub op: CommandOp,
 }
@@ -111,6 +120,7 @@ impl CommandQueue {
         self.last_id += 1;
         self.kept.push_back(CommandRequest {
             id: self.last_id,
+            queued_at_ms: Some(crate::cameras::unix_ms()),
             op,
         });
         while self.kept.len() > MAX_KEPT {

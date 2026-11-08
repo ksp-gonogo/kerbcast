@@ -1627,6 +1627,11 @@ pub struct NetworkDefinition {
     /// The mod that made it in game; absent for a saved network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// The `token` of the `SaveNetwork` that created it, so a client whose
+    /// answer was lost can still find the network it made. A save repeating
+    /// that token returns this network rather than making another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_token: Option<String>,
 }
 
 /// Every tracking network: the saved ones, then those mods made in game.
@@ -1637,6 +1642,15 @@ pub struct NetworkDefinition {
 pub struct NetworkDefinitionsPayload {
     #[serde(default)]
     pub networks: Vec<NetworkDefinition>,
+    /// False while the game cannot apply `SaveNetwork` or `DeleteNetwork`
+    /// (no scene where command cameras run, or a scene loading); show the
+    /// networks read only then. Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editable: Option<bool>,
+    /// Networks left off the end of `networks` to keep the message small.
+    /// Absent when none were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub networks_omitted: Option<u32>,
 }
 
 /// The outcome of one `SaveNetwork` or `DeleteNetwork`, matched by `token`.
@@ -1651,7 +1665,9 @@ pub struct NetworkResultPayload {
     pub network_id: Option<String>,
     /// Why it was refused: `notOwner`, `notFound`, `stale`, `noVantages`,
     /// `tooManyVantages`, `badVantage`, `badAim`, `badName`, `badNumber`,
-    /// `badToken` or `writeFailed`. New codes may appear.
+    /// `badToken`, `full`, `notRunning` (the game could not start its
+    /// camera) or `writeFailed`. A refusal changes nothing. New codes may
+    /// appear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// The refusal in words, for a log.

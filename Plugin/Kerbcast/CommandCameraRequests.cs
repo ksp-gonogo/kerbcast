@@ -88,6 +88,7 @@ namespace Kerbcast
         public const string BadName = "badName";
         public const string BadNumber = "badNumber";
         public const string Full = "full";
+        public const string NotRunning = "notRunning";
         public const string WriteFailed = "writeFailed";
     }
 
@@ -118,6 +119,10 @@ namespace Kerbcast
         public double MinHoldUt = double.NaN, MinHoldRealSeconds = double.NaN, MarginStops = double.NaN;
         public string RefusalCode;
         public string RefusalText;
+        /* Unix milliseconds when the sidecar queued it; NaN from a sidecar that does not say. */
+        public double QueuedAtMs = double.NaN;
+
+        public bool IsNetworkOp => Op == CommandRequestOp.SaveNetwork || Op == CommandRequestOp.DeleteNetwork;
 
         /* The requests in `json`, malformed entries skipped with a reason in
            `skipped`. An unreadable file yields an empty list. */
@@ -149,7 +154,7 @@ namespace Kerbcast
             if (o == null) { why = "not an object"; return null; }
             double idNum = Num(o, "id", -1);
             if (idNum < 1 || idNum != Math.Floor(idNum)) { why = "missing id"; return null; }
-            var req = new CommandCameraRequest { Id = (ulong)idNum };
+            var req = new CommandCameraRequest { Id = (ulong)idNum, QueuedAtMs = Num(o, "queuedAtMs", double.NaN) };
             string op = Str(o, "op");
             switch (op)
             {
@@ -320,6 +325,25 @@ namespace Kerbcast
         {
             foreach (var r in existing)
                 if (r.Id > LastAppliedId) LastAppliedId = r.Id;
+        }
+
+        /* How long before a scene starts a network save or delete is still applied in it. */
+        public const double CarryOverMs = 60000;
+
+        /*
+         * The network saves and deletes in a file a new scene seeds from that
+         * were queued in the last CarryOverMs: sent while the game was loading
+         * or in a scene that could not apply them, they are applied now rather
+         * than lost. Their tokens keep a repeat from applying twice.
+         */
+        public static List<CommandCameraRequest> CarriedOver(List<CommandCameraRequest> existing, double nowMs)
+        {
+            var carried = new List<CommandCameraRequest>();
+            foreach (var r in existing)
+                if (r.IsNetworkOp && !double.IsNaN(r.QueuedAtMs) && nowMs - r.QueuedAtMs <= CarryOverMs && r.QueuedAtMs <= nowMs + 5000)
+                    carried.Add(r);
+            carried.Sort((a, b) => a.Id.CompareTo(b.Id));
+            return carried;
         }
 
         public List<CommandCameraRequest> Fresh(List<CommandCameraRequest> requests)

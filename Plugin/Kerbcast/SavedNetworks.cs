@@ -21,7 +21,12 @@ namespace Kerbcast
         public List<SavedVantage> Vantages = new List<SavedVantage>();
         /* NaN keeps the game's default. */
         public double MinHoldUt = double.NaN, MinHoldRealSeconds = double.NaN, MarginStops = double.NaN;
+        /* Bumps on every change; a viewer's retarget bumps only this. */
         public uint Revision;
+        /* The revision of the last save from a form, which an edit must not predate. */
+        public uint ContentRevision;
+        /* The token of the request that created it, so a repeat of that request finds it rather than making another. */
+        public string CreateToken;
         /* Set only on a mod's network, listed read only, with the camera it runs as. */
         public string Owner;
         public uint HostFlightId;
@@ -54,6 +59,8 @@ namespace Kerbcast
         public string NetworkId;
         public string Code;
         public string Text;
+        /* Unix milliseconds when it was decided, so a sidecar that restarts can still send a recent one. */
+        public long AtMs;
 
         public static SavedNetworkOutcome Refused(string token, string networkId, string code, string text) =>
             new SavedNetworkOutcome { Token = token, Ok = false, NetworkId = networkId, Code = code, Text = text };
@@ -70,9 +77,12 @@ namespace Kerbcast
         public const string JsonFileName = "global.networks.json";
         public const int MaxNameLength = 48;
         /* Outcomes kept in the JSON file for the sidecar to pick up. */
-        public const int OutcomesKept = 16;
+        public const int OutcomesKept = 64;
 
         private readonly List<SavedNetwork> _networks = new List<SavedNetwork>();
+        /* Networks this version cannot read (a newer one wrote them), written back as they were. */
+        private readonly List<CfgNode> _kept = new List<CfgNode>();
+        private readonly HashSet<int> _keptSlots = new HashSet<int>();
         private readonly List<SavedNetworkOutcome> _outcomes = new List<SavedNetworkOutcome>();
         private int _nextSlot;
 
@@ -94,9 +104,10 @@ namespace Kerbcast
             return null;
         }
 
-        public void Record(SavedNetworkOutcome outcome)
+        public void Record(SavedNetworkOutcome outcome, long atMs)
         {
             if (string.IsNullOrEmpty(outcome.Token)) return;
+            outcome.AtMs = atMs;
             _outcomes.Add(outcome);
             if (_outcomes.Count > OutcomesKept) _outcomes.RemoveAt(0);
         }
@@ -112,10 +123,14 @@ namespace Kerbcast
             saved = null;
             string token = r.Token;
             if (r.RefusalCode != null) return SavedNetworkOutcome.Refused(token, r.NetworkId, r.RefusalCode, r.RefusalText);
+            if (r.NetworkId.Length == 0 && !string.IsNullOrEmpty(token))
+                foreach (var made in _networks)
+                    if (made.CreateToken == token) return new SavedNetworkOutcome { Token = token, Ok = true, NetworkId = made.NetworkId };
             var existing = r.NetworkId.Length > 0 ? Find(r.NetworkId) : null;
             if (r.NetworkId.Length > 0 && existing == null)
                 return SavedNetworkOutcome.Refused(token, r.NetworkId, SavedNetworkCodes.NotFound, "no saved network with that id");
-            if (existing != null && r.BaseRevision >= 0 && r.BaseRevision != existing.Revision)
+            /* A viewer's retarget since the form opened is not a conflict: the form's save carries its own watch. */
+            if (existing != null && r.BaseRevision >= 0 && (r.BaseRevision < existing.ContentRevision || r.BaseRevision > existing.Revision))
                 return SavedNetworkOutcome.Refused(token, r.NetworkId, SavedNetworkCodes.Stale,
                     $"the network changed since revision {r.BaseRevision}; it is at {existing.Revision}");
             var refused = Check(r);
@@ -123,7 +138,7 @@ namespace Kerbcast
             int slot = existing != null ? existing.Slot : FreeSlot();
             if (slot < 0) return SavedNetworkOutcome.Refused(token, null, SavedNetworkCodes.Full, "every network slot is taken");
 
-            var n = existing ?? new SavedNetwork { NetworkId = newId(), Slot = slot };
+            var n = existing ?? new SavedNetwork { NetworkId = newId(), Slot = slot, CreateToken = string.IsNullOrEmpty(token) ? null : token };
             if (existing != null) before = Copy(existing);
             n.Name = CleanName(r.Name);
             n.WatchPersistentId = r.Aim?.PersistentId ?? 0;
@@ -134,6 +149,7 @@ namespace Kerbcast
             n.MinHoldRealSeconds = r.MinHoldRealSeconds;
             n.MarginStops = r.MarginStops;
             n.Revision = existing != null ? existing.Revision + 1 : 1;
+            n.ContentRevision = n.Revision;
             if (existing == null)
             {
                 _networks.Add(n);
@@ -142,6 +158,30 @@ namespace Kerbcast
             saved = n;
             return new SavedNetworkOutcome { Token = token, Ok = true, NetworkId = n.NetworkId };
         }
+
+        /*
+         * Undoes a Save or Delete whose effect could not be kept (its camera
+         * refused, or the file could not be written): `saved` with `before`
+         * null is a create to remove, with `before` set an edit to revert,
+         * and `removed` a delete to put back where it was.
+         */
+        public void Undo(SavedNetwork before, SavedNetwork saved, SavedNetwork removed = null, int removedAt = -1)
+        {
+            if (removed != null)
+            {
+                _networks.Insert(Math.Max(0, Math.Min(removedAt, _networks.Count)), removed);
+                return;
+            }
+            if (saved == null) return;
+            if (before == null)
+            {
+                _networks.Remove(saved);
+                return;
+            }
+            CopyInto(before, saved);
+        }
+
+        public int IndexOf(SavedNetwork n) => _networks.IndexOf(n);
 
         public SavedNetworkOutcome Delete(CommandCameraRequest r, out SavedNetwork removed)
         {
@@ -163,7 +203,7 @@ namespace Kerbcast
         }
 
         /* [code, text] when the request cannot be saved, else null. */
-        private static string[] Check(CommandCameraRequest r)
+        internal static string[] Check(CommandCameraRequest r)
         {
             string name = r.Name?.Trim() ?? "";
             if (name.Length > MaxNameLength) return new[] { SavedNetworkCodes.BadName, $"a name takes at most {MaxNameLength} characters" };
@@ -193,6 +233,7 @@ namespace Kerbcast
         {
             var used = new HashSet<int>();
             foreach (var n in _networks) used.Add(n.Slot);
+            used.UnionWith(_keptSlots);
             for (int k = 0; k < CameraId.NetworkSlots; k++)
             {
                 int slot = (_nextSlot + k) % CameraId.NetworkSlots;
@@ -223,18 +264,27 @@ namespace Kerbcast
             return sb.ToString().Trim();
         }
 
-        private static SavedNetwork Copy(SavedNetwork n) => new SavedNetwork
+        private static SavedNetwork Copy(SavedNetwork n)
         {
-            NetworkId = n.NetworkId,
-            Slot = n.Slot,
-            Name = n.Name,
-            WatchPersistentId = n.WatchPersistentId,
-            Vantages = new List<SavedVantage>(n.Vantages),
-            MinHoldUt = n.MinHoldUt,
-            MinHoldRealSeconds = n.MinHoldRealSeconds,
-            MarginStops = n.MarginStops,
-            Revision = n.Revision,
-        };
+            var c = new SavedNetwork();
+            CopyInto(n, c);
+            return c;
+        }
+
+        private static void CopyInto(SavedNetwork from, SavedNetwork to)
+        {
+            to.NetworkId = from.NetworkId;
+            to.Slot = from.Slot;
+            to.Name = from.Name;
+            to.WatchPersistentId = from.WatchPersistentId;
+            to.Vantages = new List<SavedVantage>(from.Vantages);
+            to.MinHoldUt = from.MinHoldUt;
+            to.MinHoldRealSeconds = from.MinHoldRealSeconds;
+            to.MarginStops = from.MarginStops;
+            to.Revision = from.Revision;
+            to.ContentRevision = from.ContentRevision;
+            to.CreateToken = from.CreateToken;
+        }
 
         /*
          * networks.cfg: KSP's ConfigNode layout, one value per line, so a
@@ -254,6 +304,8 @@ namespace Kerbcast
                 Line(sb, 2, "slot", n.Slot.ToString(inv));
                 Line(sb, 2, "name", n.Name);
                 Line(sb, 2, "revision", n.Revision.ToString(inv));
+                Line(sb, 2, "contentRevision", n.ContentRevision.ToString(inv));
+                if (n.CreateToken != null) Line(sb, 2, "createToken", n.CreateToken);
                 Line(sb, 2, "watch", n.WatchPersistentId.ToString(inv));
                 if (!double.IsNaN(n.MinHoldUt)) Line(sb, 2, "minHoldUt", n.MinHoldUt.ToString("R", inv));
                 if (!double.IsNaN(n.MinHoldRealSeconds)) Line(sb, 2, "minHoldRealSeconds", n.MinHoldRealSeconds.ToString("R", inv));
@@ -291,6 +343,7 @@ namespace Kerbcast
                 }
                 sb.Append("\t}\n");
             }
+            foreach (var node in _kept) node.Write(sb, 1);
             sb.Append("}\n");
             return sb.ToString();
         }
@@ -311,64 +364,95 @@ namespace Kerbcast
             }
         }
 
-        public static SavedNetworkSet FromCfg(string text, List<string> skipped)
+        /*
+         * The set in networks.cfg text. False when the text is not a networks
+         * file (no KERBCAST_NETWORKS node, or cut off part way), so the caller
+         * never saves over it. A network this version cannot read is kept as
+         * it was and written back, its slot and id still taken, with the
+         * reason in `skipped`.
+         */
+        public static bool TryFromCfg(string text, List<string> skipped, out SavedNetworkSet set)
         {
-            var set = new SavedNetworkSet();
-            var root = CfgNode.Parse(text ?? "");
-            var top = root.Child("KERBCAST_NETWORKS") ?? root;
+            set = new SavedNetworkSet();
+            if (string.IsNullOrWhiteSpace(text)) return true;
+            var root = CfgNode.Parse(text, out bool balanced);
+            var top = root.Child("KERBCAST_NETWORKS");
+            if (top == null || !balanced) return false;
             var inv = CultureInfo.InvariantCulture;
             int.TryParse(top.Value("nextSlot"), NumberStyles.Integer, inv, out set._nextSlot);
             if (set._nextSlot < 0 || set._nextSlot >= CameraId.NetworkSlots) set._nextSlot = 0;
             var slots = new HashSet<int>();
             var ids = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var node in top.Children("NETWORK"))
+            foreach (var node in top.ChildNodes)
             {
+                if (node.Name != "NETWORK")
+                {
+                    skipped?.Add($"unknown node '{node.Name}'");
+                    set._kept.Add(node);
+                    continue;
+                }
                 string id = node.Value("id");
-                if (!int.TryParse(node.Value("slot"), NumberStyles.Integer, inv, out int slot)
-                    || slot < 0 || slot >= CameraId.NetworkSlots || id.Length == 0)
-                {
-                    skipped?.Add($"network '{node.Value("name")}': no id or slot");
-                    continue;
-                }
-                if (!slots.Add(slot) || !ids.Add(id))
-                {
-                    skipped?.Add($"network {id}: slot {slot} or its id is taken by an earlier one");
-                    continue;
-                }
-                var n = new SavedNetwork
-                {
-                    NetworkId = id,
-                    Slot = slot,
-                    Name = CleanName(node.Value("name")),
-                    MinHoldUt = Num(node, "minHoldUt"),
-                    MinHoldRealSeconds = Num(node, "minHoldRealSeconds"),
-                    MarginStops = Num(node, "marginStops"),
-                };
-                uint.TryParse(node.Value("revision"), NumberStyles.Integer, inv, out n.Revision);
-                uint.TryParse(node.Value("watch"), NumberStyles.Integer, inv, out n.WatchPersistentId);
+                bool slotRead = int.TryParse(node.Value("slot"), NumberStyles.Integer, inv, out int slot)
+                    && slot >= 0 && slot < CameraId.NetworkSlots;
                 string bad = null;
-                foreach (var vn in node.Children("VANTAGE"))
+                if (!slotRead || id.Length == 0) bad = "no id or slot";
+                else if (slots.Contains(slot) || ids.Contains(id)) bad = $"slot {slot} or its id is taken by an earlier one";
+                var n = bad != null ? null : Network(node, id, slot, out bad);
+                if (n == null)
                 {
-                    var v = VantageFrom(vn);
-                    string why = v == null ? $"unknown kind '{vn.Value("kind")}'" : v.Invalid();
-                    if (why != null) { bad = why; break; }
-                    n.Vantages.Add(new SavedVantage
-                    {
-                        Vantage = v,
-                        Label = CleanLabel(vn.Value("label")),
-                        Fallback = string.Equals(vn.Value("fallback"), "True", StringComparison.OrdinalIgnoreCase),
-                    });
-                }
-                if (bad == null && (n.Vantages.Count == 0 || n.Vantages.Count > NetworkMath.MaxVantages))
-                    bad = $"{n.Vantages.Count} vantages";
-                if (bad != null)
-                {
-                    skipped?.Add($"network {id} '{n.Name}': {bad}");
+                    skipped?.Add($"network {id} '{node.Value("name")}': {bad}");
+                    set._kept.Add(node);
+                    if (slotRead && slots.Add(slot)) set._keptSlots.Add(slot);
+                    if (id.Length > 0) ids.Add(id);
                     continue;
                 }
+                slots.Add(slot);
+                ids.Add(id);
                 set._networks.Add(n);
             }
-            return set;
+            return true;
+        }
+
+        private static SavedNetwork Network(CfgNode node, string id, int slot, out string bad)
+        {
+            var inv = CultureInfo.InvariantCulture;
+            bad = null;
+            var n = new SavedNetwork
+            {
+                NetworkId = id,
+                Slot = slot,
+                Name = CleanName(node.Value("name")),
+                MinHoldUt = Num(node, "minHoldUt"),
+                MinHoldRealSeconds = Num(node, "minHoldRealSeconds"),
+                MarginStops = Num(node, "marginStops"),
+            };
+            uint.TryParse(node.Value("revision"), NumberStyles.Integer, inv, out n.Revision);
+            if (!uint.TryParse(node.Value("contentRevision"), NumberStyles.Integer, inv, out n.ContentRevision)) n.ContentRevision = n.Revision;
+            string token = node.Value("createToken");
+            n.CreateToken = token.Length > 0 ? token : null;
+            uint.TryParse(node.Value("watch"), NumberStyles.Integer, inv, out n.WatchPersistentId);
+            foreach (var vn in node.Children("VANTAGE"))
+            {
+                var v = VantageFrom(vn);
+                string why = v == null ? $"unknown kind '{vn.Value("kind")}'" : v.Invalid();
+                if (why != null)
+                {
+                    bad = why;
+                    return null;
+                }
+                n.Vantages.Add(new SavedVantage
+                {
+                    Vantage = v,
+                    Label = CleanLabel(vn.Value("label")),
+                    Fallback = string.Equals(vn.Value("fallback"), "True", StringComparison.OrdinalIgnoreCase),
+                });
+            }
+            if (n.Vantages.Count == 0 || n.Vantages.Count > NetworkMath.MaxVantages)
+            {
+                bad = $"{n.Vantages.Count} vantages";
+                return null;
+            }
+            return n;
         }
 
         private static CommandVantage VantageFrom(CfgNode n)
@@ -403,7 +487,7 @@ namespace Kerbcast
          * networks, always running), each with its camera when `running`
          * says it has one in this scene, and the latest outcomes.
          */
-        public string Json(Func<uint, bool> running, IList<SavedNetwork> hosts)
+        public string Json(Func<uint, bool> running, IList<SavedNetwork> hosts, bool editable)
         {
             var sb = new StringBuilder(256 + _networks.Count * 512);
             sb.Append("{\"networks\":[");
@@ -421,7 +505,7 @@ namespace Kerbcast
                     first = false;
                     AppendJson(sb, n, true);
                 }
-            sb.Append("],\"results\":[");
+            sb.Append("],\"editable\":").Append(editable ? "true" : "false").Append(",\"results\":[");
             for (int i = 0; i < _outcomes.Count; i++)
             {
                 var o = _outcomes[i];
@@ -430,6 +514,7 @@ namespace Kerbcast
                 if (!string.IsNullOrEmpty(o.NetworkId)) sb.Append(",\"networkId\":").Append(Str(o.NetworkId));
                 if (o.Code != null) sb.Append(",\"code\":").Append(Str(o.Code));
                 if (o.Text != null) sb.Append(",\"text\":").Append(Str(o.Text));
+                if (o.AtMs > 0) sb.Append(",\"atMs\":").Append(o.AtMs.ToString(CultureInfo.InvariantCulture));
                 sb.Append('}');
             }
             sb.Append("]}\n");
@@ -492,6 +577,7 @@ namespace Kerbcast
             sb.Append(",\"revision\":").Append(n.Revision.ToString(inv));
             if (running) sb.Append(",\"flightId\":").Append(n.FlightId.ToString(inv));
             if (n.Owner != null) sb.Append(",\"owner\":").Append(Str(n.Owner));
+            if (n.CreateToken != null) sb.Append(",\"createToken\":").Append(Str(n.CreateToken));
             sb.Append('}');
         }
 
@@ -543,9 +629,22 @@ namespace Kerbcast
                 if (c.Name == name) yield return c;
         }
 
-        /* Unbalanced braces close what is open at the end; a stray "}" is ignored. */
-        public static CfgNode Parse(string text)
+        public IReadOnlyList<CfgNode> ChildNodes => _children;
+
+        /* The node as it was read, values first, for a network kept unread. */
+        public void Write(StringBuilder sb, int depth)
         {
+            sb.Append('\t', depth).Append(Name).Append('\n');
+            sb.Append('\t', depth).Append("{\n");
+            foreach (var kv in _values) sb.Append('\t', depth + 1).Append(kv.Key).Append(" = ").Append(kv.Value).Append('\n');
+            foreach (var c in _children) c.Write(sb, depth + 1);
+            sb.Append('\t', depth).Append("}\n");
+        }
+
+        /* `balanced` is false when a brace is left open (a file cut off) or a "}" has nothing to close. */
+        public static CfgNode Parse(string text, out bool balanced)
+        {
+            balanced = true;
             var root = new CfgNode("");
             var stack = new Stack<CfgNode>();
             stack.Push(root);
@@ -566,6 +665,7 @@ namespace Kerbcast
                 {
                     pendingName = null;
                     if (stack.Count > 1) stack.Pop();
+                    else balanced = false;
                     continue;
                 }
                 int eq = line.IndexOf('=');
@@ -585,7 +685,82 @@ namespace Kerbcast
                 pendingName = null;
                 stack.Peek()._values.Add(new KeyValuePair<string, string>(line.Substring(0, eq).Trim(), line.Substring(eq + 1).Trim()));
             }
+            if (stack.Count != 1) balanced = false;
             return root;
+        }
+    }
+
+    /*
+     * networks.cfg on disk. A save writes a flushed .tmp and swaps it in,
+     * keeping the last file as .bak, so a crash at any point leaves a whole
+     * file to load. Unity-free, so each case is tested without the game.
+     */
+    internal static class SavedNetworkFile
+    {
+        public enum LoadResult
+        {
+            /* Read, or no file yet: saves may go ahead. */
+            Ok,
+            /* The file is there but is not a networks file: saving would lose it. */
+            Unreadable,
+        }
+
+        /*
+         * The set at `path`. A missing or empty file is recovered from its
+         * .tmp (a save cut off before the swap) or its .bak, noted in `log`.
+         */
+        public static LoadResult Load(string path, List<string> log, out SavedNetworkSet set)
+        {
+            set = new SavedNetworkSet();
+            string text = ReadOrNull(path);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                var skipped = new List<string>();
+                if (!SavedNetworkSet.TryFromCfg(text, skipped, out set))
+                {
+                    set = new SavedNetworkSet();
+                    log?.Add($"{path} is not a networks file; saved networks are read only until it is fixed or removed");
+                    return LoadResult.Unreadable;
+                }
+                foreach (var why in skipped) log?.Add($"{path}: {why}; kept as written");
+                return LoadResult.Ok;
+            }
+            foreach (var spare in new[] { path + ".tmp", path + ".bak" })
+            {
+                string spareText = ReadOrNull(spare);
+                if (string.IsNullOrWhiteSpace(spareText)) continue;
+                var skipped = new List<string>();
+                if (!SavedNetworkSet.TryFromCfg(spareText, skipped, out var recovered)) continue;
+                set = recovered;
+                log?.Add($"{path} was {(text == null ? "missing" : "empty")}; recovered {set.Networks.Count} network(s) from {System.IO.Path.GetFileName(spare)}");
+                return LoadResult.Ok;
+            }
+            return LoadResult.Ok;
+        }
+
+        public static void Save(string path, string text)
+        {
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
+            string tmp = path + ".tmp";
+            using (var fs = new System.IO.FileStream(tmp, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.None))
+            {
+                var bytes = new UTF8Encoding(false).GetBytes(text);
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(true);
+            }
+            if (System.IO.File.Exists(path) && new System.IO.FileInfo(path).Length > 0)
+                System.IO.File.Replace(tmp, path, path + ".bak");
+            else
+            {
+                if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+                System.IO.File.Move(tmp, path);
+            }
+        }
+
+        private static string ReadOrNull(string path)
+        {
+            try { return System.IO.File.Exists(path) ? System.IO.File.ReadAllText(path) : null; }
+            catch (System.IO.IOException) { return null; }
         }
     }
 }

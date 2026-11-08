@@ -11,18 +11,25 @@ namespace Kerbcast
      * revert or a quickload never takes them back. Applies viewers' saves and
      * deletes, runs each network's camera in this scene under its fixed
      * flightId, and publishes every network, mods' included, to the sidecar in
-     * global.networks.json.
+     * global.networks.json. A save or delete is all or nothing: if its camera
+     * refuses or the file cannot be written, it is undone and answered with
+     * the reason.
      */
     internal sealed class NetworkStore
     {
         private const string Tag = "[Kerbcast][NETWORK]";
         private const string HostIdPrefix = "host-";
         private const float JsonCheckSeconds = 1f;
+        private const int TokensKept = 256;
+
+        /* Tokens applied in this game session, so a request carried into the next scene is not applied twice. */
+        private static readonly Queue<string> AppliedOrder = new Queue<string>();
+        private static readonly HashSet<string> Applied = new HashSet<string>(StringComparer.Ordinal);
 
         private readonly string _jsonPath;
         private readonly string _cfgPath;
         private SavedNetworkSet _set = new SavedNetworkSet();
-        /* The file was there but could not be read: saving now would replace it, so saves are refused. */
+        /* The file is there but could not be read: saving now would replace it, so saves are refused. */
         private bool _unreadable;
         private string _jsonWritten;
         private float _jsonCooldown;
@@ -38,81 +45,142 @@ namespace Kerbcast
 
         public void Load()
         {
-            if (_cfgPath == null || !File.Exists(_cfgPath)) return;
+            if (_cfgPath == null) return;
+            var log = new List<string>();
             try
             {
-                var skipped = new List<string>();
-                _set = SavedNetworkSet.FromCfg(File.ReadAllText(_cfgPath), skipped);
-                foreach (var why in skipped) Debug.LogWarning($"{Tag} {_cfgPath}: {why}; left out");
-                Debug.Log($"{Tag} {_set.Networks.Count} saved network(s) loaded from {_cfgPath}");
+                _unreadable = SavedNetworkFile.Load(_cfgPath, log, out _set) == SavedNetworkFile.LoadResult.Unreadable;
             }
             catch (Exception ex)
             {
                 _unreadable = true;
-                Debug.LogWarning($"{Tag} {_cfgPath} could not be read ({ex.Message}); saved networks are off until it can");
+                log.Add($"{_cfgPath} could not be read ({ex.Message}); saved networks are read only until it can");
             }
+            foreach (var line in log) Debug.LogWarning($"{Tag} {line}");
+            if (!_unreadable && _set.Networks.Count > 0) Debug.Log($"{Tag} {_set.Networks.Count} saved network(s) loaded from {_cfgPath}");
         }
 
-        /* Every saved network's camera for this scene, before the first camera list is built. */
+        /* Every saved network's camera for this scene, before the first camera list is built. One that fails is logged and skipped. */
         public void StartCameras()
         {
             foreach (var n in _set.Networks) Start(n);
         }
 
-        private void Start(SavedNetwork n)
+        private bool Start(SavedNetwork n)
         {
-            uint id = KerbcastControl.StartSavedNetwork(n, out string error);
-            if (id == 0) Debug.LogWarning($"{Tag} '{n.Name}' ({n.NetworkId}) not started: {error}");
+            try
+            {
+                uint id = KerbcastControl.StartSavedNetwork(n, out string error);
+                if (id != 0) return true;
+                Debug.LogWarning($"{Tag} '{n.Name}' ({n.NetworkId}) not started: {error}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"{Tag} '{n.Name}' ({n.NetworkId}) not started: {ex}");
+            }
+            return false;
         }
 
         /* A saved network's camera, which only a delete removes. */
         public bool IsSaved(uint flightId) => _set.FindByFlightId(flightId) != null;
 
+        /* False when the token was applied earlier this game session, so a carried-over repeat changes nothing. */
+        public static bool Claim(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return true;
+            if (!Applied.Add(token)) return false;
+            AppliedOrder.Enqueue(token);
+            while (AppliedOrder.Count > TokensKept) Applied.Remove(AppliedOrder.Dequeue());
+            return true;
+        }
+
         public void Apply(CommandCameraRequest r, KerbcastCore core)
         {
-            SavedNetworkOutcome outcome;
-            if (r.NetworkId.StartsWith(HostIdPrefix, StringComparison.Ordinal))
-                outcome = SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.NotOwner, "a mod made this network; only it can change it");
-            else if (_unreadable || _cfgPath == null)
-                outcome = SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.WriteFailed, "the save's networks file can not be read");
-            else if (r.Op == CommandRequestOp.DeleteNetwork)
-            {
-                outcome = _set.Delete(r, out var removed);
-                if (removed != null)
-                {
-                    core.DestroyCommandCamera(removed.FlightId);
-                    Debug.Log($"{Tag} '{removed.Name}' ({removed.NetworkId}) deleted by a viewer");
-                }
-            }
-            else
-            {
-                outcome = _set.Save(r, NewId, out var before, out var saved);
-                if (saved != null) Run(core, before, saved);
-            }
-            if (outcome.Ok && !Persist())
-                outcome = SavedNetworkOutcome.Refused(r.Token, outcome.NetworkId, SavedNetworkCodes.WriteFailed,
-                    "applied in this scene, but the networks file could not be written");
+            var outcome = r.Op == CommandRequestOp.DeleteNetwork ? Delete(r, core) : Save(r, core);
             if (!outcome.Ok) Debug.LogWarning($"{Tag} request {r.Id} refused: {outcome.Code}: {outcome.Text}");
-            _set.Record(outcome);
+            _set.Record(outcome, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             Publish(core, force: true);
         }
 
-        /* A saved network's camera after an edit: in place, or rebuilt under the same flightId when its name changed. */
-        private void Run(KerbcastCore core, SavedNetwork before, SavedNetwork saved)
+        private SavedNetworkOutcome Refusal(CommandCameraRequest r)
         {
-            if (before == null)
+            if (r.NetworkId.StartsWith(HostIdPrefix, StringComparison.Ordinal))
+                return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.NotOwner, "a mod made this network; only it can change it");
+            if (_unreadable || _cfgPath == null)
+                return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.WriteFailed, "the save's networks file can not be read");
+            return default;
+        }
+
+        private SavedNetworkOutcome Save(CommandCameraRequest r, KerbcastCore core)
+        {
+            var refused = Refusal(r);
+            if (refused.Code != null) return refused;
+            /* What only the game can check (a surface vantage's body), before anything is stored. */
+            if (r.RefusalCode == null && SavedNetworkSet.Check(r) == null)
             {
-                Debug.Log($"{Tag} '{saved.Name}' ({saved.NetworkId}) created by a viewer, cam={saved.FlightId}");
-                Start(saved);
-                return;
+                var specs = new List<NetworkVantageSpec>(r.Vantages.Count);
+                foreach (var v in r.Vantages) specs.Add(new NetworkVantageSpec { Vantage = v.Vantage, Label = v.Label, Fallback = v.Fallback });
+                var probe = new SavedNetwork { MinHoldUt = r.MinHoldUt, MinHoldRealSeconds = r.MinHoldRealSeconds, MarginStops = r.MarginStops };
+                string why = CommandCameraProvider.NetworkInvalid(specs, probe.Tuning);
+                if (why != null) return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.BadVantage, why);
             }
-            Debug.Log($"{Tag} '{saved.Name}' ({saved.NetworkId}) edited by a viewer, revision {saved.Revision}");
-            if (SavedNetwork.NeedsRebuild(before, saved))
+            var outcome = _set.Save(r, NewId, out var before, out var saved);
+            if (!outcome.Ok || saved == null) return outcome;
+            if (!Run(core, before, saved))
+            {
+                Revert(core, before, saved);
+                return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.NotRunning,
+                    "the game could not start the network's camera; nothing changed");
+            }
+            if (!Persist())
+            {
+                Revert(core, before, saved);
+                return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.WriteFailed,
+                    "the networks file could not be written; nothing changed");
+            }
+            Debug.Log(before == null
+                ? $"{Tag} '{saved.Name}' ({saved.NetworkId}) created by a viewer, cam={saved.FlightId}"
+                : $"{Tag} '{saved.Name}' ({saved.NetworkId}) edited by a viewer, revision {saved.Revision}");
+            return outcome;
+        }
+
+        private SavedNetworkOutcome Delete(CommandCameraRequest r, KerbcastCore core)
+        {
+            var refused = Refusal(r);
+            if (refused.Code != null) return refused;
+            var target = _set.Find(r.NetworkId);
+            int at = target != null ? _set.IndexOf(target) : -1;
+            var outcome = _set.Delete(r, out var removed);
+            if (removed == null) return outcome;
+            if (!Persist())
+            {
+                _set.Undo(null, null, removed, at);
+                return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.WriteFailed,
+                    "the networks file could not be written; nothing changed");
+            }
+            core.DestroyCommandCamera(removed.FlightId);
+            Debug.Log($"{Tag} '{removed.Name}' ({removed.NetworkId}) deleted by a viewer");
+            return outcome;
+        }
+
+        /* A saved network's camera after a save: started, changed in place, or rebuilt under the same flightId when its name changed. */
+        private bool Run(KerbcastCore core, SavedNetwork before, SavedNetwork saved)
+        {
+            if (before == null) return Start(saved);
+            if (SavedNetwork.NeedsRebuild(before, saved) || !core.CommandProvider.IsNetwork(saved.FlightId))
             {
                 core.DestroyCommandCamera(saved.FlightId);
-                Start(saved);
+                return Start(saved);
             }
-            else KerbcastControl.UpdateSavedNetwork(saved, before.WatchPersistentId != saved.WatchPersistentId);
+            return KerbcastControl.UpdateSavedNetwork(saved, before.WatchPersistentId != saved.WatchPersistentId);
+        }
+
+        /* Puts a save back as it was, camera included. */
+        private void Revert(KerbcastCore core, SavedNetwork before, SavedNetwork saved)
+        {
+            _set.Undo(before, saved);
+            core.DestroyCommandCamera(saved.FlightId);
+            if (before != null) Start(saved);
         }
 
         /*
@@ -122,7 +190,7 @@ namespace Kerbcast
          */
         public void ViewerAimed(uint flightId, CommandAimSpec aim, KerbcastCore core)
         {
-            if (!CameraId.IsNetworkId(flightId)) return;
+            if (!CameraId.IsNetworkId(flightId) || _unreadable) return;
             if (aim != null && aim.Kind != "vessel") return;
             if (!_set.SetWatch(flightId, aim?.PersistentId ?? 0)) return;
             Debug.Log($"{Tag} cam={flightId} retargeted by a viewer; its saved watch follows");
@@ -138,10 +206,10 @@ namespace Kerbcast
             Publish(core, force: false);
         }
 
-        /* Leaving the scene: no network runs until the next one starts them. */
+        /* Leaving the scene: nothing runs and nothing can be saved until the next one starts. */
         public void Stop()
         {
-            Write(_set.Json(_ => false, null));
+            Write(_set.Json(_ => false, null, editable: false));
         }
 
         private void Publish(KerbcastCore core, bool force)
@@ -154,7 +222,7 @@ namespace Kerbcast
                 provider.HostNetworks(_hosts);
                 foreach (var h in _hosts) hosts.Add(HostDefinition(h));
             }
-            string json = _set.Json(id => provider != null && provider.IsNetwork(id), hosts);
+            string json = _set.Json(id => provider != null && provider.IsNetwork(id), hosts, editable: !_unreadable && _cfgPath != null);
             if (!force && json == _jsonWritten) return;
             Write(json);
         }
@@ -199,11 +267,7 @@ namespace Kerbcast
         {
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(_cfgPath));
-                var tmp = _cfgPath + ".tmp";
-                File.WriteAllText(tmp, _set.ToCfg());
-                if (File.Exists(_cfgPath)) File.Delete(_cfgPath);
-                File.Move(tmp, _cfgPath);
+                SavedNetworkFile.Save(_cfgPath, _set.ToCfg());
                 return true;
             }
             catch (Exception ex)
