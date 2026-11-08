@@ -260,6 +260,8 @@ namespace Kerbcast
                 {
                     SiteKey = r.SiteKey,
                     Label = r.Label,
+                    SiteKind = r.Kind,
+                    VantagePersistentId = r.VantagePersistentId,
                     Active = r.Active,
                     Fallback = r.Fallback,
                     State = NetworkMath.Code(r.State),

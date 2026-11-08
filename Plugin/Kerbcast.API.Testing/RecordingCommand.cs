@@ -86,8 +86,8 @@ namespace Kerbcast.Api.Testing
 
         /**
          * <summary>
-         * What NetworkStatus returns for a network camera. Unset, it lists the camera's vantages in order, the first
-         * active and every one "ok" with a NaN score: a test of cuts and states sets its own here.
+         * What NetworkStatus returns for a network camera. Unset, it lists the camera's vantages in order with their
+         * kind and craft id, the first active and every one "ok" with a NaN score: a test of cuts and states sets its own here.
          * </summary>
          */
         public void SetNetworkStatus(uint flightId, IEnumerable<NetworkVantageStatus> status) =>
@@ -438,7 +438,12 @@ namespace Kerbcast.Api.Testing
             var result = new List<NetworkVantageStatus>();
             if (!networks.TryGetValue(flightId, out var list)) return result;
             for (int i = 0; i < list.Count; i++)
-                result.Add(new NetworkVantageStatus { SiteKey = Key(list[i]), Label = list[i].Label ?? Key(list[i]), Active = i == 0, Fallback = list[i].Fallback, State = "ok", Score = 0 });
+                result.Add(new NetworkVantageStatus
+                {
+                    SiteKey = Key(list[i]), Label = list[i].Label ?? Key(list[i]), SiteKind = list[i].Kind,
+                    VantagePersistentId = list[i].Kind == SiteKind.Vessel ? list[i].PersistentId : 0,
+                    Active = i == 0, Fallback = list[i].Fallback, State = "ok", Score = 0,
+                });
             return result;
         }
 
@@ -496,7 +501,8 @@ namespace Kerbcast.Api.Testing
 
         static NetworkVantageStatus Copy(NetworkVantageStatus s) => new NetworkVantageStatus
         {
-            SiteKey = s.SiteKey, Label = s.Label, Active = s.Active, Fallback = s.Fallback, State = s.State, Score = s.Score,
+            SiteKey = s.SiteKey, Label = s.Label, SiteKind = s.SiteKind, VantagePersistentId = s.VantagePersistentId,
+            Active = s.Active, Fallback = s.Fallback, State = s.State, Score = s.Score,
         };
 
         public IReadOnlyList<CommandFeed> Feeds()

@@ -117,6 +117,18 @@ namespace Kerbcast.Api
         /** <summary>The vantage's label: the host's, or the site's own name.</summary> */
         public string Label { get; set; }
 
+        /** <summary>What kind of place the vantage is, as <see cref="CommandFeed.SiteKind"/> would say were the camera there. Added in API 1.5.</summary> */
+        public SiteKind SiteKind { get; set; }
+
+        /**
+         * <summary>
+         * A craft vantage's Vessel.persistentId, following its craft through docking as <see cref="CommandFeed.VantagePersistentId"/>
+         * does; 0 for any other kind. With <see cref="SiteKey"/> and <see cref="SiteKind"/> it lets a host bind every
+         * vantage's site, not only the one on air. Added in API 1.5.
+         * </summary>
+         */
+        public uint VantagePersistentId { get; set; }
+
         /** <summary>The camera stands here now.</summary> */
         public bool Active { get; set; }
 

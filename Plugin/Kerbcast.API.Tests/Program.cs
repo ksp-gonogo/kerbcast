@@ -35,7 +35,7 @@ var guidB = Guid.NewGuid();
 
 // Entry point with nothing installed.
 Check(KerbcastApi.Instance == null, "Instance is null without Kerbcast");
-Check(KerbcastApi.ApiMinor == 4, "ApiMinor is 4 for API 1.4");
+Check(KerbcastApi.ApiMinor == 5, "ApiMinor is 5 for API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(ApiFeature.CraftIdentity)
     && KerbcastApi.Supports(ApiFeature.Throttle) && KerbcastApi.Supports(ApiFeature.CommandFeeds)
     && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
@@ -217,6 +217,13 @@ using (var kc = RecordingKerbcast.Install())
         Check(status.Count == 2 && status[0].Active && !status[1].Active && status[1].Fallback && status[1].Label == "North dish",
             "NetworkStatus lists every vantage in order");
         Check(cmd.NetworkStatus(500).Count == 0, "a feed at one site has no network status");
+        Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Station("KSC"), NetworkVantage.Vessel(77) }, null, null, null, "modA", out uint mixed) == NetworkResult.Ok,
+            "a network may mix stations and craft");
+        var mixedStatus = cmd.NetworkStatus(mixed);
+        Check(mixedStatus[0].SiteKind == SiteKind.Station && mixedStatus[0].VantagePersistentId == 0
+            && mixedStatus[1].SiteKind == SiteKind.Vessel && mixedStatus[1].VantagePersistentId == 77 && mixedStatus[1].SiteKey == "vessel:77",
+            "NetworkStatus names each vantage's kind and craft, so a host can bind every site");
+        cmd.DestroyNetworkCamera(mixed, "modA");
         Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Surface(2, 1.5, 2.25) }, null, null, null, "modA", out uint mun) == NetworkResult.Ok
             && cmd.Feeds().First(f => f.FlightId == mun).SiteKey == "surface:Mun:1.50000:2.25000", "a surface vantage's key names its body as Kerbcast does");
         Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Surface(99, 0, 0) }, null, null, null, "modA", out _) == NetworkResult.BadVantage,

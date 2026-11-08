@@ -21,6 +21,9 @@ namespace Kerbcast
     {
         public string SiteKey;
         public string Label;
+        public Api.SiteKind Kind;
+        /* A craft vantage's persistentId, 0 for any other kind. */
+        public uint VantagePersistentId;
         public bool Active;
         public bool Fallback;
         public VantageState State;
@@ -483,11 +486,25 @@ namespace Kerbcast
                 {
                     SiteKey = e.Key,
                     Label = e.Label,
+                    Kind = e.Site != null ? e.Site.Kind : KindOf(e.Spec.Vantage.Kind),
+                    VantagePersistentId = e.Site != null ? e.Site.VantagePersistentId
+                        : e.Spec.Vantage.Kind == CommandVantageKind.Vessel ? e.Spec.Vantage.PersistentId : 0,
                     Active = i == _switch.Current,
                     Fallback = i == _fallback,
                     State = _states[i],
                     Score = _scores[i],
                 });
+            }
+        }
+
+        private static Api.SiteKind KindOf(CommandVantageKind kind)
+        {
+            switch (kind)
+            {
+                case CommandVantageKind.Vessel: return Api.SiteKind.Vessel;
+                case CommandVantageKind.Surface: return Api.SiteKind.Surface;
+                case CommandVantageKind.LaunchSite: return Api.SiteKind.LaunchSite;
+                default: return Api.SiteKind.Station;
             }
         }
 
