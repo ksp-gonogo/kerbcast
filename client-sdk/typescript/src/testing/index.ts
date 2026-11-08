@@ -1,6 +1,12 @@
 import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload, SiteCatalogPayload } from "../__generated__/types";
 import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, SiteKind, TrackMode } from "../__generated__/types";
-import type { CreateCommandCameraPayload } from "../__generated__/types";
+import type {
+  CreateCommandCameraPayload,
+  DeleteNetworkPayload,
+  NetworkDefinition,
+  NetworkResultPayload,
+  SaveNetworkPayload,
+} from "../__generated__/types";
 import type {
   DiscoveredCamera,
   InboundVideoStats,
@@ -145,6 +151,31 @@ export interface MockSidecarOptions {
    */
   forceBumpDelayMs?: number;
 }
+
+/** Options for {@link MockSidecar.withNetworks}. */
+export interface MockNetworkOptions {
+  /**
+   * Leave `save-network` and `delete-network` unanswered, for the caller to
+   * answer with {@link MockSidecar.fireNetworkResult}. By default the mock
+   * answers as the game does.
+   */
+  manual?: boolean;
+  /** Milliseconds before an automatic answer goes out. Default 0 (at once). */
+  answerDelayMs?: number;
+  /**
+   * Called when an automatic save is accepted, before the new definitions go
+   * out, so a harness can add or update the network's camera. Return the
+   * flight id it runs as, or undefined to leave it not running.
+   */
+  onSave?: (def: NetworkDefinition, created: boolean) => number | undefined;
+  /** Called when an automatic delete is accepted, so a harness can remove the network's camera. */
+  onDelete?: (def: NetworkDefinition) => void;
+}
+
+/** The most vantages a saved network takes, as the game enforces it. */
+const MAX_NETWORK_VANTAGES = 64;
+/** The longest network name the game takes. */
+const MAX_NETWORK_NAME = 48;
 
 /**
  * In-process protocol-level fake for the kerbcast sidecar.
@@ -330,9 +361,16 @@ export class MockSidecar {
         maxAnchorsPerCamera: 16,
         sizeHold: true,
         ...(this._maxSlots !== null ? { renegotiate: true, maxSlots: this._maxSlots } : {}),
+        ...(this._networks !== null ? { networks: true } : {}),
       },
     });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
+    if (this._siteCatalog !== null) {
+      this._sendToClient({ type: "site-catalog", content: this._siteCatalog });
+    }
+    if (this._networks !== null) {
+      this._sendToClient({ type: "network-definitions", content: { networks: this._networks } });
+    }
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
 
@@ -361,6 +399,17 @@ export class MockSidecar {
     const destroyed: CameraState = { ...cam, lifecycle: CameraLifecycle.Destroyed };
     this._cameras.set(flightId, destroyed);
     this._sendToClient({ type: "camera-state-changed", content: { state: destroyed } });
+  }
+
+  /**
+   * Take a camera out of the registry and push a fresh `camera-snapshot`
+   * without it, as the sidecar does when a created camera ends.
+   */
+  removeCamera(flightId: number): void {
+    if (!this._cameras.delete(flightId)) return;
+    this._maxRenderSizes.delete(flightId);
+    this._displaySizes.delete(flightId);
+    this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
   }
 
   /**
@@ -447,8 +496,105 @@ export class MockSidecar {
 
   private readonly _anchors = new Map<number, Anchor[]>();
 
-  /** Push a `site-catalog` message: the ground stations the game lists. */
+  private _networks: NetworkDefinition[] | null = null;
+  private _networkOptions: MockNetworkOptions = {};
+  private _nextNetworkId = 1;
+
+  /**
+   * Take tracking network saves the way a 1.12 sidecar does: `hello` says
+   * `networks: true`, `open()` sends `networks` as the first
+   * `network-definitions`, and `save-network` and `delete-network` are
+   * answered (see {@link MockNetworkOptions}). Set before `open()`.
+   */
+  withNetworks(networks: NetworkDefinition[] = [], opts: MockNetworkOptions = {}): this {
+    this._networks = networks.map((n) => ({ ...n }));
+    this._networkOptions = opts;
+    return this;
+  }
+
+  /** The tracking networks the mock holds now. Empty unless {@link withNetworks} was called. */
+  get networks(): ReadonlyArray<NetworkDefinition> {
+    return this._networks ?? [];
+  }
+
+  /** Replace the tracking networks and push a `network-definitions` message, as the game does on any change. */
+  fireNetworkDefinitions(networks: NetworkDefinition[]): void {
+    this._networks = networks.map((n) => ({ ...n }));
+    this._sendToClient({ type: "network-definitions", content: { networks: this._networks } });
+  }
+
+  /** Push a `network-result` message, to answer a request by hand. */
+  fireNetworkResult(payload: NetworkResultPayload): void {
+    this._sendToClient({ type: "network-result", content: payload });
+  }
+
+  private _answerNetwork(answer: () => NetworkResultPayload): void {
+    if (this._networks === null || this._networkOptions.manual) return;
+    const delay = this._networkOptions.answerDelayMs ?? 0;
+    if (delay <= 0) {
+      this._sendToClient({ type: "network-result", content: answer() });
+      return;
+    }
+    setTimeout(() => this._sendToClient({ type: "network-result", content: answer() }), delay);
+  }
+
+  /* Checked in the game's order: the request's shape first, then the network it names. */
+  private _saveNetwork(req: SaveNetworkPayload): NetworkResultPayload {
+    const refuse = (code: string, text: string): NetworkResultPayload => ({
+      token: req.token,
+      ok: false,
+      ...(req.networkId !== undefined ? { networkId: req.networkId } : {}),
+      code,
+      text,
+    });
+    const networks = this._networks ?? [];
+    if (req.vantages.length === 0) return refuse("noVantages", "a network needs at least one vantage");
+    if (req.vantages.length > MAX_NETWORK_VANTAGES) {
+      return refuse("tooManyVantages", `at most ${MAX_NETWORK_VANTAGES} vantages`);
+    }
+    if ((req.name ?? "").length > MAX_NETWORK_NAME) return refuse("badName", `at most ${MAX_NETWORK_NAME} characters`);
+    const name = req.name?.trim() || "Tracking network";
+    const existing = req.networkId !== undefined ? networks.find((n) => n.networkId === req.networkId) : undefined;
+    if (req.networkId !== undefined && !existing) return refuse("notFound", `no network ${req.networkId}`);
+    if (existing?.owner) return refuse("notOwner", `${existing.owner} made this network`);
+    if (existing && req.baseRevision !== undefined && req.baseRevision !== (existing.revision ?? 0)) {
+      return refuse("stale", "the network changed since it was read");
+    }
+    const def: NetworkDefinition = {
+      networkId: existing?.networkId ?? `mock-net-${this._nextNetworkId++}`,
+      name,
+      ...(req.watch !== undefined ? { watch: req.watch } : {}),
+      vantages: req.vantages,
+      ...(req.options !== undefined ? { options: req.options } : {}),
+      revision: (existing?.revision ?? 0) + 1,
+      ...(existing?.flightId !== undefined ? { flightId: existing.flightId } : {}),
+    };
+    const flightId = this._networkOptions.onSave?.(def, existing === undefined);
+    if (flightId !== undefined) def.flightId = flightId;
+    const next = existing ? networks.map((n) => (n === existing ? def : n)) : [...networks, def];
+    this.fireNetworkDefinitions(next);
+    return { token: req.token, ok: true, networkId: def.networkId };
+  }
+
+  private _deleteNetwork(req: DeleteNetworkPayload): NetworkResultPayload {
+    const networks = this._networks ?? [];
+    const existing = networks.find((n) => n.networkId === req.networkId);
+    if (!existing) {
+      return { token: req.token, ok: false, networkId: req.networkId, code: "notFound", text: `no network ${req.networkId}` };
+    }
+    if (existing.owner) {
+      return { token: req.token, ok: false, networkId: req.networkId, code: "notOwner", text: `${existing.owner} made this network` };
+    }
+    this._networkOptions.onDelete?.(existing);
+    this.fireNetworkDefinitions(networks.filter((n) => n !== existing));
+    return { token: req.token, ok: true, networkId: req.networkId };
+  }
+
+  private _siteCatalog: SiteCatalogPayload | null = null;
+
+  /** Push a `site-catalog` message: the ground stations the game lists. `open()` sends the last one again, as the sidecar does after `hello`. */
   fireSiteCatalog(payload: SiteCatalogPayload): void {
+    this._siteCatalog = payload;
     this._sendToClient({ type: "site-catalog", content: payload });
   }
 
@@ -819,6 +965,16 @@ export class MockSidecar {
       }
       case "create-command-camera": {
         this._createCommandCamera(msg.content);
+        break;
+      }
+      case "save-network": {
+        const req = msg.content;
+        this._answerNetwork(() => this._saveNetwork(req));
+        break;
+      }
+      case "delete-network": {
+        const req = msg.content;
+        this._answerNetwork(() => this._deleteNetwork(req));
         break;
       }
       case "destroy-command-camera": {

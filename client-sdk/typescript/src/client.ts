@@ -9,7 +9,10 @@ import type {
   DisplaySizeReport,
   ErrorPayload,
   Layer,
+  NetworkDefinition,
+  NetworkResultPayload,
   QualityPreset,
+  SaveNetworkPayload,
   ServerMessage,
   SettingsStatePayload,
   SiteCatalogPayload,
@@ -735,6 +738,35 @@ export interface CreateCommandCameraOptions {
   timeoutMs?: number;
 }
 
+/** How long {@link KerbcastClient.saveNetwork} and {@link KerbcastClient.deleteNetwork} wait for the game's answer by default. */
+export const NETWORK_REQUEST_TIMEOUT_MS = 10_000;
+
+/** Options for {@link KerbcastClient.saveNetwork} and {@link KerbcastClient.deleteNetwork}. */
+export interface NetworkRequestOptions {
+  /** Milliseconds to wait for the game's answer before rejecting with `timeout`. Default {@link NETWORK_REQUEST_TIMEOUT_MS}. */
+  timeoutMs?: number;
+}
+
+/** What {@link KerbcastClient.saveNetwork} takes: a `save-network` request without its token, which the client makes. */
+export type SaveNetworkSpec = Omit<SaveNetworkPayload, "token">;
+
+/**
+ * A tracking network save or delete that did not succeed. `code` is the
+ * game's refusal code (`stale`, `notOwner`, `noVantages` and so on, newer
+ * ones possible), or one of the client's own: `timeout` when no answer came
+ * in time, `unsupported` when the sidecar does not take networks, and
+ * `notConnected` when there is no connection to send it on.
+ */
+export class NetworkRequestError extends Error {
+  constructor(
+    readonly code: string,
+    readonly detail?: string,
+  ) {
+    super(`[kerbcast] tracking network request refused: ${code}${detail ? ` (${detail})` : ""}`);
+    this.name = "NetworkRequestError";
+  }
+}
+
 function randomToken(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
   if (c?.randomUUID) return c.randomUUID();
@@ -771,6 +803,12 @@ export interface KerbcastClientEvents {
    * has listed its ground stations, and whenever that list changes.
    */
   "site-catalog": SiteCatalogPayload;
+  /**
+   * Fired when a `network-definitions` message arrives: after `Hello` once
+   * the game has its tracking networks, and whenever one is saved, deleted
+   * or starts or stops running.
+   */
+  networks: NetworkDefinition[];
   /**
    * Fired each time the control channel of a freshly (re)connected peer
    * opens, i.e. the earliest moment it can carry messages. Consumers that
@@ -1921,6 +1959,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
   private _siteCatalog: SiteCatalogPayload | null = null;
+  private _networks: NetworkDefinition[] = [];
+  /** Whether the connected sidecar's `hello` said it takes tracking network saves. */
+  private _supportsNetworks = false;
+  /** Save and delete requests awaiting their `network-result`, by token. */
+  private readonly networkRequests = new Map<string, (result: NetworkResultPayload) => void>();
   private _lastContactAt: number | null = null;
   /** Client-side recording controller, lazily built on first `recording` access. */
   private _recording: RecordingController | null = null;
@@ -2160,6 +2203,84 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * Every tracking network the game has, from the sidecar's
+   * `network-definitions`: the saved ones, then those a mod made in game
+   * (`owner` set). Empty until the first arrives. Kept across reconnects.
+   */
+  networks(): NetworkDefinition[] {
+    return this._networks;
+  }
+
+  /** Whether the connected sidecar takes {@link saveNetwork} and {@link deleteNetwork}. False until its `hello`. */
+  get supportsNetworks(): boolean {
+    return this._supportsNetworks;
+  }
+
+  /**
+   * Create a saved tracking network (no `networkId`) or replace one. Every
+   * viewer sees the change in {@link networks}, and the network's camera
+   * appears in or updates in the camera list. Pass the `revision` you edited
+   * as `baseRevision` so a change made meanwhile by someone else is refused
+   * as `stale` rather than overwritten.
+   *
+   * Resolves with the network's id once the game has saved it. Rejects with
+   * a {@link NetworkRequestError} carrying the game's code, or `timeout`,
+   * `unsupported` or `notConnected`.
+   */
+  async saveNetwork(spec: SaveNetworkSpec, opts: NetworkRequestOptions = {}): Promise<{ networkId: string }> {
+    const token = randomToken();
+    const result = await this._networkRequest(
+      { type: "save-network", content: { ...spec, token } },
+      token,
+      opts.timeoutMs,
+    );
+    return { networkId: result.networkId ?? spec.networkId ?? "" };
+  }
+
+  /**
+   * Delete a saved tracking network; its camera ends for every viewer.
+   * Rejects as {@link saveNetwork} does, with `notOwner` for one a mod made
+   * in game.
+   */
+  async deleteNetwork(networkId: string, opts: NetworkRequestOptions = {}): Promise<void> {
+    const token = randomToken();
+    await this._networkRequest({ type: "delete-network", content: { token, networkId } }, token, opts.timeoutMs);
+  }
+
+  /**
+   * The game answers every viewer's requests to every viewer, so only the
+   * result carrying this request's token settles it.
+   */
+  private async _networkRequest(
+    msg: ClientMessage,
+    token: string,
+    timeoutMs = NETWORK_REQUEST_TIMEOUT_MS,
+  ): Promise<NetworkResultPayload> {
+    if (!this.control) throw new NetworkRequestError("notConnected");
+    if (!this._supportsNetworks) throw new NetworkRequestError("unsupported");
+    const answered = new Promise<NetworkResultPayload>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.networkRequests.delete(token);
+        reject(new NetworkRequestError("timeout", `no answer within ${timeoutMs} ms`));
+      }, timeoutMs);
+      this.networkRequests.set(token, (result) => {
+        clearTimeout(timer);
+        this.networkRequests.delete(token);
+        if (result.ok) resolve(result);
+        else reject(new NetworkRequestError(result.code ?? "refused", result.text));
+      });
+    });
+    try {
+      await this._send(msg);
+    } catch (err) {
+      this.networkRequests.get(token)?.({ token, ok: false, code: "notConnected" });
+      answered.catch(() => {});
+      throw new NetworkRequestError("notConnected", err instanceof Error ? err.message : undefined);
+    }
+    return answered;
+  }
+
+  /**
    * When the last message from the sidecar arrived, as `Date.now()`, or null
    * before the first. Kept across connections, so once a connection drops it
    * still says when that connection was last heard from, including time the
@@ -2255,6 +2376,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.commandCentres.clear();
     this._anchorsSupported = false;
     this._sizeHoldSupported = false;
+    this._supportsNetworks = false;
     this.slotCount = 0;
     this.session = null;
     this._renegotiateSupported = false;
@@ -3356,6 +3478,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this._sizeHoldSupported = msg.content.sizeHold === true;
         this._renegotiateSupported = msg.content.renegotiate === true;
         this._maxSlots = msg.content.maxSlots ?? Number.POSITIVE_INFINITY;
+        this._supportsNetworks = msg.content.networks === true;
         if (msg.content.resume === true) this._sendResume();
         this._sendHeldSizes();
         /* A new connection starts with no anchors on the sidecar. */
@@ -3497,6 +3620,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       case "site-catalog":
         this._siteCatalog = msg.content;
         this.emit("site-catalog", msg.content);
+        break;
+      case "network-definitions":
+        this._networks = msg.content.networks ?? [];
+        this.emit("networks", this._networks);
+        break;
+      case "network-result":
+        this.networkRequests.get(msg.content.token)?.(msg.content);
         break;
     }
   }

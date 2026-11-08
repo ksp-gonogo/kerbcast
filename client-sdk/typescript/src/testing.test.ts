@@ -271,6 +271,38 @@ describe("MockSidecar", () => {
     expect(client.cameras.find((c) => c.flightId === 7)?.trackMode).toBe(TrackMode.None);
   });
 
+  it("removeCamera drops a camera and resends the list; open() resends the site catalog", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    sidecar.addCamera({ flightId: 43 });
+    sidecar.fireSiteCatalog({ stations: [], vessels: [] });
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([42]);
+    sidecar.open();
+    expect(client.siteCatalog()?.vessels).toEqual([]);
+    sidecar.removeCamera(43);
+    expect(client.cameras.map((c) => c.flightId)).toEqual([42]);
+  });
+
+  it("answers network saves through onSave and refuses a mod's network", async () => {
+    const saved: boolean[] = [];
+    const sidecar = new MockSidecar().withNetworks(
+      [{ networkId: "m", name: "Mod net", vantages: [{ vantage: { kind: CommandVantageKind.Station, station: "KSC" } }], owner: "a-mod" }],
+      { onSave: (_def, created) => (saved.push(created), 900) },
+    );
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+    const vantages = [{ vantage: { kind: CommandVantageKind.Station, station: "KSC" } }];
+    const { networkId } = await client.saveNetwork({ name: "  ", vantages });
+    const made = client.networks().find((n) => n.networkId === networkId);
+    expect(made).toMatchObject({ name: "Tracking network", revision: 1, flightId: 900 });
+    await client.saveNetwork({ networkId, baseRevision: 1, name: "Renamed", vantages });
+    expect(client.networks().find((n) => n.networkId === networkId)?.revision).toBe(2);
+    expect(saved).toEqual([true, false]);
+    await expect(client.saveNetwork({ networkId: "m", vantages })).rejects.toMatchObject({ code: "notOwner" });
+  });
+
   it("updateCamera pushes state-change to the client", async () => {
     const sidecar = new MockSidecar();
     sidecar.addCamera({ flightId: 42, layers: [Layer.Near] });

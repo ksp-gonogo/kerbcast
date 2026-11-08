@@ -8,7 +8,8 @@
  * cameras and delivers animated canvas captureStream tracks to each slot.
  *
  * One camera starts destroyed to demonstrate SIGNAL LOST. A command
- * camera cycles through the target-bracket states.
+ * camera cycles through the target-bracket states. Tracking networks run as
+ * further command cameras (see ./networks).
  * /profile fetch is intercepted to return plausible stagger numbers.
  */
 
@@ -24,6 +25,7 @@ import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { loadLocalMediabunnyTrimmer } from "../mediabunnyAsset";
 import { stateFollowingDecodedSizeProbe } from "./decodedSizeProbe";
+import { installMockNetworks } from "./networks";
 import {
   MOCK_COMMAND_FRAME_HEIGHT,
   MOCK_COMMAND_SCENARIO_COUNT,
@@ -298,6 +300,10 @@ export async function createMockClient(): Promise<KerbcastClient> {
   for (const cam of MOCK_CAMERAS) {
     sidecar.addCamera(cam);
   }
+  const networks = installMockNetworks(sidecar);
+  for (const cam of networks.cameras) {
+    sidecar.addCamera(cam);
+  }
 
   /*
    * Canvas tracks are built once per camera (keyed by flightId, drawing that
@@ -315,7 +321,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
     const existing = tracks.get(flightId);
     if (existing) return existing;
     const i = MOCK_CAMERAS.findIndex((c) => c.flightId === flightId);
-    if (i < 0) return undefined;
+    if (i < 0) return networks.trackFor(flightId);
     const cam = MOCK_CAMERAS[i];
     // Destroyed cams have no live track (the UI shows SIGNAL LOST).
     if ((cam.lifecycle ?? CameraLifecycle.Active) === CameraLifecycle.Destroyed) return undefined;
@@ -437,6 +443,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
     sidecar.updateCamera(COMMAND_FLIGHT_ID, {
       commandTrack: mockCommandTrack(scenario, ut, switchedAtUt),
     });
+    networks.tick(ut);
   }, 1000);
 
   // Periodic pings (keeps the watchdog alive in mock mode)

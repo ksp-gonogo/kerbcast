@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import styled from "styled-components";
+import { useNetworkCount } from "./networks/useNetworkCount";
 import type { CrewBarPlacement, ThemePreference } from "./settings";
 
 interface SettingsProps {
@@ -21,6 +22,7 @@ interface SettingsProps {
   onCrewPlacementChange: (placement: CrewBarPlacement) => void;
   onCrewMergeChange: (merge: boolean) => void;
   onShowLaunchpadChange: (show: boolean) => void;
+  onOpenNetworks: () => void;
   onClose: () => void;
 }
 
@@ -41,9 +43,11 @@ export function Settings({
   onCrewPlacementChange,
   onCrewMergeChange,
   onShowLaunchpadChange,
+  onOpenNetworks,
   onClose,
 }: SettingsProps): React.JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
+  const networkCount = useNetworkCount();
 
   // Close on outside click or Escape
   useEffect(() => {
@@ -179,6 +183,21 @@ export function Settings({
           />
         </FieldRow>
 
+        {networkCount !== null && (
+          <>
+            <SectionLabel style={{ marginTop: "0.75rem" }}>Tracking networks</SectionLabel>
+            <FieldRow>
+              <div>
+                <FieldLabel as="span">Camera networks</FieldLabel>
+                <FieldHint>One feed that cuts between stations and craft to keep a craft in view</FieldHint>
+              </div>
+              <ManageButton type="button" onClick={onOpenNetworks}>
+                {networkCount === 0 ? "Create" : `Manage (${networkCount})`}
+              </ManageButton>
+            </FieldRow>
+          </>
+        )}
+
         <SectionLabel style={{ marginTop: "0.75rem" }}>Developer</SectionLabel>
 
         <FieldRow>
@@ -298,6 +317,27 @@ const NativeSelect = styled.select`
   accent-color: var(--kc-accent);
   cursor: pointer;
 
+  &:focus-visible {
+    outline: 2px solid var(--kc-accent);
+    outline-offset: 1px;
+  }
+`;
+
+const ManageButton = styled.button`
+  color: var(--kc-text);
+  background: var(--kc-surface-raised);
+  border: 1px solid var(--kc-border);
+  border-radius: 4px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.75rem;
+  font-family: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &:hover {
+    border-color: var(--kc-accent);
+    color: var(--kc-accent);
+  }
   &:focus-visible {
     outline: 2px solid var(--kc-accent);
     outline-offset: 1px;
