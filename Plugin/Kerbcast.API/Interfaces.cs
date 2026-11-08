@@ -233,6 +233,17 @@ namespace Kerbcast.Api
          */
         LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN);
 
+        /**
+         * <summary>
+         * How fine a detail a command camera standing at <paramref name="vantage"/> could show now: its tightest zoom,
+         * the frame it renders, and its lens when deep-space optics are drawn, by the rules a camera there would have.
+         * For the blur toward one point, air included, read <see cref="LineOfSightResult.ResolutionRad"/>. A read for the
+         * host alone: no lock applies and no camera uses it. Not Known for a null vantage or one that does not resolve.
+         * Check <see cref="KerbcastApi.Supports"/> with <see cref="ApiFeature.VantageResolution"/> first.
+         * </summary>
+         */
+        VantageResolution VantageResolution(NetworkVantage vantage);
+
         /** <summary>Every craft a command feed could watch, empty when it is not a command feed.</summary> */
         IReadOnlyList<CommandTarget> Targets(uint flightId);
 

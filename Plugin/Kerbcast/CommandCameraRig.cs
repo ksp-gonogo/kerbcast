@@ -2653,12 +2653,7 @@ namespace Kerbcast
             var knobs = over.Over(_lens.Defaults);
 
             var body = _mount.Site.StationBody;
-            double air = 0;
-            if (body != null && body.atmosphere)
-            {
-                double alt = (station - ToD(body.position)).Magnitude - body.Radius;
-                if (alt < body.atmosphereDepth) air = OpticsModel.AirFactor(body.GetPressure(Math.Max(0.0, alt)));
-            }
+            double air = body != null ? CommandCameraOptics.AirAt(body, (station - ToD(body.position)).Magnitude) : 0;
             double sunElev = double.NaN;
             var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
             if (sun != null && sun != body)

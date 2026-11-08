@@ -734,16 +734,18 @@ namespace Kerbcast
            follows the Tracking Station level in career with the tracking rules
            on. A vessel vantage or a surface point, sandbox and science get the
            full zoom. */
-        private Func<double> LensFovMin(CommandCameraSite site)
+        private Func<double> LensFovMin(CommandCameraSite site) => () => FovMinAt(site);
+
+        private double FovMinAt(CommandCameraSite site)
         {
             double top = _settings.CommandCameraFovMin;
             /* Under deep-space optics the blur, not the zoom, holds a low level back; without the shaders for it the level's zoom stays. */
-            if (_settings.DeepSpaceOptics && CommandCameraOptics.Available()) return () => top;
+            if (_settings.DeepSpaceOptics && CommandCameraOptics.Available()) return top;
             double middle = Math.Max(_settings.CommandCameraFovMinLevel2, top);
             double lowest = Math.Max(_settings.CommandCameraFovMinLevel1, middle);
-            if (site.HasVantage || site.IsSurfacePoint) return () => top;
-            if (site.IsLaunchSite) return () => lowest;
-            return () => CommandCameraTargets.Gated()
+            if (site.HasVantage || site.IsSurfacePoint) return top;
+            if (site.IsLaunchSite) return lowest;
+            return CommandCameraTargets.Gated()
                 ? CommandCameraMath.LensFovMin(CommandCameraTargets.NormLevel(), lowest, middle, top)
                 : top;
         }
@@ -773,6 +775,28 @@ namespace Kerbcast
                     : game.Mode == Game.Modes.CAREER ? "tracking rules off"
                     : game.Mode.ToString().ToLowerInvariant();
                 return new OpticsLens(s.OpticsDefaults(OpticsModel.ResolutionForLevel(1, l1, l2, l3)), $"top lens ({why})");
+            };
+        }
+
+        /*
+         * What a command camera at `site` renders with at its tightest zoom,
+         * from the rules its rig is built with: the zoom limit, the frame at
+         * full quality, and the optics when this GPU draws them. A feed's
+         * SetOptics override is the feed's, not the site's, so it is not in it.
+         */
+        internal LensLimits LensLimitsAt(CommandCameraSite site)
+        {
+            if (site == null) return LensLimits.Unknown;
+            /* LensKnobs picks the lens by the same level LensOptics does, without the label. */
+            bool on = _settings.DeepSpaceOptics && CommandCameraOptics.Available();
+            return new LensLimits
+            {
+                Known = true,
+                FovMinDeg = FovMinAt(site),
+                WidthPx = _settings.Width,
+                HeightPx = _settings.Height,
+                OpticsOn = on,
+                Knobs = on ? LensKnobs(site) : OpticsKnobs.Unset,
             };
         }
 

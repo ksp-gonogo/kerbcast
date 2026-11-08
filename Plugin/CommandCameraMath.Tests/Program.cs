@@ -1874,5 +1874,45 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(!bad.Valid && !bad2.Valid, "out of range or infinite knobs are refused");
 }
 
+// How fine a detail a lens resolves at its tightest zoom.
+{
+    var off = new LensLimits { Known = true, FovMinDeg = 0.02, WidthPx = 1024, HeightPx = 576, Knobs = OpticsKnobs.Unset };
+    double pixel = 2 * Math.Tan(0.01 * Math.PI / 180) / 576 * OpticsModel.ArcsecPerRadian;
+    Check(Near(off.PixelArcsec, pixel, 1e-9) && Near(off.PixelArcsec, 0.125, 1e-3), "one pixel at 0.02 degrees over 576 rows is about 0.125 arcsec");
+    Check(off.ResolutionArcsec(0, 90) == off.PixelArcsec && off.ResolutionArcsec(1, 3) == off.PixelArcsec,
+        "with the optics off the pixel is the limit, whatever the air");
+    Check(double.IsNaN(off.LensArcsec), "with the optics off there is no lens blur");
+
+    var knobs = OpticsModel.Defaults;
+    knobs.ResolutionArcsec = 4;
+    var on = off;
+    on.OpticsOn = true;
+    on.Knobs = knobs;
+    Check(on.LensArcsec == 4, "the lens blur is the knob's");
+    Check(Near(on.ResolutionArcsec(0, 10), 4, 1e-12), "in space the lens alone limits, toward any elevation");
+    Check(Near(on.ResolutionArcsec(1, 90), Math.Sqrt(16 + 1), 1e-9), "from Kerbin's sea level at the zenith lens and seeing add in quadrature");
+    double lowBlur = OpticsModel.Assess(new OpticsSite
+    {
+        ResolutionArcsec = 4, ZenithSeeingArcsec = knobs.SeeingArcsec, SeeingAirmassPower = knobs.SeeingAirmassPower,
+        AirFactor = 1, ElevationDeg = 5,
+    }, 1e6).BlurArcsec;
+    Check(on.ResolutionArcsec(1, 5) == lowBlur && lowBlur > on.ResolutionArcsec(1, 90), "low in the sky it is the blur the optics draw, and worse");
+    Check(on.ResolutionArcsec(0.5, 5) < lowBlur, "thinner air blurs less");
+
+    var wide = on;
+    wide.FovMinDeg = 1;
+    wide.Knobs.ResolutionArcsec = 1;
+    Check(Near(wide.ResolutionArcsec(0, 90), wide.PixelArcsec, 1e-12) && wide.PixelArcsec > 6,
+        "a lens finer than its widest pixel is held to the pixel");
+    var sharp = on;
+    sharp.Knobs.ResolutionArcsec = 0;
+    Check(sharp.ResolutionArcsec(0, 90) == sharp.PixelArcsec, "a perfect lens in space is held to the pixel");
+
+    var unknown = LensLimits.Unknown;
+    unknown.OpticsOn = true;
+    Check(double.IsNaN(unknown.PixelArcsec) && double.IsNaN(unknown.ResolutionArcsec(1, 45)) && double.IsNaN(unknown.LensArcsec),
+        "an unknown lens resolves nothing");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

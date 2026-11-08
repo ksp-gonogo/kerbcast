@@ -45,6 +45,7 @@ Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.3");
 Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras, from API 1.4");
 Check(KerbcastApi.Supports(ApiFeature.GroundStations) && (int)ApiFeature.GroundStations == 10, "shipped: the ground station list, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.LineOfSight) && (int)ApiFeature.LineOfSight == 11, "shipped: line of sight, from API 1.5");
+Check(KerbcastApi.Supports(ApiFeature.VantageResolution) && (int)ApiFeature.VantageResolution == 12, "shipped: vantage resolution, from API 1.5");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
 
 // Enum numbers are part of the contract.
@@ -230,6 +231,22 @@ using (var kc = RecordingKerbcast.Install())
         Check(cmd.LineOfSight(NetworkVantage.Station("Crater Rim"), 1000, 1, new Vec3d(7e5, 0, 0)).Disabled, "and can answer for a station switched off");
         Check(OnOtherThread(() => Throws<InvalidOperationException>(() => cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0)))),
             "line of sight keeps to the main thread");
+        Check(double.IsNaN(new LineOfSightResult(true, true, null, false, 1e6).ResolutionRad), "a line of sight answer built without a resolution has none");
+        kc.Command.SetLineOfSight(new LineOfSightResult(true, true, null, false, 1e6, resolutionRad: 2e-6));
+        Check(cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0)).ResolutionRad == 2e-6, "a test sets the resolution line of sight answers");
+        var res = cmd.VantageResolution(relay);
+        Check(!res.Known && double.IsNaN(res.FovMinDeg) && double.IsNaN(res.PixelRad) && double.IsNaN(res.LensArcsec) && double.IsNaN(res.BestResolutionRad),
+            "vantage resolution is unknown until a test sets an answer");
+        var set = new VantageResolution { Known = true, FovMinDeg = 0.02, FrameWidthPx = 1024, FrameHeightPx = 576, PixelRad = 6.06e-7, OpticsOn = true, LensArcsec = 4, BestResolutionRad = 1.94e-5 };
+        kc.Command.SetVantageResolution(set);
+        set.FovMinDeg = 9;
+        res = cmd.VantageResolution(NetworkVantage.Station("KSC"));
+        Check(res.Known && res.FovMinDeg == 0.02 && res.FrameWidthPx == 1024 && res.FrameHeightPx == 576 && res.OpticsOn && res.LensArcsec == 4
+            && res.BestResolutionRad == 1.94e-5, "a test sets what vantage resolution answers, kept as it was set");
+        res.FrameWidthPx = 1;
+        Check(cmd.VantageResolution(relay).FrameWidthPx == 1024, "each answer is the caller's own copy");
+        Check(!cmd.VantageResolution(null).Known, "a null vantage resolves nothing");
+        Check(OnOtherThread(() => Throws<InvalidOperationException>(() => cmd.VantageResolution(relay))), "vantage resolution keeps to the main thread");
         Check(cmd.GroundStations().Count == 0, "no ground stations until a test sets them");
         kc.Command.SetGroundStations(new[]
         {

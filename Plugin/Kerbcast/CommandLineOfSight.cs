@@ -11,7 +11,8 @@ namespace Kerbcast
      * CommandCameraOcclusion.Blocks, the cameras' own test. Each vantage
      * keeps its resolved site and its skyline between calls, so a caller
      * asking often allocates nothing once its vantages are known. No camera
-     * reads it.
+     * reads it. The answer also says how fine a detail the vantage's lens
+     * resolves toward the point, by the rules its camera would render with.
      */
     internal sealed class CommandLineOfSight
     {
@@ -30,12 +31,7 @@ namespace Kerbcast
 
         public LineOfSightAnswer Check(Api.NetworkVantage vantage, double ut, int bodyIndex, DVec3 position, double radiusM)
         {
-            var core = KerbcastCore.Instance;
-            if (!ReferenceEquals(core, _scene))
-            {
-                _entries.Clear();
-                _scene = core;
-            }
+            Sync();
             if (vantage == null || !Finite(ut) || !Finite(position.X) || !Finite(position.Y) || !Finite(position.Z))
                 return LineOfSightMath.Unknown;
             var world = KinematicsWorld.Now();
@@ -56,7 +52,7 @@ namespace Kerbcast
                 : CommandCameraMath.CarriedByBody(motion.RelNow, homeAt, CommandCameraOcclusion.Spin(standsOn), dt);
             var target = ToD(craftBody.getTruePositionAtUT(ut)) + world.Zup.ToWorld(position);
             double radius = Finite(radiusM) && radiusM > 0 ? radiusM : 0;
-            if (switchedOff) return LineOfSightMath.SwitchedOff(station, target);
+            if (switchedOff) return Resolved(LineOfSightMath.SwitchedOff(station, target), site, standsOn, homeAt, station, target);
 
             e.Occlusion.UseSite(site);
             int fallbacks = e.Occlusion.MaskFallbacks;
@@ -72,7 +68,39 @@ namespace Kerbcast
             }
             /* A skyline bin the line needed fell back to the smooth horizon: the answer is not whole, so it is not given. */
             if (e.Occlusion.MaskFallbacks != fallbacks) return LineOfSightMath.Unknown;
-            return LineOfSightMath.Answer(station, target, occluder, standsOn.bodyName);
+            return Resolved(LineOfSightMath.Answer(station, target, occluder, standsOn.bodyName), site, standsOn, homeAt, station, target);
+        }
+
+        /* What a command camera standing at `vantage` renders with at its tightest zoom; not Known while it does not resolve. */
+        public LensLimits Lens(Api.NetworkVantage vantage)
+        {
+            var provider = KerbcastCore.Instance?.CommandProvider;
+            if (vantage == null || provider == null) return LensLimits.Unknown;
+            Sync();
+            var site = EntryFor(vantage)?.Site;
+            return site == null || site.VantageGone ? LensLimits.Unknown : provider.LensLimitsAt(site);
+        }
+
+        /* `a` with the finest angle the lens resolves toward the target, through the air at the lens as the rig's optics take it. */
+        private static LineOfSightAnswer Resolved(LineOfSightAnswer a, CommandCameraSite site, CelestialBody standsOn, DVec3 centre,
+            DVec3 station, DVec3 target)
+        {
+            var provider = KerbcastCore.Instance?.CommandProvider;
+            if (provider == null) return a;
+            var up = station - centre;
+            double air = CommandCameraOptics.AirAt(standsOn, up.Magnitude);
+            double elevation = CommandCameraMath.ElevationDeg(target - station, up);
+            a.ResolutionRad = provider.LensLimitsAt(site).ResolutionArcsec(air, elevation) / OpticsModel.ArcsecPerRadian;
+            return a;
+        }
+
+        /* A new scene's sites are new objects, so none is kept past it. */
+        private void Sync()
+        {
+            var core = KerbcastCore.Instance;
+            if (ReferenceEquals(core, _scene)) return;
+            _entries.Clear();
+            _scene = core;
         }
 
         /* The vantage's resolved site and skyline, kept; null while it does not resolve, tried again a second later. */

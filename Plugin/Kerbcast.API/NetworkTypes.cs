@@ -120,7 +120,8 @@ namespace Kerbcast.Api
     /** <summary>Whether a vantage can see a point at one instant, from <see cref="ICommand.LineOfSight"/>.</summary> */
     public readonly struct LineOfSightResult
     {
-        public LineOfSightResult(bool known, bool visible, string occluder, bool belowHorizon, double rangeM, bool disabled = false)
+        public LineOfSightResult(bool known, bool visible, string occluder, bool belowHorizon, double rangeM, bool disabled = false,
+            double resolutionRad = double.NaN)
         {
             Known = known;
             Visible = visible;
@@ -128,6 +129,7 @@ namespace Kerbcast.Api
             BelowHorizon = belowHorizon;
             RangeM = rangeM;
             Disabled = disabled;
+            ResolutionRad = resolutionRad;
         }
 
         /** <summary>False when the vantage cannot be placed at the instant, or the point's body is unknown; nothing else is then meaningful.</summary> */
@@ -153,8 +155,67 @@ namespace Kerbcast.Api
          */
         public bool Disabled { get; }
 
+        /**
+         * <summary>
+         * The smallest angle, in radians, a command camera at the vantage resolves toward the point at its tightest
+         * zoom: one pixel there (see <see cref="VantageResolution.PixelRad"/>), or, when deep-space optics are drawn,
+         * the blur of its lens and of the air between, if wider. The air is taken at the vantage and toward the point,
+         * as the camera's own optics take it. A feed's <see cref="ICommand.SetOptics"/> override is not in it.
+         * RangeM times this is the smallest size on the point the vantage could tell apart. NaN when not Known.
+         * Added in API 1.5.
+         * </summary>
+         */
+        public double ResolutionRad { get; }
+
         public override string ToString() =>
-            !Known ? "LineOfSight(unknown)" : Disabled ? $"LineOfSight(station switched off, {RangeM} m)" : Visible ? $"LineOfSight(visible, {RangeM} m)" : $"LineOfSight(blocked by {Occluder}{(BelowHorizon ? ", below horizon" : "")}, {RangeM} m)";
+            !Known ? "LineOfSight(unknown)" : Disabled ? $"LineOfSight(station switched off, {RangeM} m)" : Visible ? $"LineOfSight(visible, {RangeM} m, resolves {ResolutionRad} rad)" : $"LineOfSight(blocked by {Occluder}{(BelowHorizon ? ", below horizon" : "")}, {RangeM} m)";
+    }
+
+    /**
+     * <summary>
+     * How fine a detail a command camera at one vantage can show, from <see cref="ICommand.VantageResolution"/>:
+     * the limits it renders with, by the same rules as a camera standing there. They can change within a scene (a
+     * Tracking Station upgrade), so read them again rather than keeping them.
+     * </summary>
+     */
+    public sealed class VantageResolution
+    {
+        /** <summary>False when the vantage does not resolve to a place now; nothing else is then meaningful.</summary> */
+        public bool Known { get; set; }
+
+        /** <summary>The narrowest vertical field of view the camera there zooms to, degrees. NaN when not Known.</summary> */
+        public double FovMinDeg { get; set; } = double.NaN;
+
+        /** <summary>The frame a command camera renders at full quality, in pixels. Under load it may render smaller for a while.</summary> */
+        public int FrameWidthPx { get; set; }
+        public int FrameHeightPx { get; set; }
+
+        /** <summary>The angle one pixel covers at the frame's centre at FovMinDeg, radians: FovMinDeg spans FrameHeightPx. NaN when not Known.</summary> */
+        public double PixelRad { get; set; } = double.NaN;
+
+        /** <summary>Deep-space optics are on and drawn: the player's setting is on and the game can draw them.</summary> */
+        public bool OpticsOn { get; set; }
+
+        /**
+         * <summary>
+         * The lens's own blur (FWHM) in arcseconds while OpticsOn, Kerbcast's own for the vantage at the Tracking
+         * Station level now, before any feed's <see cref="ICommand.SetOptics"/> override; NaN otherwise. Air adds to it
+         * from the ground: <see cref="LineOfSightResult.ResolutionRad"/> has the whole blur toward a point.
+         * </summary>
+         */
+        public double LensArcsec { get; set; } = double.NaN;
+
+        /**
+         * <summary>
+         * The smallest angle it resolves with no air in the way, radians: PixelRad, or the lens blur when OpticsOn and
+         * wider. No sight line from the vantage resolves finer. NaN when not Known.
+         * </summary>
+         */
+        public double BestResolutionRad { get; set; } = double.NaN;
+
+        public override string ToString() =>
+            !Known ? "VantageResolution(unknown)"
+                : $"VantageResolution(fovMin={FovMinDeg} deg, {FrameWidthPx}x{FrameHeightPx}, pixel={PixelRad} rad, optics={(OpticsOn ? LensArcsec + " arcsec" : "off")}, best={BestResolutionRad} rad)";
     }
 
     /** <summary>How a tracking network holds after a cut. Every value finite and 0 or more.</summary> */

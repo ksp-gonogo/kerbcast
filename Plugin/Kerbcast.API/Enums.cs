@@ -30,6 +30,8 @@ namespace Kerbcast.Api
         GroundStations = 10,
         /** <summary><see cref="ICommand.LineOfSight"/>. Added in API 1.5.</summary> */
         LineOfSight = 11,
+        /** <summary><see cref="ICommand.VantageResolution"/> and <see cref="LineOfSightResult.ResolutionRad"/>. Added in API 1.5.</summary> */
+        VantageResolution = 12,
     }
 
     public enum CameraKind

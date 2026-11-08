@@ -23,6 +23,7 @@ namespace Kerbcast.Api.Testing
         readonly Dictionary<uint, List<NetworkVantageStatus>> networkStatus = new Dictionary<uint, List<NetworkVantageStatus>>();
         readonly List<GroundStationInfo> stations = new List<GroundStationInfo>();
         LineOfSightResult sight = new LineOfSightResult(false, false, null, false, double.NaN);
+        VantageResolution resolution = new VantageResolution();
         uint nextNetworkId = 0x4E000001;
         readonly List<PublishedSnapshot> published = new List<PublishedSnapshot>();
         string lockOwner;
@@ -97,6 +98,9 @@ namespace Kerbcast.Api.Testing
 
         /** <summary>What every LineOfSight call answers: not Known until a test sets it.</summary> */
         public void SetLineOfSight(LineOfSightResult answer) => sight = answer;
+
+        /** <summary>What every VantageResolution call answers, a copy each time: not Known until a test sets it.</summary> */
+        public void SetVantageResolution(VantageResolution answer) => resolution = answer != null ? Copy(answer) : new VantageResolution();
 
         /** <summary>What GroundStations returns: none until a test sets them.</summary> */
         public void SetGroundStations(IEnumerable<GroundStationInfo> list)
@@ -548,6 +552,19 @@ namespace Kerbcast.Api.Testing
             kc.Record($"LineOfSight {vantage?.ToString() ?? "null"} {ut} {bodyIndex} {position}");
             return vantage == null ? new LineOfSightResult(false, false, null, false, double.NaN) : sight;
         }
+
+        public VantageResolution VantageResolution(NetworkVantage vantage)
+        {
+            kc.Enter("VantageResolution", ApiFeature.VantageResolution);
+            kc.Record($"VantageResolution {vantage?.ToString() ?? "null"}");
+            return vantage == null ? new VantageResolution() : Copy(resolution);
+        }
+
+        static VantageResolution Copy(VantageResolution r) => new VantageResolution
+        {
+            Known = r.Known, FovMinDeg = r.FovMinDeg, FrameWidthPx = r.FrameWidthPx, FrameHeightPx = r.FrameHeightPx,
+            PixelRad = r.PixelRad, OpticsOn = r.OpticsOn, LensArcsec = r.LensArcsec, BestResolutionRad = r.BestResolutionRad,
+        };
 
         public IReadOnlyList<CommandTarget> Targets(uint flightId)
         {

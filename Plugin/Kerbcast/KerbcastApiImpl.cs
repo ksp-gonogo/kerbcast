@@ -276,7 +276,26 @@ namespace Kerbcast
         {
             Enter(nameof(LineOfSight), ApiFeature.LineOfSight);
             var a = sight.Check(vantage, ut, bodyIndex, new DVec3(position.X, position.Y, position.Z), radiusM);
-            return new LineOfSightResult(a.Known, a.Visible, a.Occluder, a.BelowHorizon, a.RangeM, a.Disabled);
+            return new LineOfSightResult(a.Known, a.Visible, a.Occluder, a.BelowHorizon, a.RangeM, a.Disabled,
+                KerbcastApi.Supports(ApiFeature.VantageResolution) ? a.ResolutionRad : double.NaN);
+        }
+
+        public VantageResolution VantageResolution(NetworkVantage vantage)
+        {
+            Enter(nameof(VantageResolution), ApiFeature.VantageResolution);
+            var lens = sight.Lens(vantage);
+            if (!lens.Known) return new VantageResolution();
+            return new VantageResolution
+            {
+                Known = true,
+                FovMinDeg = lens.FovMinDeg,
+                FrameWidthPx = lens.WidthPx,
+                FrameHeightPx = lens.HeightPx,
+                PixelRad = lens.PixelArcsec / OpticsModel.ArcsecPerRadian,
+                OpticsOn = lens.OpticsOn,
+                LensArcsec = lens.LensArcsec,
+                BestResolutionRad = lens.ResolutionArcsec(0, 90) / OpticsModel.ArcsecPerRadian,
+            };
         }
 
         public IReadOnlyList<GroundStationInfo> GroundStations()

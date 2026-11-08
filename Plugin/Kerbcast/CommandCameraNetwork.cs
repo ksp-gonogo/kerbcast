@@ -409,12 +409,7 @@ namespace Kerbcast
                     v.Occluder = occluder;
                 }
             }
-            double air = 0;
-            if (body.atmosphere)
-            {
-                double alt = (station - bodyPos).Magnitude - body.Radius;
-                if (alt < body.atmosphereDepth) air = OpticsModel.AirFactor(body.GetPressure(Math.Max(0.0, alt)));
-            }
+            double air = CommandCameraOptics.AirAt(body, (station - bodyPos).Magnitude);
             double sunElev = double.NaN;
             if (sun != null && sun != body)
             {

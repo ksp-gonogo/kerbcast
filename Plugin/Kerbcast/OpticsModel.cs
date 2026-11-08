@@ -91,6 +91,53 @@ namespace Kerbcast
         public double SunElevationDeg;
     }
 
+    /*
+     * How fine a detail a command camera's lens can show at its tightest zoom:
+     * the zoom limit and frame size it renders with, and its optics when they
+     * are drawn. Unity-free, so the formula is tested without the game.
+     */
+    internal struct LensLimits
+    {
+        public bool Known;
+        /* The tightest vertical field of view, degrees. */
+        public double FovMinDeg;
+        public int WidthPx;
+        public int HeightPx;
+        /* The optics blur is drawn; Knobs means nothing otherwise. */
+        public bool OpticsOn;
+        public OpticsKnobs Knobs;
+
+        public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset };
+
+        /* Arcseconds one pixel covers at the frame's centre at the tightest zoom. */
+        public double PixelArcsec => Known ? OpticsModel.PixelArcsec(FovMinDeg, HeightPx) : double.NaN;
+
+        /* The lens's own blur in arcseconds, NaN with the optics off. */
+        public double LensArcsec => Known && OpticsOn ? Math.Max(0.0, Knobs.ResolutionArcsec) : double.NaN;
+
+        /*
+         * The smallest angle, in arcseconds, the lens resolves toward a target
+         * `elevationDeg` above its horizon with `airFactor` air around it (see
+         * OpticsModel.AirFactor): one pixel at the tightest zoom, or the blur
+         * the optics draw there when that is wider.
+         */
+        public double ResolutionArcsec(double airFactor, double elevationDeg)
+        {
+            double pixel = PixelArcsec;
+            if (!OpticsOn || double.IsNaN(pixel)) return pixel;
+            var r = OpticsModel.Assess(new OpticsSite
+            {
+                ResolutionArcsec = Knobs.ResolutionArcsec,
+                ZenithSeeingArcsec = Knobs.SeeingArcsec,
+                SeeingAirmassPower = Knobs.SeeingAirmassPower,
+                AirFactor = airFactor,
+                ElevationDeg = elevationDeg,
+                SunElevationDeg = double.NaN,
+            }, double.NaN);
+            return Math.Max(pixel, r.BlurArcsec);
+        }
+    }
+
     /* What a lens makes of a target. Every number depends only on the lens,
        the range and the air at the lens, so it reads the same whichever body
        the lens stands on and whichever way it looks. */

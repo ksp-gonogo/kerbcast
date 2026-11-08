@@ -12,6 +12,8 @@ namespace Kerbcast
         /* A ground station the game has switched off: it sees nothing, as a network vantage there reads "disabled". */
         public bool Disabled;
         public double RangeM;
+        /* The smallest angle the vantage's lens resolves toward the point at its tightest zoom, radians; NaN when not Known. */
+        public double ResolutionRad;
     }
 
     /*
@@ -22,11 +24,11 @@ namespace Kerbcast
     internal static class LineOfSightMath
     {
         /* Nothing can be said: the vantage or the craft has no place. */
-        public static LineOfSightAnswer Unknown => new LineOfSightAnswer { RangeM = double.NaN };
+        public static LineOfSightAnswer Unknown => new LineOfSightAnswer { RangeM = double.NaN, ResolutionRad = double.NaN };
 
         /* A switched-off station: known, seeing nothing, with the range it would have. */
         public static LineOfSightAnswer SwitchedOff(DVec3 station, DVec3 target) =>
-            new LineOfSightAnswer { Known = true, Disabled = true, RangeM = (target - station).Magnitude };
+            new LineOfSightAnswer { Known = true, Disabled = true, RangeM = (target - station).Magnitude, ResolutionRad = double.NaN };
 
         /* The answer for a line from `station` to `target` whose first blocking body is `occluder` (null for none). */
         public static LineOfSightAnswer Answer(DVec3 station, DVec3 target, string occluder, string standsOn) =>
@@ -37,6 +39,7 @@ namespace Kerbcast
                 Occluder = occluder,
                 BelowHorizon = occluder != null && occluder == standsOn,
                 RangeM = (target - station).Magnitude,
+                ResolutionRad = double.NaN,
             };
 
         /*
