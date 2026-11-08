@@ -1723,7 +1723,7 @@ namespace Kerbcast
             _poseValid = true;
             _poseEye = station;
             /* A lens riding a craft in the scene stands inside its parts, so that craft is hidden from this camera's own render. */
-            var rides = LensCraft;
+            var rides = KerbcastSettings.DebugShowOwnCraft ? null : LensCraft;
             if (rides != null && rides.loaded) cam.Picture.HideOwn(rides);
             _poseForward = fwd;
             _poseAimToward = aim + ViewOffset - station;

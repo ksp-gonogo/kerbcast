@@ -902,6 +902,19 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         "point fov: a surface point frames its margin, whatever craft is the subject");
 }
 
+// A direction aim straight down from a craft vantage has a pose.
+{
+    var up = new DVec3(0.3, 0.9, 0.1).Normalized;
+    var nNorth = new DVec3(0, 0, 1);
+    var nEast = DVec3.Cross(nNorth, up);
+    var nDown = CommandCameraMath.DirectionVector(up, nNorth, nEast, 0, -90);
+    Check(Near(DVec3.Dot(nDown, up), -1, 1e-12), "nadir: el -90 points straight down");
+    var nStation = new DVec3(7e5, 1e5, 3e4);
+    CommandCameraMath.AimBasis(nStation, nStation + nDown * 50, up, nNorth, out var fwd, out var lensUp);
+    Check(Near(DVec3.Dot(fwd, up), -1, 1e-12) && Near(lensUp.Magnitude, 1, 1e-9) && Math.Abs(DVec3.Dot(lensUp, fwd)) < 1e-9,
+        "nadir: the lens keeps a finite up, from north, when local up is its axis");
+}
+
 // The Sun's light turned to face a lens far from the main camera.
 {
     /* The Sun at the origin, Kerbin and Duna on their orbits 137 degrees apart: stock lights from the Sun toward the main camera at Duna. */

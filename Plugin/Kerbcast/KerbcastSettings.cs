@@ -340,6 +340,11 @@ namespace Kerbcast
         // without needing a back-ref to the settings instance.
         public static bool DebugCameraLogging { get; private set; } = false;
 
+        /* Debug: a command camera standing on a loaded craft draws that craft
+           instead of hiding it, to compare the two views. Static so the rig
+           reads it without the settings instance. */
+        public static bool DebugShowOwnCraft { get; private set; } = false;
+
         // Low-overhead in-plugin performance telemetry (Recommendation 1 from
         // the profiling study). When true, KerbcastCamera.Refresh times each
         // render phase (galaxy / scaled / near / blit / readback) with
@@ -522,6 +527,8 @@ namespace Kerbcast
             Debug.Log($"[Kerbcast] settings loaded from {sources}: bind={settings.HttpBind} tier={settings.MaxQuality} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
             if (!EnableGalaxySkip)
                 Debug.Log("[Kerbcast] EnableGalaxySkip=false: every camera renders its galaxy layer, even when the sky is black");
+            if (DebugShowOwnCraft)
+                Debug.Log("[Kerbcast] DebugShowOwnCraft=true: command cameras on a craft draw that craft instead of hiding it");
             if (!IsLoopback(settings.BindAddress))
             {
                 Debug.LogWarning($"[Kerbcast] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
@@ -615,6 +622,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
+            ApplyBool(node, "DebugShowOwnCraft", v => DebugShowOwnCraft = v);
             ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
             ApplyVector3(node, "DebugWindDirection", v => DebugWindDirection = v);
