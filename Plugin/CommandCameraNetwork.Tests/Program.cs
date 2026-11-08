@@ -57,7 +57,6 @@ VantageInput Seeing(double rangeM, double elevationDeg, double sunElevationDeg, 
     t = v; t.Disabled = true; Check(NetworkMath.Gate(t) == VantageState.Disabled, "a station the game turned off is disabled");
     t = v; t.Gone = true; Check(NetworkMath.Gate(t) == VantageState.Gone, "a ridden craft that is gone is gone");
     t = v; t.IsSubject = true; Check(NetworkMath.Gate(t) == VantageState.IsSubject, "a lens on the watched craft is out");
-    t = v; t.Loaded = true; Check(NetworkMath.Gate(t) == VantageState.Loaded, "a lens on a loaded craft is out");
     t = v; t.HasSubject = false; Check(NetworkMath.Gate(t) == VantageState.NoSubject, "with no craft to follow nothing sees");
     t = v; t.TooFar = true; Check(NetworkMath.Gate(t) == VantageState.TooFar, "beyond the tracking range is too far");
     t = v; t.BelowHorizon = true; Check(NetworkMath.Gate(t) == VantageState.BelowHorizon, "under the lens's own skyline is below the horizon");
@@ -69,7 +68,7 @@ VantageInput Seeing(double rangeM, double elevationDeg, double sunElevationDeg, 
         && NetworkMath.Code(VantageState.Ok) == "ok" && NetworkMath.Code(VantageState.TooFar) == "tooFar", "state codes are the wire's");
     Check(!NetworkMath.Placeable(VantageState.Disabled) && !NetworkMath.Placeable(VantageState.Unresolved) && !NetworkMath.Placeable(VantageState.Gone)
         && NetworkMath.Placeable(VantageState.Occluded), "only a placed, enabled vantage can stand in");
-    Check(!NetworkMath.Placeable(VantageState.IsSubject) && !NetworkMath.Placeable(VantageState.Loaded), "never one whose lens would sit inside a craft");
+    Check(!NetworkMath.Placeable(VantageState.IsSubject), "never one whose lens rides the craft it watches");
 }
 
 // World-model fairness: each vantage gates only on what its own site knows.
@@ -167,8 +166,8 @@ VantageInput Seeing(double rangeM, double elevationDeg, double sunElevationDeg, 
     p = stuck.Decide(new[] { VantageState.Gone, VantageState.Occluded, VantageState.Occluded }, new[] { 0.0, 0.0, 0.0 }, 3, -1, false, null, 1, 1, t);
     Check(p.Index == 1 && p.Reason == CutReason.Unplaceable, "with no view it still leaves a vantage it may not stand at");
     stuck.CutTo(1, 1, 1);
-    p = stuck.Decide(new[] { VantageState.Occluded, VantageState.Loaded, VantageState.Occluded }, new[] { 0.0, 0.0, 0.0 }, 3, -1, false, null, 2, 2, t);
-    Check(p.Index == 0 && p.Reason == CutReason.Unplaceable, "a lens now inside a loaded craft moves too");
+    p = stuck.Decide(new[] { VantageState.Occluded, VantageState.IsSubject, VantageState.Occluded }, new[] { 0.0, 0.0, 0.0 }, 3, -1, false, null, 2, 2, t);
+    Check(p.Index == 0 && p.Reason == CutReason.Unplaceable, "a lens now riding the craft it watches moves too");
     var nowhere = new NetworkSwitch();
     p = nowhere.Decide(new[] { VantageState.Disabled, VantageState.Unresolved }, new[] { 0.0, 0.0 }, 2, -1, false, null, 1, 1, t);
     Check(!p.Cuts && nowhere.NothingPlaceable, "with nowhere to stand nothing is picked, and the camera says so (the feed blanks)");
@@ -195,8 +194,8 @@ VantageInput Seeing(double rangeM, double elevationDeg, double sunElevationDeg, 
     Check(fresh.Decide(new[] { VantageState.Ok }, new[] { -1.0 }, 1, -1, false, null, 1, 1, t).Reason == CutReason.Start,
         "a list replaced before the first cut still starts, rather than reading as removed");
     var blindStart = new NetworkSwitch();
-    var inside = blindStart.Decide(new[] { VantageState.Loaded, VantageState.Occluded }, new[] { 0.0, 0.0 }, 2, 0, false, null, 1, 1, t);
-    Check(inside.Index == 1, "with no view it never stands in a loaded craft, even as the fallback");
+    var inside = blindStart.Decide(new[] { VantageState.IsSubject, VantageState.Occluded }, new[] { 0.0, 0.0 }, 2, 0, false, null, 1, 1, t);
+    Check(inside.Index == 1, "with no view it never rides the craft it watches, even as the fallback");
 }
 
 // The log line proves a cut from KSP.log alone.

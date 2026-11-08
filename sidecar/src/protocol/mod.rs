@@ -261,7 +261,7 @@ pub struct CommandNetworkVantage {
     /// The host's label for it, or the site's own name.
     pub label: String,
     /// `ok`, or why it cannot show the craft: `occluded`, `belowHorizon`,
-    /// `tooFar`, `unknown`, `loaded`, `subject`, `gone`, `disabled` (a ground
+    /// `tooFar`, `unknown`, `subject`, `gone`, `disabled` (a ground
     /// station the game has turned off), `unresolved`, `unplaced`, `pending`
     /// or `noSubject`. New
     /// values may appear; treat one you do not recognise as unable to see.

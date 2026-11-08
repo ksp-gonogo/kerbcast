@@ -71,7 +71,7 @@ namespace Kerbcast.Api
             double height = DefaultSurfaceHeight) =>
             new NetworkVantage(SiteKind.Surface, null, label, false, height, body: bodyIndex, lat: latitude, lon: longitude);
 
-        /** <summary>Riding a craft. A craft loaded in the scene, or the craft being watched, cannot be used while it is.</summary> */
+        /** <summary>Riding a craft. While the craft is in the scene its own parts are hidden from this camera alone. Skipped while it is the craft being watched.</summary> */
         public static NetworkVantage Vessel(uint persistentId, string label = null) =>
             new NetworkVantage(SiteKind.Vessel, null, label, false, 0, pid: persistentId);
 
@@ -137,7 +137,7 @@ namespace Kerbcast.Api
         /**
          * <summary>
          * "ok", or why the vantage cannot show the craft: "occluded", "belowHorizon", "tooFar", "unknown" (its site does
-         * not know where the craft is), "loaded", "subject", "gone", "disabled" (a ground station the game has turned
+         * not know where the craft is), "subject", "gone", "disabled" (a ground station the game has turned
          * off), "unresolved", "unplaced" (a ridden craft with no position now), "pending" (not scored yet) or
          * "noSubject". New codes may appear. The active vantage reading anything but "ok" means no vantage can see the
          * craft. When no vantage can even stand in, the feed is blank ("no vantage").

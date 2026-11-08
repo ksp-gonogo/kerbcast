@@ -499,8 +499,6 @@ namespace Kerbcast
                     {
                         RetryPending = false;
                         Debug.Log($"[Kerbcast][CMDCAM] vantage vessel resolved: {_site}");
-                        if (_site.Vantage.loaded)
-                            Debug.LogWarning("[Kerbcast][CMDCAM] vantage vessel is loaded, so the camera sits inside its parts; keep it unloaded (over 2.5 km from the active vessel)");
                     }
                     else if (!_vantageLost && now - _siteFirstAttemptAt < SiteRetrySeconds)
                     {
@@ -595,8 +593,6 @@ namespace Kerbcast
                     RetryPending = false;
                     Debug.Log($"[Kerbcast][CMDCAM] {Label} site resolved: {_site}"
                         + (_siteAttempts > 1 ? $" after {_siteAttempts} attempts ({now - _siteFirstAttemptAt:F1}s)" : ""));
-                    if (_site.HasVantage && _site.Vantage.loaded)
-                        Debug.LogWarning($"[Kerbcast][CMDCAM] {Label}: vantage vessel is loaded, so the camera sits inside its parts; keep it unloaded (over 2.5 km from the active vessel)");
                     return true;
                 }
                 if (now - _siteFirstAttemptAt >= SiteRetrySeconds)

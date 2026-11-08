@@ -306,7 +306,7 @@ export interface CommandNetworkVantage {
 	label: string;
 	/**
 	 * `ok`, or why it cannot show the craft: `occluded`, `belowHorizon`,
-	 * `tooFar`, `unknown`, `loaded`, `subject`, `gone`, `disabled` (a ground
+	 * `tooFar`, `unknown`, `subject`, `gone`, `disabled` (a ground
 	 * station the game has turned off), `unresolved`, `unplaced`, `pending`
 	 * or `noSubject`. New
 	 * values may appear; treat one you do not recognise as unable to see.

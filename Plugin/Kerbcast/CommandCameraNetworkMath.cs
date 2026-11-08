@@ -11,7 +11,6 @@ namespace Kerbcast
         Disabled,
         Gone,
         IsSubject,
-        Loaded,
         NoSubject,
         Unknown,
         TooFar,
@@ -81,8 +80,6 @@ namespace Kerbcast
         public bool Gone;
         /* The lens rides the craft it would watch. */
         public bool IsSubject;
-        /* The lens rides a craft loaded in the scene, so it would sit inside its parts. */
-        public bool Loaded;
         /* The lens has a position now. */
         public bool Placed;
         /* The network has a craft to follow. */
@@ -139,7 +136,6 @@ namespace Kerbcast
             if (v.Gone) return VantageState.Gone;
             if (!v.Placed) return VantageState.Unplaced;
             if (v.IsSubject) return VantageState.IsSubject;
-            if (v.Loaded) return VantageState.Loaded;
             if (!v.HasSubject) return VantageState.NoSubject;
             if (v.Fix != CraftFixState.Positioned) return VantageState.Unknown;
             if (v.TooFar) return VantageState.TooFar;
@@ -152,10 +148,10 @@ namespace Kerbcast
         public static double Score(in VantageInput v, double daylightStops) =>
             OpticsModel.Assess(v.Optics, v.RangeM, daylightStops).ClarityStops;
 
-        /* Whether a vantage can stand in at all: it has a place to put the lens, and the lens would not sit inside a craft. */
+        /* Whether a vantage can stand in at all: it has a place to put the lens, and the lens does not ride the craft it watches. */
         public static bool Placeable(VantageState s) =>
             s != VantageState.Unresolved && s != VantageState.Disabled && s != VantageState.Gone
-            && s != VantageState.IsSubject && s != VantageState.Loaded && s != VantageState.Unplaced && s != VantageState.Pending;
+            && s != VantageState.IsSubject && s != VantageState.Unplaced && s != VantageState.Pending;
 
         /* The wire's code for a state. */
         public static string Code(VantageState s)
@@ -167,7 +163,6 @@ namespace Kerbcast
                 case VantageState.Disabled: return "disabled";
                 case VantageState.Gone: return "gone";
                 case VantageState.IsSubject: return "subject";
-                case VantageState.Loaded: return "loaded";
                 case VantageState.NoSubject: return "noSubject";
                 case VantageState.Unknown: return "unknown";
                 case VantageState.TooFar: return "tooFar";

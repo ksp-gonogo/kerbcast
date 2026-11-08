@@ -74,8 +74,7 @@ namespace Kerbcast
             double height = DefaultSurfaceHeight) =>
             new CommandVantage(CommandVantageKind.Surface, body: body, lat: latitude, lon: longitude, height: height);
 
-        /* Riding a craft. Keep it unloaded (beyond physics range of the active
-           craft), or the lens sits inside its parts. */
+        /* Riding a craft. While it is loaded its own parts are hidden from the camera's render. */
         public static CommandVantage Vessel(uint persistentId) =>
             new CommandVantage(CommandVantageKind.Vessel, pid: persistentId);
 

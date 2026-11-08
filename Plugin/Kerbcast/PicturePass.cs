@@ -174,6 +174,9 @@ namespace Kerbcast
         /* Whether this camera hides loaded craft `v` this frame, beyond the boundary, and draws it at its past instant instead. */
         public bool Hides(Vessel v) => _hider.Hides(v);
 
+        /* The lens stands inside loaded craft `v` this frame: its parts are hidden from this camera's local layers only. */
+        public void HideOwn(Vessel v) => _hider.HideOwn(v);
+
         /* A command rig draws its subject's stand-in itself this frame, so the pass leaves it out. */
         public void RigDraws(RigDrawn drawn) => _hider.RigDraws(drawn);
 

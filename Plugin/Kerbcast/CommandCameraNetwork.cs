@@ -382,9 +382,8 @@ namespace Kerbcast
             var fix = e.Known.Subject(ut);
             uint subject = e.Known.SubjectPersistentId;
             v.IsSubject = site.HasVantage && subject != 0 && site.VantagePersistentId == subject;
-            v.Loaded = site.HasVantage && site.Vantage != null && site.Vantage.loaded;
             v.HasSubject = subject != 0;
-            if (v.IsSubject || v.Loaded || !v.HasSubject) return v;
+            if (v.IsSubject || !v.HasSubject) return v;
             v.Fix = fix.State;
             if (!fix.Positioned) return v;
             var target = fix.World;

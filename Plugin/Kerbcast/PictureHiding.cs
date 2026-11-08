@@ -47,6 +47,8 @@ namespace Kerbcast
         private readonly HashSet<uint> _sceneDraws = new HashSet<uint>();
         private int _frame = -1;
         private bool _stale = true;
+        private Vessel _own;
+        private int _ownFrame = -1;
         private RigDrawn _rigDraws;
         private int _rigDrawsFrame = -1;
 
@@ -71,6 +73,17 @@ namespace Kerbcast
 
         /* The craft this camera hid that have since left the scene, still drawn while their light lasts. */
         public Lingering Lingering => _lingering;
+
+        /*
+         * The lens stands inside loaded craft `v` this frame, so its own parts
+         * are hidden from this camera's local layers alone, whatever the light
+         * speed. Its lights stay on: they still light what the lens sees.
+         */
+        public void HideOwn(Vessel v)
+        {
+            _own = v;
+            _ownFrame = Time.frameCount;
+        }
 
         /* The rig draws its subject's stand-in itself this frame, with its own clip plan. */
         public void RigDraws(RigDrawn drawn)
@@ -132,9 +145,21 @@ namespace Kerbcast
            is dropped rather than sent with that craft live. */
         public void Hide()
         {
-            if (_hidden.Count == 0 && _loose.Count == 0) return;
+            var own = _ownFrame == Time.frameCount && _own != null && _own.loaded ? _own : null;
+            if (_hidden.Count == 0 && _loose.Count == 0 && own == null) return;
             long t0 = Stopwatch.GetTimestamp();
             int renderers = _off.Count;
+            if (own != null)
+            {
+                var list = OwnCraft.Renderers(own);
+                for (int r = 0; r < list.Count; r++)
+                {
+                    var rend = list[r];
+                    if (rend == null || rend.forceRenderingOff) continue;
+                    rend.forceRenderingOff = true;
+                    _off.Add(rend);
+                }
+            }
             /* Nothing of a loose object is drawn in its place: it has no history to draw it from. */
             for (int i = 0; i < _loose.Count; i++)
             {
@@ -460,6 +485,87 @@ namespace Kerbcast
             var s = t.lossyScale;
             float scale = Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z))) / Mathf.Max(rootScale, 1e-6f);
             return root.InverseTransformPoint(t.TransformPoint(mesh.bounds.center)).magnitude + mesh.bounds.extents.magnitude * scale;
+        }
+    }
+
+    /*
+     * The renderers of each loaded craft a command camera's lens stands in,
+     * kept between frames since that craft is hidden on every frame its
+     * camera draws. Read again when its part count changes (staging, docking,
+     * a part lost), when a renderer has been destroyed, and every few seconds
+     * for anything added below a part without a part changing.
+     */
+    internal static class OwnCraft
+    {
+        private sealed class Entry
+        {
+            public readonly List<Renderer> Renderers = new List<Renderer>();
+            public int PartCount = -1;
+            public float ReadAt;
+            public bool Broken;
+        }
+
+        private const float RereadSeconds = 10f;
+        private static readonly Dictionary<Vessel, Entry> s_craft = new Dictionary<Vessel, Entry>();
+        private static readonly HashSet<int> s_ids = new HashSet<int>();
+        private static readonly List<Renderer> s_scratch = new List<Renderer>();
+        private static readonly List<Vessel> s_dead = new List<Vessel>();
+        private static int s_prunedFrame = -1;
+
+        public static List<Renderer> Renderers(Vessel v)
+        {
+            Prune();
+            if (!s_craft.TryGetValue(v, out var e)) s_craft[v] = e = new Entry();
+            var parts = v.parts;
+            int count = parts != null ? parts.Count : 0;
+            float now = Time.realtimeSinceStartup;
+            if (e.Broken || count != e.PartCount || now - e.ReadAt >= RereadSeconds)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                Read(parts, e);
+                e.PartCount = count;
+                e.ReadAt = now;
+                e.Broken = false;
+                HideCost.Prepared(Stopwatch.GetTimestamp() - t0);
+            }
+            else
+            {
+                for (int i = 0; i < e.Renderers.Count && !e.Broken; i++)
+                    if (e.Renderers[i] == null) e.Broken = true;
+            }
+            return e.Renderers;
+        }
+
+        private static void Read(List<Part> parts, Entry e)
+        {
+            e.Renderers.Clear();
+            s_ids.Clear();
+            if (parts == null) return;
+            try
+            {
+                for (int i = 0; i < parts.Count; i++)
+                {
+                    var part = parts[i];
+                    if (part == null || part.transform == null) continue;
+                    part.GetComponentsInChildren(true, s_scratch);
+                    for (int r = 0; r < s_scratch.Count; r++)
+                        if (s_scratch[r] != null && s_ids.Add(s_scratch[r].GetInstanceID())) e.Renderers.Add(s_scratch[r]);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][PICTURE] cannot read the parts of the craft a lens stands in: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private static void Prune()
+        {
+            int frame = Time.frameCount;
+            if (frame == s_prunedFrame || frame % 300 != 0) return;
+            s_prunedFrame = frame;
+            s_dead.Clear();
+            foreach (var kv in s_craft) if (kv.Key == null || !kv.Key.loaded) s_dead.Add(kv.Key);
+            for (int i = 0; i < s_dead.Count; i++) s_craft.Remove(s_dead[i]);
         }
     }
 
