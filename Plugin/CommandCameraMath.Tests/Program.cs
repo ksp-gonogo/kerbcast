@@ -782,6 +782,36 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         $"mask: out of budget, the sea-level skyline stands in and nothing is kept (got {fb:G6}, dip {dip:G6})");
 }
 
+// A station whose stored altitude is under its own ground stands on the ground.
+{
+    Check(CommandCameraMath.StationAltitude(-230, 64.8) == 64.8, "station: an altitude under the ground is raised to it");
+    Check(CommandCameraMath.StationAltitude(100, 64.8) == 100, "station: an altitude over the ground is kept");
+    Check(CommandCameraMath.StationAltitude(-230, double.NaN) == -230, "station: no ground to read keeps the stored altitude");
+
+    /* The Deck: KSC's home read -230 m with Kerbin's terrain unloaded, the lens 30 m over that, ground 64.8 m. A craft 77 degrees up was hidden by the lens's own skyline. */
+    double seaR = 600000, rMax = 606800, ground = 64.8, offset = 30;
+    var axis = new DVec3(0, 1, 0);
+    Func<DVec3, double> flat = d => seaR + ground;
+    var up = new DVec3(1, 0, 0);
+    DVec3 Toward(DVec3 relS, double elDeg) =>
+        relS + (up * Math.Sin(elDeg * Math.PI / 180) + new DVec3(0, 0, 1) * Math.Cos(elDeg * Math.PI / 180)) * 3.3e10;
+
+    double buried = seaR + (-230 + offset);
+    var buriedMask = new HorizonMask(buried, seaR, rMax, 0.25, flat);
+    Check(buriedMask.Blocks(new DVec3(buried, 0, 0), Toward(new DVec3(buried, 0, 0), 77), axis),
+        "station: a buried lens hides a craft 77 degrees up (the false occlusion)");
+    HorizonMask.Basis(new DVec3(buried, 0, 0), axis, out var bu, out var bn, out var be);
+    double wall = buriedMask.MaskAt(1.0, 0.2, bu, bn, be) * 180 / Math.PI;
+    Check(Near(wall, 85.68, 0.05), $"station: the buried skyline stands where the Deck's occlusion cleared, 85.68 degrees (got {wall:F2})");
+
+    double placed = seaR + CommandCameraMath.StationAltitude(-230, ground) + offset;
+    var relS = new DVec3(placed, 0, 0);
+    var mask = new HorizonMask(placed, seaR, rMax, 0.25, flat);
+    Check(!mask.Blocks(relS, Toward(relS, 77), axis), "station: on the ground, a craft 77 degrees up is clear");
+    Check(!mask.Blocks(relS, Toward(relS, 1), axis), "station: on the ground, a craft 1 degree up is clear");
+    Check(mask.Blocks(relS, Toward(relS, -1), axis), "station: on the ground, a craft 1 degree down is hidden");
+}
+
 // Scaled mesh occluder on an icosphere.
 {
     var (verts, tris) = Icosphere(4, 1.0);
@@ -1533,6 +1563,82 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     since = CommandCameraMath.OccludedSince(true, since, 301);
     Check(since == 301, "a fresh occlusion stamps a fresh UT");
     Check(CommandCameraMath.OccludedSince(true, double.NaN, 0) == 0, "UT 0 is a real time, distinct from not occluded");
+}
+
+// LowestViewElevationDeg: the lowest ray of a rectangular frustum against the local horizontal.
+{
+    var up = iy;
+    var level = iz;
+    Check(Near(CommandCameraMath.LowestViewElevationDeg(level, up, up, 20, 1), -10, 1e-9),
+        "a level view's lowest ray is half the vertical field down");
+    Check(Near(CommandCameraMath.LowestViewElevationDeg(iy * -1.0, iz, up, 10, 1), -90, 1e-9),
+        "a frustum holding the nadir bottoms out at -90");
+    var raised = new DVec3(0, Math.Sin(30 * Math.PI / 180), Math.Cos(30 * Math.PI / 180));
+    var raisedUp = new DVec3(0, Math.Cos(30 * Math.PI / 180), -Math.Sin(30 * Math.PI / 180));
+    double wide = CommandCameraMath.LowestViewElevationDeg(raised, raisedUp, up, 20, 1.5);
+    Check(wide < 20 && wide > 18.5, "at a raised view the bottom corners sit a little lower than the bottom edge's middle");
+    // Rolled 90: the frustum's long axis is now vertical, so the half width sets the lowest ray.
+    double tanV = Math.Tan(10 * Math.PI / 180);
+    double halfWidthDeg = Math.Atan(tanV * 2) * 180 / Math.PI;
+    Check(Near(CommandCameraMath.LowestViewElevationDeg(level, ix, up, 20, 2), -halfWidthDeg, 1e-9),
+        "rolled onto its side, the half width sets the lowest ray");
+    // An edge can dip below both its corners when the view looks steeply down past the nadir side.
+    var steep = new DVec3(0, -Math.Sin(70 * Math.PI / 180), Math.Cos(70 * Math.PI / 180));
+    var steepUp = new DVec3(0, Math.Cos(70 * Math.PI / 180), Math.Sin(70 * Math.PI / 180));
+    double lowest = CommandCameraMath.LowestViewElevationDeg(steep, steepUp, up, 30, 3);
+    double brute = 90;
+    for (double a = -1; a <= 1; a += 0.002)
+        for (double b = -1; b <= 1; b += 0.002)
+        {
+            var right = DVec3.Cross(steepUp, steep).Normalized;
+            var d = (steep + right * (a * 3 * Math.Tan(15 * Math.PI / 180)) + steepUp * (b * Math.Tan(15 * Math.PI / 180))).Normalized;
+            double el = Math.Asin(DVec3.Dot(d, up)) * 180 / Math.PI;
+            if (el < brute) brute = el;
+        }
+    Check(Near(lowest, brute, 0.02), $"the analytic lowest ray matches a brute search ({lowest:F3} against {brute:F3})");
+}
+
+// PlanStationGround: when the body's own ground has to be drawn for a lens standing on it.
+{
+    const double SF = 6000.0;
+    var nadirUp = iy;
+    var eyeR = R + 70;
+    var below = new DVec3(0, -Math.Sin(39 * Math.PI / 180), Math.Cos(39 * Math.PI / 180));
+    var downUp = new DVec3(0, Math.Cos(39 * Math.PI / 180), Math.Sin(39 * Math.PI / 180));
+    var plan = CommandCameraMath.PlanStationGround(eyeR, R, SF, below, downUp, nadirUp, 20, 1.5, false);
+    Check(plan.Draw, "a view 39 down from KSC draws the ground");
+    Check(Near(plan.GroundRadiusM, R, 1e-6), "a station above the datum stands on the sphere at the datum");
+    Check(Near(plan.HorizonDipDeg, Math.Acos(R / eyeR) * 180 / Math.PI, 1e-9), "the horizon dips by the sphere's own geometry");
+    double eyeToCentre = eyeR * plan.EyeToCentreScale;
+    Check(Near(eyeToCentre - plan.SphereRadiusUnits, 2.0, 1e-9), "the magnified ground lies two scaled units under the lens");
+    Check(plan.SphereRadiusUnits > 0.2, "well past the scaled layer's 0.2 near plane");
+    Check(Near(Math.Asin(plan.SphereRadiusUnits / eyeToCentre), Math.Asin(R / eyeR), 1e-12),
+        "magnifying about the lens leaves the horizon where it was");
+
+    var level = iz;
+    var clear = CommandCameraMath.PlanStationGround(eyeR, R, SF, new DVec3(0, Math.Sin(30 * Math.PI / 180), Math.Cos(30 * Math.PI / 180)),
+        new DVec3(0, Math.Cos(30 * Math.PI / 180), -Math.Sin(30 * Math.PI / 180)), nadirUp, 20, 1.5, false);
+    Check(!clear.Draw, "a view wholly above the horizon draws nothing");
+
+    var straddle = CommandCameraMath.PlanStationGround(eyeR, R, SF, level, nadirUp, nadirUp, 20, 1.5, false);
+    Check(straddle.Draw, "a level view with the horizon in frame draws the ground under it");
+
+    double dip = Math.Acos(R / eyeR) * 180 / Math.PI;
+    double fov = 0.1;
+    double aimEl = -dip + 0.10 + fov / 2; // the frame's lowest ray sits between the on and off thresholds
+    var just = new DVec3(0, Math.Sin(aimEl * Math.PI / 180), Math.Cos(aimEl * Math.PI / 180));
+    var justUp = new DVec3(0, Math.Cos(aimEl * Math.PI / 180), -Math.Sin(aimEl * Math.PI / 180));
+    Check(!CommandCameraMath.PlanStationGround(eyeR, R, SF, just, justUp, nadirUp, fov, 1, false).Draw,
+        "just above the horizon a resting view stays off");
+    Check(CommandCameraMath.PlanStationGround(eyeR, R, SF, just, justUp, nadirUp, fov, 1, true).Draw,
+        "and a drawing view holds on through the same small margin");
+
+    var pit = CommandCameraMath.PlanStationGround(R - 100, R, SF, below, downUp, nadirUp, 20, 1.5, false);
+    Check(pit.Draw && Near(pit.GroundRadiusM, R - 105, 1e-6), "a station below the datum keeps the sphere just under its lens");
+    Check((R - 100) * pit.EyeToCentreScale > pit.SphereRadiusUnits, "so the lens is never inside the drawn sphere");
+
+    var high = CommandCameraMath.PlanStationGround(R + 80000, R, SF, below, downUp, nadirUp, 20, 1.5, false);
+    Check(!high.Draw, "a lens high enough to clear the near plane leaves the real mesh alone");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");

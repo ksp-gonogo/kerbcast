@@ -36,6 +36,18 @@ namespace Kerbcast
 
     /* Which local layers the command camera renders this tick, and with
        what clip planes. Produced by CommandCameraMath.PlanClips. */
+    /* See CommandCameraMath.PlanStationGround. EyeToCentreScale turns the lens-to-body-centre vector in metres into the drawn sphere's offset from the lens in scaled units. */
+    public struct StationGroundPlan
+    {
+        public bool Draw;
+        public double GroundRadiusM;
+        public double HorizonDipDeg;
+        public double LowestDeg;
+        public double Magnify;
+        public double EyeToCentreScale;
+        public double SphereRadiusUnits;
+    }
+
     public struct CommandClipPlan
     {
         /* Extra local layer covering the terrain between the station and the
@@ -465,6 +477,17 @@ namespace Kerbcast
         public const double SplitOnRatio = 2.0;
         public const double SplitOffRatio = 1.5;
 
+        /*
+         * A ground station's altitude, never under the ground at its own
+         * coordinates. Stock reads a home's altitude from its building's
+         * transform when the network starts, and with the body's terrain
+         * unloaded that transform can sit hundreds of metres down, which
+         * puts the lens inside a wall of its own skyline. A NaN ground (no
+         * terrain to read) leaves the stored altitude as it is.
+         */
+        public static double StationAltitude(double storedAlt, double groundAlt) =>
+            double.IsNaN(groundAlt) || storedAlt >= groundAlt ? storedAlt : groundAlt;
+
         /* KSP's CelestialBody.GetWorldSurfacePosition, reproduced: the body-local
            spherical vector (z up) scaled to radius + alt, rotated by the body
            frame's axes (given in KSP's z-up world), swizzled to Unity's y-up
@@ -512,6 +535,91 @@ namespace Kerbcast
         }
 
         private static DVec3 Reject(DVec3 v, DVec3 unitAxis) => v - unitAxis * DVec3.Dot(v, unitAxis);
+
+        /*
+         * The lowest elevation any ray of a rectangular frustum has above the
+         * plane normal to localUp, degrees. Elevation has no interior minimum
+         * except the nadir, so the answer is the nadir when the frustum holds
+         * it, else the least over the four edges, each of which has one
+         * turning point in closed form.
+         */
+        public static double LowestViewElevationDeg(DVec3 forward, DVec3 lensUp, DVec3 localUp, double verticalFovDeg, double aspect)
+        {
+            var f = forward.Normalized;
+            var z = localUp.Normalized;
+            var r = DVec3.Cross(lensUp, f).Normalized;
+            var u = DVec3.Cross(f, r).Normalized;
+            double tanV = Math.Tan(verticalFovDeg * 0.5 / Rad2Deg);
+            double tanH = tanV * aspect;
+
+            double nf = -DVec3.Dot(z, f);
+            if (nf > 0 && Math.Abs(-DVec3.Dot(z, r) / nf) <= tanH && Math.Abs(-DVec3.Dot(z, u) / nf) <= tanV) return -90.0;
+
+            double least = double.MaxValue;
+            for (int side = -1; side <= 1; side += 2)
+            {
+                least = Math.Min(least, LowestOnEdge(f + u * (side * tanV), r * tanH, z));
+                least = Math.Min(least, LowestOnEdge(f + r * (side * tanH), u * tanV, z));
+            }
+            return Math.Asin(Math.Max(-1.0, Math.Min(1.0, least))) * Rad2Deg;
+        }
+
+        /* The least sine of elevation along mid + t * half for t in [-1, 1]. */
+        private static double LowestOnEdge(DVec3 mid, DVec3 half, DVec3 up)
+        {
+            double a = DVec3.Dot(mid, up), b = DVec3.Dot(half, up);
+            double mm = DVec3.Dot(mid, mid), mh = DVec3.Dot(mid, half), hh = DVec3.Dot(half, half);
+            double SinAt(double t) => (a + b * t) / Math.Sqrt(mm + 2 * mh * t + hh * t * t);
+            double least = Math.Min(SinAt(-1), SinAt(1));
+            double denom = b * mh - a * hh;
+            if (denom != 0)
+            {
+                double t = (a * mh - b * mm) / denom;
+                if (t > -1 && t < 1) least = Math.Min(least, SinAt(t));
+            }
+            return least;
+        }
+
+        /* How far under the lens the drawn ground lies, in scaled units: clear of
+           the scaled layer's near plane at any field, and far enough that float
+           rounding of a body far from the scaled origin moves it by little. */
+        public const double StationGroundUnitsBelowLens = 2.0;
+        /* The drawn sphere stays at least this far under a lens at or below the datum. */
+        public const double StationGroundClearanceM = 5.0;
+        /* Starts just before the horizon enters the frame and stops a little after
+           it leaves, so a view resting on the horizon does not flicker the state. */
+        public const double StationGroundOnMarginDeg = 0.05;
+        public const double StationGroundOffMarginDeg = 0.15;
+
+        /*
+         * Whether a lens standing on a body with no local terrain has to draw
+         * that body's ground, and how. The ground under such a lens is nearer
+         * than the scaled layer's near plane, so the mesh is clipped away and
+         * the far side's back faces are culled. Scaling the scene about the
+         * lens leaves every direction in the picture where it was and carries
+         * the ground past the near plane, so the plan is a magnification.
+         */
+        public static StationGroundPlan PlanStationGround(double eyeRadiusM, double bodyRadiusM, double metresPerUnit,
+            DVec3 forward, DVec3 lensUp, DVec3 localUp, double verticalFovDeg, double aspect, bool wasDrawing)
+        {
+            double groundM = Math.Min(bodyRadiusM, eyeRadiusM - StationGroundClearanceM);
+            double heightUnits = (eyeRadiusM - groundM) / metresPerUnit;
+            double magnify = StationGroundUnitsBelowLens / heightUnits;
+            double dip = Math.Acos(groundM / eyeRadiusM) * Rad2Deg;
+            double lowest = LowestViewElevationDeg(forward, lensUp, localUp, verticalFovDeg, aspect);
+            double margin = wasDrawing ? StationGroundOffMarginDeg : StationGroundOnMarginDeg;
+            return new StationGroundPlan
+            {
+                /* Past a magnification of one the real mesh is already beyond the near plane. */
+                Draw = magnify > 1.0 && lowest < -dip + margin,
+                GroundRadiusM = groundM,
+                HorizonDipDeg = dip,
+                LowestDeg = lowest,
+                Magnify = magnify,
+                EyeToCentreScale = magnify / metresPerUnit,
+                SphereRadiusUnits = groundM / metresPerUnit * magnify,
+            };
+        }
 
         /* Elevation of the look direction above the station's horizon, degrees. */
         public static double ElevationDeg(DVec3 forward, DVec3 localUp)
