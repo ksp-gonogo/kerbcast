@@ -118,6 +118,8 @@ var truthFiles = new Dictionary<string, string>
 /* Members allowed to read truth whole, and single pinned lines. */
 var truthPins = new[]
 {
+    Pin.Whole("KerbcastCore.cs", "KerbcastCore.CatalogVessels",
+        "the site catalog lists every craft the game has, for building vantage lists; scoring still gates each vantage on what its own site knows"),
     Pin.Whole("PicturePass.cs", "PictureLens.OnCraft", "the picture: a camera's lens on the craft it rides"),
     Pin.Whole("PicturePass.cs", "PicturePass.Locate", "the picture: whether a craft draws itself live or is drawn at its past instant"),
     Pin.Whole("PicturePass.cs", "PicturePass.Drawn", "the picture: the craft a tracking camera aims at, where it is drawn"),
@@ -323,7 +325,7 @@ string Here([CallerFilePath] string path = "") => path;
 string pluginDir = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Here()), "..", "Kerbcast"));
 Check(Directory.Exists(pluginDir), $"plugin source found at {pluginDir}");
 
-var extraFiles = new[] { "KerbcastControl.cs", "KerbcastCore.cs", "AnchorProjector.cs", "KerbcastApiImpl.cs" };
+var extraFiles = new[] { "KerbcastControl.cs", "KerbcastCore.cs", "AnchorProjector.cs", "KerbcastApiImpl.cs", "NetworkStore.cs" };
 bool InScope(string file) =>
     file.StartsWith("Command", StringComparison.Ordinal) || extraFiles.Contains(file)
     || new[] { "IFixSource.cs", "TruthFixSource.cs", "DrawnSubject.cs", "PicturePass.cs", "PictureHiding.cs", "PictureStandIns.cs", "PictureCull.cs", "LensSights.cs", "SubjectTrack.cs", "SubjectSelection.cs", "CraftFixState.cs",

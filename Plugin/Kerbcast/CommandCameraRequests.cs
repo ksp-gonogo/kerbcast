@@ -66,6 +66,31 @@ namespace Kerbcast
         private static bool Vec3(double[] v) => v != null && v.Length == 3 && Finite(v[0]) && Finite(v[1]) && Finite(v[2]);
     }
 
+    /* One vantage of a saved network, as a client sent it and the save keeps it. */
+    internal sealed class SavedVantage
+    {
+        public CommandVantage Vantage;
+        /* Null keeps the site's own name. */
+        public string Label;
+        public bool Fallback;
+    }
+
+    /* The codes a NetworkResult carries. */
+    internal static class SavedNetworkCodes
+    {
+        public const string NotOwner = "notOwner";
+        public const string NotFound = "notFound";
+        public const string Stale = "stale";
+        public const string NoVantages = "noVantages";
+        public const string TooManyVantages = "tooManyVantages";
+        public const string BadVantage = "badVantage";
+        public const string BadAim = "badAim";
+        public const string BadName = "badName";
+        public const string BadNumber = "badNumber";
+        public const string Full = "full";
+        public const string WriteFailed = "writeFailed";
+    }
+
     /* One entry of global.commands.json, which the sidecar appends to for
        every create-command-camera, destroy-command-camera, set-command-aim,
        save-network and delete-network a client sends. */

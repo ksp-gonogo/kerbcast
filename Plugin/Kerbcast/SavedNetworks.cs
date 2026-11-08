@@ -5,15 +5,6 @@ using System.Text;
 
 namespace Kerbcast
 {
-    /* One vantage of a saved network, as a client sent it and the save keeps it. */
-    internal sealed class SavedVantage
-    {
-        public CommandVantage Vantage;
-        /* Null keeps the site's own name. */
-        public string Label;
-        public bool Fallback;
-    }
-
     /*
      * A tracking network a viewer saved with the game. Its slot fixes its
      * camera's flightId (CameraId.NetworkWireId) for the life of the save.
@@ -53,22 +44,6 @@ namespace Kerbcast
 
         /* The camera must be rebuilt for this change: its name is in the manifest. */
         public static bool NeedsRebuild(SavedNetwork before, SavedNetwork after) => before.Name != after.Name;
-    }
-
-    /* The codes a NetworkResult carries. */
-    internal static class SavedNetworkCodes
-    {
-        public const string NotOwner = "notOwner";
-        public const string NotFound = "notFound";
-        public const string Stale = "stale";
-        public const string NoVantages = "noVantages";
-        public const string TooManyVantages = "tooManyVantages";
-        public const string BadVantage = "badVantage";
-        public const string BadAim = "badAim";
-        public const string BadName = "badName";
-        public const string BadNumber = "badNumber";
-        public const string Full = "full";
-        public const string WriteFailed = "writeFailed";
     }
 
     /* The answer to one save or delete, sent back by the client's token. */
