@@ -67,8 +67,8 @@ Check(ksc == CameraId.CommandCameraWireId("KSC"), "command camera id stable");
 Check((ksc & TopBit) != 0, "command camera id top-bit set (never a part id)");
 Check(ksc != CameraId.KerbalWireId("KSC"), "command camera id differs from a kerbal named the same");
 Check(ksc != CameraId.CommandCameraWireId("Harvester Massif"), "different stations differ");
-Check(CameraId.CommandCentreId("KSC") == "ground:KSC", "centre id matches gonogo's ground:<name>");
-Check(CameraId.CommandCentreId(null) == "ground:", "centre id tolerates a null name");
+Check(CameraId.SiteHashKey("KSC") == "ground:KSC", "a site's hash input is ground:<name>, so ids never renumber");
+Check(CameraId.SiteHashKey(null) == "ground:", "the hash input tolerates a null name");
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

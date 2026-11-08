@@ -9,8 +9,8 @@
 
     Kept out of Kerbcast.dll on purpose: kOS.Safe types must never load
     into the plugin (kOS.Safe re-entrant load-trap). The addon calls the
-    plugin only through the Unity-free IKerbcastControl seam, wrapping the
-    public Kerbcast.KerbcastControl facade via RealKerbcastControl.
+    plugin only through the Unity-free IKerbcastControl seam, wrapping
+    Kerbcast.API via RealKerbcastControl.
 
     Build:
       dotnet build Plugin/KerbcastKos/KerbcastKos.csproj \
@@ -82,12 +82,11 @@
     </Reference>
   </ItemGroup>
 
-  <!-- The kerbcast plugin. Compile-time only for the public
-       Kerbcast.KerbcastControl facade + KerbcastCameraView; KSP loads the
-       plugin's own GameData/Kerbcast/Plugins/Kerbcast.dll at runtime, so
+  <!-- Kerbcast's public interface, compile-time only. KSP loads the
+       Kerbcast.API.dll that Kerbcast ships in GameData/Kerbcast/Plugins/, so
        this addon must NOT bundle a copy. -->
   <ItemGroup>
-    <ProjectReference Include="../Kerbcast.csproj" Private="false" />
+    <ProjectReference Include="../Kerbcast.API/Kerbcast.API.csproj" Private="false" />
   </ItemGroup>
 
 </Project>

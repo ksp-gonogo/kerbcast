@@ -144,5 +144,30 @@ bool Near(double a, double b) => Math.Abs(a - b) < 1e-6;
     Check(gc.FrameDelta0 == 1 && gc.IntervalGen0 == 1, "baseline preserved across ResetInterval");
 }
 
+// CostMeter: the 1.12 costs, read once per status write.
+{
+    var m = new CostMeter();
+    var none = m.TakeInterval();
+    Check(!none.Seen && none.Count == 0, "CostMeter: nothing recorded reads as not seen (the block writes null)");
+    m.Record(4.0);
+    m.Record(2.0);
+    var first = m.TakeInterval();
+    Check(first.Seen && Near(first.Last, 2.0) && Near(first.Max, 4.0) && first.Count == 2, "CostMeter: last, interval max and count");
+    Check(Near(first.Ema, 4.0 + 0.1 * (2.0 - 4.0)), "CostMeter: the EMA seeds on the first value and smooths at 0.1, as PhaseTimings does");
+    var quiet = m.TakeInterval();
+    Check(quiet.Count == 0 && Near(quiet.Max, 0) && Near(quiet.Last, 2.0) && Near(quiet.Ema, first.Ema),
+        "CostMeter: the interval max and count reset on each read; last and EMA carry on");
+    m.Record(1.0);
+    Check(Near(m.TakeInterval().Max, 1.0), "CostMeter: a new interval's max is its own, not the old spike");
+    m.Record(double.NaN);
+    Check(m.TakeInterval().Count == 0, "CostMeter: a non-finite value is not recorded");
+
+    var rate = new RateMeter();
+    Check(Near(rate.TakeInterval(100, 10.0), 0), "RateMeter: the first read has no interval yet");
+    Check(Near(rate.TakeInterval(160, 12.0), 30.0), "RateMeter: entries per second since the previous read");
+    Check(Near(rate.TakeInterval(160, 12.0), 0), "RateMeter: no time passed reads 0");
+    Check(Near(rate.TakeInterval(50, 13.0), 0) && Near(rate.TakeInterval(80, 14.0), 30.0), "RateMeter: a total that went back reads 0, then counts on");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");
 return failures == 0 ? 0 : 1;

@@ -70,6 +70,28 @@ quickest "is it up" check.
   filtered modes (B&W, CRT, night vision) render wrong, make sure
   `GameData/Kerbcast/HullcamShaders/shaders.linux` exists.
 
+## Command camera feeds stay blank and the browser can't add or remove them
+
+Another mod (a mission control mod, say) holds the lock on the command
+cameras. While it holds the lock only that mod aims, creates and removes them,
+and a feed blanks with "Authority not responding" (or the mod's own words)
+when the mod stops answering. A mod can also reserve the lock, so every scene
+starts locked for it.
+
+- KSP.log names the holder: search for `command lock taken` or
+  `scene starts locked for`
+- If a reserved scene's mod makes no call within 30 seconds, KSP.log says
+  `made no call`. The feeds stay blank, so nothing the mod should hide is
+  shown, but the browser can create and remove command cameras again (they
+  are blank too). If the mod answers later, it takes charge as usual. The
+  next scene starts locked again while the mod is installed
+- To see the scene on the feeds again, release the lock and clear the
+  reservation: Pause → Difficulty Settings → Kerbcast → tick **Release
+  command lock** and accept. It unticks itself once done. This is the only
+  way a reserved scene goes back to normal feeds. A working mod can take the
+  lock again when it next asks for it
+- Removing the mod also clears its reservation the next time KSP starts
+
 ## Choppy streams / low game fps
 
 This is the adaptive scaler doing its job: kerbcast caps its own main-thread
@@ -120,6 +142,21 @@ Crew face cameras live in the crew bar by default and are not part-camera grid
 tiles. If you'd rather see them as ordinary tiles in the main grid, turn on
 "Merge crew into the camera list" in Settings. With merge off they appear only
 in the crew bar; with merge on only in the grid.
+
+## A command camera lists no craft after an upgrade
+
+The game and the sidecar ship together and must match. A sidecar older than
+1.12 running against a 1.12 game (a leftover copy staged by hand under
+`GameData/Kerbcast/Sidecar/`, say) drops a command camera's whole craft list
+as soon as a mod that publishes a world model marks one craft in a way it
+does not know. Reinstall the whole Kerbcast bundle so both are the same
+version; the sidecar logs its version as it starts.
+
+## The camera list fills in over a few updates
+
+With very many cameras the sidecar sends the list in several parts. A page
+built on an SDK older than 1.12 shows them as they arrive, so the list can
+fill in over a few updates; a 1.12 page shows it whole.
 
 ## Still stuck?
 

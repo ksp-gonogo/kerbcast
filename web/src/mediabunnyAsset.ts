@@ -5,7 +5,7 @@
  * remux-trim dynamic-imports Mediabunny through this route instead of the
  * bare "mediabunny" package specifier the SDK's default loader uses, so
  * grouped recording works offline/LAN on this page, no CDN. Bundler
- * consumers (e.g. gonogo) keep the SDK's default bare-specifier loader.
+ * consumers keep the SDK's default bare-specifier loader.
  */
 
 import { createMediabunnyTrimmerLoader, type TrimmerLoader } from "@ksp-gonogo/kerbcast";

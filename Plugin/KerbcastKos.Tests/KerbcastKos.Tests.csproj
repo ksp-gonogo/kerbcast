@@ -39,7 +39,7 @@
        KerbcastKos project's own bin/$(Configuration). Soft-degrade to a build
        warning (dropping the kOS-touching test source) when either the kOS
        DLLs or the built addon are absent, so a stock runner still builds.
-       Mirrors Gonogo.Kos.Tests. NO UnityEngine reference: the whole driven
+       NO UnityEngine reference: the whole driven
        path stays Unity-free. -->
   <PropertyGroup>
     <KosSafeDll>$(KspGameData)/kOS/Plugins/kOS.Safe.dll</KosSafeDll>

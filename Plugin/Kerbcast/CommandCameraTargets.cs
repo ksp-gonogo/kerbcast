@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Kerbcast.Api;
 using UnityEngine;
 
 namespace Kerbcast
@@ -14,9 +15,12 @@ namespace Kerbcast
         public string VesselType;
         /* Metres from the station; NaN when the craft cannot be placed. */
         public double RangeM;
-        /* "ok", "tooFar", "levelTooLow" or "notTrackable". */
+        /* "ok", "tooFar", "levelTooLow", "notTrackable", or under a world model "notPositioned", "refused", "stale" or "tooUncertain". */
         public string Eligibility;
         public string EligibilityText;
+        /* The world model's own refusal, when Eligibility is "refused"; Kerbcast.API reports them. */
+        internal string RefusalCode;
+        internal string RefusalText;
     }
 
     /*
@@ -38,6 +42,9 @@ namespace Kerbcast
     internal static class CommandCameraTargets
     {
         private const int RangeSignificantFigures = 3;
+
+        /* Scratch for List; every caller is on the main thread. */
+        private static readonly List<CraftFix> Craft = new List<CraftFix>();
 
         /* Career with the tracking rules on. */
         public static bool Gated()
@@ -72,7 +79,8 @@ namespace Kerbcast
         public static double RoundRange(double rangeM) =>
             CommandCameraMath.RoundSignificant(rangeM, RangeSignificantFigures);
 
-        public static List<CommandTargetView> List(CommandCameraSite site, double ut)
+        /* `fovMaxDeg` is the feed's widest field, for tooUncertain. */
+        public static List<CommandTargetView> List(CommandCameraSite site, double ut, double fovMaxDeg)
         {
             var result = new List<CommandTargetView>();
             if (site == null) return result;
@@ -87,33 +95,15 @@ namespace Kerbcast
                 trackedLimit = GameVariables.Instance.GetTrackedObjectLimit(norm);
             }
 
-            var seen = new HashSet<uint>();
-            var vessels = FlightGlobals.Vessels;
-            if (vessels != null)
+            var source = FixSources.For(site);
+            Craft.Clear();
+            source.List(ut, site.VantagePersistentId, hasStation, Craft);
+            foreach (var c in Craft)
             {
-                foreach (var v in vessels)
-                {
-                    if (v == null || v.persistentId == site.VantagePersistentId || !Listed(v.vesselType)) continue;
-                    var level = v.DiscoveryInfo != null ? v.DiscoveryInfo.Level : DiscoveryLevels.Owned;
-                    if (!seen.Add(v.persistentId)) continue;
-                    double range = hasStation && TryPosition(v, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
-                    Add(result, v.persistentId, v.GetDisplayName(), v.vesselType, level, range, gated, trackedLimit, maxRange);
-                }
+                double range = hasStation ? RangeFrom(station, c) : double.NaN;
+                Add(result, c, range, source.ListsUnplacedByCareerRules, gated, trackedLimit, maxRange, fovMaxDeg);
             }
-            /* The Space Center may not have built Vessel objects; the save's records cover it. */
-            var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
-            if (protos != null)
-            {
-                foreach (var pv in protos)
-                {
-                    if (!RecordCounts(pv) || !Listed(pv.vesselType) || seen.Contains(pv.persistentId)) continue;
-                    if (pv.persistentId == site.VantagePersistentId) continue;
-                    seen.Add(pv.persistentId);
-                    double range = hasStation && TryPosition(pv, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
-                    Add(result, pv.persistentId, Localised(pv.vesselName), pv.vesselType, ProtoLevel(pv), range,
-                        gated, trackedLimit, maxRange);
-                }
-            }
+            Craft.Clear();
 
             result.Sort((a, b) =>
             {
@@ -131,63 +121,81 @@ namespace Kerbcast
         public static double RangeTo(CommandCameraSite site, uint persistentId, double ut)
         {
             if (site == null || persistentId == 0 || !TryStation(site, ut, out Vector3d station)) return double.NaN;
-            if (FlightGlobals.FindVessel(persistentId, out Vessel v) && v != null)
-                return TryPosition(v, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
-            var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
-            if (protos != null)
-                foreach (var pv in protos)
-                    if (RecordCounts(pv) && pv.persistentId == persistentId)
-                        return TryPosition(pv, ut, out Vector3d at) ? (at - station).magnitude : double.NaN;
-            return double.NaN;
+            return RangeFrom(station, FixSources.For(site).Find(persistentId, ut));
         }
 
-        /* Whether a craft with this persistentId exists now, live or, in a
-           scene that has not built it, as a saved record. */
-        public static bool Exists(uint persistentId)
+        /*
+         * Whether the feed at `siteKey` (null when not known yet) may name this
+         * craft in an aim. An unknown craft never; for a Vessel aim, which
+         * points at the craft itself, a world model's listed craft is not
+         * positioned, a refused one is refused or stale, and one too uncertain
+         * to frame from `site` (when it is known) with the aim's margin in
+         * the feed's widest field is refused unless the aim allows it. Under
+         * truth a known craft is always accepted, as 1.11 did.
+         */
+        public static AimResult AimSubject(string siteKey, CommandCameraSite site, uint persistentId, bool vesselAim,
+            bool allowUncertain, double marginM, double fovMaxDeg)
         {
-            if (persistentId == 0) return false;
-            if (FlightGlobals.FindVessel(persistentId, out Vessel v) && v != null && v.state != Vessel.State.DEAD) return true;
-            var protos = HighLogic.CurrentGame?.flightState?.protoVessels;
-            if (protos == null) return false;
-            for (int i = 0; i < protos.Count; i++)
-                if (RecordCounts(protos[i]) && protos[i].persistentId == persistentId) return true;
-            return false;
+            var source = FixSources.ForKey(siteKey);
+            if (!source.Knows(persistentId)) return AimResult.UnknownCraft;
+            if (!vesselAim || source.ListsUnplacedByCareerRules) return AimResult.Ok;
+            double ut = Planetarium.GetUniversalTime();
+            var craft = source.Find(persistentId, ut);
+            switch (craft.State)
+            {
+                case CraftFixState.Listed: return AimResult.NotPositioned;
+                case CraftFixState.Refused:
+                    return craft.RefusalCode == CommandCameraMath.RefusalStale ? AimResult.Stale : AimResult.Refused;
+            }
+            if (allowUncertain || site == null || !TryStation(site, ut, out Vector3d station)) return AimResult.Ok;
+            return TooUncertain(craft, RangeFrom(station, craft), marginM, fovMaxDeg) ? AimResult.TooUncertain : AimResult.Ok;
         }
 
-        /* Whether a saved record still names a real craft (see
-           CommandCameraMath.SavedRecordCounts). A Vessel built from the record
-           and since destroyed reads as Unity-null while still referenced. */
-        public static bool RecordCounts(ProtoVessel pv)
-        {
-            if (pv == null) return false;
-            var vessels = FlightGlobals.Vessels;
-            bool authoritative = HighLogic.LoadedSceneIsFlight && vessels != null && vessels.Count > 0;
-            bool built = !ReferenceEquals(pv.vesselRef, null);
-            return CommandCameraMath.SavedRecordCounts(authoritative, built, built && pv.vesselRef == null);
-        }
+        private static bool TooUncertain(CraftFix craft, double range, double marginM, double fovMaxDeg) =>
+            craft.Positioned && Kinematics.TooUncertain(craft.UncertaintyM,
+                double.IsNaN(craft.RadiusM) ? CommandCameraMath.NominalCraftRadiusM : craft.RadiusM, marginM, range, fovMaxDeg);
 
-        private static void Add(List<CommandTargetView> into, uint pid, string name, VesselType type,
-            DiscoveryLevels level, double range, bool gated, int trackedLimit, double maxRange)
+        private static double RangeFrom(Vector3d station, CraftFix craft) =>
+            craft.Positioned ? (craft.World - new DVec3(station.x, station.y, station.z)).Magnitude : double.NaN;
+
+        /*
+         * One row, or none for an undiscovered or unknown craft. The career
+         * rules read the Tracking Station from KSP (its level, the network's
+         * range, the unowned-object limit), which describe the player's
+         * facility rather than any craft. Discovery is a fact about the craft:
+         * truth gives it, and a world model does not (null), so under a model
+         * every record counts as owned. notTrackable and levelTooLow, which
+         * hinge on an unowned or untracked craft, then never apply: the
+         * model's Listed and Refused records say what it does not know.
+         * tooFar applies to the modelled range, and tooUncertain to the
+         * model's uncertainty with no margin.
+         */
+        private static void Add(List<CommandTargetView> into, CraftFix craft, double range, bool truthListing,
+            bool gated, int trackedLimit, double maxRange, double fovMaxDeg)
         {
+            var level = craft.Discovery ?? DiscoveryLevels.Owned;
             bool owned = level == DiscoveryLevels.Owned;
             if (!owned && (level & DiscoveryLevels.Presence) == 0) return;
             bool unowned = !owned;
             bool trackable = owned || (level & DiscoveryLevels.StateVectors) != 0;
-            string code = CommandCameraMath.Eligibility(gated, trackable, unowned, trackedLimit, range, maxRange);
+            string career = CommandCameraMath.Eligibility(gated, trackable, unowned, trackedLimit, range, maxRange);
+            string code = CommandCameraMath.TargetEligibility(craft.State, craft.RefusalCode, truthListing, career,
+                TooUncertain(craft, range, 0, fovMaxDeg));
+            if (code == null) return;
             into.Add(new CommandTargetView
             {
-                PersistentId = pid,
-                VesselName = name ?? "",
-                VesselType = type.ToString(),
+                PersistentId = craft.PersistentId,
+                VesselName = craft.Name ?? "",
+                VesselType = craft.Kind ?? "",
                 RangeM = range,
                 Eligibility = code,
-                EligibilityText = CommandCameraMath.EligibilityText(code),
+                EligibilityText = code == CommandCameraMath.EligibleRefused && !string.IsNullOrEmpty(craft.RefusalText)
+                    ? craft.RefusalText
+                    : CommandCameraMath.EligibilityText(code),
+                RefusalCode = code == CommandCameraMath.EligibleRefused ? craft.RefusalCode : null,
+                RefusalText = code == CommandCameraMath.EligibleRefused ? craft.RefusalText : null,
             });
         }
-
-        private static bool Listed(VesselType t) =>
-            t != VesselType.Flag && t != VesselType.Unknown && t != VesselType.DroppedPart
-            && t != VesselType.DeployedSciencePart && t != VesselType.DeployedGroundPart;
 
         private static bool TryStation(CommandCameraSite site, double ut, out Vector3d world)
         {
@@ -197,52 +205,5 @@ namespace Kerbcast
             world = site.Body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
             return true;
         }
-
-        private static bool TryPosition(Vessel v, double ut, out Vector3d world)
-        {
-            world = default;
-            if (v.mainBody == null) return false;
-            if (v.loaded) world = v.packed ? v.GetWorldPos3D() : v.CoMD;
-            else if (IsSurface(v.situation)) world = v.mainBody.GetWorldSurfacePosition(v.latitude, v.longitude, v.altitude);
-            else if (v.orbit != null) world = v.orbit.getPositionAtUT(ut);
-            else return false;
-            return true;
-        }
-
-        private static bool TryPosition(ProtoVessel pv, double ut, out Vector3d world)
-        {
-            world = default;
-            var snap = pv.orbitSnapShot;
-            if (snap == null) return false;
-            var bodies = FlightGlobals.Bodies;
-            int idx = snap.ReferenceBodyIndex;
-            if (bodies == null || idx < 0 || idx >= bodies.Count || bodies[idx] == null) return false;
-            try
-            {
-                if (IsSurface(pv.situation))
-                    world = bodies[idx].GetWorldSurfacePosition(pv.latitude, pv.longitude, pv.altitude);
-                else
-                    world = snap.Load().getPositionAtUT(ut);
-                return true;
-            }
-            catch (Exception) { return false; }
-        }
-
-        /* A saved craft's discovery state; Owned when the record has none. */
-        private static DiscoveryLevels ProtoLevel(ProtoVessel pv)
-        {
-            var state = pv.discoveryInfo?.GetValue("state");
-            return int.TryParse(state, out int level) ? (DiscoveryLevels)level : DiscoveryLevels.Owned;
-        }
-
-        private static string Localised(string name)
-        {
-            if (string.IsNullOrEmpty(name) || !name.StartsWith("#", StringComparison.Ordinal)) return name ?? "";
-            try { return KSP.Localization.Localizer.Format(name); }
-            catch (Exception) { return name; }
-        }
-
-        private static bool IsSurface(Vessel.Situations s) =>
-            s == Vessel.Situations.LANDED || s == Vessel.Situations.SPLASHED || s == Vessel.Situations.PRELAUNCH;
     }
 }

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Standalone test for the past-instant solve: the latest root of the
+       light-time equation, read through the history ring's lives. Unity-free.
+       Run: `dotnet run`. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <!-- The ring's part records are filled only by the plugin's sampler. -->
+    <NoWarn>CS0649</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Kerbcast/PastInstant.cs" />
+    <Compile Include="../Kerbcast/LensSights.cs" />
+    <Compile Include="../Kerbcast/LightHistory.cs" />
+    <Compile Include="../Kerbcast/LightHistorySave.cs" />
+    <Compile Include="../Kerbcast/LightHistoryMath.cs" />
+    <Compile Include="../Kerbcast/CommandCameraMath.cs" />
+    <Compile Include="../Kerbcast/CraftFixState.cs" />
+  </ItemGroup>
+</Project>

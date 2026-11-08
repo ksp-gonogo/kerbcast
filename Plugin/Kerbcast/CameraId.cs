@@ -49,12 +49,12 @@ namespace Kerbcast
            with kerbal ids rather than carving out a new tag, because every 31-bit
            value is already reachable by both existing namespaces: a third tag
            would mean re-hashing kerbal ids and breaking stored ones. The "ground:"
-           prefix keys the hash on gonogo's centre id format, so the station
-           and a kerbal can only meet on a 1-in-2^31 hash collision, which the
+           prefix (SiteHashKey) keeps a site apart from a kerbal of the same name,
+           so the two can only meet on a 1-in-2^31 hash collision, which the
            provider logs. The manifest's kind, not the id, says which it is. */
         public static uint CommandCameraWireId(string stationNodeName)
         {
-            return (NameHash(CommandCentreId(stationNodeName)) & PartMask) | KerbalTag;
+            return (NameHash(SiteHashKey(stationNodeName)) & PartMask) | KerbalTag;
         }
 
         /* The key a created command camera's wire id hashes, in place of a
@@ -66,11 +66,15 @@ namespace Kerbcast
             return "kerbcast:command:" + serial;
         }
 
-        /* gonogo's command-centre id for a CommNet home: "ground:<nodeName>". */
-        public static string CommandCentreId(string stationNodeName)
+        /* What a site's wire id hashes: "ground:<nodeName>". Changing it
+           would renumber every command camera. */
+        internal static string SiteHashKey(string siteKey)
         {
-            return "ground:" + (stationNodeName ?? string.Empty);
+            return "ground:" + (siteKey ?? string.Empty);
         }
+
+        [System.Obsolete("Command feeds are named by SiteKey and SiteKind; this is only the wire id's hash input")]
+        public static string CommandCentreId(string stationNodeName) => SiteHashKey(stationNodeName);
 
         /* True when a wire-id is in the KERBAL namespace (bit 31 set), i.e. a
            kerbal camera rather than a part camera. Lets Unity-free code tell the

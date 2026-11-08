@@ -38,7 +38,7 @@ const SCENARIOS: ReadonlyArray<Scenario> = [
     sunlit: false,
     bracketHalfPx: 6,
     framingFits: true,
-    authority: { owner: "gonogo" },
+    authority: { owner: "mission-control" },
   },
   {
     hasFix: true,
@@ -48,7 +48,7 @@ const SCENARIOS: ReadonlyArray<Scenario> = [
     sunlit: true,
     bracketHalfPx: 40,
     framingFits: true,
-    authority: { owner: "gonogo" },
+    authority: { owner: "mission-control" },
   },
   {
     hasFix: true,
@@ -58,8 +58,8 @@ const SCENARIOS: ReadonlyArray<Scenario> = [
     sunlit: true,
     bracketHalfPx: 300,
     framingFits: false,
-    authority: { owner: "gonogo" },
-    blank: "Waiting for gonogo",
+    authority: { owner: "mission-control" },
+    blank: "Waiting for mission control",
   },
 ];
 

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="../Versions.props" />
+  <!-- Tests Kerbcast.API's pure parts, the recording implementation and the
+       identity ledger Kerbcast.dll builds its events with. Compiles the
+       sources directly (no KSP/Unity). Run: `dotnet run`. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <KerbcastVersionCode>$(KerbcastApiVersionCode)</KerbcastVersionCode>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Kerbcast.API/**/*.cs" Exclude="../Kerbcast.API/obj/**;../Kerbcast.API/bin/**" />
+    <Compile Include="../Kerbcast.API.Testing/**/*.cs" Exclude="../Kerbcast.API.Testing/obj/**;../Kerbcast.API.Testing/bin/**" />
+    <Compile Include="../Kerbcast/VesselIdentityLedger.cs" />
+    <Compile Include="../Kerbcast/SiteBindings.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    A stand-in for another mod, built by scripts/nuget-extraction-probe.mjs from
+    a copy outside the repo against nothing but the packed KspGonogo.Kerbcast.API.
+    It references no KSP or Unity assembly, so a package that needed one fails
+    here. net48 is what KSP loads; netstandard2.0 lets ProbeMod.Tests run it on
+    modern .NET.
+  -->
+
+  <PropertyGroup>
+    <TargetFrameworks>net48;netstandard2.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="KspGonogo.Kerbcast.API" Version="$(KerbcastApiPackageVersion)" PrivateAssets="all" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <ItemGroup Condition=" '$(TargetFramework)' == 'net48' ">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

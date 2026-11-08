@@ -1,7 +1,7 @@
 // KSP Difficulty Settings integration for kerbcast's runtime-toggleable
 // flags. Lives in the per-save game state via KSP's
 // `GameParameters.CustomParameterNode` API, so the toggles persist with
-// each save independently — a gonogo-driven save can keep
+// each save independently, so a mission-control save can keep
 // ThrottleMainScreen on while a regular career save keeps it off.
 //
 // Default values are seeded from `settings.cfg` (KerbcastSettings) the
@@ -34,7 +34,7 @@ namespace Kerbcast
             "Throttle KSP main render",
             toolTip =
                 "Disable KSP's main flight cameras to free GPU/CPU for kerbcast streams. " +
-                "Designed for gonogo / mission-control workflows where the operator " +
+                "Designed for mission-control workflows where the operator " +
                 "watches the dashboard, not the KSP viewport. UI, staging, kOS terminal, " +
                 "and physics all still work. You can't click on parts in the world while " +
                 "throttled."
@@ -51,6 +51,18 @@ namespace Kerbcast
                 "track yet, as ineligible in the command camera's target list."
         )]
         public bool CommandCameraTrackingRules = true;
+
+        /* A one-shot: KerbcastCore releases the scene's command lock and clears
+           any reservation, then unticks it. The way out when a mod that locks
+           the command cameras has stopped answering. */
+        [GameParameters.CustomParameterUI(
+            "Release command lock",
+            toolTip =
+                "Release the lock another mod holds on the command cameras for this scene, and clear " +
+                "its reservation so later scenes start unlocked. Use it when a mod's command feeds stay " +
+                "blank because the mod has stopped answering."
+        )]
+        public bool ReleaseCommandLock;
 
         // Override default-init so newly-created saves pick up the
         // settings.cfg seed. Existing saves with a stored value

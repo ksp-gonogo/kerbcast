@@ -57,6 +57,396 @@ namespace Kerbcast
         public bool Split;
     }
 
+    /* Where one point lands in a frame; see CommandCameraMath.ProjectCameraSpace. */
+    public struct FrameProjection
+    {
+        /* Pixels from the frame's top left. */
+        public double X, Y;
+        public bool InFrame, Behind;
+        public double AngleOffAxisDeg;
+        /* Lens to point in metres; 0 for a direction. */
+        public double Distance;
+    }
+
+    /* What a craft aim's view follows this solve; see SubjectWait. */
+    public enum SubjectAimMode
+    {
+        /* The subject, where it is known to be. */
+        Subject,
+        /* The placeholder: the subject has not been positioned since it, the aim or the vantage last changed. */
+        Placeholder,
+        /* The last aim solved, held: the subject was positioned and is not now. */
+        Hold,
+    }
+
+    /*
+     * Whether a craft aim waits for its subject or holds its last aim. The
+     * placeholder stands only until the subject is first positioned; losing
+     * it after that (a refusal, a stale record, a light time that will not
+     * solve) holds the view where it was, so it never swings back to the
+     * placeholder and a flickering fix never wobbles it. A new subject, aim
+     * or vantage waits again. A new rig, as on a scene load, starts waiting.
+     */
+    public sealed class SubjectWait
+    {
+        private bool _seen;
+
+        public SubjectAimMode Step(bool changed, bool positioned)
+        {
+            if (changed) _seen = false;
+            if (positioned)
+            {
+                _seen = true;
+                return SubjectAimMode.Subject;
+            }
+            return _seen ? SubjectAimMode.Hold : SubjectAimMode.Placeholder;
+        }
+    }
+
+    /*
+     * How far one frame advances an ease (a slew, a zoom). A frame more than
+     * HitchFactor times the usual one is a hitch, as when the first fix of a
+     * subject builds its horizon mask and forecast, and advances the ease by
+     * a usual frame only; stepped by the whole gap, a short turn would finish
+     * inside that one frame and show as a snap. The usual frame follows the
+     * frame rate, a lasting slowdown included. A gap over snapAfter (a feed
+     * resumed, a scene load) is left to the ease's own snap: it passes
+     * through and is not learned.
+     */
+    public sealed class FrameStep
+    {
+        public const double HitchFactor = 2.0;
+        private const double Follow = 0.1;
+        private readonly double _snapAfter;
+        private double _usual;
+
+        public FrameStep(double snapAfter) { _snapAfter = snapAfter; }
+
+        /* Learns one frame's gap and returns how far it advances an ease. */
+        public double Next(double dt)
+        {
+            double step = Clip(dt);
+            Learn(dt);
+            return step;
+        }
+
+        /* How far a gap advances an ease, without learning from it. */
+        public double Clip(double dt)
+        {
+            if (!(dt > 0) || dt > _snapAfter || !(_usual > 0)) return dt;
+            return dt > HitchFactor * _usual ? _usual : dt;
+        }
+
+        public void Learn(double dt)
+        {
+            if (!(dt > 0) || dt > _snapAfter) return;
+            if (!(_usual > 0)) _usual = dt;
+            else _usual += Follow * (Math.Min(dt, 2 * HitchFactor * _usual) - _usual);
+        }
+    }
+
+    /*
+     * A subject's framing as the picture eases onto it, as tangents of the
+     * subject's half-angle. The field and the bracket are both taken from
+     * these eased values, never from the raw framing, so the bracket frames
+     * what the view frames on every frame: while the field is free it holds
+     * the framing fraction. The raw framing jumps whenever a world model's
+     * uncertainty resets on a new record, and a bracket sized from it over
+     * the eased field pumped in and out at the publish rate. The view eases
+     * toward the framing clamped to the fields the lens has, so it settles
+     * gently onto a limit; the box eases toward the framing itself, so it
+     * shrinks below the fraction once the field can narrow no further. The
+     * box starts on the framing itself, not the view's, so on acquisition it
+     * shows the craft at its size while the view zooms onto it, and it never
+     * draws smaller than the craft without its uncertainty, which moves
+     * smoothly, so a fast pass cannot leave the box inside the craft.
+     */
+    public sealed class SubjectFraming
+    {
+        private double _view = double.NaN;
+        private double _box = double.NaN;
+        private double _craft = double.NaN;
+
+        public bool Started => !double.IsNaN(_view);
+
+        public void Reset()
+        {
+            _view = double.NaN;
+            _box = double.NaN;
+            _craft = double.NaN;
+        }
+
+        /*
+         * Eases onto `rawTan` over `dt` and returns the field to render;
+         * `craftTan` is the craft's own framing without its uncertainty. The
+         * first step after a reset starts the view from `fovNow`, so a view
+         * coming off a placeholder or a hold zooms on from where it was.
+         */
+        public double Step(double rawTan, double craftTan, double fovNow, double fraction, double fovMin, double fovMax,
+            double dt, double tau, double snapAfter)
+        {
+            if (!Started)
+            {
+                _view = CommandCameraMath.FramingTanAt(fovNow, fraction);
+                _box = double.IsNaN(rawTan) ? _view : rawTan;
+            }
+            _craft = craftTan;
+            double lo = CommandCameraMath.FramingTanAt(fovMin, fraction);
+            double hi = CommandCameraMath.FramingTanAt(fovMax, fraction);
+            double clamped = rawTan < lo ? lo : rawTan > hi ? hi : rawTan;
+            _view = CommandCameraMath.EaseFraming(_view, clamped, dt, tau, snapAfter);
+            _box = CommandCameraMath.EaseFraming(_box, rawTan, dt, tau, snapAfter);
+            return CommandCameraMath.FovForTan(_view, fraction, fovMin, fovMax);
+        }
+
+        /* The bracket's half-extent in a `rows`-high frame at `fovDeg`; NaN before the first step. */
+        public double BracketHalfPx(double fovDeg, int rows) =>
+            Started ? CommandCameraMath.BracketHalfPxForTan(_craft > _box ? _craft : _box, fovDeg, rows) : double.NaN;
+    }
+
+    /*
+     * The aim eased from one world model record's prediction onto the next
+     * instead of snapping to it, as SubjectFraming eases the framing. At a
+     * publish the caller gives the subject's place under the old record and
+     * under the new one at the same instant, about the same body; what
+     * separates them becomes an offset on the aim that eases out on its own,
+     * while the aim itself moves with the new record at once. A new record
+     * that agrees with the old leaves no offset, so the aim is never held off
+     * a prediction that does not change. One that disagrees is followed late
+     * whichever of the two was right: the aim starts on the old place and is
+     * within e^(-t/TauS) of the correction on the new one after t, so a wrong
+     * old record is lagged behind a right new one for a second or so, and a
+     * right old record is left for a wrong new one as smoothly. A correction
+     * too wide to ease at a turn the slew allows is refused and left to the
+     * slew. Where the publish also moves the instant the subject is placed
+     * at (InstantStepped), the caller gives the new place at the new instant,
+     * so that step eases too. A real change of subject, aim or vantage resets
+     * it rather than easing across it, and a place that is not a finite
+     * number holds the offset.
+     */
+    public sealed class AimHandover
+    {
+        public const double TauS = 0.25;
+        /* The widest offset eased, as a fraction of the field. */
+        public const double MaxFieldFraction = 0.5;
+
+        /*
+         * The widest offset eased in a field of `fieldRad`, in radians. An
+         * ease starts turning at its angle over TauS, so it is also held to
+         * what keeps that turn under the slew's top rate `slewRadPerS`: wider
+         * than either, the slew's capped turn takes it instead.
+         */
+        public static double WidestRad(double fieldRad, double slewRadPerS) => Math.Min(MaxFieldFraction * fieldRad, slewRadPerS * TauS);
+
+        /* Slack on InstantStepped, in seconds, for a frame too short to scale it. */
+        public const double StepSlackS = 0.01;
+
+        /*
+         * Whether the instant the subject is placed at moved by `placedStepS`
+         * across a publish where the frame itself moved `utStepS`: a new
+         * record read back only to its cap starts the craft later than the
+         * old one held it, so the craft moves on that much at once. The caller
+         * then eases the whole move it draws, not only the records'
+         * disagreement at one instant. A light time changing at under half the
+         * light speed stays within the slack. False when either is not known.
+         */
+        public static bool InstantStepped(double placedStepS, double utStepS) =>
+            Math.Abs(placedStepS - utStepS) > Math.Max(StepSlackS, 0.5 * Math.Abs(utStepS));
+
+        private DVec3 _offset;
+
+        /* Metres added to the aim point, in the frame the caller gives its places in. */
+        public DVec3 Offset => _offset;
+        public bool Easing => _offset.Magnitude > 0;
+
+        public void Reset() => _offset = default;
+
+        /*
+         * A publish: `before` the subject as the old record placed it, `after`
+         * as the new one places it at that instant, about the same body, with
+         * the aim `rangeM` from the lens and `widestRad` from WidestRad. True
+         * when it is eased; false, with the offset reset, when the offset it
+         * would leave is wider (or no range or width is known), and the
+         * caller then lets the slew turn onto the new aim. A place that is not
+         * finite holds the offset and is not eased.
+         */
+        public bool Handover(DVec3 before, DVec3 after, double rangeM, double widestRad)
+        {
+            var moved = before - after;
+            if (!CommandCameraMath.Finite(moved)) return false;
+            var offset = _offset + moved;
+            if (!(rangeM > 0) || !(widestRad > 0) || Math.Atan2(offset.Magnitude, rangeM) > widestRad)
+            {
+                _offset = default;
+                return false;
+            }
+            _offset = offset;
+            return true;
+        }
+
+        /*
+         * Eases the offset out over `dt` seconds and returns it. A step of no
+         * time leaves it, a gap over `snapAfter` drops it, as a long gap snaps
+         * the framing, and so does what is left once it is under `floorM`.
+         */
+        public DVec3 Step(double dt, double tau, double snapAfter, double floorM)
+        {
+            if (!(dt > 0)) return _offset;
+            _offset = dt > snapAfter || !(tau > 0) ? default : _offset * Math.Exp(-dt / tau);
+            if (!(_offset.Magnitude > floorM)) _offset = default;
+            return _offset;
+        }
+    }
+
+    /* Where a command camera looks while it has no subject to aim at. */
+    public enum PlaceholderAim
+    {
+        /* It has a subject, or an aim of its own that needs none. */
+        None,
+        /* At the launch site the lens stands beside, where a craft would sit before liftoff. */
+        LaunchSite,
+        /* Level toward the horizon, due east. */
+        Horizon,
+        /* Along the forward axis of the craft the lens rides. */
+        MountForward,
+    }
+
+    /* A craft's shape for framing, as offsets from its centre of mass, each point padded by a radius of its own. */
+    public sealed class CraftExtent
+    {
+        private readonly List<DVec3> _points = new List<DVec3>();
+        private readonly List<double> _pads = new List<double>();
+
+        public int Count => _points.Count;
+
+        public void Clear()
+        {
+            _points.Clear();
+            _pads.Clear();
+        }
+
+        public void Add(DVec3 offset, double pad)
+        {
+            _points.Add(offset);
+            _pads.Add(pad);
+        }
+
+        /* The corners of an axis-aligned box (a renderer's world bounds) about `centre`. */
+        public void AddBox(DVec3 centre, DVec3 extents)
+        {
+            double x = Math.Abs(extents.X), y = Math.Abs(extents.Y), z = Math.Abs(extents.Z);
+            for (int i = 0; i < 8; i++)
+                Add(centre + new DVec3((i & 1) != 0 ? x : -x, (i & 2) != 0 ? y : -y, (i & 4) != 0 ? z : -z), 0);
+        }
+
+        public void AddFrom(CraftExtent other)
+        {
+            for (int i = 0; i < other._points.Count; i++) Add(other._points[i], other._pads[i]);
+        }
+
+        public DVec3 Point(int i) => _points[i];
+        public double Pad(int i) => _pads[i];
+
+        /* The farthest the extent reaches from `from`, an offset from the centre of mass; 0 when empty. */
+        public double ReachFrom(DVec3 from)
+        {
+            double r = 0;
+            for (int i = 0; i < _points.Count; i++) r = Math.Max(r, (_points[i] - from).Magnitude + _pads[i]);
+            return r;
+        }
+
+        /*
+         * A sphere holding every padded point, close to the smallest
+         * (Badoiu and Clarkson's steps toward the farthest point, from the
+         * points' mean). It depends on the shape alone, so a craft rolling
+         * or the view turning moves neither its centre nor its size. Never
+         * larger than the sphere about the centre of mass, which it falls
+         * back to, and never below `minHalf`.
+         */
+        public void Enclose(double minHalf, out DVec3 centre, out double half)
+        {
+            centre = default;
+            double about = ReachFrom(default);
+            if (_points.Count > 0)
+            {
+                var c = default(DVec3);
+                for (int i = 0; i < _points.Count; i++) c = c + _points[i];
+                c = c * (1.0 / _points.Count);
+                for (int k = 1; k <= EncloseSteps; k++)
+                {
+                    int far = 0;
+                    double farReach = -1;
+                    for (int i = 0; i < _points.Count; i++)
+                    {
+                        double r = (_points[i] - c).Magnitude + _pads[i];
+                        if (r > farReach)
+                        {
+                            farReach = r;
+                            far = i;
+                        }
+                    }
+                    var toward = _points[far] - c;
+                    double d = toward.Magnitude;
+                    if (d < 1e-9) break;
+                    c = c + toward * ((farReach / d) / (k + 1));
+                }
+                if (ReachFrom(c) < about) centre = c;
+            }
+            half = Math.Max(minHalf, ReachFrom(centre));
+        }
+
+        private const int EncloseSteps = 256;
+    }
+
+    /* How an aim on truth with a light speed places its subject (CommandCameraMath.TruthAimPlaceFor). */
+    public enum TruthAimPlace
+    {
+        /* As the fix source gives it. */
+        Source,
+        /* Where and when the picture draws the craft. */
+        Drawn,
+        /* Not at all: the picture shows the craft's last light has already arrived. */
+        NoFix,
+        /* At the last Drawn place, read as drawn, while a loss waits out TruthPlaceFilter. */
+        Kept,
+    }
+
+    /*
+     * Steadies TruthAimPlaceFor across picture flicker. A craft the picture
+     * stops drawing right after a Drawn solve is Kept for up to Solves - 1
+     * solves in a row, so a craft whose light the picture finds and loses on
+     * alternate frames does not throw the aim between its drawn place and
+     * truth's place or a hold. A drawn place is taken again at once. It counts
+     * solves, not frames: a hidden feed solves at its poll rate, and under
+     * warp a solve spans more game time. The caller resets it whenever the
+     * aim, subject or vantage changes and on any solve that places no subject,
+     * so only a Drawn solve of the same aim, subject and vantage is kept.
+     */
+    public sealed class TruthPlaceFilter
+    {
+        public const int Solves = 4;
+        private int _misses = Solves;
+
+        /* `drawn`: whether the picture drew the craft at all this solve, past or live. */
+        public TruthAimPlace Step(TruthAimPlace raw, bool drawn)
+        {
+            if (raw == TruthAimPlace.Drawn)
+            {
+                _misses = 0;
+                return raw;
+            }
+            if (!drawn && _misses < Solves - 1)
+            {
+                _misses++;
+                return TruthAimPlace.Kept;
+            }
+            _misses = Solves;
+            return raw;
+        }
+
+        public void Reset() => _misses = Solves;
+    }
+
     /* Unity-free maths for the command camera: where the station
        is, where it looks, how wide it zooms, which layers carry the craft and
        whether a body is in the way. Compiled verbatim by CommandCameraMath.Tests. */
@@ -148,26 +538,53 @@ namespace Kerbcast
             double fovMin, double fovMax)
         {
             if (fraction <= 0 || distance <= radius) return fovMax;
-            double half = AngularDiameterDeg(radius, distance) * 0.5 * Deg2Rad;
-            double fov = 2.0 * Math.Atan(Math.Tan(half) / fraction) * Rad2Deg;
+            return FovForTan(FramingTan(radius, distance), fraction, fovMin, fovMax);
+        }
+
+        /* Tangent of the half-angle a sphere of `radius` subtends at `distance`; infinite with the lens inside it. */
+        public static double FramingTan(double radius, double distance)
+        {
+            if (radius <= 0) return 0;
+            if (distance <= radius) return double.PositiveInfinity;
+            return radius / Math.Sqrt(distance * distance - radius * radius);
+        }
+
+        /* The half-angle tangent a field of `fovDeg` frames at `fraction` of its height. */
+        public static double FramingTanAt(double fovDeg, double fraction) =>
+            fraction * Math.Tan(fovDeg * 0.5 * Deg2Rad);
+
+        /* The field that frames a half-angle tangent at `fraction` of the frame height, clamped to [fovMin, fovMax]. */
+        public static double FovForTan(double halfTan, double fraction, double fovMin, double fovMax)
+        {
+            if (fraction <= 0 || !Finite(halfTan)) return fovMax;
+            double fov = 2.0 * Math.Atan(Math.Max(0, halfTan) / fraction) * Rad2Deg;
             if (fov < fovMin) return fovMin;
             if (fov > fovMax) return fovMax;
             return fov;
         }
 
+        /* A framing tangent eased as SmoothFov eases a field. A NaN target holds the current one; an infinite one (the lens inside the sphere) is taken at once, as is any target from a current that is not finite. */
+        public static double EaseFraming(double current, double target, double dt, double tau, double snapAfter)
+        {
+            if (double.IsNaN(target)) return current;
+            return Finite(current) && Finite(target) ? SmoothFov(current, target, dt, tau, snapAfter) : target;
+        }
+
         /* Exponential approach to `target` in log space, so a zoom from 20° to
            0.02° takes the same time per factor of ten instead of crawling at the
            narrow end. A gap longer than `snapAfter` (resubscribe, scene load)
-           snaps rather than replaying a stale ease. */
+           snaps rather than replaying a stale ease. A target that is not a
+           finite number holds the current field. */
         public static double SmoothFov(double current, double target, double dt, double tau, double snapAfter)
         {
+            if (!Finite(target)) return current;
             if (current <= 0 || target <= 0 || dt <= 0 || dt > snapAfter || tau <= 0) return target;
             double alpha = 1.0 - Math.Exp(-dt / tau);
             return Math.Exp(Math.Log(current) + alpha * (Math.Log(target) - Math.Log(current)));
         }
 
-        /* True when no part of the segment a-b passes inside the sphere. Same rule
-           as gonogo's sight lines: a body blocks, nothing else does. */
+        /* True when no part of the segment a-b passes inside the sphere: a body
+           blocks a sight line, nothing else does. */
         public static bool SegmentClearOfSphere(DVec3 a, DVec3 b, DVec3 centre, double radius)
         {
             if (radius <= 0) return true;
@@ -244,6 +661,137 @@ namespace Kerbcast
             return r < min ? min : r;
         }
 
+        /* A parachute's deploy state as stock's ModuleParachute.deploymentStates names it. */
+        public enum ChuteState { Stowed, Active, SemiDeployed, Deployed, Cut }
+
+        /* A canopy is out while its chute is semi or fully deployed; armed, packed and cut chutes show none. */
+        public static bool CanopyOpen(ChuteState state) => state == ChuteState.SemiDeployed || state == ChuteState.Deployed;
+
+        /* Still unfolding: the deploy animation has not finished and moved since the last look. Stock holds it short of 1 in vacuum and while paused. */
+        public static bool CanopyUnfolding(float animTime, float lastAnimTime) => animTime < 1f && animTime != lastAnimTime;
+
+        /*
+         * Whether a craft's cached chutes must be found again. A reload keeps
+         * the craft's id and part count but makes every part, module and
+         * renderer anew, so a new root part or a destroyed cached object
+         * means the cache is stale. So does a chute that just opened, since
+         * a kerbal's chute model can be fitted after the cache was built.
+         */
+        public static bool ChutesStale(int cachedParts, int parts, bool sameRoot, bool anyGone, bool opened) =>
+            cachedParts != parts || !sameRoot || anyGone || opened;
+
+        /* How far an axis-aligned box (a renderer's world bounds) reaches from `from`: the distance to its farthest corner. */
+        public static double BoxReach(DVec3 centre, DVec3 extents, DVec3 from)
+        {
+            double x = Math.Abs(centre.X - from.X) + Math.Abs(extents.X);
+            double y = Math.Abs(centre.Y - from.Y) + Math.Abs(extents.Y);
+            double z = Math.Abs(centre.Z - from.Z) + Math.Abs(extents.Z);
+            return Math.Sqrt(x * x + y * y + z * z);
+        }
+
+        /* Every component is a finite number: a NaN eased in never leaves. */
+        public static bool Finite(DVec3 v) => Finite(v.X) && Finite(v.Y) && Finite(v.Z);
+
+        public static bool Finite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);
+
+        /* Exponential approach of a vector to `target`, at the pace SmoothFov eases with; a gap longer than `snapAfter` snaps. */
+        public static DVec3 EaseToward(DVec3 current, DVec3 target, double dt, double tau, double snapAfter)
+        {
+            if (!Finite(target)) return current;
+            if (dt <= 0 || dt > snapAfter || tau <= 0) return target;
+            double alpha = 1.0 - Math.Exp(-dt / tau);
+            return current + (target - current) * alpha;
+        }
+
+        /*
+         * Where an aim on truth with a light speed places its subject, decided
+         * from how the picture draws that same craft (`sameCraft`): at its past
+         * instant (`drawnPast`), live, or not at all (`drawn` false). Truth
+         * gives a loaded craft as it is now and an unloaded one on its present
+         * conic, whatever instant is asked, so a solve on it neither moves a
+         * loaded craft back along its path nor stops at a change of sphere, a
+         * burn or the start of the craft's history. The picture reads the
+         * craft's recorded past, so a craft drawn in the past is aimed at
+         * there, even one truth has lost or cannot solve back. A craft drawn
+         * live is where truth puts it now.
+         *
+         * A craft the picture does not draw has no fix only when the picture
+         * says its last light has already arrived (`lightGone`), and only for
+         * a craft aim: an aim at a point keeps truth's range for its zoom. One
+         * whose light the history is too young to hold (a light speed just set,
+         * a history dropped or trimmed, a craft just created) or whose solve
+         * did not settle cannot be judged, and truth's place stands.
+         */
+        public static TruthAimPlace TruthAimPlaceFor(bool aimIsCraft, bool sameCraft, bool drawn, bool drawnPast, bool lightGone) =>
+            !sameCraft ? TruthAimPlace.Source
+            : drawn ? (drawnPast ? TruthAimPlace.Drawn : TruthAimPlace.Source)
+            : aimIsCraft && lightGone ? TruthAimPlace.NoFix
+            : TruthAimPlace.Source;
+
+        /*
+         * Whether a truth place solved at `solvedUt` stands on a path that
+         * starts at `pathFromUt` (IFixSource.SubjectPathFromUt) about body
+         * `pathBody`. A start only cuts the past when it marks an SOI change:
+         * the light history has the craft about another body at the solved
+         * instant (`bodyAtSolved`) or, with no record there, just before the
+         * start (`bodyBeforePath`). Going on rails in one SOI keeps the conic
+         * the craft was on. Bodies are flightGlobalsIndex, -1 for no record;
+         * an unknown instant stands.
+         */
+        public static bool TruthPathHolds(double solvedUt, double pathFromUt, int pathBody, int bodyAtSolved, int bodyBeforePath)
+        {
+            if (!(solvedUt < pathFromUt)) return true;
+            int was = bodyAtSolved >= 0 ? bodyAtSolved : bodyBeforePath;
+            return was < 0 || was == pathBody;
+        }
+
+        /*
+         * Whether truth's forecast still serves an aim at the picture's place
+         * drawn `lightTimeS` in the past. The forecast samples its horizon at
+         * `samples` even steps and finds only edges it sees at a sample, so its
+         * timing holds to one step; truth's edges run early by the light time,
+         * which within one step is below what the forecast resolves already.
+         */
+        public static bool ForecastHoldsAtLightTime(double lightTimeS, double horizonUt, int samples) =>
+            !(lightTimeS > horizonUt / samples);
+
+        /* The boundary light time τ, one 60 fps frame: craft nearer to the lens than its light covers in τ are drawn at render UT. */
+        public const double BoundaryLightTimeS = 1.0 / 60.0;
+
+        /*
+         * A frame's live bound: the light time covering what of the lens's
+         * own craft and site it draws at render UT. That is the larger of τ
+         * and the light time from the lens to the farthest reach of its own
+         * craft (`farthestOwnPartM`, 0 with none). 0 with no light speed,
+         * when nothing is delayed. Other loaded craft are still drawn at
+         * render UT and are not covered until those beyond the boundary are
+         * hidden.
+         */
+        public static double LiveLightTimeS(double? lightSpeed, double farthestOwnPartM)
+        {
+            if (!lightSpeed.HasValue || !(lightSpeed.Value > 0)) return 0;
+            double own = farthestOwnPartM > 0 && !double.IsInfinity(farthestOwnPartM) ? farthestOwnPartM / lightSpeed.Value : 0;
+            return Math.Max(BoundaryLightTimeS, own);
+        }
+
+        /* How far light travels in τ, the boundary distance; NaN with no light speed. */
+        public static double BoundaryM(double? lightSpeed) =>
+            lightSpeed.HasValue && lightSpeed.Value > 0 ? lightSpeed.Value * BoundaryLightTimeS : double.NaN;
+
+        /* The farthest reach of a craft from `lens`: each part's origin distance plus that part's own radius. 0 for no parts. */
+        public static double FarthestPartM(DVec3 lens, IList<DVec3> origins, IList<double> radii)
+        {
+            double far = 0;
+            if (origins == null) return far;
+            for (int i = 0; i < origins.Count; i++)
+            {
+                double r = radii != null && i < radii.Count && radii[i] > 0 ? radii[i] : 0;
+                double d = (origins[i] - lens).Magnitude + r;
+                if (d > far) far = d;
+            }
+            return far;
+        }
+
         /* Float epsilon: Unity world positions are single precision. */
         public const double FloatEpsilon = 1.1920929e-7;
 
@@ -270,13 +818,58 @@ namespace Kerbcast
            Capped at the frame height so a lens inside the sphere stays finite. */
         public static double BracketHalfPx(double radius, double distance, double fovDeg, int rows)
         {
-            int h = Math.Max(1, rows);
             if (radius <= 0) return 0;
-            if (distance <= radius) return h;
-            double halfTan = radius / Math.Sqrt(distance * distance - radius * radius);
+            return BracketHalfPxForTan(FramingTan(radius, distance), fovDeg, rows);
+        }
+
+        /* BracketHalfPx for a sphere given by its half-angle tangent. */
+        public static double BracketHalfPxForTan(double halfTan, double fovDeg, int rows)
+        {
+            int h = Math.Max(1, rows);
+            if (!(halfTan > 0)) return 0;
+            if (double.IsInfinity(halfTan)) return h;
             double perPx = PixelSizeAtUnit(fovDeg, h);
             return perPx > 0 ? Math.Min(halfTan / perPx, h) : h;
         }
+
+        /* Under this many pixels across a subject is a point of light; wider, a model, as the picture's stand-ins draw it. */
+        public const double PointBelowPx = 6.0;
+        /* A subject drawn as a model goes back to the point of light only under this, so one near the line does not flip. */
+        public const double ModelLeaveBelowPx = 4.0;
+
+        /*
+         * The radius a rig judges its unloaded subject by: the model built
+         * for it, else the size the history records for the parts it shows,
+         * else `unknownM`, generous, so a craft of unknown size is tried as a
+         * model (and then judged by that model) rather than kept behind a dot.
+         */
+        public static double SubjectSizeM(double modelRadiusM, double partsSizeM, double unknownM) =>
+            modelRadiusM > 0 ? modelRadiusM : partsSizeM > 0 ? partsSizeM : unknownM;
+
+        /*
+         * Whether a rig draws its unloaded subject as a model: always with the
+         * model setting, and with the marker setting once the subject spans
+         * PointBelowPx or more, until it drops under ModelLeaveBelowPx
+         * (`wasModel` says which it was last frame).
+         */
+        public static bool SubjectAsModel(bool modelSetting, bool marker, bool wasModel, double radius, double distance, double fovDeg,
+            int rows)
+        {
+            if (modelSetting) return true;
+            if (!marker) return false;
+            double across = 2.0 * BracketHalfPx(radius, distance, fovDeg, rows);
+            return across >= (wasModel ? ModelLeaveBelowPx : PointBelowPx);
+        }
+
+        /*
+         * Whether a rig shows the model it decided on this frame: only one
+         * built for the subject it draws (`modelMatches`), and, under the
+         * marker setting, not on the frame a model was built only to learn a
+         * size the rig guessed (`sizeGuessed`): the marker stays that frame
+         * and the model's own radius decides from the next.
+         */
+        public static bool ShowsModel(bool decided, bool modelMatches, bool modelSetting, bool sizeGuessed) =>
+            decided && modelMatches && (modelSetting || !sizeGuessed);
 
         /* Whether the whole sphere fits inside the frame height at the widest
            field the camera allows. */
@@ -287,21 +880,36 @@ namespace Kerbcast
             return Math.Asin(radius / distance) <= fovMaxDeg * 0.5 * Deg2Rad;
         }
 
-        public const string BlankNotResponding = "gonogo not responding";
+        /* What a silent lock holder's feeds show when it gave no words of its own. */
+        public const string DefaultSilentText = "Authority not responding";
+
+        [System.Obsolete("A silent holder's feeds show its own silence text, or DefaultSilentText")]
+        public const string BlankNotResponding = DefaultSilentText;
+
         public const string BlankVantageGone = "vantage craft gone";
 
         /* Why a command feed is blanked, or null to show it. A lens whose
            vantage craft no longer exists has no position, so that blanks with
            or without a lock. Otherwise only a held lock blanks: a silent holder
-           beats everything, then the holder's own blank. */
-        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone = false)
+           beats everything, showing its silence text, then the holder's own
+           blank. */
+        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone = false) =>
+            BlankReason(governed, timedOut, explicitBlank, vantageGone, null);
+
+        /* As above, showing `silentText` (null for DefaultSilentText) for a silent holder. */
+        public static string BlankReason(bool governed, bool timedOut, string explicitBlank, bool vantageGone,
+            string silentText)
         {
             if (vantageGone) return BlankVantageGone;
             if (!governed) return null;
-            if (timedOut) return BlankNotResponding;
+            if (timedOut) return string.IsNullOrEmpty(silentText) ? DefaultSilentText : silentText;
             if (!string.IsNullOrEmpty(explicitBlank)) return explicitBlank;
             return null;
         }
+
+        /* The UT the view's target became occluded, carried from `since` while it stays occluded (whatever now blocks it), NaN while it is not. */
+        public static double OccludedSince(bool occluded, double since, double ut) =>
+            !occluded ? double.NaN : double.IsNaN(since) ? ut : since;
 
         /*
          * Unit vector `azimuthDeg` clockwise from north and `elevationDeg` above
@@ -358,6 +966,34 @@ namespace Kerbcast
         public const string EligibleTooFar = "tooFar";
         public const string EligibleLevelTooLow = "levelTooLow";
         public const string EligibleNotTrackable = "notTrackable";
+        internal const string EligibleNotPositioned = "notPositioned";
+        internal const string EligibleRefused = "refused";
+        internal const string EligibleStale = "stale";
+        internal const string EligibleTooUncertain = "tooUncertain";
+        /* The radius a craft is framed by when its source gives no size. */
+        internal const double NominalCraftRadiusM = 2.0;
+
+        /*
+         * A launch site placeholder frames this much around the point, filling
+         * PlaceholderSiteFraction of the frame whatever the craft framing is
+         * set to: about 9 degrees from the default 500 m vantage, so the pad
+         * and its tower show. The radius is fixed, so a farther vantage frames
+         * the site tighter.
+         */
+        public const double PlaceholderSiteRadiusM = 20.0;
+        public const double PlaceholderSiteFraction = 0.5;
+        /* How far above a launch site's ground the placeholder looks: about where a craft's centre sits on it. */
+        public const double PlaceholderSiteHeightM = 10.0;
+        public const double PlaceholderAzimuthDeg = 90.0;
+
+        /* The placeholder a waiting camera looks at: along the craft a lens rides, at the launch site a lens stands beside, else level toward the horizon. */
+        public static PlaceholderAim PlaceholderFor(bool ridesCraft, bool besideLaunchSite)
+        {
+            if (ridesCraft) return PlaceholderAim.MountForward;
+            return besideLaunchSite ? PlaceholderAim.LaunchSite : PlaceholderAim.Horizon;
+        }
+        /* The refusal code of a record outside its window, or of any record while the snapshot is invalid. */
+        internal const string RefusalStale = "stale";
 
         /* The 1-based Tracking Station level from KSP's normalised level and its
            highest level index (stock 2, three levels). A highest index below 1
@@ -387,6 +1023,31 @@ namespace Kerbcast
             return EligibleOk;
         }
 
+        /*
+         * A targets-list row's code from what the fix source holds, first match
+         * wins: no row for an unknown craft (null), stale or refused for a
+         * refused record, notPositioned for a listed one (it has no range for
+         * the career rules), and `careerCode` (from Eligibility) for a
+         * positioned one, then tooUncertain when the career rules pass. With
+         * `listedTakesCareerRules` a listed craft takes the career rules with
+         * no range instead, as 1.11 listed a craft KSP could not place.
+         */
+        internal static string TargetEligibility(CraftFixState state, string refusalCode, bool listedTakesCareerRules,
+            string careerCode, bool tooUncertain = false)
+        {
+            switch (state)
+            {
+                case CraftFixState.Refused:
+                    return refusalCode == RefusalStale ? EligibleStale : EligibleRefused;
+                case CraftFixState.Listed:
+                    return listedTakesCareerRules ? careerCode : EligibleNotPositioned;
+                case CraftFixState.Positioned:
+                    return careerCode == EligibleOk && tooUncertain ? EligibleTooUncertain : careerCode;
+                default:
+                    return null;
+            }
+        }
+
         public static string EligibilityText(string code)
         {
             switch (code)
@@ -395,6 +1056,10 @@ namespace Kerbcast
                 case EligibleTooFar: return "Out of tracking range";
                 case EligibleLevelTooLow: return "Upgrade the Tracking Station";
                 case EligibleNotTrackable: return "Not tracked";
+                case EligibleNotPositioned: return "Position not known";
+                case EligibleRefused: return "Refused";
+                case EligibleStale: return "Out of date";
+                case EligibleTooUncertain: return "Position too uncertain";
                 default: return "";
             }
         }
@@ -490,6 +1155,78 @@ namespace Kerbcast
             if (fovDeg <= 0) return 0;
             return angleRad * Rad2Deg / (fovDeg / Math.Max(1, rows));
         }
+
+        /* A world direction in a lens's own axes: x right, y up, z forward.
+           `forward` and `up` are the lens's unit axes in world space. */
+        public static DVec3 ToCameraSpace(DVec3 v, DVec3 forward, DVec3 up)
+        {
+            var right = DVec3.Cross(up, forward);
+            return new DVec3(DVec3.Dot(v, right), DVec3.Dot(v, up), DVec3.Dot(v, forward));
+        }
+
+        /* The m00 and m11 terms of a symmetric perspective projection with
+           vertical `fovDeg` over a frame `aspect` wide per unit high, for a
+           lens with no projection matrix to read. */
+        public static void PerspectiveTerms(double fovDeg, double aspect, out double m00, out double m11)
+        {
+            m11 = 1.0 / Math.Tan(Math.Max(1e-6, fovDeg) * 0.5 * Deg2Rad);
+            m00 = m11 / Math.Max(1e-6, aspect);
+        }
+
+        /*
+         * Where a camera-space point (x right, y up, z forward) lands in a
+         * `width` by `height` frame, pixels from the top left, through the
+         * m00, m11, m02 and m12 terms of the lens's projection matrix (Unity's
+         * layout, so an off-centre lens is honoured). A point behind the lens
+         * is placed off the frame on the side it is nearest to turning
+         * towards, at the frame's diagonal from the centre.
+         */
+        public static FrameProjection ProjectCameraSpace(DVec3 c, double m00, double m11, double m02, double m12,
+            int width, int height)
+        {
+            double w = Math.Max(1, width), h = Math.Max(1, height);
+            var p = new FrameProjection
+            {
+                AngleOffAxisDeg = AngleBetween(new DVec3(0, 0, 1), c) * Rad2Deg,
+            };
+            const double MinDepth = 1e-9;
+            if (c.Z > MinDepth * Math.Max(1.0, Math.Abs(c.X) + Math.Abs(c.Y)))
+            {
+                double ndcX = m00 * c.X / c.Z - m02;
+                double ndcY = m11 * c.Y / c.Z - m12;
+                p.X = (ndcX + 1.0) * 0.5 * w;
+                p.Y = (1.0 - ndcY) * 0.5 * h;
+                p.InFrame = p.X >= 0 && p.X <= w && p.Y >= 0 && p.Y <= h;
+                return p;
+            }
+            p.Behind = true;
+            double dx = c.X, dy = -c.Y;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            /* Dead behind the lens the side is only rounding noise, so it is
+               pinned below the frame. */
+            if (len < 1e-6 * Math.Max(1e-12, c.Magnitude)) { dx = 0; dy = 1; len = 1; }
+            double reach = Math.Sqrt(w * w + h * h);
+            p.X = w * 0.5 + dx / len * reach;
+            p.Y = h * 0.5 + dy / len * reach;
+            return p;
+        }
+
+        /* `point` seen from a lens at `eye` with unit axes `forward` and `up`,
+           with the lens-to-point distance filled in. */
+        public static FrameProjection Project(DVec3 eye, DVec3 forward, DVec3 up, double m00, double m11, double m02,
+            double m12, int width, int height, DVec3 point)
+        {
+            var d = point - eye;
+            var p = ProjectCameraSpace(ToCameraSpace(d, forward, up), m00, m11, m02, m12, width, height);
+            p.Distance = d.Magnitude;
+            return p;
+        }
+
+        /* Screen radius, in pixels of a `rows`-high frame at vertical `fovDeg`,
+           of a sphere of `radius` at `distance`; 0 for no radius. The bracket
+           half-size, which the command camera's subject marker is drawn at. */
+        public static double ApparentRadiusPx(double radius, double distance, double fovDeg, int rows) =>
+            radius > 0 && distance > 0 ? BracketHalfPx(radius, distance, fovDeg, rows) : 0;
 
         /*
          * The changes of a discrete state over [from, to]. The span is sampled
@@ -733,6 +1470,9 @@ namespace Kerbcast
      * when the terrain point's elevation from the station is higher, and a
      * target is hidden when its elevation is below the highest terrain
      * elevation closer to the station than itself.
+     * A target with a radius is hidden only when its top is: at a grazing
+     * angle the heightfield and the drawn terrain differ by metres, so a
+     * craft whose centre sits just under a crest still shows above it.
      *
      * Per azimuth bin the terrain is sampled out to ArcLimit (past which no
      * line still inside the radiusMax shell can be), and the running maximum
@@ -844,11 +1584,17 @@ namespace Kerbcast
             elevation = Math.Atan2(v, h.Magnitude);
         }
 
-        /* True when the station's own terrain hides the target. */
-        public bool Blocks(DVec3 relStation, DVec3 relTarget, DVec3 axis)
+        /* True when the station's own terrain hides the target, all of it
+           when it has a radius. */
+        public bool Blocks(DVec3 relStation, DVec3 relTarget, DVec3 axis, double targetRadius = 0)
         {
             Basis(relStation, axis, out var up, out var north, out var east);
             Locate(relStation, relTarget, up, north, east, out double az, out double arc, out double el);
+            if (targetRadius > 0)
+            {
+                double range = (relTarget - relStation).Magnitude;
+                el += range > targetRadius ? Math.Asin(targetRadius / range) : Math.PI / 2;
+            }
             return el < MaskAt(az, arc, up, north, east);
         }
 
@@ -1154,6 +1900,53 @@ namespace Kerbcast
             for (int t = 0; t < TriangleCount; t++)
                 if (TriangleHit(t, a, d, 1.0)) return true;
             return false;
+        }
+    }
+
+    /*
+     * How far each part's model reaches from its origin, for the live bound.
+     * A reach only ever grows: a canopy that opens or a panel that unfolds
+     * raises it at once and it never falls back, so the bound can be late
+     * but never early. A part whose shape can move (`moves`) is measured on
+     * every frame; any other one every RefreshFrames frames. A measurement
+     * of nothing (NaN: no renderer active yet) keeps the reach so far and is
+     * tried again on the next frame, so a part is picked up once it shows.
+     */
+    internal sealed class ReachCache
+    {
+        public const int RefreshFrames = 120;
+        /* Past this many remembered parts the cache starts again, so parts long gone do not pile up. */
+        public const int Cap = 4096;
+
+        private struct Entry
+        {
+            public double Reach;
+            public long MeasuredFrame;
+            public bool Measured;
+        }
+
+        private readonly Dictionary<int, Entry> _entries = new Dictionary<int, Entry>();
+
+        public int Count => _entries.Count;
+
+        public double Reach<T>(int key, long frame, bool moves, Func<T, double> measure, T subject)
+        {
+            bool known = _entries.TryGetValue(key, out var e);
+            bool due = !known || !e.Measured || moves || frame - e.MeasuredFrame >= RefreshFrames;
+            if (!due) return e.Reach;
+            if (e.MeasuredFrame == frame && known && e.Measured) return e.Reach;
+            double m = measure(subject);
+            if (!known && _entries.Count >= Cap) _entries.Clear();
+            if (double.IsNaN(m) || double.IsInfinity(m) || m < 0)
+            {
+                _entries[key] = new Entry { Reach = e.Reach, MeasuredFrame = frame, Measured = false };
+                return e.Reach;
+            }
+            e.Reach = Math.Max(e.Reach, m);
+            e.MeasuredFrame = frame;
+            e.Measured = true;
+            _entries[key] = e;
+            return e.Reach;
         }
     }
 }
