@@ -117,7 +117,8 @@ namespace Kerbcast.Api.Testing
          * <summary>
          * Adds or replaces a command feed by FlightId. Feeds reports each feed's Scope as Kerbcast does:
          * from the bindings of the last snapshot accepted in this lock tenure, null when its SiteKey is
-         * unbound, before any snapshot, and after the lock is released. The Scope given here is ignored.
+         * unbound, before any snapshot, and after the lock is released. FollowsActiveVessel is likewise
+         * Kerbcast's: true while the feed has no aim in Aims. The Scope and FollowsActiveVessel given here are ignored.
          * </summary>
          */
         public void AddFeed(CommandFeed feed)
@@ -522,6 +523,7 @@ namespace Kerbcast.Api.Testing
             {
                 var c = Copy(f);
                 c.Scope = bound != null && c.SiteKey != null && bound.TryGetValue(c.SiteKey, out var scope) ? scope : null;
+                c.FollowsActiveVessel = !aims.ContainsKey(c.FlightId);
                 return c;
             });
         }
@@ -617,7 +619,7 @@ namespace Kerbcast.Api.Testing
         {
             FlightId = f.FlightId, DisplayName = f.DisplayName, SiteKey = f.SiteKey, SiteKind = f.SiteKind,
             VantagePersistentId = f.VantagePersistentId, Scope = f.Scope, SubjectPersistentId = f.SubjectPersistentId,
-            Created = f.Created, Network = f.Network,
+            Created = f.Created, Network = f.Network, FollowsActiveVessel = f.FollowsActiveVessel,
         };
 
         static CommandTarget Copy(CommandTarget t) => new CommandTarget

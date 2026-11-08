@@ -47,6 +47,15 @@ namespace Kerbcast.Api
 
         /** <summary>A tracking network camera, which moves between vantages (see <see cref="ICommand.NetworkStatus"/>). Added in API 1.4.</summary> */
         public bool Network { get; set; }
+
+        /**
+         * <summary>
+         * The feed has no aim of its own, so it watches the craft Kerbcast picks by default: the active vessel in
+         * flight, the latest launched craft in the Space Center. An aim set by <see cref="ICommand.SetAim"/> or at
+         * creation, the active vessel's included, makes it false until the aim is cleared. Added in API 1.5.
+         * </summary>
+         */
+        public bool FollowsActiveVessel { get; set; }
     }
 
     /**

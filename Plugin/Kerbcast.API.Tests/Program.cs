@@ -214,6 +214,7 @@ using (var kc = RecordingKerbcast.Install())
             "the holder creates one");
         var feed = cmd.Feeds().FirstOrDefault(f => f.FlightId == net);
         Check(feed != null && feed.Network && feed.Created && feed.SiteKey == "KSC", "Feeds lists it as a network camera at its first vantage");
+        Check(feed.FollowsActiveVessel, "a network made with no aim follows the active vessel");
         var status = cmd.NetworkStatus(net);
         Check(status.Count == 2 && status[0].Active && !status[1].Active && status[1].Fallback && status[1].Label == "North dish",
             "NetworkStatus lists every vantage in order");
@@ -236,6 +237,9 @@ using (var kc = RecordingKerbcast.Install())
         Check(mixedStatus[0].SiteKind == SiteKind.Station && mixedStatus[0].VantagePersistentId == 0
             && mixedStatus[1].SiteKind == SiteKind.Vessel && mixedStatus[1].VantagePersistentId == 77 && mixedStatus[1].SiteKey == "vessel:77",
             "NetworkStatus names each vantage's kind and craft, so a host can bind every site");
+        Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Station("KSC") }, null, Aim.Vessel(55), null, "modA", out uint watching) == NetworkResult.Ok
+            && !cmd.Feeds().First(f => f.FlightId == watching).FollowsActiveVessel, "a network made to watch a chosen craft does not");
+        cmd.DestroyNetworkCamera(watching, "modA");
         cmd.DestroyNetworkCamera(mixed, "modA");
         Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Surface(2, 1.5, 2.25) }, null, null, null, "modA", out uint mun) == NetworkResult.Ok
             && cmd.Feeds().First(f => f.FlightId == mun).SiteKey == "surface:Mun:1.50000:2.25000", "a surface vantage's key names its body as Kerbcast does");

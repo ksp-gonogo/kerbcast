@@ -5797,7 +5797,7 @@ mod tests {
         let built = command_centre_from_manifest(&m);
         let status = |site: &str, label: &str| -> Option<CommandTargetsStatus> {
             let per: PerCameraStatus = serde_json::from_str(&format!(
-                r#"{{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{{"subjectPersistentId":42,"trackingLevel":3,"targets":[],"site":{{"siteKey":"{site}","siteKind":"station","displayName":"{label}","body":"Kerbin","latitude":-6.5,"longitude":-141.6,"altitude":3000.0}},"network":{{"name":"Ground net","state":"ok","vantages":[{{"siteKey":"KSC","label":"Kerbal Space Center","state":"belowHorizon","active":false,"fallback":false}},{{"siteKey":"{site}","label":"{label}","state":"ok","active":true,"fallback":true}}]}}}}}}"#
+                r#"{{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{{"subjectPersistentId":42,"trackingLevel":3,"targets":[],"site":{{"siteKey":"{site}","siteKind":"station","displayName":"{label}","body":"Kerbin","latitude":-6.5,"longitude":-141.6,"altitude":3000.0}},"network":{{"name":"Ground net","followsActiveVessel":true,"state":"ok","vantages":[{{"siteKey":"KSC","label":"Kerbal Space Center","state":"belowHorizon","active":false,"fallback":false}},{{"siteKey":"{site}","label":"{label}","state":"ok","active":true,"fallback":true}}]}}}}}}"#
             ))
             .unwrap();
             per.command_targets
@@ -5814,6 +5814,7 @@ mod tests {
         assert_eq!((merged.latitude, merged.altitude), (-6.5, 3000.0));
         let network = merged.network.as_ref().expect("network");
         assert_eq!(network.name, "Ground net");
+        assert_eq!(network.follows_active_vessel, Some(true));
         assert_eq!(network.state, "ok");
         assert_eq!(network.vantages.len(), 2);
         assert!(network.vantages[1].active && network.vantages[1].fallback);
@@ -5821,6 +5822,7 @@ mod tests {
 
         let json = serde_json::to_value(&merged).unwrap();
         assert_eq!(json["network"]["vantages"][1]["siteKey"], "Crater Rim");
+        assert_eq!(json["network"]["followsActiveVessel"], true);
         assert_eq!(json["displayName"], "North dish");
 
         assert!(

@@ -323,6 +323,13 @@ export interface CommandNetworkInfo {
 	/** The camera's own name, which stays the same through every cut. */
 	name: string;
 	/**
+	 * The camera has no aim of its own, so it watches the craft the game
+	 * picks by default (the active vessel in flight); false once it is aimed
+	 * at a chosen craft, the active one included. Absent from a game older
+	 * than 1.12.
+	 */
+	followsActiveVessel?: boolean;
+	/**
 	 * `ok`, or `noView` when no vantage can see the craft and the camera
 	 * stays on its last vantage (or the host's fallback). Treat an
 	 * unrecognised value as `noView`.

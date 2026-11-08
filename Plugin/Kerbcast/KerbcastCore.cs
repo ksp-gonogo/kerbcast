@@ -1738,7 +1738,7 @@ namespace Kerbcast
             NetworkReadings.Clear();
             gr.Network.Readings(NetworkReadings);
             sb.Append("        \"network\": { ");
-            sb.Append($"\"name\": \"{JsonEsc(gr.Network.Name)}\", \"state\": \"{(gr.Network.NoView ? CommandFrameState.NetworkNoView : CommandFrameState.NetworkOk)}\", \"vantages\": [");
+            sb.Append($"\"name\": \"{JsonEsc(gr.Network.Name)}\", \"followsActiveVessel\": {(gr.Aim == null ? "true" : "false")}, \"state\": \"{(gr.Network.NoView ? CommandFrameState.NetworkNoView : CommandFrameState.NetworkOk)}\", \"vantages\": [");
             for (int i = 0; i < NetworkReadings.Count; i++)
             {
                 var r = NetworkReadings[i];

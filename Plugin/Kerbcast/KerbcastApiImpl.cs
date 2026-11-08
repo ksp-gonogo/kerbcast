@@ -428,6 +428,7 @@ namespace Kerbcast
                     SubjectPersistentId = gr.SubjectPersistentId,
                     Created = core.CommandProvider?.IsCreated(c.FlightId) ?? false,
                     Network = gr.Network != null,
+                    FollowsActiveVessel = gr.Aim == null,
                 });
             }
             return result;
