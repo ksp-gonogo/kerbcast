@@ -477,6 +477,17 @@ namespace Kerbcast
         public const double SplitOnRatio = 2.0;
         public const double SplitOffRatio = 1.5;
 
+        /*
+         * A ground station's altitude, never under the ground at its own
+         * coordinates. Stock reads a home's altitude from its building's
+         * transform when the network starts, and with the body's terrain
+         * unloaded that transform can sit hundreds of metres down, which
+         * puts the lens inside a wall of its own skyline. A NaN ground (no
+         * terrain to read) leaves the stored altitude as it is.
+         */
+        public static double StationAltitude(double storedAlt, double groundAlt) =>
+            double.IsNaN(groundAlt) || storedAlt >= groundAlt ? storedAlt : groundAlt;
+
         /* KSP's CelestialBody.GetWorldSurfacePosition, reproduced: the body-local
            spherical vector (z up) scaled to radius + alt, rotated by the body
            frame's axes (given in KSP's z-up world), swizzled to Unity's y-up

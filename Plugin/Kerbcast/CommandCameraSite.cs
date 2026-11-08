@@ -267,7 +267,7 @@ namespace Kerbcast
                 return new CommandCameraSite
                 {
                     NodeName = node, DisplayName = display, Body = body,
-                    Latitude = lat, Longitude = lon, Altitude = alt + altitudeOffset,
+                    Latitude = lat, Longitude = lon, Altitude = OnOrAboveGround(body, node, lat, lon, alt) + altitudeOffset,
                     IsHome = home.isKSC, Source = "commnet-fields",
                 };
             }
@@ -283,12 +283,29 @@ namespace Kerbcast
                     return new CommandCameraSite
                     {
                         NodeName = node, DisplayName = display, Body = body,
-                        Latitude = tlat, Longitude = tlon, Altitude = talt + altitudeOffset,
+                        Latitude = tlat, Longitude = tlon, Altitude = OnOrAboveGround(body, node, tlat, tlon, talt) + altitudeOffset,
                         IsHome = home.isKSC, Source = "commnet-transform",
                     };
                 }
             }
             return null;
+        }
+
+        /* A home's stored altitude raised to the ground at its coordinates (the sea over water) when it reads below it. */
+        private static double OnOrAboveGround(CelestialBody body, string node, double lat, double lon, double alt)
+        {
+            double ground = double.NaN;
+            if (body.pqsController != null)
+            {
+                try { ground = body.TerrainAltitude(lat, lon); }
+                catch (Exception) { /* no terrain to read: keep the stored altitude */ }
+                if (body.ocean && ground < 0) ground = 0;
+            }
+            double placed = CommandCameraMath.StationAltitude(alt, ground);
+            if (placed != alt)
+                Debug.Log($"[Kerbcast][CMDCAM] station '{node}' stored altitude {alt:F1}m is under the ground there ({ground:F1}m); "
+                    + "the lens stands on the ground");
+            return placed;
         }
 
         private static CommandCameraSite OnTerrain(string node, string display, CelestialBody body,
