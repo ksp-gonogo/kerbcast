@@ -7,17 +7,17 @@
 //! stamp be published under the exact RTP timestamp it carries.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
+use tracing::info;
 use webrtc::rtp::codecs::h264::H264Payloader;
 use webrtc::rtp::packetizer::{new_packetizer, Packetizer};
 use webrtc::rtp::sequence::new_random_sequencer;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
-use super::outbox::Outbox;
-use crate::protocol::FrameStampPayload;
+use super::outbox::{Outbox, SentFrame};
 use crate::shared_mem::CaptureStamp;
 
 /// RTP clock for video, fixed by RFC 6184 for H.264.
@@ -28,9 +28,35 @@ const RTP_OUTBOUND_MTU: usize = 1200;
 
 pub struct VideoTrack {
     rtp: Arc<TrackLocalStaticRTP>,
-    packetizer: Mutex<Box<dyn Packetizer + Send + Sync>>,
+    packetizer: Mutex<Paced>,
     /// Where frame stamps for this track go. `None` sends none (tests).
     stamps: Option<Outbox>,
+    /// The camera whose frames this track last sent live, cleared while the
+    /// track sends nothing. See `first_live_frame`.
+    live_camera: std::sync::Mutex<Option<u32>>,
+    /// Frames handed to this track, sent or not.
+    frames_given: std::sync::atomic::AtomicU64,
+}
+
+/// What `write_frame` sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentFrameInfo {
+    pub rtp_timestamp: u32,
+    /// The frame was the first this track sent live for its camera and was
+    /// not a keyframe, so the viewer cannot decode it: the camera must
+    /// produce an IDR.
+    pub wants_keyframe: bool,
+}
+
+/**
+ * Whether a frame sent live for `flight_id` is the first since the track last
+ * sent nothing or fed another camera, recording it as the track's camera.
+ * Frames go nowhere until the RTP binding is live after DTLS, so the IDR a new
+ * camera binding or a cold encoder starts with is usually dropped, and this
+ * is the first moment one can reach the viewer.
+ */
+fn first_live_frame(live_camera: &mut Option<u32>, flight_id: u32) -> bool {
+    live_camera.replace(flight_id) != Some(flight_id)
 }
 
 impl VideoTrack {
@@ -50,18 +76,29 @@ impl VideoTrack {
         );
         Self {
             rtp: Arc::new(TrackLocalStaticRTP::new(codec, id, stream_id)),
-            packetizer: Mutex::new(Box::new(packetizer)),
+            packetizer: Mutex::new(Paced {
+                packetizer: Box::new(packetizer),
+                clock: MediaClock::default(),
+            }),
             stamps,
+            live_camera: std::sync::Mutex::new(None),
+            frames_given: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// The webrtc-rs track to `add_track` onto the peer connection.
+    /// How many frames have been handed to this track, sent or not.
+    pub fn frames_given(&self) -> u64 {
+        self.frames_given.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn rtp_track(&self) -> Arc<TrackLocalStaticRTP> {
         self.rtp.clone()
     }
 
     /**
-     * Packetise and send one encoded frame (Annex-B NALs) lasting `duration`.
+     * Packetise and send one encoded frame (Annex-B NALs) captured at `time`,
+     * `keyframe` when it is an IDR.
      * When `capture` carries a UT, its stamp is queued for the control channel
      * before the frame's packets are written. Never waits on the data channel.
      * Returns the frame's RTP timestamp, or `None` when nothing was sent.
@@ -69,52 +106,251 @@ impl VideoTrack {
     pub async fn write_frame(
         &self,
         data: &[u8],
-        duration: Duration,
+        time: CaptureTime,
+        keyframe: bool,
         flight_id: u32,
-        capture: CaptureStamp,
-    ) -> webrtc::error::Result<Option<u32>> {
+        capture: &CaptureStamp,
+    ) -> webrtc::error::Result<Option<SentFrameInfo>> {
+        self.frames_given
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         /* Unbound or paused everywhere (`all` is true with no bindings): send
         nothing and leave the sequence untouched, matching
         TrackLocalStaticSample. */
         if self.rtp.all_binding_paused().await {
+            if self.live_camera.lock().unwrap().take().is_some() {
+                info!(
+                    flight_id,
+                    "track stopped sending: its sender is paused or unbound"
+                );
+            }
             return Ok(None);
         }
-        let packets = self.packetize(data, duration).await?;
+        let packets = self.packetize(data, time, capture).await?;
         let Some(first) = packets.first() else {
             return Ok(None);
         };
         let rtp_timestamp = first.header.timestamp;
 
-        if let (Some(ut), Some(stamps)) = (capture.ut, &self.stamps) {
-            stamps.offer_stamp(FrameStampPayload {
-                flight_id,
-                rtp_timestamp,
-                capture_ut: ut,
-                capture_epoch: capture.epoch,
-            });
+        if let Some(stamps) = &self.stamps {
+            let sent = SentFrame {
+                wall_ms: unix_ms_now(),
+                bytes: data.len() as u32,
+                keyframe,
+            };
+            stamps.offer_stamp(flight_id, rtp_timestamp, capture, sent);
         }
 
         for p in &packets {
             self.rtp.write_rtp_with_extensions(p, &[]).await?;
         }
-        Ok(Some(rtp_timestamp))
+        let first = first_live_frame(&mut self.live_camera.lock().unwrap(), flight_id);
+        Ok(Some(SentFrameInfo {
+            rtp_timestamp,
+            wants_keyframe: first && !keyframe,
+        }))
     }
 
-    /// Every packet of one frame shares the timestamp; the next frame's is
-    /// this one's plus `duration` in RTP ticks.
+    /// Every packet of one frame shares the timestamp, which is the last
+    /// frame's plus the media time between their captures.
     async fn packetize(
         &self,
         data: &[u8],
-        duration: Duration,
+        time: CaptureTime,
+        capture: &CaptureStamp,
     ) -> webrtc::error::Result<Vec<webrtc::rtp::packet::Packet>> {
-        let mut packetizer = self.packetizer.lock().await;
-        Ok(packetizer.packetize(&data.to_vec().into(), rtp_samples(duration))?)
+        let mut paced = self.packetizer.lock().await;
+        let step = paced.clock.step(time, capture.ut, capture.epoch);
+        paced.packetizer.skip_samples(step);
+        Ok(paced.packetizer.packetize(&data.to_vec().into(), 0)?)
     }
 }
 
-/// RTP clock ticks a frame of `duration` spans.
-fn rtp_samples(duration: Duration) -> u32 {
-    (duration.as_secs_f64() * H264_CLOCK_RATE as f64) as u32
+struct Paced {
+    packetizer: Box<dyn Packetizer + Send + Sync>,
+    clock: MediaClock,
+}
+
+/// When a frame was captured, on the two clocks that can tell.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureTime {
+    /// The game's real-time clock at the render the frame came from, in ms
+    /// (the ring's `capture_ts_ms`). Not Unix time; only its differences count.
+    pub game_clock_ms: f64,
+    /// When the sidecar took the frame from the ring: the fallback for a
+    /// writer whose clock did not advance.
+    pub picked_up: Instant,
+}
+
+/**
+ * Spaces one track's RTP timestamps by when each frame was captured, so the
+ * receiver's jitter buffer and renderer play them at the rhythm they were
+ * captured at rather than the rhythm they happened to be encoded and sent at.
+ *
+ * Each step is the UT between the two frames, since that is how far the
+ * picture moved (physics ticks fall unevenly across render frames, so equal
+ * real time between captures can hold one tick or three), divided by the
+ * game's pace in UT per real second over the last couple of seconds. A game
+ * running at 0.9x then plays at real time with every step in proportion to its
+ * UT, rather than at 0.9x with a correction added to each step. What the pace
+ * misses (it moves, and rounds to whole RTP ticks) is repaid by a small share
+ * of how far media time has fallen behind real time, and media time is never
+ * let more than `MAX_BEHIND_MS` either side of it.
+ *
+ * Whether a UT step is the picture's motion is judged on the game's pace over
+ * the last fraction of a second, not on the one step: at 1x a loaded game
+ * runs two physics ticks in one short render frame and one in a long one, so
+ * a single step can be twice or half the real time between its captures, and
+ * judging each step alone sent about one in twelve of them to real time. A UT
+ * step is followed while that pace is near 1x and the scaled step is within
+ * the debt cap of the real one. Anything else is the real time (plus a share
+ * of the debt): physics or on-rails warp, a pause, a new epoch, a camera
+ * rebound to this track, or a hitch where the game stood still for longer
+ * than the cap, whose frame arrives that late however it is stamped. The debt
+ * is booked in the whole RTP ticks actually sent, so rounding cannot drift.
+ */
+#[derive(Debug)]
+struct MediaClock {
+    last: Option<LastFrame>,
+    /// Real time minus media time since the first frame, ms.
+    behind_ms: f64,
+    /// The game's recent pace in UT per real second, smoothed over about
+    /// `PACE_SMOOTHING_MS` of the steps that could be motion. Decides whether
+    /// a step is followed at all.
+    pace: f64,
+    /// UT and real time of the followed steps, each smoothed over about
+    /// `SCALE_SMOOTHING_MS`. Their ratio is the pace a followed step is divided
+    /// by: steadier than `pace`, so steps of one size stay one size.
+    scale_ut_ms: f64,
+    scale_real_ms: f64,
+}
+
+impl Default for MediaClock {
+    fn default() -> Self {
+        Self {
+            last: None,
+            behind_ms: 0.0,
+            pace: 1.0,
+            scale_ut_ms: SCALE_PRIOR_MS,
+            scale_real_ms: SCALE_PRIOR_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastFrame {
+    time: CaptureTime,
+    ut: Option<f64>,
+    epoch: u32,
+}
+
+/// Share of the gap to real time each real-time step repays: about a second
+/// to settle.
+const MEDIA_CLOCK_GAIN: f64 = 0.1;
+
+/// Share of the gap a followed step repays. The scale already keeps those
+/// steps on real time, so this only mops up what it misses, and is kept small
+/// so it barely moves one step against the next.
+const FOLLOW_GAIN: f64 = 0.05;
+
+/// How far media time may run from real time: about two frames at 25 fps.
+const MAX_BEHIND_MS: f64 = 80.0;
+
+/**
+ * Longest real-time step between two frames. RTP timestamps wrap, so a
+ * receiver reads a step past half their range (about 6.6 h at 90 kHz) as a
+ * step backwards; a feed idle longer than this resumes one hour on.
+ */
+const MAX_STEP_MS: f64 = 3_600_000.0;
+
+/**
+ * Real time the pace is smoothed over. Long enough that a frame's uneven
+ * ticks do not move it far, short enough that entering 2x warp is caught
+ * within a few frames, and the cap bounds what those frames can owe.
+ */
+const PACE_SMOOTHING_MS: f64 = 300.0;
+
+/// The pace band UT steps are followed in: below it the game is paused or
+/// crawling, above it warping (physics warp starts at 2x).
+const PACE_FOLLOWED: std::ops::Range<f64> = 0.5..1.5;
+
+/**
+ * Real time the scale is smoothed over: long enough that a run of three-tick
+ * steps does not shrink the next one-tick step, short enough to follow the
+ * game as its load changes over a flight.
+ */
+const SCALE_SMOOTHING_MS: f64 = 2000.0;
+
+/// The scale starts as if it had seen 1x steps of a 30 fps frame, so the
+/// first steps are not divided by whatever pace one uneven step suggests.
+const SCALE_PRIOR_MS: f64 = 1000.0 / 30.0;
+
+impl MediaClock {
+    /// RTP ticks from the last frame on this track to this one.
+    fn step(&mut self, time: CaptureTime, ut: Option<f64>, epoch: u32) -> u32 {
+        let Some(last) = self.last.replace(LastFrame { time, ut, epoch }) else {
+            return 0;
+        };
+        let game_clock = time.game_clock_ms - last.time.game_clock_ms;
+        let real = if game_clock.is_finite() && game_clock > 0.0 {
+            game_clock
+        } else {
+            time.picked_up
+                .saturating_duration_since(last.time.picked_up)
+                .as_secs_f64()
+                * 1000.0
+        }
+        .min(MAX_STEP_MS);
+        let game = match (ut, last.ut) {
+            (Some(now), Some(then)) if epoch == last.epoch => (now - then) * 1000.0,
+            _ => f64::NAN,
+        };
+        let within_cap = (game / self.scale() - real).abs() <= MAX_BEHIND_MS;
+        if within_cap && real > 0.0 {
+            let weight = real / (real + PACE_SMOOTHING_MS);
+            self.pace += weight * (game / real - self.pace);
+        }
+        /* Out of the band is warp or a pause, and the steps that led into it
+        (a pace takes a few frames to cross the band's edge) say nothing about
+        the game's 1x pace, so the scale starts again from 1x when the game
+        is back. A hitch leaves the band alone and keeps the scale. */
+        if !PACE_FOLLOWED.contains(&self.pace) {
+            self.scale_ut_ms = SCALE_PRIOR_MS;
+            self.scale_real_ms = SCALE_PRIOR_MS;
+        }
+        let step_ms = if within_cap && game > 0.0 && PACE_FOLLOWED.contains(&self.pace) {
+            let weight = real / (real + SCALE_SMOOTHING_MS);
+            self.scale_ut_ms += weight * (game - self.scale_ut_ms);
+            self.scale_real_ms += weight * (real - self.scale_real_ms);
+            (game / self.scale() + FOLLOW_GAIN * self.behind_ms)
+                .clamp(
+                    real + self.behind_ms - MAX_BEHIND_MS,
+                    real + self.behind_ms + MAX_BEHIND_MS,
+                )
+                .max(0.0)
+        } else {
+            (real + MEDIA_CLOCK_GAIN * self.behind_ms).max(0.0)
+        };
+        let ticks = rtp_samples(step_ms);
+        self.behind_ms += real - ticks as f64 * 1000.0 / H264_CLOCK_RATE as f64;
+        ticks
+    }
+
+    /// UT per real ms over the recent followed steps.
+    fn scale(&self) -> f64 {
+        self.scale_ut_ms / self.scale_real_ms
+    }
+}
+
+/// RTP clock ticks spanning `ms`.
+fn rtp_samples(ms: f64) -> u32 {
+    (ms * H264_CLOCK_RATE as f64 / 1000.0) as u32
+}
+
+fn unix_ms_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -122,6 +358,7 @@ mod tests {
     use super::*;
     use crate::protocol::ServerMessage;
     use crate::webrtc::outbox::ControlChannel;
+    use std::time::Duration;
     use webrtc::api::media_engine::MIME_TYPE_H264;
 
     fn track() -> VideoTrack {
@@ -143,8 +380,20 @@ mod tests {
         v
     }
 
-    async fn frame_timestamps(t: &VideoTrack, data: &[u8], ms: u64) -> Vec<u32> {
-        t.packetize(data, Duration::from_millis(ms))
+    /// A frame captured `ms` into the game clock at `ut` seconds.
+    fn at(ms: f64, ut: Option<f64>) -> (CaptureTime, CaptureStamp) {
+        (
+            CaptureTime {
+                game_clock_ms: ms,
+                picked_up: Instant::now(),
+            },
+            CaptureStamp::at(ut, 0),
+        )
+    }
+
+    async fn frame_timestamps(t: &VideoTrack, data: &[u8], ms: f64, ut: Option<f64>) -> Vec<u32> {
+        let (time, stamp) = at(ms, ut);
+        t.packetize(data, time, &stamp)
             .await
             .unwrap()
             .iter()
@@ -152,39 +401,366 @@ mod tests {
             .collect()
     }
 
+    /// The step between two frames is in front of the second frame, the one
+    /// it belongs to, and follows the UT between them.
     #[tokio::test]
-    async fn timestamps_advance_by_each_frames_duration() {
+    async fn timestamps_follow_the_ut_between_captures() {
         let t = track();
-        let a = frame_timestamps(&t, &nal(64), 33).await;
-        let b = frame_timestamps(&t, &nal(64), 50).await;
-        let c = frame_timestamps(&t, &nal(64), 33).await;
-        assert_eq!(
-            b[0].wrapping_sub(a[0]),
-            rtp_samples(Duration::from_millis(33))
+        let a = frame_timestamps(&t, &nal(64), 0.0, Some(100.0)).await;
+        let b = frame_timestamps(&t, &nal(64), 40.0, Some(100.06)).await;
+        let c = frame_timestamps(&t, &nal(64), 80.0, Some(100.08)).await;
+        let ms = |ts: u32| ts as f64 * 1000.0 / H264_CLOCK_RATE as f64;
+        let ab = ms(b[0].wrapping_sub(a[0]));
+        let bc = ms(c[0].wrapping_sub(b[0]));
+        assert!(
+            ab > 50.0 && bc < 25.0,
+            "three ticks then one in equal real time step 3:1, not 1:1: {ab}, {bc}"
         );
-        assert_eq!(
-            c[0].wrapping_sub(b[0]),
-            rtp_samples(Duration::from_millis(50))
+        assert!(
+            (ab / bc - 3.0).abs() < 0.2,
+            "in proportion to their UT: {ab} / {bc}"
+        );
+    }
+
+    impl MediaClock {
+        /// The step in ms, as the RTP ticks it sends.
+        fn step_ms(&mut self, time: CaptureTime, ut: Option<f64>, epoch: u32) -> f64 {
+            self.step(time, ut, epoch) as f64 * 1000.0 / H264_CLOCK_RATE as f64
+        }
+    }
+
+    /// With no UT, or a UT step that is not motion (warp, a pause), the step
+    /// is the game's real time between the captures.
+    #[test]
+    fn steps_fall_back_to_real_time() {
+        let mut c = MediaClock::default();
+        let (t0, _) = at(1000.0, None);
+        assert_eq!(c.step_ms(t0, None, 0), 0.0, "the first frame has no step");
+        let (t1, _) = at(1033.0, None);
+        assert!((c.step_ms(t1, None, 0) - 33.0).abs() < 1e-6);
+        let (t2, _) = at(1066.0, None);
+        c.step_ms(t2, Some(5.0), 0);
+        let (t3, _) = at(1100.0, None);
+        assert!(
+            (c.step_ms(t3, Some(15.0), 0) - 34.0).abs() < 1e-6,
+            "ten seconds of UT in 34 ms is warp"
+        );
+        let (t4, _) = at(1133.0, None);
+        assert!(
+            (c.step_ms(t4, Some(15.0), 0) - 33.0).abs() < 1e-6,
+            "a paused UT"
+        );
+        let (t5, _) = at(1166.0, None);
+        assert!(
+            (c.step_ms(t5, Some(15.033), 1) - 33.0).abs() < 1e-6,
+            "a new epoch"
+        );
+        assert!(c.behind_ms.abs() < 1e-6, "real-time steps owe nothing");
+    }
+
+    /// A feed idle for hours resumes with a step under half the RTP range,
+    /// and owes nothing for the time it skipped.
+    #[test]
+    fn a_long_idle_step_is_clamped() {
+        let mut c = MediaClock::default();
+        let (t0, _) = at(0.0, None);
+        c.step(t0, None, 0);
+        let (t1, _) = at(14.0 * 3_600_000.0, None);
+        let ticks = c.step(t1, None, 0);
+        assert!(ticks < 1 << 31, "under half the range: {ticks}");
+        assert!((ticks as f64 * 1000.0 / H264_CLOCK_RATE as f64 - MAX_STEP_MS).abs() < 1.0);
+        assert!(c.behind_ms.abs() < 1.0, "owes nothing: {}", c.behind_ms);
+    }
+
+    /**
+     * A game below real time, captured unevenly: each step follows its UT, and
+     * over many frames the media time stays a fixed distance from real time
+     * instead of drifting.
+     */
+    #[test]
+    fn media_time_holds_to_real_time_over_a_slow_game() {
+        let mut c = MediaClock::default();
+        let ticks = [1u32, 2, 3, 2, 1, 4, 2, 2, 3, 1];
+        let (mut real, mut ut, mut media) = (0.0f64, 0.0f64, 0.0f64);
+        let (t, _) = at(real, None);
+        c.step_ms(t, Some(ut), 0);
+        for i in 0..2000 {
+            let n = ticks[i % ticks.len()] as f64;
+            ut += n * 0.02;
+            real += n * 20.0 / 0.9;
+            let (t, _) = at(real, None);
+            media += c.step_ms(t, Some(ut), 0);
+        }
+        let gap = real - media;
+        assert!(
+            gap > 0.0 && gap <= MAX_BEHIND_MS,
+            "media time {gap} ms behind real time"
+        );
+    }
+
+    /**
+     * The Deck at load: a 0.88x game whose captures hold one to four physics
+     * ticks, with render jitter on the real time between them and a hitch
+     * every second or so where the game stands still for 200 ms. Once the
+     * scale has settled every ordinary step is its UT divided by the pace, so
+     * a one-tick step is a quarter of a four-tick one; hitches step on real
+     * time; media time stays within the cap of real time throughout.
+     */
+    #[test]
+    fn steps_scale_with_ut_in_a_slow_game() {
+        const PACE: f64 = 0.88;
+        let mut c = MediaClock::default();
+        let ticks = [1u32, 2, 3, 2, 1, 4, 2, 2, 3, 1, 3, 2];
+        let jitter = [6.0, -4.0, 0.0, -7.0, 3.0, 8.0, -2.0, -5.0];
+        let (mut real, mut ut, mut media) = (0.0f64, 0.0f64, 0.0f64);
+        let (t, _) = at(real, None);
+        c.step_ms(t, Some(ut), 0);
+        let mut prev_jitter = 0.0;
+        for i in 0..1500 {
+            let hitch = i % 45 == 44;
+            let n = if hitch { 2 } else { ticks[i % ticks.len()] };
+            let game = n as f64 * 20.0;
+            let r = if hitch {
+                200.0
+            } else {
+                let j = jitter[i % jitter.len()];
+                let r = game / PACE + j - prev_jitter;
+                prev_jitter = j;
+                r
+            };
+            real += r;
+            ut += game / 1000.0;
+            let (t, _) = at(real, None);
+            let step = c.step_ms(t, Some(ut), 0);
+            media += step;
+            assert!(
+                (real - media).abs() <= MAX_BEHIND_MS + 0.1,
+                "media time {} ms from real time at frame {i}",
+                real - media
+            );
+            if i < 150 {
+                continue;
+            }
+            if hitch {
+                assert!(
+                    (step - r).abs() <= MEDIA_CLOCK_GAIN * MAX_BEHIND_MS + 0.1,
+                    "a hitch steps on real time: {step} for {r} ms real"
+                );
+            } else {
+                let want = game / PACE;
+                assert!(
+                    (step - want).abs() <= 0.05 * want + 1.0,
+                    "frame {i}: {n} ticks step {step} ms, not {want}"
+                );
+            }
+        }
+    }
+
+    /**
+     * Into 2x physics warp and back: the warp's UT steps are not the picture's
+     * pace, so media time follows real time through it, and never strays more
+     * than the cap from it either side.
+     */
+    #[test]
+    fn media_time_stays_near_real_time_through_physics_warp() {
+        let mut c = MediaClock::default();
+        let (mut real, mut ut, mut media) = (0.0f64, 0.0f64, 0.0f64);
+        let (t, _) = at(real, None);
+        c.step_ms(t, Some(ut), 0);
+        for warp in std::iter::repeat_n(1.0, 30)
+            .chain(std::iter::repeat_n(2.0, 60))
+            .chain(std::iter::repeat_n(1.0, 30))
+        {
+            real += 40.0;
+            ut += 0.04 * warp;
+            let (t, _) = at(real, None);
+            media += c.step_ms(t, Some(ut), 0);
+            assert!(
+                (real - media).abs() <= MAX_BEHIND_MS + 0.1,
+                "media time {} ms from real time at warp {warp}",
+                real - media
+            );
+        }
+        assert!(
+            (real - media).abs() < 1.0,
+            "and none of it is owed after: {}",
+            real - media
+        );
+    }
+
+    /**
+     * A loaded game at 1x, as the Deck runs one: physics ticks land two in a
+     * short render frame and one in a long one, and every second or so the
+     * game stalls for a whole frame of 150 ms while UT moves on by the 40 ms
+     * the physics limit allows. Each ordinary step follows its UT however far
+     * it sits from the real time between the captures; the stall follows real
+     * time, since its frame arrives that late regardless.
+     */
+    #[test]
+    fn steps_follow_ut_through_uneven_ticks_at_1x() {
+        let mut c = MediaClock::default();
+        /* (real ms, UT ticks) per capture: 2:1 and 1:2 tick-to-frame ratios. */
+        let steps = [
+            (20.0, 2u32),
+            (40.0, 1),
+            (20.0, 1),
+            (40.0, 2),
+            (27.0, 2),
+            (33.0, 1),
+            (40.0, 2),
+            (21.0, 1),
+        ];
+        let (mut real, mut ut, mut media) = (0.0f64, 0.0f64, 0.0f64);
+        let (t, _) = at(real, None);
+        c.step_ms(t, Some(ut), 0);
+        let mut followed = 0;
+        let mut ordinary = 0;
+        for i in 0..600 {
+            let stall = i % 40 == 39;
+            let (r, n) = if stall {
+                (150.0, 2)
+            } else {
+                steps[i % steps.len()]
+            };
+            real += r;
+            ut += n as f64 * 0.02;
+            let (t, _) = at(real, None);
+            let step = c.step_ms(t, Some(ut), 0);
+            media += step;
+            let game = n as f64 * 20.0;
+            if stall {
+                assert!(
+                    (step - r).abs() <= MEDIA_CLOCK_GAIN * MAX_BEHIND_MS + 0.1,
+                    "a stall steps on real time: {step} for {r} ms real, {game} ms UT"
+                );
+            } else {
+                ordinary += 1;
+                if (step - game).abs() <= MEDIA_CLOCK_GAIN * MAX_BEHIND_MS + 0.1 {
+                    followed += 1;
+                }
+            }
+            assert!(
+                (real - media).abs() <= MAX_BEHIND_MS + 0.1,
+                "media time {} ms from real time",
+                real - media
+            );
+        }
+        assert_eq!(followed, ordinary, "every ordinary step follows its UT");
+    }
+
+    /**
+     * 2x physics warp whose ticks fall unevenly, so some single steps look
+     * like 1x: the pace, not the step, decides, and once it has risen the
+     * steps stay on real time for the rest of the warp.
+     */
+    #[test]
+    fn uneven_physics_warp_still_steps_on_real_time() {
+        let mut c = MediaClock::default();
+        let (mut real, mut ut, mut media) = (0.0f64, 0.0f64, 0.0f64);
+        let (t, _) = at(real, None);
+        c.step_ms(t, Some(ut), 0);
+        let warp_ticks = [4u32, 2, 6, 3, 5, 4];
+        for i in 0..150 {
+            let n = if (30..120).contains(&i) {
+                warp_ticks[i % warp_ticks.len()]
+            } else {
+                2
+            };
+            real += 40.0;
+            ut += n as f64 * 0.02;
+            let (t, _) = at(real, None);
+            let step = c.step_ms(t, Some(ut), 0);
+            media += step;
+            assert!(
+                (real - media).abs() <= MAX_BEHIND_MS + 0.1,
+                "media time {} ms from real time at frame {i}",
+                real - media
+            );
+            if (37..120).contains(&i) {
+                assert!(
+                    (step - 40.0).abs() <= MEDIA_CLOCK_GAIN * MAX_BEHIND_MS + 0.1,
+                    "frame {i} of the warp steps on real time, not {step}"
+                );
+            }
+        }
+        assert!(
+            (real - media).abs() < 1.0,
+            "and none of it is owed after: {}",
+            real - media
+        );
+    }
+
+    /// Rounding each step down to whole RTP ticks is booked, so an hour of
+    /// steps that do not divide the tick lands on real time.
+    #[test]
+    fn rounding_to_rtp_ticks_does_not_drift() {
+        let mut c = MediaClock::default();
+        let (mut real, mut ut, mut ticks) = (0.0f64, 0.0f64, 0u64);
+        let (t, _) = at(real, None);
+        c.step(t, Some(ut), 0);
+        for _ in 0..(3600 * 30) {
+            real += 33.337;
+            ut += 0.033337;
+            let (t, _) = at(real, None);
+            ticks += c.step(t, Some(ut), 0) as u64;
+        }
+        let media = ticks as f64 * 1000.0 / H264_CLOCK_RATE as f64;
+        assert!(
+            (real - media).abs() < 1.0,
+            "{} ms off after an hour",
+            real - media
         );
     }
 
     #[tokio::test]
     async fn fragmented_frame_shares_one_timestamp_across_packets() {
         let t = track();
-        let ts = frame_timestamps(&t, &nal(5000), 33).await;
+        let ts = frame_timestamps(&t, &nal(5000), 33.0, None).await;
         assert!(ts.len() > 1, "a 5 kB frame spans several FU-A packets");
         assert!(ts.iter().all(|&x| x == ts[0]));
+    }
+
+    /// A camera's first live frame on a track asks for an IDR; later frames,
+    /// or the same camera after a write that went live, do not. Rebinding the
+    /// track to another camera, or a spell of sending nothing, asks again.
+    #[test]
+    fn first_live_frame_per_camera_binding() {
+        let mut live = None;
+        assert!(first_live_frame(&mut live, 7), "the binding's first frame");
+        assert!(!first_live_frame(&mut live, 7), "the next frame is not");
+        assert!(
+            first_live_frame(&mut live, 9),
+            "a camera swapped into the slot"
+        );
+        assert!(!first_live_frame(&mut live, 9));
+        live = None;
+        assert!(
+            first_live_frame(&mut live, 9),
+            "sending again after a pause"
+        );
+    }
+
+    /// A track that sends nothing forgets which camera it last sent live,
+    /// so its next live frame is checked for a keyframe again.
+    #[tokio::test]
+    async fn a_track_sending_nothing_forgets_its_live_camera() {
+        let t = track();
+        *t.live_camera.lock().unwrap() = Some(1);
+        let (time, stamp) = at(33.0, Some(1.0));
+        let got = t
+            .write_frame(&nal(64), time, false, 1, &stamp)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+        assert_eq!(*t.live_camera.lock().unwrap(), None);
     }
 
     #[tokio::test]
     async fn unbound_track_sends_nothing() {
         let t = track();
-        let stamp = CaptureStamp {
-            ut: Some(1.0),
-            epoch: 0,
-        };
+        let (time, stamp) = at(33.0, Some(1.0));
         let got = t
-            .write_frame(&nal(64), Duration::from_millis(33), 1, stamp)
+            .write_frame(&nal(64), time, false, 1, &stamp)
             .await
             .unwrap();
         assert_eq!(got, None);
@@ -197,7 +773,31 @@ mod tests {
      */
     #[tokio::test]
     async fn stamp_names_the_rtp_timestamp_the_viewer_receives() {
-        let (sent, stamps, rtp_seen) = loopback_stamps(true).await;
+        let (sent, stamps, rtp_seen, extra) = loopback_stamps(true).await;
+        let (anchors, fov, width, live, subject, send) = extra.expect("a stamp arrived");
+        let (bytes, keyframe, sent_wall_ms) = send;
+        assert_eq!(bytes, Some(64), "the frame's encoded size rides its stamp");
+        assert_eq!(keyframe, Some(true), "and whether it is a keyframe");
+        assert!(
+            sent_wall_ms.is_some_and(|ms| ms > 0.0),
+            "and when it was sent"
+        );
+        assert_eq!(fov, Some(35.0), "the frame's fov rides its stamp");
+        assert_eq!(width, Some(64), "and its size");
+        assert_eq!(live, Some(2.5), "and its live bound");
+        assert_eq!(
+            subject,
+            Some(42),
+            "and the command state the viewer asked for"
+        );
+        assert_eq!(
+            anchors,
+            vec![
+                ("mine".to_owned(), None),
+                ("subject".to_owned(), Some("kerbcast".to_owned()))
+            ],
+            "the viewer gets its own anchors and the game's, never another browser's"
+        );
         let matched: Vec<_> = stamps
             .iter()
             .filter(|(ts, _)| rtp_seen.contains(ts))
@@ -218,7 +818,7 @@ mod tests {
     /// frames and no stamps.
     #[tokio::test]
     async fn a_viewer_that_never_asks_gets_no_stamps() {
-        let (_, stamps, rtp_seen) = loopback_stamps(false).await;
+        let (_, stamps, rtp_seen, _) = loopback_stamps(false).await;
         assert!(!rtp_seen.is_empty(), "frames still arrive");
         assert!(stamps.is_empty(), "no stamps sent: {stamps:?}");
     }
@@ -229,7 +829,14 @@ mod tests {
      * UT), the stamps the viewer received, and the RTP timestamps it saw.
      */
     #[allow(clippy::type_complexity)]
-    async fn loopback_stamps(wanted: bool) -> (Vec<(u32, f64)>, Vec<(u32, f64)>, Vec<u32>) {
+    async fn loopback_stamps(
+        wanted: bool,
+    ) -> (
+        Vec<(u32, f64)>,
+        Vec<(u32, f64)>,
+        Vec<u32>,
+        Option<StampExtra>,
+    ) {
         use tokio::sync::mpsc;
         use webrtc::api::media_engine::MediaEngine;
         use webrtc::api::APIBuilder;
@@ -252,7 +859,7 @@ mod tests {
 
         #[derive(Debug)]
         enum Seen {
-            Stamp(u32, f64),
+            Stamp(u32, f64, StampExtra),
             Rtp(u32),
         }
         let (tx, mut rx) = mpsc::unbounded_channel::<Seen>();
@@ -273,7 +880,24 @@ mod tests {
             Box::pin(async move {
                 let msg: ServerMessage = serde_json::from_slice(&m.data).unwrap();
                 if let ServerMessage::FrameStamp(p) = msg {
-                    let _ = tx.send(Seen::Stamp(p.rtp_timestamp, p.capture_ut));
+                    let anchors = p
+                        .anchors
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.id, a.owner))
+                        .collect();
+                    let _ = tx.send(Seen::Stamp(
+                        p.rtp_timestamp,
+                        p.capture_ut,
+                        (
+                            anchors,
+                            p.fov,
+                            p.width,
+                            p.live_light_time_s,
+                            p.command.map(|c| c.subject_persistent_id),
+                            (p.encoded_bytes, p.keyframe, p.sent_wall_ms),
+                        ),
+                    ));
                 }
             })
         }));
@@ -303,8 +927,8 @@ mod tests {
             "video".to_owned(),
             "stream".to_owned(),
             Some({
-                let outbox = Outbox::spawn(control.clone());
-                outbox.set_stamps_wanted(wanted);
+                let outbox = Outbox::spawn(control.clone(), "peer:0:1".to_owned());
+                outbox.set_stamps_wanted(wanted, wanted, wanted);
                 outbox
             }),
         ));
@@ -364,26 +988,44 @@ mod tests {
         let mut sent = Vec::new();
         let mut stamps = Vec::new();
         let mut rtp_seen = Vec::new();
+        let mut extra = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut n = 0u32;
         while tokio::time::Instant::now() < deadline {
             let ut = 1000.0 + n as f64;
             let stamp = CaptureStamp {
-                ut: Some(ut),
-                epoch: 2,
+                fov: Some(35.0),
+                size: Some((64, 36)),
+                anchors: Some(std::sync::Arc::new(vec![
+                    frame_anchor("mine", Some("peer:0:1")),
+                    frame_anchor("another-browser", Some("peer:0:2")),
+                    frame_anchor("subject", Some("kerbcast")),
+                ])),
+                live_light_time_s: Some(2.5),
+                command: Some(std::sync::Arc::new(
+                    serde_json::from_str(
+                        r#"{"hasFix":true,"frameHeightPx":36,"framingFits":true,"occluded":false,"occluder":"","sunlit":true,"subjectPersistentId":42}"#,
+                    )
+                    .unwrap(),
+                )),
+                ..CaptureStamp::at(Some(ut), 2)
             };
-            if let Some(ts) = vt
-                .write_frame(&nal(64), Duration::from_millis(33), 9, stamp)
+            if let Some(info) = vt
+                .write_frame(&nal(64), at(n as f64 * 33.0, None).0, true, 9, &stamp)
                 .await
                 .unwrap()
             {
-                sent.push((ts, ut));
+                assert!(!info.wants_keyframe, "a keyframe needs no other");
+                sent.push((info.rtp_timestamp, ut));
             }
             n += 1;
             tokio::time::sleep(Duration::from_millis(33)).await;
             while let Ok(seen) = rx.try_recv() {
                 match seen {
-                    Seen::Stamp(ts, ut) => stamps.push((ts, ut)),
+                    Seen::Stamp(ts, ut, e) => {
+                        stamps.push((ts, ut));
+                        extra = Some(e);
+                    }
                     Seen::Rtp(ts) => rtp_seen.push(ts),
                 }
             }
@@ -400,7 +1042,35 @@ mod tests {
 
         viewer.close().await.ok();
         sidecar.close().await.ok();
-        (sent, stamps, rtp_seen)
+        (sent, stamps, rtp_seen, extra)
+    }
+
+    /// Anchor ids with owners, fov and width from one received stamp.
+    type StampExtra = (
+        Vec<(String, Option<String>)>,
+        Option<f64>,
+        Option<u32>,
+        Option<f64>,
+        Option<u32>,
+        (Option<u32>, Option<bool>, Option<f64>),
+    );
+
+    fn frame_anchor(id: &str, owner: Option<&str>) -> crate::protocol::FrameAnchor {
+        crate::protocol::FrameAnchor {
+            id: id.into(),
+            owner: owner.map(str::to_owned),
+            observed: false,
+            x: Some(10.0),
+            y: Some(5.0),
+            in_frame: true,
+            behind: Some(false),
+            distance_m: Some(100.0),
+            apparent_radius_px: Some(3.0),
+            angle_off_axis: Some(0.5),
+            forward: None,
+            up: None,
+            occluded: None,
+        }
     }
 
     mod churn {
@@ -423,7 +1093,6 @@ mod tests {
         use webrtc::util::vnet::router::{Router, RouterConfig};
 
         const TRACKS_PER_VIEWER: usize = 3;
-        const FRAME: Duration = Duration::from_millis(33);
         /// 30 s of 30 fps video.
         const FRAMES_PER_PHASE: u32 = 900;
 
@@ -563,8 +1232,8 @@ mod tests {
 
             let sidecar = pc_on(sidecar_net).await;
             let control: ControlChannel = Arc::new(Mutex::new(None));
-            let outbox = Outbox::spawn(control.clone());
-            outbox.set_stamps_wanted(true);
+            let outbox = Outbox::spawn(control.clone(), "peer:0:1".to_owned());
+            outbox.set_stamps_wanted(true, false, false);
             let mut tracks = Vec::new();
             for i in 0..TRACKS_PER_VIEWER {
                 let vt = Arc::new(VideoTrack::new(
@@ -662,10 +1331,7 @@ mod tests {
             status_seq: &mut u64,
         ) {
             for n in 0..frames {
-                let stamp = CaptureStamp {
-                    ut: Some(ut_base + n as f64),
-                    epoch: 1,
-                };
+                let stamp = CaptureStamp::at(Some(ut_base + n as f64), 1);
                 let first_status = *status_seq;
                 *status_seq += status_per_tick as u64;
                 let tick = async {
@@ -675,7 +1341,8 @@ mod tests {
                         }
                     }
                     for t in peers.iter().flat_map(|p| p.tracks.iter()) {
-                        let _ = t.write_frame(&nal(64), FRAME, 9, stamp).await;
+                        let time = at(n as f64 * 33.0, None).0;
+                        let _ = t.write_frame(&nal(64), time, false, 9, &stamp).await;
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(2), tick)

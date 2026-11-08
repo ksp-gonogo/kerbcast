@@ -68,6 +68,36 @@ ship without OpenH264) is refused, and `connect` rejects with an
 `OfferRefusedError` whose `code` is `ErrorCode.CodecUnsupported` and whose
 message says what to change.
 
+### Reconnecting
+
+A connection that fails stays failed: by default the client never rebuilds
+it, so a consumer can do that itself on `state-change` reaching `"failed"`.
+Pass `autoReconnect` to have the client do it instead:
+
+```ts
+const client = new KerbcastClient({
+  host: "192.168.1.74",
+  port: 8088,
+  autoReconnect: { maxAttempts: 8, initialDelayMs: 1000, maxDelayMs: 30_000, attemptTimeoutMs: 30_000 },
+});
+
+client.on("reconnect-attempt", ({ attempt }) => console.log("reconnecting, try", attempt));
+client.on("reconnect-success", ({ attempt }) => console.log("back after", attempt));
+client.on("reconnect-give-up", ({ attempt }) => console.log("gave up after", attempt));
+```
+
+`autoReconnect: true` takes the defaults shown. Once a connection that was up
+fails, the client waits `initialDelayMs`, opens a new connection with the same
+cameras subscribed, and doubles the wait after each failed attempt up to
+`maxDelayMs`. An attempt that has not connected within `attemptTimeoutMs`
+counts as failed. A first connection that never came up is left to the
+caller. Between attempts the state stays `"failed"`, and each attempt goes
+straight to `"connecting"`, so `"disconnected"` still means only a pause the
+connection may recover from by itself, or your own `disconnect`. The feeds
+show no signal until the new connection carries frames; display sizes, forces,
+holds and anchors are sent again on it. Calling `connect` or `disconnect`,
+even from a reconnect listener, cancels a reconnect under way.
+
 ### Pre-handshake discovery
 
 ```ts
@@ -102,12 +132,58 @@ static and frame lock, so anything it does (holding frames back, dropping
 them) shows up in `cam.mediaStream` with the static still drawn on top.
 
 Kerbcast installs the transform on whichever receiver carries the camera. A
-transform instance works on one receiver only, so you pass a factory:
-Kerbcast calls it for a fresh instance when the camera is bound, again when a
-slot rebind moves the camera to another receiver, and again after a
-reconnect. A receiver the camera leaves goes back to passthrough, and frames
-the old instance still holds are dropped. `setEncodedTransform(null)`
+transform instance works on one receiver only, so you pass a factory: Kerbcast
+calls it for a fresh instance when the camera is bound, again when a slot
+rebind moves the camera to another receiver, and again after a reconnect. It
+also calls it again when the camera's stream starts over on the receiver it
+kept: back in the list after a scene change (a relaunch, say), back from
+destroyed, or reattached in place without leaving the list (a vessel switch
+that rebuilds its camera; needs a sidecar that sends `attach`). The new frames
+come from a new encoder on a new capture timeline, so an instance holding
+state from the old one is replaced, in one step with no frames passing
+untransformed. A receiver the camera leaves goes back to passthrough, and
+frames the old instance still holds are dropped. `setEncodedTransform(null)`
 detaches. It works in both legacy and dynamic slot modes.
+
+On the `"script"` path Chromium wires a script transform to its receiver
+only as frames reach it, so on a receiver with no packets coming in (a
+relaunch gap, a slot about to be fed) an instance built before it was handed
+over can lose to the previous transform and receive nothing, for good.
+The passthrough a receiver goes back to, or a transform given `holdMs` (see
+below), is watched once packets arrive. One whose frames decode is left
+alone. One that sees packets arrive with no frame decoded for 2 s past its
+hold is renewed from the factory, which Chromium wires at once since packets
+are flowing, and Kerbcast asks the sidecar for a keyframe after the swap. It
+is renewed again, up to three more times, while packets keep arriving with no
+frame decoded for 2 s, then 4 s, then 8 s past the hold. A transform with no
+`holdMs` is renewed once when packets first arrive, and not checked after.
+Build the transform inside the factory call
+rather than ahead of it, and be ready for the factory to run again for the
+same install. A factory that throws on a renewal leaves the previous instance in
+place.
+
+A transform that holds frames back, such as a delay, decodes nothing until
+its hold has passed, so Kerbcast cannot tell it from one left without
+frames. Give the hold, the longest a frame can sit inside the transform
+including any pacing buffer, to have your transform checked the same way:
+
+```ts
+cam.setEncodedTransform(factory, { holdMs: () => currentDelayMs() });
+```
+
+`holdMs` is a number or a function, read at each check, so it can follow a
+changing delay. With it, the transform is renewed only when packets keep
+arriving undecoded for the hold plus 2 s (then plus 4 s, then plus 8 s, at
+most three more times), so a delay that is working keeps the frames it
+holds. The longest hold read (a function is read every 2 s while the
+transform is installed) also tells Kerbcast how long a replaced instance may
+go on decoding what it held, so the check of whatever replaces it on that
+receiver, after a relaunch too, waits that out before it trusts decoded
+frames or renews. Without it, every install is renewed once when
+packets first arrive on its receiver, and that renewal drops whatever the
+first instance was holding and waits for a keyframe. Whatever replaces it on
+that receiver, the passthrough included, is also renewed once when packets
+first arrive.
 
 It needs `encodedTransforms: true` when the client is constructed, and
 `setEncodedTransform` throws without it. The option gives every receiver a
@@ -199,7 +275,11 @@ and watches a craft from there, the way a tracking station would. The
 game's settings give each scene one, the Launchpad camera, and a client can
 create more at any vantage. Each appears in `client.cameras` with
 `kind: "command"` and a `commandCentre` describing where it stands and what
-it watches.
+it watches. `commandCentre.siteKey` names the place the lens stands and
+`siteKind` says what it is (`station`, `launchSite`, `surface` or `vessel`);
+the key stays the same when the craft a `vessel` site rides docks, while
+`vantagePersistentId` follows the craft it rides now. `stationId` is
+deprecated.
 
 A created camera lasts for the rest of the game scene (a flight, or the
 Space Center while the game's command camera setting is on); leaving the
@@ -247,13 +327,26 @@ at the Space Center. `createCommandCamera` takes the same `aim` as an option.
 The aim is one of:
 
 - `vessel`: follows the craft with that `persistentId` (any entry of
-  `commandCentre.targets`, whatever its eligibility)
+  `commandCentre.targets`, whatever its eligibility). Where a world model
+  governs the feed, a craft whose position it cannot narrow enough for the
+  view to frame is refused as `tooUncertain`; add `allowUncertain: true` to
+  aim at it anyway, as a deliberate search of the region it may be in. Under
+  the game's own knowledge every known craft is accepted, and while a command
+  lock is held browser aims are refused whatever they allow
 - `orbit`: follows a conic (`body`, `inclination`, `eccentricity`,
   `semiMajorAxis`, `lan`, `argumentOfPeriapsis` in degrees and metres,
   `meanAnomalyAtEpoch` in radians, `epoch`)
-- `positionAt`: follows a position you propagate yourself: `position` and
-  `velocity` as `[x, y, z]` relative to `body` in its non-rotating frame at
-  `ut`, carried on linearly
+- `positionAt`: follows a craft coasting from a state you give: `position`
+  and `velocity` as `[x, y, z]` relative to `body` at `ut`, z up, in KSP's
+  fixed inertial frame, carried on ballistically under the body's gravity
+  with no thrust. From a KSP `Orbit` that frame is always
+  `Planetarium.Zup.LocalToWorld(orbit.getRelativePositionAtUT(ut))` (and the
+  same for `getOrbitalVelocityAtUT`, `orbit.pos`, `orbit.vel`); the raw
+  values are not, since KSP leaves Zup turned after a low flight. A browser
+  client has no `Orbit`, so it takes these vectors from whatever mod or model
+  hands it craft states in that frame. A velocity of zero no longer holds a
+  point still (it falls); use `surface` for a fixed point. Before 1.12 this
+  was Zup's own frame, carried on linearly
 - `surface`: holds a point on a `body` (`latitude`, `longitude`, `altitude`
   in metres above sea level), turning with the planet
 - `direction`: holds a direction from the camera's local horizon,
@@ -377,9 +470,9 @@ before or during the lock are not restored.
 
 The lock holds until its holder releases it (or the scene changes); it never
 times out. A holder that stops calling for 5 s blanks every command feed
-("gonogo not responding") but keeps the lock, so aims from anyone else are
-still refused. This is deliberate: a holder that delays commands (gonogo
-applies signal delay) can not be bypassed while it is unresponsive.
+("Authority not responding") but keeps the lock, so aims from anyone else are
+still refused. This is deliberate: a holder that delays commands (one that
+applies signal delay, say) can not be bypassed while it is unresponsive.
 
 ### In game (C#)
 
@@ -406,15 +499,15 @@ Holding the lock:
 
 ```csharp
 // Re-take it on every scene load; a different owner is refused.
-KerbcastControl.SetCommandAuthority("gonogo");
+KerbcastControl.SetCommandAuthority("mission-control");
 
 // Only calls passing the owner are accepted now, and each is a heartbeat.
 KerbcastControl.SetCommandAim(pad, CommandAim.PositionAt("Kerbin", ut, pos, vel,
-    subject: craft.persistentId, framingMarginM: uncertaintyM), "gonogo");
+    subject: craft.persistentId, framingMarginM: uncertaintyM), "mission-control");
 KerbcastControl.SetCommandAim(pad, CommandAim.Vessel(other)); // false: locked
 
 // Every command camera returns to its default.
-KerbcastControl.ClearCommandAuthority("gonogo");
+KerbcastControl.ClearCommandAuthority("mission-control");
 ```
 
 - `CommandVantage.LaunchSite(site, distance, bearing, height)`,
@@ -438,15 +531,175 @@ KerbcastControl.ClearCommandAuthority("gonogo");
 - The lock holds until `ClearCommandAuthority` or a scene change, and fails
   closed: a holder that makes no call (`SetCommandAuthority`, `SetCommandAim`
   with its owner, `SetCommandBlank`) for 5 s of real time blanks every
-  command feed "gonogo not responding" and keeps the lock, so everyone else
+  command feed "Authority not responding" and keeps the lock, so everyone else
   stays refused. `SetCommandBlank(flightId, reason)` blanks one feed
 - `DestroyCommandCamera(flightId)` returns false for the settings camera or
   an unknown id
-- `CommandFeeds()` lists every built command camera, with its `Aim`,
-  `SubjectPersistentId`, and `Created` set on the ones made at runtime;
+- `CommandFeeds()` lists every built command camera, with its `SiteKey`,
+  `SiteKind`, `VantagePersistentId`, `Aim`, `SubjectPersistentId`, and
+  `Created` set on the ones made at runtime (`StationId` is obsolete);
   `CommandTargets(flightId)` lists the craft it could follow (a craft docked
   into another drops out; the combined craft keeps the survivor's
   `persistentId`)
+
+## Anchored markers
+
+Anchors mark things in the game on a camera's picture. The game projects
+each one through the camera that rendered every frame (its pose and field
+of view at that moment, so zoom and pan are exact), and the result rides
+that frame's stamp. Markers drawn from it line up with the picture under
+any stream delay. There is no live position: everything is tied to frames.
+
+```ts
+import { AnchorDirection, AnchorKind } from "@ksp-gonogo/kerbcast";
+
+await client.setAnchors(flightId, [
+  { id: "port", kind: AnchorKind.Part, vessel: targetPid, part: portPid, orientation: true },
+  { id: "ship", kind: AnchorKind.Vessel, vessel: targetPid, occlusion: true },
+  { id: "site", kind: AnchorKind.Surface, body: "Mun", latitude: 2.4, longitude: 81.5 },
+  { id: "pro", kind: AnchorKind.Direction, direction: AnchorDirection.TargetRelativeVelocity },
+]);
+await client.setAnchors(flightId, null); // clear
+```
+
+- Kinds: `part` (craft and part persistentId, optional `offset` in the
+  part's axes; a docking port is marked at its docking face; follows the
+  part through docking), `vessel` (centre of mass; follows a craft merged
+  into another), `surface` (body, latitude, longitude, altitude) and
+  `direction` (a named direction of a craft, the active one by default, or
+  a fixed inertial `vector`), drawn at infinity, and `kinematic` (a point
+  you describe with `kinematics`: a `conic` from KSP Orbit elements, a
+  `stateVector` coasting ballistically in the same fixed frame as a
+  `positionAt` aim, or a `surface` point, each about a named `body`), for a
+  last-known ghost, a hypothesis or a predicted point
+- `orientation: true` on a part or vessel adds its `forward` and `up` axes
+  in camera space (x right, y up, z forward) to every result.
+  `occlusion: true` adds `occluded`, at the cost of a ray cast per frame.
+  `marginM` pads the radius `apparentRadiusPx` is worked out from
+- Anchors belong to the client that set them: other clients never see them,
+  the command lock does not apply, and the sidecar drops them when the
+  client disconnects. The client keeps them until cleared and sends them
+  again on reconnect; anchors on a camera the sidecar does not list wait
+  until it appears. At most `client.maxAnchorsPerCamera` per camera, which
+  the sidecar announces in `hello` (16 when it does not say,
+  `MAX_ANCHORS_PER_CAMERA`)
+- Needs a 1.12 sidecar and plugin; against an older sidecar they are kept
+  but never sent (`client.anchorsSupported`)
+
+Each result lands on the displayed frame through `watchDisplayedFrames`:
+
+```ts
+import { anchorPoint, fitFrame, frameToScreen, frameLengthToScreen, findAnchor } from "@ksp-gonogo/kerbcast";
+
+client.watchDisplayedFrames(flightId, video, (frame) => {
+  const port = findAnchor(frame.anchors, "port");
+  const point = port && anchorPoint(port); // null when the result carries no position
+  if (!point || !frame.frameWidth || !frame.frameHeight) return;
+  const fitted = fitFrame(video.clientWidth, video.clientHeight,
+    frame.frameWidth, frame.frameHeight, "contain"); // or "cover"
+  const { x, y } = frameToScreen(point, frame.frameWidth, frame.frameHeight, fitted);
+  const r = frameLengthToScreen(port.apparentRadiusPx ?? 0, frame.frameHeight, fitted);
+  draw(x, y, r, port.inFrame, port.behind);
+});
+```
+
+Each result has `x`, `y` (capture pixels from the top left), `inFrame`,
+`behind` (then `x`, `y` sit off the frame on the side it is nearest),
+`distanceM` (absent for directions), `apparentRadiusPx`, `angleOffAxis`
+(degrees), and `forward`, `up`, `occluded` when asked for. Anchors set in
+game carry their `owner`; this client's own have none. Every stamp also
+gives the frame's `fov` and size, for overlays that do their own maths.
+
+An `observed: true` result carries only what the picture shows: `x`, `y`,
+`apparentRadiusPx` (and `forward`, `up`) only while the anchor is in frame and
+not occluded, and never `distanceM`, `angleOffAxis` or `behind`. Out of view it
+is just `inFrame` and `occluded`. Use `anchorPoint(result)`, which is `null`
+when there is no position.
+
+A command camera adds its own anchor: `id: "subject"`, owner `"kerbcast"`
+(`COMMAND_SUBJECT_ANCHOR_ID`, `KERBCAST_ANCHOR_OWNER`), a `vessel` anchor on
+the craft it watches with occlusion on. It is always observed, so it never
+gives away a craft the picture does not show. The React brackets follow it.
+A second, `id: "aim"` (`COMMAND_AIM_ANCHOR_ID`), is where the aim point lands
+in the frame: the centre, except while the camera turns onto a moved aim.
+
+While a command authority holds the lock, every browser client's anchors
+are observed-only by default. The holder can relax that
+(`KerbcastControl.SetAnchorPolicy(AnchorPolicy.Full, owner)`, for every
+camera or one) and can withhold the subject anchor
+(`KerbcastControl.SetSubjectAnchor(false, owner)`). Both return to the
+unrestricted behaviour when the lock clears. A `kinematic` anchor is never
+observed: it marks what you supplied, not what the game shows. Where it would
+be observed, though, its result still withholds the lens's pose: `x`, `y` and
+`apparentRadiusPx` only while `inFrame`, and never `distanceM`, `behind` or
+`angleOffAxis`. Under the lock
+`commandTrack.trueOffsetPx` is likewise sent only while the true craft is in
+frame and not occluded.
+
+### State that rides the frame
+
+From 1.12 every frame's stamp carries what that frame shows, so a view that
+delays the picture never learns it sooner.
+
+A light speed comes only from the game: the mod holding the command lock
+sets it through Kerbcast.API. Without one the picture is live, so a command
+camera's `subjectUt` equals the frame's `ut`.
+
+- `liveLightTimeS` on every frame of every camera: the light time covering
+  what of the lens's own craft and site the frame draws at its `ut`. It is
+  0 with no light speed. A delayed view releases the frame no sooner than
+  its `ut` plus this plus its own delay from the lens. Absent means unknown
+  (the game could not read it, or it is older than 1.12): under a light
+  speed, hold the frame. Other loaded craft near the lens are still drawn at
+  `ut` and are not covered yet; once craft beyond the boundary are hidden,
+  the bound covers everything drawn at `ut`
+- `boundaryM`: how far light travels in one 60 fps frame at the light
+  speed, the picture's boundary distance. Absent with no light speed
+- `command` on a command camera's frames: its fix, range, bracket,
+  occlusion, sunlight, blank reason, lock owner, subject, the subject's
+  refusal (`unknown`, `notPositioned`, `refused`, `stale`) and which world
+  model snapshot it read
+
+All three arrive on `DisplayedFrameUt` through `watchDisplayedFrames`.
+`effectiveCommandTrack(track, displayUt, frame.command)` uses a frame's own
+state whole; the React feed does this for its brackets and readout.
+
+Without help, the feed uses the frame the browser presents, or the newest
+stamped frame before it. That lags the picture only while the video element
+plays the stream as it arrives. A host that holds frames back on its own
+delay (a decoded or encoded frame transform) hides which frame is shown, so
+the feed would draw the brackets, readout and markers of a frame the picture
+has not reached yet. Such a host tells the feed what it shows:
+
+- `displayUt` on the React feed: the capture UT of the frame its buffer last
+  released, updated as it releases frames. The feed looks the frame up with
+  `client.frameAt(flightId, displayUt)`, the newest stamped frame at or
+  before that UT, and draws that frame's brackets, readout and anchor
+  markers; the UT also picks the transition in force. Before any frame that
+  old is known the feed behaves as without it
+- `displayFrame` instead, when the host kept the `DisplayedFrameUt` for each
+  frame itself. It wins over `displayUt`
+
+`frameAt` keeps frames back to 15 minutes of UT before the newest, at most
+20,000 per camera (`FRAME_HISTORY_MAX_LAG_UT`, `FRAME_HISTORY_MAX_ENTRIES`).
+It keeps them across a reconnect, and forgets a camera's frames on a new
+capture epoch or when the camera leaves the list.
+
+While a command lock is held, the camera list's `commandTrack` keeps only its
+`ut`, `authority` and `events` (each replayed at its own UT); the other fields
+read as their defaults, which a 1.11 client shows as no fix. The targets list
+in `commandCentre` carries the `ut` it describes:
+`client.commandCentreAt(flightId, displayUt)` gives the list as it stood at
+the displayed frame, and `null` while every list sent is newer. With no
+displayed UT it gives the newest, except under a lock, where it gives `null`.
+Lists are kept back to two hours of UT before the newest, at most 600 per
+camera (a UT older than every list kept finds none), and are forgotten when
+the camera leaves the list or the client reconnects.
+
+In game, `KerbcastControl.SetAnchors(flightId, anchors, owner)` does the same
+with `AnchorSpec.ForPart`, `ForVessel`, `ForSurface`, `ForDirection` and
+`ForVector`. Those results go to every client that asked for anchors, tagged
+with `owner`, until replaced, `ClearAnchors(owner)` or a scene change.
 
 ## Pan/zoom input helper
 

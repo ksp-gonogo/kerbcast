@@ -1,5 +1,5 @@
-import type { AdaptiveShedPayload, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
-import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
+import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
+import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, SiteKind, TrackMode } from "../__generated__/types";
 import type { CreateCommandCameraPayload } from "../__generated__/types";
 import type {
   DiscoveredCamera,
@@ -62,6 +62,8 @@ export interface MockCameraInit {
    */
   maxWidth?: number;
   maxHeight?: number;
+  /** Which attach of this flight id the camera is, as the sidecar counts them. Omitted when not given. */
+  attach?: number;
 }
 
 /** The `commandCentre` aim fields the game reports for `aim`; null is the default aim. */
@@ -113,6 +115,7 @@ function buildCamera(init: MockCameraInit): CameraState {
     viewerQuality: init.viewerQuality,
     qualityLimitedBy: init.qualityLimitedBy,
     trackMode: init.trackMode ?? TrackMode.None,
+    ...(init.attach !== undefined ? { attach: init.attach } : {}),
   };
 }
 
@@ -178,6 +181,8 @@ export class MockSidecar {
   private readonly _preForceSize = new Map<number, { width: number; height: number }>();
   /** Per-flight pending bump/revert timer, so a rapid force/unforce toggle cancels the stale one. */
   private readonly _forceTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** The display size held from this client per camera, read through {@link displaySizeFor}. */
+  private readonly _displaySizes = new Map<number, { width: number; height: number }>();
 
   constructor(opts: MockSidecarOptions = {}) {
     this._forceBumpDelayMs = opts.forceBumpDelayMs ?? 600;
@@ -186,6 +191,7 @@ export class MockSidecar {
   private _openHandler: (() => void) | undefined;
   private _clientMsgHandler: ((raw: string) => void) | undefined;
   private _stateHandler: ((s: KerbcastConnectionState) => void) | undefined;
+  private _lastConnectionState: KerbcastConnectionState | undefined;
   private _onTrackHandler:
     | ((track: MediaStreamTrack, idx: number, mid: string) => void)
     | undefined;
@@ -198,6 +204,12 @@ export class MockSidecar {
   private _slotMids: string[] = ["0", "1", "2", "3"];
   /** mid -> camera currently bound to that slot. */
   private readonly _slotBindings = new Map<string, number>();
+  /** Pool ceiling once {@link withRenegotiation} turns growth on; null while off. */
+  private _maxSlots: number | null = null;
+  /** How many leading mids take a camera; grown mids wait for `confirm-slots`. */
+  private _readySlots = Number.POSITIVE_INFINITY;
+  /** Times the client rolled back a pending re-offer. */
+  rollbacks = 0;
   /**
    * Per-flight inbound stats to return from the fake getStats. Set via
    * {@link setInboundStats}. Keyed by flightId.
@@ -288,6 +300,9 @@ export class MockSidecar {
           createOffer: async () => "v=0\r\n",
           setLocalDescription: async () => {},
           setRemoteAnswer: async () => {},
+          rollback: async () => {
+            self.rollbacks++;
+          },
           waitForIceComplete: async () => {},
           localSdp: () => "v=0\r\n",
           close() {},
@@ -304,14 +319,35 @@ export class MockSidecar {
    */
   open(): void {
     this._openHandler?.();
-    this._sendToClient({ type: "hello", content: { sidecarVersion: "0.0.1-mock", encoderBackend: "mock", frameStamps: true } });
+    this._sendToClient({
+      type: "hello",
+      content: {
+        sidecarVersion: "0.0.1-mock",
+        encoderBackend: "mock",
+        frameStamps: true,
+        anchors: true,
+        frameCommand: true,
+        maxAnchorsPerCamera: 16,
+        sizeHold: true,
+        ...(this._maxSlots !== null ? { renegotiate: true, maxSlots: this._maxSlots } : {}),
+      },
+    });
     this._sendToClient({ type: "camera-snapshot", content: { cameras: Array.from(this._cameras.values()) } });
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
 
-  /** Drive the underlying peer's connection-state handler. */
+  /**
+   * Drive the underlying peer's connection-state handler. Like the sidecar,
+   * a return to connected from disconnected announces every bound slot again.
+   */
   setConnectionState(state: KerbcastConnectionState): void {
+    const recovered = this._lastConnectionState === "disconnected" && state === "connected";
+    this._lastConnectionState = state;
     this._stateHandler?.(state);
+    if (!recovered) return;
+    for (const [mid, flightId] of this._slotBindings) {
+      this._sendToClient({ type: "slot-map", content: { mid, flightId } });
+    }
   }
 
   /**
@@ -349,6 +385,12 @@ export class MockSidecar {
     for (const timer of this._forceTimers.values()) clearTimeout(timer);
     this._forceTimers.clear();
     this._preForceSize.clear();
+    /* A camera that stays listed, and was not destroyed, keeps its sizes; any other starts afresh. */
+    for (const flightId of [...this._displaySizes.keys()]) {
+      const before = this._cameras.get(flightId);
+      const kept = inits.some((c) => c.flightId === flightId);
+      if (!kept || before?.lifecycle === CameraLifecycle.Destroyed) this._displaySizes.delete(flightId);
+    }
     this._cameras.clear();
     this._maxRenderSizes.clear();
     for (const init of inits) {
@@ -390,10 +432,20 @@ export class MockSidecar {
     this._sendToClient({ type: "settings-state", content: payload });
   }
 
-  /** Push a `frame-stamp` to the client: the capture UT of one frame, keyed by RTP timestamp. */
+  /**
+   * Push a `frame-stamp` to the client: the capture UT of one frame, keyed by
+   * RTP timestamp, with any `fov`, size and `anchors` results given.
+   */
   fireFrameStamp(payload: FrameStampPayload): void {
     this._sendToClient({ type: "frame-stamp", content: payload });
   }
+
+  /** The anchors the client last set on `flightId` with `set-anchors`. Empty when none. */
+  anchorsFor(flightId: number): readonly Anchor[] {
+    return this._anchors.get(flightId) ?? [];
+  }
+
+  private readonly _anchors = new Map<number, Anchor[]>();
 
   /** Push a `scene-state-changed` event to the client (flight scene or not). */
   fireSceneState(inFlight: boolean): void {
@@ -404,6 +456,38 @@ export class MockSidecar {
   withSlots(mids: string[]): this {
     this._slotMids = [...mids];
     return this;
+  }
+
+  /**
+   * Let the client grow its slot pool, up to `maxSlots`, the way a 1.12
+   * sidecar does. Pass {@link renegotiate} as the client's `renegotiate`
+   * config (or answer `POST /renegotiate` with it). Set before `open()`.
+   */
+  withRenegotiation(maxSlots = 32): this {
+    this._maxSlots = maxSlots;
+    return this;
+  }
+
+  /** Slot mids in the pool, grown ones included. */
+  get slotMids(): ReadonlyArray<string> {
+    return this._slotMids;
+  }
+
+  /**
+   * Answer a re-offer: the pool grows to `offer.slots`, new mids numbered on
+   * from the existing ones. As on the sidecar, the new mids take no camera
+   * until the client sends `confirm-slots`. Refused past the
+   * {@link withRenegotiation} ceiling.
+   */
+  renegotiate(offer: { session: string; sdp: string; slots: number }): Promise<{ sdp: string }> {
+    if (this._maxSlots === null || offer.slots > this._maxSlots) {
+      return Promise.reject(new Error("POST /renegotiate returned 422"));
+    }
+    this._readySlots = Math.min(this._readySlots, this._slotMids.length);
+    while (this._slotMids.length < offer.slots) {
+      this._slotMids.push(String(this._slotMids.length));
+    }
+    return Promise.resolve({ sdp: "v=0\r\n" });
   }
 
   /**
@@ -436,6 +520,17 @@ export class MockSidecar {
       if (fid === flightId) return mid;
     }
     return undefined;
+  }
+
+  /**
+   * The display size the sidecar holds from this client for a camera, or
+   * undefined when it holds none. Follows the sidecar's rules: a report for a
+   * camera it does not list is dropped, a withdraw or an unsubscribe forgets
+   * the size, and a camera that leaves the list (or comes back from
+   * destroyed) starts again with none.
+   */
+  displaySizeFor(flightId: number): { width: number; height: number } | undefined {
+    return this._displaySizes.get(flightId);
   }
 
   /** Every `ClientMessage` received from the client, in order. */
@@ -491,8 +586,8 @@ export class MockSidecar {
     sdp: string;
     cameras: number[];
     slots?: number;
-  }): Promise<{ sdp: string; cameras: number[] }> {
-    return Promise.resolve({ sdp: "v=0\r\n", cameras: offer.cameras });
+  }): Promise<{ sdp: string; cameras: number[]; session: string }> {
+    return Promise.resolve({ sdp: "v=0\r\n", cameras: offer.cameras, session: "mock-session" });
   }
 
   /**
@@ -711,6 +806,12 @@ export class MockSidecar {
         this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
         break;
       }
+      case "set-anchors": {
+        /* Per client in the real sidecar; the mock has one client. */
+        if (msg.content.anchors?.length) this._anchors.set(msg.content.flightId, msg.content.anchors);
+        else this._anchors.delete(msg.content.flightId);
+        break;
+      }
       case "create-command-camera": {
         this._createCommandCamera(msg.content);
         break;
@@ -736,7 +837,9 @@ export class MockSidecar {
       }
       case "subscribe": {
         const flightId = msg.content.flightId;
-        const freeMid = this._slotMids.find((m) => !this._slotBindings.has(m));
+        const freeMid = this._slotMids
+          .slice(0, this._readySlots)
+          .find((m) => !this._slotBindings.has(m));
         if (freeMid === undefined) {
           this._sendToClient({
             type: "error",
@@ -759,6 +862,9 @@ export class MockSidecar {
         }
         break;
       }
+      case "confirm-slots":
+        this._readySlots = Math.min(msg.content.slots, this._slotMids.length);
+        break;
       case "unsubscribe": {
         const flightId = msg.content.flightId;
         let bound: string | undefined;
@@ -768,6 +874,7 @@ export class MockSidecar {
             break;
           }
         }
+        this._displaySizes.delete(flightId);
         if (bound !== undefined) {
           this._slotBindings.delete(bound);
           this._sendToClient({
@@ -781,17 +888,26 @@ export class MockSidecar {
       // the mock has no frame clock, so it doesn't model their *effect* on
       // panYaw/fov. They're still recorded in `_commands`, so consumer tests
       // can assert the command was sent via `lastCommand("set-pan-rate")`.
-      // Advisory per-consumer display-size input. The real sidecar aggregates
-      // it MAX-across-consumers to drive auto-resolution; the mock has no
-      // aggregator, so it just records the command (via `_commands`) and does
-      // NOT mutate camera render dims (unlike the operator `set-render-size`).
-      case "report-display-size":
+      /*
+       * Advisory per-consumer display-size input. The real sidecar aggregates
+       * it MAX-across-consumers to drive auto-resolution; the mock has one
+       * consumer, so it holds the size (see displaySizeFor) and does NOT
+       * mutate camera render dims (unlike the operator `set-render-size`).
+       */
+      case "report-display-size": {
+        const { flightId, width, height } = msg.content;
+        if (!this._cameras.has(flightId)) break;
+        if (width < 2 || height < 2) this._displaySizes.delete(flightId);
+        else this._displaySizes.set(flightId, { width, height });
+        break;
+      }
       case "set-pan-rate":
       case "set-zoom-rate":
       case "hello":
       case "pong":
       case "request-keyframe":
       case "set-frame-stamps":
+      case "set-size-hold":
         break;
       case "set-throttle-main-screen": {
         /* Flip state and echo SettingsState back, mirroring the sidecar's broadcast. */
@@ -852,6 +968,16 @@ export class MockSidecar {
       commandCentre: {
         stationId: `ground:${place}`,
         nodeName: place,
+        siteKey: place,
+        siteKind:
+          v.kind === CommandVantageKind.Station
+            ? SiteKind.Station
+            : v.kind === CommandVantageKind.Surface
+              ? SiteKind.Surface
+              : v.kind === CommandVantageKind.Vessel
+                ? SiteKind.Vessel
+                : SiteKind.LaunchSite,
+        vantagePersistentId: v.kind === CommandVantageKind.Vessel ? (v.persistentId ?? 0) : 0,
         displayName: place,
         body: v.body ?? "Kerbin",
         latitude: v.latitude ?? 0,
@@ -1114,9 +1240,13 @@ function installStubMediaStream(): void {
  * Minimal MediaRecorder stand-in for jsdom, installed by {@link installDomStubs}.
  *
  * jsdom implements no MediaRecorder, so the recording controller can't run
- * headlessly without this. On `stop()` it synchronously flushes one canned
- * Blob (a fixed byte pattern tagged with the negotiated mimeType) then fires
- * `stop`, closing the start -> stop -> Blob path the controller drives.
+ * headlessly without this. It flushes data the way Chromium's MP4 recorder
+ * does: `requestData()` before the stop yields only the 36-byte file header
+ * the first time and nothing after, and `stop()` flushes the rest of the file
+ * in one 2048-byte Blob (a fixed byte pattern tagged with the negotiated
+ * mimeType), then fires `stop`. So a clip cut at a chunk boundary keeps no
+ * media, as in the browser. `pause()` and `resume()` leave the paused time
+ * out of the file, which {@link mediaMs} reports.
  *
  * `isTypeSupported` is controllable so tests exercise mime negotiation:
  *   - `supportedTypes = null` (default): support everything, so negotiation
@@ -1127,6 +1257,8 @@ function installStubMediaStream(): void {
 export class StubMediaRecorder {
   /** Types isTypeSupported reports available; null = everything. */
   static supportedTypes: string[] | null = null;
+  /** The recorder made last. */
+  static last: StubMediaRecorder | null = null;
 
   static isTypeSupported(type: string): boolean {
     return StubMediaRecorder.supportedTypes === null
@@ -1139,10 +1271,19 @@ export class StubMediaRecorder {
   state: "inactive" | "recording" | "paused" = "inactive";
 
   private readonly _listeners = new Map<string, Set<(e: { data?: Blob }) => void>>();
+  private _headerSent = false;
+  private _recordedMs = 0;
+  private _since: number | null = null;
 
   constructor(stream: MediaStream, options?: { mimeType?: string }) {
     this.stream = stream;
     this.mimeType = options?.mimeType ?? "";
+    StubMediaRecorder.last = this;
+  }
+
+  /** How long the file runs, in ms: the time spent recording, paused stretches left out. */
+  get mediaMs(): number {
+    return this._recordedMs + (this._since == null ? 0 : stubNow() - this._since);
   }
 
   addEventListener(type: string, cb: (e: { data?: Blob }) => void): void {
@@ -1162,25 +1303,51 @@ export class StubMediaRecorder {
     this._listeners.get(type)?.forEach((cb) => cb(e));
   }
 
+  private _type(): string {
+    return this.mimeType || "video/webm";
+  }
+
   start(_timeslice?: number): void {
+    this.state = "recording";
+    this._since = stubNow();
+  }
+
+  pause(): void {
+    if (this.state !== "recording") return;
+    this._recordedMs = this.mediaMs;
+    this._since = null;
+    this.state = "paused";
+  }
+
+  resume(): void {
+    if (this.state !== "paused") return;
+    this._since = stubNow();
     this.state = "recording";
   }
 
-  /** Flush a canned data chunk, then fire `stop`, mirroring the real order. */
+  /** Flush the rest of the file, then fire `stop`, mirroring the real order. */
   stop(): void {
     if (this.state === "inactive") return;
+    this._recordedMs = this.mediaMs;
+    this._since = null;
     this.state = "inactive";
     const bytes = new Uint8Array(2048);
     for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
-    const data = new Blob([bytes], { type: this.mimeType || "video/webm" });
-    this._emit("dataavailable", { data });
+    this._emit("dataavailable", { data: new Blob([bytes], { type: this._type() }) });
     this._emit("stop", {});
   }
 
-  /** Emit a partial data chunk without stopping (matches the real API). */
+  /** The file header on the first call and nothing after, as Chromium's MP4 muxer does. */
   requestData(): void {
-    if (this.state !== "recording") return;
-    const data = new Blob([new Uint8Array(512)], { type: this.mimeType || "video/webm" });
-    this._emit("dataavailable", { data });
+    if (this.state === "inactive") return;
+    const size = this._headerSent ? 0 : 36;
+    this._headerSent = true;
+    this._emit("dataavailable", { data: new Blob([new Uint8Array(size)], { type: this._type() }) });
   }
+}
+
+function stubNow(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
 }

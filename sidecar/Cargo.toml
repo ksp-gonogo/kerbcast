@@ -45,6 +45,8 @@ memmap2 = "0.9"
 # OCISLY's JPEG-over-gRPC architecture which is what we're trying to escape.
 webrtc = "0.13"
 ice = { package = "webrtc-ice", version = "0.13" }
+# Unguessable session tokens for POST /renegotiate. Already in the tree via webrtc.
+rand = "0.8"
 
 # HTTP signalling endpoint — POST /offer accepts the browser's SDP, returns
 # the sidecar's answer. axum is the lightest tokio-native option that

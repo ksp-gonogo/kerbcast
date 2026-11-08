@@ -2,12 +2,19 @@
 //! protocol types, and shared-memory ring buffer used by both `main.rs`
 //! (binary entry) and integration tests.
 
+pub mod anchors;
 pub mod cameras;
 pub mod commands;
 pub mod encoder;
+pub mod feed_watch;
+pub mod frame_watch;
 pub mod heartbeat;
+pub mod ladder;
+pub mod link;
 pub mod protocol;
 pub mod rate;
+pub mod send_tally;
+pub mod session_log;
 pub mod shared_mem;
 pub mod signalling;
 pub mod webrtc;

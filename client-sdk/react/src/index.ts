@@ -11,6 +11,7 @@ export {
   KerbcastProvider,
   createClientSubscriptions,
   createClientDisplaySizes,
+  KERBCAST_RELEASE_GRACE_MS,
   useKerbcastClient,
   useKerbcastSubscriptions,
   useKerbcastDisplaySizes,
@@ -18,6 +19,7 @@ export {
 export type {
   KerbcastProviderProps,
   KerbcastSubscriptions,
+  ClientSubscriptionsOptions,
   KerbcastDisplaySizes,
 } from "./context";
 
@@ -27,7 +29,8 @@ export { useKerbcastStream } from "./hooks/useKerbcastStream";
 export { useKerbcastClock } from "./hooks/useKerbcastClock";
 export { useDisplayedFrameUt } from "./hooks/useDisplayedFrameUt";
 export { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
-export { useReportDisplaySize } from "./hooks/useReportDisplaySize";
+export { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
+export { useReportDisplaySize, MIN_DISPLAY_REPORT_PX } from "./hooks/useReportDisplaySize";
 export { useRecordings } from "./hooks/useRecordings";
 export type { RecordingsStore, ActiveRecordingInfo } from "./hooks/useRecordings";
 
@@ -68,6 +71,27 @@ export type {
   ContentRect,
 } from "./CommandBrackets";
 
+// Anchored markers: CameraFeed's `anchors` and `anchorOverlay`, and the
+// pieces for drawing a frame's anchors over a video of your own
+export {
+  AnchorMarkers,
+  ANCHOR_MARKER_COLOURS,
+  anchorMarkerGeometry,
+  useDisplayedFrame,
+} from "./AnchorMarkers";
+export type {
+  AnchorContext,
+  AnchorCorner,
+  AnchorCornerOverride,
+  AnchorCornerOverrides,
+  AnchorCornerStyle,
+  AnchorMarkerGeometry,
+  AnchorMarkerShape,
+  AnchorMarkersProps,
+  AnchorOverlay,
+  PlacedAnchor,
+} from "./AnchorMarkers";
+
 // FeedActionBar: the shared action row (tracking, fullscreen, PiP, quality,
 // close, REC) both CameraFeed and KerbalFaceFeed render, with the issue-#6
 // overflow (⋮) engine.
@@ -79,5 +103,5 @@ export { KerbalFaceFeed } from "./KerbalFaceFeed";
 export type { KerbalFaceFeedProps, KerbalFeedState } from "./KerbalFaceFeed";
 
 // RecordingsTray: a presentational drawer over the recordings store
-export { RecordingsTray } from "./RecordingsTray";
+export { RecordingsTray, recordingEndNote } from "./RecordingsTray";
 export type { RecordingsTrayProps } from "./RecordingsTray";

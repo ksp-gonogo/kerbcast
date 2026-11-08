@@ -16,23 +16,32 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::webrtc::video_track::VideoTrack;
+use crate::webrtc::video_track::{CaptureTime, VideoTrack};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::commands::{validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE};
-use crate::encoder::{EncoderBackend, SessionHealth};
+use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
+use crate::commands::{
+    validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
+};
+use crate::encoder::{
+    align_down, aligned_cover, EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION,
+};
+use crate::feed_watch::{FeedVerdict, FeedWatch};
+use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
     CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
-    ErrorCode, Layer, QualityPreset, SetCommandAimPayload, SettingsStatePayload, TrackMode,
+    ErrorCode, Layer, QualityPreset, ResumePayload, SetCommandAimPayload, SettingsStatePayload,
+    SiteKind, TrackMode,
 };
 use crate::rate::RateWindow;
-use crate::shared_mem::{ControlBlock, MmapFrameRing};
+use crate::send_tally::SendTally;
+use crate::shared_mem::{ChangeSignal, ControlBlock, MmapFrameRing};
 
 /// Filesystem identity for a `.ring` file: distinguishes "same path, same
 /// underlying file" from "same path, file was unlinked and a new one
@@ -160,14 +169,17 @@ struct PerCameraStatus {
         skip_serializing_if = "Option::is_none"
     )]
     command_track: Option<CommandTrackState>,
-    /// A command camera's target, range, Tracking Station level and target
-    /// list. Absent for every other kind; a malformed object is dropped.
+    /// A command camera's target, range, Tracking Station level, target list
+    /// and current vantage craft. Absent for every other kind; a malformed
+    /// object is dropped. The key stays `commandCentre` so plugins and
+    /// sidecars of either version read each other's files.
     #[serde(
         default,
-        deserialize_with = "lenient_command_centre",
+        rename = "commandCentre",
+        deserialize_with = "lenient_command_targets",
         skip_serializing_if = "Option::is_none"
     )]
-    command_centre: Option<CommandCentreStatus>,
+    command_targets: Option<CommandTargetsStatus>,
 }
 
 /// The per-write part of a command camera's `CommandCentreInfo`. The plugin
@@ -175,7 +187,7 @@ struct PerCameraStatus {
 /// equal from one write to the next and only a visible move re-broadcasts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CommandCentreStatus {
+struct CommandTargetsStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     aim_kind: Option<CommandAimKind>,
     #[serde(default)]
@@ -184,11 +196,40 @@ struct CommandCentreStatus {
     range_m: Option<f64>,
     #[serde(default)]
     tracking_level: u32,
+    /// UT of the write; not compared when deciding whether the list changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ut: Option<f64>,
     #[serde(default)]
     targets: Vec<CommandTarget>,
+    #[serde(default)]
+    vantage_persistent_id: u32,
 }
 
-fn lenient_command_centre<'de, D>(d: D) -> Result<Option<CommandCentreStatus>, D::Error>
+/// Whether a command camera's subject, range or targets moved. A later `ut`
+/// on the same content is not a change: a client keeps the UT the content
+/// first had. An earlier one is (a load or revert ran time back), so
+/// clients see the content again from the UT the game is at now.
+fn command_targets_changed(
+    a: &Option<CommandTargetsStatus>,
+    b: &Option<CommandTargetsStatus>,
+) -> bool {
+    if let (Some(x), Some(y)) = (a, b) {
+        if let (Some(before), Some(now)) = (x.ut, y.ut) {
+            if now < before {
+                return true;
+            }
+        }
+    }
+    let strip = |s: &Option<CommandTargetsStatus>| {
+        s.clone().map(|mut s| {
+            s.ut = None;
+            s
+        })
+    };
+    strip(a) != strip(b)
+}
+
+fn lenient_command_targets<'de, D>(d: D) -> Result<Option<CommandTargetsStatus>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -199,7 +240,7 @@ where
     match serde_json::from_value(value) {
         Ok(c) => Ok(Some(c)),
         Err(e) => {
-            tracing::debug!(error = %e, "command centre parse failed; dropping it");
+            tracing::debug!(error = %e, "command targets parse failed; dropping it");
             Ok(None)
         }
     }
@@ -418,6 +459,11 @@ pub struct ControlState {
     /// without paying full capture cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_fps: Option<f32>,
+    /// Keep the render size where it is (a viewer is recording). Not stored
+    /// here by any setter: `flush_control` derives it from the camera's
+    /// holds on every write, so no flush path can drop it.
+    #[serde(default)]
+    pub size_held: bool,
 }
 
 /// serde skip helper: keep the debug JSON clean for the common not-tracking case.
@@ -562,9 +608,14 @@ struct InfoManifest {
     /// `"seat"` or `"eva"`. `None` for part cameras.
     #[serde(default)]
     crew_location: Option<String>,
-    /// Command camera station identity, present only on `"command"` manifests.
+    /// The command camera's site key and kind, present only on `"command"`
+    /// manifests.
     #[serde(default)]
-    station_id: Option<String>,
+    site_key: Option<String>,
+    #[serde(default)]
+    site_kind: Option<String>,
+    #[serde(default)]
+    vantage_persistent_id: Option<u32>,
     /// Set on a command camera created at runtime.
     #[serde(default)]
     command_created: Option<bool>,
@@ -598,6 +649,9 @@ pub struct CameraState {
     /// the file underneath changed and reattach instead of leaving the mmap
     /// pointed at the unlinked original.
     pub ring_identity: u64,
+    /// Which attach of this flight id this entry is, from 1. See the protocol
+    /// `CameraState::attach`.
+    pub attach: u32,
     pub max_width: u32,
     pub max_height: u32,
     /// Whether this is a Hullcam part camera or a per-kerbal face camera.
@@ -650,35 +704,14 @@ pub struct CameraState {
     /// A `std::sync::Mutex`, not the tokio one — the mmap write is synchronous
     /// and never held across an await.
     pub control_block: std::sync::Mutex<Option<ControlBlock>>,
-    /// Lazy: created on first encoded frame so the encoder sees the
-    /// actual frame dimensions, not the ring's max. Closed + reinit if
-    /// the frame dimensions change (the plugin's adaptive downscale
-    /// path triggers this).
-    pub encoder: Mutex<Option<Box<dyn EncoderBackend>>>,
-    /// Width/height the encoder is currently initialised for. The
-    /// consume loop compares these against the incoming frame's
-    /// dimensions to detect adaptive-downscale resolution changes.
-    /// Both 0 when no encoder is running.
-    pub encoder_width: AtomicU32,
-    pub encoder_height: AtomicU32,
-    /// Bitrate the current encoder session was initialised with.
-    /// 0 = no encoder running yet. The consume loop compares against
-    /// `target_bitrate_bps` and reinitialises the encoder when they
-    /// diverge significantly (REMB-driven adaptation).
-    pub encoder_bitrate: AtomicU32,
-    /// Consecutive encode() failures. Reset on success; at the consume
-    /// loop's threshold the encoder is closed + dropped so the next
-    /// frame re-initialises it (hardware first, software fallback) —
-    /// otherwise a wedged encoder session stalls subscribed peers
-    /// forever while only emitting warn logs.
-    pub encode_failure_streak: AtomicU32,
-    /// Session-level escalation state: hardware sessions that stay
-    /// silent (init fine, accept frames, never emit a NAL, the GPU
-    /// concurrent-session-limit signature) or persistently error
-    /// strike toward pinning this camera to the software fallback.
-    /// std Mutex: only touched under the encoder lock, never across
-    /// an await.
-    pub session_health: std::sync::Mutex<SessionHealth>,
+    /// Whether this camera's ring is moving while it has viewers.
+    pub feed_watch: std::sync::Mutex<FeedWatch>,
+    /// The camera's own encoder at the ring's size, and the viewer tracks it
+    /// feeds.
+    pub full: TierEncoder,
+    /// A lighter stream (half size, half rate) for viewers whose link cannot
+    /// carry Full. Encodes only while some viewer is on it.
+    pub reduced: TierEncoder,
     /// Most-recent target bitrate, computed as the min across active
     /// subscribers' REMB estimates (so the slowest receiver doesn't
     /// drop the whole stream). 0 = no REMB received yet; consume loop
@@ -693,7 +726,7 @@ pub struct CameraState {
     /// not of any one viewer, and the single shared encoder can only
     /// emit one degrade anyway — so this is a single per-camera scalar,
     /// not a per-peer reduction. Whichever subscriber wrote last owns it;
-    /// a well-behaved driver (e.g. gonogo) re-asserts every tick.
+    /// a well-behaved driver re-asserts every tick.
     /// Stored as bits-of-f32 in an AtomicU32 to keep the hot path
     /// lock-free (encode_and_fan_out runs per-frame, the f32 is
     /// already bit-pattern-stable for our levels).
@@ -709,24 +742,18 @@ pub struct CameraState {
     /// the incoming seq differs from this, then stores it — so a level-triggered
     /// echo is adopted exactly once per kOS set (no re-adopt loop). Starts 0.
     pub last_track_report_seq: AtomicU32,
-    /// Last wall-clock instant we *encoded* (and emitted NALs to) a frame.
-    /// The consume loop uses this to pace encodes against the configured
-    /// `fps`, instead of running once per ring write at LateUpdate's
-    /// native cadence (40-60 Hz on the Deck) and tagging samples with
-    /// duration=1/fps that the receiver can't reconcile.
-    pub last_encoded_at: Mutex<Option<Instant>>,
+    /// When the last frame sent to the tracks was captured. The consume loop
+    /// skips a frame captured too soon after it, so a writer capturing faster
+    /// than the configured `fps` cannot drive the encoder past it.
+    pub last_sent: Mutex<Option<CaptureTime>>,
     pub last_sequence: AtomicU64,
     /// Count of peer-tracks currently subscribed. Encoder runs only when > 0.
     pub subscribers: AtomicUsize,
     /// Promoted out of background capture but not yet renderable — set when display demand
     /// appears, cleared when a keyframe is emitted.
     pub ramping: AtomicBool,
-    /// Pending forced-IDR request, consumed by the encode path.
-    pub keyframe_wanted: AtomicBool,
-    /// One `VideoTrack` per subscribed peer-track. Weak refs so
-    /// dropped peers get GC'd from this list naturally — no manual unsub
-    /// bookkeeping per peer needed.
-    pub tracks: RwLock<Vec<Weak<VideoTrack>>>,
+    /// Holds back a falling render size; see `ShrinkDelay`.
+    pub shrink_delay: std::sync::Mutex<ShrinkDelay>,
     /// Per-consumer reported display size in px, keyed by `peer_id` (stable for
     /// the connection's lifetime, present at the report site AND every teardown
     /// site). Auto-resolution takes the per-dimension MAX across live entries;
@@ -748,10 +775,16 @@ pub struct CameraState {
     /// reap), not `effective_degrade` (a camera-global scalar): forcing is a
     /// genuine per-consumer demand, not a camera-wide property.
     pub forced_full_res: Mutex<std::collections::HashSet<u32>>,
+    /// Peers recording this camera, keyed by `peer_id`: while any is present
+    /// the plugin keeps the render size where it is (see `SetSizeHold`).
+    /// Forgotten alongside `forced_full_res`.
+    pub size_holds: Mutex<std::collections::HashSet<u32>>,
     /// Frames the plugin produced into the ring, counted from sequence advances.
     pub capture_rate: RateWindow,
     /// Encoded frames handed to at least one track.
     pub sent_rate: RateWindow,
+    /// Why frames were or were not sent, for the `--telemetry` report.
+    pub send_tally: SendTally,
     pub keyframes_sent: AtomicU64,
     pub keyframe_requests_received: AtomicU64,
 }
@@ -759,10 +792,18 @@ pub struct CameraState {
 impl CameraState {
     /// Add a track to this camera and bump the subscriber count. Returns
     /// the count after the increment so the caller can request a keyframe
-    /// on the 0→1 transition.
+    /// on the 0→1 transition. Adding a track the camera already feeds is a
+    /// no-op: a Subscribe can race the rescan's own resync and bind it twice.
     pub async fn add_track(&self, track: Arc<VideoTrack>) -> usize {
-        let mut tracks = self.tracks.write().await;
-        tracks.push(Arc::downgrade(&track));
+        let (mut full, reduced) = self.lock_tracks().await;
+        let fed = |list: &Vec<Weak<VideoTrack>>| {
+            list.iter()
+                .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, &track)))
+        };
+        if fed(&full) || fed(&reduced) {
+            return self.subscribers.load(Ordering::Acquire);
+        }
+        full.push(Arc::downgrade(&track));
         self.subscribers.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -783,11 +824,18 @@ impl CameraState {
     /// subscriber count after the decrement; removing a track this camera
     /// isn't feeding is a no-op.
     pub async fn remove_track(&self, track: &Arc<VideoTrack>) -> usize {
-        let mut tracks = self.tracks.write().await;
-        let before = tracks.len();
-        tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
-        let removed = before - tracks.len();
-        drop(tracks);
+        let mut removed = 0;
+        {
+            let (mut full, mut reduced) = self.lock_tracks().await;
+            for tracks in [&mut *full, &mut *reduced] {
+                let before = tracks.len();
+                tracks.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
+                removed += before - tracks.len();
+            }
+        }
+        for tier in self.tiers() {
+            tier.forget_pending(track).await;
+        }
         if removed > 0 {
             self.subscribers.fetch_sub(removed, Ordering::AcqRel);
         }
@@ -822,15 +870,123 @@ impl CameraState {
     /// path once a keyframe is emitted.
     pub fn begin_ramp(&self) {
         self.ramping.store(true, Ordering::Release);
-        self.keyframe_wanted.store(true, Ordering::Release);
+        self.request_keyframe();
     }
 
-    /// Whether the encoder should force an IDR on its next encode, consuming
-    /// the request. Promotion sets it: background capture stream's periodic IDR is counted
-    /// in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural keyframe can
-    /// be ~60s away and a promoted camera would sit unrenderable until then.
-    pub fn take_keyframe_request(&self) -> bool {
-        self.keyframe_wanted.swap(false, Ordering::AcqRel)
+    /// Every delivery tier of this camera, Full first.
+    pub fn tiers(&self) -> [&TierEncoder; 2] {
+        [&self.full, &self.reduced]
+    }
+
+    pub fn tier(&self, tier: Tier) -> &TierEncoder {
+        match tier {
+            Tier::Full => &self.full,
+            Tier::Reduced => &self.reduced,
+        }
+    }
+
+    /**
+     * Both tiers' track lists, always locked Full first. Adding, removing and
+     * moving a track hold both, so a viewer leaving in the middle of a tier
+     * switch can never be left fed by a tier after it unsubscribed.
+     */
+    pub async fn lock_tracks(
+        &self,
+    ) -> (
+        tokio::sync::RwLockWriteGuard<'_, Vec<Weak<VideoTrack>>>,
+        tokio::sync::RwLockWriteGuard<'_, Vec<Weak<VideoTrack>>>,
+    ) {
+        let full = self.full.tracks.write().await;
+        let reduced = self.reduced.tracks.write().await;
+        (full, reduced)
+    }
+
+    /**
+     * Move `track` onto `to`'s live list from the other tier's. Returns false
+     * when the other tier no longer feeds it (the viewer left), so nothing
+     * moves.
+     */
+    pub async fn move_track(&self, track: &Arc<VideoTrack>, to: Tier) -> bool {
+        let (mut full, mut reduced) = self.lock_tracks().await;
+        let (from, dest) = match to {
+            Tier::Full => (&mut *reduced, &mut *full),
+            Tier::Reduced => (&mut *full, &mut *reduced),
+        };
+        let before = from.len();
+        from.retain(|w| !w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)));
+        if from.len() == before {
+            return false;
+        }
+        dest.push(Arc::downgrade(track));
+        true
+    }
+
+    /// The tier currently sending to `track`, if this camera feeds it.
+    pub async fn tier_of(&self, track: &Arc<VideoTrack>) -> Option<Tier> {
+        for tier in self.tiers() {
+            if tier.holds(track).await {
+                return Some(tier.tier);
+            }
+        }
+        None
+    }
+
+    /**
+     * Move a viewer's track to `to`. The track keeps receiving from its
+     * current tier until `to` produces a keyframe, then switches on that
+     * keyframe (see `TierEncoder::take_pending`), so the viewer never gets a
+     * frame it cannot decode. Returns false when this camera does not feed
+     * the track. Asking for the tier it is already on cancels a pending move.
+     */
+    pub async fn set_track_tier(&self, track: &Arc<VideoTrack>, to: Tier) -> bool {
+        /* Held across the check and the push, so a racing remove_track either
+        runs first (and this finds nothing to move) or after (and forgets the
+        pending entry). */
+        let (full, reduced) = self.lock_tracks().await;
+        let fed = |list: &Vec<Weak<VideoTrack>>| {
+            list.iter()
+                .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)))
+        };
+        let current = if fed(&full) {
+            Tier::Full
+        } else if fed(&reduced) {
+            Tier::Reduced
+        } else {
+            return false;
+        };
+        for tier in self.tiers() {
+            tier.forget_pending(track).await;
+        }
+        if current != to {
+            let dest = self.tier(to);
+            dest.pending.write().await.push(Arc::downgrade(track));
+            dest.request_keyframe();
+        }
+        drop((full, reduced));
+        true
+    }
+
+    /// Ask every tier of this camera for an IDR, for an event every viewer
+    /// shares (a promotion, a reattached ring). Each tier's `KeyframeGate`
+    /// bounds them.
+    pub fn request_keyframe(&self) {
+        for tier in self.tiers() {
+            tier.request_keyframe();
+        }
+    }
+
+    /// Ask for an IDR from the tier feeding `track` only, for a request one
+    /// viewer made (a PLI, a reconnect): the other tiers' viewers lost nothing.
+    /// A track this camera does not feed asks every tier, which costs at most
+    /// a wasted IDR.
+    pub async fn request_keyframe_for(&self, track: &Arc<VideoTrack>) {
+        for tier in self.tiers() {
+            if tier.holds(track).await {
+                tier.request_keyframe();
+                return;
+            }
+        }
+        self.request_keyframe();
     }
 
     /// The promotion completed: a keyframe went out, so the feed is renderable
@@ -921,7 +1077,10 @@ impl CameraState {
     /// keyed by `peer_id`. A sub-2 report (a `display:none` / not-yet-laid-out
     /// tile reporting offsetWidth 0) is NO DEMAND, not a real 0x0 render
     /// target: drop the peer's entry so the sole-0x0-consumer case resolves to
-    /// `None` (plugin default) rather than a 0x0 that could wedge the ring.
+    /// `None` (plugin default) rather than a 0x0 that could wedge the ring. A
+    /// small but real box (a phone tile, a face cam) is kept as reported;
+    /// `effective_render_size` raises the demand to an encodable size once it
+    /// has the ring's shape, so a thin strip cannot inflate it.
     pub async fn record_display_size(&self, peer_id: u32, width: u32, height: u32) {
         let mut sizes = self.display_sizes.lock().await;
         if width < 2 || height < 2 {
@@ -935,6 +1094,15 @@ impl CameraState {
     /// reap) so the MAX relaxes. Returns whether an entry was actually removed
     /// (so callers skip a redundant reflush). Idempotent — a second call, or
     /// one for a peer that never reported, returns false.
+    /// The display area `peer_id` last reported for this camera, 0 if none.
+    pub async fn display_area_for(&self, peer_id: u32) -> u64 {
+        self.display_sizes
+            .lock()
+            .await
+            .get(&peer_id)
+            .map_or(0, |&(w, h, _)| w as u64 * h as u64)
+    }
+
     pub async fn forget_display_size(&self, peer_id: u32) -> bool {
         self.display_sizes.lock().await.remove(&peer_id).is_some()
     }
@@ -956,11 +1124,69 @@ impl CameraState {
         }
     }
 
-    /// Forget a peer's force (on unsubscribe / disconnect / peer reap) so the
-    /// OR relaxes once no peer still forces it. Returns whether an entry was
-    /// actually removed (so callers skip a redundant reflush).
+    /// Forget a peer's force and size hold (on unsubscribe / disconnect /
+    /// peer reap) so each relaxes once no peer still holds it. Returns
+    /// whether an entry was actually removed (so callers skip a redundant
+    /// reflush).
     pub async fn forget_forced(&self, peer_id: u32) -> bool {
-        self.forced_full_res.lock().await.remove(&peer_id)
+        let forced = self.forced_full_res.lock().await.remove(&peer_id);
+        let held = self.size_holds.lock().await.remove(&peer_id);
+        forced || held
+    }
+
+    /// Whether `peer_id` forces or holds this camera.
+    pub async fn forced_or_held_by(&self, peer_id: u32) -> bool {
+        self.forced_full_res.lock().await.contains(&peer_id)
+            || self.size_holds.lock().await.contains(&peer_id)
+    }
+
+    /// Moves a departed peer's force and size hold onto the peer that resumed
+    /// its client, keeping each only if the client still asks for it. The new
+    /// entry goes in before the old one comes out, so a camera kept on both
+    /// never reads as released. Returns whether either aggregate changed, so
+    /// callers skip a redundant reflush.
+    pub async fn hand_over(&self, from: u32, to: u32, keep_force: bool, keep_hold: bool) -> bool {
+        async fn move_entry(
+            set: &Mutex<std::collections::HashSet<u32>>,
+            from: u32,
+            to: u32,
+            keep: bool,
+        ) -> bool {
+            let mut set = set.lock().await;
+            let was_empty = set.is_empty();
+            if set.contains(&from) && keep {
+                set.insert(to);
+            }
+            set.remove(&from);
+            was_empty != set.is_empty()
+        }
+        let force = move_entry(&self.forced_full_res, from, to, keep_force).await;
+        let hold = move_entry(&self.size_holds, from, to, keep_hold).await;
+        force || hold
+    }
+
+    /// Hold (or release) this camera's render size for one peer.
+    pub async fn set_size_hold(&self, peer_id: u32, hold: bool) {
+        let mut holds = self.size_holds.lock().await;
+        if hold {
+            holds.insert(peer_id);
+        } else {
+            holds.remove(&peer_id);
+        }
+    }
+
+    /// The control state as the plugin should see it. A held camera carries
+    /// the hold. A forced camera drops the viewer quality clamp: a
+    /// full-resolution recording asked for the full size, which a preset
+    /// another viewer picked for their own screen must not undercut. The
+    /// stored clamp is kept and comes back once the force is released.
+    pub async fn control_for_plugin(&self, state: &ControlState) -> ControlState {
+        let mut out = state.clone();
+        out.size_held = !self.size_holds.lock().await.is_empty();
+        if !self.forced_full_res.lock().await.is_empty() {
+            out.viewer_level = None;
+        }
+        out
     }
 
     /// Whether anyone is actually displaying this camera at size right now.
@@ -994,6 +1220,7 @@ impl CameraState {
     pub fn note_ring_advance_at(&self, now: Instant, prev: u64, seq: u64) {
         if prev != 0 && seq > prev {
             self.capture_rate.record_at(now, seq - prev);
+            self.send_tally.note_advance(seq - prev);
         }
     }
 
@@ -1001,12 +1228,31 @@ impl CameraState {
         self.note_ring_advance_at(Instant::now(), prev, seq);
     }
 
-    pub fn note_frame_sent(&self) {
-        self.sent_rate.record(1);
+    /**
+     * Start from the next frame the plugin captures. A camera nobody watched
+     * was not read, so the frames it skipped are not owed to anyone, and the
+     * plugin stops capturing an unwatched camera: whatever the ring still
+     * holds was captured before the viewers left. Sending one of those first
+     * would show a returning viewer the picture from before the gap, and its
+     * old capture time would put the next frame the whole gap later on the
+     * track's media clock, so the viewer's player would hold the fresh
+     * frames back for it.
+     */
+    pub fn rebase_after_idle(&self) {
+        self.last_sequence
+            .store(self.ring.latest_sequence(), Ordering::Release);
     }
 
-    pub fn note_keyframe_sent(&self) {
+    pub fn note_frame_sent(&self) {
+        self.sent_rate.record(1);
+        self.send_tally.note_sent();
+    }
+
+    /// A keyframe went out at `now`, forced or periodic. It answers every
+    /// request made before it and starts the gap.
+    pub fn note_keyframe_sent(&self, tier: &TierEncoder, now: Instant) {
         self.keyframes_sent.fetch_add(1, Ordering::Relaxed);
+        tier.keyframe_gate.lock().unwrap().note_sent(now);
     }
 
     pub fn note_keyframe_requests(&self, n: u64) {
@@ -1063,7 +1309,8 @@ impl CameraState {
     }
 
     /// Effective render size = min(demand, manual cap) at the ring's aspect,
-    /// clamped to the ring's max dims and made even (H.264 chroma). Demand is normally the auto MAX-
+    /// raised to `MIN_ENCODE_DIMENSION` on both sides, clamped to the ring's
+    /// max dims and aligned as `aligned_cover` describes. Demand is normally the auto MAX-
     /// across-consumers display size; while ANY peer forces this camera (see
     /// `forced_full_res`), demand is instead the ring ceiling, so a forced feed
     /// sizes up regardless of what's actually being displayed. `None` when
@@ -1093,12 +1340,233 @@ impl CameraState {
             (None, None) => None,
         };
         combined.map(|(w, h)| {
+            let (w, h) = raise_to_encodable(w, h);
             let (w, h) = fit_within(w, h, mw, mh);
-            (
-                even_clamp(w.round() as u32, mw),
-                even_clamp(h.round() as u32, mh),
-            )
+            /* A cap limits the rounding too, unless the encoder's minimum has
+            already lifted the size past it. */
+            let limit = match cap {
+                Some((cw, ch)) if w <= cw as f64 + 0.5 && h <= ch as f64 + 0.5 => {
+                    (mw.min(cw), mh.min(ch))
+                }
+                _ => (mw, mh),
+            };
+            aligned_cover((w, h), limit, mw as f64 / mh as f64)
         })
+    }
+}
+
+/**
+ * One delivery tier's encoder for a camera and the viewer tracks it feeds.
+ * Each tier keeps its own session, keyframe gap and hardware health, so one
+ * tier's keyframes and failures never reach another tier's viewers.
+ */
+pub struct TierEncoder {
+    pub tier: Tier,
+    /// Lazy: created on the first frame this tier encodes, so the encoder
+    /// sees the actual frame dimensions. Closed and reinitialised when they
+    /// change (the plugin's adaptive downscale path triggers this).
+    pub encoder: Mutex<Option<Box<dyn EncoderBackend>>>,
+    /// Dimensions and bitrate the current session was initialised with; all 0
+    /// when no session is running.
+    pub encoder_width: AtomicU32,
+    pub encoder_height: AtomicU32,
+    pub encoder_bitrate: AtomicU32,
+    /// Consecutive encode() failures. Reset on success; at the consume
+    /// loop's threshold the session is dropped so the next frame
+    /// reinitialises it, instead of a wedged session stalling its viewers.
+    pub encode_failure_streak: AtomicU32,
+    /// Hardware sessions that stay silent or keep failing strike toward
+    /// pinning this tier to the software fallback. Only touched under the
+    /// encoder lock, never across an await.
+    pub session_health: std::sync::Mutex<SessionHealth>,
+    /// Pending forced-IDR request and when this tier last produced one.
+    pub keyframe_gate: std::sync::Mutex<KeyframeGate>,
+    /// One `VideoTrack` per viewer slot this tier feeds. Weak refs so a
+    /// dropped peer's tracks go stale and are pruned on the next fan-out.
+    pub tracks: RwLock<Vec<Weak<VideoTrack>>>,
+    /// Tracks moving to this tier from another, still fed by the other until
+    /// this tier's next keyframe.
+    pub pending: RwLock<Vec<Weak<VideoTrack>>>,
+    /// Frames offered to this tier, for tiers that encode only some of them.
+    pub offered: AtomicU64,
+    /// Since when this tier has had nobody to send to.
+    pub idle_since: std::sync::Mutex<Option<Instant>>,
+    /// Reused buffer for this tier's downscaled copy of each frame.
+    pub scratch: Mutex<Vec<u8>>,
+}
+
+impl TierEncoder {
+    pub fn new(tier: Tier) -> Self {
+        Self {
+            tier,
+            encoder: Mutex::new(None),
+            encoder_width: AtomicU32::new(0),
+            encoder_height: AtomicU32::new(0),
+            encoder_bitrate: AtomicU32::new(0),
+            encode_failure_streak: AtomicU32::new(0),
+            session_health: std::sync::Mutex::new(SessionHealth::new()),
+            keyframe_gate: std::sync::Mutex::new(KeyframeGate::default()),
+            tracks: RwLock::new(Vec::new()),
+            pending: RwLock::new(Vec::new()),
+            offered: AtomicU64::new(0),
+            idle_since: std::sync::Mutex::new(None),
+            scratch: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Drop the tracks and pending moves whose viewer has gone, returning how
+    /// many live tracks that was so the caller can release them.
+    pub async fn prune_dead(&self) -> usize {
+        self.pending.write().await.retain(|w| w.strong_count() > 0);
+        let mut tracks = self.tracks.write().await;
+        let before = tracks.len();
+        tracks.retain(|w| w.strong_count() > 0);
+        before - tracks.len()
+    }
+
+    /// Whether this tier has anyone to encode for: a track it feeds, or one
+    /// waiting to move onto it.
+    pub async fn wanted(&self) -> bool {
+        let live = |list: &Vec<Weak<VideoTrack>>| list.iter().any(|w| w.strong_count() > 0);
+        live(&*self.tracks.read().await) || live(&*self.pending.read().await)
+    }
+
+    async fn forget_pending(&self, track: &Arc<VideoTrack>) {
+        self.pending
+            .write()
+            .await
+            .retain(|w| w.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, track)));
+    }
+
+    /**
+     * Take every track waiting to move onto this tier. Called by the encode
+     * path when this tier has a keyframe in hand, so the moved tracks' first
+     * frame from it is that keyframe.
+     */
+    pub async fn take_pending(&self) -> Vec<Arc<VideoTrack>> {
+        std::mem::take(&mut *self.pending.write().await)
+            .into_iter()
+            .filter_map(|w| w.upgrade())
+            .collect()
+    }
+
+    pub fn request_keyframe(&self) {
+        self.keyframe_gate.lock().unwrap().request();
+    }
+
+    /// Whether this tier's next encode should force an IDR, consuming the
+    /// request. Promotion needs it: background capture's periodic IDR is
+    /// counted in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural
+    /// keyframe can be ~60s away and a promoted camera would sit unrenderable
+    /// until then. A request inside the gap stays pending for a later encode.
+    pub fn take_keyframe_request(&self, now: Instant) -> bool {
+        self.keyframe_gate.lock().unwrap().take(now)
+    }
+
+    pub async fn holds(&self, track: &Arc<VideoTrack>) -> bool {
+        self.tracks
+            .read()
+            .await
+            .iter()
+            .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, track)))
+    }
+}
+
+/// Least time between two keyframes one camera produces. An IDR from the
+/// per-camera encoder reaches every viewer of that camera as a burst of
+/// packets, so without a gap a few lossy viewers asking at once would make a
+/// storm of them that causes more loss.
+pub const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(1000);
+
+/**
+ * Debounces one camera's keyframe requests without ever dropping one: a
+ * request inside `MIN_KEYFRAME_GAP` of the last keyframe stays pending and is
+ * served by the first encode after the gap ends, or answered sooner by any
+ * keyframe the encoder produces on its own.
+ */
+#[derive(Debug, Default)]
+pub struct KeyframeGate {
+    wanted: bool,
+    last: Option<Instant>,
+}
+
+impl KeyframeGate {
+    pub fn request(&mut self) {
+        self.wanted = true;
+    }
+
+    pub fn pending(&self) -> bool {
+        self.wanted
+    }
+
+    /// Whether to force an IDR now. A forced one starts the gap at once,
+    /// since a pipelined hardware encoder may emit it a frame later.
+    pub fn take(&mut self, now: Instant) -> bool {
+        let gap_open = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= MIN_KEYFRAME_GAP);
+        if !self.wanted || !gap_open {
+            return false;
+        }
+        self.wanted = false;
+        self.last = Some(now);
+        true
+    }
+
+    pub fn note_sent(&mut self, now: Instant) {
+        self.wanted = false;
+        self.last = Some(now);
+    }
+}
+
+/// How long a lower render size must stay wanted before the camera shrinks to
+/// it. Every size change restarts the camera's one encoder for all its viewers,
+/// so a viewer flicking a tile to another feed and back must not cost the
+/// others two restarts. A rise still applies at once.
+pub const SHRINK_HOLD: Duration = Duration::from_secs(10);
+
+/**
+ * Delays a camera's render size shrinking until the lower demand has held for
+ * `SHRINK_HOLD`. Tracks the size last written for the plugin; a size that is
+ * no bigger on either side (or no demand at all) starts the clock, and a
+ * return to the written size or above stops it, so a brief dip never reaches
+ * the encoder.
+ */
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ShrinkDelay {
+    applied: Option<(u32, u32)>,
+    lower_since: Option<Instant>,
+}
+
+impl ShrinkDelay {
+    /// The size to write for `target` at `now`. `immediate` applies a shrink
+    /// at once, for an explicit choice such as the operator's manual cap.
+    pub fn settle(
+        &mut self,
+        target: Option<(u32, u32)>,
+        now: Instant,
+        immediate: bool,
+    ) -> Option<(u32, u32)> {
+        let lowers = match (self.applied, target) {
+            (Some((aw, ah)), Some((tw, th))) => tw <= aw && th <= ah && (tw, th) != (aw, ah),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if lowers && !immediate {
+            let since = *self.lower_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < SHRINK_HOLD {
+                return self.applied;
+            }
+        }
+        self.applied = target;
+        self.lower_since = None;
+        target
+    }
+
+    /// Whether a held shrink is due at `now`.
+    pub fn due(&self, now: Instant) -> bool {
+        self.lower_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= SHRINK_HOLD)
     }
 }
 
@@ -1116,6 +1584,17 @@ fn cover_at_aspect((w, h): (u32, u32), max_w: u32, max_h: u32) -> (f64, f64) {
     (width, width / aspect)
 }
 
+/// Scale `(w, h)` up uniformly, keeping its aspect, until neither side is under
+/// `MIN_ENCODE_DIMENSION`. Only a ring smaller than that can bring it back under.
+fn raise_to_encodable(w: f64, h: f64) -> (f64, f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return (w, h);
+    }
+    let min = MIN_ENCODE_DIMENSION as f64;
+    let scale = (min / w).max(min / h).max(1.0);
+    (w * scale, h * scale)
+}
+
 /// Scale `(w, h)` down uniformly, keeping its aspect, until it fits `limit_w` x `limit_h`.
 fn fit_within(w: f64, h: f64, limit_w: u32, limit_h: u32) -> (f64, f64) {
     if w <= 0.0 || h <= 0.0 {
@@ -1123,13 +1602,6 @@ fn fit_within(w: f64, h: f64, limit_w: u32, limit_h: u32) -> (f64, f64) {
     }
     let scale = (limit_w as f64 / w).min(limit_h as f64 / h).min(1.0);
     (w * scale, h * scale)
-}
-
-/// Clamp a requested dimension to the ring's allocated max and force it even
-/// (H.264 chroma needs even dims; anything over the ring max would be rejected
-/// by the plugin's `MmapFrameRing.Produce`).
-fn even_clamp(v: u32, max: u32) -> u32 {
-    (v.min(max)) & !1
 }
 
 /// Registry of cameras. Owns the rescan logic that discovers new rings
@@ -1176,6 +1648,10 @@ pub struct CameraRegistry {
     /// consume loop never encodes; we measure the plugin's KSP-frametime
     /// cost cleanly, not the sidecar encode path.
     force_render: AtomicBool,
+    /// Move a slow viewer's feeds onto the lighter stream automatically
+    /// (`--lighter-streams-for-slow-viewers`). Off: the tier detector only
+    /// logs what it would do.
+    lighter_streams: AtomicBool,
     /*
      * Monotonic sequence counter for global.control.json writes. Seeded on
      * the first write from the on-disk file (max(on-disk seq, 0) + 1) so a
@@ -1186,6 +1662,23 @@ pub struct CameraRegistry {
     /// The sidecar's copy of `global.commands.json`. Held across the whole
     /// append and file write, so two requests can never land out of order.
     command_queue: Mutex<CommandQueue>,
+    /// Bumped after every write of `global.commands.json`; the plugin
+    /// watches it to read the file on the next frame. Opened on first write.
+    command_signal: std::sync::Mutex<Option<ChangeSignal>>,
+    /// Set once an open failure has been logged, so a rings dir that stays
+    /// unwritable warns once rather than on every request.
+    command_signal_warned: AtomicBool,
+    /// Every browser client's anchors, written into `global.commands.json`
+    /// whole on each change. Peer-scoped like the display sizes: cleared on
+    /// graceful disconnect and in the dead-peer reaper.
+    anchors: Mutex<AnchorTable>,
+    /// How many times each flight id has been attached this session. Outlives
+    /// the camera's entry, so a camera that leaves and comes back still gets
+    /// an attach number it never had before.
+    attach_counts: std::sync::Mutex<HashMap<u32, u32>>,
+    /// Drawn once per process and folded into each client's anchor owner, so
+    /// a restarted sidecar's peer 1 is never taken for the last one's.
+    anchor_boot: u32,
     /// Cameras whose sidecar-side state (e.g. viewer quality preset)
     /// changed and needs a `camera-state-changed` broadcast to EVERY
     /// connected peer. The plugin-status diff in `poll_status` can't see
@@ -1194,9 +1687,23 @@ pub struct CameraRegistry {
     /// while shed already holds the camera lower), so the consume loop
     /// drains this set each tick and broadcasts directly.
     dirty_cameras: Mutex<std::collections::HashSet<u32>>,
+    /// The client each live peer named in `Resume`, keyed by `peer_id`.
+    peer_clients: Mutex<HashMap<u32, String>>,
+    /// Clients whose connection went while they forced or held a camera:
+    /// their old `peer_id`, whose entries stay in place, and when those are
+    /// released unless the client resumes first.
+    departed_clients: Mutex<HashMap<String, (u32, Instant)>>,
 }
 
 const STATUS_LOG_CAP: usize = 12_288;
+
+/// How long a departed client's force and size holds outlive its connection,
+/// waiting for it to `Resume`, so a recorded camera never resizes while the
+/// client reconnects. Counted from the reap, which is never before the client
+/// last heard from this connection, where the client's 25 s recorder grace
+/// starts: any reconnect the client still records through finds its holds
+/// kept.
+pub const RESUME_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1247,6 +1754,12 @@ pub struct PerCameraStatusExport {
     pub pan_yaw: f32,
     #[serde(default)]
     pub pan_pitch: f32,
+}
+
+/* The plugin's live FoV when it reported a usable one, else the manifest default. */
+fn effective_fov(live: Option<f32>, default: f32) -> f32 {
+    live.filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(default)
 }
 
 impl From<&GlobalStatusFile> for GlobalStatusFileExport {
@@ -1316,10 +1829,23 @@ impl CameraRegistry {
             status_log: Mutex::new(std::collections::VecDeque::new()),
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
+            lighter_streams: AtomicBool::new(false),
             global_control_seq: AtomicU64::new(0),
             command_queue: Mutex::new(CommandQueue::default()),
+            command_signal: std::sync::Mutex::new(None),
+            command_signal_warned: AtomicBool::new(false),
+            anchors: Mutex::new(AnchorTable::default()),
+            attach_counts: std::sync::Mutex::new(HashMap::new()),
+            anchor_boot: boot_nonce(),
             dirty_cameras: Mutex::new(std::collections::HashSet::new()),
+            peer_clients: Mutex::new(HashMap::new()),
+            departed_clients: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The owner tag the plugin reports a client's anchor results under.
+    pub fn anchor_owner(&self, peer_id: u32) -> String {
+        peer_owner(self.anchor_boot, peer_id)
     }
 
     /// The shm directory the plugin writes rings + `global.status.json` into.
@@ -1380,23 +1906,39 @@ impl CameraRegistry {
         self.force_render.load(Ordering::Acquire)
     }
 
-    /// Per-tick subscription bookkeeping. Normally: a camera that has lost its
-    /// last peer-track is flushed `subscribed=false` so the plugin sleeps it.
-    /// Under the force-render profiling override, every live camera is instead
-    /// kept `subscribed=true` so it renders without a peer. `set_subscribed` is
+    pub fn set_lighter_streams(&self, on: bool) {
+        self.lighter_streams.store(on, Ordering::Release);
+    }
+
+    pub fn lighter_streams(&self) -> bool {
+        self.lighter_streams.load(Ordering::Acquire)
+    }
+
+    /// Per-tick subscription bookkeeping: the flag follows the viewer count, so
+    /// a camera that has lost its last peer-track is flushed `subscribed=false`
+    /// and the plugin sleeps it, and one with a viewer is flushed
+    /// `subscribed=true`. The wake repairs a release that read zero viewers just
+    /// as another viewer bound and then slept the camera under it; that viewer
+    /// has no reason to subscribe again, so the feed would stay silent. Under
+    /// the force-render profiling override, every live camera is instead kept
+    /// `subscribed=true` so it renders without a peer. `set_subscribed` is
     /// idempotent (no flush without a transition), so calling this each consume
-    /// tick is cheap. Replaces the old free-standing `maybe_sleep_idle_cameras`
-    /// so the force-render branch is unit-testable.
+    /// tick is cheap.
     pub async fn refresh_idle_subscriptions(&self, cameras: &[Arc<CameraState>]) {
         let force = self.force_render();
         for cam in cameras {
             if cam.destroyed.load(Ordering::Acquire) {
                 continue;
             }
-            if force {
-                self.set_subscribed(cam.flight_id, true).await;
-            } else if cam.subscribers.load(Ordering::Acquire) == 0 {
-                self.set_subscribed(cam.flight_id, false).await;
+            let viewers = cam.subscribers.load(Ordering::Acquire);
+            let woken = self
+                .set_subscribed(cam.flight_id, force || viewers > 0)
+                .await;
+            if woken && viewers > 0 {
+                info!(
+                    flight_id = cam.flight_id,
+                    viewers, "camera with viewers was asleep, woke it"
+                );
             }
         }
     }
@@ -1555,6 +2097,21 @@ impl CameraRegistry {
                 Some(_) => continue,
                 None => false,
             };
+            /* An in-place reattach is the same camera to its viewers, who are
+            still connected and will not ask again, so what they asked of it
+            carries over. Their departure clears it from the new entry as it
+            would have from the old. A destroyed camera coming back is new. */
+            let (display_sizes, forced_full_res, size_holds, manual_render_cap, shrink_delay) =
+                match cameras.get(id) {
+                    Some(old) if !old.destroyed.load(Ordering::Acquire) => (
+                        old.display_sizes.lock().await.clone(),
+                        old.forced_full_res.lock().await.clone(),
+                        old.size_holds.lock().await.clone(),
+                        *old.manual_render_cap.lock().await,
+                        *old.shrink_delay.lock().unwrap_or_else(|e| e.into_inner()),
+                    ),
+                    _ => Default::default(),
+                };
             match MmapFrameRing::open_self_describing(path) {
                 Ok(ring) => {
                     // Each ring self-describes its geometry; a kerbal face ring
@@ -1563,6 +2120,13 @@ impl CameraRegistry {
                     let ring_dims = ring.config();
                     let manifest = read_manifest(&self.shm_dir, *id).await;
                     attached.push(*id);
+                    let attach = {
+                        let mut counts =
+                            self.attach_counts.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = counts.entry(*id).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
                     info!(
                         flight_id = id,
                         path = %path.display(),
@@ -1570,6 +2134,7 @@ impl CameraRegistry {
                         part_title = %manifest.part_title,
                         vessel = %manifest.vessel_name,
                         resurrected = resurrecting,
+                        attach,
                         "camera ring attached",
                     );
                     cameras.insert(
@@ -1578,6 +2143,7 @@ impl CameraRegistry {
                             flight_id: *id,
                             ring,
                             ring_identity: found_identity,
+                            attach,
                             max_width: ring_dims.max_width,
                             max_height: ring_dims.max_height,
                             kind: camera_kind_from_manifest(&manifest.kind),
@@ -1601,32 +2167,30 @@ impl CameraRegistry {
                             pan_pitch_max: manifest.pan_pitch_max,
                             destroyed: AtomicBool::new(false),
                             destruction_broadcast_sent: AtomicBool::new(false),
-                            encoder: Mutex::new(None),
-                            encoder_width: AtomicU32::new(0),
-                            encoder_height: AtomicU32::new(0),
-                            encoder_bitrate: AtomicU32::new(0),
-                            encode_failure_streak: AtomicU32::new(0),
-                            session_health: std::sync::Mutex::new(SessionHealth::new()),
+                            full: TierEncoder::new(Tier::Full),
+                            reduced: TierEncoder::new(Tier::Reduced),
                             target_bitrate_bps: AtomicU32::new(0),
                             bandwidth_estimates: Mutex::new(std::collections::HashMap::new()),
                             effective_degrade: AtomicU32::new(0),
                             track_mode_bits: AtomicU32::new(0),
                             last_track_report_seq: AtomicU32::new(0),
-                            last_encoded_at: Mutex::new(None),
+                            last_sent: Mutex::new(None),
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
                             ramping: AtomicBool::new(false),
-                            keyframe_wanted: AtomicBool::new(false),
-                            tracks: RwLock::new(Vec::new()),
-                            display_sizes: Mutex::new(std::collections::HashMap::new()),
-                            manual_render_cap: Mutex::new(None),
-                            forced_full_res: Mutex::new(std::collections::HashSet::new()),
+                            shrink_delay: std::sync::Mutex::new(shrink_delay),
+                            display_sizes: Mutex::new(display_sizes),
+                            manual_render_cap: Mutex::new(manual_render_cap),
+                            forced_full_res: Mutex::new(forced_full_res),
+                            size_holds: Mutex::new(size_holds),
                             capture_rate: RateWindow::new(),
                             sent_rate: RateWindow::new(),
+                            send_tally: SendTally::default(),
                             keyframes_sent: AtomicU64::new(0),
                             keyframe_requests_received: AtomicU64::new(0),
                             control: Mutex::new(ControlState::default()),
                             control_block: std::sync::Mutex::new(None),
+                            feed_watch: std::sync::Mutex::new(FeedWatch::default()),
                         }),
                     );
                 }
@@ -1708,16 +2272,19 @@ impl CameraRegistry {
     pub async fn list(&self) -> Vec<CameraInfo> {
         let cams = self.snapshot().await;
         let primary_fps = self.primary_capture_fps().await;
-        let centres: HashMap<u32, CommandCentreStatus> = self
+        let (centres, live_fovs): (HashMap<u32, CommandTargetsStatus>, HashMap<u32, f32>) = self
             .last_status
             .lock()
             .await
             .as_ref()
             .map(|st| {
-                st.cameras
+                let centres = st
+                    .cameras
                     .iter()
-                    .filter_map(|c| c.command_centre.clone().map(|cc| (c.flight_id, cc)))
-                    .collect()
+                    .filter_map(|c| c.command_targets.clone().map(|cc| (c.flight_id, cc)))
+                    .collect();
+                let fovs = st.cameras.iter().map(|c| (c.flight_id, c.fov)).collect();
+                (centres, fovs)
             })
             .unwrap_or_default();
         let mut out = Vec::with_capacity(cams.len());
@@ -1743,7 +2310,7 @@ impl CameraRegistry {
                 camera_name: s.camera_name.clone(),
                 vessel_name: s.vessel_name.clone(),
                 supports_zoom: s.supports_zoom,
-                fov: s.fov_default,
+                fov: effective_fov(live_fovs.get(&s.flight_id).copied(), s.fov_default),
                 fov_min: s.fov_min,
                 fov_max: s.fov_max,
                 supports_pan: s.supports_pan,
@@ -1751,7 +2318,7 @@ impl CameraRegistry {
                 pan_yaw_max: s.pan_yaw_max,
                 pan_pitch_min: s.pan_pitch_min,
                 pan_pitch_max: s.pan_pitch_max,
-                encoder_bitrate_bps: s.encoder_bitrate.load(Ordering::Acquire),
+                encoder_bitrate_bps: s.full.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: s.target_bitrate_bps.load(Ordering::Acquire),
                 degrade_level: s.current_degrade(),
                 target_capture_fps: stats.target_capture_fps,
@@ -1799,7 +2366,7 @@ impl CameraRegistry {
                 return StatusDelta::default();
             }
         };
-        let parsed: GlobalStatusFile = match serde_json::from_slice(&bytes) {
+        let mut parsed: GlobalStatusFile = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "status parse failed");
@@ -1862,6 +2429,24 @@ impl CameraRegistry {
         // kOS set need not move render state).
         let mut adopts: Vec<(u32, TrackMode)> = Vec::new();
 
+        /* A targets list keeps the UT it first had while its content holds,
+        so the stored snapshot and every delta name the same UT. */
+        if let Some(prev) = last.as_ref() {
+            for cam in parsed.cameras.iter_mut() {
+                let Some(p) = prev.cameras.iter().find(|c| c.flight_id == cam.flight_id) else {
+                    continue;
+                };
+                if command_targets_changed(&p.command_targets, &cam.command_targets) {
+                    continue;
+                }
+                if let (Some(now), Some(before)) =
+                    (cam.command_targets.as_mut(), p.command_targets.as_ref())
+                {
+                    now.ut = before.ut;
+                }
+            }
+        }
+
         // Per-camera diffs. Only flag cameras whose effective state moved.
         for cam_status in &parsed.cameras {
             if let Some(cam) = cameras.get(&cam_status.flight_id) {
@@ -1897,7 +2482,7 @@ impl CameraRegistry {
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
                         || command_track_changed(&p.command_track, &cam_status.command_track)
-                        || p.command_centre != cam_status.command_centre
+                        || command_targets_changed(&p.command_targets, &cam_status.command_targets)
                 }
             };
             if !changed {
@@ -1907,7 +2492,10 @@ impl CameraRegistry {
                 continue;
             };
             let (viewer_quality, background_capturing, stats) = {
-                let ctrl = cam.control.lock().await.clone();
+                /* What the plugin was told, so a forced camera reports no preset. */
+                let ctrl = cam
+                    .control_for_plugin(&cam.control.lock().await.clone())
+                    .await;
                 let primary_fps = parsed
                     .max_capture_fps
                     .filter(|f| *f > 0.0)
@@ -1923,6 +2511,7 @@ impl CameraRegistry {
             };
             delta.changed_cameras.push(ProtocolCameraState {
                 flight_id: cam_status.flight_id,
+                attach: cam.attach,
                 lifecycle: if cam.destroyed.load(Ordering::Acquire) {
                     CameraLifecycle::Destroyed
                 } else {
@@ -1932,7 +2521,7 @@ impl CameraRegistry {
                 kerbal_persistent_id: cam.kerbal_persistent_id,
                 command_centre: command_centre_with(
                     &cam.command_centre,
-                    cam_status.command_centre.as_ref(),
+                    cam_status.command_targets.as_ref(),
                 ),
                 command_track: cam_status.command_track.clone(),
                 capture_state: cam.capture_state_with(background_capturing),
@@ -1961,7 +2550,7 @@ impl CameraRegistry {
                 pan_yaw_max: cam.pan_yaw_max,
                 pan_pitch_min: cam.pan_pitch_min,
                 pan_pitch_max: cam.pan_pitch_max,
-                encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
+                encoder_bitrate_bps: cam.full.encoder_bitrate.load(Ordering::Acquire),
                 target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
                 degrade_level: cam.current_degrade(),
                 viewer_quality,
@@ -2017,16 +2606,26 @@ impl CameraRegistry {
     /// rapid rate=0 stop right after a drag can't be missed. The block is
     /// created on first flush and persists for the camera's life so the
     /// seqlock counter keeps advancing. No-op if the camera is gone.
-    pub async fn flush_control(&self, flight_id: u32, state: &ControlState) -> std::io::Result<()> {
+    ///
+    /// Always the state as it stands, read and written under the state's lock.
+    /// Writers race (a viewer's message, the reaper, the consume loop), and one
+    /// that wrote a state it read earlier could overwrite a newer one, leaving
+    /// the plugin asleep while this side believes the camera awake.
+    pub async fn flush_control(&self, flight_id: u32) -> std::io::Result<()> {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(());
         };
+        let current = cam.control.lock().await;
+        let state = cam.control_for_plugin(&current).await;
         let mut guard = cam.control_block.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let path = self.shm_dir.join(format!("{flight_id}.control.bin"));
             *guard = Some(ControlBlock::create(&path)?);
         }
-        guard.as_mut().expect("just created if absent").write(state);
+        guard
+            .as_mut()
+            .expect("just created if absent")
+            .write(&state);
         Ok(())
     }
 
@@ -2073,20 +2672,118 @@ impl CameraRegistry {
     /// Append a request to `global.commands.json` under the next id and
     /// return the id. The plugin applies each id once.
     async fn append_command(&self, op: CommandOp) -> std::io::Result<u64> {
-        let path = self.shm_dir.join(COMMANDS_FILE);
         let mut queue = self.command_queue.lock().await;
+        self.seed_commands(&mut queue).await;
+        let id = queue.push(op);
+        self.write_commands(&queue).await?;
+        Ok(id)
+    }
+
+    async fn seed_commands(&self, queue: &mut CommandQueue) {
         if !queue.is_seeded() {
-            let on_disk = tokio::fs::read(&path).await.ok();
+            let on_disk = tokio::fs::read(self.shm_dir.join(COMMANDS_FILE)).await.ok();
             queue.seed(on_disk.as_deref());
         }
-        let id = queue.push(op);
+    }
+
+    async fn write_commands(&self, queue: &CommandQueue) -> std::io::Result<()> {
+        let path = self.shm_dir.join(COMMANDS_FILE);
         let json = queue
             .to_json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        /* Opened before the file is first written, so the plugin, which
+         * looks for the signal when it sees the file change, finds it
+         * complete. */
+        self.open_command_signal();
         let tmp = path.with_extension("json.tmp");
         tokio::fs::write(&tmp, json.as_bytes()).await?;
         tokio::fs::rename(&tmp, &path).await?;
-        Ok(id)
+        if let Some(s) = self
+            .command_signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            s.bump();
+        }
+        Ok(())
+    }
+
+    fn open_command_signal(&self) {
+        let mut signal = self
+            .command_signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if signal.is_some() {
+            return;
+        }
+        match ChangeSignal::open(&self.shm_dir.join(COMMANDS_SIGNAL_FILE)) {
+            Ok(s) => {
+                *signal = Some(s);
+                self.command_signal_warned.store(false, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if !self.command_signal_warned.swap(true, Ordering::Relaxed) {
+                    warn!(error = %e, "command signal open failed; the plugin falls back to its timed read");
+                }
+            }
+        }
+    }
+
+    /*
+     * Write the anchor table into the commands file. The table lock is held
+     * across the write so two changes can never land out of order.
+     */
+    async fn publish_anchors(&self, table: &AnchorTable) -> std::io::Result<()> {
+        let mut queue = self.command_queue.lock().await;
+        self.seed_commands(&mut queue).await;
+        queue.set_anchors(table.to_sets(self.anchor_boot));
+        self.write_commands(&queue).await
+    }
+
+    /// Start this process with no anchors in the commands file: whatever is
+    /// there belongs to the clients of a sidecar that has gone.
+    pub async fn reset_anchors(&self) {
+        let table = self.anchors.lock().await;
+        if let Err(e) = self.publish_anchors(&table).await {
+            warn!(error = %e, "anchor reset write failed");
+        }
+    }
+
+    /// Replace (or clear, with `anchors` absent) a client's anchors on one
+    /// camera. Errors on an unknown camera, a malformed set or a failed write.
+    pub async fn set_anchors(
+        &self,
+        peer_id: u32,
+        payload: crate::protocol::SetAnchorsPayload,
+    ) -> Result<(), String> {
+        let flight_id = payload.flight_id;
+        if let Some(anchors) = &payload.anchors {
+            if self.get(flight_id).await.is_none() {
+                return Err(format!("no camera with flight_id={flight_id}"));
+            }
+            validate_anchor_set(anchors)?;
+        }
+        let mut table = self.anchors.lock().await;
+        if !table.set(peer_id, flight_id, payload.anchors) {
+            return Ok(());
+        }
+        self.publish_anchors(&table)
+            .await
+            .map_err(|e| format!("anchor write failed: {e}"))
+    }
+
+    /// Forget a client's anchors on every camera. Peer-scoped for the same
+    /// reason as `forget_display_size_all`: a client can set anchors on a
+    /// camera it never bound a slot to. Called on graceful Disconnect and in
+    /// the dead-peer reaper.
+    pub async fn forget_anchors_all(&self, peer_id: u32) {
+        let mut table = self.anchors.lock().await;
+        if table.forget_peer(peer_id) {
+            if let Err(e) = self.publish_anchors(&table).await {
+                warn!(peer_id, error = %e, "anchor forget write failed");
+            }
+        }
     }
 
     /// Queue a command camera for the plugin to create. Errors on a malformed
@@ -2169,14 +2866,14 @@ impl CameraRegistry {
      */
     async fn command_target_unknown(&self, flight_id: u32, pid: u32) -> bool {
         let status = self.last_status.lock().await;
-        let Some(centre) = status
+        let Some(listed) = status
             .as_ref()
             .and_then(|s| s.cameras.iter().find(|c| c.flight_id == flight_id))
-            .and_then(|c| c.command_centre.as_ref())
+            .and_then(|c| c.command_targets.as_ref())
         else {
             return false;
         };
-        !centre.targets.is_empty() && !centre.targets.iter().any(|t| t.persistent_id == pid)
+        !listed.targets.is_empty() && !listed.targets.iter().any(|t| t.persistent_id == pid)
     }
 
     /// The command authority the plugin last reported for this camera, if any.
@@ -2200,20 +2897,100 @@ impl CameraRegistry {
     /// dead-track pruner (false on last-release). The plugin polls
     /// control.json by mtime, so the next tick after this flush is
     /// when the camera wakes / sleeps.
-    pub async fn set_subscribed(&self, flight_id: u32, subscribed: bool) {
+    /// Returns whether the flag changed.
+    pub async fn set_subscribed(&self, flight_id: u32, subscribed: bool) -> bool {
         let Some(cam) = self.get(flight_id).await else {
-            return;
+            return false;
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             if ctrl.subscribed == subscribed {
-                return; // no transition, no flush
+                return false; // no transition, no flush
             }
             ctrl.subscribed = subscribed;
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        }
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "set_subscribed flush failed");
+        }
+        true
+    }
+
+    /**
+     * Looks for cameras with viewers whose ring has stopped moving, and does what
+     * can be done without disturbing their viewers: publishes the control block
+     * again, so a plugin that missed a write or lost the file reads it afresh,
+     * and asks for a keyframe. The log line is the point when this does not
+     * help, since it separates a camera the plugin stopped capturing from a
+     * viewer that stopped showing a feed still arriving.
+     */
+    pub async fn recover_silent_feeds(&self, now: Instant) {
+        let primary_fps = self.primary_capture_fps().await;
+        let cameras = self.snapshot().await;
+        for cam in &cameras {
+            if cam.destroyed.load(Ordering::Acquire) {
+                continue;
+            }
+            let viewers = cam.subscribers.load(Ordering::Acquire);
+            let sequence = cam.ring.published_sequence();
+            let (subscribed, target_fps) = {
+                let ctrl = cam.control.lock().await;
+                (ctrl.subscribed, cam.target_capture_fps(&ctrl, primary_fps))
+            };
+            let verdict = cam
+                .feed_watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(now, viewers > 0, sequence, target_fps);
+            match verdict {
+                FeedVerdict::Quiet => {}
+                FeedVerdict::Resumed {
+                    silent_for,
+                    attempts,
+                } => info!(
+                    flight_id = cam.flight_id,
+                    silent_s = silent_for.as_secs(),
+                    attempts,
+                    "camera is capturing again"
+                ),
+                FeedVerdict::Silent {
+                    silent_for,
+                    attempt,
+                } => {
+                    let others_capturing = cameras
+                        .iter()
+                        .filter(|c| {
+                            c.flight_id != cam.flight_id && c.capture_rate.rate_at(now) > 0.0
+                        })
+                        .count();
+                    warn!(
+                        flight_id = cam.flight_id,
+                        camera = %cam.camera_name,
+                        viewers,
+                        subscribed,
+                        target_fps,
+                        ring_sequence = sequence,
+                        silent_s = silent_for.as_secs(),
+                        attempt,
+                        others_capturing,
+                        "camera with viewers has captured nothing; publishing its control block again"
+                    );
+                    self.forget_lost_control_block(cam).await;
+                    if let Err(e) = self.flush_control(cam.flight_id).await {
+                        warn!(flight_id = cam.flight_id, error = %e, "silent feed flush failed");
+                    }
+                    cam.request_keyframe();
+                }
+            }
+        }
+    }
+
+    /// Drops a control block whose file has gone, so the next flush makes a new
+    /// one the plugin can open. A block still on disk is kept, since creating
+    /// one truncates it and restarts its sequence.
+    async fn forget_lost_control_block(&self, cam: &CameraState) {
+        let path = self.shm_dir.join(format!("{}.control.bin", cam.flight_id));
+        if tokio::fs::metadata(&path).await.is_err() {
+            *cam.control_block.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
@@ -2229,7 +3006,7 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return;
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             let already_stopped = |r: Option<f32>| r.unwrap_or(0.0) == 0.0;
             if already_stopped(ctrl.pan_yaw_rate)
@@ -2241,9 +3018,8 @@ impl CameraRegistry {
             ctrl.pan_yaw_rate = Some(0.0);
             ctrl.pan_pitch_rate = Some(0.0);
             ctrl.zoom_rate = Some(0.0);
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        }
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "zero_rates flush failed");
         }
     }
@@ -2271,12 +3047,11 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return Err(format!("no camera with flight_id={flight_id}"));
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             ctrl.viewer_level = preset.map(|p| p.viewer_level());
-            ctrl.clone()
-        };
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        }
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "viewer quality flush failed");
             return Err(format!("control flush failed: {e}"));
         }
@@ -2313,16 +3088,15 @@ impl CameraRegistry {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(()); // camera gone this tick — nothing to write
         };
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             ctrl.track_mode = mode;
             ctrl.track_seq = ctrl.track_seq.wrapping_add(1);
-            ctrl.clone()
-        };
+        }
         // Mirror to the lock-free publish source BEFORE the broadcast so
         // list()/protocol_state read the new value.
         cam.set_track_mode_bits(mode);
-        if let Err(e) = self.flush_control(flight_id, &snapshot).await {
+        if let Err(e) = self.flush_control(flight_id).await {
             warn!(flight_id, error = %e, "track target flush failed");
             return Err(format!("control flush failed: {e}"));
         }
@@ -2424,11 +3198,50 @@ impl CameraRegistry {
 
     /// Called after any display-size report, forget, or manual-cap change. The
     /// plugin's adaptive-shed min() still rides underneath on the game side.
+    /// A fall in demand waits out `SHRINK_HOLD` first.
     pub async fn flush_effective_render_size(&self, flight_id: u32) -> std::io::Result<()> {
+        self.flush_render_size_at(flight_id, Instant::now(), false)
+            .await
+    }
+
+    /// Applies every held shrink whose `SHRINK_HOLD` has run out. Called from
+    /// the consume loop's tick, since nothing else may arrive to apply it.
+    pub async fn settle_render_shrinks(&self, now: Instant) {
+        let due: Vec<u32> = self
+            .cameras
+            .read()
+            .await
+            .iter()
+            .filter(|(_, cam)| {
+                cam.shrink_delay
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .due(now)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for flight_id in due {
+            if let Err(e) = self.flush_render_size_at(flight_id, now, false).await {
+                warn!(flight_id, error = %e, "held shrink flush failed");
+            }
+        }
+    }
+
+    async fn flush_render_size_at(
+        &self,
+        flight_id: u32,
+        now: Instant,
+        immediate: bool,
+    ) -> std::io::Result<()> {
         let Some(cam) = self.get(flight_id).await else {
             return Ok(()); // camera gone this tick — nothing to flush
         };
-        let eff = cam.effective_render_size().await;
+        let target = cam.effective_render_size().await;
+        let eff = cam
+            .shrink_delay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settle(target, now, immediate);
         /* Demand drives the capture RATE as well as the size: a subscribed
         camera nobody is displaying runs background capture instead of running at full rate.
         Recomputed here because this is exactly the path every display-size
@@ -2447,7 +3260,7 @@ impl CameraRegistry {
                 cam.begin_ramp();
             }
         }
-        let snapshot = {
+        {
             let mut ctrl = cam.control.lock().await;
             let (w, h) = match eff {
                 Some((w, h)) => (Some(w), Some(h)),
@@ -2456,9 +3269,8 @@ impl CameraRegistry {
             ctrl.width = w;
             ctrl.height = h;
             ctrl.capture_fps = fps;
-            ctrl.clone()
-        };
-        self.flush_control(flight_id, &snapshot).await?;
+        }
+        self.flush_control(flight_id).await?;
         self.mark_camera_dirty(flight_id).await;
         Ok(())
     }
@@ -2525,6 +3337,18 @@ impl CameraRegistry {
         }
     }
 
+    /// A peer started (or stopped) recording this camera: record its size
+    /// hold and reflush so the plugin sees it. See `SetSizeHold`.
+    pub async fn set_size_hold(&self, flight_id: u32, peer_id: u32, hold: bool) {
+        match self.get(flight_id).await {
+            Some(cam) => cam.set_size_hold(peer_id, hold).await,
+            None => return,
+        }
+        if let Err(e) = self.flush_effective_render_size(flight_id).await {
+            warn!(flight_id, error = %e, "size hold flush failed");
+        }
+    }
+
     /// A consumer stopped displaying ONE camera (explicit unsubscribe /
     /// rebind-away): forget its force for that camera and reflush so the
     /// ceiling relaxes if it was the last peer forcing it. Mirrors
@@ -2562,8 +3386,116 @@ impl CameraRegistry {
         }
     }
 
+    /// A connection named its client (`Resume`). If that client's last
+    /// connection left forces or holds behind, this one takes over the ones
+    /// it still asks for and the rest are released.
+    pub async fn resume_client(&self, peer_id: u32, payload: &ResumePayload) {
+        self.peer_clients
+            .lock()
+            .await
+            .insert(peer_id, payload.client_id.clone());
+        let departed = self
+            .departed_clients
+            .lock()
+            .await
+            .remove(&payload.client_id);
+        let Some((old_peer, _)) = departed else {
+            return;
+        };
+        let flight_ids: Vec<u32> = self.cameras.read().await.keys().copied().collect();
+        for flight_id in flight_ids {
+            let Some(cam) = self.get(flight_id).await else {
+                continue;
+            };
+            let keep_force = payload.forced.contains(&flight_id);
+            let keep_hold = payload.held.contains(&flight_id);
+            if cam
+                .hand_over(old_peer, peer_id, keep_force, keep_hold)
+                .await
+            {
+                if let Err(e) = self.flush_effective_render_size(flight_id).await {
+                    warn!(flight_id, error = %e, "resume flush failed");
+                }
+            }
+        }
+        info!(
+            peer_id,
+            old_peer, "client resumed; its force and size holds carried over"
+        );
+    }
+
+    /// A peer said goodbye: it will not resume, so nothing is kept for it.
+    pub async fn forget_client(&self, peer_id: u32) {
+        self.peer_clients.lock().await.remove(&peer_id);
+    }
+
+    /// A peer's connection is gone (the reaper). Its forces and holds are
+    /// released, unless its client named itself, has no other connection
+    /// open and forced or held something: then they stay for
+    /// `RESUME_GRACE`, for the client's next connection to take over.
+    pub async fn depart_peer(&self, peer_id: u32, now: Instant) {
+        let client = {
+            let mut clients = self.peer_clients.lock().await;
+            let client = clients.remove(&peer_id);
+            /* A connection that resumed before this one was reaped already
+            holds what the client wants. */
+            client.filter(|c| !clients.values().any(|other| other == c))
+        };
+        if let Some(client) = client {
+            if self.forces_or_holds_any(peer_id).await {
+                let previous = self
+                    .departed_clients
+                    .lock()
+                    .await
+                    .insert(client, (peer_id, now + RESUME_GRACE));
+                if let Some((older, _)) = previous {
+                    self.forget_forced_all(older).await;
+                }
+                info!(
+                    peer_id,
+                    grace_s = RESUME_GRACE.as_secs(),
+                    "keeping a departed client's force and size holds for its return"
+                );
+                return;
+            }
+        }
+        self.forget_forced_all(peer_id).await;
+    }
+
+    /// Releases the forces and holds of departed clients whose grace ran out.
+    pub async fn expire_departed(&self, now: Instant) {
+        let expired: Vec<u32> = {
+            let mut departed = self.departed_clients.lock().await;
+            let expired = departed
+                .values()
+                .filter(|(_, until)| *until <= now)
+                .map(|(peer, _)| *peer)
+                .collect();
+            departed.retain(|_, (_, until)| *until > now);
+            expired
+        };
+        for peer_id in expired {
+            info!(
+                peer_id,
+                "departed client did not return; releasing its force and size holds"
+            );
+            self.forget_forced_all(peer_id).await;
+        }
+    }
+
+    async fn forces_or_holds_any(&self, peer_id: u32) -> bool {
+        let cams: Vec<Arc<CameraState>> = self.cameras.read().await.values().cloned().collect();
+        for cam in cams {
+            if cam.forced_or_held_by(peer_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Operator `SetRenderSize`: set (or clear) the manual cap and reflush the
-    /// effective size (min(auto, cap)).
+    /// effective size (min(auto, cap)). The player chose this size, so it
+    /// applies at once, past `SHRINK_HOLD`.
     pub async fn set_manual_render_size(
         &self,
         flight_id: u32,
@@ -2573,7 +3505,8 @@ impl CameraRegistry {
             Some(cam) => cam.set_manual_render_cap(cap).await,
             None => return Ok(()),
         }
-        self.flush_effective_render_size(flight_id).await
+        self.flush_render_size_at(flight_id, Instant::now(), true)
+            .await
     }
 
     /// Flag a camera for a state broadcast on the consume loop's next tick.
@@ -2587,6 +3520,54 @@ impl CameraRegistry {
         dirty.drain().collect()
     }
 
+    /// The `camera-state-changed` state announcing a destroyed camera: its
+    /// identity and limits, with nothing captured, rendered or sent.
+    pub async fn destroyed_state(&self, flight_id: u32) -> Option<ProtocolCameraState> {
+        let cam = self.get(flight_id).await?;
+        Some(ProtocolCameraState {
+            flight_id,
+            attach: cam.attach,
+            lifecycle: CameraLifecycle::Destroyed,
+            // Destroyed: nothing is being captured, whatever subscribers linger.
+            capture_state: CaptureState::Off,
+            kind: cam.kind,
+            kerbal_persistent_id: cam.kerbal_persistent_id,
+            command_centre: cam.command_centre.clone(),
+            crew_location: cam.crew_location(),
+            track_mode: cam.track_mode(),
+            part_name: cam.part_name.clone(),
+            part_title: cam.part_title.clone(),
+            camera_name: cam.camera_name.clone(),
+            vessel_name: cam.vessel_name.clone(),
+            layers: Vec::new(),
+            operator_layers: Vec::new(),
+            render_width: 0,
+            render_height: 0,
+            operator_width: 0,
+            operator_height: 0,
+            max_width: Some(cam.max_width),
+            max_height: Some(cam.max_height),
+            supports_zoom: cam.supports_zoom,
+            fov: 0.0,
+            fov_min: cam.fov_min,
+            fov_max: cam.fov_max,
+            supports_pan: cam.supports_pan,
+            pan_yaw: 0.0,
+            pan_pitch: 0.0,
+            pan_yaw_min: cam.pan_yaw_min,
+            pan_yaw_max: cam.pan_yaw_max,
+            pan_pitch_min: cam.pan_pitch_min,
+            pan_pitch_max: cam.pan_pitch_max,
+            encoder_bitrate_bps: 0,
+            target_bitrate_bps: 0,
+            degrade_level: 0.0,
+            viewer_quality: None,
+            quality_limited_by: None,
+            // Nothing is captured or sent for a destroyed camera.
+            ..Default::default()
+        })
+    }
+
     /// Authoritative protocol-shape snapshot of one camera, merging the
     /// last plugin-reported effective state (render dims, layers, fov,
     /// pan, when the status file has been seen) with the sidecar-owned
@@ -2596,7 +3577,10 @@ impl CameraRegistry {
     /// the first status write, exactly like the Hello snapshot always did.
     pub async fn protocol_state(&self, flight_id: u32) -> Option<ProtocolCameraState> {
         let cam = self.get(flight_id).await?;
-        let ctrl = cam.control.lock().await.clone();
+        /* What the plugin was told, so a forced camera reports no preset. */
+        let ctrl = cam
+            .control_for_plugin(&cam.control.lock().await.clone())
+            .await;
         let per = {
             let status = self.last_status.lock().await;
             status
@@ -2633,7 +3617,7 @@ impl CameraRegistry {
         let fov = per
             .as_ref()
             .map(|p| p.fov)
-            .filter(|f| *f != 0.0)
+            .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or_else(|| ctrl.fov.unwrap_or(cam.fov_default));
         let pan_yaw = per
             .as_ref()
@@ -2652,6 +3636,7 @@ impl CameraRegistry {
 
         Some(ProtocolCameraState {
             flight_id,
+            attach: cam.attach,
             lifecycle: if cam.destroyed.load(Ordering::Acquire) {
                 CameraLifecycle::Destroyed
             } else {
@@ -2661,7 +3646,7 @@ impl CameraRegistry {
             kerbal_persistent_id: cam.kerbal_persistent_id,
             command_centre: command_centre_with(
                 &cam.command_centre,
-                per.as_ref().and_then(|p| p.command_centre.as_ref()),
+                per.as_ref().and_then(|p| p.command_targets.as_ref()),
             ),
             command_track: per.as_ref().and_then(|p| p.command_track.clone()),
             capture_state: cam.capture_state_with(background_capturing),
@@ -2690,7 +3675,7 @@ impl CameraRegistry {
             pan_yaw_max: cam.pan_yaw_max,
             pan_pitch_min: cam.pan_pitch_min,
             pan_pitch_max: cam.pan_pitch_max,
-            encoder_bitrate_bps: cam.encoder_bitrate.load(Ordering::Acquire),
+            encoder_bitrate_bps: cam.full.encoder_bitrate.load(Ordering::Acquire),
             target_bitrate_bps: cam.target_bitrate_bps.load(Ordering::Acquire),
             degrade_level: cam.current_degrade(),
             viewer_quality,
@@ -2708,7 +3693,7 @@ impl CameraRegistry {
 
 /// Why the effective resolution differs from the viewer's request, if it
 /// does. Expected width = the operator ceiling scaled by the viewer's
-/// preset (1.0 when auto), floored to even exactly like the plugin's
+/// preset (1.0 when auto), floored to a multiple of 16 exactly like the plugin's
 /// `QualityClamp` does. Anything below that means the adaptive perf
 /// machinery is holding the camera down: report `"throttled"` so UIs can
 /// mark the feed. The viewer request itself can never push the effective
@@ -2720,7 +3705,7 @@ pub fn quality_limited_reason(
     viewer_quality: Option<QualityPreset>,
 ) -> Option<String> {
     let scale = viewer_quality.map(|p| p.scale()).unwrap_or(1.0);
-    let expected = (((operator_width as f32) * scale) as u32 & !1).max(2);
+    let expected = align_down(((operator_width as f32) * scale) as u32);
     if render_width < expected {
         Some("throttled".to_string())
     } else {
@@ -2752,7 +3737,9 @@ async fn read_manifest(shm_dir: &std::path::Path, flight_id: u32) -> InfoManifes
         pan_pitch_max: 0.0,
         kind: String::new(),
         kerbal_persistent_id: None,
-        station_id: None,
+        site_key: None,
+        site_kind: None,
+        vantage_persistent_id: None,
         command_created: None,
         command_token: None,
         station_node_name: None,
@@ -2807,16 +3794,28 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
     if camera_kind_from_manifest(&m.kind) != CameraKind::Command {
         return None;
     }
-    let station_id = m.station_id.clone()?;
-    let node_name = m.station_node_name.clone().unwrap_or_default();
+    let node_name = m
+        .station_node_name
+        .clone()
+        .or_else(|| m.site_key.clone())
+        .filter(|n| !n.is_empty())?;
+    let site_key = m
+        .site_key
+        .clone()
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| node_name.clone());
     let display_name = m
         .station_name
         .clone()
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| node_name.clone());
+    let site_kind = site_kind_from_manifest(m.site_kind.as_deref(), &site_key);
     Some(CommandCentreInfo {
-        station_id,
+        station_id: format!("ground:{node_name}"),
         node_name,
+        site_key,
+        site_kind,
+        vantage_persistent_id: m.vantage_persistent_id.unwrap_or_default(),
         display_name,
         body: m.station_body.clone().unwrap_or_default(),
         latitude: m.station_latitude.unwrap_or_default(),
@@ -2826,7 +3825,9 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         subject_persistent_id: 0,
         range_m: None,
         tracking_level: 0,
+        ut: None,
         targets: Vec::new(),
+        targets_omitted: None,
         created: m.command_created.unwrap_or(false),
         token: m.command_token.clone().filter(|t| !t.is_empty()),
     })
@@ -2836,7 +3837,7 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
 /// target, range, level and target list laid over it.
 fn command_centre_with(
     info: &Option<CommandCentreInfo>,
-    status: Option<&CommandCentreStatus>,
+    status: Option<&CommandTargetsStatus>,
 ) -> Option<CommandCentreInfo> {
     let mut out = info.clone()?;
     if let Some(s) = status {
@@ -2844,9 +3845,26 @@ fn command_centre_with(
         out.subject_persistent_id = s.subject_persistent_id;
         out.range_m = s.range_m;
         out.tracking_level = s.tracking_level;
+        out.ut = s.ut;
         out.targets = s.targets.clone();
+        out.vantage_persistent_id = s.vantage_persistent_id;
     }
     Some(out)
+}
+
+/// Manifest `site_kind` string -> protocol enum. A plugin before 1.12 writes
+/// none, so its kind comes from the key's prefix; a launch site reads as a
+/// station there, since its key carries no prefix.
+fn site_kind_from_manifest(kind: Option<&str>, site_key: &str) -> SiteKind {
+    match kind {
+        Some("station") => SiteKind::Station,
+        Some("launchSite") => SiteKind::LaunchSite,
+        Some("surface") => SiteKind::Surface,
+        Some("vessel") => SiteKind::Vessel,
+        _ if site_key.starts_with("vessel:") => SiteKind::Vessel,
+        _ if site_key.starts_with("surface:") => SiteKind::Surface,
+        _ => SiteKind::Station,
+    }
 }
 
 /// Manifest `crew_location` string -> protocol enum. Absent/unrecognised
@@ -2968,7 +3986,7 @@ mod tests {
         );
     }
 
-    const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"gonogo"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;
+    const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"mission-control"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;
 
     fn per_camera_with(command_track: Option<&str>) -> PerCameraStatus {
         let extra = command_track
@@ -2992,7 +4010,7 @@ mod tests {
         assert_eq!(track.bracket_half_px, Some(4.2));
         assert_eq!(track.frame_height_px, 576);
         let authority = track.authority.expect("authority");
-        assert_eq!(authority.owner, "gonogo");
+        assert_eq!(authority.owner, "mission-control");
         assert_eq!(track.blank, None);
         assert_eq!(track.events.len(), 2);
         assert!(track.events[1].occluded);
@@ -3037,6 +4055,74 @@ mod tests {
     /// A command track reaches the protocol camera state, re-broadcasts when
     /// it changes, and an identical re-write does not re-broadcast.
     #[tokio::test]
+    async fn poll_status_keeps_a_targets_list_first_ut_and_takes_a_revert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 5_003;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("ring");
+        std::fs::write(
+            shm.join(format!("{flight_id}.info.json")),
+            format!(
+                r#"{{"flight_id":{flight_id},"kind":"command","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center"}}"#
+            ),
+        )
+        .unwrap();
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let status_path = shm.join("global.status.json");
+        let write = |ut: f64| {
+            std::fs::write(
+                &status_path,
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{flight_id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{{"ut":{ut},"subjectPersistentId":42,"rangeM":100.0,"trackingLevel":3,"targets":[]}}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let snapshot_ut = || async {
+            registry
+                .list()
+                .await
+                .iter()
+                .find(|c| c.flight_id == flight_id)
+                .and_then(|c| c.command_centre.as_ref())
+                .and_then(|c| c.ut)
+        };
+
+        write(100.0);
+        registry.poll_status().await;
+        write(105.0);
+        assert!(
+            registry.poll_status().await.changed_cameras.is_empty(),
+            "a later UT on the same list does not re-broadcast"
+        );
+        assert_eq!(
+            snapshot_ut().await,
+            Some(100.0),
+            "and the snapshot keeps the first UT"
+        );
+
+        write(50.0);
+        let delta = registry.poll_status().await;
+        let ut = delta
+            .changed_cameras
+            .first()
+            .and_then(|c| c.command_centre.as_ref())
+            .and_then(|c| c.ut);
+        assert_eq!(
+            ut,
+            Some(50.0),
+            "a revert re-broadcasts the list at the UT the game is at"
+        );
+        assert_eq!(snapshot_ut().await, Some(50.0));
+    }
+
+    #[tokio::test]
     async fn poll_status_broadcasts_command_track_changes_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm = dir.path();
@@ -3072,7 +4158,10 @@ mod tests {
             Some("Mun")
         );
         let json = serde_json::to_value(state).unwrap();
-        assert_eq!(json["commandTrack"]["authority"]["owner"], "gonogo");
+        assert_eq!(
+            json["commandTrack"]["authority"]["owner"],
+            "mission-control"
+        );
         assert_eq!(json["commandTrack"]["bracketHalfPx"], 4.2);
 
         write(COMMAND_TRACK_JSON);
@@ -3101,7 +4190,7 @@ mod tests {
 
         write(&COMMAND_TRACK_JSON.replace(
             r#""blank":null,"events""#,
-            r#""blank":"Waiting for gonogo","events""#,
+            r#""blank":"Waiting for mission control","events""#,
         ));
         let delta = registry.poll_status().await;
         assert_eq!(
@@ -3109,7 +4198,7 @@ mod tests {
                 .command_track
                 .as_ref()
                 .and_then(|t| t.blank.as_deref()),
-            Some("Waiting for gonogo")
+            Some("Waiting for mission control")
         );
 
         let snapshot = registry.protocol_state(flight_id).await.expect("state");
@@ -3320,7 +4409,7 @@ mod tests {
         let (_dir, cam) = attach_camera_sized(7_051, 1920, 1080).await;
         cam.record_display_size(1, 640, 360).await;
         cam.record_display_size(2, 300, 500).await;
-        assert_eq!(cam.effective_render_size().await, Some((888, 500)));
+        assert_eq!(cam.effective_render_size().await, Some((912, 512)));
     }
 
     /// A manual cap of another shape bounds the size but not the shape.
@@ -3328,10 +4417,35 @@ mod tests {
     async fn manual_cap_keeps_the_configured_aspect() {
         let (_dir, cam) = attach_camera_sized(7_052, 1280, 720).await;
         cam.set_manual_render_cap(Some((640, 480))).await;
-        assert_eq!(cam.effective_render_size().await, Some((640, 360)));
+        assert_eq!(cam.effective_render_size().await, Some((624, 352)));
 
         cam.record_display_size(1, 1024, 576).await;
-        assert_eq!(cam.effective_render_size().await, Some((640, 360)));
+        assert_eq!(cam.effective_render_size().await, Some((624, 352)));
+    }
+
+    /// The sizes a phone tile asks for, and the sizes at a ring max, all arrive
+    /// as multiples of 16 at the configured shape.
+    #[tokio::test]
+    async fn every_requested_size_is_sixteen_aligned() {
+        let (_dir, cam) = attach_camera_sized(7_053, 1024, 576).await;
+        cam.record_display_size(1, 432, 244).await;
+        assert_eq!(cam.effective_render_size().await, Some((480, 272)));
+        cam.record_display_size(1, 434, 244).await;
+        assert_eq!(cam.effective_render_size().await, Some((480, 272)));
+        cam.record_display_size(1, 3, 3).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
+        cam.record_display_size(1, 1024, 576).await;
+        assert_eq!(cam.effective_render_size().await, Some((1024, 576)));
+        cam.record_display_size(1, 4000, 4000).await;
+        assert_eq!(cam.effective_render_size().await, Some((1024, 576)));
+
+        let (_dir2, full_hd) = attach_camera_sized(7_054, 1920, 1080).await;
+        full_hd.record_display_size(1, 1920, 1080).await;
+        assert_eq!(full_hd.effective_render_size().await, Some((1920, 1072)));
+
+        let (_dir3, low) = attach_camera_sized(7_055, 640, 360).await;
+        low.record_display_size(1, 640, 360).await;
+        assert_eq!(low.effective_render_size().await, Some((624, 352)));
     }
 
     /// Auto-resolution aggregates each consumer's reported display size as the
@@ -3339,7 +4453,7 @@ mod tests {
     #[tokio::test]
     async fn display_size_tracker_takes_max_across_consumers() {
         let (_dir, cam) = attach_camera_for_tracker(7_001).await;
-        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(1, 200, 200).await;
         cam.record_display_size(2, 512, 512).await;
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
     }
@@ -3350,14 +4464,14 @@ mod tests {
     #[tokio::test]
     async fn display_size_relaxes_when_large_consumer_departs() {
         let (_dir, cam) = attach_camera_for_tracker(7_002).await;
-        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(1, 200, 200).await;
         cam.record_display_size(2, 512, 512).await;
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
 
         cam.forget_display_size(2).await;
         assert_eq!(
             cam.effective_render_size().await,
-            Some((40, 40)),
+            Some((208, 208)),
             "effective size must relax after the large consumer departs (clear-on-departure)"
         );
 
@@ -3423,6 +4537,141 @@ mod tests {
         assert_eq!(cam.effective_render_size().await, None);
     }
 
+    /// With no keyframe yet, a request is served by the very next encode.
+    #[test]
+    fn keyframe_request_with_no_recent_keyframe_is_served_at_once() {
+        let mut gate = KeyframeGate::default();
+        let t0 = Instant::now();
+        assert!(!gate.take(t0), "nothing asked");
+        gate.request();
+        assert!(gate.take(t0));
+        assert!(!gate.pending());
+    }
+
+    /// Requests inside the gap are held, not dropped, however many arrive, and
+    /// one IDR serves them all as soon as the gap ends.
+    #[test]
+    fn keyframe_requests_inside_the_gap_wait_for_it_and_coalesce() {
+        let mut gate = KeyframeGate::default();
+        let t0 = Instant::now();
+        gate.request();
+        assert!(gate.take(t0));
+
+        for ms in [10, 300, 600] {
+            gate.request();
+            assert!(
+                !gate.take(t0 + Duration::from_millis(ms)),
+                "inside the gap at {ms} ms"
+            );
+            assert!(gate.pending(), "still owed at {ms} ms");
+        }
+        assert!(gate.take(t0 + MIN_KEYFRAME_GAP), "served when the gap ends");
+        assert!(
+            !gate.take(t0 + MIN_KEYFRAME_GAP * 3),
+            "the three requests made one IDR"
+        );
+    }
+
+    /// The gap runs from any keyframe the camera sent, and that keyframe
+    /// answers whatever was pending before it.
+    #[test]
+    fn a_periodic_keyframe_answers_pending_requests_and_starts_the_gap() {
+        let mut gate = KeyframeGate::default();
+        let t0 = Instant::now();
+        gate.note_sent(t0);
+        gate.request();
+        assert!(
+            !gate.take(t0 + Duration::from_millis(500)),
+            "inside the gap"
+        );
+        gate.note_sent(t0 + Duration::from_millis(700));
+        assert!(!gate.pending(), "the periodic IDR answered it");
+        assert!(!gate.take(t0 + MIN_KEYFRAME_GAP * 2));
+
+        gate.request();
+        assert!(
+            !gate.take(t0 + Duration::from_millis(1500)),
+            "the gap restarted at the periodic IDR"
+        );
+        assert!(gate.take(t0 + Duration::from_millis(1700)));
+    }
+
+    /// Every source reaches the encode path through the camera, so one camera
+    /// takes at most one forced IDR per gap whoever asks.
+    #[tokio::test]
+    async fn camera_keyframe_requests_share_one_gap() {
+        let (_dir, cam) = attach_camera_for_tracker(7_010).await;
+        let t0 = Instant::now();
+        cam.request_keyframe();
+        assert!(cam.full.take_keyframe_request(t0));
+        cam.request_keyframe();
+        cam.begin_ramp();
+        assert!(!cam
+            .full
+            .take_keyframe_request(t0 + Duration::from_millis(200)));
+        assert!(cam.full.take_keyframe_request(t0 + MIN_KEYFRAME_GAP));
+    }
+
+    /// A small but real box (a phone's half-width tile, an older client's
+    /// 16x10 report) still counts as demand, raised to a size every encoder
+    /// accepts rather than dropped to the plugin default.
+    #[tokio::test]
+    async fn small_size_report_is_raised_to_the_encodable_minimum() {
+        let (_dir, cam) = attach_camera_sized(7_007, 1280, 720).await;
+        cam.record_display_size(1, 170, 96).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
+
+        cam.record_display_size(1, 16, 10).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
+
+        /* The larger viewer still wins the max. */
+        cam.record_display_size(2, 320, 180).await;
+        assert_eq!(cam.effective_render_size().await, Some((368, 208)));
+    }
+
+    /// A thin strip (a tile mid collapse) is covered at the ring's shape
+    /// before the floor applies, so it asks for what covers it, never the
+    /// ring max that raising it at its own shape would reach.
+    #[tokio::test]
+    async fn a_thin_box_does_not_inflate_to_the_ring_max() {
+        let (_dir, cam) = attach_camera_sized(7_011, 1280, 720).await;
+        cam.record_display_size(1, 400, 20).await;
+        assert_eq!(cam.effective_render_size().await, Some((400, 224)));
+        cam.record_display_size(1, 20, 400).await;
+        assert_eq!(cam.effective_render_size().await, Some((736, 416)));
+        cam.record_display_size(1, 200, 4).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 144)));
+    }
+
+    /// No path asks for a render under `MIN_ENCODE_DIMENSION` on either side:
+    /// the smallest accepted report, a tiny manual cap and a cap on a wide
+    /// ring all come out at least that size, at the ring's aspect.
+    #[tokio::test]
+    async fn render_size_never_goes_under_the_encodable_minimum() {
+        let min = MIN_ENCODE_DIMENSION;
+        let (_dir, cam) = attach_camera_sized(7_008, 1280, 720).await;
+        cam.record_display_size(1, min, min).await;
+        let (w, h) = cam.effective_render_size().await.expect("demand");
+        assert_eq!((w, h), (256, 144), "the smallest aligned size at the shape");
+
+        cam.set_manual_render_cap(Some((32, 16))).await;
+        let (w, h) = cam.effective_render_size().await.expect("capped");
+        assert!(w >= min && h >= min, "a tiny cap is lifted: {w}x{h}");
+        assert_eq!((w % 16, h % 16), (0, 0));
+        assert!(
+            (w as f64 / h as f64 - 16.0 / 9.0).abs() < 0.02,
+            "at the ring's aspect: {w}x{h}"
+        );
+
+        cam.forget_display_size(1).await;
+        let (w, h) = cam.effective_render_size().await.expect("cap alone");
+        assert!(w >= min && h >= min, "a cap with no viewer: {w}x{h}");
+
+        let (_dir2, wide) = attach_camera_sized(7_009, 2048, 256).await;
+        wide.set_manual_render_cap(Some((100, 10))).await;
+        assert_eq!(wide.effective_render_size().await, Some((1024, 128)));
+    }
+
     /// With background capture disabled (ceiling 0 — the default, and what an older plugin
     /// reports) NO camera is ever asked for a reduced rate, displayed or not.
     /// This is the "default changes nothing" guarantee.
@@ -3478,6 +4727,90 @@ mod tests {
         assert_eq!(cam.requested_capture_fps(2.0).await, Some(2.0));
     }
 
+    fn bare_track(name: &str) -> Arc<VideoTrack> {
+        use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+        Arc::new(VideoTrack::new(
+            RTCRtpCodecCapability {
+                mime_type: "video/H264".to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            name.to_owned(),
+            None,
+        ))
+    }
+
+    /// A move waits on the destination tier, which is asked for a keyframe,
+    /// while the viewer stays on the tier it is on.
+    #[tokio::test]
+    async fn a_tier_move_waits_on_the_destination_keyframe() {
+        let (_dir, cam) = attach_camera_for_tracker(7_201).await;
+        let track = bare_track("t");
+        cam.add_track(track.clone()).await;
+        assert!(!cam.reduced.wanted().await);
+
+        assert!(cam.set_track_tier(&track, Tier::Reduced).await);
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Full));
+        assert!(cam.reduced.wanted().await);
+        assert!(cam.reduced.keyframe_gate.lock().unwrap().pending());
+        assert!(!cam.full.keyframe_gate.lock().unwrap().pending());
+
+        let moved = cam.reduced.take_pending().await;
+        assert_eq!(moved.len(), 1);
+        assert!(cam.move_track(&moved[0], Tier::Reduced).await);
+        assert_eq!(cam.tier_of(&track).await, Some(Tier::Reduced));
+        assert!(!cam.full.wanted().await);
+        assert_eq!(
+            cam.subscribers.load(Ordering::Acquire),
+            1,
+            "a move is not a new viewer"
+        );
+    }
+
+    /// Asking for the tier a viewer is already on cancels its pending move.
+    #[tokio::test]
+    async fn moving_back_before_the_keyframe_cancels_the_move() {
+        let (_dir, cam) = attach_camera_for_tracker(7_202).await;
+        let track = bare_track("t");
+        cam.add_track(track.clone()).await;
+        cam.set_track_tier(&track, Tier::Reduced).await;
+        assert!(cam.set_track_tier(&track, Tier::Full).await);
+        assert!(!cam.reduced.wanted().await);
+        assert!(cam.reduced.take_pending().await.is_empty());
+    }
+
+    /// A viewer leaving mid-move is forgotten by both tiers, and the move
+    /// lands nowhere.
+    #[tokio::test]
+    async fn a_viewer_leaving_mid_move_is_not_moved() {
+        let (_dir, cam) = attach_camera_for_tracker(7_203).await;
+        let track = bare_track("t");
+        cam.add_track(track.clone()).await;
+        cam.set_track_tier(&track, Tier::Reduced).await;
+        assert_eq!(cam.remove_track(&track).await, 0);
+        assert!(!cam.reduced.wanted().await);
+        assert!(!cam.move_track(&track, Tier::Reduced).await);
+        assert_eq!(cam.tier_of(&track).await, None);
+        assert!(!cam.set_track_tier(&track, Tier::Full).await, "not fed");
+    }
+
+    /// One viewer's keyframe request reaches only the tier feeding it.
+    #[tokio::test]
+    async fn a_viewer_keyframe_request_goes_to_its_own_tier() {
+        let (_dir, cam) = attach_camera_for_tracker(7_204).await;
+        let slow = bare_track("slow");
+        let fast = bare_track("fast");
+        cam.add_track(slow.clone()).await;
+        cam.add_track(fast.clone()).await;
+        assert!(cam.move_track(&slow, Tier::Reduced).await);
+
+        cam.request_keyframe_for(&slow).await;
+        assert!(cam.reduced.keyframe_gate.lock().unwrap().pending());
+        assert!(!cam.full.keyframe_gate.lock().unwrap().pending());
+        cam.request_keyframe_for(&fast).await;
+        assert!(cam.full.keyframe_gate.lock().unwrap().pending());
+    }
+
     /// Published state: Off when nobody subscribes, Hum when capturing in the background, Ramping
     /// between promotion and the keyframe, Full once renderable.
     #[tokio::test]
@@ -3509,9 +4842,13 @@ mod tests {
         // the state stays honest instead of claiming Full while undecodable.
         cam.begin_ramp();
         assert_eq!(cam.capture_state_with(false), CaptureState::Ramping);
-        assert!(cam.take_keyframe_request(), "promotion asks for an IDR");
+        let now = Instant::now();
         assert!(
-            !cam.take_keyframe_request(),
+            cam.full.take_keyframe_request(now),
+            "promotion asks for an IDR"
+        );
+        assert!(
+            !cam.full.take_keyframe_request(now + MIN_KEYFRAME_GAP * 2),
             "the request is consumed, not re-armed every encode"
         );
         assert_eq!(
@@ -3627,8 +4964,8 @@ mod tests {
     #[tokio::test]
     async fn forced_full_res_sizes_to_the_ceiling_over_tiny_demand() {
         let (_dir, cam) = attach_camera_for_tracker(7_005).await;
-        cam.record_display_size(1, 40, 40).await;
-        assert_eq!(cam.effective_render_size().await, Some((40, 40)));
+        cam.record_display_size(1, 200, 200).await;
+        assert_eq!(cam.effective_render_size().await, Some((208, 208)));
 
         cam.set_forced(1, true).await;
         assert_eq!(
@@ -3645,7 +4982,7 @@ mod tests {
     #[tokio::test]
     async fn forced_full_res_or_aggregates_across_peers() {
         let (_dir, cam) = attach_camera_for_tracker(7_006).await;
-        cam.record_display_size(1, 40, 40).await;
+        cam.record_display_size(1, 200, 200).await;
 
         cam.set_forced(1, true).await;
         cam.set_forced(2, true).await;
@@ -3661,7 +4998,7 @@ mod tests {
         cam.set_forced(2, false).await;
         assert_eq!(
             cam.effective_render_size().await,
-            Some((40, 40)),
+            Some((208, 208)),
             "released back to demand once every peer clears"
         );
     }
@@ -3944,6 +5281,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, look + 1);
+
+        /* Every write bumped the signal, across the restart too. */
+        let signal = ChangeSignal::open(&shm.join(COMMANDS_SIGNAL_FILE)).unwrap();
+        assert_eq!(signal.count(), 3);
     }
 
     /// While the plugin reports a command authority, browser aims are refused
@@ -3987,12 +5328,27 @@ mod tests {
         registry.poll_status().await;
         let (message, code) = registry.request_command_aim(aim()).await.unwrap_err();
         assert_eq!(code, Some(ErrorCode::CommandLocked));
-        assert!(message.contains("gonogo"), "{message}");
+        assert!(message.contains("mission-control"), "{message}");
         assert!(!shm.join(COMMANDS_FILE).exists());
 
-        write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"gonogo"},"#, ""));
+        /* A search of a region is still an aim: the holder's lock refuses it as well. */
+        let search = || SetCommandAimPayload {
+            flight_id: id,
+            aim: Some(
+                serde_json::from_str(r#"{"kind":"vessel","persistentId":7,"allowUncertain":true}"#)
+                    .unwrap(),
+            ),
+        };
+        let (_, code) = registry.request_command_aim(search()).await.unwrap_err();
+        assert_eq!(code, Some(ErrorCode::CommandLocked));
+        assert!(!shm.join(COMMANDS_FILE).exists());
+
+        write(&COMMAND_TRACK_JSON.replace(r#""authority":{"owner":"mission-control"},"#, ""));
         registry.poll_status().await;
         assert!(registry.request_command_aim(aim()).await.is_ok());
+        assert!(registry.request_command_aim(search()).await.is_ok());
+        let written = std::fs::read_to_string(shm.join(COMMANDS_FILE)).unwrap();
+        assert!(written.contains(r#""allowUncertain":true"#), "{written}");
     }
 
     /// An aim at a craft missing from the camera's latest target list (one
@@ -4099,13 +5455,65 @@ mod tests {
 
     const COMMAND_CENTRE_JSON: &str = r#"{"aimKind":"vessel","subjectPersistentId":42,"rangeM":12300.0,"trackingLevel":2,"targets":[{"persistentId":42,"vesselName":"Kerbal X","vesselType":"Ship","rangeM":12300.0,"eligibility":"ok","eligibilityText":"Trackable"},{"persistentId":7,"vesselName":"Ast. HSJ-227","vesselType":"SpaceObject","eligibility":"levelTooLow","eligibilityText":"Upgrade the Tracking Station"}]}"#;
 
+    /// Under a held lock the plugin sends only the UT, the lock's owner and
+    /// the events; the rest takes its defaults rather than dropping the track.
+    #[test]
+    fn a_locked_command_track_parses_with_the_rest_defaulted() {
+        let track = per_camera_with(Some(
+            r#"{"ut":10.5,"authority":{"owner":"mission"},"events":[{"ut":10.0,"occluded":true,"occluder":"Mun","sunlit":false,"blank":null}]}"#,
+        ))
+        .command_track
+        .expect("command track");
+        assert_eq!(track.ut, 10.5);
+        assert!(!track.has_fix && track.range_m.is_none() && track.bracket_half_px.is_none());
+        assert!(track.framing_fits && track.true_offset_px.is_none() && track.blank.is_none());
+        assert_eq!(track.events.len(), 1);
+        assert_eq!(track.authority.map(|a| a.owner).as_deref(), Some("mission"));
+    }
+
+    /// Each write stamps the targets list with its UT; that alone is no
+    /// change, so viewers keep the UT the content first had.
+    #[test]
+    fn command_centre_ut_alone_is_no_change_and_merges_through() {
+        let parse = |ut: f64, range: f64| -> Option<CommandTargetsStatus> {
+            Some(
+                serde_json::from_str(&format!(
+                    r#"{{"ut":{ut},"subjectPersistentId":42,"rangeM":{range},"trackingLevel":2,"targets":[]}}"#
+                ))
+                .unwrap(),
+            )
+        };
+        assert!(!command_targets_changed(
+            &parse(10.0, 100.0),
+            &parse(11.0, 100.0)
+        ));
+        assert!(command_targets_changed(
+            &parse(10.0, 100.0),
+            &parse(11.0, 200.0)
+        ));
+        assert!(
+            command_targets_changed(&parse(10.0, 100.0), &parse(5.0, 100.0)),
+            "a revert's earlier UT is a change, so the list shows from the UT the game is at"
+        );
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":7,"kind":"command","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center"}"#,
+        )
+        .unwrap();
+        let merged = command_centre_with(
+            &command_centre_from_manifest(&m),
+            parse(10.0, 100.0).as_ref(),
+        )
+        .expect("merged");
+        assert_eq!(merged.ut, Some(10.0));
+    }
+
     #[test]
     fn command_centre_status_parses_and_merges_over_the_manifest() {
         let per: PerCameraStatus = serde_json::from_str(&format!(
             r#"{{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{COMMAND_CENTRE_JSON}}}"#
         ))
         .unwrap();
-        let status = per.command_centre.expect("command centre status");
+        let status = per.command_targets.expect("command targets status");
         assert_eq!(status.targets.len(), 2);
         assert_eq!(
             status.targets[1].eligibility,
@@ -4131,7 +5539,76 @@ mod tests {
             r#"{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"targets":"nope"}}"#,
         )
         .unwrap();
-        assert!(malformed.command_centre.is_none(), "malformed is dropped");
+        assert!(malformed.command_targets.is_none(), "malformed is dropped");
+    }
+
+    /// A world model's eligibility codes parse, and one this sidecar does not
+    /// know reads as unknown rather than dropping the whole target list.
+    #[test]
+    fn unknown_eligibility_keeps_the_rest_of_the_targets() {
+        let per: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"subjectPersistentId":42,"targets":[{"persistentId":42,"vesselName":"A","vesselType":"Ship","eligibility":"tooUncertain","eligibilityText":"Position too uncertain"},{"persistentId":43,"vesselName":"B","vesselType":"Ship","eligibility":"fromTheFuture","eligibilityText":"?"},{"persistentId":44,"vesselName":"C","vesselType":"Probe","eligibility":"stale","eligibilityText":"Out of date"}]}}"#,
+        )
+        .unwrap();
+        let status = per.command_targets.expect("the list survives");
+        use crate::protocol::CommandTargetEligibility as E;
+        let codes: Vec<_> = status.targets.iter().map(|t| t.eligibility).collect();
+        assert_eq!(codes, vec![E::TooUncertain, E::Unknown, E::Stale]);
+    }
+
+    /// A 1.12 manifest names its site by key, kind and vantage craft, the
+    /// status keeps the vantage current, and the deprecated station id is
+    /// still derived for older clients.
+    #[test]
+    fn command_site_key_kind_and_vantage_reach_the_camera() {
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":9,"kind":"command","site_key":"vessel:41","site_kind":"vessel","vantage_persistent_id":41,"station_id":"ground:vessel:41","station_node_name":"vessel:41","station_name":"Relay camera"}"#,
+        )
+        .unwrap();
+        let before_status = command_centre_from_manifest(&m).expect("identity");
+        assert_eq!(
+            before_status.vantage_persistent_id, 41,
+            "the manifest's vantage shows before the first status write"
+        );
+        let per: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"subjectPersistentId":0,"trackingLevel":3,"targets":[],"vantagePersistentId":77}}"#,
+        )
+        .unwrap();
+        let merged = command_centre_with(&Some(before_status), per.command_targets.as_ref())
+            .expect("merged");
+        assert_eq!(merged.site_key, "vessel:41");
+        assert_eq!(merged.site_kind, SiteKind::Vessel);
+        assert_eq!(merged.vantage_persistent_id, 77);
+        assert_eq!(merged.station_id, "ground:vessel:41");
+
+        let json = serde_json::to_value(&merged).unwrap();
+        assert_eq!(json["siteKey"], "vessel:41");
+        assert_eq!(json["siteKind"], "vessel");
+        assert_eq!(json["vantagePersistentId"], 77);
+
+        let old: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":1,"kind":"command","station_id":"ground:KSC","station_node_name":"KSC"}"#,
+        )
+        .unwrap();
+        let old = command_centre_from_manifest(&old).unwrap();
+        assert_eq!(
+            (old.site_key.as_str(), old.site_kind),
+            ("KSC", SiteKind::Station)
+        );
+        for (node, kind) in [
+            ("vessel:12", SiteKind::Vessel),
+            ("surface:Mun:1.00000:2.00000", SiteKind::Surface),
+        ] {
+            let m: InfoManifest = serde_json::from_str(&format!(
+                r#"{{"flight_id":1,"kind":"command","station_id":"ground:{node}","station_node_name":"{node}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                command_centre_from_manifest(&m).unwrap().site_kind,
+                kind,
+                "a 1.11 manifest's kind comes from its key"
+            );
+        }
     }
 
     /// Station fields on a manifest of another kind are ignored.
@@ -4331,6 +5808,11 @@ mod tests {
             2,
             "second slot, same camera"
         );
+        assert_eq!(
+            cam.add_track(b.clone()).await,
+            2,
+            "binding the same slot again is a no-op"
+        );
         assert_eq!(cam.remove_track(&a).await, 1, "unsubscribe one slot");
         assert_eq!(cam.remove_track(&b).await, 0, "last viewer leaves");
         assert_eq!(
@@ -4474,6 +5956,158 @@ mod tests {
         );
     }
 
+    /// The viewers of a camera reattached in place are still connected and do
+    /// not report again, so what they asked of it carries over to the new
+    /// entry, and leaves with them as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_place_reattach_keeps_what_viewers_asked_of_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        let first = registry.get(7).await.expect("camera attached");
+        registry.record_display_size(7, 3, 640, 360).await;
+        registry.set_forced_full_res(7, 4, true).await;
+        registry.set_size_hold(7, 5, true).await;
+        registry
+            .set_manual_render_size(7, Some((320, 180)))
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&ring_path).unwrap();
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        registry.rescan().await;
+        let second = registry.get(7).await.expect("camera still present");
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            second
+                .display_sizes
+                .lock()
+                .await
+                .get(&3)
+                .map(|&(w, h, _)| (w, h)),
+            Some((640, 360))
+        );
+        assert!(second.forced_or_held_by(4).await, "the force");
+        assert!(second.forced_or_held_by(5).await, "the hold");
+        assert_eq!(*second.manual_render_cap.lock().await, Some((320, 180)));
+
+        registry.forget_display_size_all(3).await;
+        registry.forget_forced_all(4).await;
+        assert!(second.display_sizes.lock().await.is_empty());
+        assert!(!second.forced_or_held_by(4).await);
+    }
+
+    /// An in-place reattach is invisible in the camera list, so the attach
+    /// number is what tells a client its stream started over. The rescan
+    /// reports it as attached, which pushes every peer a snapshot built from
+    /// `protocol_state`, and that carries the new number. So do the status
+    /// delta and the destroyed state, since a 0 from either would leave a
+    /// client with no baseline for the next change. Rescans that find the same
+    /// ring keep it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_in_place_reattach_bumps_the_attach_number_and_is_announced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        assert_eq!(registry.protocol_state(7).await.unwrap().attach, 1);
+
+        let quiet = registry.rescan().await;
+        assert!(quiet.attached.is_empty() && quiet.removed.is_empty());
+        assert_eq!(
+            registry.protocol_state(7).await.unwrap().attach,
+            1,
+            "same ring, same attach"
+        );
+
+        std::fs::remove_file(&ring_path).unwrap();
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        let outcome = registry.rescan().await;
+        assert_eq!(outcome.attached, vec![7]);
+        assert!(outcome.removed.is_empty(), "the camera never left the list");
+        assert_eq!(registry.protocol_state(7).await.unwrap().attach, 2);
+
+        std::fs::write(
+            shm.join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":7,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64}]}"#,
+        )
+        .unwrap();
+        let delta = registry.poll_status().await;
+        assert_eq!(delta.changed_cameras.len(), 1);
+        assert_eq!(delta.changed_cameras[0].attach, 2, "the status delta");
+        assert_eq!(
+            registry.destroyed_state(7).await.unwrap().attach,
+            2,
+            "the destroyed state"
+        );
+    }
+
+    /// A camera that leaves and returns, or comes back from destroyed, gets an
+    /// attach number it never had, so a client that saw the old one cannot
+    /// mistake the new stream for it.
+    #[tokio::test]
+    async fn the_attach_number_keeps_rising_across_a_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        std::fs::remove_file(&ring_path).unwrap();
+        registry.rescan().await;
+        assert!(registry.get(7).await.is_none());
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        registry.rescan().await;
+        assert_eq!(registry.get(7).await.expect("camera back").attach, 2);
+    }
+
+    /// A camera that was gone and comes back is a new camera: nothing carries.
+    #[tokio::test]
+    async fn a_camera_back_after_a_gap_starts_with_no_viewer_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        let shm = dir.path();
+        let ring_path = shm.join("7.ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        registry.rescan().await;
+        registry.record_display_size(7, 3, 640, 360).await;
+
+        std::fs::remove_file(&ring_path).unwrap();
+        registry.rescan().await;
+        assert!(registry.get(7).await.is_none());
+        MmapFrameRing::create(&ring_path, cfg).expect("recreate ring");
+        registry.rescan().await;
+        let back = registry.get(7).await.expect("camera back");
+        assert!(back.display_sizes.lock().await.is_empty());
+    }
+
     // The force-render profiling override keeps a peerless camera subscribed
     // (so the plugin renders + reports telemetry), and clearing it releases the
     // camera again — the cleanup path POST /profile/render?on=false relies on.
@@ -4514,6 +6148,127 @@ mod tests {
             !cam.control.lock().await.subscribed,
             "clearing force_render releases the camera (cleanup path)"
         );
+    }
+
+    /// What the plugin would read: the subscribed byte of the camera's control
+    /// block on disk.
+    fn published_subscribed(dir: &std::path::Path, flight_id: u32) -> bool {
+        let bytes = std::fs::read(dir.join(format!("{flight_id}.control.bin"))).expect("block");
+        crate::shared_mem::control::decode(&bytes)
+            .expect("decodes")
+            .subscribed
+    }
+
+    async fn registry_with_camera(
+        flight_id: u32,
+    ) -> (tempfile::TempDir, CameraRegistry, Arc<CameraState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join(format!("{flight_id}.ring")), cfg)
+            .expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(flight_id).await.expect("camera attached");
+        (dir, registry, cam)
+    }
+
+    /* The last viewer's release reads zero viewers and then writes
+    subscribed=false. A viewer binding between the two leaves a camera asleep
+    with a viewer on it, and no viewer has reason to subscribe again. */
+    #[tokio::test]
+    async fn a_camera_put_to_sleep_under_a_viewer_wakes_on_the_next_tick() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        let cams = vec![cam.clone()];
+
+        cam.subscribers.store(1, Ordering::Release);
+        registry.set_subscribed(1, true).await;
+        registry.set_subscribed(1, false).await;
+
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(cam.control.lock().await.subscribed, "woken for its viewer");
+        assert!(
+            published_subscribed(dir.path(), 1),
+            "and the plugin is told"
+        );
+
+        cam.subscribers.store(0, Ordering::Release);
+        registry.refresh_idle_subscriptions(&cams).await;
+        assert!(
+            !cam.control.lock().await.subscribed,
+            "asleep once it leaves"
+        );
+        assert!(!published_subscribed(dir.path(), 1));
+    }
+
+    /* Writers racing on one camera must leave the block saying what the state
+    says. A flush of a state read before another writer's change would put the
+    plugin to sleep while the sidecar believes it awake, and since no later
+    write sees a transition, nothing would correct it. */
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_control_writes_publish_the_final_state() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        let registry = Arc::new(registry);
+        for round in 0..2000u32 {
+            let writers: Vec<_> = (0..4u32)
+                .map(|w| {
+                    let registry = registry.clone();
+                    tokio::spawn(async move {
+                        if w % 2 == 0 {
+                            registry.set_subscribed(1, (round + w / 2) % 2 == 0).await;
+                        } else {
+                            registry.record_display_size(1, w, 640, 360).await;
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.await.expect("writer");
+            }
+            assert_eq!(
+                published_subscribed(dir.path(), 1),
+                cam.control.lock().await.subscribed,
+                "block and state differ after round {round}"
+            );
+        }
+    }
+
+    /* A control block lost from under the sidecar leaves it writing to a file the
+    plugin can no longer open, so the camera never wakes, and nothing on this
+    side looks wrong. */
+    #[tokio::test]
+    async fn a_silent_feed_gets_its_control_block_and_a_keyframe_back() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        cam.subscribers.store(1, Ordering::Release);
+        registry.set_subscribed(1, true).await;
+        let block = dir.path().join("1.control.bin");
+        std::fs::remove_file(&block).expect("block lost");
+
+        let t = Instant::now();
+        registry.recover_silent_feeds(t).await;
+        assert!(!block.exists(), "not silent long enough yet");
+
+        registry
+            .recover_silent_feeds(t + crate::feed_watch::SILENT_AFTER)
+            .await;
+        assert!(published_subscribed(dir.path(), 1), "the plugin is told");
+        assert!(cam.full.keyframe_gate.lock().unwrap().pending());
+    }
+
+    /// A viewer's feed that is moving, or a camera nobody watches, is left alone.
+    #[tokio::test]
+    async fn the_silent_feed_recovery_leaves_healthy_cameras_alone() {
+        let (dir, registry, cam) = registry_with_camera(1).await;
+        let t = Instant::now();
+        registry.recover_silent_feeds(t).await;
+        registry
+            .recover_silent_feeds(t + crate::feed_watch::SILENT_AFTER)
+            .await;
+        assert!(!dir.path().join("1.control.bin").exists(), "no viewer");
+        assert!(!cam.full.keyframe_gate.lock().unwrap().pending());
     }
 
     /// The persistent rate fields serialise to the camelCase keys the
@@ -4617,11 +6372,246 @@ mod tests {
         (registry, cam)
     }
 
+    fn ship_anchor(id: &str) -> crate::protocol::Anchor {
+        crate::protocol::Anchor {
+            id: id.into(),
+            kind: crate::protocol::AnchorKind::Vessel,
+            vessel: Some(77),
+            part: None,
+            offset: None,
+            body: None,
+            latitude: None,
+            longitude: None,
+            altitude: None,
+            direction: None,
+            vector: None,
+            orientation: None,
+            occlusion: Some(true),
+            margin_m: None,
+            kinematics: None,
+        }
+    }
+
+    async fn anchors_on_disk(dir: &tempfile::TempDir) -> serde_json::Value {
+        let bytes = tokio::fs::read(dir.path().join(COMMANDS_FILE))
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["anchors"].clone()
+    }
+
+    /// A client's anchors reach the plugin in the commands file under its
+    /// owner tag, an unknown camera or an oversized set is refused, and the
+    /// client's departure clears them on every camera at once.
+    #[tokio::test]
+    async fn anchors_are_written_per_client_and_forgotten_with_it() {
+        use crate::protocol::SetAnchorsPayload;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        registry.reset_anchors().await;
+        assert_eq!(anchors_on_disk(&dir).await, serde_json::json!([]));
+
+        registry
+            .set_anchors(
+                5,
+                SetAnchorsPayload {
+                    flight_id: 1,
+                    anchors: Some(vec![ship_anchor("ship")]),
+                },
+            )
+            .await
+            .unwrap();
+        let on_disk = anchors_on_disk(&dir).await;
+        assert_eq!(on_disk[0]["owner"], registry.anchor_owner(5));
+        assert_eq!(on_disk[0]["flightId"], 1);
+        assert_eq!(on_disk[0]["anchors"][0]["id"], "ship");
+
+        let unknown = registry
+            .set_anchors(
+                5,
+                SetAnchorsPayload {
+                    flight_id: 999,
+                    anchors: Some(vec![ship_anchor("ship")]),
+                },
+            )
+            .await;
+        assert!(unknown.is_err(), "no such camera");
+        let too_many: Vec<_> = (0..17).map(|i| ship_anchor(&format!("a{i}"))).collect();
+        assert!(registry
+            .set_anchors(
+                5,
+                SetAnchorsPayload {
+                    flight_id: 1,
+                    anchors: Some(too_many),
+                },
+            )
+            .await
+            .is_err());
+        assert_eq!(anchors_on_disk(&dir).await[0]["anchors"][0]["id"], "ship");
+
+        registry.forget_anchors_all(5).await;
+        assert_eq!(anchors_on_disk(&dir).await, serde_json::json!([]));
+    }
+
     /// `apply_viewer_quality` stores the preset's viewer level, flushes it
     /// to the plugin's control block, and marks the camera dirty for the
     /// all-peers broadcast. Multi-peer policy is last write wins: a second
     /// apply (from any peer) replaces the first, and clearing (auto)
     /// removes the field from the block entirely.
+    /// A recording's size hold reaches the plugin, and a force lifts the
+    /// viewer quality clamp for its duration without forgetting it.
+    #[tokio::test]
+    async fn size_hold_and_force_shape_what_the_plugin_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let read = || async {
+            let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+                .await
+                .expect("control block flushed");
+            crate::shared_mem::control::decode(&bytes).expect("decodes")
+        };
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::ThreeQuarter))
+            .await
+            .expect("apply");
+
+        registry.set_size_hold(1, 5, true).await;
+        let snap = read().await;
+        assert!(snap.size_held);
+        assert_eq!(snap.viewer_level, Some(1), "a hold alone leaves the clamp");
+
+        registry.set_forced_full_res(1, 5, true).await;
+        assert_eq!(read().await.viewer_level, None, "forced: clamp lifted");
+
+        /* Any later flush keeps both, whichever setter triggered it. */
+        registry
+            .apply_viewer_quality(1, Some(QualityPreset::Half))
+            .await
+            .expect("apply");
+        let snap = read().await;
+        assert!(snap.size_held);
+        assert_eq!(snap.viewer_level, None);
+        let published = registry.protocol_state(1).await.expect("state");
+        assert_eq!(
+            published.viewer_quality, None,
+            "viewers see the preset as lifted"
+        );
+
+        /* The peer leaving releases both; the stored clamp comes back. */
+        registry.forget_forced(1, 5).await;
+        let snap = read().await;
+        assert!(!snap.size_held);
+        assert_eq!(snap.viewer_level, Some(2));
+        let published = registry.protocol_state(1).await.expect("state");
+        assert_eq!(published.viewer_quality, Some(QualityPreset::Half));
+    }
+
+    fn resume(client: &str, forced: &[u32], held: &[u32]) -> ResumePayload {
+        ResumePayload {
+            client_id: client.into(),
+            forced: forced.to_vec(),
+            held: held.to_vec(),
+        }
+    }
+
+    /// A reconnect inside the grace never lets the plugin see the force or
+    /// hold drop, so a recorded camera keeps its size across it.
+    #[tokio::test]
+    async fn a_resuming_client_takes_over_its_force_and_hold_with_no_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        let read = || async {
+            let bytes = tokio::fs::read(dir.path().join("1.control.bin"))
+                .await
+                .expect("control block flushed");
+            crate::shared_mem::control::decode(&bytes).expect("decodes")
+        };
+        registry.resume_client(5, &resume("c1", &[1], &[1])).await;
+        registry.set_forced_full_res(1, 5, true).await;
+        registry.set_size_hold(1, 5, true).await;
+
+        let t0 = Instant::now();
+        registry.depart_peer(5, t0).await;
+        assert!(read().await.size_held, "kept while the client may return");
+        assert!(cam.forced_full_res.lock().await.contains(&5));
+        registry.expire_departed(t0 + RESUME_GRACE / 2).await;
+        assert!(read().await.size_held);
+
+        registry.resume_client(6, &resume("c1", &[1], &[1])).await;
+        assert!(read().await.size_held);
+        assert_eq!(*cam.forced_full_res.lock().await, [6].into());
+        assert_eq!(*cam.size_holds.lock().await, [6].into());
+        /* The grace ending later does not touch the new connection's entries. */
+        registry.expire_departed(t0 + RESUME_GRACE * 2).await;
+        assert!(read().await.size_held);
+        assert_eq!(*cam.forced_full_res.lock().await, [6].into());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_does_not_return_is_released_after_the_grace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.resume_client(5, &resume("c1", &[1], &[1])).await;
+        registry.set_forced_full_res(1, 5, true).await;
+        registry.set_size_hold(1, 5, true).await;
+
+        let t0 = Instant::now();
+        registry.depart_peer(5, t0).await;
+        registry.expire_departed(t0 + RESUME_GRACE).await;
+        assert!(cam.forced_full_res.lock().await.is_empty());
+        assert!(cam.size_holds.lock().await.is_empty());
+        /* Too late: nothing left to take over. */
+        registry.resume_client(6, &resume("c1", &[1], &[1])).await;
+        assert!(cam.size_holds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resume_keeps_only_what_the_client_still_asks_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.resume_client(5, &resume("c1", &[1], &[1])).await;
+        registry.set_forced_full_res(1, 5, true).await;
+        registry.set_size_hold(1, 5, true).await;
+        registry.depart_peer(5, Instant::now()).await;
+
+        /* The recording stopped while disconnected: the force stays, the hold goes. */
+        registry.resume_client(6, &resume("c1", &[1], &[])).await;
+        assert_eq!(*cam.forced_full_res.lock().await, [6].into());
+        assert!(cam.size_holds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_or_goodbye_peer_is_released_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.set_size_hold(1, 5, true).await;
+        registry.depart_peer(5, Instant::now()).await;
+        assert!(
+            cam.size_holds.lock().await.is_empty(),
+            "never named a client"
+        );
+
+        registry.resume_client(7, &resume("c2", &[], &[1])).await;
+        registry.set_size_hold(1, 7, true).await;
+        registry.forget_client(7).await;
+        registry.depart_peer(7, Instant::now()).await;
+        assert!(cam.size_holds.lock().await.is_empty(), "said goodbye");
+    }
+
+    /// The new connection resumed before the old one was reaped: the old
+    /// one's entries go at once, as the new one already holds what it needs.
+    #[tokio::test]
+    async fn an_old_connection_reaped_after_its_client_resumed_is_released_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_one_camera(&dir).await;
+        registry.resume_client(5, &resume("c1", &[], &[1])).await;
+        registry.set_size_hold(1, 5, true).await;
+        registry.resume_client(6, &resume("c1", &[], &[1])).await;
+        registry.set_size_hold(1, 6, true).await;
+
+        registry.depart_peer(5, Instant::now()).await;
+        assert_eq!(*cam.size_holds.lock().await, [6].into());
+    }
+
     #[tokio::test]
     async fn apply_viewer_quality_flushes_and_marks_dirty() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4754,7 +6744,7 @@ mod tests {
     }
 
     /// The pure expected-width computation: viewer scale applied to the
-    /// operator ceiling, floored to even like the plugin's QualityClamp.
+    /// operator ceiling, floored to 16 like the plugin's QualityClamp.
     #[test]
     fn quality_limited_reason_thresholds() {
         use QualityPreset::*;
@@ -4767,13 +6757,14 @@ mod tests {
         // Half of 1024 = 512: exact match honored, below = throttled.
         assert_eq!(quality_limited_reason(1024, 512, Some(Half)), None);
         assert_eq!(
-            quality_limited_reason(1024, 510, Some(Half)).as_deref(),
+            quality_limited_reason(1024, 496, Some(Half)).as_deref(),
             Some("throttled")
         );
         // Render above the target (shed gentler than the preset) is fine.
         assert_eq!(quality_limited_reason(1024, 768, Some(Half)), None);
-        // Odd products floor to even, matching the plugin's MakeEven.
-        assert_eq!(quality_limited_reason(1030, 772, Some(ThreeQuarter)), None);
+        // Other products floor to 16, matching the plugin's ScaleDimension.
+        assert_eq!(quality_limited_reason(1280, 960, Some(ThreeQuarter)), None);
+        assert_eq!(quality_limited_reason(1040, 768, Some(ThreeQuarter)), None);
     }
 
     /* Tombstone-pruning fixture: a part camera whose ring + manifest the test
@@ -4986,6 +6977,30 @@ mod tests {
         std::fs::write(dir.join("global.status.json"), body).unwrap();
     }
 
+    #[test]
+    fn effective_fov_prefers_a_usable_live_value() {
+        assert_eq!(effective_fov(Some(25.0), 60.0), 25.0);
+        assert_eq!(effective_fov(None, 60.0), 60.0);
+        assert_eq!(effective_fov(Some(0.0), 60.0), 60.0);
+        assert_eq!(effective_fov(Some(f32::NAN), 60.0), 60.0);
+        assert_eq!(effective_fov(Some(-5.0), 60.0), 60.0);
+    }
+
+    #[tokio::test]
+    async fn list_reports_the_live_status_fov() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let default = info_for(&registry, 1).await.fov;
+        std::fs::write(
+            dir.path().join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":23.5}]}"#,
+        )
+        .unwrap();
+        registry.poll_status().await;
+        assert_eq!(info_for(&registry, 1).await.fov, 23.5);
+        assert_ne!(default, 23.5);
+    }
+
     async fn info_for(registry: &CameraRegistry, flight_id: u32) -> CameraInfo {
         registry
             .list()
@@ -5094,7 +7109,7 @@ mod tests {
         let (registry, cam) = registry_with_one_camera(&dir).await;
         cam.note_keyframe_requests(2);
         cam.note_keyframe_requests(1);
-        cam.note_keyframe_sent();
+        cam.note_keyframe_sent(&cam.full, Instant::now());
         let info = info_for(&registry, 1).await;
         assert_eq!(info.keyframe_requests_received, 3);
         assert_eq!(info.keyframes_sent, 1);
@@ -5119,7 +7134,7 @@ mod tests {
         let (_dir, cam) = attach_camera_for_tracker(7_203).await;
         cam.record_display_size(1, 800, 450).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
-        cam.record_display_size(2, 100, 100).await;
+        cam.record_display_size(2, 200, 200).await;
         let now = Instant::now() + Duration::from_millis(200);
         let ds = cam.display_size_report_at(now).await.expect("held");
         assert_eq!((ds.width, ds.height), (800, 450));
@@ -5164,5 +7179,156 @@ mod tests {
         assert_eq!(v["displaySize"]["width"], 320);
         assert_eq!(v["displaySize"]["height"], 180);
         assert!(v["displaySize"]["ageMs"].is_number());
+    }
+
+    async fn registry_with_hd_camera(
+        dir: &tempfile::TempDir,
+    ) -> (CameraRegistry, Arc<CameraState>) {
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 1280,
+            max_height: 720,
+        };
+        MmapFrameRing::create(&dir.path().join("1.ring"), cfg).expect("create ring");
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(1).await.expect("camera attached from ring");
+        (registry, cam)
+    }
+
+    async fn written_size(cam: &CameraState) -> Option<(u32, u32)> {
+        let ctrl = cam.control.lock().await;
+        ctrl.width.zip(ctrl.height)
+    }
+
+    /// A viewer going bigger gets the size on the same flush.
+    #[tokio::test]
+    async fn render_size_grows_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 320, 180).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((368, 208)));
+
+        cam.record_display_size(2, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
+    }
+
+    /// The bigger viewer switching away keeps its size for `SHRINK_HOLD`,
+    /// then the camera shrinks on the tick that finds the hold run out.
+    #[tokio::test]
+    async fn render_size_shrinks_after_the_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 320, 180).await;
+        cam.record_display_size(2, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        cam.forget_display_size(2).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((656, 368)), "held");
+
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD / 2).await;
+        assert_eq!(written_size(&cam).await, Some((656, 368)), "still held");
+
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD).await;
+        assert_eq!(written_size(&cam).await, Some((368, 208)), "hold over");
+    }
+
+    /// A smaller report and a withdrawn report hold the same way, and demand
+    /// coming back inside the hold leaves the size untouched with no shrink
+    /// left pending.
+    #[tokio::test]
+    async fn render_shrink_is_cancelled_when_demand_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 434, 244).await;
+        cam.record_display_size(2, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        cam.record_display_size(2, 0, 0).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        cam.record_display_size(2, 640, 360).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(2), false)
+            .await
+            .unwrap();
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
+
+        cam.record_display_size(2, 500, 280).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(3), false)
+            .await
+            .unwrap();
+        cam.record_display_size(2, 640, 360).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(5), false)
+            .await
+            .unwrap();
+
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD * 3).await;
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
+        assert!(!cam.shrink_delay.lock().unwrap().due(t0 + SHRINK_HOLD * 3));
+    }
+
+    /// The last viewer leaving holds its size too, so a quick return costs
+    /// no restart; after the hold the camera goes back to the plugin default.
+    #[tokio::test]
+    async fn last_viewer_leaving_holds_then_releases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        cam.forget_display_size(1).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
+
+        cam.record_display_size(1, 640, 360).await;
+        registry
+            .flush_render_size_at(1, t0 + Duration::from_secs(4), false)
+            .await
+            .unwrap();
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
+
+        cam.forget_display_size(1).await;
+        let left = t0 + Duration::from_secs(6);
+        registry.flush_render_size_at(1, left, false).await.unwrap();
+        registry.settle_render_shrinks(left + SHRINK_HOLD).await;
+        assert_eq!(written_size(&cam).await, None);
+    }
+
+    /// The operator's manual cap is an explicit choice and applies at once;
+    /// a force grows at once and its release waits like any fall in demand.
+    #[tokio::test]
+    async fn manual_cap_skips_the_hold_and_force_follows_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, cam) = registry_with_hd_camera(&dir).await;
+        let t0 = Instant::now();
+        cam.record_display_size(1, 640, 360).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+
+        registry
+            .set_manual_render_size(1, Some((320, 180)))
+            .await
+            .unwrap();
+        assert_eq!(written_size(&cam).await, Some((256, 144)));
+        registry.set_manual_render_size(1, None).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
+
+        cam.set_forced(9, true).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((1280, 720)));
+
+        cam.set_forced(9, false).await;
+        registry.flush_render_size_at(1, t0, false).await.unwrap();
+        assert_eq!(written_size(&cam).await, Some((1280, 720)));
+        registry.settle_render_shrinks(t0 + SHRINK_HOLD).await;
+        assert_eq!(written_size(&cam).await, Some((656, 368)));
     }
 }

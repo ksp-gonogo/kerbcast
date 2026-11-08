@@ -55,6 +55,11 @@
 //                     so `cargo run` can own the sidecar process during
 //                     sidecar development. Set false in your install's
 //                     settings.cfg in that case.
+//
+//   devLightSpeedMps a light speed in m/s applied at startup as if a lock
+//                     holder had set it, for trying the light-time picture.
+//                     Read only when GameData/Kerbcast/PluginData/dev exists;
+//                     undocumented in the shipped settings.cfg.
 
 using System.Collections.Generic;
 using System.IO;
@@ -77,6 +82,12 @@ namespace Kerbcast
            (1280,720,6_000_000). */
         public QualityTier MaxQuality { get; private set; } = QualityTier.Sd;
         public bool AutoSpawnSidecar { get; private set; } = true;
+        /* Development only: a light speed in m/s set at startup as if a lock
+           holder had set it, so the light-time picture can be tried without
+           one. Honoured only beside a GameData/Kerbcast/PluginData/dev marker,
+           never shipped in a release; a tester's marker survives upgrades on
+           that machine. 0 (the default) is off. */
+        public double DevLightSpeedMps { get; private set; }
 
         // Target H.264 bitrate forwarded to the sidecar at launch, in bits
         // per second. 0 (the default) means auto: the flag is not forwarded
@@ -85,6 +96,15 @@ namespace Kerbcast
         // software fallback). Set explicitly to trade bandwidth for image
         // quality. Applies to every stream; only read at sidecar launch.
         public int BitrateBps { get; private set; } = 0;
+        /* Test tool: lets a test rig move one viewer's feed between the full
+           and the lighter stream by hand (the sidecar's POST /links/tier).
+           Forwarded to the sidecar at launch. Default false. */
+        public bool ManualStreamTierTesting { get; private set; } = false;
+        /* Give a viewer whose connection cannot carry a camera's full stream
+           a lighter one (half size and frame rate) automatically, and the
+           full one back once it recovers. Forwarded to the sidecar at launch.
+           Default false until measured on more connections. */
+        public bool LighterStreamsForSlowViewers { get; private set; } = false;
         /* Adaptive QUALITY ladder (resolution + FX-layer cascade,
            see KerbcastCamera.ShedTable) driven by AdaptiveQualityController.
            Default true: kerbcast demotes quality once staggering is exhausted
@@ -275,6 +295,11 @@ namespace Kerbcast
         // instance) can read it without a back-ref.
         public static bool EnableHullcamLinuxShaderSwap { get; private set; } = true;
 
+        /* By day in an atmosphere, clear a camera's galaxy layer instead of
+           rendering the black sky (see GalaxyBlackout). Off renders it every
+           frame, an escape hatch should a visual mod ever expect the render. */
+        public static bool EnableGalaxySkip { get; private set; } = true;
+
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
         // (atmospheric FX missing from streams, layer mismatches
@@ -463,6 +488,8 @@ namespace Kerbcast
                     : $"{defaultsPath} + user overrides ({userPath})";
             var camCount = settings._initialLayers.Count;
             Debug.Log($"[Kerbcast] settings loaded from {sources}: bind={settings.HttpBind} tier={settings.MaxQuality} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
+            if (!EnableGalaxySkip)
+                Debug.Log("[Kerbcast] EnableGalaxySkip=false: every camera renders its galaxy layer, even when the sky is black");
             if (!IsLoopback(settings.BindAddress))
             {
                 Debug.LogWarning($"[Kerbcast] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
@@ -499,8 +526,11 @@ namespace Kerbcast
             ApplyInt(node, "Width", v => settings.Width = v);
             ApplyInt(node, "Height", v => settings.Height = v);
             ApplyInt(node, "BitrateBps", v => settings.BitrateBps = v);
+            ApplyBool(node, "ManualStreamTierTesting", v => settings.ManualStreamTierTesting = v);
+            ApplyBool(node, "LighterStreamsForSlowViewers", v => settings.LighterStreamsForSlowViewers = v);
             ApplyBool(node, "AdaptiveQuality", v => settings.AdaptiveQuality = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
+            ApplyFloat(node, "devLightSpeedMps", v => settings.DevLightSpeedMps = v);
             ApplyFloat(node, "MaxCaptureFps", v => settings.MaxCaptureFps = v);
             ApplyFloat(node, "BackgroundCaptureFps", v => settings.BackgroundCaptureFps = v);
             ApplyBool(node, "EnableCommandCamera", v => settings.EnableCommandCamera = v);
@@ -542,6 +572,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableDeferred", v => EnableDeferred = v);
             ApplyBool(node, "EnableFirefly", v => EnableFirefly = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
+            ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
@@ -584,18 +615,16 @@ namespace Kerbcast
                 {
                     settings._atmosphericFxLayers[partName] = ParseAtmoFxLayers(fxLayersRaw);
                 }
-                // Per-camera Width/Height overrides must be even (H.264
-                // chroma sampling) and <= the global Width/Height (the
-                // ring's allocated capacity). Either field defaults to the
-                // global value if omitted.
+                /* Per-camera Width/Height overrides must be <= the global
+                   Width/Height (the ring's allocated capacity). Either field
+                   defaults to the global value if omitted. KerbcastCamera
+                   aligns the result to a multiple of 16 inside it. */
                 int? w = TryParseIntField(camNode, "Width");
                 int? h = TryParseIntField(camNode, "Height");
                 if (w.HasValue || h.HasValue)
                 {
                     int width = w ?? settings.Width;
                     int height = h ?? settings.Height;
-                    width -= width & 1;
-                    height -= height & 1;
                     if (width > settings.Width || height > settings.Height)
                     {
                         Debug.LogWarning($"[Kerbcast] settings.cfg: Camera '{partName}' size {width}x{height} exceeds global max {settings.Width}x{settings.Height}; capping");

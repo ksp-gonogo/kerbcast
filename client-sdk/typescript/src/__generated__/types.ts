@@ -8,6 +8,157 @@ export interface AdaptiveShedPayload {
 	reason: string;
 }
 
+/** What an anchor marks. */
+export enum AnchorKind {
+	/** One part of a craft, followed through docking. */
+	Part = "part",
+	/** A craft's centre of mass. */
+	Vessel = "vessel",
+	/** A point on a body's surface. */
+	Surface = "surface",
+	/** A direction, drawn at infinity. */
+	Direction = "direction",
+	/**
+	 * A point moving as `kinematics` says, propagated as a world model's
+	 * records are: a last-known ghost, a hypothesis, a predicted point.
+	 * Caller-supplied knowledge, so it is never refused and never `observed`.
+	 * Where an anchor would be observed, its result still withholds the
+	 * lens's pose: `x`, `y` and `apparentRadiusPx` only while `inFrame`, and
+	 * never `distanceM`, `behind` or `angleOffAxis`.
+	 */
+	Kinematic = "kinematic",
+}
+
+/**
+ * A direction a `direction` anchor follows, taken from its craft's orbit
+ * (not the surface frame).
+ */
+export enum AnchorDirection {
+	Prograde = "prograde",
+	Retrograde = "retrograde",
+	Normal = "normal",
+	Antinormal = "antinormal",
+	RadialIn = "radialIn",
+	RadialOut = "radialOut",
+	/** The first maneuver node's burn vector. */
+	Maneuver = "maneuver",
+	/** From the craft towards the Sun. */
+	Sun = "sun",
+	/** From the craft towards its target. */
+	Target = "target",
+	/** The craft's velocity relative to its target. */
+	TargetRelativeVelocity = "targetRelativeVelocity",
+}
+
+/** How a `kinematic` anchor moves. */
+export enum AnchorKinematicsKind {
+	/** On a conic from KSP Orbit elements. */
+	Conic = "conic",
+	/** Coasting ballistically from a state, under the body's gravity. */
+	StateVector = "stateVector",
+	/** Fixed to the body's surface, carried by its rotation. */
+	Surface = "surface",
+}
+
+/**
+ * A `kinematic` anchor's motion about one body. `kind` says which fields
+ * apply. With a light speed set, the point is placed where the light
+ * reaching the lens left it.
+ */
+export interface AnchorKinematics {
+	kind: AnchorKinematicsKind;
+	/** The body's name, e.g. `"Kerbin"`. */
+	body: string;
+	/** `conic`: degrees. */
+	inclination?: number;
+	/** `conic`: not 1; a hyperbola has a negative `semiMajorAxis`, as KSP keeps it. */
+	eccentricity?: number;
+	/** `conic`: metres. */
+	semiMajorAxis?: number;
+	/** `conic`: longitude of the ascending node, degrees. */
+	lan?: number;
+	/** `conic`: degrees. */
+	argumentOfPeriapsis?: number;
+	/** `conic`: radians, at `epoch`. */
+	meanAnomalyAtEpoch?: number;
+	/** `conic`: UT. */
+	epoch?: number;
+	/** `stateVector`: UT of the state. */
+	ut?: number;
+	/**
+	 * `stateVector`: `[x, y, z]` metres from the body centre, z up, in KSP's
+	 * fixed inertial frame (as a `positionAt` aim takes it).
+	 */
+	position?: number[];
+	/** `stateVector`: `[x, y, z]` metres per second in the same frame. */
+	velocity?: number[];
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `surface`: metres above sea level. Default 0. */
+	altitude?: number;
+}
+
+/**
+ * Something a client wants marked on a camera's picture. `kind` says which
+ * fields apply. The game projects every anchor through the camera that
+ * rendered each frame and sends the result with that frame's `FrameStamp`.
+ */
+export interface Anchor {
+	/**
+	 * The client's own name for the anchor, unique among its anchors on
+	 * one camera. 1 to 64 characters.
+	 */
+	id: string;
+	kind: AnchorKind;
+	/**
+	 * `part` and `vessel`: the craft's `Vessel.persistentId`. `direction`:
+	 * the craft whose direction is followed; absent for the active craft.
+	 */
+	vessel?: number;
+	/** `part`: the part's `Part.persistentId`. */
+	part?: number;
+	/**
+	 * `part`: `[x, y, z]` metres from the part's origin in its own axes. A
+	 * docking port is marked at its docking face, and the offset is in the
+	 * face's axes.
+	 */
+	offset?: number[];
+	/** `surface`: the body's name, e.g. `"Kerbin"`. */
+	body?: string;
+	/** `surface`: degrees, -90..=90. */
+	latitude?: number;
+	/** `surface`: degrees. */
+	longitude?: number;
+	/** `surface`: metres above sea level. Default 0. */
+	altitude?: number;
+	/** `direction`: a named direction of the craft. Give this or `vector`. */
+	direction?: AnchorDirection;
+	/**
+	 * `direction`: a fixed `[x, y, z]` direction in the inertial frame of
+	 * `Orbit.getRelativePositionAtUT` (z up). Give this or `direction`.
+	 */
+	vector?: number[];
+	/**
+	 * `part` and `vessel`: also report the thing's `forward` and `up` axes
+	 * in camera space every frame.
+	 */
+	orientation?: boolean;
+	/**
+	 * Also report whether something stands between the lens and the
+	 * anchor. Off by default: it costs a ray cast per anchor per frame.
+	 */
+	occlusion?: boolean;
+	/**
+	 * Metres added to the marked thing's radius before `apparentRadiusPx`
+	 * is worked out, to leave room around it. Default 0.
+	 */
+	marginM?: number;
+	/** `kinematic`: how the point moves. Refused on any other kind. */
+	kinematics?: AnchorKinematics;
+}
+
 /**
  * Lifecycle state of a camera. Transmitted in `CameraState` so clients
  * can react to part destruction without a new message type.
@@ -74,6 +225,23 @@ export enum CrewLocation {
 	Eva = "eva",
 }
 
+/**
+ * What kind of place a command camera's site is.
+ * 
+ * Consumers must treat a value they do not recognise as some other kind of
+ * site: new kinds are added without a protocol bump.
+ */
+export enum SiteKind {
+	/** A CommNet ground station. */
+	Station = "station",
+	/** Beside a launch site. */
+	LaunchSite = "launchSite",
+	/** A point on a body's surface. */
+	Surface = "surface",
+	/** Riding a craft. */
+	Vessel = "vessel",
+}
+
 /** How a command camera aims. */
 export enum CommandAimKind {
 	/** Follows a craft, which is the subject. */
@@ -90,7 +258,9 @@ export enum CommandAimKind {
 
 /**
  * Whether a command camera's tracking network could watch a craft. Only
- * `NotTrackable` applies outside career (or with the tracking rules off).
+ * `NotTrackable` applies outside career (or with the tracking rules off),
+ * and the world-model codes only while a command authority's world model
+ * governs the feed.
  */
 export enum CommandTargetEligibility {
 	Ok = "ok",
@@ -100,6 +270,16 @@ export enum CommandTargetEligibility {
 	LevelTooLow = "levelTooLow",
 	/** An unowned object the player has found but not tracked. */
 	NotTrackable = "notTrackable",
+	/** The world model knows the craft but not where it is. */
+	NotPositioned = "notPositioned",
+	/** The world model refuses to position the craft. */
+	Refused = "refused",
+	/** The world model's record is outside its window, or the model is invalid. */
+	Stale = "stale",
+	/** The world model is too unsure where the craft is to frame it. */
+	TooUncertain = "tooUncertain",
+	/** A code this sidecar does not know, from a newer plugin. */
+	Unknown = "unknown",
 }
 
 /** One craft a command camera could watch. */
@@ -123,10 +303,29 @@ export interface CommandTarget {
  * Present only when `CameraState.kind == Command`.
  */
 export interface CommandCentreInfo {
-	/** gonogo's command-centre id for this station, `ground:<nodeName>`. */
+	/**
+	 * `"ground:"` followed by `node_name`.
+	 * 
+	 * @deprecated Use `site_key` and `site_kind`.
+	 */
 	stationId: string;
-	/** The CommNet home's `nodeName` (KSC's is `"KSC"`). */
+	/**
+	 * The site's node name: a CommNet home's `nodeName` (KSC's is `"KSC"`),
+	 * or the generated key of a launch site, surface point or craft site.
+	 */
 	nodeName: string;
+	/**
+	 * Stable key of the place the lens stands; the same as `node_name`, and
+	 * unchanged when the craft a vessel site rides docks.
+	 */
+	siteKey?: string;
+	/** What kind of place `site_key` names. */
+	siteKind?: SiteKind;
+	/**
+	 * For a `vessel` site, `Vessel.persistentId` of the craft the lens rides
+	 * now, which follows it through docking; 0 for every other kind.
+	 */
+	vantagePersistentId?: number;
 	/**
 	 * The station's name as the player reads it in game, or `node_name` when
 	 * it has none.
@@ -164,11 +363,27 @@ export interface CommandCentreInfo {
 	 */
 	trackingLevel: number;
 	/**
+	 * UT the subject, range and targets list describe: the first status
+	 * write that showed them. A delayed client shows them only once the
+	 * frame it displays reaches this UT. Absent from plugins and sidecars
+	 * older than 1.12.
+	 */
+	ut?: number;
+	/**
 	 * Every craft the camera could watch, eligible first, then nearest
 	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
-	 * only reports what the tracking network would allow.
+	 * only reports what the tracking network would allow. A control channel
+	 * message has a size limit, so with hundreds of craft the list over it
+	 * is cut from the end and `targets_omitted` counts what was left out.
+	 * A cut list keeps the feed's subject, appended at the end out of the
+	 * eligible-then-nearest order when it fell in the cut part.
 	 */
 	targets: CommandTarget[];
+	/**
+	 * How many craft were cut from the end of `targets` to fit the message.
+	 * Absent when none were.
+	 */
+	targetsOmitted?: number;
 	/**
 	 * True for a camera made at runtime (`CreateCommandCamera`, or the
 	 * plugin's `KerbcastControl.CreateCommandCamera`), false for the one
@@ -310,6 +525,16 @@ export interface DisplaySizeReport {
  */
 export interface CameraState {
 	flightId: number;
+	/**
+	 * Which attach of this flight id the sidecar is streaming, from 1. It
+	 * changes whenever the sidecar starts the camera over on a new ring (the
+	 * camera reattached in place, came back from destroyed, or returned after
+	 * leaving the list), even when nothing else about the camera does. A
+	 * change means the stream starts again on a new encoder and capture
+	 * timeline. Compare for change only. Absent (0) from a sidecar that
+	 * predates the field.
+	 */
+	attach?: number;
 	/**
 	 * Part-destruction lifecycle. `Active` for live cameras. `Destroyed`
 	 * when the plugin reports the Hullcam part was destroyed in-flight
@@ -499,6 +724,14 @@ export interface CameraState {
 
 export interface CameraSnapshotPayload {
 	cameras: CameraState[];
+	/**
+	 * How many more cameras complete this snapshot. A snapshot too large
+	 * for one message carries the first cameras, and each of the rest
+	 * follows straight after it as a `CameraStateChanged`, which a client
+	 * that predates this field applies as it would any state change.
+	 * Absent when the snapshot is whole.
+	 */
+	follows?: number;
 }
 
 export interface CameraStateChangedPayload {
@@ -539,11 +772,17 @@ export interface CommandAim {
 	/** `positionAt`: UT of the sample. */
 	ut?: number;
 	/**
-	 * `positionAt`: `[x, y, z]` metres from the body centre at `ut`, in its
-	 * non-rotating frame (the frame of `Orbit.getRelativePositionAtUT`, z up).
+	 * `positionAt`: `[x, y, z]` metres from the body centre at `ut`, z up, in
+	 * KSP's fixed inertial frame, the one `Orbit.OrbitFrame` and
+	 * `Orbit.UpdateFromFixedVectors` work in: always
+	 * `Planetarium.Zup.LocalToWorld(orbit.getRelativePositionAtUT(ut))`.
+	 * Propagated ballistically under the body's gravity, no thrust.
 	 */
 	position?: number[];
-	/** `positionAt`: `[x, y, z]` metres per second in the same frame. */
+	/**
+	 * `positionAt`: `[x, y, z]` metres per second in the same frame:
+	 * `Planetarium.Zup.LocalToWorld(orbit.getOrbitalVelocityAtUT(ut))`.
+	 */
 	velocity?: number[];
 	/** `direction`: compass bearing in degrees from north, clockwise. */
 	azimuth?: number;
@@ -556,6 +795,13 @@ export interface CommandAim {
 	subjectPersistentId?: number;
 	/** Metres of view kept around the subject's own size when framing. Default 0. */
 	framingMarginM?: number;
+	/**
+	 * `vessel`: accept a craft whose position is too uncertain for the view
+	 * to frame, as a deliberate search of the region it may be in; without
+	 * it such an aim is refused as `tooUncertain`. Ignored on other kinds.
+	 * Default false.
+	 */
+	allowUncertain?: boolean;
 }
 
 /** Which kind of place a created command camera stands at. */
@@ -668,7 +914,8 @@ export enum ErrorCode {
 	 */
 	CommandTargetUnknown = "command-target-unknown",
 	/**
-	 * `POST /offer` refused: the offer's video carries no H.264 with
+	 * `POST /offer` or `POST /renegotiate` refused: the offer's video carries
+	 * no H.264 constrained baseline (profile-level-id 42e0xx) with
 	 * packetization-mode=1, the only video Kerbcast sends. A browser
 	 * without H.264 support (some Firefox builds lack OpenH264) offers none.
 	 */
@@ -692,6 +939,144 @@ export interface FlightIdPayload {
 }
 
 /**
+ * Where one anchor landed in one frame. Pixel positions are in the
+ * capture frame (`FrameStamp.width` by `FrameStamp.height`, origin top
+ * left). Absent for a frame in which the anchor could not be located.
+ * 
+ * An `observed` result carries only what the picture shows: `x`, `y`,
+ * `apparentRadiusPx` (and `forward` and `up` when asked for) only while the
+ * anchor is in frame and not occluded, and never `distanceM`,
+ * `angleOffAxis` or `behind`. Kerbcast's own `"subject"` anchor is always
+ * observed; a browser client's anchors are observed by default while a
+ * command authority holds the lock. A `kinematic` anchor is never observed,
+ * but where it would be its result withholds the lens's pose (see
+ * `AnchorKind::Kinematic`).
+ */
+export interface FrameAnchor {
+	/** The anchor's `id` as its owner set it. */
+	id: string;
+	/**
+	 * Who set it, for an anchor this client did not set: the game-side
+	 * owner passed to `KerbcastControl.SetAnchors`, or `"kerbcast"` for
+	 * Kerbcast's own. Absent for this client's own anchors.
+	 */
+	owner?: string;
+	/** True when the result is limited to what the picture shows (see above). */
+	observed?: boolean;
+	/** Absent from an observed result that is out of frame or occluded. */
+	x?: number;
+	y?: number;
+	/** Inside the frame and in front of the lens. */
+	inFrame: boolean;
+	/**
+	 * Behind the lens. `x` and `y` then sit off the frame on the side the
+	 * anchor is nearest. Absent from an observed result.
+	 */
+	behind?: boolean;
+	/**
+	 * Lens to anchor in metres. Absent for a `direction` anchor and from an
+	 * observed result.
+	 */
+	distanceM?: number;
+	/**
+	 * The marked thing's radius (plus `marginM`) on screen, in capture
+	 * pixels. 0 for a `surface` anchor without a margin, and always 0 for a
+	 * `direction` anchor. Absent with `x` and `y`.
+	 */
+	apparentRadiusPx?: number;
+	/**
+	 * Degrees between the camera's axis and the anchor. Absent from an
+	 * observed result.
+	 */
+	angleOffAxis?: number;
+	/**
+	 * The thing's forward axis in camera space (x right, y up, z forward),
+	 * when the anchor asked for `orientation`. For a craft, the direction
+	 * its control point faces; for a docking port, the way the port faces;
+	 * for another part, its stack axis.
+	 */
+	forward?: number[];
+	/**
+	 * The thing's up axis in camera space, perpendicular to `forward`,
+	 * when the anchor asked for `orientation`. Gives its roll.
+	 */
+	up?: number[];
+	/**
+	 * Whether something stands between the lens and the anchor, when the
+	 * anchor asked for `occlusion`, and always on an observed result.
+	 */
+	occluded?: boolean;
+}
+
+/**
+ * A command camera's state as one frame shows it, taken when the frame was
+ * rendered and sent with that frame's `FrameStamp`, so a delayed viewer
+ * never learns it before seeing the frame. The fields shared with
+ * `CommandTrackState` mean the same; the rest say what the knowledge was.
+ */
+export interface FrameCommandState {
+	hasFix: boolean;
+	/** Range to the aimed point in metres. Absent without a fix. */
+	rangeM?: number;
+	/**
+	 * Bracket half-extent in capture pixels of a `frame_height_px` frame.
+	 * Absent without a fix.
+	 */
+	bracketHalfPx?: number;
+	frameHeightPx: number;
+	framingFits: boolean;
+	/**
+	 * The drawn craft's offset from frame centre in capture pixels. Under a
+	 * lock, only while the picture shows the craft.
+	 */
+	trueOffsetPx?: number;
+	occluded: boolean;
+	/** Name of the occluding body when `occluded`, otherwise empty. */
+	occluder: string;
+	sunlit: boolean;
+	/** Why the feed is blanked; this frame is black. */
+	blank?: string;
+	/** The lock holder, absent with no lock. */
+	authority?: CommandAuthorityState;
+	/** The craft the frame is aimed at; 0 for none. */
+	subjectPersistentId: number;
+	aimKind?: CommandAimKind;
+	/**
+	 * Why the subject has no position: `unknown`, `notPositioned`,
+	 * `refused` or `stale`. Absent when it has one or there is no subject.
+	 * Treat an unrecognised value as `refused`.
+	 */
+	refusal?: string;
+	/** The world model's own code and words for a `refused` subject. */
+	refusalCode?: string;
+	refusalText?: string;
+	/**
+	 * The instant the subject's known position is taken at: the frame's
+	 * UT, the subject's past instant under a light speed, or the start of
+	 * the world model's record for it when that is later.
+	 */
+	subjectUt?: number;
+	/** Where the knowledge came from: `truth`, `waiting`, `model` or `stale`. */
+	worldModel?: string;
+	/**
+	 * Sequence of the world model snapshot the frame read, with the UT its
+	 * knowledge describes and the scope the feed's site is bound to.
+	 * Absent under truth. The sequence is a whole number, sent as a
+	 * JSON number.
+	 */
+	worldModelSeq?: number;
+	knowledgeUt?: number;
+	scope?: string;
+	/**
+	 * The camera has no subject to aim at yet, so the frame shows its
+	 * placeholder framing (a launch site lens at its site, a station level
+	 * toward the horizon, a riding lens along its craft). A viewer can say
+	 * it is waiting for a target. False from a game that does not send it.
+	 */
+	waitingForTarget?: boolean;
+}
+
+/**
  * Mission-time stamp of one video frame, sent on the control channel just
  * before the frame's RTP packets. A browser matches it to a presented frame
  * by `rtp_timestamp` (`requestVideoFrameCallback` metadata `rtpTimestamp`),
@@ -712,6 +1097,59 @@ export interface FrameStampPayload {
 	 * belongs to.
 	 */
 	captureEpoch: number;
+	/**
+	 * Vertical field of view the frame was rendered with, degrees. Absent
+	 * when the game did not report one (kerbal cameras, plugins older
+	 * than 1.12).
+	 */
+	fov?: number;
+	/** The frame's size in capture pixels, the space anchor positions are in. */
+	width?: number;
+	height?: number;
+	/**
+	 * Where each anchor landed in this frame: the client's own anchors and
+	 * those set in game. Only for a client that asked for anchors with
+	 * `SetFrameStamps`; absent when there are none.
+	 */
+	anchors?: FrameAnchor[];
+	/**
+	 * The frame's live bound in seconds: the light time covering what of
+	 * the lens's own craft and site it draws at `capture_ut`, the larger of
+	 * one 60 fps frame and the light time to the lens's own farthest part.
+	 * 0 with no light speed. Other loaded craft near the lens are still
+	 * drawn at `capture_ut` and are not covered yet; once craft beyond the
+	 * boundary are hidden, the bound covers everything drawn at
+	 * `capture_ut`. A delayed viewer releases the frame no sooner than
+	 * `capture_ut` plus this plus its own delay from the lens. Absent when
+	 * the game could not read it, and from sidecars older than 1.12: under
+	 * a light speed that is unknown, and the frame is held.
+	 */
+	liveLightTimeS?: number;
+	/**
+	 * How far light travels in one 60 fps frame at the light speed: craft
+	 * nearer the lens than this are drawn at `capture_ut`, farther ones at
+	 * their own past instant. Absent with no light speed.
+	 */
+	boundaryM?: number;
+	/**
+	 * Unix wall-clock milliseconds just before the sidecar hands the
+	 * frame's packets to the transport. Differences between frames show the
+	 * sidecar's own send pacing, apart from what the network adds. Absent
+	 * from sidecars older than 1.12.
+	 */
+	sentWallMs?: number;
+	/** The frame's encoded size in bytes. Absent from sidecars older than 1.12. */
+	encodedBytes?: number;
+	/**
+	 * Whether the frame is a keyframe (IDR). Absent from sidecars older than
+	 * 1.12.
+	 */
+	keyframe?: boolean;
+	/**
+	 * A command camera's state in this frame. Only for a client that asked
+	 * with `SetFrameStamps` `command: true`.
+	 */
+	command?: FrameCommandState;
 }
 
 export interface HelloPayload {
@@ -722,6 +1160,45 @@ export interface HelloPayload {
 	 * `SetFrameStamps`. Absent from sidecars older than 1.11.
 	 */
 	frameStamps?: boolean;
+	/**
+	 * True when this sidecar takes `SetAnchors` and sends anchor results
+	 * with frame stamps to a client that asks with `SetFrameStamps`
+	 * `anchors: true`. Absent from sidecars older than 1.12.
+	 */
+	anchors?: boolean;
+	/**
+	 * True when this sidecar sends a command camera's per-frame state with
+	 * frame stamps to a client that asks with `SetFrameStamps`
+	 * `command: true`, and `liveLightTimeS` on every stamp. Absent from
+	 * sidecars older than 1.12.
+	 */
+	frameCommand?: boolean;
+	/**
+	 * The most anchors one client may set on one camera. Absent from
+	 * sidecars older than 1.12.
+	 */
+	maxAnchorsPerCamera?: number;
+	/**
+	 * True when this sidecar takes `SetSizeHold`. Absent from sidecars
+	 * older than 1.12, which answer it with an error.
+	 */
+	sizeHold?: boolean;
+	/**
+	 * True when this sidecar takes `Resume`. Absent from sidecars older
+	 * than 1.12.
+	 */
+	resume?: boolean;
+	/**
+	 * True when this sidecar answers `POST /renegotiate`, so a client whose
+	 * slots are all bound can add more without reconnecting. Absent from
+	 * sidecars older than 1.12.
+	 */
+	renegotiate?: boolean;
+	/**
+	 * The most video slots one connection may hold, counting slots added by
+	 * renegotiation. Absent from sidecars older than 1.12.
+	 */
+	maxSlots?: number;
 }
 
 /**
@@ -739,6 +1216,26 @@ export interface ReportDisplaySizePayload {
 }
 
 /**
+ * Names the client behind a new connection, so a reconnect keeps what its
+ * last connection asked for. When a connection drops, the sidecar keeps that
+ * client's `SetForceFullResolution` and `SetSizeHold` for a grace period
+ * instead of releasing them at once; a connection that resumes the same
+ * `client_id` within it takes them over, so a recorded camera never
+ * resizes across the reconnect. Only the cameras still listed in `forced`
+ * and `held` are kept. A client that does not return in time is released
+ * as before. Send right after `Hello`, before resending any force or hold,
+ * and only to a sidecar whose `Hello` has `resume: true`.
+ */
+export interface ResumePayload {
+	/** Stable for the life of the client, across its connections. */
+	clientId: string;
+	/** Cameras this client still forces to full resolution. */
+	forced: number[];
+	/** Cameras this client still holds at their size. */
+	held: number[];
+}
+
+/**
  * Scene-state change: whether KSP is currently in a flight scene. Sent
  * after `Hello` (priming) and whenever the polled in-flight flag flips,
  * so clients can show a calm out-of-flight standby instead of per-camera
@@ -746,6 +1243,29 @@ export interface ReportDisplaySizePayload {
  */
 export interface SceneStateChangedPayload {
 	inFlight: boolean;
+}
+
+/**
+ * Replace this client's anchors on one camera, or clear them with
+ * `anchors` absent or null. Anchors belong to the client that set them:
+ * they are display, not commands, so the command lock does not apply, and
+ * they are cleared when the client disconnects. At most
+ * `MAX_ANCHORS_PER_CAMERA` per client per camera.
+ */
+export interface SetAnchorsPayload {
+	flightId: number;
+	anchors?: Anchor[];
+}
+
+/**
+ * Sent after the browser applies a re-offer's answer, before it subscribes
+ * any camera to the new slots. A re-offer whose answer the browser never
+ * applies is never confirmed, so its slots stay idle instead of carrying a
+ * camera the browser cannot play.
+ */
+export interface ConfirmSlotsPayload {
+	/** The pool size the applied answer covers, old slots and new. */
+	slots: number;
 }
 
 /**
@@ -788,8 +1308,9 @@ export interface SetDegradePayload {
  * Forces a camera to render at the operator ceiling regardless of
  * display-size demand. Per-viewer, OR-aggregated by the sidecar: a feed
  * stays forced while any connected viewer forces it, and releases when
- * the last one clears it (or disconnects). Still yields to the adaptive
- * framerate shed; overrides only the demand term.
+ * the last one clears it (or disconnects). Overrides the demand term and
+ * any viewer quality preset (which returns on release); still capped by
+ * an operator render-size cap and the adaptive shed.
  */
 export interface SetForceFullResolutionPayload {
 	flightId: number;
@@ -803,6 +1324,16 @@ export interface SetFovPayload {
 
 export interface SetFrameStampsPayload {
 	enabled: boolean;
+	/**
+	 * Also send each frame's anchor results. Off unless asked for, so a
+	 * client that predates anchors never receives them.
+	 */
+	anchors?: boolean;
+	/**
+	 * Also send a command camera's state with each of its frames. Off
+	 * unless asked for.
+	 */
+	command?: boolean;
 }
 
 export interface SetLayersPayload {
@@ -848,6 +1379,20 @@ export interface SetRenderSizePayload {
 	flightId: number;
 	width: number;
 	height: number;
+}
+
+/**
+ * Holds a camera at the size it is rendering now, for as long as a viewer
+ * is recording it, so the clip never changes size mid-file. While held, the
+ * adaptive ladder sheds this camera's frame rate rather than its resolution,
+ * and display-size reports, quality presets and render-size changes wait
+ * until the last hold is released. Per-viewer, OR-aggregated like
+ * `SetForceFullResolution`, and released when the viewer unsubscribes or
+ * disconnects (after a grace for a client that may `Resume`).
+ */
+export interface SetSizeHoldPayload {
+	flightId: number;
+	hold: boolean;
 }
 
 export interface SetThrottleMainScreenPayload {
@@ -973,6 +1518,12 @@ export type ClientMessage =
 	/** Point a command camera, or return it to its default. Server-wide. */
 	| { type: "set-command-aim", content: SetCommandAimPayload }
 	/**
+	 * Replace or clear this client's anchors on one camera. Per client:
+	 * other clients never see them, and they go when this client does.
+	 * Send only to a sidecar whose `Hello` has `anchors: true`.
+	 */
+	| { type: "set-anchors", content: SetAnchorsPayload }
+	/**
 	 * A consumer reporting its OWN current display size in px; the sidecar
 	 * aggregates MAX-across-consumers to drive auto-resolution
 	 * (meet-the-minimum-need). Distinct from the operator `SetRenderSize`
@@ -984,11 +1535,27 @@ export type ClientMessage =
 	 * Force a camera to render at the operator ceiling regardless of
 	 * display-size demand. Per-viewer, OR-aggregated by the sidecar: a
 	 * feed stays forced while any connected viewer forces it, and
-	 * releases when the last one clears it (or disconnects). Still
-	 * yields to the adaptive framerate shed; overrides only the demand
-	 * term, never the perf-protection ceiling.
+	 * releases when the last one clears it (or disconnects). Overrides
+	 * the demand term and any viewer quality preset, never the
+	 * perf-protection ceiling.
 	 */
 	| { type: "set-force-full-resolution", content: SetForceFullResolutionPayload }
+	/**
+	 * Hold a camera at its current size while a viewer records it. See
+	 * `SetSizeHoldPayload`.
+	 */
+	| { type: "set-size-hold", content: SetSizeHoldPayload }
+	/**
+	 * Name the client behind this connection and take over what its last
+	 * connection forced and held. See `ResumePayload`.
+	 */
+	| { type: "resume", content: ResumePayload }
+	/**
+	 * The browser applied the answer to a `POST /renegotiate` re-offer and
+	 * can play every slot up to `slots`; until then grown slots take no
+	 * camera. See `ConfirmSlotsPayload`.
+	 */
+	| { type: "confirm-slots", content: ConfirmSlotsPayload }
 	/**
 	 * Ask for background capture: subscribed cameras that this
 	 * consumer is NOT displaying keep capturing at a low rate instead of
@@ -1112,7 +1679,8 @@ export type ClientMessage =
 	/**
 	 * Start or stop `FrameStamp` messages on this peer's control channel.
 	 * Off until asked for, so clients that predate stamps never receive
-	 * them. Send only to a sidecar whose `Hello` has `frameStamps: true`.
+	 * them. Send only to a sidecar whose `Hello` has `frameStamps: true`;
+	 * `anchors: true` only to one whose `Hello` has `anchors: true`.
 	 */
 	| { type: "set-frame-stamps", content: SetFrameStampsPayload };
 
@@ -1156,8 +1724,8 @@ export type ServerMessage =
 	| { type: "error", content: ErrorPayload }
 	/**
 	 * Keepalive probe sent by the sidecar every 5 seconds. Browser responds
-	 * with `Pong`; if no Ping arrives within 15s the browser tears down
-	 * the connection.
+	 * with `Pong`, which the sidecar does not wait for. Neither side closes
+	 * the connection over a missing Ping or Pong.
 	 */
 	| { type: "ping", content?: undefined }
 	/**

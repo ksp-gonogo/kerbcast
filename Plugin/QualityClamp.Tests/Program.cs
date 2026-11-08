@@ -70,9 +70,9 @@ Check(QualityClamp.ClampViewerLevel(99) == QualityClamp.MaxViewerLevel,
     "oversized level clamps to the deepest preset");
 Check(Effective(1024, 576, 0, 99) == (256, 144), "oversized level degrades sanely");
 
-// --- Dimension rounding: even (H.264 chroma), floor, never below 2. ---
-Check(QualityClamp.ScaleDimension(1030, 0.75f) == 772, "odd product floors to even");
-Check(QualityClamp.ScaleDimension(2, 0.25f) == 2, "tiny dims floor at 2");
+// --- Dimension rounding: multiples of 16 (H.264 macroblocks), floor, never below 16. ---
+Check(QualityClamp.ScaleDimension(1030, 0.75f) == 768, "other products floor to 16");
+Check(QualityClamp.ScaleDimension(2, 0.25f) == 16, "tiny dims floor at 16");
 Check(QualityClamp.ScaleDimension(1024, 0.75f) == 768, "exact products untouched");
 
 // --- The ceiling is the ceiling: no input combination exceeds it. ---
@@ -85,6 +85,65 @@ Check(QualityClamp.ScaleDimension(1024, 0.75f) == 768, "exact products untouched
             if (w > 1024 || h > 576) exceeded = true;
         }
     Check(!exceeded, "no shed/viewer combination exceeds the operator ceiling");
+}
+
+// --- Shedding never takes a render under the encoder minimum. ---
+{
+    int min = QualityClamp.MinEncodeDimension;
+    Check(QualityClamp.ScaleSize(1024, 576, 0.25f) == (256, 144), "a large size sheds as before");
+    Check(QualityClamp.ScaleSize(256, 144, 1.0f) == (256, 144), "unshed small size untouched");
+    Check(QualityClamp.ScaleSize(256, 144, 0.75f) == (256, 144), "a shed 256x144 stays at the minimum");
+    Check(QualityClamp.ScaleSize(256, 144, 0.25f) == (256, 144), "a deep shed too");
+    Check(QualityClamp.ScaleSize(512, 288, 0.25f) == (256, 144), "shed lands on the minimum at its shape");
+    Check(QualityClamp.ScaleSize(128, 448, 0.5f) == (128, 448), "a tall size keeps its shape");
+    Check(QualityClamp.ScaleSize(64, 64, 1.0f) == (64, 64), "never past the operator dims");
+    bool under = false;
+    foreach (var (ow, oh) in new[] { (228, 128), (300, 170), (1024, 576), (170, 300), (2048, 256) })
+        for (int shed = 0; shed < shedScales.Length; shed++)
+            for (int viewer = 0; viewer <= QualityClamp.MaxViewerLevel; viewer++)
+            {
+                float scale = QualityClamp.EffectiveScale(shedScales[shed], viewer);
+                var (w, h) = QualityClamp.ScaleSize(ow, oh, scale);
+                if (w < min || h < min || w > ow || h > oh || w % 16 != 0 || h % 16 != 0) under = true;
+            }
+    Check(!under, "every shed/viewer step stays within [minimum, operator] and 16-aligned");
+}
+
+// --- Rendered sizes are multiples of 16 at the configured shape. ---
+{
+    Check(QualityClamp.ScaleSize(1920, 1080, 1.0f) == (1920, 1072), "fullhd rounds down inside its ring");
+    Check(QualityClamp.ScaleSize(640, 360, 1.0f) == (624, 352), "low rounds down at its shape");
+    Check(QualityClamp.ScaleSize(1000, 562, 1.0f) == (992, 560), "an unaligned setting rounds down at its shape");
+    Check(QualityClamp.ScaleSize(1280, 720, 0.75f) == (960, 544), "a shed step covers the scaled size");
+    Check(QualityClamp.ScaleSize(432, 244, 1.0f) == (400, 224), "an unaligned operator size stays inside itself, in shape");
+    Check(QualityClamp.AlignDown(1080) == 1072 && QualityClamp.AlignDown(1024) == 1024 && QualityClamp.AlignDown(3) == 16,
+        "AlignDown floors to 16");
+
+    /* The same answers as the sidecar's encoder/frame_size.rs for the same inputs. */
+    double wide = 16.0 / 9.0;
+    Check(QualityClamp.AlignedCover(432, 244, 1024, 576, wide) == (480, 272), "matches the sidecar: 432x244");
+    Check(QualityClamp.AlignedCover(434, 244, 1024, 576, wide) == (480, 272), "matches the sidecar: 434x244");
+    Check(QualityClamp.AlignedCover(228, 128, 1280, 720, wide) == (256, 144), "matches the sidecar: the minimum");
+    Check(QualityClamp.AlignedCover(400, 225, 1280, 720, wide) == (400, 224), "matches the sidecar: one row short");
+    Check(QualityClamp.AlignedCover(320, 180, 1280, 720, wide) == (368, 208), "matches the sidecar: 320x180");
+    Check(QualityClamp.AlignedCover(320, 180, 320, 180, wide) == (256, 144), "matches the sidecar: at a limit");
+
+    /* Whatever size the sidecar chose comes back unchanged, so render == operator at rest. */
+    bool moved = false;
+    foreach (var (ow, oh) in new[] { (256, 144), (368, 208), (480, 272), (656, 368), (1024, 576), (1920, 1072) })
+        if (QualityClamp.ScaleSize(ow, oh, 1.0f) != (ow, oh)) moved = true;
+    Check(!moved, "an aligned operator size is its own render size");
+
+    bool bad = false;
+    foreach (var (ow, oh) in new[] { (640, 360), (1024, 576), (1280, 720), (1920, 1080), (1024, 768) })
+        for (int shed = 0; shed < shedScales.Length; shed++)
+            for (int viewer = 0; viewer <= QualityClamp.MaxViewerLevel; viewer++)
+            {
+                var (w, h) = QualityClamp.ScaleSize(ow, oh, QualityClamp.EffectiveScale(shedScales[shed], viewer));
+                double drift = Math.Abs((double)w / h / ((double)ow / oh) - 1.0);
+                if (w % 16 != 0 || h % 16 != 0 || w > ow || h > oh || drift > 0.0101) bad = true;
+            }
+    Check(!bad, "every tier at every shed/viewer step is aligned, inside the ceiling and in shape");
 }
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILURE(S)");

@@ -41,6 +41,15 @@ const HOLD_MS = 5000;
 const ASPECT_TOLERANCE = 0.06;
 const MAGNITUDE_SLACK = 1.15;
 
+/**
+ * The smallest request on either axis: a small box asks for this much, at the
+ * camera's shape, because hardware encoders refuse to encode tinier frames.
+ */
+export const MIN_DISPLAY_REPORT_PX = 128;
+
+/* A box under this on either axis (hidden, or not yet laid out) is no demand, matching the sidecar. */
+const EMPTY_BOX_PX = 2;
+
 function bucket(px: number): number {
   const b = Math.ceil(px / BUCKET_PX) * BUCKET_PX;
   return b < BUCKET_PX ? BUCKET_PX : b;
@@ -60,8 +69,14 @@ export function displayReportSize(
 ): { width: number; height: number } {
   const a = aspect > 0 && Number.isFinite(aspect) ? aspect : DEFAULT_FEED_ASPECT;
   const fit = width > 0 && height > 0 ? Math.min(width, height * a) : width;
-  const w = bucket(fit);
-  return { width: w, height: Math.max(2, Math.round(w / a / 2) * 2) };
+  let w = bucket(fit);
+  if (w < MIN_DISPLAY_REPORT_PX) w = bucket(MIN_DISPLAY_REPORT_PX);
+  if (w / a < MIN_DISPLAY_REPORT_PX) w = bucket(MIN_DISPLAY_REPORT_PX * a);
+  return { width: w, height: Math.round(w / a / 2) * 2 };
+}
+
+function isEmpty(box: Size): boolean {
+  return !(box.width >= EMPTY_BOX_PX) || !(box.height >= EMPTY_BOX_PX);
 }
 
 export interface Size {
@@ -246,7 +261,7 @@ export function useReportDisplaySize(
 
     const sizeFor = (box: Size): Size => {
       if (!square) return displayReportSize(box.width, box.height, aspectRef.current);
-      const side = bucket(Math.min(box.width, box.height));
+      const side = Math.max(MIN_DISPLAY_REPORT_PX, bucket(Math.min(box.width, box.height)));
       return { width: side, height: side };
     };
 
@@ -254,6 +269,13 @@ export function useReportDisplaySize(
       lastW = width;
       lastH = height;
       displaySizes.report(flightId, instanceId, width, height);
+    };
+
+    const withdraw = () => {
+      if (lastW < 0) return;
+      lastW = -1;
+      lastH = -1;
+      displaySizes.clear(flightId, instanceId);
     };
 
     /*
@@ -269,9 +291,14 @@ export function useReportDisplaySize(
       if (prev && near.some((c) => c.at >= seenAt - FOLLOW_MS && followsStream(prev, box, c))) {
         return;
       }
+      if (isEmpty(box)) {
+        withdraw();
+        return;
+      }
       const next = sizeFor(box);
       if (next.width === lastW && next.height === lastH) return;
-      if (near.length > 0) {
+      /* With nothing reported since a withdraw there is no loop to break. */
+      if (near.length > 0 && lastW >= 0) {
         const held = now - lastSuspectAt < HOLD_MS;
         lastSuspectAt = now;
         if (held) return;
@@ -283,6 +310,8 @@ export function useReportDisplaySize(
       const entry = entries[0];
       if (!entry) return;
       const box = { width: entry.contentRect.width, height: entry.contentRect.height };
+      /* Until the box is first laid out, every measurement counts as the first, so it reports promptly. */
+      if (!firstReported && isEmpty(box)) return;
       if (!firstReported) {
         firstReported = true;
         baseline = box;
@@ -296,7 +325,7 @@ export function useReportDisplaySize(
     });
     observer.observe(el);
     reapply.current = () => {
-      if (!baseline) return;
+      if (!baseline || isEmpty(baseline)) return;
       const next = sizeFor(baseline);
       if (next.width !== lastW || next.height !== lastH) send(next);
     };

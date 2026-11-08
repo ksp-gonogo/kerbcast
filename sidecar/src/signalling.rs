@@ -7,8 +7,14 @@
 //!   `KerbcastPeer` with one video track per selected camera AND a
 //!   "kerbcast-control" data channel, answers the SDP, and returns the
 //!   answer. Unknown camera IDs are dropped with a warning rather than
-//!   failing the whole request. An offer whose video has no H.264 is
-//!   refused with 422 and an `ErrorPayload` body (`code: codec-unsupported`).
+//!   failing the whole request. An offer whose video lacks the H.264 format
+//!   Kerbcast sends is refused with 422 and an `ErrorPayload` body
+//!   (`code: codec-unsupported`), as is such a re-offer.
+//! - `POST /renegotiate` takes `{ session, sdp, slots }`: a re-offer from
+//!   the peer the `/offer` answer named `session`, adding video transceivers
+//!   so the slot pool grows to `slots` without disturbing running feeds.
+//!   Returns `{ sdp }`. A re-offer may repeat one whose answer the browser
+//!   never applied; `slots` must exceed the slots the browser has confirmed.
 //! - `GET /` serves the bundled kerbcast web UI (web/dist/index.html,
 //!   embedded at compile time via include_str!).
 //! - `GET /assets/mediabunny.min.mjs` serves the Mediabunny remux-trim
@@ -41,7 +47,9 @@ use tracing::{info, warn};
 use crate::cameras::{CameraInfo, CameraRegistry, StatusLogEntry};
 use crate::encoder::EncoderChoice;
 use crate::protocol::{ErrorCode, ErrorPayload, ErrorSource};
-use crate::webrtc::KerbcastPeer;
+use crate::webrtc::{
+    offers_sent_h264, FormatRefused, GrowRefused, KerbcastPeer, MAX_SLOTS_PER_PEER,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +61,8 @@ pub struct AppState {
     pub encoder_choice: EncoderChoice,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// Serve POST /links/tier (`--manual-tier-switch`).
+    pub manual_tier_switch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +90,23 @@ pub struct AnswerResponse {
     /// IDs). The browser uses this to render the right number of video
     /// elements.
     pub cameras: Vec<u32>,
+    /// Names this connection to `POST /renegotiate`.
+    pub session: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenegotiateRequest {
+    /// The `session` from this connection's `/offer` answer.
+    pub session: String,
+    pub sdp: String,
+    /// The pool size after this re-offer: every recv-only video transceiver
+    /// the offer carries, old and new.
+    pub slots: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RenegotiateResponse {
+    pub sdp: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,17 +115,60 @@ pub struct CamerasResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct LinksResponse {
+    pub peers: Vec<PeerLink>,
+}
+
+/// One viewer's connection quality, for diagnosing a slow viewer remotely.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerLink {
+    pub peer_id: u32,
+    pub cameras: Vec<u32>,
+    /// `None` until the peer has been sampled twice.
+    pub link: Option<crate::link::LinkWindow>,
+    /// The tier each feed is actually sent on.
+    pub tiers: Vec<crate::ladder::SlotTier>,
+    /// The tiers the detector chose for this viewer's feeds. They are applied
+    /// only with `--lighter-streams-for-slow-viewers`; otherwise they are a
+    /// shadow of what it would do.
+    pub shadow: crate::ladder::LadderState,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTierRequest {
+    pub peer_id: u32,
+    pub flight_id: u32,
+    pub tier: crate::ladder::Tier,
+}
+
+#[derive(Debug, Serialize)]
 pub struct DumpLogsResponse {
     pub entries: Vec<StatusLogEntry>,
 }
 
+/// Turns on `POST /links/tier` like `--manual-tier-switch`, for test rigs
+/// that start the sidecar themselves.
+pub const RIG_MANUAL_TIERS_ENV: &str = "KERBCAST_RIG_MANUAL_TIERS";
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let manual_tiers =
+        state.manual_tier_switch || std::env::var(RIG_MANUAL_TIERS_ENV).is_ok_and(|v| v == "1");
+    let mut router = Router::new();
+    /* Any web page a viewer opens can reach the sidecar (CORS allows every
+    origin), so the hand tier switch exists only when a rig asks for it. */
+    if manual_tiers {
+        router = router.route("/links/tier", post(set_link_tier));
+    }
+    router
         .route("/", get(serve_index))
         .route("/assets/mediabunny.min.mjs", get(serve_mediabunny))
         .route("/health", get(health))
         .route("/cameras", get(cameras))
+        .route("/links", get(links))
         .route("/offer", post(offer))
+        .route("/renegotiate", post(renegotiate))
         .route("/dumpLogs", get(dump_logs))
         .route("/dumpLogs/reset", post(reset_logs))
         .route("/profile", get(profile))
@@ -138,6 +208,50 @@ async fn serve_mediabunny() -> impl IntoResponse {
 async fn cameras(State(state): State<AppState>) -> impl IntoResponse {
     let list = state.registry.list().await;
     (StatusCode::OK, Json(CamerasResponse { cameras: list })).into_response()
+}
+
+async fn links(State(state): State<AppState>) -> impl IntoResponse {
+    let peers: Vec<Arc<KerbcastPeer>> = state.peers.read().await.clone();
+    let mut out = Vec::with_capacity(peers.len());
+    for peer in peers.iter().filter(|p| p.is_alive()) {
+        out.push(PeerLink {
+            peer_id: peer.peer_id,
+            cameras: peer.bound_flight_ids().await,
+            link: peer.link_window(),
+            tiers: peer.delivery_tiers().await,
+            shadow: peer.ladder_state(),
+        });
+    }
+    (StatusCode::OK, Json(LinksResponse { peers: out })).into_response()
+}
+
+/// Move one viewer's feed of one camera onto a delivery tier by hand, for
+/// testing a tier switch on a real link. Served only with
+/// `--manual-tier-switch` (settings.cfg ManualStreamTierTesting) or
+/// `KERBCAST_RIG_MANUAL_TIERS=1`.
+async fn set_link_tier(
+    State(state): State<AppState>,
+    Json(req): Json<SetTierRequest>,
+) -> impl IntoResponse {
+    let peer = state
+        .peers
+        .read()
+        .await
+        .iter()
+        .find(|p| p.peer_id == req.peer_id && p.is_alive())
+        .cloned();
+    let Some(peer) = peer else {
+        return (StatusCode::NOT_FOUND, "no live viewer with that peerId\n").into_response();
+    };
+    if peer.set_tier(req.flight_id, req.tier).await {
+        (StatusCode::OK, "ok\n").into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            "that viewer is not watching that camera\n",
+        )
+            .into_response()
+    }
 }
 
 /// Serves the plugin's latest `global.status.json` (the per-phase render/
@@ -238,6 +352,114 @@ async fn offer(State(state): State<AppState>, Json(req): Json<OfferRequest>) -> 
     }
 }
 
+fn too_many_slots(asked: usize) -> ErrorPayload {
+    ErrorPayload {
+        message: format!(
+            "a connection holds at most {MAX_SLOTS_PER_PEER} video slots, asked for {asked}"
+        ),
+        source: ErrorSource::Sidecar,
+        flight_id: None,
+        code: Some(ErrorCode::NoFreeSlot),
+    }
+}
+
+fn codec_unsupported() -> ErrorPayload {
+    ErrorPayload {
+        message: "the offer has no video section the sidecar can answer with H.264 \
+                  constrained baseline, packetization-mode=1 (profile-level-id 42e0xx), the \
+                  only video Kerbcast sends, under one payload type; if the browser lacks \
+                  H.264, enable it (Firefox: the OpenH264 plugin) or use another browser"
+            .to_owned(),
+        source: ErrorSource::Sidecar,
+        flight_id: None,
+        code: Some(ErrorCode::CodecUnsupported),
+    }
+}
+
+fn unprocessable(message: String) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ErrorPayload {
+            message,
+            source: ErrorSource::Sidecar,
+            flight_id: None,
+            code: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Grows a live peer's slot pool from a re-offer. Spawned for the same reason
+/// as `/offer`: a client hanging up mid-exchange must not leave the peer
+/// connection half-renegotiated.
+async fn renegotiate(
+    State(state): State<AppState>,
+    Json(req): Json<RenegotiateRequest>,
+) -> impl IntoResponse {
+    let slots = req.slots as usize;
+    if slots > MAX_SLOTS_PER_PEER {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(too_many_slots(slots)),
+        )
+            .into_response();
+    }
+    /* A pool size that disagrees with the offer would leave the two sides
+    counting different slots, so the mismatch is refused before any change. */
+    let offered = offered_video_sections(&req.sdp);
+    if offered != slots {
+        return unprocessable(format!(
+            "the re-offer carries {offered} video sections but asks for {slots} slots"
+        ));
+    }
+    let peer = {
+        let peers = state.peers.read().await;
+        peers
+            .iter()
+            .find(|p| p.session == req.session && p.is_alive())
+            .cloned()
+    };
+    let Some(peer) = peer else {
+        return (
+            StatusCode::NOT_FOUND,
+            "no live connection with that session\n",
+        )
+            .into_response();
+    };
+    /* The format is grow's to judge: it knows the payload type this connection
+    already sends under, which a re-offer has to keep. */
+    let current = peer.confirmed_slot_count().await;
+    if slots <= current {
+        return unprocessable(format!(
+            "a re-offer must add slots: asked for {slots}, the pool already has {current}"
+        ));
+    }
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(peer.grow(slots, req.sdp).await);
+    });
+    match rx.await {
+        Ok(Ok(sdp)) => (StatusCode::OK, Json(RenegotiateResponse { sdp })).into_response(),
+        Ok(Err(e)) if e.is::<GrowRefused>() => unprocessable(e.to_string()),
+        Ok(Err(e)) if e.is::<FormatRefused>() => {
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(codec_unsupported())).into_response()
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "renegotiation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("renegotiation failed: {e}"),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "renegotiation task died before answering\n",
+        )
+            .into_response(),
+    }
+}
+
 /// Runs the whole exchange on a spawned task rather than inline.
 ///
 /// Axum drops a handler's future the moment the client hangs up, and every
@@ -260,19 +482,9 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
 
 async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerResponse> {
     /* Refused before the peer exists, so no camera is subscribed for an
-    exchange that would only fail later with webrtc-rs's "codec is not
-    supported by remote". */
-    if offered_video_sections(&req.sdp) > 0 && !offers_h264_mode1(&req.sdp) {
-        return Err(OfferRefused(ErrorPayload {
-            message: "the browser offered no H.264 video (packetization-mode=1), the only \
-                      video Kerbcast sends; enable H.264 in the browser (Firefox: the OpenH264 \
-                      plugin) or use another browser"
-                .to_owned(),
-            source: ErrorSource::Sidecar,
-            flight_id: None,
-            code: Some(ErrorCode::CodecUnsupported),
-        })
-        .into());
+    exchange that can never carry a feed. */
+    if offered_video_sections(&req.sdp) > 0 && !offers_sent_h264(&req.sdp) {
+        return Err(OfferRefused(codec_unsupported()).into());
     }
     // Resolve selection: if the browser didn't ask for specific cameras,
     // subscribe to all of them. Useful for the v0.2 test page which
@@ -300,6 +512,11 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
     // Pool size = the offer's recv-only video transceiver count. Absent
     // (older clients) → one slot per initial camera (the old behaviour).
     let slot_count = req.slots.map(|s| s as usize).unwrap_or(requested.len());
+    /* Only an explicit pool is held to the ceiling: a legacy offer's size is
+    its camera list, which it has always been free to make as long as it likes. */
+    if req.slots.is_some() && slot_count > MAX_SLOTS_PER_PEER {
+        return Err(OfferRefused(too_many_slots(slot_count)).into());
+    }
 
     let peer = Arc::new(KerbcastPeer::new(state.registry.clone(), &requested, slot_count).await?);
 
@@ -321,6 +538,9 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
             /* This connection can never come up, so don't make its cameras wait
             out the negotiation deadline. */
             peer.mark_dead();
+            if e.is::<FormatRefused>() {
+                return Err(OfferRefused(codec_unsupported()).into());
+            }
             return Err(e);
         }
     };
@@ -334,47 +554,13 @@ async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerR
     Ok(AnswerResponse {
         sdp: answer_sdp,
         cameras: subscribed,
+        session: peer.session.clone(),
     })
 }
 
 /// The number of video m-lines in an SDP offer.
 fn offered_video_sections(sdp: &str) -> usize {
     sdp.lines().filter(|l| l.starts_with("m=video")).count()
-}
-
-/// Whether any video section of an SDP offer has an H.264 payload type with
-/// packetization-mode=1, the mode every slot's track is pinned to.
-fn offers_h264_mode1(sdp: &str) -> bool {
-    let mut sections: Vec<(bool, Vec<&str>)> = Vec::new();
-    for line in sdp.lines().map(str::trim) {
-        if line.starts_with("m=") {
-            sections.push((line.starts_with("m=video"), Vec::new()));
-        } else if let Some((_, attrs)) = sections.last_mut() {
-            attrs.push(line);
-        }
-    }
-    sections
-        .iter()
-        .filter(|(video, _)| *video)
-        .any(|(_, attrs)| {
-            let payload_types = |prefix: &str, keep: fn(&str) -> bool| -> Vec<&str> {
-                attrs
-                    .iter()
-                    .filter_map(|l| l.strip_prefix(prefix)?.split_once(' '))
-                    .filter(|(_, rest)| keep(rest))
-                    .map(|(pt, _)| pt)
-                    .collect()
-            };
-            let h264 = payload_types("a=rtpmap:", |codec| {
-                codec.to_ascii_lowercase().starts_with("h264/")
-            });
-            let mode1 = payload_types("a=fmtp:", |params| {
-                params
-                    .split(';')
-                    .any(|p| p.trim().eq_ignore_ascii_case("packetization-mode=1"))
-            });
-            h264.iter().any(|pt| mode1.contains(pt))
-        })
 }
 
 #[cfg(test)]
@@ -397,6 +583,7 @@ mod tests {
             encoder_choice: EncoderChoice::Auto,
             fps: 30,
             bitrate_bps: 2_000_000,
+            manual_tier_switch: false,
         }
     }
 
@@ -433,6 +620,40 @@ mod tests {
             body.len() > 400_000,
             "expected the real Mediabunny bundle, got {} bytes",
             body.len(),
+        );
+    }
+
+    /// The hand tier switch exists only when the operator turns it on.
+    #[tokio::test]
+    async fn the_manual_tier_switch_is_served_only_when_turned_on() {
+        let post = |state: AppState| async move {
+            let response = router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/links/tier")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"peerId":7,"flightId":1,"tier":"reduced"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        let (status, body) = post(empty_state()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.is_empty(), "no such route: {body}");
+        let on = AppState {
+            manual_tier_switch: true,
+            ..empty_state()
+        };
+        let (status, body) = post(on).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.contains("no live viewer"),
+            "the route answered: {body}"
         );
     }
 
@@ -515,7 +736,7 @@ mod tests {
         };
 
         let req = OfferRequest {
-            sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
                 .to_owned(),
             cameras: Vec::new(),
             slots: None,
@@ -531,20 +752,128 @@ mod tests {
         );
     }
 
+    /// POST `body` as JSON to `uri`, returning the status and body bytes.
+    async fn post_json(
+        state: &AppState,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, axum::body::Bytes) {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        (
+            status,
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+    }
+
+    /// An H.264 offer with `n` video sections, as far as the handlers read it.
+    fn offer_with_videos(n: usize) -> String {
+        let mut sdp = "v=0\r\n".to_owned();
+        for _ in 0..n {
+            sdp.push_str("m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n");
+        }
+        sdp
+    }
+
+    #[tokio::test]
+    async fn an_offer_over_the_slot_ceiling_is_refused() {
+        let state = empty_state();
+        let asked = MAX_SLOTS_PER_PEER + 1;
+        let body =
+            serde_json::json!({ "sdp": offer_with_videos(asked), "cameras": [], "slots": asked });
+        let (status, body) = post_json(&state, "/offer", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::NoFreeSlot));
+        assert!(state.peers.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_over_the_slot_ceiling_is_refused() {
+        let state = empty_state();
+        let asked = MAX_SLOTS_PER_PEER + 1;
+        let body =
+            serde_json::json!({ "session": "x", "sdp": offer_with_videos(asked), "slots": asked });
+        let (status, body) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::NoFreeSlot));
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_whose_slots_disagree_with_its_sections_is_refused() {
+        let state = empty_state();
+        let body = serde_json::json!({ "session": "x", "sdp": offer_with_videos(3), "slots": 4 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_for_an_unknown_or_dead_session_is_not_found() {
+        let state = empty_state();
+        let body =
+            serde_json::json!({ "session": "nobody", "sdp": offer_with_videos(3), "slots": 3 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let peer = Arc::new(
+            KerbcastPeer::new(state.registry.clone(), &[], 2)
+                .await
+                .expect("peer"),
+        );
+        peer.mark_dead();
+        state.peers.write().await.push(peer.clone());
+        let body =
+            serde_json::json!({ "session": peer.session, "sdp": offer_with_videos(3), "slots": 3 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a dead peer's session is stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_offer_that_adds_no_slots_is_refused() {
+        let state = empty_state();
+        let peer = Arc::new(
+            KerbcastPeer::new(state.registry.clone(), &[], 2)
+                .await
+                .expect("peer"),
+        );
+        state.peers.write().await.push(peer.clone());
+        let body =
+            serde_json::json!({ "session": peer.session, "sdp": offer_with_videos(2), "slots": 2 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(peer.slot_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn sessions_are_distinct_and_unguessable_in_length() {
+        let state = empty_state();
+        let a = KerbcastPeer::new(state.registry.clone(), &[], 1)
+            .await
+            .unwrap();
+        let b = KerbcastPeer::new(state.registry.clone(), &[], 1)
+            .await
+            .unwrap();
+        assert_ne!(a.session, b.session);
+        assert_eq!(a.session.len(), 32);
+    }
+
     /// The video section of a Firefox offer built without OpenH264.
     const VP8_ONLY_OFFER: &str = "v=0\r\no=mozilla...THIS_IS_SDPARTA-99.0 1 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=video 9 UDP/TLS/RTP/SAVPF 120 124 121 125 126 127 97 98\r\nc=IN IP4 0.0.0.0\r\na=recvonly\r\na=mid:0\r\na=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1\r\na=fmtp:120 max-fs=12288;max-fr=60\r\na=rtpmap:120 VP8/90000\r\na=rtpmap:121 VP9/90000\r\na=rtpmap:124 rtx/90000\r\na=rtpmap:126 AV1/90000\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\na=sctp-port:5000\r\n";
-
-    #[test]
-    fn detects_h264_with_packetization_mode_1() {
-        assert!(!offers_h264_mode1(VP8_ONLY_OFFER));
-        let chrome = "v=0\r\nm=video 9 X 96 102 104\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f\r\na=rtpmap:104 h264/90000\r\na=fmtp:104 level-asymmetry-allowed=1; packetization-mode=1;profile-level-id=42e01f\r\n";
-        assert!(offers_h264_mode1(chrome));
-        let mode0_only = "v=0\r\nm=video 9 X 102\r\na=rtpmap:102 H264/90000\r\na=fmtp:102 packetization-mode=0;profile-level-id=42e01f\r\n";
-        assert!(!offers_h264_mode1(mode0_only));
-        /* Payload types are per section: an fmtp in another section does not count. */
-        let split = "v=0\r\nm=video 9 X 102\r\na=rtpmap:102 H264/90000\r\nm=video 9 X 102\r\na=rtpmap:102 VP8/90000\r\na=fmtp:102 packetization-mode=1\r\n";
-        assert!(!offers_h264_mode1(split));
-    }
 
     /// A browser with no H.264 gets a 422 naming the cause, and no peer is
     /// built for it, instead of a 500 from deep inside the SDP exchange.
@@ -573,6 +902,73 @@ mod tests {
         assert!(
             state.peers.read().await.is_empty(),
             "no peer for a refused offer"
+        );
+    }
+
+    /// webrtc-rs reads codecs from the first video section alone, so a first
+    /// section without the sent format is refused even when a later one has it.
+    #[tokio::test]
+    async fn an_offer_whose_first_video_section_lacks_h264_is_refused() {
+        let state = empty_state();
+        let sdp = format!(
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n{}",
+            offer_with_videos(1).trim_start_matches("v=0\r\n")
+        );
+        let body = serde_json::json!({ "sdp": sdp, "cameras": [], "slots": 2 });
+        let (status, body) = post_json(&state, "/offer", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::CodecUnsupported));
+        assert!(state.peers.read().await.is_empty());
+    }
+
+    /// webrtc-rs takes codecs from the first video section whatever its port,
+    /// so one on port 0 without the sent format is refused with a reason, not
+    /// failed deep in the exchange.
+    #[tokio::test]
+    async fn an_offer_whose_first_video_section_is_on_port_0_without_h264_is_refused() {
+        let state = empty_state();
+        let sdp = format!(
+            "v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n{}",
+            offer_with_videos(1).trim_start_matches("v=0\r\n")
+        );
+        let body = serde_json::json!({ "sdp": sdp, "cameras": [], "slots": 2 });
+        let (status, body) = post_json(&state, "/offer", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::CodecUnsupported));
+        assert!(state.peers.read().await.is_empty());
+    }
+
+    /// The handler leaves the format to `grow`, whose refusal still reaches
+    /// the client as codec-unsupported.
+    #[tokio::test]
+    async fn a_re_offer_without_h264_is_refused_with_a_reason() {
+        let state = empty_state();
+        let body = serde_json::json!({ "session": "x", "sdp": VP8_ONLY_OFFER, "slots": 1 });
+        let (status, _) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown session is not found whatever it offers"
+        );
+
+        let peer = Arc::new(
+            KerbcastPeer::new(state.registry.clone(), &[], 0)
+                .await
+                .expect("peer"),
+        );
+        state.peers.write().await.push(peer.clone());
+        let body =
+            serde_json::json!({ "session": peer.session, "sdp": VP8_ONLY_OFFER, "slots": 1 });
+        let (status, body) = post_json(&state, "/renegotiate", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let refusal: ErrorPayload = serde_json::from_slice(&body).expect("ErrorPayload body");
+        assert_eq!(refusal.code, Some(ErrorCode::CodecUnsupported));
+        assert_eq!(
+            peer.slot_count().await,
+            0,
+            "no slot added for a refused re-offer"
         );
     }
 

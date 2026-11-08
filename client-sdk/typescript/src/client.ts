@@ -1,8 +1,10 @@
 import type {
   AdaptiveShedPayload,
+  Anchor,
   CameraState,
   ClientMessage,
   CommandAim,
+  CommandCentreInfo,
   CommandVantage,
   DisplaySizeReport,
   ErrorPayload,
@@ -16,6 +18,7 @@ import { CameraKind, CameraLifecycle, CommandAimKind, ErrorCode, ErrorSource } f
 import {
   type DisplayedFrameUt,
   type FrameUt,
+  FrameHistory,
   FrameStampStore,
   STAMP_TO_DISPLAY_MAX_MS,
   type VideoWithFrameCallback,
@@ -28,7 +31,19 @@ import {
   type NoisePipeline,
   tryCreateNoisePipeline,
 } from "./noise";
-import { RecordingController, type RecordingControllerOptions } from "./recording";
+import {
+  RecordingController,
+  type RecordingControllerOptions,
+  type RecordingTiming,
+} from "./recording";
+import type { EncodedFrameCopy } from "./captureClip";
+import { MAX_ANCHORS_PER_CAMERA } from "./anchors";
+import { CommandCentreHistory } from "./commandTrack";
+
+/** A reported display size as the wire carries it: whole px, 0 for anything that is not a number. */
+function wholeDisplayPx(px: number): number {
+  return Number.isFinite(px) ? Math.round(px) : 0;
+}
 
 /** Cadence of estimated frames from a watcher on a browser without `requestVideoFrameCallback`. */
 const ESTIMATED_FRAME_INTERVAL_MS = 100;
@@ -39,12 +54,75 @@ const SOURCELESS_INTENSITY = 1.0;
 /** Floor applied to the degrade-driven intensity of a live feed. */
 const LIVE_INTENSITY_FLOOR = 0.05;
 /**
- * While a feed is stalled, how often to re-request a keyframe. A stall is
- * usually a wedged decoder that only a fresh IDR clears; the first request or
- * its keyframe can be lost during the same outage, so we keep asking until
- * frames resume.
+ * While a feed is stalled, how long to wait before re-requesting a keyframe.
+ * A stall is usually a wedged decoder that only a fresh IDR clears; the first
+ * request or its keyframe can be lost during the same outage, so we keep
+ * asking until frames resume. The wait doubles after each request up to the
+ * cap, because on a lossy link every IDR burst adds loss of its own.
  */
 const STALL_KEYFRAME_RETRY_MS = 2000;
+const STALL_KEYFRAME_RETRY_MAX_MS = 8000;
+/**
+ * How long frames must flow before a new stall starts the backoff over. A
+ * lossy link that trickles a frame every second or two keeps its backoff.
+ */
+const STALL_KEYFRAME_RESET_MS = 5000;
+/**
+ * The fewest slots one re-offer adds. A page opening several feeds at once
+ * gets them in one exchange instead of one per feed.
+ */
+const SLOT_GROWTH_STEP = 4;
+/**
+ * How long a slot re-offer may wait for the sidecar's answer before it counts
+ * as failed, so a hung request cannot leave the pool stuck mid-grow.
+ */
+const RENEGOTIATE_TIMEOUT_MS = 10_000;
+/**
+ * Waits before each retry of a failed slot re-offer, the last repeating
+ * while any camera still waits for a slot.
+ */
+const GROW_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000];
+/**
+ * How often a receiver whose transform is watched is checked for arriving
+ * packets: quickly for its first minute, then slowly for as long as it stays
+ * idle. A freed slot that is never fed again is so polled every 2 s until
+ * disconnect. A stats call taking longer than the timeout is abandoned so the
+ * next check can ask again.
+ *
+ * The passthrough, or a camera's transform whose host gave its hold, is
+ * checked for decoded frames once packets arrive. An instance replaced on
+ * the receiver may go on decoding what it held for up to its hold after the
+ * handover. A frame decoded once that drain is over, and once packets have
+ * arrived for the transform's own hold, ends the watch. A receiver where a
+ * camera's transform with no hold given was replaced, whose drain has no
+ * bound, is renewed once when packets first arrive and checked after.
+ * Packets arriving with none decoded for the longer of the hold and the
+ * drain left, plus the stall window (doubling with each renewal after the
+ * first), earn a renewal, up to the retry limit.
+ * A gap in packets restarts that count only when longer than the idle
+ * window, so a camera at a few frames a second still builds one. A camera's
+ * transform with no hold given is renewed once when packets first arrive.
+ * See {@link KerbcastClient._syncEncodedTransforms}.
+ */
+const TRANSFORM_HEAL_POLL_MS = 250;
+const TRANSFORM_HEAL_FAST_FOR_MS = 60_000;
+const TRANSFORM_HEAL_SLOW_POLL_MS = 2_000;
+const TRANSFORM_HEAL_STATS_TIMEOUT_MS = 5_000;
+const TRANSFORM_HEAL_STALL_MS = 2_000;
+const TRANSFORM_HEAL_IDLE_MS = 1_000;
+/**
+ * How often a hold given as a function is read while its transform is
+ * installed, checked or not, so the longest it reached is known when the
+ * instance is replaced and may drain for that long.
+ */
+const TRANSFORM_HOLD_SAMPLE_MS = 2_000;
+const TRANSFORM_HEAL_RETRIES = 3;
+/**
+ * Failed re-offers in a row after which a connection stops growing. Each
+ * failure after the sidecar answered leaves it a few stopped transceivers it
+ * keeps for the connection's life, so the retries must end.
+ */
+const MAX_GROW_FAILURES = 6;
 
 /** Controls the digital-static noise overlay baked into `cam.mediaStream`. */
 export interface NoiseConfig {
@@ -67,13 +145,29 @@ export interface KerbcastCameraHandle {
    * Transitions are emitted as `stall` events.
    */
   readonly stalled: boolean;
+  /**
+   * True while this client receives the camera's video: its track is bound
+   * and live. False before the first track, after its slot is freed or moved
+   * to another camera, once the camera is destroyed or its track ends, and
+   * while disconnected. Transitions are emitted as `source` events.
+   */
+  readonly hasSource: boolean;
+  /**
+   * True while this client wants the camera's video but the connection has
+   * no video slot to carry it, and cannot add one. The camera gets the next
+   * slot another camera gives up. A client that can grow its slot pool adds
+   * one instead, so this stays false. Transitions are emitted as `waiting`
+   * events.
+   */
+  readonly waitingForSlot: boolean;
   /** Current {@link setShowStatic} setting. */
   readonly showStatic: boolean;
   /**
-   * The feed's physical/ceiling maximum render size (`DiscoveredCamera.maxWidth`
-   * / `maxHeight`), or `null` until known. Populated from a prior
-   * `client.discover()` call (there is no live-pushed field for it), so a
-   * consumer that never calls `discover()` sees `null` here indefinitely.
+   * The feed's physical/ceiling maximum render size, or `null` until known.
+   * Read from the live camera state's `maxWidth` / `maxHeight`, falling back
+   * to the last `client.discover()` for a sidecar that predates those fields.
+   * A camera that appears after the page's discovery still gets a ceiling
+   * from its first state.
    * Used by `RecordingController` to recognise a force-full-resolution feed
    * that has actually reached its ceiling, as opposed to one merely
    * unchanged since before the force was sent.
@@ -115,10 +209,23 @@ export interface KerbcastCameraHandle {
    * regardless of display size, until released by calling this with
    * `false`. Per-viewer, OR-aggregated server-side across viewers: a feed
    * stays forced while any viewer forces it, and releases when the last one
-   * clears it (or disconnects). Still yields to the adaptive framerate
-   * shed; it only overrides the display-size demand term.
+   * clears it (or disconnects); sent again after a reconnect. Overrides the
+   * display-size demand and any viewer quality preset (the preset returns
+   * on release); still capped by an operator render-size cap and the
+   * adaptive shed.
    */
   setForceFullResolution(force: boolean): Promise<void>;
+  /**
+   * Hold this feed at the size it is rendering now, until released by
+   * calling this with `false`, so a recording never changes size mid-clip.
+   * While held, load is shed through the frame rate instead, and size
+   * changes (display size, quality presets) wait for the release.
+   * Per-viewer and OR-aggregated server-side, like
+   * {@link setForceFullResolution}, and sent again after a reconnect. Only a
+   * sidecar whose `hello` offers holds (1.12 and later) receives it. The
+   * recorder holds a feed for as long as it records it.
+   */
+  setSizeHold(hold: boolean): Promise<void>;
   requestKeyframe(): Promise<void>;
 
   /**
@@ -140,16 +247,43 @@ export interface KerbcastCameraHandle {
    * Run a transform on this camera's encoded frames before they are decoded,
    * and so before Kerbcast's static and frame lock see them. Kerbcast calls
    * `factory` for a fresh instance each time the camera lands on a receiver
-   * (connect, slot rebind, reconnect) and removes it from a receiver the
-   * camera leaves; frames the old instance still holds are discarded. The
-   * setting persists across reconnects. `null` detaches.
+   * (connect, slot rebind, reconnect) or its stream starts over on the one it
+   * has (back in the list after a scene change, back from destroyed, or a new
+   * {@link CameraState.attach} from a reattach in place), and removes it from a
+   * receiver the camera leaves; frames the old instance still holds are
+   * discarded. On the `"script"` path Chromium can leave an instance handed
+   * to an idle receiver without frames, and one built while packets flow is
+   * wired at once. With {@link EncodedTransformOptions.holdMs} given, an
+   * install is renewed from the factory only when packets keep arriving with
+   * no frame decoded past the hold; one whose frames decode is left alone.
+   * Without it, each install is renewed once when packets next arrive on its
+   * receiver, which drops whatever the first instance held.
+   * Build the instance inside the factory call. The setting persists across
+   * reconnects. `null` detaches.
    *
    * Needs {@link KerbcastClientConfig.encodedTransforms}; throws without it,
    * or when the browser has no install path. Failures while installing
    * (the factory throws, or returns the wrong kind for the path) surface as
    * client `error` events.
    */
-  setEncodedTransform(factory: EncodedTransformFactory | null): void;
+  setEncodedTransform(factory: EncodedTransformFactory | null, opts?: EncodedTransformOptions): void;
+
+  /**
+   * Copy this camera's encoded frames, as received and before decode, to
+   * `onFrame` until the returned function is called. What the camera shows
+   * is unchanged. Returns null when frames cannot be copied: the client was
+   * built without `recordingTiming: "capture"`, the browser has no encoded
+   * transform path, or (where the browser uses `RTCRtpScriptTransform`) the
+   * camera already runs its own {@link setEncodedTransform}. Follows the
+   * camera across receivers, so a copy can switch synchronisation source
+   * mid-stream. On that same `RTCRtpScriptTransform` path, setting a
+   * transform on a tapped camera stops the copies until it is removed; the
+   * client emits an `error` event when that happens.
+   */
+  tapEncodedFrames(onFrame: (frame: EncodedFrameCopy) => void): (() => void) | null;
+
+  /** Whether {@link tapEncodedFrames} would copy frames right now. */
+  canTapEncodedFrames(): boolean;
 
   on<K extends keyof KerbcastCameraEvents>(
     event: K,
@@ -165,6 +299,10 @@ export interface KerbcastCameraEvents {
   stream: MediaStream | null;
   /** Frames stopped arriving on a live source (`true`) / resumed (`false`). */
   stall: boolean;
+  /** {@link KerbcastCameraHandle.hasSource} changed. */
+  source: boolean;
+  /** {@link KerbcastCameraHandle.waitingForSlot} changed. */
+  waiting: boolean;
 }
 
 /**
@@ -187,11 +325,75 @@ export interface EncodedTransformContext {
   path: EncodedTransformPath;
 }
 
+/** Options for {@link KerbcastCameraHandle.setEncodedTransform}. */
+export interface EncodedTransformOptions {
+  /**
+   * The longest a frame can be held inside the transform, including any
+   * pacing buffer, in ms, or a function returning it, called at each check so
+   * the hold can change as it runs. Given, Kerbcast renews the transform on
+   * the `"script"` path only when packets keep arriving with no frame decoded
+   * for longer than the hold plus 2 s (doubling with each retry after the
+   * first, at most three), since Chromium may have left the instance without
+   * frames. An instance whose frames decode once packets have reached it for
+   * the hold is never renewed, so its held frames survive. The longest hold
+   * read (a function is read every 2 s while the transform is installed)
+   * also bounds how long the instance may go on decoding what it held after
+   * it is replaced on its receiver, relaunch included, which the check of the
+   * one replacing it waits out before trusting or renewing it. Left out,
+   * Kerbcast cannot tell a hold from a lost instance and renews each install
+   * once when packets first arrive, restarting the hold, and does the same
+   * for whatever replaces it on that receiver. A value that is not a finite
+   * number of 0 or more, or a function that throws, counts as left out.
+   */
+  holdMs?: number | (() => number);
+}
+
 /**
  * Builds a transform instance for one receiver. An instance is single-use,
- * so Kerbcast asks for a new one whenever the camera moves receiver.
+ * so Kerbcast asks for a new one whenever the camera moves receiver or its
+ * stream starts over.
  */
 export type EncodedTransformFactory = (ctx: EncodedTransformContext) => EncodedTransform;
+
+/** A factory's instance on one receiver, as {@link KerbcastClient} tracks it. */
+interface TransformInstall {
+  flightId: number;
+  factory: EncodedTransformFactory;
+  /** The hold the host gave with the factory when it was installed. */
+  holdMs: EncodedTransformOptions["holdMs"];
+  /** The longest hold read for this install, which bounds what it can still be holding after a shorter one is given. */
+  maxHoldMs: number;
+}
+
+/** A receiver's inbound-rtp counters, for one stats entry. */
+interface ReceiverCounts {
+  packets: number;
+  frames: number;
+}
+
+/** A script-path receiver whose transform is watched once packets arrive on it, and renewed only while none decode. */
+interface PendingHeal {
+  /** The camera's install to renew from its factory, or null for the passthrough left when one was removed. */
+  install: TransformInstall | null;
+  /** The camera named when the renewal fails and nothing is bound to the receiver. */
+  flightId: number;
+  /** Orders this watch against stats requests, so it is sampled only from a report asked for after its transform was handed over. */
+  seq: number;
+  /** Each inbound-rtp stats entry's counters on the receiver at the latest sample, by stats id. */
+  last: Map<string, ReceiverCounts> | null;
+  /** When the latest sample was taken. */
+  lastAt: number;
+  /** Renewals made so far. */
+  renewals: number;
+  /** Since when packets have kept arriving with no frame decoded, through gaps no longer than {@link TRANSFORM_HEAL_IDLE_MS}. */
+  stalledSince: number | null;
+  /** The first poll since the watch started or last renewed that saw packets arrive. */
+  packetsSince: number | null;
+  /** The latest poll that saw packets arrive. */
+  packetsAt: number | null;
+  /** When the watch started or last renewed, which sets how fast it is polled. */
+  since: number;
+}
 
 /** Configuration for {@link KerbcastClient} construction. */
 export interface KerbcastClientConfig {
@@ -233,6 +435,20 @@ export interface KerbcastClientConfig {
    */
   encodedTransforms?: boolean;
   /**
+   * How `client.recording` times a clip. `"capture"` records the encoded
+   * H.264 frames as received, without re-encoding, into an MP4 timed by each
+   * frame's RTP timestamp, which follows when the game captured the frame:
+   * a network stall no longer shows as a freeze and then a burst. It needs
+   * the same per-receiver passthrough as {@link encodedTransforms} (a worker
+   * on a `blob:` URL, or Chrome's legacy `createEncodedStreams` where that is
+   * the only path), so it too is set before connecting and is off by
+   * default. `"arrival"` (the default) records the decoded track with
+   * `MediaRecorder`, timed by arrival. A clip falls back to arrival timing
+   * when its frames cannot be copied; `RecordingHandle.timing` says which
+   * it got.
+   */
+  recordingTiming?: RecordingTiming;
+  /**
    * ICE gathering timeout in milliseconds. Passed to the default
    * {@link BrowserKerbcastTransport}; ignored when a custom transport is
    * provided (the transport owns gathering). Defaults to 2000 ms.
@@ -254,16 +470,68 @@ export interface KerbcastClientConfig {
     sdp: string;
     cameras: number[];
     slots?: number;
-  }) => Promise<{ sdp: string; cameras: number[] }>;
+  }) => Promise<{ sdp: string; cameras: number[]; session?: string }>;
+  /**
+   * Override how a re-offer that grows the slot pool is exchanged. Defaults
+   * to a POST to the sidecar's HTTP `/renegotiate`. `session` comes from the
+   * `/offer` answer, so a relay that brokers {@link negotiate} must pass it
+   * through. A client given `negotiate` but not this one cannot grow its
+   * pool: a camera that finds every slot taken reports
+   * {@link KerbcastCameraHandle.waitingForSlot} instead.
+   */
+  renegotiate?: (offer: {
+    session: string;
+    sdp: string;
+    slots: number;
+  }) => Promise<{ sdp: string }>;
   /**
    * Options for the lazily-built {@link RecordingController} (`client.recording`).
    * The load-bearing use is `loadTrimmer`: a consumer that can't rely on the
    * default bare `import("mediabunny")` resolving (the sidecar's embedded web
    * page serves its own copy of the package locally, offline/LAN, no CDN)
-   * supplies its own loader here. Bundler consumers (e.g. gonogo) can omit
+   * supplies its own loader here. Bundler consumers can omit
    * this and get the default.
    */
   recording?: RecordingControllerOptions;
+  /**
+   * Rebuild the connection by itself when one that was up fails, with the
+   * same cameras subscribed. `true` takes the defaults in
+   * {@link AutoReconnectOptions}. Off by default: a consumer that rebuilds
+   * its own connection on `"failed"` sees no change. Between attempts the
+   * state stays `"failed"`, and an attempt goes from there to `"connecting"`
+   * without passing `"disconnected"`; `reconnect-attempt`, `reconnect-success` and
+   * `reconnect-give-up` report progress. {@link KerbcastClient.connect} and
+   * {@link KerbcastClient.disconnect} cancel a reconnect under way.
+   */
+  autoReconnect?: boolean | AutoReconnectOptions;
+}
+
+/** Tuning for {@link KerbcastClientConfig.autoReconnect}. */
+export interface AutoReconnectOptions {
+  /** Attempts before giving up. Default 8. */
+  maxAttempts?: number;
+  /** Wait before the first attempt, doubling after each. Default 1000 ms. */
+  initialDelayMs?: number;
+  /** Longest wait between attempts. Default 30 000 ms. */
+  maxDelayMs?: number;
+  /**
+   * How long an attempt may take to connect before it counts as failed, so
+   * an offer exchange that never answers cannot stall the run. Default
+   * 30 000 ms.
+   */
+  attemptTimeoutMs?: number;
+}
+
+const AUTO_RECONNECT_DEFAULTS: Required<AutoReconnectOptions> = {
+  maxAttempts: 8,
+  initialDelayMs: 1000,
+  maxDelayMs: 30_000,
+  attemptTimeoutMs: 30_000,
+};
+
+/** Payload of the reconnect events: the attempt starting, or how many were made. */
+export interface ReconnectProgress {
+  attempt: number;
 }
 
 /** WebRTC connection state surface. */
@@ -300,9 +568,8 @@ export interface InboundVideoStats {
  * channel after `connect()`.
  *
  * Deliberately separate from `CameraState` even though the two share several
- * field names, because the shapes differ: `DiscoveredCamera` has `maxWidth`
- * / `maxHeight` (physical sensor limits) which `CameraState` omits, while
- * `CameraState` adds runtime fields (`layers`, `renderWidth`, `panYaw`, ...).
+ * field names, because the shapes differ: `CameraState` adds runtime fields
+ * (`layers`, `renderWidth`, `panYaw`, ...).
  */
 export interface DiscoveredCamera {
   flightId: number;
@@ -398,8 +665,11 @@ export class CommandTargetUnknownError extends Error {
 }
 
 /**
- * The sidecar refused `POST /offer` with a reason, for example
- * `ErrorCode.CodecUnsupported` when the browser offers no H.264 video.
+ * The sidecar refused `POST /offer` or `POST /renegotiate` with a reason, for
+ * example `ErrorCode.CodecUnsupported` when the browser offers no H.264
+ * constrained baseline. A refused `/renegotiate` throws the subclass
+ * {@link RenegotiateRefusedError}, which carries the same `status`, `reason`
+ * and `code`; `code` is absent when the refusal had no error payload.
  */
 export class OfferRefusedError extends Error {
   constructor(
@@ -409,6 +679,15 @@ export class OfferRefusedError extends Error {
   ) {
     super(`[kerbcast] connection refused: ${reason}`);
     this.name = "OfferRefusedError";
+  }
+}
+
+/** The sidecar refused a re-offer outright, so sending it again cannot help. */
+export class RenegotiateRefusedError extends OfferRefusedError {
+  constructor(status: number, reason: string, code?: ErrorCode) {
+    super(status, reason, code);
+    this.message = `[kerbcast] re-offer refused: ${reason}`;
+    this.name = "RenegotiateRefusedError";
   }
 }
 
@@ -493,7 +772,28 @@ export interface KerbcastClientEvents {
    * it here, because the sidecar forgets a peer's state when it leaves.
    */
   "control-open": undefined;
+  /**
+   * Fired when a message arrives after the sidecar was silent for
+   * {@link CONTACT_GAP_MS} or more, as when the page was paused or asleep
+   * and is handed the messages held back meanwhile.
+   */
+  "contact-gap": ContactGap;
+  /** Fired as each {@link KerbcastClientConfig.autoReconnect} attempt starts, numbered from 1. */
+  "reconnect-attempt": ReconnectProgress;
+  /** Fired when a reconnect attempt's connection comes up; `attempt` is the one that did. */
+  "reconnect-success": ReconnectProgress;
+  /** Fired when the last allowed attempt has failed; `attempt` is how many were made. The client stays `"failed"`. */
+  "reconnect-give-up": ReconnectProgress;
 }
+
+/** A silence from the sidecar: when it was last heard from and when it next was, both as `Date.now()`. */
+export interface ContactGap {
+  from: number;
+  to: number;
+}
+
+/** Two of the sidecar's 5 s pings missed: shorter silences are not reported as a {@link ContactGap}. */
+export const CONTACT_GAP_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // Transport abstraction for tests
@@ -517,6 +817,8 @@ export interface KerbcastTransport {
 export interface KerbcastPeerOptions {
   /** Mirrors {@link KerbcastClientConfig.encodedTransforms}. */
   encodedTransforms?: boolean;
+  /** Set when {@link KerbcastClientConfig.recordingTiming} is `"capture"`: receivers carry a passthrough that can copy frames. */
+  frameTaps?: boolean;
 }
 
 export interface KerbcastPeer {
@@ -529,6 +831,12 @@ export interface KerbcastPeer {
   createOffer(): Promise<string>;
   setLocalDescription(sdp: string): Promise<void>;
   setRemoteAnswer(sdp: string): Promise<void>;
+  /**
+   * Abandon a local offer whose answer never arrived, returning to the last
+   * agreed description. Optional so older transports keep compiling; without
+   * it a failed slot re-offer is left pending.
+   */
+  rollback?(): Promise<void>;
   waitForIceComplete(): Promise<void>;
   localSdp(): string;
   close(): void;
@@ -544,6 +852,13 @@ export interface KerbcastPeer {
    * unknown or the transform's kind does not match the peer's path.
    */
   setReceiverTransform?(mid: string, transform: EncodedTransform | null): void;
+  /**
+   * Copy each encoded frame the receiver of slot `mid` gets to `onFrame`
+   * (`null` stops). Only on a peer created with `frameTaps`; a script-path
+   * receiver running a custom transform copies nothing until passthrough
+   * is restored.
+   */
+  setReceiverTap?(mid: string, onFrame: ((frame: EncodedFrameCopy) => void) | null): void;
 }
 
 export interface KerbcastDataChannel {
@@ -578,7 +893,9 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
   }
 
   encodedTransformPath(opts: KerbcastPeerOptions): EncodedTransformPath | null {
-    return opts.encodedTransforms === true ? detectEncodedTransformPath() : null;
+    return opts.encodedTransforms === true || opts.frameTaps === true
+      ? detectEncodedTransformPath()
+      : null;
   }
 
   createPeer(iceServers: RTCIceServer[], opts: KerbcastPeerOptions = {}): KerbcastPeer {
@@ -598,14 +915,29 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
        Script path: each receiver holds a passthrough transform from
        creation, and swaps back to a fresh one instead of clearing. */
     let passthroughWorker: { worker: Worker; url: string } | null = null;
-    const passthrough = (): RTCRtpScriptTransform => {
+    const taps = new Map<RTCRtpTransceiver, (frame: EncodedFrameCopy) => void>();
+    /* Script path with frame taps: each receiver's passthrough reports to the page over its own port. */
+    const tapPorts = new Map<RTCRtpTransceiver, MessagePort>();
+    const passthrough = (t: RTCRtpTransceiver): RTCRtpScriptTransform => {
       if (!passthroughWorker) {
         const url = URL.createObjectURL(
           new Blob([PASSTHROUGH_WORKER_SOURCE], { type: "text/javascript" }),
         );
         passthroughWorker = { worker: new Worker(url), url };
       }
-      return new RTCRtpScriptTransform(passthroughWorker.worker);
+      if (opts.frameTaps !== true) return new RTCRtpScriptTransform(passthroughWorker.worker);
+      tapPorts.get(t)?.close();
+      const channel = new MessageChannel();
+      channel.port1.onmessage = (ev: MessageEvent<Omit<EncodedFrameCopy, "receivedAt">>) => {
+        taps.get(t)?.({ ...ev.data, receivedAt: monotonicNowMs() });
+      };
+      channel.port1.postMessage(taps.has(t));
+      tapPorts.set(t, channel.port1);
+      return new RTCRtpScriptTransform(
+        passthroughWorker.worker,
+        { port: channel.port2 },
+        [channel.port2],
+      );
     };
     const pipes = new Map<RTCRtpTransceiver, SwitchableFramePipe>();
     const pipeFor = (t: RTCRtpTransceiver): SwitchableFramePipe => {
@@ -635,7 +967,7 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
     return {
       addRecvOnlyTransceiver: () => {
         const t = pc.addTransceiver("video", { direction: "recvonly" });
-        if (transformPath === "script") t.receiver.transform = passthrough();
+        if (transformPath === "script") t.receiver.transform = passthrough(t);
       },
       createDataChannel: (label) =>
         wrapBrowserDataChannel(pc.createDataChannel(label)),
@@ -654,6 +986,11 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
       },
       setRemoteAnswer: async (sdp) => {
         await pc.setRemoteDescription({ type: "answer", sdp });
+      },
+      rollback: async () => {
+        if (pc.signalingState === "have-local-offer") {
+          await pc.setLocalDescription({ type: "rollback" });
+        }
       },
       waitForIceComplete: () =>
         new Promise<void>((resolve) => {
@@ -696,12 +1033,30 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
           if (transform !== null && !(transform instanceof RTCRtpScriptTransform)) {
             throw new TypeError("[kerbcast] the script path needs an RTCRtpScriptTransform");
           }
-          transceiver.receiver.transform = transform ?? passthrough();
+          if (transform) {
+            tapPorts.get(transceiver)?.close();
+            tapPorts.delete(transceiver);
+          }
+          transceiver.receiver.transform = transform ?? passthrough(transceiver);
         } else {
           throw new Error("[kerbcast] encoded transforms are unavailable on this peer");
         }
       },
+      setReceiverTap: (mid, onFrame) => {
+        if (opts.frameTaps !== true || !transformPath) {
+          throw new Error("[kerbcast] frame taps are unavailable on this peer");
+        }
+        const transceiver = pc.getTransceivers().find((t) => t.mid === mid);
+        if (!transceiver) throw new Error(`[kerbcast] no receiver for slot ${mid}`);
+        if (onFrame) taps.set(transceiver, onFrame);
+        else taps.delete(transceiver);
+        if (transformPath === "streams") pipeFor(transceiver).tap = onFrame;
+        else tapPorts.get(transceiver)?.postMessage(onFrame !== null);
+      },
       close: () => {
+        for (const port of tapPorts.values()) port.close();
+        tapPorts.clear();
+        taps.clear();
         pc.close();
         if (passthroughWorker) {
           passthroughWorker.worker.terminate();
@@ -713,8 +1068,38 @@ export class BrowserKerbcastTransport implements KerbcastTransport {
   }
 }
 
-const PASSTHROUGH_WORKER_SOURCE =
-  "onrtctransform = (e) => { e.transformer.readable.pipeTo(e.transformer.writable).catch(() => {}); };";
+/*
+ * Forwards every frame untouched. A receiver given a port (frame taps on)
+ * also posts a copy of each frame to it while the page has switched the
+ * copy on. The original goes on to the decoder either way: a failed copy
+ * loses only the copy, never the live picture.
+ */
+const PASSTHROUGH_WORKER_SOURCE = `onrtctransform = (e) => {
+  const { readable, writable, options } = e.transformer;
+  const port = options && options.port;
+  if (!port) {
+    readable.pipeTo(writable).catch(() => {});
+    return;
+  }
+  let tap = false;
+  port.onmessage = (m) => { tap = m.data === true; };
+  readable.pipeThrough(new TransformStream({
+    transform(frame, out) {
+      if (tap) {
+        try {
+          const meta = frame.getMetadata();
+          const data = frame.data.slice(0);
+          port.postMessage({
+            data,
+            rtpTimestamp: meta.rtpTimestamp ?? frame.timestamp,
+            ssrc: meta.synchronizationSource,
+          }, [data]);
+        } catch {}
+      }
+      out.enqueue(frame);
+    },
+  })).pipeTo(writable).catch(() => {});
+};`;
 
 interface EncodedVideoStreams {
   readable: ReadableStream<RTCEncodedVideoFrame>;
@@ -725,6 +1110,30 @@ interface EncodedVideoStreams {
 type ReceiverWithEncodedStreams = RTCRtpReceiver & {
   createEncodedStreams(): EncodedVideoStreams;
 };
+
+/* Metadata fields not every lib.dom version declares. */
+type EncodedFrameWithTimestamp = RTCEncodedVideoFrame & { timestamp?: number };
+type EncodedMetadataWithRtp = RTCEncodedVideoFrameMetadata & { rtpTimestamp?: number };
+
+/**
+ * Whether the sidecar started a camera over on a new ring since `prev`, which
+ * an in-place reattach shows in nothing but `attach`. A missing or zero value
+ * on either side (a sidecar predating the field, or a camera not seen before)
+ * is never a change.
+ */
+function attachChanged(prev: CameraState | null, next: CameraState): boolean {
+  return !!prev?.attach && !!next.attach && prev.attach !== next.attach;
+}
+
+function copyEncodedFrame(frame: RTCEncodedVideoFrame): EncodedFrameCopy {
+  const meta = frame.getMetadata() as EncodedMetadataWithRtp;
+  return {
+    data: frame.data.slice(0),
+    rtpTimestamp: meta.rtpTimestamp ?? (frame as EncodedFrameWithTimestamp).timestamp ?? 0,
+    ssrc: meta.synchronizationSource,
+    receivedAt: monotonicNowMs(),
+  };
+}
 
 function detectEncodedTransformPath(): EncodedTransformPath | null {
   if (typeof RTCRtpReceiver === "undefined") return null;
@@ -739,9 +1148,11 @@ function detectEncodedTransformPath(): EncodedTransformPath | null {
  * TransformStream while one is set. Swapping aborts the old transform, so
  * frames it still holds are dropped.
  */
-class SwitchableFramePipe {
+export class SwitchableFramePipe {
   private readonly out: WritableStreamDefaultWriter<RTCEncodedVideoFrame>;
   private stage: WritableStreamDefaultWriter<RTCEncodedVideoFrame> | null = null;
+  /** Gets a copy of each received frame, before any transform, while set. */
+  tap: ((frame: EncodedFrameCopy) => void) | null = null;
 
   constructor(streams: EncodedVideoStreams) {
     this.out = streams.writable.getWriter();
@@ -763,9 +1174,31 @@ class SwitchableFramePipe {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) return;
+        /* Copied before the write, which hands the frame's data on; delivered
+           after it and off this loop, so a failing tap never stalls the
+           decoder (an exception here would read as the receiver closing). */
+        const tap = this.tap;
+        let copy: EncodedFrameCopy | null = null;
+        if (tap) {
+          try {
+            copy = copyEncodedFrame(value);
+          } catch {
+            /* lose this copy, keep the picture */
+          }
+        }
         const stage = this.stage;
         if (stage) await stage.write(value).catch(() => {});
         else await this.out.write(value);
+        if (tap && copy) {
+          const frame = copy;
+          queueMicrotask(() => {
+            try {
+              tap(frame);
+            } catch (err) {
+              console.error("kerbcast: encoded frame tap failed", err);
+            }
+          });
+        }
       }
     } catch {
       /* The receiver closed with its peer. */
@@ -834,6 +1267,21 @@ function mapPeerState(state: RTCPeerConnectionState): KerbcastConnectionState {
 
 type Listener<T> = (data: T) => void;
 
+/**
+ * A random id for {@link KerbcastClient}'s resume name. `randomUUID` only
+ * exists in a secure context, and the page is usually served over plain
+ * http from the game machine's LAN address.
+ */
+function mintClientId(): string {
+  const crypto = (globalThis as { crypto?: Crypto }).crypto;
+  if (typeof crypto?.randomUUID === "function") return crypto.randomUUID();
+  if (typeof crypto?.getRandomValues === "function") {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 // No bound on E so consumers can use `interface` declarations
 // (interfaces don't carry an implicit string index signature, so
 // `extends Record<string, unknown>` would reject them).
@@ -881,14 +1329,26 @@ class CameraHandle
   private _sourceless = false;
   /** Stall state mirrored from the pipeline's onStallChange callback. */
   private _stalled = false;
-  /** Interval that re-requests keyframes while stalled; null when not stalled. */
-  private _keyframeRetry: ReturnType<typeof setInterval> | null = null;
+  private _hasSource = false;
+  private _waitingForSlot = false;
+  /** The raw stream {@link _watchSource} last subscribed to, so a re-apply of it adds no listener. */
+  private _watchedStream: MediaStream | null = null;
+  /** Timer for the next keyframe re-request while stalled; null when not stalled. */
+  private _keyframeRetry: ReturnType<typeof setTimeout> | null = null;
+  /** The wait owed after the last keyframe request; null when a fresh backoff starts. */
+  private _keyframeGap: number | null = null;
+  private _lastKeyframeAt = Number.NEGATIVE_INFINITY;
+  private _unstalledAt = Number.NEGATIVE_INFINITY;
   /** Whether animated static is drawn; survives pipeline rebuilds. */
   private _showStatic = true;
   /** True while the pipeline runs as a static-free frame-lock passthrough (noise off, `frameLock` on). */
   private _clear = false;
   /** Set by {@link setEncodedTransform}; the client installs it on whichever receiver carries this camera. */
   _encodedTransform: EncodedTransformFactory | null = null;
+  /** Set by {@link setEncodedTransform} alongside {@link _encodedTransform}. */
+  _encodedTransformHoldMs: EncodedTransformOptions["holdMs"];
+  /** Listeners from {@link tapEncodedFrames}; the client taps whichever receiver carries this camera while any are set. */
+  readonly _frameTaps = new Set<(frame: EncodedFrameCopy) => void>();
   private readonly client: KerbcastClient;
 
   constructor(flightId: number, client: KerbcastClient) {
@@ -909,11 +1369,32 @@ class CameraHandle
     return this._stalled;
   }
 
+  get hasSource(): boolean {
+    return this._hasSource;
+  }
+
+  get waitingForSlot(): boolean {
+    return this._waitingForSlot;
+  }
+
+  /** Internal: the client found no slot for this camera, or found one. */
+  _setWaitingForSlot(waiting: boolean): void {
+    if (waiting === this._waitingForSlot) return;
+    this._waitingForSlot = waiting;
+    this.emit("waiting", waiting);
+  }
+
   get showStatic(): boolean {
     return this._showStatic;
   }
 
   get maxRenderSize(): { width: number; height: number } | null {
+    const state = this._state;
+    /* 0 or absent counts as unknown: a sidecar that predates the fields, or
+       a state sent before the camera's ring attached. */
+    if (state?.maxWidth && state.maxHeight) {
+      return { width: state.maxWidth, height: state.maxHeight };
+    }
     return this.client._maxRenderSize(this.flightId);
   }
 
@@ -929,10 +1410,39 @@ class CameraHandle
     if (!this._clear) this._noisePipeline?.setShowStatic(enabled);
   }
 
-  setEncodedTransform(factory: EncodedTransformFactory | null): void {
+  setEncodedTransform(factory: EncodedTransformFactory | null, opts?: EncodedTransformOptions): void {
     if (factory) this.client._assertEncodedTransforms();
+    if (factory && !this._encodedTransform && this._frameTaps.size > 0) {
+      this.client._warnTapsDisplaced(this.flightId);
+    }
     this._encodedTransform = factory;
+    this._encodedTransformHoldMs = factory ? opts?.holdMs : undefined;
     this.client._syncEncodedTransforms();
+  }
+
+  canTapEncodedFrames(): boolean {
+    return this.client._frameTapAvailable(this.flightId);
+  }
+
+  tapEncodedFrames(onFrame: (frame: EncodedFrameCopy) => void): (() => void) | null {
+    if (!this.client._frameTapAvailable(this.flightId)) return null;
+    this._frameTaps.add(onFrame);
+    this.client._syncEncodedTransforms();
+    return () => {
+      if (!this._frameTaps.delete(onFrame)) return;
+      this.client._syncEncodedTransforms();
+    };
+  }
+
+  /** Internal: hands a copied frame to every tap. */
+  _deliverFrame(frame: EncodedFrameCopy): void {
+    for (const tap of this._frameTaps) {
+      try {
+        tap(frame);
+      } catch (err) {
+        console.error(`kerbcast: encoded frame tap for camera ${this.flightId} failed`, err);
+      }
+    }
   }
 
   /**
@@ -976,6 +1486,14 @@ class CameraHandle
     this._applySource(stream);
   }
 
+  /** Internal: whether the handle's source is a stream carrying `track`, still live. */
+  _isSourcedFrom(track: MediaStreamTrack): boolean {
+    return (
+      track.readyState !== "ended" &&
+      (this._rawStream?.getTracks().includes(track) ?? false)
+    );
+  }
+
   /**
    * Drive the persistent pipeline to a given source (or sourceless static when
    * `raw` is null). Creates the pipeline lazily on first need and reuses it
@@ -984,6 +1502,7 @@ class CameraHandle
   private _applySource(raw: MediaStream | null): void {
     this._rawStream = raw;
     this._sourceless = raw === null;
+    this._watchSource(raw);
 
     const noiseEnabled = this.client._resolveNoise(this._noiseOverride);
     this._clear = !noiseEnabled && this.client._frameLock();
@@ -1043,6 +1562,27 @@ class CameraHandle
     }
   }
 
+  /** Follows whether `raw` still carries a live track, for {@link hasSource}. */
+  private _watchSource(raw: MediaStream | null): void {
+    if (raw !== null && raw === this._watchedStream) return;
+    this._watchedStream = raw;
+    const track = raw?.getVideoTracks?.()[0];
+    this._setHasSource(raw !== null && track?.readyState !== "ended");
+    track?.addEventListener?.(
+      "ended",
+      () => {
+        if (this._rawStream === raw) this._setHasSource(false);
+      },
+      { once: true },
+    );
+  }
+
+  private _setHasSource(hasSource: boolean): void {
+    if (this._hasSource === hasSource) return;
+    this._hasSource = hasSource;
+    this.emit("source", hasSource);
+  }
+
   private _setOutput(stream: MediaStream | null): void {
     this._mediaStream = stream;
     this.emit("stream", stream);
@@ -1057,17 +1597,42 @@ class CameraHandle
       // reference chain after packet loss or heavy degrade), which only a
       // fresh keyframe clears. Force one now and keep asking while stalled,
       // rather than waiting on the browser's rate-limited PLI.
-      this._requestKeyframeForRecovery();
-      if (this._keyframeRetry === null) {
-        this._keyframeRetry = setInterval(
-          () => this._requestKeyframeForRecovery(),
-          STALL_KEYFRAME_RETRY_MS,
-        );
+      const now = Date.now();
+      if (now - this._unstalledAt >= STALL_KEYFRAME_RESET_MS) this._keyframeGap = null;
+      const gap = this._keyframeGap;
+      if (gap === null || now - this._lastKeyframeAt >= gap) {
+        this._keyframeAfter(0);
+      } else {
+        this._keyframeAfter(this._lastKeyframeAt + gap - now);
       }
-    } else if (this._keyframeRetry !== null) {
-      clearInterval(this._keyframeRetry);
-      this._keyframeRetry = null;
+    } else {
+      this._cancelKeyframeRetry();
+      this._unstalledAt = Date.now();
     }
+  }
+
+  /** Requests a keyframe after `delayMs`, then keeps asking with the wait doubling to the cap. */
+  private _keyframeAfter(delayMs: number): void {
+    const fire = () => {
+      this._requestKeyframeForRecovery();
+      this._lastKeyframeAt = Date.now();
+      this._keyframeGap =
+        this._keyframeGap === null
+          ? STALL_KEYFRAME_RETRY_MS
+          : Math.min(this._keyframeGap * 2, STALL_KEYFRAME_RETRY_MAX_MS);
+      this._keyframeAfter(this._keyframeGap);
+    };
+    if (delayMs <= 0) {
+      fire();
+      return;
+    }
+    this._keyframeRetry = setTimeout(fire, delayMs);
+  }
+
+  private _cancelKeyframeRetry(): void {
+    if (this._keyframeRetry === null) return;
+    clearTimeout(this._keyframeRetry);
+    this._keyframeRetry = null;
   }
 
   private _requestKeyframeForRecovery(): void {
@@ -1100,14 +1665,16 @@ class CameraHandle
    * the persistent pipeline, stops its rAF loop, and nulls the stream.
    */
   _teardown(): void {
-    if (this._keyframeRetry !== null) {
-      clearInterval(this._keyframeRetry);
-      this._keyframeRetry = null;
-    }
+    this._cancelKeyframeRetry();
+    this._keyframeGap = null;
+    this._lastKeyframeAt = Number.NEGATIVE_INFINITY;
+    this._unstalledAt = Number.NEGATIVE_INFINITY;
     this._noisePipeline?.destroy();
     this._noisePipeline = null;
     this._rawStream = null;
+    this._watchedStream = null;
     this._sourceless = false;
+    this._setHasSource(false);
     this._setStalled(false);
     this._setOutput(null);
   }
@@ -1171,10 +1738,11 @@ class CameraHandle
   }
 
   async setForceFullResolution(force: boolean): Promise<void> {
-    await this.client._send({
-      type: "set-force-full-resolution",
-      content: { flightId: this.flightId, force },
-    });
+    await this.client._setForceFullResolution(this.flightId, force);
+  }
+
+  async setSizeHold(hold: boolean): Promise<void> {
+    await this.client._setSizeHold(this.flightId, hold);
   }
 
   async requestKeyframe(): Promise<void> {
@@ -1246,12 +1814,83 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /** The encoded-transform path the current peer was created with. */
   private peerTransformPath: EncodedTransformPath | null = null;
   /** Receivers holding a camera's encoded transform, by mid, with the factory that built it. */
-  private readonly transformInstalls = new Map<
-    string,
-    { flightId: number; factory: EncodedTransformFactory }
-  >();
+  private readonly transformInstalls = new Map<string, TransformInstall>();
+  /**
+   * Until when, by mid, an instance replaced on a script-path receiver may go
+   * on decoding what it held: Infinity after a camera's transform with no
+   * hold given, whose drain has no bound.
+   */
+  private readonly drainUntil = new Map<string, number>();
+  /** Script-path receivers whose transform is watched for frames or awaits its renewal, by mid; see {@link _syncEncodedTransforms}. */
+  private readonly pendingHeals = new Map<string, PendingHeal>();
+  private healTimer: ReturnType<typeof setInterval> | null = null;
+  private healTimerMs = 0;
+  private healSeq = 0;
+  /** The peer whose stats call a heal poll is awaiting, so another poll of it does not overlap. */
+  private healPolling: KerbcastPeer | null = null;
+  private holdSampler: ReturnType<typeof setInterval> | null = null;
+  /** Receivers copying frames for a camera's taps, by mid. */
+  private readonly tapInstalls = new Map<string, number>();
   /** Sidecar version reported on `Hello`; null before handshake. */
   private _sidecarVersion: string | null = null;
+  /** Whether the connected sidecar's `hello` offered anchors. */
+  private _anchorsSupported = false;
+  /** This client's anchors per camera, kept across connections until cleared. */
+  private readonly anchorsByFlight = new Map<number, Anchor[]>();
+  /** Cameras whose anchors this connection's sidecar holds. */
+  private readonly anchorsSent = new Set<number>();
+  /** Whether this connection has sent its camera list; until then the last one may be stale. */
+  private camerasListed = false;
+  /** Whether the connected sidecar's `hello` offered size holds. */
+  private _sizeHoldSupported = false;
+  /** Video slots the current connection negotiated, grown by {@link growSlots}. */
+  private slotCount = 0;
+  /** Names this connection to `/renegotiate`; from the `/offer` answer. */
+  private session: string | null = null;
+  private _renegotiateSupported = false;
+  private _maxSlots = Number.POSITIVE_INFINITY;
+  /**
+   * Recv-only transceivers on the peer. Past {@link slotCount} are the ones a
+   * rolled-back re-offer left without a mid; the next re-offer carries them again.
+   */
+  private transceiverCount = 0;
+  /** Set once the sidecar refuses a re-offer outright, or the peer cannot roll one back. */
+  private growBroken = false;
+  private growing = false;
+  /** Failed re-offers since the last that landed, picking the next retry's wait. */
+  private growFailures = 0;
+  private growRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Refused cameras waiting on the re-offer in flight. */
+  private readonly growQueue = new Set<number>();
+  /**
+   * Cameras subscribed and not since unsubscribed, across reconnects. A
+   * refusal for a camera no longer here is stale and dropped.
+   */
+  private readonly wanted = new Set<number>();
+  /** Cameras refused a slot that the pool cannot grow to carry, in the order they next get one. */
+  private readonly slotWaiters = new Set<number>();
+  /** Cameras this client forces to full resolution, sent again on every connection. */
+  private readonly forcedFlights = new Set<number>();
+  /** Cameras this client holds at their size, sent again on every connection that takes holds. */
+  private readonly heldFlights = new Set<number>();
+  /** This client's last display size report for each camera. */
+  private readonly displaySizes = new Map<number, { width: number; height: number }>();
+  /**
+   * The size the sidecar holds from this client for each camera on the
+   * current connection, so a repeat of it is not sent again. Cleared wherever
+   * the sidecar forgets: a new peer, an unsubscribe, a camera leaving the list.
+   */
+  private readonly sentSizes = new Map<number, string>();
+  /**
+   * Names this client to the sidecar across its connections, so a reconnect
+   * takes over the force and holds the last connection left behind instead
+   * of the camera resizing in between.
+   */
+  private readonly clientId = mintClientId();
+  /** The sidecar's per-camera anchor cap from `hello`. */
+  private _maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
+  /** A snapshot split across messages, until its last camera arrives. */
+  private pendingSnapshot: { cameras: CameraState[]; remaining: number } | null = null;
   private _encoderBackend: string | null = null;
   /** Last-received throttle state from `settings-state`. False until the first push. */
   private _throttleMainScreen = false;
@@ -1269,17 +1908,38 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _captureUtAt = 0;
   /** Per-frame capture stamps from `frame-stamp`, for exact frame UT lookup. */
   private readonly frameStamps = new FrameStampStore();
+  /** The same frames keyed by UT, for {@link frameAt}. */
+  private readonly frameHistory = new FrameHistory();
+  /** Each command camera's recent targets lists, for {@link commandCentreAt}. */
+  private readonly commandCentres = new CommandCentreHistory();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
+  private _lastContactAt: number | null = null;
   /** Client-side recording controller, lazily built on first `recording` access. */
   private _recording: RecordingController | null = null;
   /**
    * Physical/ceiling max render size per camera, cached from the last
-   * `discover()` call. Empty until `discover()` has been called at least
-   * once; a camera absent from the last discovery response is simply
-   * missing here (its handle's `maxRenderSize` reads `null`).
+   * `discover()` call: the fallback behind a handle's `maxRenderSize` when
+   * the camera's live state carries no ceiling. Empty until `discover()` has
+   * been called at least once; a camera absent from the last discovery
+   * response is simply missing here.
    */
   private readonly maxRenderSizeByFlight = new Map<number, { width: number; height: number }>();
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Fails a reconnect attempt that has not connected in time. */
+  private attemptDeadline: ReturnType<typeof setTimeout> | null = null;
+  /** Peers that failed: kept as `peer` until the next connection, but nothing more is done on them. */
+  private readonly failedPeers = new WeakSet<KerbcastPeer>();
+  /** Attempts made in the current reconnect run; 0 when none is under way. */
+  private reconnectAttempts = 0;
+  /** Bumped by every consumer `connect` and `disconnect`, so a reconnect begun before one gives way. */
+  private connectEpoch = 0;
+  /** Whether a peer since the consumer's last `connect` reached connected; only such a connection is rebuilt. */
+  private everConnected = false;
+  /** The slot pool the consumer's last `connect` asked for. */
+  private connectSlots: number | undefined;
+  /** The largest pool any peer since the consumer's last `connect` negotiated, so a rebuild needs no regrowth. */
+  private peakSlots = 0;
 
   constructor(cfg: KerbcastClientConfig, transport?: KerbcastTransport) {
     super();
@@ -1374,7 +2034,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * frame (within the last second), or the newest stamp that arrived more
    * than {@link STAMP_TO_DISPLAY_MAX_MS} before the frame was shown. Only
    * with no stamp at all does it fall back to the capture clock, which
-   * leads.
+   * leads. All this assumes `video` plays the stream as it arrives: a host
+   * that holds frames back on its own delay hides which frame is shown, so
+   * the estimate runs ahead by that delay. Such a host looks its frame up
+   * with {@link frameAt} instead.
    * Without `requestVideoFrameCallback` estimated frames arrive every 100 ms
    * instead. Frames with neither a stamp nor a clock are skipped. Returns a
    * function that stops watching.
@@ -1393,14 +2056,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     let lastExact: (DisplayedFrameUt & { mediaTime: number | undefined }) | null = null;
     const estimate = (presentedAt: number) => {
       if (lastExact && presentedAt - lastExact.presentedAt <= LAST_EXACT_MAX_AGE_MS) {
-        onFrame({
-          ut: lastExact.ut,
-          epoch: lastExact.epoch,
-          source: "estimated",
-          flightId,
-          rtpTimestamp: lastExact.rtpTimestamp,
-          presentedAt,
-        });
+        const { mediaTime: _mediaTime, ...last } = lastExact;
+        onFrame({ ...last, source: "estimated", presentedAt });
         return;
       }
       const older = this.frameStamps.newestArrivedBy(
@@ -1487,6 +2144,16 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
+   * When the last message from the sidecar arrived, as `Date.now()`, or null
+   * before the first. Kept across connections, so once a connection drops it
+   * still says when that connection was last heard from, including time the
+   * page spent paused or asleep without noticing the drop.
+   */
+  get lastContactAt(): number | null {
+    return this._lastContactAt;
+  }
+
+  /**
    * Send a `set-throttle-main-screen` command to the sidecar, which writes
    * `global.control.json` for the plugin to apply. The plugin persists the
    * change in the per-save difficulty parameter. The resulting
@@ -1518,8 +2185,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Internal: backs {@link KerbcastCameraHandle.maxRenderSize}. `null` when
-   * `discover()` has never been called or never reported this camera.
+   * Internal: the discovery fallback behind
+   * {@link KerbcastCameraHandle.maxRenderSize}. `null` when `discover()` has
+   * never been called or never reported this camera.
    */
   _maxRenderSize(flightId: number): { width: number; height: number } | null {
     return this.maxRenderSizeByFlight.get(flightId) ?? null;
@@ -1544,16 +2212,51 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     requestedCameras: number[] = [],
     opts: { slots?: number } = {},
   ): Promise<void> {
-    this.disconnect();
+    this.stopReconnect();
+    this.connectSlots = opts.slots;
+    await this.openPeer(requestedCameras, opts);
+  }
+
+  /** `quiet` skips the `"disconnected"` a consumer's connect passes through, so a reconnect goes from failed to connecting. */
+  private async openPeer(
+    requestedCameras: number[],
+    opts: { slots?: number },
+    quiet = false,
+  ): Promise<void> {
+    this.closePeer(quiet);
     this.setState("connecting");
     this.requestedOrder = [...requestedCameras];
     this.dynamicMode = opts.slots !== undefined;
+    /* Cameras asked for at connect are wanted like subscribed ones, so a
+       connect-time refusal grows the pool or reports waiting, not nothing. */
+    if (this.dynamicMode) for (const flightId of requestedCameras) this.wanted.add(flightId);
     this.trackByMid.clear();
     this.flightByMid.clear();
     this.flightByTrackId.clear();
     this.legacyFlightByMid.clear();
     /* RTP timestamps restart from a fresh random base on every peer. */
     this.frameStamps.clear();
+    this.commandCentres.clear();
+    this._anchorsSupported = false;
+    this._sizeHoldSupported = false;
+    this.slotCount = 0;
+    this.session = null;
+    this._renegotiateSupported = false;
+    this._maxSlots = Number.POSITIVE_INFINITY;
+    this.transceiverCount = 0;
+    this.growBroken = false;
+    this.growing = false;
+    this.growFailures = 0;
+    this.cancelGrowRetry();
+    this.growQueue.clear();
+    for (const flightId of this.slotWaiters) {
+      this.getOrCreateHandle(flightId)._setWaitingForSlot(false);
+    }
+    this.slotWaiters.clear();
+    this.anchorsSent.clear();
+    this.camerasListed = false;
+    this._maxAnchorsPerCamera = MAX_ANCHORS_PER_CAMERA;
+    this.pendingSnapshot = null;
 
     const peerOpts = this.peerOptions();
     const peer = this.transport.createPeer(
@@ -1572,17 +2275,25 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     for (let i = 0; i < slotCount; i++) {
       peer.addRecvOnlyTransceiver();
     }
+    this.transceiverCount = slotCount;
 
     peer.onTrack((track, idx, mid) => this.handleTrack(track, idx, mid));
 
     peer.onStateChange((s) => {
       this.setState(s);
-      if (s === "disconnected" || s === "failed") {
-        if (this.peer === peer) this.clearEncodedTransforms();
-        this.tearDownStreams();
+      if (s === "connected" && this.peer === peer) {
+        this.everConnected = true;
+        this.clearAttemptDeadline();
+        if (this.reconnectAttempts > 0) {
+          const attempt = this.reconnectAttempts;
+          this.reconnectAttempts = 0;
+          this.emit("reconnect-success", { attempt });
+        }
       }
-      /* A failed peer never recovers; closing it frees its relay allocations. */
-      if (s === "failed") peer.close();
+      /* Disconnected is a pause the peer comes back from on its own, with the
+         same tracks and slots, so the feeds keep their streams and the stall
+         static covers the gap. Only a failed peer is gone for good. */
+      if (s === "failed") this.peerFailed(peer);
     });
 
     const control = peer.createDataChannel("kerbcast-control");
@@ -1619,7 +2330,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     });
 
     await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
+    if (!this.isCurrent(peer)) return;
     await peer.waitForIceComplete();
+    /* A connect or disconnect made meanwhile owns the client now. */
+    if (!this.isCurrent(peer)) return;
 
     const body: { sdp: string; cameras: number[]; slots?: number } = {
       sdp: peer.localSdp(),
@@ -1627,17 +2341,23 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     };
     if (this.dynamicMode) body.slots = slotCount;
 
-    let answer: { sdp: string; cameras: number[] };
+    let answer: { sdp: string; cameras: number[]; session?: string };
     try {
       answer = await (this.cfg.negotiate
         ? this.cfg.negotiate(body)
         : this.httpNegotiate(body));
     } catch (err) {
       peer.close();
+      if (!this.isCurrent(peer)) return;
       this.setState("failed");
       throw err;
     }
+    if (!this.isCurrent(peer)) return;
     await peer.setRemoteAnswer(answer.sdp);
+    if (!this.isCurrent(peer)) return;
+    this.slotCount = slotCount;
+    this.peakSlots = Math.max(this.peakSlots, slotCount);
+    this.session = answer.session ?? null;
     // Legacy mode routes by index → requestedOrder, so realign to what the
     // sidecar actually wired. Dynamic mode routes by mid via SlotMap (initial
     // bindings arrive on Hello), so the answer's camera list isn't used.
@@ -1651,7 +2371,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     sdp: string;
     cameras: number[];
     slots?: number;
-  }): Promise<{ sdp: string; cameras: number[] }> {
+  }): Promise<{ sdp: string; cameras: number[]; session?: string }> {
     const res = await fetch(`http://${this.cfg.host}:${this.cfg.port}/offer`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1665,18 +2385,352 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       }
       throw new Error(`POST /offer returned ${res.status}`);
     }
-    return (await res.json()) as { sdp: string; cameras: number[] };
+    return (await res.json()) as { sdp: string; cameras: number[]; session?: string };
+  }
+
+  /** Default re-offer exchange: POST to the sidecar's HTTP `/renegotiate`. */
+  private async httpRenegotiate(offer: {
+    session: string;
+    sdp: string;
+    slots: number;
+  }): Promise<{ sdp: string }> {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), RENEGOTIATE_TIMEOUT_MS);
+    try {
+      const res = await fetch(`http://${this.cfg.host}:${this.cfg.port}/renegotiate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(offer),
+        signal: abort.signal,
+      });
+      if (!res.ok) {
+        const message = `POST /renegotiate returned ${res.status}`;
+        /* A 4xx is the sidecar refusing this re-offer; a timeout or a busy
+           proxy in front of it is worth another try. */
+        const refused =
+          res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+        if (!refused) throw new Error(message);
+        const refusal = (await res.json().catch(() => null)) as Partial<ErrorPayload> | null;
+        if (typeof refusal?.message === "string") {
+          throw new RenegotiateRefusedError(res.status, refusal.message, refusal.code);
+        }
+        throw new RenegotiateRefusedError(res.status, message);
+      }
+      return (await res.json()) as { sdp: string };
+    } catch (err) {
+      if (abort.signal.aborted) {
+        throw new Error(`POST /renegotiate gave no answer within ${RENEGOTIATE_TIMEOUT_MS} ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Whether a camera refused a slot can be carried by growing the pool. */
+  private canGrowSlots(): boolean {
+    return (
+      this.dynamicMode &&
+      this.peer !== null &&
+      this._renegotiateSupported &&
+      !this.growBroken &&
+      this.growRetryTimer === null &&
+      this.session !== null &&
+      this.slotCount < this._maxSlots &&
+      (this.cfg.renegotiate !== undefined || this.cfg.negotiate === undefined)
+    );
+  }
+
+  /**
+   * Add video slots for the cameras in {@link growQueue} with one re-offer,
+   * then subscribe them again. Refusals that land meanwhile join the queue
+   * and go in the next round. Running feeds keep their slots throughout.
+   */
+  private async growSlots(): Promise<void> {
+    if (this.growing) return;
+    const peer = this.peer;
+    const session = this.session;
+    if (!peer || session === null) return;
+    this.growing = true;
+    let batch: number[] = [];
+    let answerRefused = false;
+    try {
+      while (this.growQueue.size > 0 && this.peer === peer) {
+        batch = [...this.growQueue];
+        this.growQueue.clear();
+        const target = Math.min(
+          this._maxSlots,
+          Math.max(this.transceiverCount, this.slotCount + Math.max(batch.length, SLOT_GROWTH_STEP)),
+        );
+        if (target <= this.slotCount) {
+          for (const flightId of batch) this.markWaitingForSlot(flightId);
+          batch = [];
+          continue;
+        }
+        for (let i = this.transceiverCount; i < target; i++) peer.addRecvOnlyTransceiver();
+        this.transceiverCount = Math.max(this.transceiverCount, target);
+        await peer.createOffer().then((sdp) => peer.setLocalDescription(sdp));
+        const offer = { session, sdp: peer.localSdp(), slots: target };
+        const answer = await (this.cfg.renegotiate
+          ? this.cfg.renegotiate(offer)
+          : this.httpRenegotiate(offer));
+        if (this.peer !== peer) return;
+        await peer.setRemoteAnswer(answer.sdp).catch((err: unknown) => {
+          answerRefused = true;
+          throw err;
+        });
+        /* A reconnect during that await owns the client now; this grow belongs to a dead peer. */
+        if (this.peer !== peer) return;
+        this.slotCount = target;
+        this.peakSlots = Math.max(this.peakSlots, target);
+        this.growFailures = 0;
+        /* The sidecar binds no camera to the new slots until this lands, and
+           the channel is ordered, so the subscribes below can use them. */
+        void this._send({ type: "confirm-slots", content: { slots: target } }).catch(() => {});
+        for (const flightId of batch) {
+          if (this.wanted.has(flightId)) {
+            void this._send({ type: "subscribe", content: { flightId } }).catch(() => {});
+          }
+        }
+        batch = [];
+      }
+    } catch (err) {
+      if (this.peer !== peer) return;
+      /*
+       * The sidecar may have grown its side already (the answer was lost, or
+       * the browser refused it). Its new slots stay unconfirmed and idle, so
+       * running feeds carry on; rolling back returns the browser to its last
+       * agreed description, keeping the added transceivers without a mid.
+       * The retry offers those same transceivers, and the sidecar answers
+       * again whatever unconfirmed slots it holds, so the two sides line up.
+       * Meanwhile the cameras wait for a slot.
+       */
+      try {
+        await peer.rollback?.();
+      } catch {
+        // Nothing pending to roll back.
+      }
+      this.growFailures++;
+      /* The browser refusing the sidecar's answer would refuse the next one too. */
+      if (
+        err instanceof RenegotiateRefusedError ||
+        answerRefused ||
+        !peer.rollback ||
+        this.growFailures >= MAX_GROW_FAILURES
+      ) {
+        this.growBroken = true;
+      }
+      for (const flightId of [...batch, ...this.growQueue]) this.markWaitingForSlot(flightId);
+      this.growQueue.clear();
+      if (!this.growBroken) this.scheduleGrowRetry(peer);
+      /* A run of failures is said once, not on every retry. */
+      if (this.growFailures === 1 || this.growBroken) {
+        this.emit("error", {
+          message: `[kerbcast] could not add video slots: ${
+            err instanceof RenegotiateRefusedError ? err.reason : err instanceof Error ? err.message : String(err)
+          }`,
+          source: ErrorSource.Sidecar,
+          ...(err instanceof RenegotiateRefusedError && err.code !== undefined ? { code: err.code } : {}),
+        });
+      }
+    } finally {
+      if (this.peer === peer) this.growing = false;
+    }
+  }
+
+  private scheduleGrowRetry(peer: KerbcastPeer): void {
+    if (this.growRetryTimer !== null) return;
+    const delay = GROW_RETRY_DELAYS_MS[Math.min(this.growFailures, GROW_RETRY_DELAYS_MS.length) - 1];
+    this.growRetryTimer = setTimeout(() => {
+      this.growRetryTimer = null;
+      if (this.peer !== peer || this.growing) return;
+      for (const flightId of this.slotWaiters) {
+        const destroyed = this.handles.get(flightId)?.state?.lifecycle === CameraLifecycle.Destroyed;
+        if (this.wanted.has(flightId) && !destroyed) this.growQueue.add(flightId);
+      }
+      if (this.growQueue.size === 0 || !this.canGrowSlots()) {
+        this.growQueue.clear();
+        this.growFailures = 0;
+        return;
+      }
+      void this.growSlots();
+    }, delay);
+  }
+
+  /** End a run of failed re-offers, so the next failure starts a fresh one. */
+  private cancelGrowRetry(): void {
+    this.growFailures = 0;
+    if (this.growRetryTimer === null) return;
+    clearTimeout(this.growRetryTimer);
+    this.growRetryTimer = null;
+  }
+
+  /**
+   * A subscribe for `flightId` found every slot taken. Grows the pool when it
+   * can and returns true (handled quietly); otherwise marks the camera
+   * waiting and returns false so the refusal still reaches `error` listeners.
+   */
+  private onNoFreeSlot(flightId: number): boolean {
+    /* A stale refusal, or a waiter refused again after a hand-off race: either way already said. */
+    if (!this.wanted.has(flightId) || this.slotWaiters.has(flightId)) return true;
+    if (this.canGrowSlots()) {
+      this.growQueue.add(flightId);
+      void this.growSlots();
+      return true;
+    }
+    this.markWaitingForSlot(flightId);
+    return false;
+  }
+
+  private markWaitingForSlot(flightId: number): void {
+    if (!this.wanted.has(flightId)) return;
+    this.slotWaiters.add(flightId);
+    this.getOrCreateHandle(flightId)._setWaitingForSlot(true);
+  }
+
+  private clearWaitingForSlot(flightId: number): void {
+    if (!this.slotWaiters.delete(flightId)) return;
+    this.getOrCreateHandle(flightId)._setWaitingForSlot(false);
+    if (this.slotWaiters.size === 0) this.cancelGrowRetry();
+  }
+
+  /**
+   * A slot came free: offer it to the camera that has waited longest. That
+   * camera moves to the back of the line, so slots freed together go to
+   * different cameras; it leaves the line once a slot-map binds it.
+   */
+  private handFreedSlotToWaiting(): void {
+    for (const flightId of [...this.slotWaiters]) {
+      const destroyed = this.handles.get(flightId)?.state?.lifecycle === CameraLifecycle.Destroyed;
+      if (!this.wanted.has(flightId) || destroyed) {
+        this.clearWaitingForSlot(flightId);
+        continue;
+      }
+      this.slotWaiters.delete(flightId);
+      this.slotWaiters.add(flightId);
+      void this._send({ type: "subscribe", content: { flightId } }).catch(() => {});
+      return;
+    }
   }
 
   disconnect(): void {
+    this.stopReconnect();
+    this.closePeer();
+  }
+
+  private reconnectOptions(): Required<AutoReconnectOptions> | null {
+    const opt = this.cfg.autoReconnect;
+    if (!opt) return null;
+    if (opt === true) return AUTO_RECONNECT_DEFAULTS;
+    /* A missing, negative or non-finite field takes its default. */
+    const pick = (v: number | undefined, d: number) =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : d;
+    const d = AUTO_RECONNECT_DEFAULTS;
+    return {
+      maxAttempts: Math.floor(pick(opt.maxAttempts, d.maxAttempts)),
+      initialDelayMs: pick(opt.initialDelayMs, d.initialDelayMs),
+      maxDelayMs: pick(opt.maxDelayMs, d.maxDelayMs),
+      attemptTimeoutMs: pick(opt.attemptTimeoutMs, d.attemptTimeoutMs),
+    };
+  }
+
+  /**
+   * `peer` failed, or a reconnect attempt on it ran out of time: drop its
+   * streams, close it to free its relay allocations, and rebuild it when the
+   * client reconnects by itself.
+   */
+  private peerFailed(peer: KerbcastPeer): void {
+    if (this.failedPeers.has(peer)) return;
+    this.failedPeers.add(peer);
+    if (this.peer === peer) {
+      this.clearAttemptDeadline();
+      this.clearEncodedTransforms();
+      this.tearDownStreams();
+      this.growBroken = true;
+      this.cancelGrowRetry();
+    }
+    peer.close();
+    if (this.peer === peer) this.scheduleReconnect();
+  }
+
+  /** Whether `peer` is still the client's live peer, so work begun on it may go on. */
+  private isCurrent(peer: KerbcastPeer): boolean {
+    return this.peer === peer && !this.failedPeers.has(peer);
+  }
+
+  private clearAttemptDeadline(): void {
+    if (this.attemptDeadline === null) return;
+    clearTimeout(this.attemptDeadline);
+    this.attemptDeadline = null;
+  }
+
+  /** Ends any reconnect run, for a consumer `connect` or `disconnect` that takes over. */
+  private stopReconnect(): void {
+    this.connectEpoch++;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.clearAttemptDeadline();
+    this.reconnectAttempts = 0;
+    this.everConnected = false;
+    this.peakSlots = 0;
+  }
+
+  /** The current peer failed: schedule the next attempt to rebuild it, or give up. */
+  private scheduleReconnect(): void {
+    const opts = this.reconnectOptions();
+    if (!opts || this.reconnectTimer !== null) return;
+    if (!this.everConnected && this.reconnectAttempts === 0) return;
+    if (this.reconnectAttempts >= opts.maxAttempts) {
+      const attempt = this.reconnectAttempts;
+      this.reconnectAttempts = 0;
+      this.everConnected = false;
+      this.emit("reconnect-give-up", { attempt });
+      return;
+    }
+    const delay = Math.min(opts.initialDelayMs * 2 ** this.reconnectAttempts, opts.maxDelayMs);
+    const epoch = this.connectEpoch;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (epoch !== this.connectEpoch) return;
+      this.reconnectAttempts++;
+      this.emit("reconnect-attempt", { attempt: this.reconnectAttempts });
+      /* A listener may have connected or disconnected itself. */
+      if (epoch !== this.connectEpoch) return;
+      /* The same cameras on a pool as large as the last one grew to. */
+      const cameras = this.dynamicMode ? [...this.wanted] : [...this.requestedOrder];
+      const peerOpts = this.dynamicMode
+        ? { slots: Math.max(this.connectSlots ?? 0, this.peakSlots) }
+        : {};
+      const opening = this.openPeer(cameras, peerOpts, true);
+      const peer = this.peer;
+      if (!peer) return;
+      /* An offer exchange can hang with no answer; past the deadline the attempt counts as failed. */
+      this.attemptDeadline = setTimeout(() => {
+        this.attemptDeadline = null;
+        if (this.peer !== peer) return;
+        this.setState("failed");
+        this.peerFailed(peer);
+      }, opts.attemptTimeoutMs);
+      opening.catch(() => {
+        if (epoch !== this.connectEpoch || this.peer !== peer) return;
+        this.failedPeers.add(peer);
+        this.clearAttemptDeadline();
+        this.scheduleReconnect();
+      });
+    }, delay);
+  }
+
+  private closePeer(quiet = false): void {
+    this.cancelGrowRetry();
     this.clearEncodedTransforms();
     this.peer?.close();
     this.peer = null;
     this.control = null;
     this.controlOpen = false;
+    this.sentSizes.clear();
     this.rejectPendingSends("[kerbcast] client disconnected before the control channel opened");
     this.tearDownStreams();
-    this.setState("disconnected");
+    if (!quiet) this.setState("disconnected");
   }
 
   /**
@@ -1690,11 +2744,27 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   /**
    * Dynamic mode only: bind a camera to a free slot on the already-connected
    * peer. The camera's stream appears on its handle once the sidecar answers
-   * with a SlotMap; the sidecar emits an `error` event if no slot is free. No
-   * renegotiation.
+   * with a SlotMap. When every slot is taken the client adds slots with a
+   * re-offer, leaving running feeds alone; where it cannot, the handle
+   * reports `waitingForSlot`, the refusal is emitted as an `error` event, and
+   * the camera takes the next slot that comes free.
    */
   async subscribe(flightId: number): Promise<void> {
+    if (this.dynamicMode) this.wanted.add(flightId);
     await this._send({ type: "subscribe", content: { flightId } });
+    this._sendHeldOnSubscribe(flightId);
+  }
+
+  /**
+   * A subscribe after an unsubscribe finds the sidecar holding no force, size
+   * hold or size from this client, and a feed that did not change has nothing
+   * new to report, so what this consumer still holds goes out again. A camera
+   * the list does not have yet would drop it; its return to the list sends it
+   * instead.
+   */
+  private _sendHeldOnSubscribe(flightId: number): void {
+    if (this.camerasListed && !this._cameras.some((c) => c.flightId === flightId)) return;
+    this._sendHeldFor(flightId);
   }
 
   /**
@@ -1702,6 +2772,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * goes null once the sidecar confirms with a SlotMap.
    */
   async unsubscribe(flightId: number): Promise<void> {
+    this.wanted.delete(flightId);
+    this.growQueue.delete(flightId);
+    this.clearWaitingForSlot(flightId);
+    /* The sidecar forgets this client's force, hold and size with the subscription. They stay held for a later subscribe; only an explicit release clears them. */
+    this.sentSizes.delete(flightId);
     await this._send({ type: "unsubscribe", content: { flightId } });
   }
 
@@ -1712,9 +2787,34 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * per-consumer input the sidecar aggregates MAX-across-consumers, so a big
    * spotlight bumps the stream up while tiny avatars leave it small. The SDK's
    * feed primitives self-measure and call this; consumers do not report by hand.
+   * A size under 2 on either axis withdraws this consumer's report, which is
+   * also what a size that is not a number does. A size the sidecar already
+   * holds from this client is not sent again.
    */
-  async reportDisplaySize(flightId: number, width: number, height: number): Promise<void> {
-    await this._send({ type: "report-display-size", content: { flightId, width, height } });
+  async reportDisplaySize(flightId: number, rawWidth: number, rawHeight: number): Promise<void> {
+    /* The wire takes whole numbers. NaN goes out as null and a fraction as itself, and the sidecar refuses either message whole, leaving the old size in force. */
+    const width = wholeDisplayPx(rawWidth);
+    const height = wholeDisplayPx(rawHeight);
+    if (width < 2 || height < 2) {
+      this.displaySizes.delete(flightId);
+      this.sentSizes.delete(flightId);
+      await this._send({ type: "report-display-size", content: { flightId, width, height } });
+      return;
+    }
+    this.displaySizes.set(flightId, { width, height });
+    await this._sendDisplaySize(flightId, width, height);
+  }
+
+  private async _sendDisplaySize(flightId: number, width: number, height: number): Promise<void> {
+    const key = `${width}x${height}`;
+    if (this.sentSizes.get(flightId) === key) return;
+    this.sentSizes.set(flightId, key);
+    try {
+      await this._send({ type: "report-display-size", content: { flightId, width, height } });
+    } catch (err) {
+      if (this.sentSizes.get(flightId) === key) this.sentSizes.delete(flightId);
+      throw err;
+    }
   }
 
   /**
@@ -1760,7 +2860,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * Point a command camera by `aim`, or return it to its default with `null`
    * (the active craft in flight, the configured craft at the Space Center).
    * A `vessel` aim follows any craft from `commandCentre.targets`, whatever
-   * its eligibility. The aim shows up in `commandCentre.aimKind` and
+   * its eligibility; `allowUncertain` also accepts one whose position a
+   * governing world model cannot narrow enough to frame (`tooUncertain`), as
+   * a deliberate search of the region. The aim shows up in
+   * `commandCentre.aimKind` and
    * `.subjectPersistentId` once the game applies it.
    *
    * Rejects at once while the camera's state reports a command authority
@@ -1770,8 +2873,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    *
    * Rejects with a {@link CommandTargetUnknownError} when the aim's craft is
    * not in the camera's `commandCentre.targets` (a craft merged away in a
-   * dock, say). A refusal that races the list changing arrives as an `error`
-   * event with code `ErrorCode.CommandTargetUnknown`.
+   * dock, say). A list cut to fit the control channel
+   * (`commandCentre.targetsOmitted` set) may leave the craft out, so the
+   * sidecar decides then. A refusal that races the list changing, or that the
+   * sidecar makes, arrives as an `error` event with code
+   * `ErrorCode.CommandTargetUnknown`.
    */
   async setCommandAim(flightId: number, aim: CommandAim | null): Promise<void> {
     const cam = this._cameras.find((c) => c.flightId === flightId);
@@ -1779,16 +2885,171 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     if (owner) {
       throw new CommandLockedError(owner);
     }
-    /* An empty list is what the game writes when listing fails, so it decides then. */
+    /* An empty list is what the game writes when listing fails, and a cut one
+       leaves craft out, so the sidecar decides then. */
     const craft = aim ? aimCraft(aim) : undefined;
     const targets = cam?.commandCentre?.targets;
-    if (craft !== undefined && targets?.length && !targets.some((t) => t.persistentId === craft)) {
+    const whole = !cam?.commandCentre?.targetsOmitted;
+    if (craft !== undefined && whole && targets?.length && !targets.some((t) => t.persistentId === craft)) {
       throw new CommandTargetUnknownError(flightId, craft);
     }
     await this._send({
       type: "set-command-aim",
       content: aim ? { flightId, aim } : { flightId },
     });
+  }
+
+  /**
+   * A command camera's subject, range and targets list as they stood at
+   * `displayUt`, the UT of the frame a view shows (`DisplayedFrameUt.ut`), so
+   * a delayed view never lists what its picture has not reached. `null`
+   * while every list the game has sent is newer than that. Without a
+   * displayed UT, the newest, as `commandCentre` on the camera list, but
+   * `null` while a command lock is held: with nothing displayed there is no
+   * frame the list may run to. Lists from a game older than 1.12 carry no UT
+   * and apply at once.
+   */
+  commandCentreAt(flightId: number, displayUt?: number | null): CommandCentreInfo | null {
+    if (displayUt == null) {
+      const cam = this._cameras.find((c) => c.flightId === flightId);
+      if (cam?.commandTrack?.authority) return null;
+    }
+    return this.commandCentres.at(flightId, displayUt);
+  }
+
+  /**
+   * The frame of `flightId` a view showing `displayUt` has on screen: the
+   * newest stamped frame at or before that UT, with its command state and
+   * anchors. For a host that plays the video out on its own delay, where
+   * the browser can no longer say which frame it presents. `null` when no
+   * frame that old is kept: frames go 15 minutes of UT behind the newest,
+   * at most 20,000 per camera, and on a new capture epoch or when the
+   * camera leaves the list. Kept across reconnects.
+   */
+  frameAt(flightId: number, displayUt: number): DisplayedFrameUt | null {
+    return this.frameHistory.at(flightId, displayUt);
+  }
+
+  /**
+   * Mark things in the game on `flightId`'s picture: a part, a craft, a
+   * point on a body or a direction. Replaces this client's anchors on that
+   * camera; `null` or an empty list clears them. The game projects each
+   * anchor through the camera that rendered every frame, and the results
+   * arrive with that frame (see {@link watchDisplayedFrames} and
+   * `DisplayedFrameUt.anchors`), so they line up with the picture under any
+   * stream delay.
+   *
+   * Anchors belong to this client: other clients never see them, the
+   * command lock does not apply, and they are kept here until cleared and
+   * sent again whenever the client reconnects. Anchors on a camera missing
+   * from {@link cameras} wait until it appears. Only a sidecar whose
+   * `hello` offers anchors (1.12 and later) receives them; against an older
+   * one they are kept but never sent. Rejects with a `RangeError` for more
+   * than {@link maxAnchorsPerCamera} anchors or a repeated id; a malformed
+   * anchor is refused by the sidecar with an `error` event.
+   */
+  async setAnchors(flightId: number, anchors: readonly Anchor[] | null): Promise<void> {
+    const list = anchors ? [...anchors] : [];
+    if (list.length > this._maxAnchorsPerCamera) {
+      throw new RangeError(
+        `at most ${this._maxAnchorsPerCamera} anchors per camera, got ${list.length}`,
+      );
+    }
+    const ids = new Set<string>();
+    for (const a of list) {
+      if (ids.has(a.id)) throw new RangeError(`anchor id ${a.id} is used twice`);
+      ids.add(a.id);
+    }
+    if (list.length === 0) {
+      this.anchorsByFlight.delete(flightId);
+      /* A camera the sidecar no longer lists would answer with an error. */
+      if (!this.anchorsSent.delete(flightId) || !this._isListed(flightId)) return;
+      await this._send({ type: "set-anchors", content: { flightId } });
+      return;
+    }
+    this.anchorsByFlight.set(flightId, list);
+    if (!this._anchorsSupported || !this._isListed(flightId)) return;
+    this.anchorsSent.add(flightId);
+    await this._send({ type: "set-anchors", content: { flightId, anchors: list } });
+  }
+
+  private _isListed(flightId: number): boolean {
+    return this.camerasListed && this._cameras.some((c) => c.flightId === flightId);
+  }
+
+  /** Send the sidecar the anchors it lacks for cameras it now lists. */
+  private _sendHeldAnchors(): void {
+    if (!this._anchorsSupported) return;
+    for (const [flightId, anchors] of this.anchorsByFlight) {
+      if (this.anchorsSent.has(flightId) || !this._isListed(flightId)) continue;
+      this.anchorsSent.add(flightId);
+      void this._send({ type: "set-anchors", content: { flightId, anchors } }).catch(() => {});
+    }
+  }
+
+  /**
+   * Internal: records a camera's force and sends it. Kept here rather than
+   * on the handle so a reconnect can send it again: the sidecar forgets a
+   * viewer's force when its connection drops.
+   */
+  async _setForceFullResolution(flightId: number, force: boolean): Promise<void> {
+    if (force) this.forcedFlights.add(flightId);
+    else this.forcedFlights.delete(flightId);
+    await this._send({ type: "set-force-full-resolution", content: { flightId, force } });
+  }
+
+  /**
+   * Internal: records a camera's size hold and sends it when the sidecar
+   * takes holds. Kept across connections like the force; a sidecar older
+   * than 1.12 never receives it.
+   */
+  async _setSizeHold(flightId: number, hold: boolean): Promise<void> {
+    if (hold) this.heldFlights.add(flightId);
+    else this.heldFlights.delete(flightId);
+    if (!this._sizeHoldSupported) return;
+    await this._send({ type: "set-size-hold", content: { flightId, hold } });
+  }
+
+  /** Must go ahead of {@link _sendHeldSizes}: the sidecar hands over what a resume names. */
+  private _sendResume(): void {
+    void this._send({
+      type: "resume",
+      content: {
+        clientId: this.clientId,
+        forced: [...this.forcedFlights],
+        held: this._sizeHoldSupported ? [...this.heldFlights] : [],
+      },
+    }).catch(() => {});
+  }
+
+  /** Sends a new connection the forces and holds this client still has in place. */
+  private _sendHeldSizes(): void {
+    for (const flightId of this.forcedFlights) {
+      void this._send({ type: "set-force-full-resolution", content: { flightId, force: true } }).catch(() => {});
+    }
+    if (!this._sizeHoldSupported) return;
+    for (const flightId of this.heldFlights) {
+      void this._send({ type: "set-size-hold", content: { flightId, hold: true } }).catch(() => {});
+    }
+  }
+
+  /** This client's anchors on `flightId`, as last set. Empty when none. */
+  anchorsFor(flightId: number): readonly Anchor[] {
+    return this.anchorsByFlight.get(flightId) ?? [];
+  }
+
+  /**
+   * The most anchors {@link setAnchors} takes on one camera: what the
+   * connected sidecar's `hello` says, or {@link MAX_ANCHORS_PER_CAMERA}
+   * before it and from a sidecar that does not say.
+   */
+  get maxAnchorsPerCamera(): number {
+    return this._maxAnchorsPerCamera;
+  }
+
+  /** Whether the connected sidecar takes anchors. False until its `hello`. */
+  get anchorsSupported(): boolean {
+    return this._anchorsSupported;
   }
 
   /**
@@ -1982,6 +3243,70 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     this.getOrCreateHandle(flightId)._setMediaStream(new MediaStream([track]));
   }
 
+  private _applySnapshot(cameras: CameraState[]): void {
+    const listed = this.camerasListed ? new Set(this._cameras.map((c) => c.flightId)) : null;
+    this._cameras = cameras;
+    this.camerasListed = true;
+    this.commandCentres.retain(cameras.map((c) => c.flightId));
+    this.frameHistory.retain(cameras.map((c) => c.flightId));
+    const registeredAgain = new Set<number>();
+    for (const cam of cameras) {
+      this.commandCentres.record(cam.flightId, cam.commandCentre);
+      const handle = this.getOrCreateHandle(cam.flightId);
+      const reattached = attachChanged(handle.state, cam);
+      const resurrected = handle._setState(cam);
+      if (resurrected) this._resourceHandle(cam.flightId);
+      if (resurrected || reattached) registeredAgain.add(cam.flightId);
+      if (resurrected || reattached || (listed && !listed.has(cam.flightId))) {
+        this._renewEncodedTransform(cam.flightId);
+      }
+    }
+    /* The sidecar drops a size for a camera it does not list, and a camera new to the list starts with none. */
+    const present = new Set(cameras.map((c) => c.flightId));
+    for (const flightId of [...this.sentSizes.keys()]) {
+      if (!present.has(flightId) || (listed && !listed.has(flightId))) this.sentSizes.delete(flightId);
+    }
+    this.emit("cameras-change", cameras);
+    this._sendHeldAnchors();
+    /* A camera back in the list after a scene change, or registered again in
+       place, is a new camera to the sidecar, which has forgotten what this
+       client asked of the old one. */
+    for (const cam of cameras) {
+      const isNew = (listed && !listed.has(cam.flightId)) || registeredAgain.has(cam.flightId);
+      if (isNew) this._sendHeldAfterReregister(cam.flightId);
+    }
+  }
+
+  /**
+   * A camera registered again under its flight id (destroyed and back, or its
+   * ring attached afresh) may have lost what this client asked of it: the
+   * sidecar starts a destroyed camera that returns with no size, force or
+   * hold, and may never have shown it destroyed. The consumer's tile has not
+   * changed size, so nothing else would send them, and the camera would stay
+   * at its default size for good. Only for cameras this client still
+   * subscribes to, so a size from a feed it has since closed cannot pin the
+   * camera for everyone.
+   */
+  private _sendHeldAfterReregister(flightId: number): void {
+    this.sentSizes.delete(flightId);
+    if (this._subscribes(flightId)) this._sendHeldFor(flightId);
+  }
+
+  private _subscribes(flightId: number): boolean {
+    return this.dynamicMode ? this.wanted.has(flightId) : this.requestedOrder.includes(flightId);
+  }
+
+  private _sendHeldFor(flightId: number): void {
+    if (this.forcedFlights.has(flightId)) {
+      void this._send({ type: "set-force-full-resolution", content: { flightId, force: true } }).catch(() => {});
+    }
+    if (this._sizeHoldSupported && this.heldFlights.has(flightId)) {
+      void this._send({ type: "set-size-hold", content: { flightId, hold: true } }).catch(() => {});
+    }
+    const size = this.displaySizes.get(flightId);
+    if (size) void this._sendDisplaySize(flightId, size.width, size.height).catch(() => {});
+  }
+
   private handleServerMessage(raw: string): void {
     let msg: ServerMessage;
     try {
@@ -1993,39 +3318,77 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       });
       return;
     }
+    const heardAt = Date.now();
+    const lastHeard = this._lastContactAt;
+    this._lastContactAt = heardAt;
+    if (lastHeard != null && heardAt - lastHeard >= CONTACT_GAP_MS) {
+      this.emit("contact-gap", { from: lastHeard, to: heardAt });
+    }
+    /* A split snapshot's cameras arrive back to back; anything else means the rest were lost. */
+    if (this.pendingSnapshot && msg.type !== "camera-state-changed") {
+      const pending = this.pendingSnapshot;
+      this.pendingSnapshot = null;
+      this._applySnapshot(pending.cameras);
+    }
     switch (msg.type) {
       case "hello":
         this._sidecarVersion = msg.content.sidecarVersion;
         this._encoderBackend = msg.content.encoderBackend;
         /* Stamps are opt-in so clients that predate them never pay for them. */
+        this._anchorsSupported = msg.content.anchors === true;
+        this._maxAnchorsPerCamera = msg.content.maxAnchorsPerCamera ?? MAX_ANCHORS_PER_CAMERA;
+        this._sizeHoldSupported = msg.content.sizeHold === true;
+        this._renegotiateSupported = msg.content.renegotiate === true;
+        this._maxSlots = msg.content.maxSlots ?? Number.POSITIVE_INFINITY;
+        if (msg.content.resume === true) this._sendResume();
+        this._sendHeldSizes();
+        /* A new connection starts with no anchors on the sidecar. */
+        this.anchorsSent.clear();
+        this.camerasListed = false;
         if (msg.content.frameStamps === true) {
-          void this._send({ type: "set-frame-stamps", content: { enabled: true } }).catch(() => {});
+          void this._send({
+            type: "set-frame-stamps",
+            content: {
+              enabled: true,
+              ...(this._anchorsSupported ? { anchors: true } : {}),
+              ...(msg.content.frameCommand === true ? { command: true } : {}),
+            },
+          }).catch(() => {});
         }
         break;
       case "camera-snapshot":
-        this._cameras = msg.content.cameras;
-        for (const cam of this._cameras) {
-          if (this.getOrCreateHandle(cam.flightId)._setState(cam)) {
-            this._resourceHandle(cam.flightId);
-          }
+        /* The rest of a split snapshot follows straight after as state changes. */
+        if (msg.content.follows) {
+          this.pendingSnapshot = { cameras: [...msg.content.cameras], remaining: msg.content.follows };
+          break;
         }
-        this.emit("cameras-change", this._cameras);
+        this.pendingSnapshot = null;
+        this._applySnapshot(msg.content.cameras);
         break;
       case "camera-state-changed": {
+        const pending = this.pendingSnapshot;
+        if (pending) {
+          pending.cameras.push(msg.content.state);
+          if (--pending.remaining > 0) break;
+          this.pendingSnapshot = null;
+          this._applySnapshot(pending.cameras);
+          break;
+        }
         const next = this._cameras.filter(
           (c) => c.flightId !== msg.content.state.flightId,
         );
         next.push(msg.content.state);
         next.sort((a, b) => a.flightId - b.flightId);
+        this.commandCentres.record(msg.content.state.flightId, msg.content.state.commandCentre);
         this._cameras = next;
-        if (
-          this.getOrCreateHandle(msg.content.state.flightId)._setState(
-            msg.content.state,
-          )
-        ) {
-          this._resourceHandle(msg.content.state.flightId);
-        }
+        const handle = this.getOrCreateHandle(msg.content.state.flightId);
+        const reattached = attachChanged(handle.state, msg.content.state);
+        const resurrected = handle._setState(msg.content.state);
+        if (resurrected) this._resourceHandle(msg.content.state.flightId);
+        if (resurrected || reattached) this._renewEncodedTransform(msg.content.state.flightId);
         this.emit("cameras-change", this._cameras);
+        this._sendHeldAnchors();
+        if (resurrected || reattached) this._sendHeldAfterReregister(msg.content.state.flightId);
         break;
       }
       case "slot-map": {
@@ -2037,7 +3400,9 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
             this.getOrCreateHandle(prev)._setMediaStream(null);
           }
           this.flightByMid.delete(mid);
+          this.handFreedSlotToWaiting();
         } else {
+          this.clearWaitingForSlot(flightId);
           // A switch (a different camera held this slot) clears the old one.
           if (prev !== undefined && prev !== flightId) {
             this.getOrCreateHandle(prev)._setMediaStream(null);
@@ -2045,9 +3410,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           this.flightByMid.set(mid, flightId);
           const track = this.trackByMid.get(mid);
           if (track) {
-            this.getOrCreateHandle(flightId)._setMediaStream(
-              new MediaStream([track]),
-            );
+            /* The sidecar announces every binding again when the connection
+            recovers. A feed already playing that track keeps its source:
+            swapping it would drop the held frame and flash static. */
+            const handle = this.getOrCreateHandle(flightId);
+            if (!handle._isSourcedFrom(track)) {
+              handle._setMediaStream(new MediaStream([track]));
+            }
           } else {
             // Bound to a slot but the track hasn't arrived yet (the
             // camera-switch gap). Drive the incoming handle sourceless so it
@@ -2062,6 +3431,14 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this.emit("adaptive-shed", msg.content);
         break;
       case "error":
+        if (
+          msg.content.code === ErrorCode.NoFreeSlot &&
+          msg.content.flightId != null &&
+          this.dynamicMode &&
+          this.onNoFreeSlot(msg.content.flightId)
+        ) {
+          break;
+        }
         this.emit("error", msg.content);
         break;
       case "ping":
@@ -2089,6 +3466,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         break;
       case "frame-stamp":
         this.frameStamps.record(msg.content);
+        this.frameHistory.record(msg.content);
         break;
       case "scene-state-changed":
         this._inFlight = msg.content.inFlight;
@@ -2115,12 +3493,30 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       if (boundFlightId !== flightId) continue;
       const track = this.trackByMid.get(mid);
       if (track) {
-        this.getOrCreateHandle(flightId)._setMediaStream(
-          new MediaStream([track]),
-        );
+        /* A feed already playing that track keeps its source: swapping it would drop the held frame and flash static. */
+        const handle = this.getOrCreateHandle(flightId);
+        if (!handle._isSourcedFrom(track)) handle._setMediaStream(new MediaStream([track]));
       }
       return;
     }
+  }
+
+  /**
+   * Give a camera whose source restarted (back in the list after a scene
+   * change, back from destroyed, or reattached in place) a fresh encoded
+   * transform on the receiver it kept. Its frames now come from a new encoder
+   * on a new capture timeline, and an instance built for the old one can hold
+   * them back for good. The new instance replaces the old in one step, so no
+   * frame skips the transform.
+   */
+  private _renewEncodedTransform(flightId: number): void {
+    for (const [mid, installed] of this.transformInstalls) {
+      if (installed.flightId !== flightId) continue;
+      this.warnTransformLeaving(mid, flightId, "the camera's source restarted, so a fresh one replaces it");
+      this.noteDrain(mid, installed);
+      this.transformInstalls.delete(mid);
+    }
+    this._syncEncodedTransforms();
   }
 
   private setState(state: KerbcastConnectionState): void {
@@ -2194,12 +3590,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   private peerOptions(): KerbcastPeerOptions {
-    return { encodedTransforms: this.cfg.encodedTransforms === true };
+    return {
+      encodedTransforms: this.cfg.encodedTransforms === true,
+      ...(this.cfg.recordingTiming === "capture" ? { frameTaps: true } : {}),
+    };
   }
 
   /** Internal: throws unless {@link KerbcastCameraHandle.setEncodedTransform} can work here. */
   _assertEncodedTransforms(): void {
-    if (this.encodedTransformPath) return;
+    if (this.encodedTransformPath && this.cfg.encodedTransforms === true) return;
     const optIn = this.transport.encodedTransformPath?.({ encodedTransforms: true });
     if (optIn && this.cfg.encodedTransforms !== true) {
       throw new Error(
@@ -2215,8 +3614,22 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * Internal: bring each receiver's installed transform in line with the
    * camera now bound to it. A receiver whose camera or factory changed loses
    * its instance; a bound camera with a factory gets a fresh one.
+   *
+   * On the script path every transform handed to a receiver, a camera's or
+   * the passthrough it goes back to, is watched once packets arrive on that
+   * receiver, and renewed only if no frame decodes; see
+   * {@link TRANSFORM_HEAL_POLL_MS}. Chromium wires a script transform to its
+   * receiver only as frames reach it, so on a receiver with no packets coming
+   * in (a relaunch gap, a slot about to be fed) an instance built before it
+   * was handed over can lose to the previous one's late wiring, and then
+   * receives nothing. One built while packets flow is wired at once. Renewing
+   * a wired instance would drop the frames it holds, which for a delay is
+   * seconds of picture.
    */
   _syncEncodedTransforms(): void {
+    this.syncFrameTaps();
+    /* Every setEncodedTransform syncs, so each hold a host gives is read here before it can change again. */
+    for (const install of this.transformInstalls.values()) this.installHoldMs(install);
     const peer = this.peer;
     const path = this.peerTransformPath;
     if (!peer?.setReceiverTransform || !path) return;
@@ -2225,32 +3638,390 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       const flightId = bindings.get(mid);
       const factory = flightId === undefined ? null : (this.handles.get(flightId)?._encodedTransform ?? null);
       if (flightId === installed.flightId && factory === installed.factory) continue;
+      this.warnTransformLeaving(
+        mid,
+        installed.flightId,
+        flightId === undefined
+          ? "its slot was freed"
+          : flightId !== installed.flightId
+            ? `its slot now carries camera ${flightId}`
+            : factory === null
+              ? "setEncodedTransform(null) removed it, so the receiver runs the passthrough"
+              : "setEncodedTransform gave a new factory",
+      );
+      this.noteDrain(mid, installed);
       this.transformInstalls.delete(mid);
-      this.setReceiverTransform(peer, mid, installed.flightId, null);
+      if (this.setReceiverTransform(peer, mid, installed.flightId, null) && path === "script") {
+        this.awaitHeal(mid, null, installed.flightId);
+      }
     }
     for (const [mid, flightId] of bindings) {
       if (this.transformInstalls.has(mid)) continue;
       const factory = this.handles.get(flightId)?._encodedTransform;
       if (!factory) continue;
-      let transform: EncodedTransform;
-      try {
-        transform = factory({ flightId, path });
-      } catch (err) {
-        this.emitTransformError(flightId, err);
+      const install = { flightId, factory, holdMs: this.handles.get(flightId)?._encodedTransformHoldMs, maxHoldMs: 0 };
+      this.installHoldMs(install);
+      if (this.installTransform(peer, mid, install, path) && path === "script") {
+        this.awaitHeal(mid, install, flightId);
+      }
+    }
+    this.syncHoldSampler();
+  }
+
+  /** Reads every install's hold on a timer while any script-path install has its hold as a function; see {@link TRANSFORM_HOLD_SAMPLE_MS}. */
+  private syncHoldSampler(): void {
+    const sampled =
+      this.peerTransformPath === "script" &&
+      [...this.transformInstalls.values()].some((install) => typeof this.installHold(install) === "function");
+    if (sampled && this.holdSampler === null) {
+      this.holdSampler = setInterval(() => {
+        for (const install of this.transformInstalls.values()) this.installHoldMs(install);
+      }, TRANSFORM_HOLD_SAMPLE_MS);
+    } else if (!sampled && this.holdSampler !== null) {
+      clearInterval(this.holdSampler);
+      this.holdSampler = null;
+    }
+  }
+
+  /** Builds `install`'s instance and hands it to `mid`, recording it there only once it is in place. */
+  private installTransform(
+    peer: KerbcastPeer,
+    mid: string,
+    install: TransformInstall,
+    path: EncodedTransformPath,
+  ): boolean {
+    let transform: EncodedTransform;
+    try {
+      transform = install.factory({ flightId: install.flightId, path });
+    } catch (err) {
+      this.emitTransformError(install.flightId, err);
+      return false;
+    }
+    if (!this.setReceiverTransform(peer, mid, install.flightId, transform)) return false;
+    this.transformInstalls.set(mid, install);
+    return true;
+  }
+
+  /**
+   * Records that `install`'s instance is leaving `mid`, where it can stay
+   * wired and go on decoding what it held for up to its hold. Read before the
+   * install is dropped, while its hold can still be read.
+   */
+  private noteDrain(mid: string, install: TransformInstall): void {
+    if (this.peerTransformPath !== "script") return;
+    const holdMs = this.installHoldMs(install);
+    const until = holdMs === null ? Infinity : monotonicNowMs() + Math.max(holdMs, install.maxHoldMs);
+    this.drainUntil.set(mid, Math.max(this.drainUntil.get(mid) ?? 0, until));
+  }
+
+  /** Watch `mid` for arriving packets, to renew its transform if they come with no frame decoded. */
+  private awaitHeal(mid: string, install: TransformInstall | null, flightId: number): void {
+    if (!this.peer?.getStats) return;
+    this.pendingHeals.set(mid, {
+      install,
+      flightId,
+      seq: ++this.healSeq,
+      last: null,
+      lastAt: 0,
+      renewals: 0,
+      stalledSince: null,
+      packetsSince: null,
+      packetsAt: null,
+      since: monotonicNowMs(),
+    });
+    this.armHealTimer();
+    void this.pollHeals();
+  }
+
+  /** Whether `pending`'s transform is still the one on `mid`. */
+  private healStillOwed(mid: string, pending: PendingHeal): boolean {
+    return pending.install
+      ? this.transformInstalls.get(mid) === pending.install
+      : !this.transformInstalls.has(mid);
+  }
+
+  /** Polls quickly while any receiver is in its first minute of waiting, slowly once all have waited longer. */
+  private armHealTimer(): void {
+    const now = monotonicNowMs();
+    let fast = false;
+    for (const pending of this.pendingHeals.values()) {
+      if (now - pending.since < TRANSFORM_HEAL_FAST_FOR_MS) fast = true;
+    }
+    const ms = fast ? TRANSFORM_HEAL_POLL_MS : TRANSFORM_HEAL_SLOW_POLL_MS;
+    if (this.healTimer !== null) {
+      if (this.healTimerMs === ms) return;
+      clearInterval(this.healTimer);
+    }
+    this.healTimerMs = ms;
+    this.healTimer = setInterval(() => void this.pollHeals(), ms);
+  }
+
+  private async pollHeals(): Promise<void> {
+    const peer = this.peer;
+    for (const [mid, pending] of this.pendingHeals) {
+      if (!this.healStillOwed(mid, pending)) this.pendingHeals.delete(mid);
+    }
+    if (this.pendingHeals.size === 0 || !peer?.getStats) {
+      this.stopHeals();
+      return;
+    }
+    this.armHealTimer();
+    if (this.healPolling === peer) return;
+    this.healPolling = peer;
+    const requested = this.healSeq;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let report: RTCStatsReport;
+    try {
+      report = await Promise.race([
+        peer.getStats(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("stats timed out")), TRANSFORM_HEAL_STATS_TIMEOUT_MS);
+        }),
+      ]);
+    } catch {
+      return;
+    } finally {
+      clearTimeout(timeout);
+      if (this.healPolling === peer) this.healPolling = null;
+    }
+    if (this.peer !== peer) return;
+    /* Keyed by stats id, so an old stream's entry lingering on the same mid cannot mask the new one's counts. */
+    const countsByMid = new Map<string, Map<string, ReceiverCounts>>();
+    report.forEach((raw) => {
+      const entry = raw as {
+        id?: string;
+        type?: string;
+        kind?: string;
+        mid?: string;
+        packetsReceived?: number;
+        framesDecoded?: number;
+      };
+      if (entry.type !== "inbound-rtp" || entry.kind !== "video" || entry.mid === undefined) return;
+      let byId = countsByMid.get(entry.mid);
+      if (!byId) countsByMid.set(entry.mid, (byId = new Map()));
+      byId.set(entry.id ?? "", { packets: entry.packetsReceived ?? 0, frames: entry.framesDecoded ?? 0 });
+    });
+    const now = monotonicNowMs();
+    for (const [mid, pending] of this.pendingHeals) {
+      if (pending.seq > requested || !this.healStillOwed(mid, pending)) continue;
+      const counts = countsByMid.get(mid) ?? new Map<string, ReceiverCounts>();
+      const last = pending.last;
+      const lastAt = pending.lastAt;
+      pending.last = counts;
+      pending.lastAt = now;
+      if (last === null) continue;
+      /* Against the previous sample, so each rise is what arrived or decoded since the last poll. */
+      const rose = (key: keyof ReceiverCounts): boolean =>
+        [...counts].some(([id, c]) => c[key] > (last.get(id)?.[key] ?? 0));
+      const packetsRose = rose("packets");
+      const holdMs = this.healHoldMs(pending);
+      const drainUntil = this.drainUntil.get(mid) ?? 0;
+      if (holdMs === null || drainUntil === Infinity) {
+        /*
+         * With no hold given, a transform still filling its hold looks the
+         * same as one left without frames. And an instance with no hold given
+         * that this one replaced may drain decoded frames for any length of
+         * time. Either way it is renewed once when packets first arrive,
+         * unchecked, then watched only if its own hold is known.
+         */
+        if (!packetsRose) continue;
+        if (pending.renewals > 0) this.pendingHeals.delete(mid);
+        else this.renewForHeal(peer, mid, pending);
         continue;
       }
-      if (this.setReceiverTransform(peer, mid, flightId, transform)) {
-        this.transformInstalls.set(mid, { flightId, factory });
+      /*
+       * An instance replaced here can stay wired and drain what it held after
+       * the handover, so decoded frames show this one is wired only once that
+       * drain was over before the previous sample, since a rise counts every
+       * frame decoded since it, and packets have reached this one for its own
+       * hold. Renewing a wired one would only drop the frames it holds.
+       */
+      const packetsSince = pending.packetsSince;
+      if (lastAt >= drainUntil && packetsSince !== null && now - packetsSince >= holdMs && rose("frames")) {
+        this.pendingHeals.delete(mid);
+        continue;
       }
+      if (!packetsRose) {
+        /* A camera at a few frames a second leaves polls with no packet between those with one. */
+        if (pending.packetsAt === null || now - pending.packetsAt > TRANSFORM_HEAL_IDLE_MS) pending.stalledSince = null;
+        continue;
+      }
+      pending.packetsSince ??= now;
+      pending.packetsAt = now;
+      pending.stalledSince ??= now;
+      /* Frames cannot count until the drain is over, so the stall runs at least that long. */
+      const stallMs = TRANSFORM_HEAL_STALL_MS * 2 ** Math.max(0, pending.renewals - 1);
+      const waitMs = Math.max(drainUntil - pending.stalledSince, holdMs) + stallMs;
+      if (now - pending.stalledSince < waitMs) continue;
+      this.renewForHeal(peer, mid, pending);
+    }
+    if (this.pendingHeals.size === 0) this.stopHeals();
+    else this.armHealTimer();
+  }
+
+  /**
+   * How long `pending`'s transform may hold frames before a lack of decoded
+   * ones means it lost them, read now: 0 for the passthrough, null for a
+   * camera's transform whose host gave no usable hold, which is renewed once
+   * unchecked.
+   */
+  private healHoldMs(pending: PendingHeal): number | null {
+    return pending.install ? this.installHoldMs(pending.install) : 0;
+  }
+
+  /** The host's current hold for `install` while its factory is still the camera's, else the one it was installed with. */
+  private installHold(install: TransformInstall): EncodedTransformOptions["holdMs"] {
+    const handle = this.handles.get(install.flightId);
+    return handle?._encodedTransform === install.factory ? handle._encodedTransformHoldMs : install.holdMs;
+  }
+
+  /** `install`'s hold read now, in ms, also kept as its longest when it is. */
+  private installHoldMs(install: TransformInstall): number | null {
+    const hold = this.installHold(install);
+    if (hold === undefined) return null;
+    let ms: number;
+    try {
+      ms = typeof hold === "function" ? hold() : hold;
+    } catch {
+      return null;
+    }
+    if (!Number.isFinite(ms) || ms < 0) return null;
+    install.maxHoldMs = Math.max(install.maxHoldMs, ms);
+    return ms;
+  }
+
+  /** Renews `pending`'s transform on `mid` and asks for a keyframe, then watches for frames decoding unless out of retries. */
+  private renewForHeal(peer: KerbcastPeer, mid: string, pending: PendingHeal): void {
+    const bindings = this.dynamicMode ? this.flightByMid : this.legacyFlightByMid;
+    const bound = bindings.get(mid);
+    this.warnTransformLeaving(
+      mid,
+      bound ?? pending.flightId,
+      `packets arrive with no frame decoded, so it is renewed (renewal ${pending.renewals + 1})`,
+      pending.install === null,
+    );
+    const renewed = pending.install
+      ? this.installTransform(peer, mid, pending.install, "script")
+      : this.setReceiverTransform(peer, mid, bound ?? pending.flightId, null);
+    /*
+     * A renewal hands over from this transform's own instance, after any
+     * bounded drain was waited out, so its own longest hold bounds the drain
+     * from here. That also ends an unbounded one: built while packets flow,
+     * the new instance is wired at once, so a drain still running can only
+     * end a watch it no longer needs. A renewal that failed leaves the
+     * instance it would have replaced, bounded the same way, and the receiver
+     * goes unchecked from here, so an unbounded drain would only force a
+     * renewal of whatever is wired at the next handover.
+     */
+    const holdMs = this.healHoldMs(pending);
+    const drainMs = pending.install ? Math.max(holdMs ?? 0, pending.install.maxHoldMs) : 0;
+    this.drainUntil.set(mid, monotonicNowMs() + drainMs);
+    const exhausted = ++pending.renewals > TRANSFORM_HEAL_RETRIES;
+    if (renewed && exhausted) {
+      console.warn(
+        `[kerbcast] slot ${mid}, camera ${bound ?? pending.flightId}: no frame decoded after ${pending.renewals} renewals of its encoded transform; it is no longer watched`,
+      );
+    }
+    if (!renewed || exhausted || holdMs === null) {
+      this.pendingHeals.delete(mid);
+    } else {
+      pending.seq = ++this.healSeq;
+      pending.last = null;
+      pending.stalledSince = null;
+      pending.packetsSince = null;
+      pending.packetsAt = null;
+      pending.since = monotonicNowMs();
+    }
+    /* The instance it replaced may have taken the keyframe with it. */
+    if (renewed && bound !== undefined) this.handles.get(bound)?.requestKeyframe().catch(() => {});
+  }
+
+  /**
+   * Says on the console that a transform on `mid` is being replaced or
+   * removed. A host transform still reading from the instance that leaves
+   * gets no more frames, which is silent from the host's side; this names
+   * the slot and camera so it can be traced.
+   */
+  private warnTransformLeaving(mid: string, flightId: number, why: string, passthrough = false): void {
+    console.warn(
+      `[kerbcast] slot ${mid}, camera ${flightId}: ${passthrough ? "the passthrough" : "its encoded transform"} leaves the receiver: ${why}`,
+    );
+  }
+
+  private stopHeals(): void {
+    this.pendingHeals.clear();
+    if (this.healTimer !== null) {
+      clearInterval(this.healTimer);
+      this.healTimer = null;
+    }
+  }
+
+  /** Internal: whether {@link KerbcastCameraHandle.tapEncodedFrames} can copy `flightId`'s frames on this client. */
+  _frameTapAvailable(flightId: number): boolean {
+    const path = this.encodedTransformPath;
+    if (!path || this.cfg.recordingTiming !== "capture") return false;
+    /* A script-path receiver holds one transform: the camera's own replaces the copying passthrough. */
+    return !(path === "script" && this.handles.get(flightId)?._encodedTransform);
+  }
+
+  /** Internal: a camera's own transform is about to replace the passthrough its taps copy from. */
+  _warnTapsDisplaced(flightId: number): void {
+    if (this.encodedTransformPath !== "script") return;
+    this.emit("error", {
+      message: `[kerbcast] camera ${flightId}'s encoded transform stops its frame copies until it is removed; a capture-timed recording of it misses those frames`,
+      source: ErrorSource.Client,
+      flightId,
+    });
+  }
+
+  /** Points each receiver's frame copy at the camera bound to it, while that camera has taps. */
+  private syncFrameTaps(): void {
+    const peer = this.peer;
+    if (!peer?.setReceiverTap) return;
+    const bindings = this.dynamicMode ? this.flightByMid : this.legacyFlightByMid;
+    for (const [mid, flightId] of this.tapInstalls) {
+      if (bindings.get(mid) === flightId && this.handles.get(flightId)?._frameTaps.size) continue;
+      this.tapInstalls.delete(mid);
+      this.setReceiverTap(peer, mid, flightId, null);
+    }
+    for (const [mid, flightId] of bindings) {
+      if (this.tapInstalls.has(mid) || !this.handles.get(flightId)?._frameTaps.size) continue;
+      const deliver = (frame: EncodedFrameCopy): void => {
+        this.handles.get(flightId)?._deliverFrame(frame);
+      };
+      if (this.setReceiverTap(peer, mid, flightId, deliver)) this.tapInstalls.set(mid, flightId);
+    }
+  }
+
+  private setReceiverTap(
+    peer: KerbcastPeer,
+    mid: string,
+    flightId: number,
+    onFrame: ((frame: EncodedFrameCopy) => void) | null,
+  ): boolean {
+    try {
+      peer.setReceiverTap?.(mid, onFrame);
+      return true;
+    } catch (err) {
+      this.emit("error", {
+        message: `[kerbcast] frame copy for camera ${flightId}: ${err instanceof Error ? err.message : String(err)}`,
+        source: ErrorSource.Client,
+        flightId,
+      });
+      return false;
     }
   }
 
   private clearEncodedTransforms(): void {
+    this.stopHeals();
+    this.drainUntil.clear();
+    this.tapInstalls.clear();
     const peer = this.peer;
     for (const [mid, installed] of this.transformInstalls) {
       if (peer) this.setReceiverTransform(peer, mid, installed.flightId, null);
     }
     this.transformInstalls.clear();
+    this.syncHoldSampler();
   }
 
   private setReceiverTransform(

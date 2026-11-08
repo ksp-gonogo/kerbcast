@@ -11,8 +11,13 @@ export {
   CommandLockedError,
   CommandTargetUnknownError,
   OfferRefusedError,
+  RenegotiateRefusedError,
   COMMAND_CAMERA_STATE_WAIT_MS,
   CONTROL_OPEN_TIMEOUT_MS,
+  CONTACT_GAP_MS,
+  type ContactGap,
+  type AutoReconnectOptions,
+  type ReconnectProgress,
   type CreateCommandCameraOptions,
   type BrowserKerbcastTransportOptions,
   type InboundVideoStats,
@@ -28,20 +33,38 @@ export {
   type EncodedTransform,
   type EncodedTransformContext,
   type EncodedTransformFactory,
+  type EncodedTransformOptions,
   type EncodedTransformPath,
   type DiscoveredCamera,
   type NoiseConfig,
 } from "./client";
 
 export {
+  FRAME_HISTORY_MAX_ENTRIES,
+  FRAME_HISTORY_MAX_LAG_UT,
   FRAME_STAMP_HISTORY,
   MAX_UT_EXTRAPOLATION_MS,
   STAMP_TO_DISPLAY_MAX_MS,
   extrapolateCaptureUt,
   type DisplayedFrameUt,
+  type FrameStampExtras,
   type FrameUt,
   type FrameUtSource,
 } from "./frameUt";
+
+export {
+  MAX_ANCHORS_PER_CAMERA,
+  KERBCAST_ANCHOR_OWNER,
+  COMMAND_AIM_ANCHOR_ID,
+  COMMAND_SUBJECT_ANCHOR_ID,
+  fitFrame,
+  frameToScreen,
+  frameLengthToScreen,
+  findAnchor,
+  anchorPoint,
+  type FittedFrame,
+  type FrameFit,
+} from "./anchors";
 
 export {
   PanZoomController,
@@ -58,12 +81,19 @@ export {
   utToRecordingTimeMs,
   DEFAULT_COVERAGE_TIMEOUT_MS,
   ARM_TIMEOUT_MS,
+  KEYFRAME_RETRY_MS,
+  SOURCE_LOST_GRACE_MS,
+  CAMERA_UNLISTED_GRACE_MS,
+  RECONNECT_GRACE_MS,
   videoElementDecodedSizeProbe,
   type ActiveRecordingInfo,
   type DecodedSizeProbe,
   type RecordingClient,
   type RecordingControllerOptions,
   type RecordingHandle,
+  type RecordingEndReason,
+  type RecordingEndedEvent,
+  type RecordingTiming,
   type RecordingsSnapshot,
   type GroupedRecordingHandle,
   type GroupedRecordingStart,
@@ -73,6 +103,8 @@ export {
   type StartRecordingOptions,
   type StopGroupedRecordingOptions,
 } from "./recording";
+
+export { type EncodedFrameCopy } from "./captureClip";
 
 export {
   COMMAND_TRACK_LABELS,
