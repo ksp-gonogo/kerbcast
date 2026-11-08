@@ -160,6 +160,7 @@ var truthPins = new[]
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AfgInputsFor", "var lhs = afg.planet.scaledBody.transform.position - camPos;", 1, "a body's scaled mesh"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AfgInputsFor", "? Mathf.Clamp01(Vector3.Dot(lhs, camPos - sun.scaledBody.transform.position) * afg.dawnFactor)", 1, "the Sun's scaled mesh"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.BeforeScaledRender", "_afgOurs = AfgInputsFor(afg, scaled.transform.position);", 1, "the lens's own scaled camera"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.DrawStationGround", "string failed = _ground.Show(body, scaled.transform.position, ToF(toCentre * plan.EyeToCentreScale), plan.SphereRadiusUnits);", 1, "the lens's own scaled camera"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.LogSkyBlockers", "var ray = new Ray(scaled.transform.position, scaled.transform.forward);", 1, "the lens's own scaled camera"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.LogSkyInputs", "var centre = body.scaledBody.transform.position;", 1, "a body's scaled mesh"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.LogSkyInputs", "var toSun = sun != null ? (sun.scaledBody.transform.position - t.position).normalized : Vector3.zero;", 1, "the Sun's scaled mesh"),

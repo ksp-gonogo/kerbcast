@@ -2001,8 +2001,42 @@ namespace Kerbcast
             mpb.SetFloat(LightDotId, v.LightDot);
         }
 
+        private CommandCameraStationGround _ground;
+        private bool _groundDrawn;
+        private string _groundState;
+
+        /* Draws the body's ground under a lens whose body has no local terrain,
+           when the view reaches below the horizon. Runs for every scaled render,
+           the probe's too, and draws nothing a view above the horizon can see. */
+        private void DrawStationGround(KerbcastCamera cam)
+        {
+            var scaled = cam.ScaledLayer;
+            var body = _mount.Site.Body;
+            if (scaled == null || body == null || !_poseValid) return;
+            var toCentre = ToD(body.position) - _poseEye;
+            bool wasDrawn = _groundDrawn;
+            _groundDrawn = false;
+            var plan = CommandCameraMath.PlanStationGround(toCentre.Magnitude, body.Radius, ScaledSpace.ScaleFactor,
+                _poseForward, _poseUp, toCentre.Normalized * -1.0, scaled.fieldOfView, scaled.aspect, wasDrawn);
+            string state = _stationMeshStock ? "off (terrain is local)" : "off (no ground in view, or the lens is clear of the near plane)";
+            if (plan.Draw && !_stationMeshStock)
+            {
+                if (_ground == null) _ground = new CommandCameraStationGround(_flightId);
+                string failed = _ground.Show(body, scaled.transform.position, ToF(toCentre * plan.EyeToCentreScale), plan.SphereRadiusUnits);
+                _groundDrawn = failed == null;
+                state = failed == null ? "on (no local terrain, view reaches below the horizon)" : "unavailable (" + failed + ")";
+            }
+            if (state == _groundState) return;
+            _groundState = state;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(_frameUt)} d={_lastDistance:F0} event=station-ground {state} "
+                + $"body={body.bodyName} elev={ElevationDeg:F2} lowest={plan.LowestDeg:F2} dip={plan.HorizonDipDeg:F2} "
+                + $"eyeHeight={toCentre.Magnitude - plan.GroundRadiusM:F0}m groundRadius={plan.GroundRadiusM:F0}m "
+                + $"magnify={plan.Magnify:G4} sphere={plan.SphereRadiusUnits:G6}");
+        }
+
         public void BeforeScaledRender(KerbcastCamera cam)
         {
+            DrawStationGround(cam);
             _afgOverridden = null;
             var body = _mount.Site.Body;
             var afg = body != null ? body.afg : null;
@@ -2021,6 +2055,7 @@ namespace Kerbcast
 
         public void AfterScaledRender(KerbcastCamera cam)
         {
+            _ground?.Hide();
             if (_afgOverridden == null || _afgRenderer == null) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
             ApplyAfg(_afgBlock, _afgStock);
@@ -2407,6 +2442,8 @@ namespace Kerbcast
             _utStripe = null;
             _standIn?.Dispose();
             _standIn = null;
+            _ground?.Dispose();
+            _ground = null;
             if (_midCam != null) UnityEngine.Object.Destroy(_midCam.gameObject);
             _midCam = null;
             _subpixel?.Dispose();
