@@ -1,11 +1,13 @@
 import {
   buildCameraLabeler,
   CameraFeed,
+  networkFeedName,
   useKerbcastCameras,
 } from "@ksp-gonogo/kerbcast-react";
 import type { FeedAction } from "@ksp-gonogo/kerbcast-react";
 import { Check, ListPlus, ListX, Pencil, Pin, PinOff, Plus, Trash2, WifiOff, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { loadLabel, saveLabel } from "./labels";
 import { cameraKey, isCameraShown } from "./tiles";
@@ -125,6 +127,16 @@ export function Tile({
 
   const label = customLabel ?? autoLabel;
 
+  /*
+   * A network feed is named after the vantage its frame came from ("Crater
+   * Rim via Kerbin ground net"), which only the feed knows frame by frame, so
+   * the feed draws that name into this slot. Empty (the feed blanked or not
+   * yet drawn) it shows the network's own name.
+   */
+  const displaysNetwork = !!cameras.find((c) => c.flightId === displayedFlightId)?.commandCentre?.network;
+  const [networkSlot, setNetworkSlot] = useState<HTMLSpanElement | null>(null);
+  const namesNetwork = displaysNetwork && customLabel === null;
+
   // Inline label editor: open state and draft text.
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -220,6 +232,9 @@ export function Tile({
           onSelectCamera={onSelectCamera}
           cameraFilter={mergeCrew && showLaunchpad ? undefined : (c) => isCameraShown(c, { mergeCrew, showLaunchpad })}
           onDisplayedCameraChange={setDisplayedFlightId}
+          renderNetworkVantage={(siteLabel, _state, networkName) =>
+            namesNetwork && networkSlot ? createPortal(networkFeedName(siteLabel, networkName), networkSlot) : null
+          }
           enableFullscreen
           enablePictureInPicture
           enableQualityControl
@@ -272,7 +287,11 @@ export function Tile({
         </LabelEditor>
       ) : (
         <TileCornerLabel>
-          <TileCornerText>{label}</TileCornerText>
+          {namesNetwork ? (
+            <TileNetworkName ref={setNetworkSlot} data-fallback={label} />
+          ) : (
+            <TileCornerText>{label}</TileCornerText>
+          )}
           {canRename && (
             <TileRenameButton
               type="button"
@@ -478,6 +497,13 @@ const TileCornerText = styled.span`
 
   @media (prefers-reduced-motion: reduce) {
     transition: none;
+  }
+`;
+
+/* A network feed's name, filled by the feed; empty, it falls back to the network's own name. */
+const TileNetworkName = styled(TileCornerText)`
+  &:empty::before {
+    content: attr(data-fallback);
   }
 `;
 

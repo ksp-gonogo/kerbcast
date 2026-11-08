@@ -42,6 +42,8 @@ export { StandbyIcon } from "./StandbyIcon";
 
 // Camera label utilities
 export { buildCameraLabeler } from "./cameraLabels";
+export { NETWORK_FEED_TEXT, networkFeedName, networkSees, readNetworkVantage } from "./networkVantage";
+export type { NetworkVantageReading } from "./networkVantage";
 export type { LabelableCamera } from "./cameraLabels";
 
 // Lifecycle utilities

@@ -3138,6 +3138,106 @@ describe("CameraFeed - command camera target brackets", () => {
     });
   });
 
+  describe("network vantage caption", () => {
+    const NETWORK: CommandCentreInfo = {
+      ...STATION,
+      siteKey: "Crater Rim",
+      nodeName: "Crater Rim",
+      displayName: "North dish",
+      network: {
+        name: "Tracking network",
+        state: "ok",
+        vantages: [
+          { siteKey: "KSC", label: "KSC", state: "occluded", active: false },
+          { siteKey: "Crater Rim", label: "North dish", state: "ok", active: true },
+        ],
+      },
+    };
+    const networkCamera = () =>
+      makeCamera({
+        flightId: 301,
+        kind: CameraKind.Command,
+        cameraName: "Tracking network",
+        commandCentre: NETWORK,
+        commandTrack: commandTrack(),
+      });
+    const frameAt = (siteLabel: string, networkState: string, blank?: string): DisplayedFrameUt => ({
+      flightId: 301,
+      ut: 1000,
+      epoch: 0,
+      source: "exact",
+      rtpTimestamp: 1,
+      presentedAt: 0,
+      command: {
+        hasFix: true,
+        frameHeightPx: 576,
+        framingFits: true,
+        occluded: networkState !== "ok",
+        occluder: "",
+        sunlit: true,
+        subjectPersistentId: 7,
+        siteKey: siteLabel,
+        siteLabel,
+        networkState,
+        ...(blank ? { blank } : {}),
+      },
+    });
+    const feed = (client: KerbcastClient, frame: DisplayedFrameUt | null, extra: Partial<CameraFeedProps> = {}) => (
+      <KerbcastProvider client={client}>
+        <CameraFeed flightId={301} displayFrame={frame} {...extra} />
+      </KerbcastProvider>
+    );
+
+    it("names the feed after the frame's vantage and the network, and renames it on the cut", async () => {
+      const { client } = await buildConnectedSource([networkCamera()]);
+      const view = render(feed(client, frameAt("Crater Rim", "ok")));
+      expect(screen.getByText("Crater Rim via Tracking network")).toBeTruthy();
+      view.rerender(feed(client, frameAt("Comms Relay", "noView")));
+      expect(screen.getByText("Comms Relay via Tracking network")).toBeTruthy();
+    });
+
+    it("falls back to the camera list before a frame says", async () => {
+      const { client } = await buildConnectedSource([networkCamera()]);
+      render(feed(client, null));
+      expect(screen.getByText("North dish via Tracking network")).toBeTruthy();
+    });
+
+    it("lists a network once, by its own name", async () => {
+      const station = makeCamera({ flightId: 302, kind: CameraKind.Command, cameraName: "KSC tracking", vesselName: "KSC", commandCentre: STATION });
+      const { client } = await buildConnectedSource([networkCamera(), station]);
+      render(feed(client, frameAt("Crater Rim", "ok")));
+      fireEvent.click(screen.getByRole("button", { name: /via Tracking network/ }));
+      const items = screen.getAllByRole("menuitemradio").map((i) => i.textContent);
+      expect(items).toEqual(["Tracking network", "KSC tracking (KSC)"]);
+    });
+
+    it("hands the reading to a host that draws the name in its own layer", async () => {
+      const { client } = await buildConnectedSource([networkCamera()]);
+      render(
+        feed(client, frameAt("Crater Rim", "noView"), {
+          renderNetworkVantage: (label, state, network) => (
+            <span data-testid="host-chip">{`${state}:${label}:${network}`}</span>
+          ),
+        }),
+      );
+      expect(screen.getByTestId("host-chip").textContent).toBe("noView:Crater Rim:Tracking network");
+    });
+
+    it("does not call the host on a blanked feed or a camera at one site", async () => {
+      const { client } = await buildConnectedSource([networkCamera()]);
+      const calls: string[] = [];
+      const draw = (label: string) => {
+        calls.push(label);
+        return null;
+      };
+      const view = render(feed(client, frameAt("Crater Rim", "noView", "No vantage"), { renderNetworkVantage: draw }));
+      view.unmount();
+      const single = await buildConnectedSource([commandCamera()]);
+      render(feed(single.client, null, { renderNetworkVantage: draw }));
+      expect(calls).toEqual([]);
+    });
+  });
+
   it("shows the transition in force at the displayed UT", async () => {
     const track = commandTrack({
       events: [

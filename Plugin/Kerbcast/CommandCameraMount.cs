@@ -12,15 +12,17 @@ namespace Kerbcast
         private readonly GameObject _anchor;
         private readonly float _defaultFov;
         private readonly string _name;
+        private readonly string _group;
 
         /* Set again only by a tracking network's cut; everything that reads the site reads it fresh. */
         public CommandCameraSite Site { get; set; }
 
-        /* `name` replaces the feed name the site would give it. */
-        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, string name = null)
+        /* `name` replaces the feed name the site would give it, and `group` the site's name clients group it under. */
+        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, string name = null, string group = null)
         {
             Site = site;
             _name = name;
+            _group = group;
             _defaultFov = defaultFov;
             _anchor = new GameObject($"Kerbcast_{flightId}_CommandAnchor");
         }
@@ -52,8 +54,9 @@ namespace Kerbcast
             : Site.NodeName == "LaunchPad" ? "Launchpad camera"
             : $"{Site.DisplayName} camera";
         /* A command camera has no owning craft; the station's name is the stable
-           label clients group and key it by. */
-        public string VesselDisplayName => Site.DisplayName;
+           label clients group and key it by. A tracking network's is its own
+           name, which a cut does not change. */
+        public string VesselDisplayName => !string.IsNullOrEmpty(_group) ? _group : Site.DisplayName;
 
         public bool IsAlive => _anchor != null && Site.Body != null;
         public bool OwnsPart(Part part) => false;

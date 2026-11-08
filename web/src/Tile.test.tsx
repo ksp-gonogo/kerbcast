@@ -388,3 +388,49 @@ describe("Tile - per-feed recording", () => {
     expect(startSpy).toHaveBeenCalledWith(1, { forceFullResolution: false });
   });
 });
+
+describe("Tile - tracking network name", () => {
+  const network = () =>
+    makeCamera({
+      flightId: 7,
+      kind: CameraKind.Command,
+      partName: "kerbcast.commandCamera",
+      partTitle: "Command camera",
+      cameraName: "Kerbin ground net",
+      vesselName: "Kerbin ground net",
+      commandCentre: {
+        stationId: "ground:Crater Rim",
+        siteKey: "Crater Rim",
+        nodeName: "Crater Rim",
+        displayName: "Crater Rim",
+        body: "Kerbin",
+        latitude: 9.4,
+        longitude: -172.1,
+        altitude: 4000,
+        subjectPersistentId: 0,
+        trackingLevel: 3,
+        targets: [],
+        network: {
+          name: "Kerbin ground net",
+          state: "ok",
+          vantages: [
+            { siteKey: "KSC", label: "KSC", state: "occluded", active: false },
+            { siteKey: "Crater Rim", label: "Crater Rim", state: "ok", active: true },
+          ],
+        },
+      },
+    });
+
+  it("names the corner after the vantage the feed shows, via the network", async () => {
+    const { client } = await buildConnectedFixture([network()]);
+    let container: HTMLElement;
+    await act(async () => {
+      ({ container } = renderTile(client, 7));
+    });
+    await waitFor(() => {
+      const corner = container!.querySelector("[data-fallback]");
+      expect(corner?.textContent).toBe("Crater Rim via Kerbin ground net");
+      expect(corner?.getAttribute("data-fallback")).toBe("Kerbin ground net");
+    });
+  });
+});

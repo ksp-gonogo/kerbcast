@@ -71,6 +71,8 @@ export function commandShownKey(c: FrameCommandState | undefined): string {
     c.refusalCode ?? null,
     c.refusalText ?? null,
     c.waitingForTarget ?? false,
+    c.siteLabel ?? null,
+    c.networkState ?? null,
   ]);
 }
 

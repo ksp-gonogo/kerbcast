@@ -10,6 +10,7 @@ import {
   formatCommandRange,
 } from "@ksp-gonogo/kerbcast";
 import {
+  type ReactNode,
   forwardRef,
   useCallback,
   useEffect,
@@ -23,6 +24,7 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
+import { networkFeedName, readNetworkVantage } from "./networkVantage";
 import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider, useKerbcastClient } from "./context";
 import {
   ActionBarRow,
@@ -382,6 +384,18 @@ export interface CameraFeedProps {
    * or draw anchors set in game too. See {@link AnchorOverlay}.
    */
   anchorOverlay?: AnchorOverlay;
+  /**
+   * Name a tracking network feed in your own layer. A network feed's title
+   * reads "<vantage> via <network>" ("Crater Rim via Kerbin ground net"),
+   * taken from the displayed frame so it changes on the cut frame; this is
+   * called on every render with the same reading: the vantage's label, the
+   * frame's network state (`ok`, or `noView`; treat any other value as
+   * `noView`) and the network's name. What it returns is placed over the
+   * picture with no position of its own, so return a positioned element, a
+   * portal into your own layer, or null. Called only while the feed shows a
+   * network camera in flight that is not blanked.
+   */
+  renderNetworkVantage?: (siteLabel: string, networkState: string, networkName: string) => ReactNode;
 }
 
 export interface CameraFeedHandle {
@@ -428,6 +442,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       displayFrame,
       anchors,
       anchorOverlay,
+      renderNetworkVantage,
     },
     ref,
   ) {
@@ -747,6 +762,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const commandState = commandTrack
       ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut, commandDisplayUt?.command)
       : null;
+    const networkVantage = commandCamera
+      ? readNetworkVantage(commandDisplayUt?.command, commandCamera.commandCentre, commandCamera.cameraName)
+      : null;
     /* This feed's anchors go to the camera it displays, and leave with it. */
     const anchorsKey = anchors?.length ? JSON.stringify(anchors) : "";
     useEffect(() => {
@@ -961,7 +979,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     });
 
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
-    const title = camera ? cameraLabel(camera) : "Camera Feed";
+    const title = !camera
+      ? "Camera Feed"
+      : networkVantage?.networkName
+        ? networkFeedName(networkVantage.siteLabel, networkVantage.networkName)
+        : cameraLabel(camera);
 
     // -------------------------------------------------------------------------
     // Viewer quality control (opt-in). A built-in action button + menu: Auto
@@ -1155,7 +1177,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     cameraMenu.close();
                   }}
                 >
-                  {cameraLabel(c)} ({c.vesselName})
+                  {/* A network is one feed, named by the network alone: its vantages change under it. */}
+                  {c.commandCentre?.network ? cameraLabel(c) : `${cameraLabel(c)} (${c.vesselName})`}
                   {isCameraDestroyed(c) ? " - signal lost" : ""}
                 </CameraMenuItem>
               ))}
@@ -1595,6 +1618,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
+              {networkVantage && renderNetworkVantage && !outOfFlight && !isDestroyed && !commandState?.blank &&
+                renderNetworkVantage(networkVantage.siteLabel, networkVantage.networkState, networkVantage.networkName)}
               {waitingForSlot && !outOfFlight && !isDestroyed && noSlotLabel && (
                 <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
               )}

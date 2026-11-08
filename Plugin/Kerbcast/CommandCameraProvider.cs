@@ -418,7 +418,7 @@ namespace Kerbcast
                 CommandCameraMount mount = null;
                 try
                 {
-                    mount = new CommandCameraMount(_site, flightId, (float)S.CommandCameraFovMax, name);
+                    mount = new CommandCameraMount(_site, flightId, (float)S.CommandCameraFovMax, name, IsNetwork ? _network.Name : null);
                     var cam = new KerbcastCamera(
                         mount,
                         flightId,
