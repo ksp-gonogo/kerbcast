@@ -46,6 +46,7 @@ Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras
 Check(KerbcastApi.Supports(ApiFeature.GroundStations) && (int)ApiFeature.GroundStations == 10, "shipped: the ground station list, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.LineOfSight) && (int)ApiFeature.LineOfSight == 11, "shipped: line of sight, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.VantageResolution) && (int)ApiFeature.VantageResolution == 12, "shipped: vantage resolution, from API 1.5");
+Check(KerbcastApi.Supports(ApiFeature.CommandFov) && (int)ApiFeature.CommandFov == 13, "shipped: a command feed's field of view, from API 1.5");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
 
 // Enum numbers are part of the contract.
@@ -179,8 +180,24 @@ using (var kc = RecordingKerbcast.Install())
     Check(cmd.SetAim(500, Aim.Vessel(42), null) == AimResult.Ok, "without a lock anyone aims");
     Check(cmd.SetOptics(500, new OpticsSettings { ResolutionArcsec = 30 }, null) == OpticsResult.Ok
         && kc.Command.Optics[500].ResolutionArcsec == 30, "without a lock anyone sets a feed's optics");
+    Check(cmd.SetFov(500, 30, null) == AimResult.Ok && kc.Command.Fovs[500] == 30, "without a lock anyone sets a feed's field of view");
     Check(cmd.TakeLock("modA", LockOptions.WorldModelRequired, "Authority silent") == LockResult.Taken, "TakeLock takes a free lock");
     Check(kc.Command.Aims.Count == 0, "taking the lock drops aims set before it");
+    Check(kc.Command.Fovs.Count == 0, "and fields of view set before it");
+    Check(cmd.SetFov(500, 10, "modB") == AimResult.NotLockHolder, "only the holder sets a field of view");
+    Check(cmd.SetFov(501, 10, "modA") == AimResult.NotCommandFeed, "a field of view on an unknown feed is refused");
+    Check(cmd.SetFov(500, 0, "modA") == AimResult.BadNumber && cmd.SetFov(500, double.PositiveInfinity, "modA") == AimResult.BadNumber
+        && kc.Command.Fovs.Count == 0, "a field of view that is not above 0 and finite is refused");
+    Check(cmd.SetFov(500, 2.5, "modA") == AimResult.Ok && kc.Command.Fovs[500] == 2.5, "the holder holds a feed's field of view");
+    Check(cmd.SetFov(500, double.NaN, "modA") == AimResult.Ok && kc.Command.Fovs.Count == 0, "NaN returns it to the aim's framing");
+    cmd.SetFov(500, 2.5, "modA");
+    var wide = Aim.Direction(180, 5).WithFov(30);
+    Check(wide.FovDeg == 30 && wide.Azimuth == 180 && wide.Elevation == 5 && double.IsNaN(Aim.Direction(180, 5).FovDeg),
+        "WithFov copies the aim with a field, and an aim has none of its own");
+    Check(cmd.SetAim(500, wide, "modA") == AimResult.Ok && kc.Command.Fovs.Count == 0 && kc.Command.Aims[500].FovDeg == 30,
+        "an aim replaces a held field of view with its own");
+    Check(cmd.SetAim(500, Aim.Vessel(42).WithFov(-1), "modA") == AimResult.BadNumber, "an aim's field of view is checked like SetFov's");
+    cmd.SetAim(500, null, "modA");
     Check(kc.Command.Optics.Count == 0, "and optics set before it");
     Check(cmd.SetOptics(500, new OpticsSettings { SeeingArcsec = 2 }, "modB") == OpticsResult.NotLockHolder, "only the holder sets optics");
     Check(cmd.SetOptics(501, new OpticsSettings(), "modA") == OpticsResult.NotCommandFeed, "optics on an unknown feed are refused");

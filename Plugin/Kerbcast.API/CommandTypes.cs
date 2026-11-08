@@ -147,6 +147,14 @@ namespace Kerbcast.Api
         public double Azimuth { get; }
         public double Elevation { get; }
 
+        /**
+         * <summary>
+         * The lens's vertical field of view in degrees, held until the next aim or <see cref="ICommand.SetFov"/> and
+         * clamped to the camera's limits; NaN for the aim's own framing. Set it with <see cref="WithFov"/>. Added in 1.5.
+         * </summary>
+         */
+        public double FovDeg { get; private set; } = double.NaN;
+
         Aim(AimKind kind, uint subject, int body, double margin, bool allowUncertain,
             double inc = 0, double e = 0, double sma = 0, double lan = 0, double argPe = 0, double mna = 0, double epoch = 0,
             double lat = 0, double lon = 0, double alt = 0,
@@ -204,15 +212,32 @@ namespace Kerbcast.Api
         public static Aim Direction(double azimuth, double elevation, double framingMarginM = 0) =>
             new Aim(AimKind.Direction, 0, -1, framingMarginM, false, azimuth: azimuth, elevation: elevation);
 
+        /**
+         * <summary>
+         * This aim with the lens held at <paramref name="fovDeg"/> degrees (finite and above 0, or NaN for the aim's own
+         * framing); anything else is refused as BadNumber. Without one a Vessel, Orbit or PositionAt aim frames its
+         * subject, a Surface aim frames its margin about the point (the widest view without one) and a Direction aim
+         * opens to the widest view. Check <see cref="KerbcastApi.Supports"/> with <see cref="ApiFeature.CommandFov"/>
+         * first: an older Kerbcast ignores the field.
+         * </summary>
+         */
+        public Aim WithFov(double fovDeg)
+        {
+            var copy = (Aim)MemberwiseClone();
+            copy.FovDeg = fovDeg;
+            return copy;
+        }
+
         public override string ToString()
         {
+            string fov = double.IsNaN(FovDeg) ? "" : $" fov {FovDeg}";
             switch (Kind)
             {
-                case AimKind.Vessel: return AllowUncertain ? $"Vessel({SubjectPersistentId}, allowUncertain)" : $"Vessel({SubjectPersistentId})";
-                case AimKind.Orbit: return $"Orbit(body {BodyIndex}, sma {SemiMajorAxis}, e {Eccentricity})";
-                case AimKind.Surface: return $"Surface(body {BodyIndex}, {Latitude}, {Longitude}, {Altitude})";
-                case AimKind.PositionAt: return $"PositionAt(body {BodyIndex}, ut {Ut})";
-                default: return $"Direction({Azimuth}, {Elevation})";
+                case AimKind.Vessel: return (AllowUncertain ? $"Vessel({SubjectPersistentId}, allowUncertain)" : $"Vessel({SubjectPersistentId})") + fov;
+                case AimKind.Orbit: return $"Orbit(body {BodyIndex}, sma {SemiMajorAxis}, e {Eccentricity})" + fov;
+                case AimKind.Surface: return $"Surface(body {BodyIndex}, {Latitude}, {Longitude}, {Altitude})" + fov;
+                case AimKind.PositionAt: return $"PositionAt(body {BodyIndex}, ut {Ut})" + fov;
+                default: return $"Direction({Azimuth}, {Elevation})" + fov;
             }
         }
     }

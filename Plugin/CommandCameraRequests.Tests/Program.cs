@@ -106,6 +106,11 @@ Check(new CommandAimSpec { Kind = "moon" }.Invalid() != null, "unknown aim kind 
 var dir = AimOf(@"{""kind"":""direction"",""azimuth"":90,""elevation"":30,""framingMarginM"":5}");
 Check(dir.Kind == "direction" && dir.Azimuth == 90 && dir.Elevation == 30 && dir.FramingMarginM == 5 && dir.Invalid() == null,
     "direction aim fields");
+Check(double.IsNaN(dir.FovDeg), "an aim without fovDeg leaves the field to its framing");
+var wide = AimOf(@"{""kind"":""direction"",""azimuth"":180,""elevation"":5,""fovDeg"":30}");
+Check(wide.FovDeg == 30 && wide.Invalid() == null, "an aim carries a field of view");
+Check(AimOf(@"{""kind"":""direction"",""azimuth"":180,""elevation"":5,""fovDeg"":0}").Invalid() != null, "a field of 0 refused");
+Check(AimOf(@"{""kind"":""vessel"",""persistentId"":7,""fovDeg"":-2}").Invalid() != null, "a negative field refused");
 Check(AimOf(@"{""kind"":""direction"",""azimuth"":90}").Invalid() != null, "direction needs an elevation");
 Check(AimOf(@"{""kind"":""direction"",""azimuth"":90,""elevation"":95}").Invalid() != null, "elevation above 90 refused");
 var pos = AimOf(@"{""kind"":""positionAt"",""body"":""Kerbin"",""ut"":100,""position"":[1,2,3],""velocity"":[0,0,1],""subjectPersistentId"":4000000001}");

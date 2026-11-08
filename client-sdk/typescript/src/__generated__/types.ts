@@ -908,6 +908,15 @@ export interface CommandAim {
 	 * Default false.
 	 */
 	allowUncertain?: boolean;
+	/**
+	 * The lens's vertical field of view in degrees, held until the next aim
+	 * or `SetFov`, within the camera's limits (narrower than its lens allows
+	 * opens to that limit). Absent: a `vessel` aim, and an `orbit` or
+	 * `positionAt` aim, frames its subject; a `surface` aim frames
+	 * `framingMarginM` about the point, or opens to the widest view without
+	 * one; a `direction` aim opens to the widest view.
+	 */
+	fovDeg?: number;
 }
 
 /** Which kind of place a created command camera stands at. */
@@ -1855,7 +1864,11 @@ export type ClientMessage =
 	 * Set the camera's field-of-view (degrees). Silently ignored for
 	 * parts whose Hullcam module is the fixed base (`supportsZoom ==
 	 * false`); clients are expected to clamp to `fovMin / fovMax`
-	 * from the camera's `CameraState` before sending.
+	 * from the camera's `CameraState` before sending. A command camera
+	 * takes it whatever its `supportsZoom`, as `fovDeg` on its aim would:
+	 * held until the next aim, clamped in game to its lens's limits, and
+	 * refused with `ErrorCode::CommandLocked` while a command authority
+	 * holds the lock.
 	 */
 	| { type: "set-fov", content: SetFovPayload }
 	/**

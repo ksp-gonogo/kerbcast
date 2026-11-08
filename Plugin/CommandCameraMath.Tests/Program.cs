@@ -889,6 +889,19 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(worst > 95, $"lens depth: read from float scaled positions it can be off by more than the lens's height ({worst:F0} m)");
 }
 
+// A command camera's field when no craft sizes it.
+{
+    Check(double.IsNaN(CommandCameraMath.HeldFov(double.NaN, 0.02, 30)), "held fov: none set stays none");
+    Check(CommandCameraMath.HeldFov(30, 1, 30) == 30, "held fov: within the lens it is kept");
+    Check(CommandCameraMath.HeldFov(0.001, 0.02, 30) == 0.02 && CommandCameraMath.HeldFov(90, 0.02, 30) == 30,
+        "held fov: clamped to the lens's narrowest and widest");
+    Check(CommandCameraMath.PointFov(true, 500, 1e4, 0.5, 0.02, 30) == 30, "point fov: a direction opens to the widest view");
+    Check(CommandCameraMath.PointFov(false, 0, 1e4, 0.5, 0.02, 30) == 30, "point fov: a surface point without a margin does too");
+    double f = CommandCameraMath.PointFov(false, 100, 1e4, 0.5, 0.02, 30);
+    Check(Near(f, CommandCameraMath.FovForFraction(100, 1e4, 0.5, 0.02, 30), 1e-12) && f < 30,
+        "point fov: a surface point frames its margin, whatever craft is the subject");
+}
+
 // The Sun's light turned to face a lens far from the main camera.
 {
     /* The Sun at the origin, Kerbin and Duna on their orbits 137 degrees apart: stock lights from the Sun toward the main camera at Duna. */

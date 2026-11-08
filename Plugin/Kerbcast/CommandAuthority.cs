@@ -23,7 +23,13 @@ namespace Kerbcast
        from the camera's local horizon; neither has a subject of its own, so
        the camera's default craft stays the subject. Every kind takes a
        framing margin in metres, added to the subject's own radius for the
-       field of view and the bracket. */
+       field of view and the bracket.
+
+       The field of view follows the subject on a Vessel, Orbit or
+       PositionAt aim. A Surface aim frames its margin about the point, or
+       opens to the widest view without one, and a Direction aim opens to
+       the widest view: neither is sized by a craft. WithFov sets a field
+       instead, held until the next aim, as SetCommandFov does. */
     public sealed class CommandAim
     {
         public CommandAimKind Kind { get; }
@@ -71,6 +77,10 @@ namespace Kerbcast
         /* Vessel: accept a craft whose world-model uncertainty is wider than
            the view could frame, a deliberate search of a region. */
         public bool AllowUncertain { get; }
+
+        /* The lens's vertical field of view in degrees, clamped to the
+           camera's limits; NaN leaves it to the aim's own framing. */
+        public double FovDeg { get; private set; } = double.NaN;
 
         /* The craft this aim makes the subject, or 0 to keep the default. */
         public uint SubjectPersistentId => Kind == CommandAimKind.Vessel ? PersistentId : Subject;
@@ -122,10 +132,17 @@ namespace Kerbcast
 
         /* Holds a direction from the camera's local horizon: `azimuth` degrees
            clockwise from north, `elevation` degrees above the horizon (-90..90).
-           The view is zoomed for the subject's range, so the subject is framed
-           when it passes through. */
+           The view opens to its widest unless WithFov sets a field. */
         public static CommandAim Direction(double azimuth, double elevation, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.Direction, framingMarginM, az: azimuth, el: elevation);
+
+        /* This aim with the lens's field set to `fovDeg` degrees: finite and above 0, or NaN for the aim's own framing. */
+        public CommandAim WithFov(double fovDeg)
+        {
+            var copy = (CommandAim)MemberwiseClone();
+            copy.FovDeg = fovDeg;
+            return copy;
+        }
 
         /* Whether two aims point the same way, field for field; null for the default matches only null. */
         internal static bool SameAs(CommandAim a, CommandAim b)
@@ -140,13 +157,14 @@ namespace Kerbcast
                 && a.Altitude.Equals(b.Altitude) && a.Ut.Equals(b.Ut)
                 && a.BodyRelativePosition.Equals(b.BodyRelativePosition) && a.BodyRelativeVelocity.Equals(b.BodyRelativeVelocity)
                 && a.Azimuth.Equals(b.Azimuth) && a.Elevation.Equals(b.Elevation) && a.Subject == b.Subject
-                && a.FramingMarginM.Equals(b.FramingMarginM) && a.AllowUncertain == b.AllowUncertain;
+                && a.FramingMarginM.Equals(b.FramingMarginM) && a.AllowUncertain == b.AllowUncertain
+                && a.FovDeg.Equals(b.FovDeg);
         }
 
         public override string ToString()
         {
             string tail = (Subject != 0 ? $" subject={Subject}" : "") + (FramingMarginM != 0 ? $" margin={FramingMarginM:F0}m" : "")
-                + (AllowUncertain ? " allowUncertain" : "");
+                + (AllowUncertain ? " allowUncertain" : "") + (double.IsNaN(FovDeg) ? "" : $" fov={FovDeg:G4}");
             switch (Kind)
             {
                 case CommandAimKind.Vessel: return $"Vessel({PersistentId}{tail})";

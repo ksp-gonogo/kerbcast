@@ -207,6 +207,9 @@ pub fn validate_aim(a: &CommandAim) -> Result<(), String> {
     if !a.framing_margin_m.is_none_or(|m| finite(m) && m >= 0.0) {
         return Err("framingMarginM must be a finite number, 0 or more".into());
     }
+    if !a.fov_deg.is_none_or(|f| finite(f) && f > 0.0) {
+        return Err("fovDeg must be a finite number above 0".into());
+    }
     match a.kind {
         CommandAimKind::Vessel => {
             if a.persistent_id.unwrap_or(0) == 0 {
@@ -439,6 +442,7 @@ mod tests {
             subject_persistent_id: None,
             framing_margin_m: None,
             allow_uncertain: None,
+            fov_deg: None,
         }
     }
 
@@ -519,6 +523,21 @@ mod tests {
             elevation: Some(45.0),
             ..aim(CommandAimKind::Direction)
         };
+        assert!(validate_aim(&CommandAim {
+            fov_deg: Some(30.0),
+            ..direction.clone()
+        })
+        .is_ok());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                validate_aim(&CommandAim {
+                    fov_deg: Some(bad),
+                    ..direction.clone()
+                })
+                .is_err(),
+                "fovDeg {bad}"
+            );
+        }
         assert!(validate_aim(&direction).is_ok());
         assert!(validate_aim(&CommandAim {
             elevation: Some(91.0),

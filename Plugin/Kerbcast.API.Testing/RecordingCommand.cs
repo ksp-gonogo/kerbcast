@@ -18,6 +18,7 @@ namespace Kerbcast.Api.Testing
         readonly Dictionary<uint, List<CommandTarget>> targets = new Dictionary<uint, List<CommandTarget>>();
         readonly Dictionary<uint, Aim> aims = new Dictionary<uint, Aim>();
         readonly Dictionary<uint, OpticsSettings> optics = new Dictionary<uint, OpticsSettings>();
+        readonly Dictionary<uint, double> fovs = new Dictionary<uint, double>();
         readonly Dictionary<uint, List<NetworkVantage>> networks = new Dictionary<uint, List<NetworkVantage>>();
         readonly Dictionary<uint, NetworkOptions> networkOptions = new Dictionary<uint, NetworkOptions>();
         readonly Dictionary<uint, List<NetworkVantageStatus>> networkStatus = new Dictionary<uint, List<NetworkVantageStatus>>();
@@ -65,6 +66,9 @@ namespace Kerbcast.Api.Testing
 
         /** <summary>The aim on each feed, as set and not cleared.</summary> */
         public IReadOnlyDictionary<uint, Aim> Aims => aims;
+
+        /** <summary>The field each feed's lens is held at by SetFov, unclamped, until its next aim.</summary> */
+        public IReadOnlyDictionary<uint, double> Fovs => fovs;
 
         /** <summary>The optics override on each feed, as set and not cleared.</summary> */
         public IReadOnlyDictionary<uint, OpticsSettings> Optics => optics;
@@ -267,6 +271,7 @@ namespace Kerbcast.Api.Testing
                 bindings = null;
             }
             aims.Clear();
+            fovs.Clear();
             optics.Clear();
             ReturnedToTruth = false;
             return LockResult.Taken;
@@ -341,11 +346,38 @@ namespace Kerbcast.Api.Testing
             if (aim == null)
             {
                 aims.Remove(flightId);
+                fovs.Remove(flightId);
                 return AimResult.Ok;
             }
+            if (!double.IsNaN(aim.FovDeg) && !(aim.FovDeg > 0 && !double.IsInfinity(aim.FovDeg))) return AimResult.BadNumber;
             var result = AimJudge?.Invoke(flightId, aim) ?? AimResult.Ok;
-            if (result == AimResult.Ok) aims[flightId] = aim;
+            if (result == AimResult.Ok)
+            {
+                aims[flightId] = aim;
+                fovs.Remove(flightId);
+            }
             return result;
+        }
+
+        public AimResult SetFov(uint flightId, double fovDeg, string owner)
+        {
+            kc.Enter("SetFov", ApiFeature.CommandFov);
+            kc.Record($"SetFov {flightId} {fovDeg} {owner}");
+            string holder = LockOwner;
+            if (holder != null)
+            {
+                if (holder != owner) return AimResult.NotLockHolder;
+                Heartbeats++;
+            }
+            if (!feeds.Exists(f => f.FlightId == flightId)) return AimResult.NotCommandFeed;
+            if (double.IsNaN(fovDeg))
+            {
+                fovs.Remove(flightId);
+                return AimResult.Ok;
+            }
+            if (!(fovDeg > 0 && !double.IsInfinity(fovDeg))) return AimResult.BadNumber;
+            fovs[flightId] = fovDeg;
+            return AimResult.Ok;
         }
 
         public OpticsResult SetOptics(uint flightId, OpticsSettings settings, string owner)
@@ -591,6 +623,7 @@ namespace Kerbcast.Api.Testing
         void EndTenure()
         {
             aims.Clear();
+            fovs.Clear();
             optics.Clear();
             Heartbeats = 0;
             LightSpeed = null;

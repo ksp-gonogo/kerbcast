@@ -353,14 +353,34 @@ namespace Kerbcast
         {
             _aim = aim;
             _aimOrbit = orbit;
+            _heldFov = aim?.FovDeg ?? double.NaN;
             uint subject = aim?.SubjectPersistentId ?? 0;
             if (subject != _selection.ChosenPersistentId) _selection.Choose(subject);
             Debug.Log($"{Tag} cam={_flightId} aim {(aim == null ? "default (the default craft)" : aim.ToString())}");
         }
 
+        /* Holds the lens at `fovDeg` degrees, within its limits, until the next aim; NaN returns it to the aim's own framing. */
+        internal void SetFov(double fovDeg)
+        {
+            _heldFov = fovDeg;
+            Debug.Log($"{Tag} cam={_flightId} fov {(double.IsNaN(fovDeg) ? "back to the aim's framing" : $"held at {fovDeg:G4} deg")}");
+        }
+
+        /* Through the facade, so a viewer is refused while a command authority holds the lock. */
+        public void ViewerFov(float fov)
+        {
+            var result = KerbcastControl.SetFovCore(_flightId, fov, null);
+            if (result != Kerbcast.Api.AimResult.Ok) Debug.Log($"{Tag} cam={_flightId} viewer fov {fov:G4} deg refused: {result}");
+        }
+
         private CommandAim _aim;
         private Orbit _aimOrbit;
         private DVec3 _lastAimPoint;
+        /* The field a client set, unclamped; NaN while the aim frames itself. */
+        private double _heldFov = double.NaN;
+
+        /* A Direction or Surface aim: no craft of its own, so no craft sizes its view. */
+        private bool AimIsPoint => _aim != null && (_aim.Kind == CommandAimKind.Direction || _aim.Kind == CommandAimKind.Surface);
 
         /* The lens limit can change mid-scene (a Tracking Station upgrade), so
            it is re-read once a second. */
@@ -1724,7 +1744,13 @@ namespace Kerbcast
                 _snapNext = false;
                 step = double.MaxValue;
             }
-            if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None)
+            double held = CommandCameraMath.HeldFov(_heldFov, FovMinNow(), _fovMax);
+            if (!double.IsNaN(held))
+            {
+                _framing.Reset();
+                _fov = CommandCameraMath.SmoothFov(_fov, held, step, FovTau, FovSnapAfter);
+            }
+            else if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None && !AimIsPoint)
             {
                 /* Not AimJumped, which also fires on every world model publish: the box would start over on each record and pump again. */
                 uint subject = _known.SubjectPersistentId, vantage = site.VantagePersistentId;
@@ -1747,6 +1773,9 @@ namespace Kerbcast
                     : _placeholder == PlaceholderAim.LaunchSite
                         ? CommandCameraMath.FovForFraction(CommandCameraMath.PlaceholderSiteRadiusM, distance,
                             CommandCameraMath.PlaceholderSiteFraction, FovMinNow(), _fovMax)
+                    : AimIsPoint
+                        ? CommandCameraMath.PointFov(_aim.Kind == CommandAimKind.Direction, FramingMargin, distance,
+                            _frameFraction, FovMinNow(), _fovMax)
                         : _fovMax;
                 _fov = CommandCameraMath.SmoothFov(_fov, fovTarget, step, FovTau, FovSnapAfter);
             }

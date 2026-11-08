@@ -607,6 +607,17 @@ fn track_mode_from_u32(v: u32) -> TrackMode {
 /// manifest; falling back to defaults if the manifest's missing or
 /// unreadable. Capability fields tell clients which controls to render
 /// per camera (zoom slider / pan stick).
+/// What `CameraRegistry::command_fov` decided for a `SetFov`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandFov {
+    /// Not a command camera: zoomed as a part camera is.
+    NotCommand,
+    /// A command camera's field, passed on for the game to clamp.
+    Apply(f32),
+    /// Refused, with the message and code to send back.
+    Refused(String, Option<ErrorCode>),
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraInfo {
@@ -3122,6 +3133,26 @@ impl CameraRegistry {
             return false;
         };
         !listed.targets.is_empty() && !listed.targets.iter().any(|t| t.persistent_id == pid)
+    }
+
+    /// How a `SetFov` for `cam` goes: a part camera's own way, or a command
+    /// camera's, which any client may zoom while no command authority holds
+    /// the lock. Its lens's limits are checked in game, so only a finite
+    /// field above 0 is passed on.
+    pub async fn command_fov(&self, cam: &CameraState, fov: f32) -> CommandFov {
+        if cam.kind != CameraKind::Command {
+            return CommandFov::NotCommand;
+        }
+        if !(fov.is_finite() && fov > 0.0) {
+            return CommandFov::Refused("fov must be a finite number above 0".into(), None);
+        }
+        if let Some(owner) = self.command_lock_owner(cam.flight_id).await {
+            return CommandFov::Refused(
+                format!("{owner} holds the command camera lock; fov refused"),
+                Some(ErrorCode::CommandLocked),
+            );
+        }
+        CommandFov::Apply(fov)
     }
 
     /// The command authority the plugin last reported for this camera, if any.
@@ -5723,6 +5754,78 @@ mod tests {
         assert!(registry.request_command_aim(search()).await.is_ok());
         let written = std::fs::read_to_string(shm.join(COMMANDS_FILE)).unwrap();
         assert!(written.contains(r#""allowUncertain":true"#), "{written}");
+    }
+
+    /// A command camera takes any client's field of view, unclamped for the
+    /// game to bound, unless a command authority holds the lock; a part
+    /// camera is left to its own zoom.
+    #[tokio::test]
+    async fn command_fov_follows_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let id: u32 = 0x8000_0304;
+        let part: u32 = 0x0000_0305;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+        MmapFrameRing::create(&shm.join(format!("{part}.ring")), cfg).expect("create ring");
+        tokio::fs::write(
+            shm.join(format!("{id}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","supports_zoom":false,"fov":30,"fov_min":30,"fov_max":30,"station_id":"ground:LaunchPad","station_node_name":"LaunchPad"}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            shm.join(format!("{part}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","flight_id":{part},"part_name":"hc.navcam","camera_name":"NavCam","supports_zoom":true,"fov":60.0,"fov_min":10.0,"fov_max":90.0}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let cam = registry.get(id).await.expect("command camera");
+        let part_cam = registry.get(part).await.expect("part camera");
+
+        assert_eq!(
+            registry.command_fov(&part_cam, 5.0).await,
+            CommandFov::NotCommand
+        );
+        assert_eq!(
+            registry.command_fov(&cam, 0.5).await,
+            CommandFov::Apply(0.5),
+            "below the manifest's fov_min: the game knows the lens's limit"
+        );
+        assert!(matches!(
+            registry.command_fov(&cam, f32::NAN).await,
+            CommandFov::Refused(_, None)
+        ));
+        assert!(matches!(
+            registry.command_fov(&cam, 0.0).await,
+            CommandFov::Refused(_, None)
+        ));
+
+        std::fs::write(
+            shm.join("global.status.json"),
+            format!(
+                r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandTrack":{COMMAND_TRACK_JSON}}}]}}"#
+            ),
+        )
+        .unwrap();
+        registry.poll_status().await;
+        match registry.command_fov(&cam, 30.0).await {
+            CommandFov::Refused(message, code) => {
+                assert_eq!(code, Some(ErrorCode::CommandLocked));
+                assert!(message.contains("mission-control"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     /// An aim at a craft missing from the camera's latest target list (one

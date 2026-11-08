@@ -32,6 +32,8 @@ namespace Kerbcast.Api
         LineOfSight = 11,
         /** <summary><see cref="ICommand.VantageResolution"/> and <see cref="LineOfSightResult.ResolutionRad"/>. Added in API 1.5.</summary> */
         VantageResolution = 12,
+        /** <summary><see cref="ICommand.SetFov"/> and <see cref="Aim.WithFov"/>. Added in API 1.5.</summary> */
+        CommandFov = 13,
     }
 
     public enum CameraKind

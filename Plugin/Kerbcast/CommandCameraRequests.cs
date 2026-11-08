@@ -32,10 +32,13 @@ namespace Kerbcast
         public double FramingMarginM;
         /* A vessel aim at a craft too uncertain to frame, accepted on purpose: a search. */
         public bool AllowUncertain;
+        /* The lens's field in degrees; NaN when the client sent none. */
+        public double FovDeg = double.NaN;
 
         public string Invalid()
         {
             if (!Finite(FramingMarginM) || FramingMarginM < 0) return "framingMarginM must be a finite number, 0 or more";
+            if (!double.IsNaN(FovDeg) && !(Finite(FovDeg) && FovDeg > 0)) return "fovDeg must be a finite number above 0";
             switch (Kind)
             {
                 case "vessel":
@@ -272,6 +275,7 @@ namespace Kerbcast
                 SubjectPersistentId = U32(a, "subjectPersistentId"),
                 FramingMarginM = Num(a, "framingMarginM", 0),
                 AllowUncertain = Bool(a, "allowUncertain"),
+                FovDeg = Num(a, "fovDeg", double.NaN),
             };
         }
 

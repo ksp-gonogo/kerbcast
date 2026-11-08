@@ -65,6 +65,8 @@ namespace Kerbcast
         void OnScaledProbe(KerbcastCamera cam, Color centre);
         /* The craft the lens rides, whose parts set the frame's live bound; null for none. */
         Vessel LensCraft { get; }
+        /* A viewer's set-fov, which the rig takes under its own rules rather than as a part camera's zoom. */
+        void ViewerFov(float fov);
         void Dispose();
     }
 
@@ -1756,9 +1758,10 @@ namespace Kerbcast
                 // _lastFovSeq) so the stale fov re-published on unrelated writes /
                 // the zoom-rate-stop write doesn't snap a drifting _fovTarget back.
                 long fovSeq = snap.FovSeq;
-                if (snap.Fov.HasValue && SupportsZoom && fovSeq != _lastFovSeq)
+                if (snap.Fov.HasValue && fovSeq != _lastFovSeq)
                 {
-                    SetFov(snap.Fov.Value);
+                    if (Rig != null) Rig.ViewerFov(snap.Fov.Value);
+                    else if (SupportsZoom) SetFov(snap.Fov.Value);
                 }
                 _lastFovSeq = fovSeq;
                 // Zoom rate. Absent leaves the current rate unchanged; an explicit

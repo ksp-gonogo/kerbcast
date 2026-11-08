@@ -660,6 +660,17 @@ namespace Kerbcast
             return FovForTan(FramingTan(radius, distance), fraction, fovMin, fovMax);
         }
 
+        /* A field set by a client, clamped to the lens's limits; NaN (none set) stays NaN. */
+        public static double HeldFov(double fov, double fovMin, double fovMax) =>
+            double.IsNaN(fov) ? double.NaN : Math.Max(fovMin, Math.Min(fovMax, fov));
+
+        /* The field for an aim with no craft to frame: a Surface aim's margin
+           about the point at `fraction` of the frame, otherwise (a Direction
+           aim, or no margin) the widest view. */
+        public static double PointFov(bool direction, double marginM, double distance, double fraction,
+            double fovMin, double fovMax) =>
+            direction || !(marginM > 0) ? fovMax : FovForFraction(marginM, distance, fraction, fovMin, fovMax);
+
         /* Tangent of the half-angle a sphere of `radius` subtends at `distance`; infinite with the lens inside it. */
         public static double FramingTan(double radius, double distance)
         {

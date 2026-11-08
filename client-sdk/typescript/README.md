@@ -357,11 +357,28 @@ The subject is the craft the camera draws (where it truly is, so an aim off
 the craft shows it off centre), brackets, sizes its zoom by and reads out. A
 `vessel` aim's craft is its subject; `orbit` and `positionAt` take an
 optional `subjectPersistentId`; otherwise the default craft stays the
-subject. A `direction` aim zooms for the subject's range, so the subject is
-framed as it passes through. Every kind takes `framingMarginM`, metres of
-view kept around the subject's own size. `commandCentre.aimKind` (absent for
-the default) and `commandCentre.subjectPersistentId` report what the game
-applied.
+subject. Every kind takes `framingMarginM`, metres of view kept around the
+subject's own size. `commandCentre.aimKind` (absent for the default) and
+`commandCentre.subjectPersistentId` report what the game applied.
+
+The zoom follows the subject on a `vessel`, `orbit` or `positionAt` aim. A
+`surface` aim frames `framingMarginM` about its point, or opens to the widest
+view without one, and a `direction` aim opens to the widest view, so no craft
+sizes either. Any aim takes `fovDeg`, a vertical field of view in degrees to
+hold instead, and `camera.setFov(deg)` sets one on a command camera whatever
+its `supportsZoom`. Either holds until the next aim, clamped in game to the
+lens (the Tracking Station level's narrowest, the camera's widest), and is
+refused with `ErrorCode.CommandLocked` while a command lock is held.
+
+```ts
+// Look south, 5 degrees above the horizon, through a 30 degree lens.
+await client.setCommandAim(flightId, {
+  kind: CommandAimKind.Direction,
+  azimuth: 180,
+  elevation: 5,
+  fovDeg: 30,
+});
+```
 
 ### A launchpad camera
 

@@ -271,6 +271,34 @@ namespace Kerbcast
             return AimResult.Ok;
         }
 
+        /* Sets command feed `flightId`'s field of view to `fovDeg` degrees,
+           clamped to its lens's limits (the Tracking Station level's narrowest
+           and the camera's widest), and holds it until the next aim; NaN
+           returns it to the aim's own framing. The lock applies as for
+           SetCommandAim. False when Kerbcast is not running, the lock refuses
+           the call, the feed is not built yet (a created feed takes its field
+           with its aim, CommandAim.WithFov), or `fovDeg` is not NaN and not a
+           finite number above 0. */
+        public static bool SetCommandFov(uint flightId, double fovDeg, string owner = null)
+            => SetFovCore(flightId, fovDeg, owner) == AimResult.Ok;
+
+        /* SetCommandFov with the reason it refused. */
+        internal static AimResult SetFovCore(uint flightId, double fovDeg, string owner)
+        {
+            var core = KerbcastCore.Instance;
+            if (core == null) return AimResult.NotRunning;
+            var auth = core.CommandAuthority;
+            if (auth != null && auth.Registered)
+            {
+                if (!string.Equals(owner, auth.Owner, System.StringComparison.Ordinal)) return AimResult.NotLockHolder;
+                auth.Heartbeat(Time.realtimeSinceStartup);
+            }
+            if (!(Find(flightId)?.Rig is CommandCameraRig rig)) return AimResult.NotCommandFeed;
+            if (!double.IsNaN(fovDeg) && !(Finite(fovDeg) && fovDeg > 0)) return AimResult.BadNumber;
+            rig.SetFov(fovDeg);
+            return AimResult.Ok;
+        }
+
         /* Overrides command feed `flightId`'s deep-space optics; NaN keeps
            Kerbcast's own value for that knob and all NaN returns to them.
            The lock applies as for SetCommandAim. The values take effect only
@@ -610,7 +638,9 @@ namespace Kerbcast
         }
 
         /* A client's aim as a CommandAim; call only once spec.Invalid() is null. */
-        internal static CommandAim AimOf(CommandAimSpec spec)
+        internal static CommandAim AimOf(CommandAimSpec spec) => AimKindOf(spec)?.WithFov(spec.FovDeg);
+
+        static CommandAim AimKindOf(CommandAimSpec spec)
         {
             switch (spec.Kind)
             {
@@ -664,6 +694,7 @@ namespace Kerbcast
         {
             orbit = null;
             if (!Finite(aim.FramingMarginM) || aim.FramingMarginM < 0) return AimResult.BadNumber;
+            if (!double.IsNaN(aim.FovDeg) && !(Finite(aim.FovDeg) && aim.FovDeg > 0)) return AimResult.BadNumber;
             uint subject = aim.SubjectPersistentId;
             if (aim.Kind == CommandAimKind.Vessel && subject == 0) return AimResult.UnknownCraft;
             if (subject != 0)

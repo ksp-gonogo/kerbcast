@@ -55,7 +55,7 @@ use webrtc::track::track_local::TrackLocal;
 use super::outbox::{ControlChannel, Outbox};
 use super::video_track::VideoTrack;
 
-use crate::cameras::CameraRegistry;
+use crate::cameras::{CameraRegistry, CommandFov};
 use crate::encoder::selected_backend_name;
 use crate::ladder::{Ladder, LadderConfig, LadderState, SlotTier, SlotView, Tier, TierChange};
 use crate::link::{LinkMonitor, LinkWindow, SlotCounters, LINK_WINDOW};
@@ -2075,20 +2075,37 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
             return;
         }
     };
-    if !cam.supports_zoom {
-        send_server_message(
-            dc,
-            &ServerMessage::Error(ErrorPayload {
-                message: format!("camera {flight_id} does not support zoom"),
-                source: ErrorSource::Sidecar,
-                ..Default::default()
-            }),
-        );
-        return;
-    }
-    // Clamp to the part's declared FoV range so the plugin doesn't get
-    // a value the Hullcam module would reject.
-    let clamped = fov.clamp(cam.fov_min, cam.fov_max);
+    let clamped = match registry.command_fov(&cam, fov).await {
+        CommandFov::NotCommand => {
+            if !cam.supports_zoom {
+                send_server_message(
+                    dc,
+                    &ServerMessage::Error(ErrorPayload {
+                        message: format!("camera {flight_id} does not support zoom"),
+                        source: ErrorSource::Sidecar,
+                        ..Default::default()
+                    }),
+                );
+                return;
+            }
+            // Clamp to the part's declared FoV range so the plugin doesn't get
+            // a value the Hullcam module would reject.
+            fov.clamp(cam.fov_min, cam.fov_max)
+        }
+        CommandFov::Apply(fov) => fov,
+        CommandFov::Refused(message, code) => {
+            send_server_message(
+                dc,
+                &ServerMessage::Error(ErrorPayload {
+                    message,
+                    code,
+                    source: ErrorSource::Sidecar,
+                    ..Default::default()
+                }),
+            );
+            return;
+        }
+    };
 
     {
         let mut ctrl = cam.control.lock().await;
