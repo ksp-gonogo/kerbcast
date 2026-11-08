@@ -3459,6 +3459,36 @@ describe("KerbcastClient.inboundVideoStats", () => {
       return client;
     }
 
+    it("a create whose answer is lost settles when its network arrives with its token", async () => {
+      const sidecar = new MockSidecar().withNetworks([], { manual: true });
+      const client = await withNetworks(sidecar);
+      const saving = client.saveNetwork({ vantages: [station("KSC")] }, { token: "mine" });
+      sidecar.fireNetworkDefinitions([
+        { networkId: "other", name: "B", vantages: [station("KSC")], revision: 1, createToken: "theirs" },
+        { networkId: "made", name: "A", vantages: [station("KSC")], revision: 1, createToken: "mine" },
+      ]);
+      await expect(saving).resolves.toEqual({ networkId: "made" });
+      expect(sidecar.lastCommand("save-network")?.content.token).toBe("mine");
+    });
+
+    it("a retried create with the same token gets the network the first made", async () => {
+      const sidecar = new MockSidecar().withNetworks();
+      const client = await withNetworks(sidecar);
+      const first = await client.saveNetwork({ name: "A", vantages: [station("KSC")] }, { token: "retry" });
+      const again = await client.saveNetwork({ name: "A", vantages: [station("KSC")] }, { token: "retry" });
+      expect(again.networkId).toBe(first.networkId);
+      expect(client.networks()).toHaveLength(1);
+    });
+
+    it("reports whether saves apply now and how many networks were left out", async () => {
+      const sidecar = new MockSidecar().withNetworks();
+      const client = await withNetworks(sidecar);
+      expect(client.networksEditable).toBeNull();
+      sidecar.setNetworksEditable(false);
+      expect(client.networksEditable).toBe(false);
+      expect(client.networksOmitted).toBe(0);
+    });
+
     it("reads supportsNetworks from hello", async () => {
       const plain = await withNetworks(new MockSidecar());
       expect(plain.supportsNetworks).toBe(false);

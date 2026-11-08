@@ -53,9 +53,29 @@ export interface NetworksPanelProps {
 
 type View = { kind: "list" } | { kind: "form"; networkId: string | null };
 
+/**
+ * Whether the game applies saves and deletes now, from the client's last
+ * `network-definitions`; null until it says. It does not in scenes where
+ * command cameras do not run, or while a scene loads.
+ */
+function useNetworksEditable(): boolean | null {
+  const client = useKerbcastClient();
+  const [editable, setEditable] = useState(() => client.networksEditable);
+  useEffect(() => {
+    setEditable(client.networksEditable);
+    return client.on("networks", () => setEditable(client.networksEditable));
+  }, [client]);
+  return editable;
+}
+
+const READ_ONLY_NOTE =
+  "Networks can be changed in flight or at the Space Center. Until the game is in one of those, they show read only.";
+
 export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: NetworksPanelProps): React.JSX.Element {
   const panelRef = useRef<HTMLDivElement>(null);
+  const client = useKerbcastClient();
   const networks = useNetworks();
+  const locked = useNetworksEditable() === false;
   const catalog = useSiteCatalog();
   const cameras = useKerbcastCameras();
   const [view, setView] = useState<View>({ kind: "list" });
@@ -100,11 +120,14 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
               A network is one feed that follows a craft and cuts to whichever member has the clearest view. Every
               viewer can pick it from the camera list.
             </Hint>
-            <PrimaryButton type="button" onClick={() => setView({ kind: "form", networkId: null })}>
-              <Plus size={13} strokeWidth={2} aria-hidden="true" />
-              New network
-            </PrimaryButton>
+            {!locked && (
+              <PrimaryButton type="button" onClick={() => setView({ kind: "form", networkId: null })}>
+                <Plus size={13} strokeWidth={2} aria-hidden="true" />
+                New network
+              </PrimaryButton>
+            )}
           </ListTop>
+          {locked && <NoteText role="status">{READ_ONLY_NOTE}</NoteText>}
           {networks.length === 0 && <Empty>No networks in this save yet.</Empty>}
           {networks.map((def) => {
             const camera = networkCamera(def, cameras);
@@ -114,16 +137,23 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
                 def={def}
                 catalog={catalog}
                 camera={camera}
+                locked={locked}
                 onEdit={() => setView({ kind: "form", networkId: def.networkId })}
                 onShowInGrid={camera && onShowInGrid ? () => onShowInGrid(camera) : undefined}
                 inGrid={camera !== undefined && shownFlightIds.has(camera.flightId)}
               />
             );
           })}
+          {client.networksOmitted > 0 && (
+            <Hint>
+              {client.networksOmitted} more network{client.networksOmitted === 1 ? " is" : "s are"} too large to list here.
+            </Hint>
+          )}
         </Body>
       ) : (
         <NetworkForm
           key={view.networkId ?? "new"}
+          locked={locked}
           catalog={catalog}
           editing={view.networkId !== null ? (editing ?? null) : null}
           gone={view.networkId !== null && editing === undefined}
@@ -142,9 +172,11 @@ interface NetworkCardProps {
   onEdit: () => void;
   onShowInGrid?: () => void;
   inGrid: boolean;
+  /** The game does not apply changes now: no Edit or Delete. */
+  locked: boolean;
 }
 
-function NetworkCard({ def, catalog, camera, onEdit, onShowInGrid, inGrid }: NetworkCardProps): React.JSX.Element {
+function NetworkCard({ def, catalog, camera, onEdit, onShowInGrid, inGrid, locked }: NetworkCardProps): React.JSX.Element {
   const client = useKerbcastClient();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -254,7 +286,7 @@ function NetworkCard({ def, catalog, camera, onEdit, onShowInGrid, inGrid }: Net
                 {inGrid ? "In grid" : "Show"}
               </GhostButton>
             )}
-            {!readOnly && (
+            {!readOnly && !locked && (
               <>
                 <GhostButton type="button" onClick={onEdit}>
                   <Pencil size={12} strokeWidth={1.75} aria-hidden="true" />
@@ -319,10 +351,14 @@ interface NetworkFormProps {
   gone: boolean;
   latest: (networkId: string) => NetworkDefinition | undefined;
   onDone: () => void;
+  /** The game stopped applying changes while the form was open (a scene change). */
+  locked: boolean;
 }
 
-function NetworkForm({ catalog, editing, gone, latest, onDone }: NetworkFormProps): React.JSX.Element {
+function NetworkForm({ catalog, editing, gone, latest, onDone, locked }: NetworkFormProps): React.JSX.Element {
   const client = useKerbcastClient();
+  /* One token per new network, so a retry after a timeout finds the network the first try made instead of making another. */
+  const createToken = useRef(`create-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
   const stations = catalog?.stations ?? [];
   const vessels = catalog?.vessels ?? [];
   const [form, setForm] = useState<FormState>(() => formStateFrom(editing));
@@ -409,7 +445,7 @@ function NetworkForm({ catalog, editing, gone, latest, onDone }: NetworkFormProp
         ...(watch ? { watch } : {}),
         vantages,
         ...(form.base?.options ? { options: form.base.options } : {}),
-      });
+      }, form.base ? {} : { token: createToken.current });
       onDone();
     } catch (err) {
       setBusy(false);
@@ -434,6 +470,7 @@ function NetworkForm({ catalog, editing, gone, latest, onDone }: NetworkFormProp
     <>
       <Body>
         {gone && <ErrorText role="alert">Another viewer deleted this network</ErrorText>}
+        {locked && <NoteText role="status">{READ_ONLY_NOTE}</NoteText>}
         {note && <NoteText role="status">{note}</NoteText>}
         {!catalog && <Hint>The game has not listed its ground stations and craft yet.</Hint>}
         <Field>
@@ -539,12 +576,14 @@ function NetworkForm({ catalog, editing, gone, latest, onDone }: NetworkFormProp
               .filter(([, spec]) => spec.vantage.kind !== CommandVantageKind.Station)
               .map(([k, spec]) => {
                 const craft = spec.vantage.kind === CommandVantageKind.Vessel;
+                /* A shortened craft list leaves out craft that still exist, so a missing one is not called gone. */
+                const cut = (catalog?.vesselsOmitted ?? 0) > 0;
                 return (
                   <OrphanRow
                     key={k}
                     name={vantageName(spec.vantage, spec.label, catalog)}
-                    sub={craft ? "No longer exists" : "Placed by its maker"}
-                    badge={craft ? "Gone" : null}
+                    sub={!craft ? "Placed by its maker" : cut ? "Not in the shortened craft list" : "No longer exists"}
+                    badge={craft && !cut ? "Gone" : null}
                     checked={selected.has(k)}
                     onToggle={() => toggle(k)}
                   />
@@ -585,7 +624,7 @@ function NetworkForm({ catalog, editing, gone, latest, onDone }: NetworkFormProp
           <GhostButton type="button" onClick={onDone}>
             Cancel
           </GhostButton>
-          <PrimaryButton type="button" disabled={busy || gone || total === 0 || total > MAX_VANTAGES} onClick={() => void submit()}>
+          <PrimaryButton type="button" disabled={busy || gone || locked || total === 0 || total > MAX_VANTAGES} onClick={() => void submit()}>
             <Check size={13} strokeWidth={2} aria-hidden="true" />
             {isEdit ? "Save" : "Create network"}
           </PrimaryButton>

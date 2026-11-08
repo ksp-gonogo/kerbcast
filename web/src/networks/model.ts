@@ -134,7 +134,9 @@ export function requestErrorText(code: string): string {
     case "badNumber":
       return "The game refused one of the settings";
     case "writeFailed":
-      return "The game could not write its networks file";
+      return "The game could not write its networks file, so nothing changed";
+    case "notRunning":
+      return "The game could not start the network's camera, so nothing changed";
     case "timeout":
       return "The game did not answer. Try again";
     case "unsupported":

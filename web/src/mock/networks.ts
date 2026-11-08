@@ -333,6 +333,8 @@ export function installMockNetworks(sidecar: MockSidecar): MockNetworks {
   };
 
   sidecar.withNetworks(INITIAL, {
+    /* ?networksLocked=1 shows the drawer as it is in a scene that cannot apply changes. */
+    editable: new URLSearchParams(globalThis.location?.search ?? "").get("networksLocked") !== "1",
     answerDelayMs: 300,
     onSave: (def, created) => {
       const flightId = created ? nextFlightId++ : def.flightId;

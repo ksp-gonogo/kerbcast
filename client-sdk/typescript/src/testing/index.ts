@@ -4,6 +4,7 @@ import type {
   CreateCommandCameraPayload,
   DeleteNetworkPayload,
   NetworkDefinition,
+  NetworkDefinitionsPayload,
   NetworkResultPayload,
   SaveNetworkPayload,
 } from "../__generated__/types";
@@ -154,6 +155,8 @@ export interface MockSidecarOptions {
 
 /** Options for {@link MockSidecar.withNetworks}. */
 export interface MockNetworkOptions {
+  /** Whether the game applies saves and deletes now, sent with every `network-definitions`. Absent leaves it unsaid. */
+  editable?: boolean;
   /**
    * Leave `save-network` and `delete-network` unanswered, for the caller to
    * answer with {@link MockSidecar.fireNetworkResult}. By default the mock
@@ -369,7 +372,7 @@ export class MockSidecar {
       this._sendToClient({ type: "site-catalog", content: this._siteCatalog });
     }
     if (this._networks !== null) {
-      this._sendToClient({ type: "network-definitions", content: { networks: this._networks } });
+      this._sendToClient({ type: "network-definitions", content: this._definitionsPayload() });
     }
     this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
   }
@@ -509,6 +512,7 @@ export class MockSidecar {
   withNetworks(networks: NetworkDefinition[] = [], opts: MockNetworkOptions = {}): this {
     this._networks = networks.map((n) => ({ ...n }));
     this._networkOptions = opts;
+    this._networksEditable = opts.editable;
     return this;
   }
 
@@ -517,10 +521,25 @@ export class MockSidecar {
     return this._networks ?? [];
   }
 
+  private _networksEditable: boolean | undefined = undefined;
+
+  private _definitionsPayload(): NetworkDefinitionsPayload {
+    return {
+      networks: this._networks ?? [],
+      ...(this._networksEditable !== undefined ? { editable: this._networksEditable } : {}),
+    };
+  }
+
+  /** Say whether the game applies saves and deletes now, as it does on a scene change, and push the definitions again. */
+  setNetworksEditable(editable: boolean): void {
+    this._networksEditable = editable;
+    this._sendToClient({ type: "network-definitions", content: this._definitionsPayload() });
+  }
+
   /** Replace the tracking networks and push a `network-definitions` message, as the game does on any change. */
   fireNetworkDefinitions(networks: NetworkDefinition[]): void {
     this._networks = networks.map((n) => ({ ...n }));
-    this._sendToClient({ type: "network-definitions", content: { networks: this._networks } });
+    this._sendToClient({ type: "network-definitions", content: this._definitionsPayload() });
   }
 
   /** Push a `network-result` message, to answer a request by hand. */
@@ -557,6 +576,8 @@ export class MockSidecar {
     const existing = req.networkId !== undefined ? networks.find((n) => n.networkId === req.networkId) : undefined;
     if (req.networkId !== undefined && !existing) return refuse("notFound", `no network ${req.networkId}`);
     if (existing?.owner) return refuse("notOwner", `${existing.owner} made this network`);
+    const made = req.networkId === undefined ? networks.find((n) => n.createToken === req.token) : undefined;
+    if (made) return { token: req.token, ok: true, networkId: made.networkId };
     if (existing && req.baseRevision !== undefined && req.baseRevision !== (existing.revision ?? 0)) {
       return refuse("stale", "the network changed since it was read");
     }
@@ -568,6 +589,7 @@ export class MockSidecar {
       ...(req.options !== undefined ? { options: req.options } : {}),
       revision: (existing?.revision ?? 0) + 1,
       ...(existing?.flightId !== undefined ? { flightId: existing.flightId } : {}),
+      ...(existing ? (existing.createToken ? { createToken: existing.createToken } : {}) : { createToken: req.token }),
     };
     const flightId = this._networkOptions.onSave?.(def, existing === undefined);
     if (flightId !== undefined) def.flightId = flightId;

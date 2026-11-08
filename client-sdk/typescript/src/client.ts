@@ -745,6 +745,12 @@ export const NETWORK_REQUEST_TIMEOUT_MS = 10_000;
 export interface NetworkRequestOptions {
   /** Milliseconds to wait for the game's answer before rejecting with `timeout`. Default {@link NETWORK_REQUEST_TIMEOUT_MS}. */
   timeoutMs?: number;
+  /**
+   * The request's token; one is made when absent. Pass the same token when
+   * retrying a create that timed out: the game answers a repeat with the
+   * network the first one made rather than making a second.
+   */
+  token?: string;
 }
 
 /** What {@link KerbcastClient.saveNetwork} takes: a `save-network` request without its token, which the client makes. */
@@ -1960,6 +1966,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _inFlight: boolean | undefined = undefined;
   private _siteCatalog: SiteCatalogPayload | null = null;
   private _networks: NetworkDefinition[] = [];
+  private _networksEditable: boolean | null = null;
+  private _networksOmitted = 0;
   /** Whether the connected sidecar's `hello` said it takes tracking network saves. */
   private _supportsNetworks = false;
   /** Save and delete requests awaiting their `network-result`, by token. */
@@ -2211,6 +2219,21 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     return this._networks;
   }
 
+  /**
+   * Whether the game applies {@link saveNetwork} and {@link deleteNetwork}
+   * now: false in a scene where command cameras do not run, or while one
+   * loads, when the networks should be shown read only. Null until the
+   * game says.
+   */
+  get networksEditable(): boolean | null {
+    return this._networksEditable;
+  }
+
+  /** Networks left out of {@link networks} to fit the sidecar's message size; 0 when none were. */
+  get networksOmitted(): number {
+    return this._networksOmitted;
+  }
+
   /** Whether the connected sidecar takes {@link saveNetwork} and {@link deleteNetwork}. False until its `hello`. */
   get supportsNetworks(): boolean {
     return this._supportsNetworks;
@@ -2228,7 +2251,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * `unsupported` or `notConnected`.
    */
   async saveNetwork(spec: SaveNetworkSpec, opts: NetworkRequestOptions = {}): Promise<{ networkId: string }> {
-    const token = randomToken();
+    const token = opts.token ?? randomToken();
     const result = await this._networkRequest(
       { type: "save-network", content: { ...spec, token } },
       token,
@@ -2243,7 +2266,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    * in game.
    */
   async deleteNetwork(networkId: string, opts: NetworkRequestOptions = {}): Promise<void> {
-    const token = randomToken();
+    const token = opts.token ?? randomToken();
     await this._networkRequest({ type: "delete-network", content: { token, networkId } }, token, opts.timeoutMs);
   }
 
@@ -3623,6 +3646,12 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         break;
       case "network-definitions":
         this._networks = msg.content.networks ?? [];
+        this._networksEditable = msg.content.editable ?? null;
+        this._networksOmitted = msg.content.networksOmitted ?? 0;
+        /* A create whose answer was lost still settles once its network shows up carrying its token. */
+        for (const def of this._networks) {
+          if (def.createToken) this.networkRequests.get(def.createToken)?.({ token: def.createToken, ok: true, networkId: def.networkId });
+        }
         this.emit("networks", this._networks);
         break;
       case "network-result":

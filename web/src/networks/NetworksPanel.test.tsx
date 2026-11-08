@@ -62,6 +62,19 @@ afterEach(() => {
 });
 
 describe("NetworksPanel cards", () => {
+  it("shows every card read only, with a note, while the game cannot apply changes", async () => {
+    const { client, sidecar } = await mockGame();
+    renderPanel(client);
+    expect(screen.getByRole("button", { name: "New network" })).toBeTruthy();
+    await act(async () => sidecar.setNetworksEditable(false));
+    expect(screen.queryByRole("button", { name: "New network" })).toBeNull();
+    expect(screen.getByText(/can be changed in flight or at the Space Center/)).toBeTruthy();
+    expect(within(card("Kerbin ground net")).queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(within(card("Kerbin ground net")).queryByRole("button", { name: /Delete/ })).toBeNull();
+    await act(async () => sidecar.setNetworksEditable(true));
+    expect(within(card("Kerbin ground net")).getByRole("button", { name: "Edit" })).toBeTruthy();
+  });
+
   it("shows each network's status and every member state in words", async () => {
     const { client } = await mockGame();
     renderPanel(client);
@@ -235,7 +248,7 @@ describe("NetworksPanel form", () => {
     await act(async () => {
       sidecar.fireNetworkResult({ token, ok: false, code: "writeFailed" });
     });
-    expect(screen.getByRole("alert").textContent).toBe("The game could not write its networks file");
+    expect(screen.getByRole("alert").textContent).toBe("The game could not write its networks file, so nothing changed");
   });
 });
 
