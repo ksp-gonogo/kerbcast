@@ -493,6 +493,12 @@ namespace Kerbcast
         public static double LensDepthM(double lensFromCentreM, double surfaceUnits, double metresPerUnit) =>
             surfaceUnits * metresPerUnit - lensFromCentreM;
 
+        /* Below this the Sun's light is left facing stock's target: a lens near the active craft sees the Sun from where stock does. */
+        public const double SunTurnMinDeg = 0.01;
+
+        /* How far, in degrees, the Sun's light turns from stock's `forward` (the Sun toward the main camera) to face along `sunToLens`. */
+        public static double SunTurnDeg(DVec3 forward, DVec3 sunToLens) => AngleBetween(forward, sunToLens) * Rad2Deg;
+
         /* KSP's CelestialBody.GetWorldSurfacePosition, reproduced: the body-local
            spherical vector (z up) scaled to radius + alt, rotated by the body
            frame's axes (given in KSP's z-up world), swizzled to Unity's y-up

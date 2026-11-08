@@ -2073,6 +2073,7 @@ namespace Kerbcast
         private static readonly int CameraHeight2Id = Shader.PropertyToID("_fCameraHeight2");
         private static readonly int CamHeightUnderwaterId = Shader.PropertyToID("_fCamHeightUnderwater");
         private static readonly int LightDotId = Shader.PropertyToID("_lightDot");
+        private static readonly int LightDirId = Shader.PropertyToID("_v4LightDir");
         private readonly MaterialPropertyBlock _afgBlock = new MaterialPropertyBlock();
         private Renderer _afgRenderer;
         private AtmosphereFromGround _afgOverridden;
@@ -2086,6 +2087,7 @@ namespace Kerbcast
             public float Height;
             public float Underwater;
             public float LightDot;
+            public Vector3 LightDir;
         }
 
         private static AfgInputs AfgInputsFor(AtmosphereFromGround afg, Vector3 camPos)
@@ -2103,6 +2105,7 @@ namespace Kerbcast
                 Height = h,
                 Underwater = depth >= 0f ? Mathf.Min(depth * afg.oceanDepthRecip, 1f) : 0f,
                 LightDot = dot,
+                LightDir = afg.sunLightDirection,
             };
         }
 
@@ -2132,6 +2135,7 @@ namespace Kerbcast
                 Height = (float)h,
                 Underwater = depth >= 0 ? Mathf.Min((float)depth * afg.oceanDepthRecip, 1f) : 0f,
                 LightDot = dot,
+                LightDir = afg.sunLightDirection,
             };
         }
 
@@ -2142,8 +2146,10 @@ namespace Kerbcast
             mpb.SetFloat(CameraHeight2Id, v.Height * v.Height);
             mpb.SetFloat(CamHeightUnderwaterId, v.Underwater);
             mpb.SetFloat(LightDotId, v.LightDot);
+            mpb.SetVector(LightDirId, new Vector4(v.LightDir.x, v.LightDir.y, v.LightDir.z, 0f));
         }
 
+        private readonly ScaledSunForLens _sun = new ScaledSunForLens();
         private CommandCameraStationGround _ground;
         private bool _groundDrawn;
         private string _groundState;
@@ -2188,6 +2194,7 @@ namespace Kerbcast
                     _opticsBegun = true;
                 }
             }
+            _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");
             DrawStationGround(cam);
             _afgOverridden = null;
             var body = _mount.Site.Body;
@@ -2200,6 +2207,7 @@ namespace Kerbcast
             _afgOurs = _poseValid
                 ? AfgInputsForLens(afg, _poseEye - ToD(body.position))
                 : AfgInputsFor(afg, scaled.transform.position);
+            _afgOurs.LightDir = _sun.Turn * _afgOurs.LightDir;
             if (!_afgOverride) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
             ApplyAfg(_afgBlock, _afgOurs);
@@ -2215,6 +2223,7 @@ namespace Kerbcast
                 _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame);
             }
             _ground?.Hide();
+            _sun.End();
             if (_afgOverridden == null || _afgRenderer == null) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
             ApplyAfg(_afgBlock, _afgStock);

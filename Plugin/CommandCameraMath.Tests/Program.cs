@@ -889,6 +889,19 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(worst > 95, $"lens depth: read from float scaled positions it can be off by more than the lens's height ({worst:F0} m)");
 }
 
+// The Sun's light turned to face a lens far from the main camera.
+{
+    /* The Sun at the origin, Kerbin and Duna on their orbits 137 degrees apart: stock lights from the Sun toward the main camera at Duna. */
+    double a = 137 * Math.PI / 180;
+    var kerbin = new DVec3(13.6e9, 0, 0);
+    var duna = new DVec3(20.7e9 * Math.Cos(a), 0, 20.7e9 * Math.Sin(a));
+    var stockForward = duna.Normalized;
+    Check(Near(CommandCameraMath.SunTurnDeg(stockForward, kerbin), 137, 1e-6), "sun turn: a lens on Kerbin with the craft at Duna turns the light 137 degrees");
+    var nearCraft = kerbin + new DVec3(0, 0, 100e3);
+    Check(CommandCameraMath.SunTurnDeg(kerbin.Normalized, nearCraft) < CommandCameraMath.SunTurnMinDeg,
+        "sun turn: a lens 100 km from the main camera keeps stock's light");
+}
+
 // Scaled mesh occluder on an icosphere.
 {
     var (verts, tris) = Icosphere(4, 1.0);
