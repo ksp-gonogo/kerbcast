@@ -85,6 +85,9 @@ namespace Kerbcast
             _ownFrame = Time.frameCount;
         }
 
+        /* Whether `v` is the craft the lens stands in this frame, hidden from this camera. */
+        public bool HidesOwn(Vessel v) => v != null && _ownFrame == Time.frameCount && _own == v;
+
         /* The rig draws its subject's stand-in itself this frame, with its own clip plan. */
         public void RigDraws(RigDrawn drawn)
         {
@@ -151,6 +154,7 @@ namespace Kerbcast
             int renderers = _off.Count;
             if (own != null)
             {
+                OwnCraft.Hidden = own;
                 var list = OwnCraft.Renderers(own);
                 for (int r = 0; r < list.Count; r++)
                 {
@@ -209,6 +213,7 @@ namespace Kerbcast
         /* Undoes Hide exactly, however far it got. */
         public void Restore()
         {
+            OwnCraft.Hidden = null;
             if (_off.Count == 0 && _dark.Count == 0) return;
             long t0 = Stopwatch.GetTimestamp();
             for (int i = 0; i < _off.Count; i++)
@@ -491,16 +496,25 @@ namespace Kerbcast
     /*
      * The renderers of each loaded craft a command camera's lens stands in,
      * kept between frames since that craft is hidden on every frame its
-     * camera draws. Read again when its part count changes (staging, docking,
-     * a part lost), when a renderer has been destroyed, and every few seconds
-     * for anything added below a part without a part changing.
+     * camera draws. Read again when its set of parts changes (staging,
+     * docking, a part lost), when a renderer has been destroyed, and every
+     * few seconds for anything added below a part without a part changing.
      */
     internal static class OwnCraft
     {
+        /*
+         * The craft whose parts are switched off right now, inside one
+         * camera's local-layer renders, else null. Code that runs during that
+         * render (the sunflare's rays) reads it to see past the craft.
+         */
+        public static Vessel Hidden;
+
         private sealed class Entry
         {
             public readonly List<Renderer> Renderers = new List<Renderer>();
             public int PartCount = -1;
+            public ulong PartSum;
+            public uint PartXor;
             public float ReadAt;
             public bool Broken;
         }
@@ -518,12 +532,23 @@ namespace Kerbcast
             if (!s_craft.TryGetValue(v, out var e)) s_craft[v] = e = new Entry();
             var parts = v.parts;
             int count = parts != null ? parts.Count : 0;
+            ulong sum = 0;
+            uint xor = 0;
+            for (int i = 0; i < count; i++)
+            {
+                var p = parts[i];
+                if (p == null) continue;
+                sum += p.flightID;
+                xor ^= p.flightID * 2654435761u;
+            }
             float now = Time.realtimeSinceStartup;
-            if (e.Broken || count != e.PartCount || now - e.ReadAt >= RereadSeconds)
+            if (e.Broken || count != e.PartCount || sum != e.PartSum || xor != e.PartXor || now - e.ReadAt >= RereadSeconds)
             {
                 long t0 = Stopwatch.GetTimestamp();
                 Read(parts, e);
                 e.PartCount = count;
+                e.PartSum = sum;
+                e.PartXor = xor;
                 e.ReadAt = now;
                 e.Broken = false;
                 HideCost.Prepared(Stopwatch.GetTimestamp() - t0);

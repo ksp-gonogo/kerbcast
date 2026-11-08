@@ -153,7 +153,7 @@ namespace Kerbcast
             if (dist <= sun.Radius) return true; // inside the star; nothing can occlude
 
             Vector3 dir = (Vector3)(toSun / dist);
-            if (!Physics.Raycast(origin, dir, out _, Mathf.Infinity, NearOcclusionLayers))
+            if (!NearBlocked(origin, dir))
                 return true;
 
             float ring = (float)Math.Asin(Math.Min(1.0, sun.Radius / dist)) * RingScale;
@@ -167,10 +167,28 @@ namespace Kerbcast
             {
                 float a = 2f * Mathf.PI * i / RingSamples;
                 Vector3 d = dir * cosR + (right * Mathf.Cos(a) + up * Mathf.Sin(a)) * sinR;
-                if (!Physics.Raycast(origin, d, out _, Mathf.Infinity, NearOcclusionLayers))
+                if (!NearBlocked(origin, d))
                     return true;
             }
             return false;
+        }
+
+        private static readonly RaycastHit[] Hits = new RaycastHit[32];
+
+        /* A near-space ray is blocked, not counting the craft a command camera's lens stands in, whose parts this render does not draw. */
+        private static bool NearBlocked(Vector3 origin, Vector3 dir)
+        {
+            var own = OwnCraft.Hidden;
+            if (own == null) return Physics.Raycast(origin, dir, out _, Mathf.Infinity, NearOcclusionLayers);
+            int n = Physics.RaycastNonAlloc(origin, dir, Hits, Mathf.Infinity, NearOcclusionLayers);
+            for (int i = 0; i < n; i++)
+            {
+                var c = Hits[i].collider;
+                var part = c != null ? c.GetComponentInParent<Part>() : null;
+                if (part == null || part.vessel != own) return true;
+            }
+            /* A full buffer may have dropped a hit past the craft: call it blocked. */
+            return n == Hits.Length;
         }
 
         /* The live flare's shared material, or null while the hook reference is

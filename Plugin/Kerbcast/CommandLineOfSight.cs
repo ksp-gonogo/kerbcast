@@ -44,6 +44,7 @@ namespace Kerbcast
             var e = EntryFor(vantage);
             var site = e?.Site;
             if (site == null || site.VantageGone) return LineOfSightMath.Unknown;
+            bool switchedOff = !site.StationEnabled(GameStationRules.Now());
 
             double now = Planetarium.GetUniversalTime();
             if (!site.TryStationMotion(now, out var motion) || motion.Body == null) return LineOfSightMath.Unknown;
@@ -55,8 +56,10 @@ namespace Kerbcast
                 : CommandCameraMath.CarriedByBody(motion.RelNow, homeAt, CommandCameraOcclusion.Spin(standsOn), dt);
             var target = ToD(craftBody.getTruePositionAtUT(ut)) + world.Zup.ToWorld(position);
             double radius = Finite(radiusM) && radiusM > 0 ? radiusM : 0;
+            if (switchedOff) return LineOfSightMath.SwitchedOff(station, target);
 
             e.Occlusion.UseSite(site);
+            int fallbacks = e.Occlusion.MaskFallbacks;
             string occluder = null;
             var bodies = FlightGlobals.Bodies;
             for (int i = 0; bodies != null && i < bodies.Count && occluder == null; i++)
@@ -67,13 +70,18 @@ namespace Kerbcast
                 if (e.Occlusion.Blocks(b, station, target, at, ToD(b.position), CommandCameraOcclusion.Spin(b), dt, out _, radius))
                     occluder = b.bodyName;
             }
+            /* A skyline bin the line needed fell back to the smooth horizon: the answer is not whole, so it is not given. */
+            if (e.Occlusion.MaskFallbacks != fallbacks) return LineOfSightMath.Unknown;
             return LineOfSightMath.Answer(station, target, occluder, standsOn.bodyName);
         }
 
         /* The vantage's resolved site and skyline, kept; null while it does not resolve, tried again a second later. */
         private Entry EntryFor(Api.NetworkVantage v)
         {
-            var key = new CommandVantageKey(v);
+            /* An unnamed launch site is the active craft's, which can change within a scene: that is part of what is asked. */
+            bool unnamedSite = v.Kind == Api.SiteKind.LaunchSite && string.IsNullOrEmpty(v.Name);
+            string launchedFrom = unnamedSite ? FlightGlobals.ActiveVessel?.launchedFrom : null;
+            var key = new CommandVantageKey(v, launchedFrom);
             float now = Time.realtimeSinceStartup;
             if (_entries.TryGetValue(key, out var e))
             {
@@ -91,11 +99,11 @@ namespace Kerbcast
                 e.RetryAt = float.MaxValue;
                 return e;
             }
-            string launchedFrom = cv.Name.Length > 0 ? cv.Name : FlightGlobals.ActiveVessel?.launchedFrom;
-            e.Site = CommandCameraProvider.ResolveVantage(cv, launchedFrom, out _, out string fatal);
+            e.Site = CommandCameraProvider.ResolveVantage(cv, unnamedSite ? launchedFrom : cv.Name, out _, out string fatal);
             if (e.Site == null)
             {
-                e.RetryAt = fatal != null ? float.MaxValue : now + RetrySeconds;
+                /* Only a named place can be missing for good; an unnamed launch site is tried again. */
+                e.RetryAt = fatal != null && !unnamedSite ? float.MaxValue : now + RetrySeconds;
                 return e;
             }
             e.Occlusion = new CommandCameraOcclusion(CommandCameraRig.TerrainSampleCount, 0);
@@ -114,9 +122,11 @@ namespace Kerbcast
         private readonly double _height, _distance, _bearing, _lat, _lon;
         private readonly int _body;
         private readonly uint _pid;
+        private readonly string _launchedFrom;
 
-        public CommandVantageKey(Api.NetworkVantage v)
+        public CommandVantageKey(Api.NetworkVantage v, string launchedFrom)
         {
+            _launchedFrom = launchedFrom ?? "";
             _kind = v.Kind;
             _name = v.Name ?? "";
             _height = v.Height;
@@ -130,7 +140,8 @@ namespace Kerbcast
 
         public bool Equals(CommandVantageKey o) =>
             _kind == o._kind && _name == o._name && _height.Equals(o._height) && _distance.Equals(o._distance)
-            && _bearing.Equals(o._bearing) && _lat.Equals(o._lat) && _lon.Equals(o._lon) && _body == o._body && _pid == o._pid;
+            && _bearing.Equals(o._bearing) && _lat.Equals(o._lat) && _lon.Equals(o._lon) && _body == o._body && _pid == o._pid
+            && _launchedFrom == o._launchedFrom;
 
         public override bool Equals(object obj) => obj is CommandVantageKey k && Equals(k);
 
@@ -146,6 +157,7 @@ namespace Kerbcast
                 h = h * 31 + _lat.GetHashCode();
                 h = h * 31 + _lon.GetHashCode();
                 h = h * 31 + _body;
+                h = h * 31 + _launchedFrom.GetHashCode();
                 return h * 31 + (int)_pid;
             }
         }

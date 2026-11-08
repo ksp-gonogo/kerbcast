@@ -9,6 +9,8 @@ namespace Kerbcast
         public string Occluder;
         /* That body is the one the vantage stands on or orbits. */
         public bool BelowHorizon;
+        /* A ground station the game has switched off: it sees nothing, as a network vantage there reads "disabled". */
+        public bool Disabled;
         public double RangeM;
     }
 
@@ -21,6 +23,10 @@ namespace Kerbcast
     {
         /* Nothing can be said: the vantage or the craft has no place. */
         public static LineOfSightAnswer Unknown => new LineOfSightAnswer { RangeM = double.NaN };
+
+        /* A switched-off station: known, seeing nothing, with the range it would have. */
+        public static LineOfSightAnswer SwitchedOff(DVec3 station, DVec3 target) =>
+            new LineOfSightAnswer { Known = true, Disabled = true, RangeM = (target - station).Magnitude };
 
         /* The answer for a line from `station` to `target` whose first blocking body is `occluder` (null for none). */
         public static LineOfSightAnswer Answer(DVec3 station, DVec3 target, string occluder, string standsOn) =>

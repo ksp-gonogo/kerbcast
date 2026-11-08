@@ -225,7 +225,9 @@ using (var kc = RecordingKerbcast.Install())
         Check(!sight.Known && double.IsNaN(sight.RangeM), "line of sight is unknown until a test sets an answer");
         kc.Command.SetLineOfSight(new LineOfSightResult(true, false, "Mun", false, 2.5e6));
         sight = cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0), 4);
-        Check(sight.Known && !sight.Visible && sight.Occluder == "Mun" && sight.RangeM == 2.5e6, "a test sets what line of sight answers");
+        Check(sight.Known && !sight.Visible && sight.Occluder == "Mun" && sight.RangeM == 2.5e6 && !sight.Disabled, "a test sets what line of sight answers");
+        kc.Command.SetLineOfSight(new LineOfSightResult(true, false, null, false, 1e6, disabled: true));
+        Check(cmd.LineOfSight(NetworkVantage.Station("Crater Rim"), 1000, 1, new Vec3d(7e5, 0, 0)).Disabled, "and can answer for a station switched off");
         Check(OnOtherThread(() => Throws<InvalidOperationException>(() => cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0)))),
             "line of sight keeps to the main thread");
         Check(cmd.GroundStations().Count == 0, "no ground stations until a test sets them");

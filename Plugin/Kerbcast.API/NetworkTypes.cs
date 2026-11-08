@@ -120,13 +120,14 @@ namespace Kerbcast.Api
     /** <summary>Whether a vantage can see a point at one instant, from <see cref="ICommand.LineOfSight"/>.</summary> */
     public readonly struct LineOfSightResult
     {
-        public LineOfSightResult(bool known, bool visible, string occluder, bool belowHorizon, double rangeM)
+        public LineOfSightResult(bool known, bool visible, string occluder, bool belowHorizon, double rangeM, bool disabled = false)
         {
             Known = known;
             Visible = visible;
             Occluder = occluder;
             BelowHorizon = belowHorizon;
             RangeM = rangeM;
+            Disabled = disabled;
         }
 
         /** <summary>False when the vantage cannot be placed at the instant, or the point's body is unknown; nothing else is then meaningful.</summary> */
@@ -144,8 +145,16 @@ namespace Kerbcast.Api
         /** <summary>Metres from the vantage to the point; NaN when not Known.</summary> */
         public double RangeM { get; }
 
+        /**
+         * <summary>
+         * The vantage is a ground station the game has switched off, so it sees nothing (Visible false, no Occluder),
+         * as a network vantage there reads "disabled". Known stays true and RangeM is set.
+         * </summary>
+         */
+        public bool Disabled { get; }
+
         public override string ToString() =>
-            !Known ? "LineOfSight(unknown)" : Visible ? $"LineOfSight(visible, {RangeM} m)" : $"LineOfSight(blocked by {Occluder}{(BelowHorizon ? ", below horizon" : "")}, {RangeM} m)";
+            !Known ? "LineOfSight(unknown)" : Disabled ? $"LineOfSight(station switched off, {RangeM} m)" : Visible ? $"LineOfSight(visible, {RangeM} m)" : $"LineOfSight(blocked by {Occluder}{(BelowHorizon ? ", below horizon" : "")}, {RangeM} m)";
     }
 
     /** <summary>How a tracking network holds after a cut. Every value finite and 0 or more.</summary> */

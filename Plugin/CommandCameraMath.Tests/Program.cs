@@ -811,6 +811,9 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     var under = LineOfSightMath.Answer(relS, up * -3e7, "Kerbin", "Kerbin");
     Check(!under.Visible && under.BelowHorizon, "sight: the vantage's own body in the way is below the horizon");
     Check(!LineOfSightMath.Unknown.Known && double.IsNaN(LineOfSightMath.Unknown.RangeM), "sight: unknown says nothing");
+    var off = LineOfSightMath.SwitchedOff(relS, craft);
+    Check(off.Known && off.Disabled && !off.Visible && off.Occluder == null && Near(off.RangeM, 3e7 - rs, 1e-6),
+        "sight: a switched-off station is known to see nothing, with its range");
 
     /* A 1 km ridge 20 km east; a far craft fixed in space just under its crest rises over it as the body turns. */
     var ridgeDir = (up * Math.Cos(20000 / seaR) + losEast * Math.Sin(20000 / seaR)).Normalized;

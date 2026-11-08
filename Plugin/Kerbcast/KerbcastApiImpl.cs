@@ -276,7 +276,7 @@ namespace Kerbcast
         {
             Enter(nameof(LineOfSight), ApiFeature.LineOfSight);
             var a = sight.Check(vantage, ut, bodyIndex, new DVec3(position.X, position.Y, position.Z), radiusM);
-            return new LineOfSightResult(a.Known, a.Visible, a.Occluder, a.BelowHorizon, a.RangeM);
+            return new LineOfSightResult(a.Known, a.Visible, a.Occluder, a.BelowHorizon, a.RangeM, a.Disabled);
         }
 
         public IReadOnlyList<GroundStationInfo> GroundStations()

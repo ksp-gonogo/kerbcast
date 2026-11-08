@@ -223,8 +223,10 @@ namespace Kerbcast.Api
          * frame (<see cref="WorldModelBuilder.StateVector"/>: about body <paramref name="bodyIndex"/>, z-up, KSP's fixed
          * inertial frame), with <paramref name="radiusM"/> letting a craft show over a skyline (NaN for a point). There is
          * no light time or delay in it: the caller picks the instant and the point. A craft vantage is placed on its
-         * orbit, or carried by its body when landed. The skyline is measured lazily, a few bins per call, so the first
-         * calls toward a new direction may read the smooth horizon. It is a read for the host alone: no lock applies,
+         * current orbit patch, as if nothing changed its course (no thrust, no change of sphere of influence), or carried
+         * by its body when landed. A ground station the game has switched off answers Disabled. Known is false when the
+         * vantage or the body cannot be placed, and whenever any part of the vantage's skyline the line needs is not
+         * measured yet, so a Known answer is always whole. It is a read for the host alone: no lock applies,
          * nothing is shown to viewers and no camera uses it. Check <see cref="KerbcastApi.Supports"/> with
          * <see cref="ApiFeature.LineOfSight"/> first.
          * </summary>
