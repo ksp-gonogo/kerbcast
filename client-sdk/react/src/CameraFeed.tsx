@@ -16,6 +16,7 @@ import {
   useEffect,
   useId,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -386,16 +387,23 @@ export interface CameraFeedProps {
   anchorOverlay?: AnchorOverlay;
   /**
    * Name a tracking network feed in your own layer. A network feed's title
-   * reads "<vantage> via <network>" ("Crater Rim via Kerbin ground net"),
-   * taken from the displayed frame so it changes on the cut frame; this is
-   * called on every render with the same reading: the vantage's label, the
-   * frame's network state (`ok`, or `noView`; treat any other value as
-   * `noView`) and the network's name. What it returns is placed over the
-   * picture with no position of its own, so return a positioned element, a
-   * portal into your own layer, or null. Called only while the feed shows a
-   * network camera in flight that is not blanked.
+   * names the network alone, and by default its bottom left corner reads
+   * "<vantage> via <network>" ("Crater Rim via Kerbin ground net"), taken
+   * from the displayed frame so it changes on the cut frame. Given this,
+   * the feed draws no corner name and calls it on every render instead,
+   * with the vantage's label, the frame's network state (`ok`, or
+   * `noView`; treat any other value as `noView`) and the network's name.
+   * What it returns is placed over the picture with no position of its
+   * own, so return a positioned element, a portal into your own layer, or
+   * null. Called only while the feed shows a network camera in flight that
+   * is not blanked.
    */
   renderNetworkVantage?: (siteLabel: string, networkState: string, networkName: string) => ReactNode;
+  /**
+   * Drop the feed's own 1px border and rounded corners, for a host that
+   * frames the feed itself. Default false.
+   */
+  frameless?: boolean;
 }
 
 export interface CameraFeedHandle {
@@ -443,6 +451,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       anchors,
       anchorOverlay,
       renderNetworkVantage,
+      frameless = false,
     },
     ref,
   ) {
@@ -979,11 +988,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     });
 
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
-    const title = !camera
-      ? "Camera Feed"
-      : networkVantage?.networkName
-        ? networkFeedName(networkVantage.siteLabel, networkVantage.networkName)
-        : cameraLabel(camera);
+    /* A network feed's title names the network alone; where it shows the craft from goes in the corner name. */
+    const title = !camera ? "Camera Feed" : networkVantage?.networkName || cameraLabel(camera);
 
     // -------------------------------------------------------------------------
     // Viewer quality control (opt-in). A built-in action button + menu: Auto
@@ -1459,12 +1465,29 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       <FeedActionBar leading={stepButtons} entries={entries} />
     ) : null;
 
+    /* The title stops short of the action bar, however many buttons it
+       holds, so its chevron never sits under one; on a tile too narrow for
+       both it drops below the bar instead. The bar's width changes only when
+       it renders, so it is read after each render rather than observed. */
+    useLayoutEffect(() => {
+      const stage = wrapRef.current;
+      if (!stage) return;
+      const bar = stage.querySelector<HTMLElement>(String(ActionBarRow));
+      const barW = bar ? bar.offsetWidth : 0;
+      const beside = stage.clientWidth - 16 - (barW + 8) >= TITLE_MIN_WIDTH;
+      const pad = `${beside ? barW + 8 : 0}px`;
+      const drop = `${beside || !bar ? 0 : bar.offsetHeight + 4}px`;
+      if (stage.style.getPropertyValue("--kc-title-pad") !== pad) stage.style.setProperty("--kc-title-pad", pad);
+      if (stage.style.getPropertyValue("--kc-title-drop") !== drop) stage.style.setProperty("--kc-title-drop", drop);
+    });
+
     return (
       <FeedBox style={feedShape}>
         <Stage
           ref={wrapRef}
           $pinned={chromePinned}
           $fullscreen={isFullscreen}
+          $frameless={frameless}
           data-fullscreen={isFullscreen || undefined}
           data-kc-signal={signal}
         >
@@ -1618,8 +1641,14 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
-              {networkVantage && renderNetworkVantage && !outOfFlight && !isDestroyed && !commandState?.blank &&
-                renderNetworkVantage(networkVantage.siteLabel, networkVantage.networkState, networkVantage.networkName)}
+              {networkVantage && !outOfFlight && !isDestroyed && !commandState?.blank &&
+                (renderNetworkVantage ? (
+                  renderNetworkVantage(networkVantage.siteLabel, networkVantage.networkState, networkVantage.networkName)
+                ) : (
+                  <NetworkCaption data-kc-network-caption>
+                    {networkFeedName(networkVantage.siteLabel, networkVantage.networkName)}
+                  </NetworkCaption>
+                ))}
               {waitingForSlot && !outOfFlight && !isDestroyed && noSlotLabel && (
                 <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
               )}
@@ -2095,14 +2124,42 @@ const TopOverlay = styled.div`
   }
 `;
 
+/* The least room beside the action bar a title takes before it drops below it. */
+const TITLE_MIN_WIDTH = 64;
+
 const TitleRow = styled.div`
   display: flex;
   align-items: flex-start;
   gap: 8px;
   /* Reserve the top-right corner where the ActionBar overlay sits (now home
-     to the camera step buttons too) so a long title ellipsizes rather than
-     sliding underneath the controls. */
-  padding-right: 96px;
+     to the camera step buttons too), measured into --kc-title-pad, so a long
+     title ellipsizes rather than sliding underneath the controls. */
+  padding-right: var(--kc-title-pad, 96px);
+  margin-top: var(--kc-title-drop, 0px);
+`;
+
+/* A network feed's corner name, bottom left. Always shown, it steps aside while the zoom controls take that corner on hover. */
+const NetworkCaption = styled.div`
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  z-index: 2;
+  max-width: calc(100% - 96px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+  transition: opacity 0.15s;
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
+  }
 `;
 
 const TopTitle = styled.h3`
@@ -2418,7 +2475,14 @@ const FeedBox = styled.div`
   justify-content: center;
 `;
 
-const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean }>`
+const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean; $frameless: boolean }>`
+  ${(p) => p.$frameless && "border: none; border-radius: 0;"}
+
+  &:hover ${NetworkCaption},
+  &:focus-within ${NetworkCaption} {
+    opacity: 0;
+  }
+
   width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
   height: auto;
   aspect-ratio: var(--kc-feed-w) / var(--kc-feed-h);
