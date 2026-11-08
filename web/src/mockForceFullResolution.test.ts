@@ -301,49 +301,43 @@ describe("force-full-resolution through the real production connect flow (Connec
     manager.stop();
   });
 
-  it("regression guard: with maxRenderSize unknown (no discover()), the same already-at-ceiling feed stalls for the full ARM_TIMEOUT_MS", async () => {
-    vi.useFakeTimers();
-    try {
-      const sidecar = new MockSidecar();
-      sidecar.withSlots(["0", "1", "2", "3"]);
-      sidecar.onSubscribe((_flightId, mid) => sidecar.deliverTrack(mid, fakeVideoTrack()));
-      sidecar.addCamera({
-        flightId: 7,
-        renderWidth: 1280,
-        renderHeight: 720,
-        operatorWidth: 1280,
-        operatorHeight: 720,
-      });
+  it("arms promptly for a feed discover() never saw, from the ceiling in its live state", async () => {
+    /* A camera that appears after the page's one discovery (a fresh flight
+       scene) used to have no known ceiling and stalled the full
+       ARM_TIMEOUT_MS when already at it. */
+    const sidecar = new MockSidecar();
+    sidecar.withSlots(["0", "1", "2", "3"]);
+    sidecar.onSubscribe((_flightId, mid) => sidecar.deliverTrack(mid, fakeVideoTrack()));
+    sidecar.addCamera({
+      flightId: 7,
+      renderWidth: 1280,
+      renderHeight: 720,
+      operatorWidth: 1280,
+      operatorHeight: 720,
+    });
 
-      const client = new KerbcastClient(
-        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
-        sidecar.createTransport(),
-      );
-      await client.connect([], { slots: 4 });
-      sidecar.open();
-      sidecar.setConnectionState("connected");
-      await client.subscribe(7);
+    const client: KerbcastClient = new KerbcastClient(
+      {
+        host: "h",
+        port: 1,
+        negotiate: (o) => sidecar.negotiate(o),
+        recording: { probeDecodedSize: stateFollowingDecodedSizeProbe(() => client) },
+      },
+      sidecar.createTransport(),
+    );
+    await client.connect([], { slots: 4 });
+    sidecar.open();
+    sidecar.setConnectionState("connected");
+    await client.subscribe(7);
 
-      expect(client.camera(7).maxRenderSize).toBeNull();
+    expect(client.camera(7).maxRenderSize).toEqual({ width: 1280, height: 720 });
 
-      const id = client.recording.startRecording(7, { forceFullResolution: true });
-      expect(
-        client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
-      ).toBe(true);
+    const id = client.recording.startRecording(7, { forceFullResolution: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
+    ).toBe(false);
 
-      await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS - 100);
-      expect(
-        client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
-      ).toBe(true);
-
-      await vi.advanceTimersByTimeAsync(200);
-      expect(
-        client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
-      ).toBe(false);
-
-      await client.recording.stopRecording(id);
-    } finally {
-      vi.useRealTimers();
-    }
+    await client.recording.stopRecording(id);
   });
 });

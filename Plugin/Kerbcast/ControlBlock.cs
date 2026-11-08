@@ -98,6 +98,10 @@ namespace Kerbcast
         /// subscribed but is paced far below the primary rate because nothing
         /// is displaying it at size.</summary>
         public float? CaptureFps;
+        /// <summary>A viewer is recording this camera: keep the render size
+        /// where it is. Carried by its fields_present bit alone, with no body
+        /// field, so an older sidecar simply never sets it.</summary>
+        public bool SizeHeld;
         /// <summary>The seqlock value this snapshot was read at (even).</summary>
         public long Seq;
     }
@@ -153,6 +157,7 @@ namespace Kerbcast
         public const uint FpViewerLevel = 1u << 9;
         public const uint FpTrackMode = 1u << 10;
         public const uint FpCaptureFps = 1u << 11;
+        public const uint FpSizeHeld = 1u << 12;
 
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewAccessor _view;
@@ -263,6 +268,7 @@ namespace Kerbcast
                 ViewerLevel = (present & FpViewerLevel) != 0 ? _view.ReadUInt32(BViewerLevel) : (uint?)null,
                 TrackMode = (present & FpTrackMode) != 0 ? _view.ReadUInt32(BTrackMode) : (uint?)null,
                 CaptureFps = (present & FpCaptureFps) != 0 ? _view.ReadSingle(BCaptureFps) : (float?)null,
+                SizeHeld = (present & FpSizeHeld) != 0,
                 TrackSeq = _view.ReadUInt32(BTrackSeq),
                 Seq = seq,
             };

@@ -53,6 +53,10 @@
 //!                                capture at the primary rate, which is what a
 //!                                sidecar predating background capture writes. A low value is a
 //!                                background background capture. Append -> no version bump.)
+//!
+//! fields_present bit 12 (FP_SIZE_HELD) carries a flag with no body field:
+//! set = a viewer is recording, keep the render size where it is. An old
+//! reader ignores the bit, so this is an append too.
 //! ```
 //!
 //! NOTE: this field is an APPEND with its own `fields_present` bit, NOT a layout
@@ -138,6 +142,8 @@ pub const FP_ZOOM_RATE: u32 = 1 << 8;
 pub const FP_VIEWER_LEVEL: u32 = 1 << 9;
 pub const FP_TRACK_MODE: u32 = 1 << 10;
 pub const FP_CAPTURE_FPS: u32 = 1 << 11;
+/// A flag carried by the bit alone: hold the render size (see `ControlState::size_held`).
+pub const FP_SIZE_HELD: u32 = 1 << 12;
 
 /// Auto-track mode → the u32 the plugin decodes (0=none, 1=active-vessel,
 /// 2=target). Keep in lockstep with ControlBlock.cs's SetTrackMode mapping.
@@ -262,6 +268,9 @@ impl ControlBlock {
         if s.track_mode != TrackMode::None {
             present |= FP_TRACK_MODE;
         }
+        if s.size_held {
+            present |= FP_SIZE_HELD;
+        }
 
         self.put_u32(B_FIELDS_PRESENT, present);
         // subscribed (u8) + 3 pad bytes.
@@ -317,6 +326,8 @@ pub struct ControlSnapshot {
     /// Requested capture rate in fps. `None` when the present bit is clear =
     /// capture at the primary rate.
     pub capture_fps: Option<f32>,
+    /// Hold the render size where it is.
+    pub size_held: bool,
 }
 
 fn rd_u32(buf: &[u8], at: usize) -> u32 {
@@ -373,6 +384,7 @@ pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
         track_mode: opt_u32(FP_TRACK_MODE, B_TRACK_MODE),
         track_seq: rd_u32(buf, b + B_TRACK_SEQ),
         capture_fps: opt_f32(FP_CAPTURE_FPS, B_CAPTURE_FPS),
+        size_held: present & FP_SIZE_HELD != 0,
     })
 }
 
@@ -407,6 +419,8 @@ mod tests {
             // Left None for the same reason: bit clear, +64 zero, fixture
             // unchanged. Its own round-trip test covers the set case.
             capture_fps: None,
+            // False for the same reason: bit 12 clear, fixture unchanged.
+            size_held: false,
         }
     }
 
@@ -522,6 +536,26 @@ mod tests {
         let snap = decode(&write_to_vec(&stopped)).expect("decodes");
         assert_eq!(snap.capture_fps, Some(0.0));
         assert_ne!(snap.fields_present & FP_CAPTURE_FPS, 0);
+    }
+
+    #[test]
+    fn size_hold_rides_in_its_present_bit_alone() {
+        let plain = write_to_vec(&fixture_state());
+        assert!(!decode(&plain).unwrap().size_held);
+        let held = write_to_vec(&ControlState {
+            size_held: true,
+            ..fixture_state()
+        });
+        let snap = decode(&held).unwrap();
+        assert!(snap.size_held);
+        assert_ne!(snap.fields_present & FP_SIZE_HELD, 0);
+        /* Only the bitmask word differs, so an old reader sees the same body. */
+        let at = CONTROL_HEADER_SIZE + B_FIELDS_PRESENT;
+        let differing: Vec<usize> = (0..plain.len()).filter(|&i| plain[i] != held[i]).collect();
+        assert!(
+            differing.iter().all(|&i| (at..at + 4).contains(&i)),
+            "{differing:?}"
+        );
     }
 
     #[test]

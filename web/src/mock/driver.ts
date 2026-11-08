@@ -18,6 +18,7 @@ import {
   CommandTargetEligibility,
   CrewLocation,
   KerbcastClient,
+  SiteKind,
 } from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
@@ -128,6 +129,8 @@ const MOCK_CAMERAS: MockCameraInit[] = [
     commandCentre: {
       stationId: "ground:KSC",
       nodeName: "KSC",
+      siteKey: "KSC",
+      siteKind: SiteKind.Station,
       displayName: "Kerbal Space Center",
       body: "Kerbin",
       latitude: -0.13,
@@ -289,7 +292,8 @@ export async function createMockClient(): Promise<KerbcastClient> {
    * to catch a tile's "ARMING" pill before it clears.
    */
   const sidecar = new MockSidecar({ forceBumpDelayMs: 900 });
-  sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
+  /* The page's starting pool, grown by re-offers past eight feeds as on a real sidecar. */
+  sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]).withRenegotiation();
 
   for (const cam of MOCK_CAMERAS) {
     sidecar.addCamera(cam);
@@ -358,6 +362,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
         }, 50);
         return answer;
       },
+      renegotiate: (offer) => sidecar.renegotiate(offer),
     },
     sidecar.createTransport(),
   );
@@ -367,12 +372,9 @@ export async function createMockClient(): Promise<KerbcastClient> {
   interceptMockFetch(sidecar);
 
   /*
-   * Populate maxRenderSize (client.camera(id).maxRenderSize) up front, the
-   * same way a consumer would call discover() before subscribing: without
-   * it the force-full-resolution arm-and-wait falls back to its weaker
-   * "operator size increased past baseline" check instead of recognising a
-   * feed that reaches (or already sits at) its true ceiling. See
-   * RecordingController.watchResolutionReady.
+   * Mirrors ConnectionManager's discovery before connect. Each camera's live
+   * state already carries its ceiling (client.camera(id).maxRenderSize), so
+   * this only fills the fallback an older sidecar would need.
    */
   await mockClient.discover();
 

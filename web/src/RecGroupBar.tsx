@@ -54,6 +54,28 @@ export function RecGroupBar({
     : [];
   const startedAt = members.length > 0 ? Math.min(...members.map((m) => m.startedAt)) : null;
 
+  /* The group that last reported its end, so a Stop click and the members
+     running out together still report it once. */
+  const reported = useRef<string | null>(null);
+  const reportStopped = (): void => {
+    if (groupId === null || reported.current === groupId) return;
+    reported.current = groupId;
+    onStopped();
+  };
+  /* A group can end without the Stop button: its cameras went away or its
+     connection did not come back. The bar goes once its last member has. */
+  const hadMembers = useRef(false);
+  useEffect(() => {
+    if (groupId === null || members.length > 0) {
+      hadMembers.current = groupId !== null;
+      return;
+    }
+    if (hadMembers.current) {
+      hadMembers.current = false;
+      reportStopped();
+    }
+  });
+
   // Ticks once a second while a grouped recording is running, so the shared
   // elapsed timer stays live (mirrors CameraFeed's own per-feed REC timer).
   const [, tick] = useReducer((c: number) => c + 1, 0);
@@ -88,12 +110,12 @@ export function RecGroupBar({
           onClick={() => {
             void recordings
               .stopGroup(groupId)
-              .then(() => onStopped())
+              .then(reportStopped)
               .catch((err: unknown) => {
                 /* A stuck "Stop grouped recording" control is worse than a
                    silently-failed stop: clear the bar either way. */
                 console.error("kerbcast: grouped recording stop failed", err);
-                onStopped();
+                reportStopped();
               });
           }}
         >

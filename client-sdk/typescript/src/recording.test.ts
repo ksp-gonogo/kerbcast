@@ -10,10 +10,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CameraState } from "./__generated__/types";
+import { CameraLifecycle, type CameraState } from "./__generated__/types";
 import {
   ARM_TIMEOUT_MS,
+  RECONNECT_GRACE_MS,
   RecordingController,
+  SOURCE_LOST_GRACE_MS,
+  CAMERA_UNLISTED_GRACE_MS,
   commonUtWindow,
   createMediabunnyTrimmerLoader,
   negotiateMimeType,
@@ -21,9 +24,11 @@ import {
   type GroupTrimmer,
   type RecordingClient,
   type RecordingClientCamera,
+  type RecordingEndedEvent,
   type RecordingHandle,
   type RecordingsSnapshot,
 } from "./recording";
+import type { ContactGap } from "./client";
 import { installDomStubs, StubMediaRecorder } from "./testing/index";
 
 /**
@@ -146,7 +151,9 @@ class FakeCamera implements RecordingClientCamera {
   /** When > 0, the next N calls to setForceFullResolution reject instead of
    * resolving (consumed one per call), to simulate a dropped send. */
   forceRejectCount = 0;
+  hasSource = true;
   private readonly listeners = new Set<(state: CameraState) => void>();
+  private readonly sourceListeners = new Set<(hasSource: boolean) => void>();
 
   constructor(stream: MediaStream | null) {
     this.mediaStream = stream;
@@ -160,9 +167,18 @@ class FakeCamera implements RecordingClientCamera {
     }
   }
 
-  on(_event: "change", handler: (state: CameraState) => void): () => void {
-    this.listeners.add(handler);
-    return () => this.listeners.delete(handler);
+  on(event: "change", handler: (state: CameraState) => void): () => void;
+  on(event: "source", handler: (hasSource: boolean) => void): () => void;
+  on(event: "change" | "source", handler: (data: never) => void): () => void {
+    const set = (event === "change" ? this.listeners : this.sourceListeners) as Set<typeof handler>;
+    set.add(handler);
+    return () => set.delete(handler);
+  }
+
+  /** Test hook: the feed leaves or returns to this client. */
+  setSource(hasSource: boolean): void {
+    this.hasSource = hasSource;
+    for (const l of [...this.sourceListeners]) l(hasSource);
   }
 
   /** Test hook: push a new state and notify subscribers. */
@@ -213,9 +229,16 @@ class FakeCamera implements RecordingClientCamera {
  */
 class FakeRecordingClient implements RecordingClient {
   captureUt: number | null = null;
+  /** Undefined models a client whose clock reports no epoch. */
+  epoch: number | undefined = 0;
+  state = "connected";
+  lastContactAt: number | null = null;
   private readonly streams = new Map<number, MediaStream | null>();
   private readonly cams = new Map<number, FakeCamera>();
   private readonly listeners = new Set<(data: unknown) => void>();
+  private readonly cameraListeners = new Set<(cameras: CameraState[]) => void>();
+  private readonly stateListeners = new Set<(state: string) => void>();
+  private readonly gapListeners = new Set<(gap: ContactGap) => void>();
 
   setStream(flightId: number, stream: MediaStream | null): void {
     this.streams.set(flightId, stream);
@@ -232,18 +255,52 @@ class FakeRecordingClient implements RecordingClient {
     return cam;
   }
 
-  get clock(): { readonly captureUt: number | null } {
-    return { captureUt: this.captureUt };
+  get clock(): { readonly captureUt: number | null; readonly epoch?: number } {
+    return this.epoch === undefined ? { captureUt: this.captureUt } : { captureUt: this.captureUt, epoch: this.epoch };
   }
 
-  on(_event: "settings-change", handler: (data: unknown) => void): () => void {
-    this.listeners.add(handler);
-    return () => this.listeners.delete(handler);
+  on(event: "settings-change", handler: (data: unknown) => void): () => void;
+  on(event: "cameras-change", handler: (cameras: CameraState[]) => void): () => void;
+  on(event: "state-change", handler: (state: string) => void): () => void;
+  on(event: "contact-gap", handler: (gap: ContactGap) => void): () => void;
+  on(
+    event: "settings-change" | "cameras-change" | "state-change" | "contact-gap",
+    handler: (data: never) => void,
+  ): () => void {
+    const set = (
+      event === "settings-change"
+        ? this.listeners
+        : event === "cameras-change"
+          ? this.cameraListeners
+          : event === "contact-gap"
+            ? this.gapListeners
+            : this.stateListeners
+    ) as Set<typeof handler>;
+    set.add(handler);
+    return () => set.delete(handler);
   }
 
-  /** Advance the shared capture clock and fire a settings-change push. */
-  tick(ut: number | null): void {
+  /** Test hook: the connection state changes. */
+  setState(state: string): void {
+    this.state = state;
+    for (const l of [...this.stateListeners]) l(state);
+  }
+
+  /** Test hook: messages arrive after a silence, as the client reports it. */
+  emitGap(gap: ContactGap): void {
+    this.lastContactAt = gap.to;
+    for (const l of [...this.gapListeners]) l(gap);
+  }
+
+  /** Test hook: a new camera list arrives. */
+  emitCameras(cameras: CameraState[]): void {
+    for (const l of [...this.cameraListeners]) l(cameras);
+  }
+
+  /** Advance the shared capture clock and fire a settings-change push; a new `epoch` models a revert. */
+  tick(ut: number | null, epoch = this.epoch): void {
     this.captureUt = ut;
+    this.epoch = epoch;
     for (const h of [...this.listeners]) h(undefined);
   }
 
@@ -1578,6 +1635,692 @@ describe("RecordingController grouped", () => {
     for (const rec of handle.recordings) {
       expect(ctrl.fetchRecording(rec.recordingId)).toBeUndefined();
     }
+  });
+});
+
+/** A StubMediaRecorder whose last instance a test can stop as the browser would. */
+class EndableRecorder extends StubMediaRecorder {
+  static last: EndableRecorder | null = null;
+  constructor(stream: MediaStream, options?: { mimeType?: string }) {
+    super(stream, options);
+    EndableRecorder.last = this;
+  }
+  /** The browser stops the recorder itself, as when its track ends. */
+  endByItself(): void {
+    super.stop();
+  }
+}
+
+describe("RecordingController when the camera goes away", () => {
+  let client: FakeRecordingClient;
+  let ctrl: RecordingController;
+  let ended: RecordingEndedEvent[];
+  const listed = (...ids: number[]): CameraState[] => ids.map((flightId) => makeCameraState({ flightId }));
+
+  beforeEach(() => {
+    client = new FakeRecordingClient();
+    client.setStream(1, liveStream());
+    client.setStream(2, liveStream());
+    ctrl = new RecordingController(client, { loadTrimmer: () => Promise.resolve(null) });
+    ended = [];
+    ctrl.onRecordingEnded((e) => ended.push(e));
+    vi.spyOn(console, "info").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("saves the clip when a scene change destroys the camera", async () => {
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    client.captureUt = 104;
+    client.emitCameras([makeCameraState({ flightId: 1, lifecycle: CameraLifecycle.Destroyed })]);
+    await flush();
+
+    expect(ctrl.isRecording(1)).toBe(false);
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.byteSize).toBeGreaterThan(0);
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utEnd).toBe(104);
+    expect(ctrl.getSnapshot().recordings.map((r) => r.recordingId)).toEqual([id]);
+    expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
+  });
+
+  it("saves the clip as camera-gone when a revert starts a new capture epoch", async () => {
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    client.tick(102);
+    client.tick(104);
+    /* The camera stays listed: a revert keeps its flight id. */
+    client.tick(40, 1);
+    await flush();
+
+    expect(ctrl.isRecording(1)).toBe(false);
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utEnd).toBe(104);
+    expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 102, 104, 104]);
+    expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
+  });
+
+  /*
+   * Revert to Launch as a Deck run saw it: the list empties, the same cameras
+   * come back a second later under their old flight ids, and the clock push
+   * with the new epoch arrives two seconds after that.
+   */
+  const revertToLaunch = async (): Promise<void> => {
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(2000);
+    client.tick(40, 1);
+    await vi.advanceTimersByTimeAsync(0);
+  };
+
+  /** The media length of the file the recorder made last. */
+  const fileMs = (): number => StubMediaRecorder.last!.mediaMs;
+
+  it("cuts a revert's clip back to when its camera left the list", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(101);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(102);
+    await vi.advanceTimersByTimeAsync(500);
+    await revertToLaunch();
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.utSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 1000, ut: 101 },
+      { t: 2000, ut: 102 },
+      { t: 2500, ut: 102 },
+    ]);
+    expect(handle.utEnd).toBe(102);
+    expect(handle.durationMs).toBe(2500);
+    /* The whole file, which the recorder stopped taking frames into when the list emptied. */
+    expect(fileMs()).toBe(2500);
+    expect(handle.byteSize).toBe(2048);
+    expect(ended).toEqual([{ recording: handle, endedBy: "camera-gone" }]);
+  });
+
+  it("cuts back to when the camera left when the revert's clock arrives before it is listed again", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(101);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBe(1000);
+    expect(handle.utSamples.map((s) => s.ut)).toEqual([100, 101, 101]);
+    expect(fileMs()).toBe(1000);
+    expect(handle.byteSize).toBe(2048);
+  });
+
+  it("ends a clip whose camera stays off the list where the camera left, not after the grace", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.tick(101);
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    /* The clock runs on through the gap; none of it belongs in the clip. */
+    client.tick(102);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(handle.durationMs).toBe(1500);
+    expect(handle.utSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 1000, ut: 101 },
+      { t: 1500, ut: 101 },
+    ]);
+    expect(handle.utEnd).toBe(101);
+    expect(fileMs()).toBe(1500);
+    expect(handle.byteSize).toBe(2048);
+  });
+
+  it("leaves a brief list gap out of the clip once the clock shows no revert came with it", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras(listed(1, 2));
+    /* Listed again, but held until the clock shows the same timeline. */
+    await vi.advanceTimersByTimeAsync(500);
+    expect(StubMediaRecorder.last!.state).toBe("paused");
+    client.tick(102);
+    expect(StubMediaRecorder.last!.state).toBe("recording");
+    await vi.advanceTimersByTimeAsync(1500);
+    /* A later revert with the camera staying listed ends the clip where the clock saw it. */
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    /* 1 s before the gap and 1.5 s after it; the 1.5 s held is not in the file. */
+    expect(handle.durationMs).toBe(2500);
+    expect(fileMs()).toBe(2500);
+    /* The UT steps where the gap was left out. */
+    expect(handle.utSamples).toEqual([
+      { t: 0, ut: 100 },
+      { t: 1000, ut: 100 },
+      { t: 1000, ut: 102 },
+      { t: 2500, ut: 102 },
+    ]);
+    /* A UT inside the gap maps to where the clip skips it. */
+    expect(utToRecordingTimeMs(handle.utSamples, 101)).toBe(1000);
+    expect(handle.byteSize).toBe(2048);
+  });
+
+  it("ends a clip stopped by hand during a list gap where the camera left", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(500);
+    const handle = await ctrl.stopRecording(id);
+    expect(handle.endedBy).toBe("user");
+    expect(handle.durationMs).toBe(1000);
+    expect(fileMs()).toBe(1000);
+    expect(handle.utSamples.map((s) => s.t)).toEqual([0, 1000]);
+  });
+
+  it("holds the clip at the first time its camera left when it leaves again before the clock confirms", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(500);
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.durationMs).toBe(1000);
+    expect(fileMs()).toBe(1000);
+  });
+
+  it("takes the epoch of the first clock when it started without one", async () => {
+    const id = ctrl.startRecording(1);
+    client.tick(100, 3);
+    client.tick(101);
+    expect(ctrl.isRecording(1)).toBe(true);
+    client.tick(20, 4);
+    await flush();
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("keeps recording across pushes from a clock that reports no epoch", async () => {
+    client.epoch = undefined;
+    client.captureUt = 100;
+    const never = ctrl.startRecording(1);
+    client.epoch = 0;
+    const known = ctrl.startRecording(2);
+    /* A clock that stops reporting its epoch has not changed it. */
+    client.epoch = undefined;
+    client.tick(101);
+    client.tick(102);
+    await flush();
+    expect(ctrl.isRecording(1)).toBe(true);
+    expect(ctrl.isRecording(2)).toBe(true);
+    expect((await ctrl.stopRecording(never)).endedBy).toBe("user");
+    expect((await ctrl.stopRecording(known)).endedBy).toBe("user");
+  });
+
+  it("saves the clip when the camera stays out of the camera list past the grace", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(1, 2));
+    expect(ctrl.isRecording(1)).toBe(true);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("keeps the same recording when the camera returns to the list within the grace", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS * 3);
+    expect(ctrl.isRecording(1)).toBe(true);
+    expect((await ctrl.stopRecording(id)).endedBy).toBe("user");
+  });
+
+  it("times each gap on its own, so a second brief gap gets a fresh grace", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    for (let i = 0; i < 3; i++) {
+      client.emitCameras(listed(2));
+      await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1);
+      client.emitCameras(listed(1));
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    expect(ctrl.isRecording(1)).toBe(true);
+  });
+
+  it("ends a recording whose camera came back under a different flight id after the grace", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1);
+    client.emitCameras(listed(2, 7));
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("leaves a dropped connection to the reconnect grace when the list empties", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    client.emitCameras([]);
+    client.state = "reconnecting";
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS * 2);
+    expect(ctrl.isRecording(1)).toBe(true);
+  });
+
+  it("keeps the recording when the camera and its feed both go and are back within the grace", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    const cam = client.camera(1);
+    cam.setSource(false);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(1900);
+    client.emitCameras(listed(1, 2));
+    /* The feed rebinds after the list, so it has a fresh grace from here. */
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS - 1);
+    cam.setSource(true);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS * 3);
+    expect(ctrl.isRecording(1)).toBe(true);
+    expect((await ctrl.stopRecording(id)).endedBy).toBe("user");
+  });
+
+  it("ends as camera-gone, not feed-closed, when the feed goes just before the camera leaves the list", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.camera(1).setSource(false);
+    await vi.advanceTimersByTimeAsync(5);
+    client.emitCameras(listed(2));
+    /* Past the feed's grace, short of the list's. */
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS - 4);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("ends as feed-closed when the camera is listed again but its feed never rebinds", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.camera(1).setSource(false);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(1900);
+    client.emitCameras(listed(1, 2));
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("feed-closed");
+  });
+
+  it("ends a camera reported destroyed during the grace at once, as camera-gone", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(500);
+    client.emitCameras([makeCameraState({ flightId: 1, lifecycle: CameraLifecycle.Destroyed })]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS * 2);
+    expect(ended.map((e) => e.endedBy)).toEqual(["camera-gone"]);
+  });
+
+  it("ends once, on its own clock, when the camera leaves the list while the recording is arming", async () => {
+    vi.useFakeTimers();
+    const cam = client.camera(1);
+    cam.maxRenderSize = { width: 1920, height: 1080 };
+    cam.emitState(
+      makeCameraState({ flightId: 1, renderWidth: 160, renderHeight: 120, operatorWidth: 160, operatorHeight: 120 }),
+    );
+    client.captureUt = 100;
+    const id = ctrl.startRecording(1, { forceFullResolution: true });
+    expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+    await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS - 500);
+    client.tick(102);
+    client.emitCameras(listed(2));
+    /* The arm runs out inside the grace, so the recorder starts on a new clock base. */
+    await vi.advanceTimersByTimeAsync(500);
+    expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+    client.tick(104);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const handle = ctrl.fetchRecording(id)!;
+    expect(handle.endedBy).toBe("camera-gone");
+    expect(ended.map((e) => e.endedBy)).toEqual(["camera-gone"]);
+    const ts = handle.utSamples.map((s) => s.t);
+    expect(ts).toEqual([...ts].sort((a, b) => a - b));
+    expect(handle.utEnd).toBeGreaterThanOrEqual(handle.utStart!);
+    expect(handle.utStart).toBe(102);
+    expect(handle.utEnd).toBe(104);
+  });
+
+  it("gives a camera still missing after a reconnect a fresh grace, then ends it", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(2));
+    client.setState("reconnecting");
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS * 2);
+    expect(ctrl.isRecording(1)).toBe(true);
+    client.setState("connected");
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("camera-gone");
+  });
+
+  it("does not end a recording stopped during the grace a second time", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.emitCameras(listed(2));
+    const handle = await ctrl.stopRecording(id);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS * 2);
+    expect(handle.endedBy).toBe("user");
+    expect(ended.map((e) => e.endedBy)).toEqual(["user"]);
+  });
+
+  it("marks a clip stopped by a call as ended by the user and one that ran out as max-duration", async () => {
+    vi.useFakeTimers();
+    const a = ctrl.startRecording(1);
+    const b = ctrl.startRecording(2, { maxDurationMs: 1000 });
+    expect((await ctrl.stopRecording(a)).endedBy).toBe("user");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ctrl.fetchRecording(b)?.endedBy).toBe("max-duration");
+    expect(ended.map((e) => e.endedBy)).toEqual(["user", "max-duration"]);
+  });
+
+  it("waits a short grace for a feed that leaves while connected, then saves it as feed-closed", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    const cam = client.camera(1);
+
+    cam.setSource(false);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS - 1);
+    cam.setSource(true);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS * 2);
+    expect(ctrl.isRecording(1)).toBe(true);
+
+    cam.setSource(false);
+    await vi.advanceTimersByTimeAsync(SOURCE_LOST_GRACE_MS);
+    expect(ctrl.isRecording(1)).toBe(false);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("feed-closed");
+  });
+
+  it("keeps recording through a reconnect that brings the feed back in time", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    const cam = client.camera(1);
+
+    /* The watchdog tears the feeds down before the state says so. */
+    cam.setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(1500);
+    client.setState("connected");
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(ctrl.isRecording(1)).toBe(true);
+    cam.setSource(true);
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS);
+    expect(ctrl.isRecording(1)).toBe(true);
+  });
+
+  it("saves the clip as disconnected when the client does not come back", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.setState("disconnected");
+    client.camera(1).setSource(false);
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ctrl.isRecording(1)).toBe(false);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+  });
+
+  it("counts the reconnect grace from when the sidecar was last heard from", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    /* The drop is only noticed now, by a watchdog. */
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS - 15_000 - 1);
+    expect(ctrl.isRecording(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+  });
+
+  it("ends at once as disconnected when a paused page wakes long after the sidecar went quiet", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    vi.setSystemTime(Date.now() + 75_000);
+
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.isRecording(1)).toBe(false);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+    expect(ended.map((e) => e.endedBy)).toEqual(["disconnected"]);
+  });
+
+  it("ends as disconnected when the feed returns after the grace before its timer could run", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    client.setState("disconnected");
+    client.camera(1).setSource(false);
+
+    /* The page sleeps: the clock moves on and no timer runs. */
+    vi.setSystemTime(Date.now() + RECONNECT_GRACE_MS + 5_000);
+    client.setState("connected");
+    client.camera(1).setSource(true);
+    expect(ctrl.getSnapshot().active.map((a) => a.stopping)).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+  });
+
+  it("keeps recording through a drop found by the ping watchdog that reconnects in time", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    client.lastContactAt = Date.now();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(2_500);
+    client.setState("connected");
+    client.camera(1).setSource(true);
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS * 2);
+    expect(ctrl.isRecording(1)).toBe(true);
+    expect(ended).toEqual([]);
+  });
+
+  it("ends as disconnected when a paused page is handed held-back messages before its watchdog runs", async () => {
+    vi.useFakeTimers();
+    const id = ctrl.startRecording(1);
+    const quietFrom = Date.now();
+    client.lastContactAt = quietFrom;
+    vi.setSystemTime(quietFrom + 75_000);
+
+    /* The burst of stale messages comes first and says the client was heard from just now. */
+    client.emitGap({ from: quietFrom, to: Date.now() });
+    expect(ctrl.getSnapshot().active.map((a) => a.stopping)).toEqual([true]);
+
+    /* Then the watchdog finds the dead connection. */
+    client.camera(1).setSource(false);
+    client.setState("disconnected");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.fetchRecording(id)?.endedBy).toBe("disconnected");
+    expect(ended.map((e) => e.endedBy)).toEqual(["disconnected"]);
+  });
+
+  it("keeps recording through a silence shorter than the grace", async () => {
+    vi.useFakeTimers();
+    ctrl.startRecording(1);
+    const quietFrom = Date.now();
+    client.emitGap({ from: quietFrom, to: quietFrom + RECONNECT_GRACE_MS - 1 });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ctrl.isRecording(1)).toBe(true);
+  });
+
+  it("finishes a REC+ group as disconnected when the connection does not come back", async () => {
+    vi.useFakeTimers();
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.lastContactAt = Date.now();
+    client.setState("disconnected");
+    client.camera(1).setSource(false);
+    client.camera(2).setSource(false);
+    await vi.advanceTimersByTimeAsync(RECONNECT_GRACE_MS + 500);
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => r.recordingId)).toEqual(recordingIds);
+    expect(group.recordings.every((r) => r.endedBy === "disconnected")).toBe(true);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+    expect(ended.map((e) => [e.groupId, e.endedBy])).toEqual([
+      [groupId, "disconnected"],
+      [groupId, "disconnected"],
+    ]);
+  });
+
+  it("saves an arrival-timed clip whose MediaRecorder the browser stopped, and a later stop returns it", async () => {
+    const original = (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+    (globalThis as { MediaRecorder?: unknown }).MediaRecorder = EndableRecorder;
+    try {
+      const id = ctrl.startRecording(1);
+      EndableRecorder.last!.endByItself();
+      await flush();
+
+      const handle = ctrl.fetchRecording(id)!;
+      expect(handle.byteSize).toBeGreaterThan(0);
+      expect(handle.endedBy).toBe("feed-closed");
+      await expect(ctrl.stopRecording(id)).resolves.toBe(handle);
+    } finally {
+      (globalThis as { MediaRecorder?: unknown }).MediaRecorder = original;
+    }
+  });
+
+  it("finishes a REC+ group whose cameras all went away in one scene change", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.captureUt = 110;
+    client.emitCameras([]);
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => r.recordingId)).toEqual(recordingIds);
+    expect(group.recordings.every((r) => r.endedBy === "camera-gone" && r.byteSize > 0)).toBe(true);
+    expect(ctrl.getSnapshot().groups).toEqual([group]);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+    expect(ended.map((e) => e.groupId)).toEqual([groupId, groupId]);
+    /* A user stop that arrives afterwards gets the same set. */
+    await expect(ctrl.stopGroupedRecording(groupId)).resolves.toBe(group);
+  });
+
+  it("finishes a REC+ group on a revert, every member on the old epoch's window", async () => {
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.tick(105);
+    client.tick(30, 1);
+    await flush();
+    await flush();
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => [r.recordingId, r.endedBy])).toEqual([
+      [recordingIds[0], "camera-gone"],
+      [recordingIds[1], "camera-gone"],
+    ]);
+    expect(group.commonUtWindow).toEqual([100, 105]);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+  });
+
+  it("finishes a REC+ group on a revert after one member already went", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.tick(105);
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    client.tick(110);
+    client.tick(30, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const group = ctrl.fetchGroupedRecording(groupId)!;
+    expect(group.recordings.map((r) => [r.recordingId, r.endedBy, r.utEnd])).toEqual([
+      [recordingIds[0], "camera-gone", 105],
+      [recordingIds[1], "camera-gone", 110],
+    ]);
+    /* Neither ran to a stop, so the window is the span both cover, all of it before the revert. */
+    expect(group.commonUtWindow).toEqual([100, 105]);
+    expect(ctrl.getSnapshot().active).toEqual([]);
+  });
+
+  it("keeps a REC+ group recording when one camera goes, and does not cut the others to its end", async () => {
+    vi.useFakeTimers();
+    client.captureUt = 100;
+    const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2]);
+    client.captureUt = 105;
+    client.emitCameras(listed(2));
+    await vi.advanceTimersByTimeAsync(CAMERA_UNLISTED_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctrl.fetchGroupedRecording(groupId)).toBeUndefined();
+    expect(ctrl.isRecording(2)).toBe(true);
+
+    client.captureUt = 120;
+    const group = await ctrl.stopGroupedRecording(groupId);
+    expect(group.recordings.map((r) => [r.recordingId, r.endedBy])).toEqual([
+      [recordingIds[0], "camera-gone"],
+      [recordingIds[1], "user"],
+    ]);
+    expect(group.commonUtWindow).toEqual([100, 120]);
   });
 });
 

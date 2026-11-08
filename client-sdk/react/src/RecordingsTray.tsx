@@ -22,7 +22,11 @@
  * camera registry; omit it for a plain "Camera <flightId>" fallback.
  */
 
-import type { GroupedRecordingHandle, RecordingHandle } from "@ksp-gonogo/kerbcast";
+import type {
+  GroupedRecordingHandle,
+  RecordingEndReason,
+  RecordingHandle,
+} from "@ksp-gonogo/kerbcast";
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import styled from "styled-components";
 import { useRecordings } from "./hooks/useRecordings";
@@ -123,6 +127,9 @@ function ClipRow({ rec, label, url, onDiscard }: ClipRowProps) {
         <ClipDetail>
           {formatDuration(rec.durationMs)} &middot; {formatBytes(rec.byteSize)}
         </ClipDetail>
+        {rec.endedBy && recordingEndNote(rec.endedBy) && (
+          <ClipDetail>{recordingEndNote(rec.endedBy)}</ClipDetail>
+        )}
       </ClipMeta>
       <ClipActions>
         {url && (
@@ -241,6 +248,23 @@ function useClipObjectUrls(clips: RecordingHandle[]): Map<string, string> {
    in-game calendar breakdown, which needs the epoch this component doesn't have. */
 function formatUt(ut: number): string {
   return `T+${Math.round(ut)}s`;
+}
+
+/**
+ * A short line saying why a recording stopped on its own, or null for one a
+ * person stopped or that ran its set length.
+ */
+export function recordingEndNote(endedBy: RecordingEndReason): string | null {
+  switch (endedBy) {
+    case "camera-gone":
+      return "Stopped: the camera went away";
+    case "feed-closed":
+      return "Stopped: its feed was closed";
+    case "disconnected":
+      return "Stopped: the connection was lost";
+    default:
+      return null;
+  }
 }
 
 function formatDuration(ms: number): string {

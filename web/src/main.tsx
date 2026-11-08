@@ -17,7 +17,13 @@ async function bootstrap() {
     const host = location.hostname;
     const port = location.port ? Number(location.port) : 8088;
     client = new KerbcastClient(
-      { host, port, recording: { loadTrimmer: loadLocalMediabunnyTrimmer } },
+      {
+        host,
+        port,
+        /* REC keeps the game's frame timing through network stalls. */
+        recordingTiming: "capture",
+        recording: { loadTrimmer: loadLocalMediabunnyTrimmer },
+      },
       new BrowserKerbcastTransport(),
     );
   }
