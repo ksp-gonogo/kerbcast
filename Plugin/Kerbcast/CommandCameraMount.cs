@@ -40,8 +40,9 @@ namespace Kerbcast
         public IZoomCapability Zoom => null;
         public IPanCapability Pan => null;
 
-        /* The tracked craft. Followed live, so the feed survives vessel switches. */
-        public Vessel Vessel => FlightGlobals.ActiveVessel;
+        /* The tracked craft. Followed live, so the feed survives vessel switches.
+           Null while the flight scene unloads, when FlightGlobals is already gone. */
+        public Vessel Vessel => FlightGlobals.fetch != null ? FlightGlobals.ActiveVessel : null;
 
         public string PartName => "kerbcast.commandCamera";
         public string PartTitle => "Command camera";
