@@ -812,6 +812,27 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(mask.Blocks(relS, Toward(relS, -1), axis), "station: on the ground, a craft 1 degree down is hidden");
 }
 
+// A lens's depth under the atmosphere's surface, from metres rather than rounded scaled positions.
+{
+    double k = 6000, pRadius = 100, lensM = R + 95;
+    Check(Near(CommandCameraMath.LensDepthM(lensM, pRadius, k), -95, 1e-6), "lens depth: 95 m up is 95 m above the surface");
+    Check(Near(CommandCameraMath.LensDepthM(R - 10, pRadius, k), 10, 1e-6), "lens depth: 10 m down is 10 m under it");
+
+    /* Kerbin 1.7e6 scaled units from the origin (the active craft at Duna): float positions are 0.125 units (750 m) apart there. */
+    var bodyAt = new DVec3(1.7e6, 2.1e5, -3.3e5);
+    double worst = 0;
+    for (int i = 0; i < 64; i++)
+    {
+        double a = i * 0.1, b = i * 0.37;
+        var dir = new DVec3(Math.Cos(a) * Math.Cos(b), Math.Sin(b), Math.Sin(a) * Math.Cos(b));
+        var cam = bodyAt + dir * (lensM / k);
+        float dx = (float)cam.X - (float)bodyAt.X, dy = (float)cam.Y - (float)bodyAt.Y, dz = (float)cam.Z - (float)bodyAt.Z;
+        double floatDepth = (pRadius - Math.Sqrt(dx * dx + dy * dy + dz * dz)) * k;
+        worst = Math.Max(worst, Math.Abs(floatDepth - -95));
+    }
+    Check(worst > 95, $"lens depth: read from float scaled positions it can be off by more than the lens's height ({worst:F0} m)");
+}
+
 // Scaled mesh occluder on an icosphere.
 {
     var (verts, tris) = Icosphere(4, 1.0);

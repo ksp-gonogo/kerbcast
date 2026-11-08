@@ -488,6 +488,10 @@ namespace Kerbcast
         public static double StationAltitude(double storedAlt, double groundAlt) =>
             double.IsNaN(groundAlt) || storedAlt >= groundAlt ? storedAlt : groundAlt;
 
+        /* How far a lens `lensFromCentreM` metres from a body's centre is under the atmosphere shader's surface, `surfaceUnits` scaled units at `metresPerUnit`; negative above it. */
+        public static double LensDepthM(double lensFromCentreM, double surfaceUnits, double metresPerUnit) =>
+            surfaceUnits * metresPerUnit - lensFromCentreM;
+
         /* KSP's CelestialBody.GetWorldSurfacePosition, reproduced: the body-local
            spherical vector (z up) scaled to radius + alt, rotated by the body
            frame's axes (given in KSP's z-up world), swizzled to Unity's y-up
