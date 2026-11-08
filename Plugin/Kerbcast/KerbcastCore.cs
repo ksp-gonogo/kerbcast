@@ -94,6 +94,12 @@ namespace Kerbcast
         private bool _disabled;
         private float _statusCooldown;
         private const float StatusWriteIntervalSeconds = 1.0f;
+        /* The ground stations change only with the game's settings or mods, so they are read every few seconds and written when they differ. */
+        private string _sitesPath;
+        private string _sitesWritten;
+        private float _sitesCooldown;
+        private const float SitesReadIntervalSeconds = 5.0f;
+        private readonly List<GroundStation> _stations = new List<GroundStation>();
 
         /* Control file (sidecar -> plugin). Polled ~1Hz with its own cooldown. */
         private string _controlPath;
@@ -326,6 +332,7 @@ namespace Kerbcast
                 if (swept > 0 || skipped > 0)
                     Debug.Log($"[Kerbcast] swept {swept} stale camera file(s) left by an earlier flight, skipped {skipped} in use");
                 _statusPath = Path.Combine(RingDir, "global.status.json");
+                _sitesPath = Path.Combine(RingDir, GroundStationList.FileName);
                 _controlPath = Path.Combine(RingDir, "global.control.json");
                 _commandsPath = Path.Combine(RingDir, CommandsFileName);
                 _commandsSignalPath = Path.Combine(RingDir, CommandsSignalFileName);
@@ -1166,6 +1173,7 @@ namespace Kerbcast
 
             MaybeApplyGlobalControl();
             MaybeWriteStatusFile();
+            MaybeWriteSitesFile();
         }
 
         private bool RankReady(int rank) => _cameras[_subscribedIdx[rank]].ReadyToCapture;
@@ -1615,6 +1623,30 @@ namespace Kerbcast
             catch (Exception ex)
             {
                 Debug.LogWarning($"[Kerbcast] status file write failed: {ex.Message}");
+            }
+        }
+
+        private void MaybeWriteSitesFile()
+        {
+            if (_sitesPath == null) return;
+            _sitesCooldown -= Time.unscaledDeltaTime;
+            if (_sitesCooldown > 0f) return;
+            _sitesCooldown = SitesReadIntervalSeconds;
+            try
+            {
+                CommandCameraSite.GroundStations(_stations);
+                string json = GroundStationList.Json(_stations);
+                if (json == _sitesWritten) return;
+                var tmp = _sitesPath + ".tmp";
+                File.WriteAllText(tmp, json);
+                if (File.Exists(_sitesPath)) File.Delete(_sitesPath);
+                File.Move(tmp, _sitesPath);
+                _sitesWritten = json;
+                Debug.Log($"[Kerbcast] ground stations: {_stations.Count} listed for the sidecar");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast] ground station list write failed: {ex.Message}");
             }
         }
 

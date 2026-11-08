@@ -1374,6 +1374,9 @@ async fn handle_client_message(
                 &dc,
                 &ServerMessage::SettingsState(registry.last_settings().await),
             );
+            if let Some(sites) = registry.last_sites().await {
+                send_server_message(&dc, &ServerMessage::SiteCatalog(sites));
+            }
             /* Prime scene state so a peer connecting out of flight shows the
              * standby immediately, not a stale live layout. */
             if let Some(in_flight) = registry.read_in_flight().await {

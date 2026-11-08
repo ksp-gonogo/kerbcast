@@ -198,6 +198,21 @@ VantageInput Seeing(double rangeM, double elevationDeg, double sunElevationDeg, 
     Check(inside.Index == 1, "with no view it never rides the craft it watches, even as the fallback");
 }
 
+// The ground station list the sidecar reads.
+{
+    var stations = new[]
+    {
+        new GroundStation { NodeName = "KSC", DisplayName = "Kerbal \"Space\" Center", Body = "Kerbin", BodyIndex = 1, Latitude = -0.0972, Longitude = -74.5577, Altitude = 64.8, Enabled = true },
+        new GroundStation { NodeName = "Nowhere", DisplayName = "", Body = "Kerbin", Latitude = double.NaN, Longitude = 0, Altitude = 0 },
+        new GroundStation { NodeName = "Crater Rim", DisplayName = "", Body = "Kerbin", BodyIndex = 1, Latitude = 9.4, Longitude = -172.1, Altitude = 4000, Enabled = false },
+    };
+    string json = GroundStationList.Json(stations);
+    Check(json == "{\"stations\":[{\"nodeName\":\"KSC\",\"displayName\":\"Kerbal \\\"Space\\\" Center\",\"body\":\"Kerbin\",\"latitude\":-0.0972,\"longitude\":-74.5577,\"altitude\":64.8,\"enabled\":true},"
+        + "{\"nodeName\":\"Crater Rim\",\"displayName\":\"Crater Rim\",\"body\":\"Kerbin\",\"latitude\":9.4,\"longitude\":-172.1,\"altitude\":4000,\"enabled\":false}]}\n",
+        "the station list is the sidecar's shape: escaped names, a missing name falls back to the node, an unplaceable station is left out");
+    Check(GroundStationList.Json(new GroundStation[0]) == "{\"stations\":[]}\n", "no stations is an empty list, not a missing one");
+}
+
 // The log line proves a cut from KSP.log alone.
 {
     var line = NetworkMath.CutLine(7, 1234.5, new NetworkPick { Index = 1, Reason = CutReason.Forecast }, 0,

@@ -26,6 +26,8 @@ namespace Kerbcast.Api
         Optics = 8,
         /** <summary><see cref="ICommand.CreateNetworkCamera"/>, <see cref="ICommand.SetNetworkVantages"/>, <see cref="ICommand.DestroyNetworkCamera"/> and <see cref="ICommand.NetworkStatus"/>. Added in API 1.4.</summary> */
         NetworkCameras = 9,
+        /** <summary><see cref="ICommand.GroundStations"/>. Added in API 1.5.</summary> */
+        GroundStations = 10,
     }
 
     public enum CameraKind

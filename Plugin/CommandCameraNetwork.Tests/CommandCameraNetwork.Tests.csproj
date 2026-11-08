@@ -11,5 +11,6 @@
     <Compile Include="../Kerbcast/CommandCameraNetworkMath.cs" />
     <Compile Include="../Kerbcast/CraftFixState.cs" />
     <Compile Include="../Kerbcast/OpticsModel.cs" />
+    <Compile Include="../Kerbcast/GroundStationList.cs" />
   </ItemGroup>
 </Project>

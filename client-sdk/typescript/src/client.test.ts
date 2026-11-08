@@ -3413,6 +3413,38 @@ describe("KerbcastClient.inboundVideoStats", () => {
     expect(seen).toEqual([false, true]);
   });
 
+  it("keeps the ground station list from site-catalog and emits site-catalog", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    const seen: number[] = [];
+    client.on("site-catalog", (c) => seen.push(c.stations.length));
+    await client.connect();
+    sidecar.open();
+    expect(client.siteCatalog()).toBeNull();
+    const ksc = {
+      nodeName: "KSC",
+      displayName: "Kerbal Space Center",
+      body: "Kerbin",
+      latitude: -0.0972,
+      longitude: -74.5577,
+      altitude: 64.8,
+      enabled: true,
+    };
+    sidecar.fireSiteCatalog({ stations: [ksc] });
+    expect(client.siteCatalog()?.stations[0].nodeName).toBe("KSC");
+    sidecar.fireSiteCatalog({
+      stations: [ksc, { ...ksc, nodeName: "Crater Rim", displayName: "Crater Rim", enabled: false }],
+    });
+    expect(client.siteCatalog()?.stations.map((s) => s.enabled)).toEqual([true, false]);
+    expect(seen).toEqual([1, 2]);
+  });
+
   it("keeps when the sidecar was last heard from across a disconnect", async () => {
     const sidecar = new MockSidecar();
     const client = new KerbcastClient(

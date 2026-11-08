@@ -43,6 +43,7 @@ Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(Api
     "shipped: every feature of API 1.0");
 Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.3");
 Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras, from API 1.4");
+Check(KerbcastApi.Supports(ApiFeature.GroundStations) && (int)ApiFeature.GroundStations == 10, "shipped: the ground station list, from API 1.5");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
 
 // Enum numbers are part of the contract.
@@ -217,6 +218,18 @@ using (var kc = RecordingKerbcast.Install())
         Check(status.Count == 2 && status[0].Active && !status[1].Active && status[1].Fallback && status[1].Label == "North dish",
             "NetworkStatus lists every vantage in order");
         Check(cmd.NetworkStatus(500).Count == 0, "a feed at one site has no network status");
+        Check(cmd.GroundStations().Count == 0, "no ground stations until a test sets them");
+        kc.Command.SetGroundStations(new[]
+        {
+            new GroundStationInfo { NodeName = "KSC", DisplayName = "Kerbal Space Center", BodyIndex = 1, Latitude = -0.1, Longitude = -74.6, Altitude = 70, Enabled = true },
+            new GroundStationInfo { NodeName = "Crater Rim", DisplayName = "Crater Rim", BodyIndex = 1, Latitude = 9.4, Longitude = -172.1, Altitude = 4000, Enabled = false },
+        });
+        var listed = cmd.GroundStations();
+        Check(listed.Count == 2 && listed[0].NodeName == "KSC" && listed[0].Enabled && !listed[1].Enabled && listed[1].Altitude == 4000,
+            "GroundStations lists every station set, on or off");
+        Check(cmd.CreateNetworkCamera(listed.Select(s => NetworkVantage.Station(s.NodeName)).ToList(), null, null, null, "modA", out uint fromList) == NetworkResult.Ok
+            && kc.Command.Networks[fromList].Count == 2, "a host builds a network from the list");
+        cmd.DestroyNetworkCamera(fromList, "modA");
         Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.Station("KSC"), NetworkVantage.Vessel(77) }, null, null, null, "modA", out uint mixed) == NetworkResult.Ok,
             "a network may mix stations and craft");
         var mixedStatus = cmd.NetworkStatus(mixed);

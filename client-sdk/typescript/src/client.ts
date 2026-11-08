@@ -12,6 +12,7 @@ import type {
   QualityPreset,
   ServerMessage,
   SettingsStatePayload,
+  SiteCatalogPayload,
   TrackMode,
 } from "./__generated__/types";
 import { CameraKind, CameraLifecycle, CommandAimKind, ErrorCode, ErrorSource } from "./__generated__/types";
@@ -765,6 +766,11 @@ export interface KerbcastClientEvents {
    * instead of per-camera SIGNAL LOST.
    */
   "scene-change": boolean | undefined;
+  /**
+   * Fired when a `site-catalog` message arrives: after `Hello` once the game
+   * has listed its ground stations, and whenever that list changes.
+   */
+  "site-catalog": SiteCatalogPayload;
   /**
    * Fired each time the control channel of a freshly (re)connected peer
    * opens, i.e. the earliest moment it can carry messages. Consumers that
@@ -1914,6 +1920,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private readonly commandCentres = new CommandCentreHistory();
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
+  private _siteCatalog: SiteCatalogPayload | null = null;
   private _lastContactAt: number | null = null;
   /** Client-side recording controller, lazily built on first `recording` access. */
   private _recording: RecordingController | null = null;
@@ -2141,6 +2148,15 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    */
   get inFlight(): boolean | undefined {
     return this._inFlight;
+  }
+
+  /**
+   * The ground stations a command camera can stand at, from the sidecar's
+   * `site-catalog`, switched on or not. Null until the first arrives (an
+   * older sidecar never sends one). Kept across reconnects.
+   */
+  siteCatalog(): SiteCatalogPayload | null {
+    return this._siteCatalog;
   }
 
   /**
@@ -3477,6 +3493,10 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
           handle._refreshSceneState();
         }
         this.emit("scene-change", this._inFlight);
+        break;
+      case "site-catalog":
+        this._siteCatalog = msg.content;
+        this.emit("site-catalog", msg.content);
         break;
     }
   }

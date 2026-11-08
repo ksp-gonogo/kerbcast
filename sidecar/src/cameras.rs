@@ -37,7 +37,7 @@ use crate::protocol::{
     CommandAimKind, CommandCentreInfo, CommandNetworkInfo, CommandTarget, CommandTrackState,
     CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
     ErrorCode, Layer, QualityPreset, ResumePayload, SetCommandAimPayload, SettingsStatePayload,
-    SiteKind, TrackMode,
+    SiteCatalogPayload, SiteKind, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::send_tally::SendTally;
@@ -81,6 +81,10 @@ pub fn parse_in_flight(body: &str) -> Option<bool> {
         _ => None,
     }
 }
+
+/// The ground stations the plugin lists, rewritten only when they change.
+/// Kept out of `global.status.json`, which is written every second.
+pub const SITES_FILE: &str = "global.sites.json";
 
 /// On-disk shape of `global.status.json` — the plugin → sidecar push
 /// half of the IPC. The plugin rewrites this file at ~1Hz with the
@@ -1695,6 +1699,9 @@ pub struct CameraRegistry {
     /// Last-seen value of the `global.inflight` file, cached so the consume
     /// loop broadcasts `scene-state-changed` only when the flag flips.
     last_in_flight: Mutex<Option<bool>>,
+    /// Last `global.sites.json` read, so a change is broadcast once and a
+    /// connecting peer is primed with it.
+    last_sites: Mutex<Option<SiteCatalogPayload>>,
     /// Capped ring of every distinct `global.status.json` snapshot seen
     /// since the last `reset_run_logs()`. Powers the harness's
     /// `GET /dumpLogs` endpoint so perf runs can replay the full
@@ -1897,6 +1904,7 @@ impl CameraRegistry {
             last_status: Mutex::new(None),
             background_requests: Mutex::new(std::collections::HashMap::new()),
             last_in_flight: Mutex::new(None),
+            last_sites: Mutex::new(None),
             status_log: Mutex::new(std::collections::VecDeque::new()),
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
@@ -1946,6 +1954,33 @@ impl CameraRegistry {
             return current;
         }
         None
+    }
+
+    /// Poll `global.sites.json`. Returns the catalog when it differs from
+    /// the last one read, the first read included. A missing or partial file
+    /// keeps the last catalog, since the plugin writes it only on change.
+    pub async fn poll_sites(&self) -> Option<SiteCatalogPayload> {
+        let path = self.shm_dir.join(SITES_FILE);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        let parsed: SiteCatalogPayload = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "ground station list parse failed");
+                return None;
+            }
+        };
+        let mut last = self.last_sites.lock().await;
+        if last.as_ref() == Some(&parsed) {
+            return None;
+        }
+        *last = Some(parsed.clone());
+        Some(parsed)
+    }
+
+    /// The catalog last read, to prime a connecting peer; `None` until the
+    /// plugin has listed its stations.
+    pub async fn last_sites(&self) -> Option<SiteCatalogPayload> {
+        self.last_sites.lock().await.clone()
     }
 
     /*
@@ -3996,6 +4031,56 @@ mod tests {
 
         tokio::fs::write(&path, "0").await.unwrap();
         assert_eq!(reg.poll_in_flight().await, Some(false));
+    }
+
+    /// The plugin's ground station list: broadcast on first read and on
+    /// change only, and kept through a missing or half-written file.
+    #[tokio::test]
+    async fn poll_sites_fires_only_on_change_and_keeps_the_last_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let reg = CameraRegistry::new(shm.to_path_buf());
+        let path = shm.join(SITES_FILE);
+
+        assert!(reg.poll_sites().await.is_none());
+        assert!(reg.last_sites().await.is_none());
+
+        let one = r#"{"stations":[{"nodeName":"KSC","displayName":"Kerbal Space Center","body":"Kerbin","latitude":-0.0972,"longitude":-74.5577,"altitude":64.8,"enabled":true}]}"#;
+        tokio::fs::write(&path, one).await.unwrap();
+        let first = reg.poll_sites().await.expect("first read broadcasts");
+        assert_eq!(first.stations.len(), 1);
+        assert_eq!(first.stations[0].node_name, "KSC");
+        assert!(first.stations[0].enabled);
+        assert!(
+            reg.poll_sites().await.is_none(),
+            "the same list again is not news"
+        );
+
+        tokio::fs::write(&path, "{\"stations\":[{\"nodeName\"")
+            .await
+            .unwrap();
+        assert!(
+            reg.poll_sites().await.is_none(),
+            "a partial write is skipped"
+        );
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(
+            reg.poll_sites().await.is_none(),
+            "a missing file is skipped"
+        );
+        assert_eq!(
+            reg.last_sites().await,
+            Some(first.clone()),
+            "and the last list stays for new peers"
+        );
+
+        let off = one.replace("\"enabled\":true", "\"enabled\":false");
+        tokio::fs::write(&path, off).await.unwrap();
+        let changed = reg
+            .poll_sites()
+            .await
+            .expect("a station switched off is news");
+        assert!(!changed.stations[0].enabled);
     }
 
     /// A status write whose `captureUt` advanced produces a `settings`

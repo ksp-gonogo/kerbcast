@@ -21,6 +21,7 @@ namespace Kerbcast.Api.Testing
         readonly Dictionary<uint, List<NetworkVantage>> networks = new Dictionary<uint, List<NetworkVantage>>();
         readonly Dictionary<uint, NetworkOptions> networkOptions = new Dictionary<uint, NetworkOptions>();
         readonly Dictionary<uint, List<NetworkVantageStatus>> networkStatus = new Dictionary<uint, List<NetworkVantageStatus>>();
+        readonly List<GroundStationInfo> stations = new List<GroundStationInfo>();
         uint nextNetworkId = 0x4E000001;
         readonly List<PublishedSnapshot> published = new List<PublishedSnapshot>();
         string lockOwner;
@@ -92,6 +93,13 @@ namespace Kerbcast.Api.Testing
          */
         public void SetNetworkStatus(uint flightId, IEnumerable<NetworkVantageStatus> status) =>
             networkStatus[flightId] = new List<NetworkVantageStatus>(status ?? new NetworkVantageStatus[0]);
+
+        /** <summary>What GroundStations returns: none until a test sets them.</summary> */
+        public void SetGroundStations(IEnumerable<GroundStationInfo> list)
+        {
+            stations.Clear();
+            if (list != null) stations.AddRange(list);
+        }
 
         /** <summary>Every accepted snapshot, oldest first, from any thread.</summary> */
         public IReadOnlyList<PublishedSnapshot> Published
@@ -515,6 +523,16 @@ namespace Kerbcast.Api.Testing
                 var c = Copy(f);
                 c.Scope = bound != null && c.SiteKey != null && bound.TryGetValue(c.SiteKey, out var scope) ? scope : null;
                 return c;
+            });
+        }
+
+        public IReadOnlyList<GroundStationInfo> GroundStations()
+        {
+            kc.Enter("GroundStations", ApiFeature.GroundStations);
+            return stations.ConvertAll(s => new GroundStationInfo
+            {
+                NodeName = s.NodeName, DisplayName = s.DisplayName, BodyIndex = s.BodyIndex, Latitude = s.Latitude,
+                Longitude = s.Longitude, Altitude = s.Altitude, Enabled = s.Enabled,
             });
         }
 

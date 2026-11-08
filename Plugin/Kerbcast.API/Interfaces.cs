@@ -206,6 +206,15 @@ namespace Kerbcast.Api
         /** <summary>Every vantage of a network camera as its last pass scored them, in list order; empty when it is no network camera or not built yet.</summary> */
         IReadOnlyList<NetworkVantageStatus> NetworkStatus(uint flightId);
 
+        /**
+         * <summary>
+         * Every ground station in the scene a command camera can stand at, once per node name, switched on or not, so
+         * a host can build its own vantage list. Check <see cref="KerbcastApi.Supports"/> with
+         * <see cref="ApiFeature.GroundStations"/> first.
+         * </summary>
+         */
+        IReadOnlyList<GroundStationInfo> GroundStations();
+
         /** <summary>Every craft a command feed could watch, empty when it is not a command feed.</summary> */
         IReadOnlyList<CommandTarget> Targets(uint flightId);
 

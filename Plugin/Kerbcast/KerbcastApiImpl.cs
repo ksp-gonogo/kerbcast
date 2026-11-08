@@ -270,6 +270,26 @@ namespace Kerbcast
             return result;
         }
 
+        public IReadOnlyList<GroundStationInfo> GroundStations()
+        {
+            Enter(nameof(GroundStations), ApiFeature.GroundStations);
+            var stations = new List<GroundStation>();
+            CommandCameraSite.GroundStations(stations);
+            var result = new List<GroundStationInfo>(stations.Count);
+            foreach (var s in stations)
+                result.Add(new GroundStationInfo
+                {
+                    NodeName = s.NodeName,
+                    DisplayName = s.DisplayName,
+                    BodyIndex = s.BodyIndex,
+                    Latitude = s.Latitude,
+                    Longitude = s.Longitude,
+                    Altitude = s.Altitude,
+                    Enabled = s.Enabled,
+                });
+            return result;
+        }
+
         /* A refusal found before the lock is checked still answers the lock first, as SetAim does: the holder's call is a heartbeat, anyone else's is NotLockHolder. */
         static NetworkResult Refuse(NetworkResult why, string owner)
         {

@@ -1,4 +1,4 @@
-import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
+import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload, SiteCatalogPayload } from "../__generated__/types";
 import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, SiteKind, TrackMode } from "../__generated__/types";
 import type { CreateCommandCameraPayload } from "../__generated__/types";
 import type {
@@ -446,6 +446,11 @@ export class MockSidecar {
   }
 
   private readonly _anchors = new Map<number, Anchor[]>();
+
+  /** Push a `site-catalog` message: the ground stations the game lists. */
+  fireSiteCatalog(payload: SiteCatalogPayload): void {
+    this._sendToClient({ type: "site-catalog", content: payload });
+  }
 
   /** Push a `scene-state-changed` event to the client (flight scene or not). */
   fireSceneState(inFlight: boolean): void {

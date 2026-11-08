@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using CommNet;
 using UnityEngine;
@@ -273,7 +274,7 @@ namespace Kerbcast
             !double.IsNaN(lat) && !double.IsNaN(lon)
             && !(Math.Abs(lat) < 1e-6 && Math.Abs(lon) < 1e-6);
 
-        private static CommandCameraSite FromHome(CommNetHome home, double altitudeOffset)
+        private static CommandCameraSite FromHome(CommNetHome home, double altitudeOffset, bool quiet = false)
         {
             var body = Read<CelestialBody>(BodyField, home)
                 ?? home.GetComponentInParent<CelestialBody>()
@@ -293,7 +294,7 @@ namespace Kerbcast
                 return new CommandCameraSite
                 {
                     NodeName = node, DisplayName = display, Body = body,
-                    Latitude = lat, Longitude = lon, Altitude = OnGround(body, node, lat, lon, alt) + altitudeOffset,
+                    Latitude = lat, Longitude = lon, Altitude = OnGround(body, node, lat, lon, alt, quiet) + altitudeOffset,
                     IsHome = home.isKSC, Source = "commnet-fields",
                     IsCommNetHome = true, StationIsKsc = home.isKSC, StationIsPermanent = home.isPermanent,
                 };
@@ -310,7 +311,7 @@ namespace Kerbcast
                     return new CommandCameraSite
                     {
                         NodeName = node, DisplayName = display, Body = body,
-                        Latitude = tlat, Longitude = tlon, Altitude = OnGround(body, node, tlat, tlon, talt) + altitudeOffset,
+                        Latitude = tlat, Longitude = tlon, Altitude = OnGround(body, node, tlat, tlon, talt, quiet) + altitudeOffset,
                         IsHome = home.isKSC, Source = "commnet-transform",
                         IsCommNetHome = true, StationIsKsc = home.isKSC, StationIsPermanent = home.isPermanent,
                     };
@@ -320,7 +321,7 @@ namespace Kerbcast
         }
 
         /* A home's altitude replaced by the ground at its coordinates (the sea over water); the stored one is kept only when no terrain can be read. */
-        private static double OnGround(CelestialBody body, string node, double lat, double lon, double alt)
+        private static double OnGround(CelestialBody body, string node, double lat, double lon, double alt, bool quiet)
         {
             double ground = double.NaN;
             if (body.pqsController != null)
@@ -330,7 +331,7 @@ namespace Kerbcast
                 if (body.ocean && ground < 0) ground = 0;
             }
             double placed = CommandCameraMath.StationGroundAltitude(alt, ground);
-            if (Math.Abs(placed - alt) > 1)
+            if (!quiet && Math.Abs(placed - alt) > 1)
                 Debug.Log($"[Kerbcast][CMDCAM] station '{node}' stored altitude {alt:F1}m differs from the ground there ({ground:F1}m); "
                     + "the lens stands on the ground");
             return placed;
@@ -368,6 +369,44 @@ namespace Kerbcast
                 if (h != null && string.Equals(h.nodeName, nodeName, StringComparison.Ordinal))
                     return FromHome(h, height);
             return null;
+        }
+
+        /*
+         * Every ground station in the scene that can be placed, once per node
+         * name as ResolveStation finds them, standing on the ground, with
+         * whether the game has it switched on.
+         */
+        public static void GroundStations(List<GroundStation> into)
+        {
+            into.Clear();
+            CommNetHome[] homes;
+            try { homes = UnityEngine.Object.FindObjectsOfType<CommNetHome>(); }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] CommNetHome scan failed: {ex.Message}");
+                return;
+            }
+            var rules = GameStationRules.Now();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var h in homes)
+            {
+                if (h == null || string.IsNullOrEmpty(h.nodeName) || !seen.Add(h.nodeName)) continue;
+                CommandCameraSite site;
+                try { site = FromHome(h, 0, quiet: true); }
+                catch (Exception) { continue; }
+                if (site == null) continue;
+                into.Add(new GroundStation
+                {
+                    NodeName = site.NodeName,
+                    DisplayName = site.DisplayName,
+                    Body = site.Body.bodyName,
+                    BodyIndex = site.Body.flightGlobalsIndex,
+                    Latitude = site.Latitude,
+                    Longitude = site.Longitude,
+                    Altitude = site.Altitude,
+                    Enabled = site.StationEnabled(rules),
+                });
+            }
         }
 
         /*

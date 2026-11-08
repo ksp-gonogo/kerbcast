@@ -93,6 +93,30 @@ namespace Kerbcast.Api
         }
     }
 
+    /** <summary>One ground station a command camera can stand at, from <see cref="ICommand.GroundStations"/>.</summary> */
+    public sealed class GroundStationInfo
+    {
+        /** <summary>The station's CommNet node name: the key <see cref="NetworkVantage.Station"/> takes, and its site key.</summary> */
+        public string NodeName { get; set; }
+
+        /** <summary>The name the game shows for it.</summary> */
+        public string DisplayName { get; set; }
+
+        /** <summary>The body it stands on, as KSP's flightGlobalsIndex.</summary> */
+        public int BodyIndex { get; set; }
+
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+
+        /** <summary>Metres above sea level of the ground (or the sea) at the station, which a station vantage's height is added to.</summary> */
+        public double Altitude { get; set; }
+
+        /** <summary>The game has the station switched on. A vantage at one switched off reads "disabled".</summary> */
+        public bool Enabled { get; set; }
+
+        public override string ToString() => $"GroundStation({NodeName} '{DisplayName}' body {BodyIndex} {Latitude}, {Longitude}, {Altitude} m{(Enabled ? "" : " off")})";
+    }
+
     /** <summary>How a tracking network holds after a cut. Every value finite and 0 or more.</summary> */
     public sealed class NetworkOptions
     {

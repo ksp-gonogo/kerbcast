@@ -418,6 +418,10 @@ async fn consume_loop(
             {
                 broadcast_status_delta(&peers, delta).await;
             }
+            if let Some(sites) = registry.poll_sites().await {
+                let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+                broadcast(&snapshot, &ServerMessage::SiteCatalog(sites)).await;
+            }
             // Scene state lives in a separate host-written file (outlives the
             // flight-only status writer). Broadcast only when the flag flips.
             let mut left_flight = false;

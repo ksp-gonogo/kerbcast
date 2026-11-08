@@ -780,6 +780,28 @@ export interface CameraStateChangedPayload {
 	state: CameraState;
 }
 
+/** One ground station a command camera can stand at, as the game has it. */
+export interface CatalogStation {
+	/**
+	 * The CommNet node name: the key a `station` vantage takes, and the
+	 * camera's `siteKey` while it stands there.
+	 */
+	nodeName: string;
+	/** The name the game shows for it. */
+	displayName: string;
+	/** The body it stands on, by name. */
+	body: string;
+	latitude: number;
+	longitude: number;
+	/** Metres above sea level of the ground (or the sea) at the station. */
+	altitude: number;
+	/**
+	 * The game has the station switched on. A vantage at one switched off
+	 * reads `disabled`.
+	 */
+	enabled: boolean;
+}
+
 /**
  * Where a command camera points. `kind` says which fields apply. With no
  * subject (`surface`, `direction`, or `orbit` and `positionAt` without
@@ -1513,6 +1535,15 @@ export interface SettingsStatePayload {
 }
 
 /**
+ * The places a command camera can stand, as the game has them now. Sent
+ * after `Hello` once the plugin has listed them, and again whenever the
+ * list changes (a game setting or a mod adding or removing stations).
+ */
+export interface SiteCatalogPayload {
+	stations?: CatalogStation[];
+}
+
+/**
  * Slot↔camera assignment for the dynamic-subscription model. The sidecar
  * negotiates a pool of recv-only video transceivers up front; `Subscribe`
  * binds a camera to a free one and the sidecar announces the binding here.
@@ -1798,5 +1829,10 @@ export type ServerMessage =
 	 * its RTP timestamp. One per frame per track, only to a peer that
 	 * enabled them with `SetFrameStamps`.
 	 */
-	| { type: "frame-stamp", content: FrameStampPayload };
+	| { type: "frame-stamp", content: FrameStampPayload }
+	/**
+	 * The ground stations a command camera can stand at. Sent after
+	 * `Hello` once known, and whenever the list changes.
+	 */
+	| { type: "site-catalog", content: SiteCatalogPayload };
 

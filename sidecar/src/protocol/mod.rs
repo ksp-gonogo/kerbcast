@@ -1485,6 +1485,38 @@ pub struct AdaptiveShedPayload {
     pub reason: String,
 }
 
+/// One ground station a command camera can stand at, as the game has it.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStation {
+    /// The CommNet node name: the key a `station` vantage takes, and the
+    /// camera's `siteKey` while it stands there.
+    pub node_name: String,
+    /// The name the game shows for it.
+    pub display_name: String,
+    /// The body it stands on, by name.
+    pub body: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Metres above sea level of the ground (or the sea) at the station.
+    pub altitude: f64,
+    /// The game has the station switched on. A vantage at one switched off
+    /// reads `disabled`.
+    pub enabled: bool,
+}
+
+/// The places a command camera can stand, as the game has them now. Sent
+/// after `Hello` once the plugin has listed them, and again whenever the
+/// list changes (a game setting or a mod adding or removing stations).
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteCatalogPayload {
+    #[serde(default)]
+    pub stations: Vec<CatalogStation>,
+}
+
 /// Scene-state change: whether KSP is currently in a flight scene. Sent
 /// after `Hello` (priming) and whenever the polled in-flight flag flips,
 /// so clients can show a calm out-of-flight standby instead of per-camera
@@ -1865,11 +1897,33 @@ pub enum ServerMessage {
     /// its RTP timestamp. One per frame per track, only to a peer that
     /// enabled them with `SetFrameStamps`.
     FrameStamp(FrameStampPayload),
+    /// The ground stations a command camera can stand at. Sent after
+    /// `Hello` once known, and whenever the list changes.
+    SiteCatalog(SiteCatalogPayload),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_catalog_serialises_for_the_sdk() {
+        let msg = ServerMessage::SiteCatalog(SiteCatalogPayload {
+            stations: vec![CatalogStation {
+                node_name: "Crater Rim".into(),
+                display_name: "Crater Rim".into(),
+                body: "Kerbin".into(),
+                latitude: 9.5,
+                longitude: -172.25,
+                altitude: 4000.0,
+                enabled: false,
+            }],
+        });
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"site-catalog","content":{"stations":[{"nodeName":"Crater Rim","displayName":"Crater Rim","body":"Kerbin","latitude":9.5,"longitude":-172.25,"altitude":4000.0,"enabled":false}]}}"#
+        );
+    }
 
     #[test]
     fn frame_stamp_serialises_camel_case() {
