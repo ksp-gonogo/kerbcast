@@ -782,11 +782,13 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         $"mask: out of budget, the sea-level skyline stands in and nothing is kept (got {fb:G6}, dip {dip:G6})");
 }
 
-// A station whose stored altitude is under its own ground stands on the ground.
+// A station stands on its own ground, whatever altitude the game stored.
 {
-    Check(CommandCameraMath.StationAltitude(-230, 64.8) == 64.8, "station: an altitude under the ground is raised to it");
-    Check(CommandCameraMath.StationAltitude(100, 64.8) == 100, "station: an altitude over the ground is kept");
-    Check(CommandCameraMath.StationAltitude(-230, double.NaN) == -230, "station: no ground to read keeps the stored altitude");
+    Check(CommandCameraMath.StationGroundAltitude(-230, 64.8) == 64.8, "station: an altitude under the ground is raised to it");
+    Check(CommandCameraMath.StationGroundAltitude(620, 64.8) == 64.8, "station: an altitude far over the ground (the 620 m Duna case) comes down to it");
+    Check(CommandCameraMath.StationGroundAltitude(-230, double.NaN) == -230, "station: no ground to read keeps the stored altitude");
+    Check(CommandCameraMath.StationGroundAltitude(620, double.NaN) == 620, "station: no ground to read keeps a high stored altitude too");
+    Check(CommandCameraMath.StationGroundAltitude(35, 0) == 0, "station: over the sea the clamped sea surface is used");
 
     /* The Deck: KSC's home read -230 m with Kerbin's terrain unloaded, the lens 30 m over that, ground 64.8 m. A craft 77 degrees up was hidden by the lens's own skyline. */
     double seaR = 600000, rMax = 606800, ground = 64.8, offset = 30;
@@ -804,7 +806,7 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     double wall = buriedMask.MaskAt(1.0, 0.2, bu, bn, be) * 180 / Math.PI;
     Check(Near(wall, 85.68, 0.05), $"station: the buried skyline stands where the Deck's occlusion cleared, 85.68 degrees (got {wall:F2})");
 
-    double placed = seaR + CommandCameraMath.StationAltitude(-230, ground) + offset;
+    double placed = seaR + CommandCameraMath.StationGroundAltitude(-230, ground) + offset;
     var relS = new DVec3(placed, 0, 0);
     var mask = new HorizonMask(placed, seaR, rMax, 0.25, flat);
     Check(!mask.Blocks(relS, Toward(relS, 77), axis), "station: on the ground, a craft 77 degrees up is clear");

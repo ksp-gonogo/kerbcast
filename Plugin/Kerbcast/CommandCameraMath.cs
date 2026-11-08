@@ -478,15 +478,16 @@ namespace Kerbcast
         public const double SplitOffRatio = 1.5;
 
         /*
-         * A ground station's altitude, never under the ground at its own
-         * coordinates. Stock reads a home's altitude from its building's
-         * transform when the network starts, and with the body's terrain
-         * unloaded that transform can sit hundreds of metres down, which
-         * puts the lens inside a wall of its own skyline. A NaN ground (no
-         * terrain to read) leaves the stored altitude as it is.
+         * A ground station's altitude: the ground at its own coordinates (the
+         * sea surface over water), whatever the game stored. Stock reads a
+         * home's altitude from its building's transform when the network
+         * starts, and with the body's terrain unloaded that value is wrong in
+         * both directions: hundreds of metres down puts the lens inside a wall
+         * of its own skyline, hundreds up leaves it floating. A NaN ground (no
+         * terrain to read) keeps the stored altitude.
          */
-        public static double StationAltitude(double storedAlt, double groundAlt) =>
-            double.IsNaN(groundAlt) || storedAlt >= groundAlt ? storedAlt : groundAlt;
+        public static double StationGroundAltitude(double storedAlt, double groundAlt) =>
+            double.IsNaN(groundAlt) ? storedAlt : groundAlt;
 
         /* How far a lens `lensFromCentreM` metres from a body's centre is under the atmosphere shader's surface, `surfaceUnits` scaled units at `metresPerUnit`; negative above it. */
         public static double LensDepthM(double lensFromCentreM, double surfaceUnits, double metresPerUnit) =>
