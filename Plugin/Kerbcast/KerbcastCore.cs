@@ -56,8 +56,8 @@ namespace Kerbcast
         private static readonly string RingDir = ResolveRingDir();
 
         /* Live singleton for the flight scene, set in Awake / cleared in
-           OnDestroy. The in-process KerbcastControl facade (used by the
-           kOS add-on) resolves cameras through this. */
+           OnDestroy. Kerbcast.API's implementation resolves cameras through
+           this, and is KerbcastApi.Instance exactly while it is set. */
         public static KerbcastCore Instance { get; private set; }
 
         /* Live at the Space Center: feeds are up outside flight, which the
@@ -68,8 +68,8 @@ namespace Kerbcast
         // Read-only view of the tracked cameras for the KerbcastControl facade.
         internal System.Collections.Generic.IReadOnlyList<ICamera> Cameras => _cameras;
 
-        /* gonogo's authority over the command feeds; one per scene, so a scene
-           change ends any registration. */
+        /* The command lock holder's authority over the command feeds; one per
+           scene, so a scene change ends any registration. */
         internal CommandAuthority CommandAuthority { get; } = new CommandAuthority();
 
         /* ~0.5s at 60fps: long enough that a transient scene-change hiccup
@@ -108,12 +108,13 @@ namespace Kerbcast
         private int _fpsIdx;
         private int _fpsCount; // up to FpsSamples; growing-average until full
         private float _fpsAvg;
-        /* Mission-time capture-clock epoch stamped into global.status.json.
-           Bumped on a UT discontinuity (scene load / quickload) so a consumer
-           flushes and resyncs. See CaptureEpoch. */
-        private readonly CaptureEpoch _captureEpoch = new CaptureEpoch();
-        // Read by CaptureCore so every ring frame carries the epoch its UT belongs to.
-        internal uint CaptureEpochValue => _captureEpoch.Value;
+        /* The real-time clock every ring frame is stamped with, read once per
+           frame so all of a frame's captures share it. A Stopwatch in double
+           ms, because Time.unscaledTime is a float that coarsens to whole
+           milliseconds after a couple of hours, and the sidecar spaces RTP
+           timestamps by its differences. */
+        private static readonly System.Diagnostics.Stopwatch s_frameClock = System.Diagnostics.Stopwatch.StartNew();
+        internal static double FrameClockMs { get; private set; }
         // Tombstone-or-normal decision for cameras whose part goes away. See CameraTeardown.
         private readonly CameraTeardown _teardown = new CameraTeardown();
         // Adaptive-shed decision state machine. The fps thresholds + hysteresis
@@ -173,20 +174,25 @@ namespace Kerbcast
         // render thread on any leftover readback tasks until KSP is restarted.
         private GameObject _readbackUpdaterGo;
 
-        // Bounds how many cameras capture each frame (see ReadbackScheduler), so
-        // they don't all issue a GPU render + readback on the same frame.
-        private bool[] _capturePermit = new bool[0];
         // Staggering is budgeted over the SUBSCRIBED (streaming) cameras only —
         // idle/attached cameras cost nothing and must not consume permits.
         // _subscribedIdx[0.._streamCount) maps a rank to a full _cameras index,
         // ordered most-overdue-first so the scheduler can grant the front of it;
-        // _streamPermit is the rank-indexed permit set, _streamEff the rank-indexed
-        // capture rate a grant is stamped at, _streamOverdue the sort key.
+        // _streamEff is the rank-indexed capture rate a grant is stamped at,
+        // _streamOverdue the sort key.
         private int[] _subscribedIdx = new int[0];
-        private bool[] _streamPermit = new bool[0];
         private float[] _streamEff = new float[0];
         private float[] _streamOverdue = new float[0];
         private int _streamCount;
+        /* The capture pass (ReadbackScheduler.GrantAsReached): which cameras are
+           ranked this tick, its scratch, the tick's grant time, and its
+           callbacks, cached so the pass allocates nothing. */
+        private bool[] _ranked = new bool[0];
+        private int[] _deferredRanks = new int[0];
+        private float _grantNow;
+        private Func<int, bool> _rankReady;
+        private Action<int, bool> _runRank;
+        private Action _runUnranked;
         /* Cameras capturing at all, due this tick or not. _streamCount is only
            the ones ELIGIBLE this tick, and now that every camera is paced (not
            just background ones) that number dips below the streaming count on
@@ -221,6 +227,7 @@ namespace Kerbcast
 
         private void Awake()
         {
+            VesselIdentity.EnsureHooked();
             _atSpaceCenter = HighLogic.LoadedScene == GameScenes.SPACECENTER;
             if (_atSpaceCenter)
             {
@@ -243,6 +250,7 @@ namespace Kerbcast
             }
 
             Instance = this;
+            KerbcastApiImpl.Start();
             Debug.Log($"[Kerbcast] KerbcastCore.Awake: initialising (scene={HighLogic.LoadedScene})");
 
             if (_settings == null) _settings = KerbcastSettings.Load();
@@ -266,6 +274,7 @@ namespace Kerbcast
                 if (_settings.EnableCommandCamera)
                     Debug.Log("[Kerbcast][CMDCAM] scene start: flight, command camera follows the active craft");
             }
+            StartReservedLock();
             _staggerController = BuildStaggerController(_settings);
             /* Only built when the operator permits background capture at all:
                with the ceiling at 0 nothing can ever background capture, so there is nothing to
@@ -319,6 +328,8 @@ namespace Kerbcast
                 _statusPath = Path.Combine(RingDir, "global.status.json");
                 _controlPath = Path.Combine(RingDir, "global.control.json");
                 _commandsPath = Path.Combine(RingDir, CommandsFileName);
+                _commandsSignalPath = Path.Combine(RingDir, CommandsSignalFileName);
+                ReopenCommandsSignal();
                 SeedCommandRequests();
                 Debug.Log($"[Kerbcast] rings directory ready at {RingDir} ({RingSlots} slots × {_settings.Width}×{_settings.Height} RGBA per camera)");
             }
@@ -339,6 +350,7 @@ namespace Kerbcast
                a UT that will never arrive. */
             GameEvents.onGameSceneLoadRequested.Add(OnGameSceneLoadRequested);
             GameEvents.onGameStatePostLoad.Add(OnGameStatePostLoad);
+            GameEvents.onVesselPersistentIdChanged.Add(OnVesselPersistentIdChanged);
 
             /* Defensive: at Awake the scene's source cameras (Camera 00,
                ScaledSpace, GalaxyCamera, FXCamera) may already be disabled, for
@@ -473,16 +485,38 @@ namespace Kerbcast
            destroyed tombstones behind. */
         private void OnGameSceneLoadRequested(GameScenes scene)
         {
-            _captureEpoch.Bump();
+            CaptureEpoch.Game.Bump();
             _teardown.OnSceneLoadRequested();
-            CommandAuthority.Reset();
+            EndSceneLock();
+            CommandAuthority.WorldModel.Close();
             /* Restore now, before the scene tears down. Camera ScaledSpace and
                GalaxyCamera survive into the next scene, so a throttle left on
                them would keep the next scene's main view in an 8x8 corner. */
             RestoreMainScreen();
         }
 
-        private void OnGameStatePostLoad(ConfigNode node) => _captureEpoch.Bump();
+        /* From now until the scene is gone every take is refused, so a LockLost
+           handler that takes the lock again does so in the next scene. */
+        internal bool SceneEnding { get; private set; }
+
+        /* The lock ends with the scene, and its holder hears so once: here on a
+           scene load, or at OnDestroy when no load was requested. */
+        private void EndSceneLock()
+        {
+            if (SceneEnding) return;
+            SceneEnding = true;
+            string holder = CommandAuthority.Owner;
+            CommandAuthority.Reset();
+            if (holder != null) RaiseLockLost(holder, Api.LockLossReason.SceneEnded);
+        }
+
+        /* A game-state load inside the scene also leaves the world model's
+           snapshot describing a timeline that is gone. */
+        private void OnGameStatePostLoad(ConfigNode node)
+        {
+            CaptureEpoch.Game.Bump();
+            CommandAuthority.WorldModel.InvalidateForLoad();
+        }
 
         private void MarkFxDirtyForVessel(Vessel v)
         {
@@ -606,13 +640,15 @@ namespace Kerbcast
         }
 
         /* Requests from clients, which the sidecar appends to
-           global.commands.json. Read whole every CommandsPollSeconds; the
-           ledger applies each request once, in id order. */
+           global.commands.json. Read whole when it changes (see
+           CommandFilePoll); the ledger applies each request once, in id order. */
         private const string CommandsFileName = "global.commands.json";
-        private const float CommandsPollSeconds = 0.25f;
+        private const string CommandsSignalFileName = "global.commands.signal";
         private string _commandsPath;
+        private string _commandsSignalPath;
+        private ChangeSignal _commandsSignal;
         private string _commandsLastJson;
-        private float _commandsCooldown;
+        private readonly CommandFilePoll _commandsPoll = new CommandFilePoll();
         private readonly CommandRequestLedger _commandLedger = new CommandRequestLedger();
 
         private void SeedCommandRequests()
@@ -620,8 +656,10 @@ namespace Kerbcast
             try
             {
                 if (!File.Exists(_commandsPath)) return;
-                _commandsLastJson = File.ReadAllText(_commandsPath);
+                _commandsLastJson = ReadCommandsFile();
                 _commandLedger.SeedFrom(CommandCameraRequest.ParseFile(_commandsLastJson, null));
+                /* Anchors are state, not requests: the table on disk applies to this scene too. */
+                ApplyRemoteAnchors(_commandsLastJson);
                 if (_commandLedger.LastAppliedId > 0)
                     Debug.Log($"[Kerbcast][CMDCAM] client requests up to id {_commandLedger.LastAppliedId} predate this scene; skipped");
             }
@@ -633,16 +671,24 @@ namespace Kerbcast
 
         private void MaybeApplyCommandRequests()
         {
-            if (_commandsPath == null || _commandProvider == null) return;
-            _commandsCooldown -= Time.unscaledDeltaTime;
-            if (_commandsCooldown > 0f) return;
-            _commandsCooldown = CommandsPollSeconds;
+            if (_commandsPath == null) return;
+            if (!_commandsPoll.Due(Time.unscaledDeltaTime, _commandsSignal?.Count ?? 0)) return;
             try
             {
                 if (!File.Exists(_commandsPath)) return;
-                var json = File.ReadAllText(_commandsPath);
-                if (json == _commandsLastJson) return;
+                string json;
+                try { json = ReadCommandsFile(); }
+                catch (Exception)
+                {
+                    _commandsPoll.ReadFailed();
+                    throw;
+                }
+                bool changed = json != _commandsLastJson;
+                if (_commandsPoll.SignalMissed(changed)) ReopenCommandsSignal();
+                if (!changed) return;
                 _commandsLastJson = json;
+                ApplyRemoteAnchors(json);
+                if (_commandProvider == null) return;
                 var skipped = new List<string>();
                 var requests = CommandCameraRequest.ParseFile(json, skipped);
                 foreach (var why in skipped)
@@ -656,8 +702,120 @@ namespace Kerbcast
             }
         }
 
+        /* Shared for writing and deleting, so the sidecar's rename over the
+           file never meets a sharing violation on Windows mid-read. */
+        private string ReadCommandsFile()
+        {
+            using (var fs = new FileStream(_commandsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(fs))
+                return reader.ReadToEnd();
+        }
+
+        /* A signal that will not open leaves the safety read, quietly: an
+           older sidecar never makes one. */
+        private void ReopenCommandsSignal()
+        {
+            _commandsSignal?.Dispose();
+            _commandsSignal = null;
+            try { _commandsSignal = ChangeSignal.Open(_commandsSignalPath); }
+            catch (Exception) { }
+            if (_commandsSignal != null)
+                Debug.Log($"[Kerbcast][CMDCAM] client requests signalled through {CommandsSignalFileName} (count {_commandsSignal.Count})");
+        }
+
+        /* Every browser client's anchors, from the sidecar. */
+        internal AnchorRegistry Anchors { get; } = new AnchorRegistry();
+
+        private void ApplyRemoteAnchors(string json)
+        {
+            var skipped = new List<string>();
+            int before = Anchors.Count;
+            Anchors.ReplaceRemote(AnchorRegistry.ParseRemote(json, skipped), skipped);
+            foreach (var why in skipped)
+                Debug.LogWarning($"[Kerbcast][ANCHOR] client anchors skipped: {why}");
+            if (Anchors.Count != before)
+                Debug.Log($"[Kerbcast][ANCHOR] anchors now {Anchors.Count} (was {before})");
+        }
+
+        /* A dock or claw grab: anchors naming the absorbed craft follow it into the survivor. */
+        private void OnVesselPersistentIdChanged(uint oldPid, uint newPid)
+        {
+            Anchors.Merged(oldPid, newPid);
+        }
+
+        /* A reservation starts the scene locked for its owner, with every craft
+           unknown until it attaches. It lapses once per process if its
+           assembly is not loaded, and for the scene if its owner never calls. */
+        private void StartReservedLock()
+        {
+            LockReservationStore.CheckLapse();
+            PollPlayerRelease();
+            var r = LockReservationStore.Reservation;
+            if (!r.Held || !LockReservationStore.AssemblyLoaded(r.Assembly)) return;
+            KerbcastControl.TakeLockCore(r.Owner, Api.LockOptions.WorldModelRequired, r.SilentText);
+            _reservedHeartbeatPending = true;
+            _reservedWatch.Watch(r.Owner, CommandAuthority.Lock);
+            Debug.Log($"[Kerbcast][CMDCAM] scene starts locked for {r.Owner} (reserved)");
+        }
+
+        private bool _reservedHeartbeatPending;
+        private readonly ReservationWatch _reservedWatch = new ReservationWatch();
+        private float _playerReleaseCheckAt;
+
+        private void WatchReservedOwner()
+        {
+            string owner = _reservedWatch.Lapse(CommandAuthority.Lock, Time.realtimeSinceStartup);
+            if (owner == null) return;
+            Debug.LogWarning($"[Kerbcast][CMDCAM] {owner} reserved the command lock but made no call within {ReservationWatch.LapseSeconds:F0} s; "
+                + "its feeds stay blank and browsers may now create and remove command cameras. To show the scene, release the lock in game: "
+                + "Difficulty Settings > Kerbcast > Release command lock");
+        }
+
+        /* Browsers manage command cameras with no lock, or while a reserved owner has never answered: its feeds are blank either way. */
+        private bool BrowserManagesCameras => CommandAuthority.Owner == null || _reservedWatch.Lapsed(CommandAuthority.Lock);
+
+        /* The Difficulty Settings one-shot, read live, once a second: release the lock and clear the reservation, whoever holds them. */
+        private void PollPlayerRelease()
+        {
+            if (Time.realtimeSinceStartup < _playerReleaseCheckAt) return;
+            _playerReleaseCheckAt = Time.realtimeSinceStartup + 1f;
+            try
+            {
+                var p = HighLogic.CurrentGame?.Parameters?.CustomParams<KerbcastGameParameters>();
+                if (p == null || !p.ReleaseCommandLock) return;
+                p.ReleaseCommandLock = false;
+                var r = LockReservationStore.Reservation;
+                string reserved = r.Owner;
+                r.ClearForPlayer();
+                string holder = CommandAuthority.Owner;
+                Debug.Log($"[Kerbcast][CMDCAM] player released the command lock (held by {holder ?? "nobody"}, reserved by {reserved ?? "nobody"})");
+                if (holder != null)
+                {
+                    KerbcastControl.ReleaseLockCore(holder, byPlayer: true);
+                    RaiseLockLost(holder, Api.LockLossReason.ReleasedByPlayer);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] release command lock: {ex.Message}");
+            }
+        }
+
+
+        private static void RaiseLockLost(string owner, Api.LockLossReason reason)
+        {
+            Debug.Log(CommandLock.LostLine(owner, reason));
+            Api.KerbcastApi.RaiseLockLost(new Api.LockLostEvent(owner, reason), Debug.LogException);
+        }
+
         private void ApplyCommandRequest(CommandCameraRequest r)
         {
+            string holder = CommandAuthority.Owner;
+            if (!BrowserManagesCameras && (r.Op == CommandRequestOp.Create || r.Op == CommandRequestOp.Destroy))
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: {holder} holds the command lock; command cameras are not {(r.Op == CommandRequestOp.Create ? "created" : "destroyed")} by clients");
+                return;
+            }
             switch (r.Op)
             {
                 case CommandRequestOp.Create:
@@ -680,7 +838,7 @@ namespace Kerbcast
                     return;
                 }
                 case CommandRequestOp.Destroy:
-                    if (!KerbcastControl.DestroyCommandCamera(r.FlightId))
+                    if (!DestroyCommandCamera(r.FlightId))
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is not a created command camera; nothing destroyed");
                     return;
                 case CommandRequestOp.Aim:
@@ -768,6 +926,7 @@ namespace Kerbcast
         // render pass — we own the render timing entirely.
         private void LateUpdate()
         {
+            FrameClockMs = s_frameClock.Elapsed.TotalMilliseconds;
             /* The library loaded but its render-thread GL setup failed, so every
                readback errors and feeds would stay empty. Shut down exactly as
                if startup had been refused: OnDestroy disposes the cameras and
@@ -778,12 +937,27 @@ namespace Kerbcast
                     Destroy(KerbcastSidecarHost.Instance.gameObject);
                 /* Cleared now rather than in the deferred OnDestroy, so
                    KerbcastControl reads as inactive from this frame on. */
-                if (Instance == this) Instance = null;
+                if (Instance == this)
+                {
+                    Instance = null;
+                    KerbcastApiImpl.Stop();
+                }
                 enabled = false;
                 Destroy(this);
                 return;
             }
 
+            /* A reserved lock is taken at Awake so nothing runs unlocked, but
+               its silence clock starts with the first frame: a long scene load
+               must not time the owner out before it can call. */
+            if (_reservedHeartbeatPending)
+            {
+                _reservedHeartbeatPending = false;
+                CommandAuthority.Lock.RestartSilence(Time.realtimeSinceStartup);
+                _reservedWatch.Start(Time.realtimeSinceStartup);
+            }
+            WatchReservedOwner();
+            PollPlayerRelease();
             UpdateFpsAverage();
             MaybeApplyCommandRequests();
             DropLostVantages();
@@ -801,6 +975,24 @@ namespace Kerbcast
                     GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2),
                     Time.unscaledDeltaTime);
             }
+            // Defensive: scan for cameras whose Hullcam part has gone null
+            // (e.g. a destruction event we missed, or a KSP internal teardown
+            // that doesn't fire onPartDestroyed). DisposeDestroyed + remove them
+            // so the orphaned Unity Camera GameObjects and ring files are cleaned
+            // up even if the event path failed. Iterate backwards to allow
+            // removal by index. Runs before the subscribed set is built, whose
+            // ranks are indices into _cameras for the rest of the tick.
+            for (int i = _cameras.Count - 1; i >= 0; i--)
+            {
+                var cam = _cameras[i];
+                if (!cam.IsAlive)
+                {
+                    Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null part/vessel, disposing (missed destruction event?)");
+                    _cameras.RemoveAt(i);
+                    DisposeLost(cam);
+                }
+            }
+
             // Build the subscribed (streaming) set first — staggering is
             // budgeted over it, not over all attached cameras. Filled here so
             // both UpdateDegradeLevel (the controller) and the capture loop below
@@ -824,6 +1016,8 @@ namespace Kerbcast
                 _effectiveBackgroundCeiling = EffectiveHumCeiling();
                 float backgroundCeiling = _effectiveBackgroundCeiling;
                 float now = Time.unscaledTime;
+                double ut = Planetarium.fetch != null ? Planetarium.GetUniversalTime() : double.NaN;
+                bool gameRunning = Time.timeScale > 0f;
                 for (int i = 0; i < n; i++)
                 {
                     var cam = _cameras[i];
@@ -831,13 +1025,32 @@ namespace Kerbcast
                     float eff = cam.EffectiveCaptureFps(primaryFps, backgroundCeiling);
                     if (eff <= 0f) continue;
                     _streamSubscribedCount++;
-                    if (!cam.CaptureDue(now, eff)) continue;
+                    /* Before this frame is counted, so a report covers whole
+                       frames. Counted always, logged only with EnableTelemetry. */
+                    string report = cam.Counters.TakeReport(now, cam.FlightId);
+                    if (report != null && KerbcastSettings.EnableTelemetry) Debug.Log(report);
+                    cam.Counters.Frame(now);
+                    /* Due is enough to be ranked. Whether a readback slot is
+                       free is asked only when the capture pass reaches it (see
+                       ReadbackScheduler.GrantAsReached). */
+                    if (!cam.CaptureDue(now, eff))
+                    {
+                        cam.Counters.Miss(CaptureMiss.NotDue);
+                        continue;
+                    }
+                    float overdue = cam.CaptureOverdue(now, eff);
+                    /* Left out, it keeps its deadline and goes on the next frame
+                       that has a physics tick. */
+                    if (CapturePacing.WaitForTick(ut, cam.LastCaptureUt, gameRunning, overdue, eff))
+                    {
+                        cam.Counters.Miss(CaptureMiss.SameUt);
+                        continue;
+                    }
                     /* Ordered most-overdue-first, because when more cameras come
                        due than the frame's concurrency bound allows the scheduler
                        grants the front of this list, and the camera furthest behind
                        has to be there. Insertion sort: a handful of entries, and no
                        allocation on the main thread. */
-                    float overdue = cam.CaptureOverdue(now, eff);
                     int at = _streamCount;
                     while (at > 0 && _streamOverdue[at - 1] < overdue)
                     {
@@ -882,23 +1095,6 @@ namespace Kerbcast
             if (_mainScreenThrottled)
                 _mainThrottle.Enforce();
 
-            // Defensive: scan for cameras whose Hullcam part has gone null
-            // (e.g. a destruction event we missed, or a KSP internal teardown
-            // that doesn't fire onPartDestroyed). DisposeDestroyed + remove them
-            // so the orphaned Unity Camera GameObjects and ring files are cleaned
-            // up even if the event path failed. Iterate backwards to allow
-            // removal by index.
-            for (int i = _cameras.Count - 1; i >= 0; i--)
-            {
-                var cam = _cameras[i];
-                if (!cam.IsAlive)
-                {
-                    Debug.LogWarning($"[Kerbcast] defensive sweep: cam={cam.FlightId} has null part/vessel — disposing (missed destruction event?)");
-                    _cameras.RemoveAt(i);
-                    DisposeLost(cam);
-                }
-            }
-
             // Stagger captures so the cameras don't all render +
             // read back on the same frame. Budget = how many captures per frame
             // the whole streaming set needs to sustain MaxCaptureFps at the
@@ -908,9 +1104,9 @@ namespace Kerbcast
             // than the budget allows delays the extras by a frame rather than
             // speeding anyone up.
             int camCount = _cameras.Count;
-            if (_capturePermit.Length < camCount) _capturePermit = new bool[camCount];
+            if (_ranked.Length < camCount) _ranked = new bool[camCount];
+            if (_deferredRanks.Length < camCount) _deferredRanks = new int[camCount];
             if (_subscribedIdx.Length < camCount) _subscribedIdx = new int[camCount];
-            if (_streamPermit.Length < camCount) _streamPermit = new bool[camCount];
             if (_streamEff.Length < camCount) _streamEff = new float[camCount];
             if (_streamOverdue.Length < camCount) _streamOverdue = new float[camCount];
 
@@ -935,72 +1131,88 @@ namespace Kerbcast
                     : _streamSubscribedCount;
                 budget = Math.Min(rateBudget, staggerBudget);
             }
-            if (_streamCount > 0)
-                ReadbackScheduler.GrantByPriority(_streamCount, budget, _streamPermit);
             _staggerBudget = budget;
 
-            // Map the rank-indexed stream permits back onto the full camera list;
-            // idle cameras get no permit (they skip render anyway, but this keeps
-            // _lastCapturedCount honest).
-            for (int i = 0; i < camCount; i++) _capturePermit[i] = false;
+            for (int i = 0; i < camCount; i++) _ranked[i] = false;
+            for (int rank = 0; rank < _streamCount; rank++) _ranked[_subscribedIdx[rank]] = true;
+            if (_runRank == null)
             {
-                /* Stamp the grant, not the eligibility: a camera that was due but
-                   lost the draw keeps its deadline and stays due, so a busy tick
-                   delays it rather than silently skipping a whole interval. It
-                   also gets more overdue, which is what puts it at the front of
-                   the next tick's order. */
-                float now = Time.unscaledTime;
-                for (int rank = 0; rank < _streamCount; rank++)
-                {
-                    if (!_streamPermit[rank]) continue;
-                    int idx = _subscribedIdx[rank];
-                    _capturePermit[idx] = true;
-                    _cameras[idx].MarkCaptureGranted(now, _streamEff[rank]);
-                }
+                _rankReady = RankReady;
+                _runRank = RunRank;
+                _runUnranked = RunUnranked;
             }
+            _grantNow = Time.unscaledTime;
 
             // Measure kerbcast's own main-thread cost this frame (the capture loop
             // wall-time), EMA-smoothed, + how many cameras actually captured —
             // together they give the per-camera cost the controller regulates.
-            int captured = 0;
-            for (int i = 0; i < camCount; i++) if (_capturePermit[i]) captured++;
-            _lastCapturedCount = captured > 0 ? captured : 1;
             long capStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            /* Backwards so a quarantine removal doesn't shift the
-               permit-to-camera index alignment of cameras not yet visited. */
-            for (int i = camCount - 1; i >= 0; i--)
+            int captured = ReadbackScheduler.GrantAsReached(
+                _streamCount, budget, _rankReady, _runRank, _runUnranked, _deferredRanks);
+            _lastCapturedCount = captured > 0 ? captured : 1;
+            /* Quarantined after the pass rather than during it, so every rank
+               still names the camera it was given for. */
+            for (int i = _cameras.Count - 1; i >= 0; i--)
             {
                 var cam = _cameras[i];
-                try
-                {
-                    cam.Refresh(_capturePermit[i]);
-                    cam.RefreshFailureStreak = 0;
-                }
-                catch (Exception ex)
-                {
-                    /* Isolate per-camera failures: one camera throwing must
-                       not abort the other cameras' captures or the control
-                       logic below. A sustained streak means the camera is
-                       broken beyond self-recovery (it would otherwise spam
-                       the log every frame forever) — dispose it like a
-                       missed-destruction part. */
-                    cam.RefreshFailureStreak++;
-                    if (cam.RefreshFailureStreak == 1)
-                        Debug.LogError($"[Kerbcast] cam={cam.FlightId} Refresh threw: {ex}");
-                    if (cam.RefreshFailureStreak >= RefreshQuarantineThreshold)
-                    {
-                        Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantined after {cam.RefreshFailureStreak} consecutive Refresh failures");
-                        _cameras.RemoveAt(i);
-                        try { cam.DisposeDestroyed(); }
-                        catch (Exception dex) { Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantine dispose threw: {dex}"); }
-                    }
-                }
+                if (cam.RefreshFailureStreak < RefreshQuarantineThreshold) continue;
+                Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantined after {cam.RefreshFailureStreak} consecutive Refresh failures");
+                _cameras.RemoveAt(i);
+                try { cam.DisposeDestroyed(); }
+                catch (Exception dex) { Debug.LogError($"[Kerbcast] cam={cam.FlightId} quarantine dispose threw: {dex}"); }
             }
             double capMs = (System.Diagnostics.Stopwatch.GetTimestamp() - capStart) * _msPerTick;
             _kerbcastFrameMs = _kerbcastFrameMs <= 0.0 ? capMs : _kerbcastFrameMs * 0.8 + capMs * 0.2;
 
             MaybeApplyGlobalControl();
             MaybeWriteStatusFile();
+        }
+
+        private bool RankReady(int rank) => _cameras[_subscribedIdx[rank]].ReadyToCapture;
+
+        /* Stamp the grant, not the eligibility: a camera that was due but lost
+           the draw keeps its deadline and stays due, so a busy tick delays it
+           rather than silently skipping a whole interval. It also gets more
+           overdue, which is what puts it at the front of the next tick's order. */
+        private void RunRank(int rank, bool permit)
+        {
+            var cam = _cameras[_subscribedIdx[rank]];
+            if (permit)
+            {
+                cam.MarkCaptureGranted(_grantNow, _streamEff[rank]);
+                cam.Counters.Grant();
+            }
+            else cam.Counters.Miss(cam.ReadyToCapture ? CaptureMiss.NoPermit : CaptureMiss.ReadbackPending);
+            RefreshCamera(cam, permit);
+        }
+
+        /* Idle cameras and those not due get no permit; they still refresh, to
+           drain a landed readback and keep their aim moving. */
+        private void RunUnranked()
+        {
+            for (int i = _cameras.Count - 1; i >= 0; i--)
+                if (!_ranked[i]) RefreshCamera(_cameras[i], false);
+        }
+
+        private static void RefreshCamera(ICamera cam, bool permit)
+        {
+            try
+            {
+                cam.Refresh(permit);
+                cam.RefreshFailureStreak = 0;
+            }
+            catch (Exception ex)
+            {
+                /* Isolate per-camera failures: one camera throwing must
+                   not abort the other cameras' captures or the control
+                   logic below. A sustained streak means the camera is
+                   broken beyond self-recovery (it would otherwise spam
+                   the log every frame forever), and the pass quarantines
+                   it like a missed-destruction part. */
+                cam.RefreshFailureStreak++;
+                if (cam.RefreshFailureStreak == 1)
+                    Debug.LogError($"[Kerbcast] cam={cam.FlightId} Refresh threw: {ex}");
+            }
         }
 
         // Warning overlay shown to the operator while the main flight
@@ -1327,7 +1539,7 @@ namespace Kerbcast
                    discontinuity epoch. Round-trip ("R") + InvariantCulture so
                    the double/float never localises to a comma. */
                 sb.Append($"  \"captureUt\": {Planetarium.GetUniversalTime().ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\n");
-                sb.Append($"  \"captureEpoch\": {_captureEpoch.Value},\n");
+                sb.Append($"  \"captureEpoch\": {CaptureEpoch.Game.Value},\n");
                 sb.Append($"  \"timeWarpRate\": {TimeWarp.CurrentRate.ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 /* Wall clock at the UT sample, so the sidecar on this machine can age captureUt to the moment it sends. */
                 sb.Append($"  \"captureWallMs\": {(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds.ToString("F0", System.Globalization.CultureInfo.InvariantCulture)},\n");
@@ -1410,21 +1622,15 @@ namespace Kerbcast
            is watching the feed. */
         private static void AppendCommandFields(System.Text.StringBuilder sb, CommandCameraRig gr)
         {
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
             gr.Poll();
-            sb.Append($"      \"occluded\": {(gr.Occluded ? "true" : "false")},\n");
-            sb.Append($"      \"blocker\": \"{JsonEsc(gr.Blocker)}\",\n");
-            sb.Append($"      \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
-            sb.Append($"      \"elevationDeg\": {(gr.HasFix ? gr.ElevationDeg.ToString("F3", ci) : "null")},\n");
-            sb.Append($"      \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
-            sb.Append($"      \"subjectPersistentId\": {gr.SubjectPersistentId},\n");
-            sb.Append($"      \"subjectName\": \"{JsonEsc(gr.SubjectName)}\",\n");
+            var state = gr.StateNow();
+            CommandTrackJson.AppendCameraFields(sb, state, gr.ElevationDeg, gr.SubjectName);
             AppendCommandCentre(sb, gr);
-            AppendCommandTrack(sb, gr);
+            AppendCommandTrack(sb, gr, state);
         }
 
         /* The wire's CommandAimKind tag. */
-        private static string AimKindTag(CommandAimKind kind)
+        internal static string AimKindTag(CommandAimKind kind)
         {
             switch (kind)
             {
@@ -1444,7 +1650,7 @@ namespace Kerbcast
             var ci = System.Globalization.CultureInfo.InvariantCulture;
             double ut = Planetarium.GetUniversalTime();
             List<CommandTargetView> targets;
-            try { targets = CommandCameraTargets.List(gr.Site, ut); }
+            try { targets = CommandCameraTargets.List(gr.Site, ut, gr.FovMax); }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[Kerbcast][CMDCAM] target list failed: {ex.Message}");
@@ -1460,6 +1666,8 @@ namespace Kerbcast
                 : CommandCameraTargets.RoundRange(m).ToString("R", ci);
 
             sb.Append("      \"commandCentre\": {\n");
+            sb.Append($"        \"ut\": {ut.ToString("R", ci)},\n");
+            sb.Append($"        \"vantagePersistentId\": {gr.Site.VantagePersistentId},\n");
             if (gr.Aim != null) sb.Append($"        \"aimKind\": \"{AimKindTag(gr.Aim.Kind)}\",\n");
             sb.Append($"        \"subjectPersistentId\": {pid},\n");
             sb.Append($"        \"rangeM\": {Range(range)},\n");
@@ -1477,44 +1685,13 @@ namespace Kerbcast
             sb.Append("      },\n");
         }
 
-        /* The bracket contract: camera-axis state at the aimed point, the
-           registered authority, any blank, and the recent discrete transitions
-           with the exact UT of each. */
-        private static void AppendCommandTrack(System.Text.StringBuilder sb, CommandCameraRig gr)
+        /* The bracket contract for clients older than 1.12 (CommandTrackJson). Newer clients read the state from each frame. */
+        private static void AppendCommandTrack(System.Text.StringBuilder sb, CommandCameraRig gr, CommandFrameState state)
         {
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
-            sb.Append("      \"commandTrack\": {\n");
-            sb.Append($"        \"ut\": {gr.TrackUt.ToString("R", ci)},\n");
-            sb.Append($"        \"hasFix\": {(gr.HasFix ? "true" : "false")},\n");
-            sb.Append($"        \"rangeM\": {(gr.HasFix ? gr.RangeM.ToString("F1", ci) : "null")},\n");
-            sb.Append($"        \"occluded\": {(gr.Occluded ? "true" : "false")},\n");
-            sb.Append($"        \"occluder\": \"{JsonEsc(gr.Blocker)}\",\n");
-            sb.Append($"        \"sunlit\": {(gr.Sunlit ? "true" : "false")},\n");
-            sb.Append($"        \"bracketHalfPx\": {(gr.HasFix ? gr.BracketHalfPx.ToString("0.###", ci) : "null")},\n");
-            sb.Append($"        \"frameHeightPx\": {gr.FrameHeightPx},\n");
-            sb.Append($"        \"framingFits\": {(gr.FramingFits ? "true" : "false")},\n");
-            var offset = gr.TrueOffsetPx;
-            sb.Append($"        \"trueOffsetPx\": {(offset.HasValue ? offset.Value.ToString("0.###", ci) : "null")},\n");
-            sb.Append(gr.AuthorityOwner == null
-                ? "        \"authority\": null,\n"
-                : $"        \"authority\": {{ \"owner\": \"{JsonEsc(gr.AuthorityOwner)}\" }},\n");
-            sb.Append($"        \"blank\": {JsonStringOrNull(gr.Blank)},\n");
-            sb.Append("        \"events\": [");
-            var events = gr.TrackEvents();
-            for (int i = 0; i < events.Count; i++)
-            {
-                var e = events[i];
-                sb.Append(i == 0 ? "\n" : ",\n");
-                sb.Append($"          {{ \"ut\": {e.Ut.ToString("R", ci)}, \"occluded\": {(e.Occluded ? "true" : "false")}, "
-                    + $"\"occluder\": \"{JsonEsc(e.Occluder)}\", \"sunlit\": {(e.Sunlit ? "true" : "false")}, "
-                    + $"\"blank\": {JsonStringOrNull(e.Blank)}"
-                    + (e.Predicted ? ", \"predicted\": true }" : " }"));
-            }
-            sb.Append(events.Count > 0 ? "\n        ]\n" : "]\n");
-            sb.Append("      },\n");
+            sb.Append("      \"commandTrack\": ");
+            CommandTrackJson.Append(sb, gr.TrackUt, state, gr.TrackEvents());
+            sb.Append(",\n");
         }
-
-        private static string JsonStringOrNull(string s) => s == null ? "null" : $"\"{JsonEsc(s)}\"";
 
         private static string JsonEsc(string s)
         {
@@ -1631,9 +1808,91 @@ namespace Kerbcast
             // player. Informational only; lead with the collection counts above,
             // which are reliable.
             sb.Append($"      \"monoHeapBytes\": {UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong()}\n");
-            sb.Append("    }\n");
+            sb.Append("    },\n");
 
+            AppendCosts(sb, ci);
             sb.Append("  }");
+        }
+
+        /*
+         * The 1.12 costs, beside phasesMs and gc in the telemetry block. A time
+         * or size is { "ms" | "bytes": last, "emaMs" | "emaBytes": EMA,
+         * "maxMs" | "maxBytes": the largest since the previous write }, null
+         * until anything was recorded; counts and rates are plain numbers.
+         * Each interval max resets on the write, like the phases. A cost per
+         * rendered or camera frame is null too for an interval with no such
+         * frame (no camera subscribed), rather than its last value.
+         *
+         *   ringTickMs        the light-time history's sampling, per physics tick
+         *   ringEntriesPerS   history entries written per second since the previous write
+         *   ringMB            history memory, as the ring counts it
+         *   ringTracks        history tracks (craft, bodies and ghosts)
+         *   ringBodyTracks    of those, body tracks (bodies seen off their Kepler paths)
+         *   pictureMs         past-instant sight solves, per rendered frame, summed over lenses
+         *   pictureLenses     lenses with sights kept
+         *   bodySolveMs       placing the bodies at their past instants, per rendered frame, summed over lenses
+         *   bodyCarriesPerS   body searches that ran out of reads and carried into the next frame, summed over lenses,
+         *                     per second since the previous write
+         *   bodyHidesPerS     bodies left out of a frame with no instant to draw them at, summed over lenses, per second
+         *                     since the previous write
+         *   liveLightMs       the live light-time bound's walk over the lens craft's parts, per camera frame
+         *   metaBytes         frame-metadata JSON written, per camera frame
+         *   metaEncodeMs      encoding it, per camera frame
+         *   worldModelFillMs  copying an accepted world-model snapshot, per publish, on the publisher's thread
+         *   worldModelRecords records in the current snapshot
+         *   saveMs, loadMs    the history's save into and load from the save file; read the last value
+         *                     (they happen at saves and loads, not every interval)
+         *   frameCopyMs       copying one landed readback into the camera's frame ring, per frame, on the main thread
+         *   readbackIssueMs   issuing one readback (the request and the frame's bookkeeping), per captured frame
+         *   galaxySkipsPerS   captures whose galaxy layer was cleared rather than rendered because the game had faded
+         *                     the sky to black, summed over cameras, per second since the previous write
+         */
+        private static void AppendCosts(System.Text.StringBuilder sb, System.Globalization.CultureInfo ci)
+        {
+            var ring = LightHistoryHost.History;
+            int bodyTracks = 0;
+            foreach (var t in ring.Tracks) if (t.IsBody) bodyTracks++;
+            double entriesPerS = Telemetry.RingEntries.TakeInterval(ring.EntriesWritten, Time.realtimeSinceStartup);
+            var store = KerbcastCore.Instance?.CommandAuthority.WorldModel;
+            sb.Append("    \"costs\": {\n");
+            AppendCost(sb, "ringTickMs", "Ms", Telemetry.RingTick.TakeInterval(), ci);
+            sb.Append($"      \"ringEntriesPerS\": {entriesPerS.ToString("F1", ci)},\n");
+            sb.Append($"      \"ringMB\": {(ring.Bytes / (1024.0 * 1024.0)).ToString("F3", ci)},\n");
+            sb.Append($"      \"ringTracks\": {ring.TrackCount},\n");
+            sb.Append($"      \"ringBodyTracks\": {bodyTracks},\n");
+            AppendCost(sb, "pictureMs", "Ms", Telemetry.Picture.TakeInterval(), ci, perFrame: true);
+            sb.Append($"      \"pictureLenses\": {PicturePass.LensCount},\n");
+            AppendCost(sb, "bodySolveMs", "Ms", Telemetry.BodySolve.TakeInterval(), ci, perFrame: true);
+            double carriesPerS = Telemetry.BodyCarries.TakeInterval(Telemetry.BodyCarriesTotal, Time.realtimeSinceStartup);
+            double hidesPerS = Telemetry.BodyHides.TakeInterval(Telemetry.BodyHidesTotal, Time.realtimeSinceStartup);
+            sb.Append($"      \"bodyCarriesPerS\": {carriesPerS.ToString("F1", ci)},\n");
+            sb.Append($"      \"bodyHidesPerS\": {hidesPerS.ToString("F1", ci)},\n");
+            AppendCost(sb, "liveLightMs", "Ms", Telemetry.LiveLight.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "metaBytes", "Bytes", Telemetry.MetaBytes.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "metaEncodeMs", "Ms", Telemetry.MetaEncode.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "worldModelFillMs", "Ms", Telemetry.WorldModelFill.TakeInterval(), ci);
+            sb.Append($"      \"worldModelRecords\": {store?.CurrentRecords ?? 0},\n");
+            AppendCost(sb, "frameCopyMs", "Ms", Telemetry.FrameCopy.TakeInterval(), ci, perFrame: true);
+            AppendCost(sb, "readbackIssueMs", "Ms", Telemetry.ReadbackIssue.TakeInterval(), ci, perFrame: true);
+            double galaxySkipsPerS = Telemetry.GalaxySkips.TakeInterval(Telemetry.GalaxySkipsTotal, Time.realtimeSinceStartup);
+            sb.Append($"      \"galaxySkipsPerS\": {galaxySkipsPerS.ToString("F1", ci)},\n");
+            AppendCost(sb, "saveMs", "Ms", Telemetry.Save.TakeInterval(), ci);
+            AppendCost(sb, "loadMs", "Ms", Telemetry.Load.TakeInterval(), ci, lastField: true);
+            sb.Append("    }\n");
+        }
+
+        private static void AppendCost(System.Text.StringBuilder sb, string name, string unit, CostReading r,
+            System.Globalization.CultureInfo ci, bool lastField = false, bool perFrame = false)
+        {
+            string end = lastField ? "\n" : ",\n";
+            string lower = unit.ToLowerInvariant();
+            if (!r.Seen || (perFrame && r.Count == 0))
+            {
+                sb.Append($"      \"{name}\": null{end}");
+                return;
+            }
+            sb.Append($"      \"{name}\": {{ \"{lower}\": {r.Last.ToString("F3", ci)}, \"ema{unit}\": {r.Ema.ToString("F3", ci)}, "
+                + $"\"max{unit}\": {r.Max.ToString("F3", ci)}, \"count\": {r.Count} }}{end}");
         }
 
         // One phase row: { "ms": <sum-of-last>, "emaMs": <sum-of-ema>, "maxMs":
@@ -1787,8 +2046,16 @@ namespace Kerbcast
 
         private void OnDestroy()
         {
+            _commandsSignal?.Dispose();
+            _commandsSignal = null;
             if (_disabled) return;
-            if (Instance == this) Instance = null;
+            if (Instance == this)
+            {
+                Instance = null;
+                KerbcastApiImpl.Stop();
+            }
+            EndSceneLock();
+            CommandAuthority.WorldModel.Close();
 
             // ALWAYS restore the main flight cameras on scene exit so a
             // revert / quit-to-KSC / quit-to-main-menu doesn't leave KSP
@@ -1803,6 +2070,7 @@ namespace Kerbcast
             GameEvents.onVesselCrewWasModified.Remove(OnVesselCrewWasModified);
             GameEvents.onGameSceneLoadRequested.Remove(OnGameSceneLoadRequested);
             GameEvents.onGameStatePostLoad.Remove(OnGameStatePostLoad);
+            GameEvents.onVesselPersistentIdChanged.Remove(OnVesselPersistentIdChanged);
             foreach (var cam in _cameras) cam.Dispose();
             _cameras.Clear();
             /* Deliberately NOT stopping the sidecar: KerbcastSidecarHost owns

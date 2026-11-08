@@ -63,6 +63,8 @@ namespace Kerbcast
         void AfterScaledRender(KerbcastCamera cam);
         /* The frame centre after galaxy and scaled rendered, when asked for. */
         void OnScaledProbe(KerbcastCamera cam, Color centre);
+        /* The craft the lens rides, whose parts set the frame's live bound; null for none. */
+        Vessel LensCraft { get; }
         void Dispose();
     }
 
@@ -72,6 +74,9 @@ namespace Kerbcast
 
         /* Null for part cameras. Set once, right after construction. */
         internal ICameraRig Rig { get; set; }
+        /* Where this camera draws every craft under light time. A part camera's
+           lens is its own eye on its craft; a rig places its lens itself. */
+        internal PicturePass Picture { get; }
         /* Set by the rig when the far layer must not draw this tick (the craft
            is hidden behind a body). */
         internal bool RigSkipFar { get; set; }
@@ -88,11 +93,20 @@ namespace Kerbcast
         internal Renderer RigStockFaderRenderer { get; set; }
 
         /* Re-renders galaxy and scaled and reads the centre, so a rig can
-           compare backdrop variants inside OnScaledProbe. */
+           compare backdrop variants inside OnScaledProbe. The bodies are drawn
+           where the frame's own scaled render drew them. */
         internal Color RenderBackdropForProbe()
         {
             if (_galaxyCam != null) _galaxyCam.Render();
-            if (_scaledCam != null) RenderScaledWithRig();
+            if (_scaledCam != null)
+            {
+                try
+                {
+                    Picture.BeforeScaledLayer();
+                    RenderScaledWithRig();
+                }
+                finally { Picture.AfterScaledLayer(); }
+            }
             return SampleCaptureCentre();
         }
 
@@ -108,6 +122,15 @@ namespace Kerbcast
             finally { Rig.AfterScaledRender(this); }
         }
 
+        /* The frame's live bound: a rig's lens rides the rig's craft (none at a
+           ground site), a part camera's the craft its part is on. */
+        private double LiveLightTimeNow()
+        {
+            var lens = _nearCam != null ? _nearCam.transform : Mount.PartTransform;
+            if (lens == null) return LiveLightTime.For(Vector3d.zero, null);
+            return LiveLightTime.For(lens.position, Rig != null ? Rig.LensCraft : Vessel);
+        }
+
         /* A blanked feed streams black, never the scene and never a frozen
            frame. The plain blit keeps any filter or test pattern off it. */
         private void PublishBlack()
@@ -119,11 +142,10 @@ namespace Kerbcast
                 RenderTexture.active = _capture.CaptureRt;
                 GL.Clear(true, true, Color.black);
                 RenderTexture.active = prev;
-                _capture.Publish(Time.unscaledTime * 1000.0, s_plainBlit);
+                _capture.Publish(KerbcastCore.FrameClockMs, s_plainBlit, _anchors.BuildBlank(this));
             }
             catch (Exception ex)
             {
-                _capture.AbortInFlight();
                 LogRateLimited($"blank frame threw: {ex.GetType().Name}: {ex.Message}");
             }
         }
@@ -237,7 +259,7 @@ namespace Kerbcast
         // Which FX layers this camera runs (subject to the _enableFx master).
         private AtmoFxLayers _fxLayers;
         // Reusable capture tail: owns the pooled capture/readback RT pair, the
-        // in-flight readback bookkeeping, the ReadbackTargetTracker and the ring
+        // in-flight readbacks and the ring
         // write. This camera renders its layer stack into _capture.CaptureRt then
         // hands the blit/flip/readback/produce tail to CaptureCore. Shared with
         // future camera types (kerbal-face) so the streaming path stays one impl.
@@ -246,6 +268,7 @@ namespace Kerbcast
         // closure allocation on the hot path).
         private readonly Action<RenderTexture, RenderTexture> _captureBlit;
         private readonly MmapFrameRing _ring;
+        private readonly AnchorProjector _anchors;
         private readonly string _ringPath;
         private readonly string _infoPath;
         private readonly string _controlPath;
@@ -344,6 +367,9 @@ namespace Kerbcast
             => _pacing.Overdue(now, effectiveFps);
         public void MarkCaptureGranted(float now, float effectiveFps)
             => _pacing.MarkGranted(now, effectiveFps);
+        public bool ReadyToCapture => _capture == null || _capture.CanIssue;
+        public double LastCaptureUt => _capture != null ? _capture.LastPublishedUt : double.NaN;
+        public CaptureCounters Counters { get; } = new CaptureCounters();
 
         private bool _disposed;
         private bool _firstRender = true;
@@ -450,6 +476,9 @@ namespace Kerbcast
             FlightId = flightId;
             MaxWidth = maxWidth;
             MaxHeight = maxHeight;
+            /* The ring keeps the configured size, which is the feed's shape; frames
+               are aligned inside it. */
+            (renderWidth, renderHeight) = QualityClamp.ScaleSize(renderWidth, renderHeight, 1f);
             OperatorWidth = renderWidth;
             OperatorHeight = renderHeight;
             RenderWidth = renderWidth;
@@ -490,14 +519,16 @@ namespace Kerbcast
             // shrinks the rendered frame but the ring's slot capacity
             // stays the same. Each slot's header carries the actual
             // content size so the sidecar encodes at the current dim.
-            _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight);
+            _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight, AnchorProjector.MetaSlotBytes);
+            _anchors = new AnchorProjector(FlightId);
+            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld, () => _nearCam);
             WriteInfoManifest();
 
             // Failure-streak (_consecutiveErrors + LogRateLimited) and the
             // PhaseTimings sink stay owned here; the tail invokes them so a
             // readback error and a render error share one rate-limit counter and
             // one telemetry object.
-            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
+            _capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0, LiveLightTimeNow, Counters);
 
             _capture.BuildTargets(renderWidth, renderHeight);
             SetCameras();
@@ -768,13 +799,13 @@ namespace Kerbcast
         /// <summary>
         /// Rebuild the RenderTexture chain at a new size and rebind every
         /// Unity Camera to it. Caller is responsible for staying within
-        /// MaxWidth × MaxHeight (the ring slot capacity). Even dimensions
-        /// only — H.264 chroma sampling requires that.
+        /// MaxWidth × MaxHeight (the ring slot capacity). Multiples of 16 only,
+        /// so H.264 has no padding to crop (see QualityClamp.FrameAlignment).
         /// </summary>
         public void SetRenderSize(int width, int height)
         {
             if (width <= 0 || height <= 0) return;
-            if (width % 2 != 0 || height % 2 != 0) return;
+            if (width % QualityClamp.FrameAlignment != 0 || height % QualityClamp.FrameAlignment != 0) return;
             if (width > MaxWidth || height > MaxHeight) return;
             if (width == RenderWidth && height == RenderHeight) return;
 
@@ -1251,7 +1282,7 @@ namespace Kerbcast
         public CameraLayers Layers => _layers;
         public CameraLayers OperatorLayers => _operatorLayers;
         /// <summary>Whether atmospheric-FX replication is currently requested
-        /// for this camera. Echoed in status JSON so the operator/gonogo can
+        /// for this camera. Echoed in status JSON so the operator or a client can
         /// confirm a control-file flip was received.</summary>
         public bool EnableFx => _enableFx;
 
@@ -1450,14 +1481,17 @@ namespace Kerbcast
 
         /* Resolve the current track target's WORLD position from FlightGlobals
            only (no orbit math): the active vessel's CoM, or its target's
-           transform. Null when there is no active vessel / no target this
-           frame (a no-op tick). */
+           transform. A craft is aimed at where this camera draws it: an onboard
+           tracker sees by the light it receives, so under a light speed a
+           distant craft is followed at its past position. Null when there is
+           no active vessel / no target this frame, or no light from the craft
+           is arriving yet (a no-op tick, so the held pose stays). */
         private UnityEngine.Vector3? ResolveTrackTarget()
         {
             if (_trackMode == TrackAim.ModeActiveVessel)
             {
                 var v = FlightGlobals.ActiveVessel;
-                return v != null ? (UnityEngine.Vector3?)v.CoM : null;
+                return v != null ? Picture.Drawn(v, v.CoM) : null;
             }
             if (_trackMode == TrackAim.ModeTarget)
             {
@@ -1465,7 +1499,9 @@ namespace Kerbcast
                     ? FlightGlobals.ActiveVessel.targetObject
                     : null;
                 var tr = tgt != null ? tgt.GetTransform() : null;
-                return tr != null ? (UnityEngine.Vector3?)tr.position : null;
+                if (tr == null) return null;
+                var craft = tgt.GetVessel();
+                return craft != null ? Picture.Drawn(craft, tr.position) : tr.position;
             }
             return null;
         }
@@ -1504,6 +1540,11 @@ namespace Kerbcast
         // never touch each other; ApplyEffectiveQuality min()s their scales.
         private int _shedLevel;
         private int _viewerLevel;
+        /* A viewer is recording this camera. Its size stays put until the
+           hold is released: the ladder still sheds load, through the stagger
+           regulator's frame rate and the other cameras' resolution, and the
+           inputs that arrive meanwhile apply on release. */
+        private bool _sizeHeld;
 
         /// <summary>Currently-applied viewer quality level (index into
         /// QualityClamp.ViewerScales; 0 = no viewer clamp).</summary>
@@ -1540,6 +1581,19 @@ namespace Kerbcast
             ApplyEffectiveQuality();
         }
 
+        /// <summary>
+        /// Hold (or release) the render size while a viewer records this
+        /// camera, so the recording never changes size mid-clip. Releasing
+        /// applies whatever the quality inputs settled on meanwhile.
+        /// </summary>
+        public void SetSizeHeld(bool held)
+        {
+            if (_sizeHeld == held) return;
+            _sizeHeld = held;
+            Debug.Log($"[Kerbcast] cam={FlightId} size hold → {held} at {RenderWidth}×{RenderHeight}");
+            if (!held) ApplyEffectiveQuality();
+        }
+
         // THE single resolution-change path. Every quality input (operator
         // ceiling changes, adaptive shed moves, viewer clamp moves) funnels
         // here, so the pooled-RT SetRenderSize mechanism is the only way
@@ -1549,9 +1603,8 @@ namespace Kerbcast
             var (resScale, drop) = ShedTable[_shedLevel];
             float scale = QualityClamp.EffectiveScale(resScale, _viewerLevel);
 
-            int targetW = QualityClamp.ScaleDimension(OperatorWidth, scale);
-            int targetH = QualityClamp.ScaleDimension(OperatorHeight, scale);
-            if (targetW != RenderWidth || targetH != RenderHeight)
+            var (targetW, targetH) = QualityClamp.ScaleSize(OperatorWidth, OperatorHeight, scale);
+            if (!_sizeHeld && (targetW != RenderWidth || targetH != RenderHeight))
             {
                 SetRenderSize(targetW, targetH);
             }
@@ -1666,6 +1719,11 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] cam={FlightId} operator layers → {_operatorLayers}");
                 }
 
+                /* A hold lands before the size inputs below, so none of them
+                   resizes a held camera; a release lands after them, so the
+                   camera resizes once, to where they all settled. */
+                if (snap.SizeHeld) SetSizeHeld(true);
+
                 // Viewer quality clamp. Absent means auto (level 0, no
                 // clamp); SetViewerQualityLevel no-ops when unchanged, so
                 // re-published snapshots are free. Applies even when the
@@ -1678,7 +1736,7 @@ namespace Kerbcast
                 // size (already capped at manual SetRenderSize) into Width/Height.
                 // Apply it as the runtime operator CEILING; the adaptive-shed and
                 // viewer-clamp min() still ride underneath via ApplyEffectiveQuality.
-                // Both fields must be present (a size needs both); the even/clamp/
+                // Both fields must be present (a size needs both); the align/clamp/
                 // <=max guards live in SetOperatorRenderSize -> SetRenderSize, so no
                 // duplication here. Changed-check avoids re-applying the same
                 // ceiling when an unrelated field triggered this poll.
@@ -1692,6 +1750,7 @@ namespace Kerbcast
                         Debug.Log($"[Kerbcast] cam={FlightId} operator render size → {w}×{h}");
                     }
                 }
+                if (!snap.SizeHeld) SetSizeHeld(false);
 
                 // Absolute FoV is applied only when its seq changes (see
                 // _lastFovSeq) so the stale fov re-published on unrelated writes /
@@ -1877,7 +1936,14 @@ namespace Kerbcast
             // (TrackAim.FovForDistance) stay distinct — this only CALLS both.
             if (TrackAim.ShouldAim(_trackMode, SupportsPan, SupportsZoom))
             {
-                UnityEngine.Vector3? target = ResolveTrackTarget();
+                UnityEngine.Vector3? target;
+                /* The light-time reads behind the target must not take the camera down: a throw holds the last pose. */
+                try { target = ResolveTrackTarget(); }
+                catch (Exception ex)
+                {
+                    LogRateLimited($"track target threw: {ex.GetType().Name}: {ex.Message}");
+                    target = null;
+                }
                 switch (TrackAim.Decide(
                     _trackMode, SupportsPan, SupportsZoom, target.HasValue, _trackHasHeld))
                 {
@@ -1998,11 +2064,11 @@ namespace Kerbcast
                 return;
             }
 
-            // Poll: drain a completed readback before issuing a new one. If one
-            // is still in flight (not done), skip this tick so the one-in-flight
-            // invariant holds — no new readback is issued below.
-            if (_capture.ReadbackInFlight && !_capture.ReadbackReady) return;
+            /* Poll: drain landed readbacks before issuing a new one. If every
+               slot is still in flight, skip this tick: no new readback is issued
+               below until one lands. */
             _capture.Drain();
+            if (!_capture.HasFreeSlot) return;
 
             // Capture staggering: KerbcastCore grants only a round-robin subset of
             // cameras a new capture each frame, so they don't all render + read
@@ -2030,6 +2096,19 @@ namespace Kerbcast
                     LogRateLimited($"rig prepare threw: {ex.GetType().Name}: {ex.Message}");
                     return;
                 }
+            }
+            try
+            {
+                if (Picture.Prepare() == RigFrame.Blank)
+                {
+                    PublishBlack();
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogRateLimited($"picture prepare threw: {ex.GetType().Name}: {ex.Message}");
+                return;
             }
 
             // Zero this frame's per-phase Last values before recording, so a
@@ -2059,8 +2138,24 @@ namespace Kerbcast
                 if (_galaxyCam != null && (_layers & CameraLayers.Galaxy) != 0)
                 {
                     long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    _integrationHost?.PerFrame(_galaxyCam, CameraLayers.Galaxy, BuildIntegrationFrameState(CameraLayers.Galaxy));
-                    _galaxyCam.Render();
+                    /* By day in an atmosphere KSP tints the galaxy cube black, and a
+                       black cube over a black clear is the clear: clearing gives the
+                       same frame without a camera render (see GalaxyBlackout). */
+                    if (KerbcastSettings.EnableGalaxySkip
+                        && (_integrationHost == null || !_integrationHost.Touches(CameraLayers.Galaxy))
+                        && GalaxySky.CanClear(_galaxyCam))
+                    {
+                        var previous = RenderTexture.active;
+                        RenderTexture.active = _galaxyCam.targetTexture;
+                        GL.Clear(true, true, _galaxyCam.backgroundColor);
+                        RenderTexture.active = previous;
+                        if (_telemetry) Telemetry.AddGalaxySkip();
+                    }
+                    else
+                    {
+                        _integrationHost?.PerFrame(_galaxyCam, CameraLayers.Galaxy, BuildIntegrationFrameState(CameraLayers.Galaxy));
+                        _galaxyCam.Render();
+                    }
                     if (_telemetry)
                         _phaseTimings.Record(RenderPhase.Galaxy,
                             (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
@@ -2120,6 +2215,7 @@ namespace Kerbcast
                                 $"ambient={RenderSettings.ambientLight} ambientMode={RenderSettings.ambientMode} " +
                                 $"scaledSunLight={(ssl == null ? "null" : $"enabled={ssl.enabled} intensity={ssl.intensity} color={ssl.color} cullingMask={ssl.cullingMask}")}");
                         }
+                        Picture.BeforeScaledLayer();
                         _integrationHost?.PerFrame(_scaledCam, CameraLayers.Scaled, BuildIntegrationFrameState(CameraLayers.Scaled));
                         RenderScaledWithRig();
                         if (_firstRender)
@@ -2141,6 +2237,7 @@ namespace Kerbcast
                     }
                     finally
                     {
+                        Picture.AfterScaledLayer();
                         foreach (var state in _faderOverrides)
                         {
                             // Restore _FadeAltitude to ScaledSpaceFader's value in the
@@ -2160,35 +2257,44 @@ namespace Kerbcast
                     _phaseTimings.Record(RenderPhase.Scaled,
                         (System.Diagnostics.Stopwatch.GetTimestamp() - scaledStart) * _msPerTick);
 
-                if (_farCam != null && (_layers & CameraLayers.Far) != 0 && !RigSkipFar)
+                /* The picture's local-layer changes are undone whatever throws in between. */
+                try
                 {
-                    long farStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    _integrationHost?.PerFrame(_farCam, CameraLayers.Far, BuildIntegrationFrameState(CameraLayers.Far));
-                    _farCam.Render();
-                    if (_telemetry)
-                        _phaseTimings.Record(RenderPhase.Far,
-                            (System.Diagnostics.Stopwatch.GetTimestamp() - farStart) * _msPerTick);
+                    Picture.BeforeLocalLayers();
+                    if (_farCam != null && (_layers & CameraLayers.Far) != 0 && !RigSkipFar)
+                    {
+                        long farStart = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                        _integrationHost?.PerFrame(_farCam, CameraLayers.Far, BuildIntegrationFrameState(CameraLayers.Far));
+                        _farCam.Render();
+                        if (_telemetry)
+                            _phaseTimings.Record(RenderPhase.Far,
+                                (System.Diagnostics.Stopwatch.GetTimestamp() - farStart) * _msPerTick);
+                    }
+
+                    Rig?.RenderBetweenFarAndNear(this);
+
+                    if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
+                    {
+                        // FX effects update materials and (re)attach their command
+                        // buffers before the render; the near render then executes
+                        // those CBs (e.g. the core sheath at AfterForwardAlpha).
+                        // Time the FX build + render + near render together (the
+                        // task's "near Render() (+ FX)" phase).
+                        long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                        _integrationHost?.PerFrame(_nearCam, CameraLayers.Near, BuildIntegrationFrameState(CameraLayers.Near));
+                        _fxHost?.Render(BuildFxFrameState());
+                        _nearCam.Render();
+                        if (_telemetry)
+                            _phaseTimings.Record(RenderPhase.Near,
+                                (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
+                    }
+
+                    Rig?.AfterLayersRender(this);
                 }
-
-                Rig?.RenderBetweenFarAndNear(this);
-
-                if (_nearCam != null && (_layers & CameraLayers.Near) != 0)
+                finally
                 {
-                    // FX effects update materials and (re)attach their command
-                    // buffers before the render; the near render then executes
-                    // those CBs (e.g. the core sheath at AfterForwardAlpha).
-                    // Time the FX build + render + near render together (the
-                    // task's "near Render() (+ FX)" phase).
-                    long t0 = _telemetry ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    _integrationHost?.PerFrame(_nearCam, CameraLayers.Near, BuildIntegrationFrameState(CameraLayers.Near));
-                    _fxHost?.Render(BuildFxFrameState());
-                    _nearCam.Render();
-                    if (_telemetry)
-                        _phaseTimings.Record(RenderPhase.Near,
-                            (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * _msPerTick);
+                    Picture.AfterLayers();
                 }
-
-                Rig?.AfterLayersRender(this);
 
                 // Composite done: re-attach Scatterer's sun-light shadow buffers
                 // so the main flight render this frame gets correct shadows. The
@@ -2198,18 +2304,16 @@ namespace Kerbcast
 
                 // Capture tail: blit _capture.CaptureRt -> ReadbackRt (via this
                 // camera's filter/nightvision/plain _captureBlit), apply the
-                // vertical-flip correction, issue the readback under the
-                // one-in-flight invariant, and record the Blit/Readback phase
-                // timings. All of it lives in CaptureCore so a second camera type
-                // reuses the exact streaming path. Time.unscaledTime is
-                // frame-constant, so reading it here yields the same value the
-                // pre-extraction Request site read.
-                double captureTsMs = Time.unscaledTime * 1000.0;
-                _capture.Publish(captureTsMs, _captureBlit);
+                // vertical-flip correction, issue the readback, and record the
+                // Blit/Readback phase timings. All of it lives in CaptureCore so a second camera type
+                // reuses the exact streaming path.
+                double captureTsMs = KerbcastCore.FrameClockMs;
+                var rt = _capture.CaptureRt;
+                var meta = _anchors.Build(this, rt != null ? rt.width : 0, rt != null ? rt.height : 0);
+                _capture.Publish(captureTsMs, _captureBlit, meta);
             }
             catch (Exception ex)
             {
-                _capture.AbortInFlight();
                 // Safety net: if a layer Render() threw mid-composite, the normal
                 // restore above was skipped. Re-attach here so the main flight
                 // render never loses Scatterer's sun-light shadow buffers. No-op
@@ -2258,6 +2362,15 @@ namespace Kerbcast
             if (_disposed) return;
             _disposed = true;
 
+            /* The files go whatever the teardown before them throws. A ring left
+               behind keeps a camera that is gone listed to every viewer, and is
+               taken over by the next camera with this id. */
+            try { DisposeRendering(partDestroyed); }
+            finally { ReleaseRingFiles(partDestroyed); }
+        }
+
+        private void DisposeRendering(bool partDestroyed)
+        {
             // The Material is owned by the static KerbcastNightVisionFilter cache;
             // only null the ref, not Destroy it.
             _nvMaterial = null;
@@ -2281,6 +2394,7 @@ namespace Kerbcast
             // destroying the camera they're attached to.
             Rig?.Dispose();
             Rig = null;
+            Picture.Dispose();
             _fxHost?.Dispose();
             _fxHost = null;
             // Detach visual-mod integrations before destroying the cameras: this
@@ -2304,11 +2418,18 @@ namespace Kerbcast
             // Release the capture tail's pooled render-target sets (its current
             // capture/readback pair are members of one of these, so this covers
             // them). Safe here because the camera is being torn down — no further
-            // readbacks will be issued. The ring is owned here, disposed below.
+            // readbacks will be issued. The ring is owned here, disposed in ReleaseRingFiles.
             _capture?.Dispose();
+        }
 
-            _ring?.Dispose();
-            _controlBlock?.Dispose();
+        private void ReleaseRingFiles(bool partDestroyed)
+        {
+            /* Each step runs whatever the one before threw, and none of them
+               replaces an exception already leaving DisposeRendering. */
+            try { _ring?.Dispose(); }
+            catch (Exception ex) { Debug.LogWarning($"[Kerbcast] cam={FlightId} ring dispose failed: {ex.Message}"); }
+            try { _controlBlock?.Dispose(); }
+            catch (Exception ex) { Debug.LogWarning($"[Kerbcast] cam={FlightId} control block dispose failed: {ex.Message}"); }
             try
             {
                 if (File.Exists(_ringPath)) File.Delete(_ringPath);

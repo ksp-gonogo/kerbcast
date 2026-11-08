@@ -20,6 +20,11 @@ namespace Kerbcast
         public uint FlightId { get; }
 
         private readonly ProtoCrewMember _pcm;
+        /* The light-time picture around KSP's EVA portrait stack, which has no
+           layer hooks of its own; the seated portrait sees only the IVA. */
+        private readonly PicturePass _picture;
+        /* The kerbal on EVA this tick, whose portrait cameras are the lens; null while seated. */
+        private KerbalEVA _evaNow;
         /* Current owning part: the seat part while seated, the EVA part while on
            EVA. Re-resolved every tick by kerbal NAME (never a cached KerbalEVA
            /seat ref) so Vessel/OwnsPart stay correct across a seat<->EVA switch and
@@ -78,6 +83,7 @@ namespace Kerbcast
         private readonly PhaseTimings _phaseTimings = new PhaseTimings();
         private int _consecutiveErrors;
 
+
         // KSP nulls Canvas.willRenderCanvases (static private) around a manual
         // portrait Camera.Render so a re-entrant canvas render can't fire
         // mid-render; mirror that here. FieldInfo cached once for the process.
@@ -109,7 +115,7 @@ namespace Kerbcast
             _ringPath = Path.Combine(ringDir, $"{FlightId}.ring");
             _infoPath = Path.Combine(ringDir, $"{FlightId}.info.json");
             _controlPath = Path.Combine(ringDir, $"{FlightId}.control.bin");
-            _maxSide = MakeEven(Math.Min(512, Math.Min(width, height)));
+            _maxSide = QualityClamp.AlignDown(Math.Min(512, Math.Min(width, height)));
             _renderSide = _maxSide;
             // Ring allocated at the SQUARE MAX so live auto-resolution stays
             // RT-pool-only. Each slot's header carries the actual content side, so
@@ -120,7 +126,15 @@ namespace Kerbcast
             // EVA cam that is never subscribed reports "seat" in /cameras until the
             // first subscribe re-resolves it.
             if (vessel != null && vessel.isEVA) _crewLocation = "eva";
+            _picture = new PicturePass(() => _evaNow != null ? _evaNow.vessel : null, EvaEye,
+                () => _evaNow != null ? _evaNow.kerbalCam00 : null, () => _capture?.CaptureRt);
             WriteInfoManifest();
+        }
+
+        private Vector3 EvaEye()
+        {
+            var cam = _evaNow != null ? _evaNow.kerbalPortraitCamera : null;
+            return cam != null ? cam.transform.position : Vector3.zero;
         }
 
         // Re-read live off the owning part; guard null so a torn-down part
@@ -151,6 +165,9 @@ namespace Kerbcast
             => _pacing.Overdue(now, effectiveFps);
         public void MarkCaptureGranted(float now, float effectiveFps)
             => _pacing.MarkGranted(now, effectiveFps);
+        public bool ReadyToCapture => _capture == null || _capture.CanIssue;
+        public double LastCaptureUt => _capture != null ? _capture.LastPublishedUt : double.NaN;
+        public CaptureCounters Counters { get; } = new CaptureCounters();
 
         public int RefreshFailureStreak { get; set; }
 
@@ -190,14 +207,15 @@ namespace Kerbcast
 
                 // Auto-resolution: the sidecar writes the effective max-consumer
                 // size into Width/Height (both present-flag gated). A face is
-                // square, so fit it to the smaller reported side, rounded even and
+                // square, so fit it to the smaller reported side, aligned to 16 and
                 // clamped to [MinSide, _maxSide]. SetRenderSize no-ops when unchanged
-                // (re-published snapshots are free).
-                if (snap.Width.HasValue && snap.Height.HasValue)
+                // (re-published snapshots are free). A held size (a viewer is
+                // recording) waits; the release snapshot carries the latest size.
+                if (!snap.SizeHeld && snap.Width.HasValue && snap.Height.HasValue)
                 {
-                    int even = MakeEven((int)Math.Min(snap.Width.Value, snap.Height.Value));
+                    int aligned = QualityClamp.AlignDown((int)Math.Min(snap.Width.Value, snap.Height.Value));
                     int lo = Math.Min(MinSide, _maxSide);
-                    int side = Math.Max(lo, Math.Min(_maxSide, even));
+                    int side = Math.Max(lo, Math.Min(_maxSide, aligned));
                     SetRenderSize(side);
                 }
             }
@@ -222,7 +240,9 @@ namespace Kerbcast
                 // succeeds: a throw there (e.g. RenderTexture.Create() failing)
                 // must leave _capture null so the next tick retries construction,
                 // rather than latching a half-initialized capture tail.
-                var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0);
+                var capture = new CaptureCore(_ring, _phaseTimings, LogRateLimited, () => _consecutiveErrors = 0,
+                    () => LiveLightTime.For(_occupiedPart != null ? _occupiedPart.transform.position : Vector3.zero, Vessel),
+                    Counters);
                 capture.BuildTargets(_renderSide, _renderSide);
                 _capture = capture;
             }
@@ -239,17 +259,15 @@ namespace Kerbcast
         // Square resize onto the shared CaptureCore path — the facecam mirror of
         // KerbcastCamera.SetRenderSize with w==h. Records the requested side; the
         // pooled-RT switch happens in EnsureCapture (inside Refresh's try, so a
-        // BuildTargets throw is caught). Even (H.264 chroma) and within
+        // BuildTargets throw is caught). A multiple of 16 and within
         // (0, _maxSide]; faces have no layers/zoom/pan, so there is no
         // ApplyEffectiveQuality machinery.
         public void SetRenderSize(int side)
         {
-            if (side <= 0 || side % 2 != 0 || side > _maxSide || side == _renderSide) return;
+            if (side <= 0 || side % QualityClamp.FrameAlignment != 0 || side > _maxSide || side == _renderSide) return;
             _renderSide = side;
             Debug.Log($"[Kerbcast] kerbal cam={FlightId} render side → {side}");
         }
-
-        private static int MakeEven(int v) => v & ~1; // round down to even
 
         private void LogRateLimited(string message)
         {
@@ -384,11 +402,34 @@ namespace Kerbcast
         {
             if (eva == null || eva.kerbalPortraitCamera == null) return false;
             RenderLayer(eva.kerbalCamSkyBox, target);
-            RenderLayer(eva.kerbalCamAtmos, target);
-            RenderLayer(eva.kerbalCam01, target);
-            RenderLayer(eva.kerbalCam00, target);
-            RenderLayer(eva.kerbalPortraitCamera, target);
+            try
+            {
+                _picture.BeforeScaledLayer();
+                RenderLayer(eva.kerbalCamAtmos, target);
+            }
+            finally { _picture.AfterScaledLayer(); }
+            /* The picture's local-layer changes are undone whatever throws in between. */
+            try
+            {
+                _picture.BeforeLocalLayers();
+                RenderLayer(eva.kerbalCam01, target);
+                RenderLayer(eva.kerbalCam00, target);
+                RenderLayer(eva.kerbalPortraitCamera, target);
+            }
+            finally
+            {
+                _picture.AfterLayers();
+            }
             return true;
+        }
+
+        /* A blanked feed streams black, never the scene. */
+        private static void ClearBlack(RenderTexture target)
+        {
+            var prev = RenderTexture.active;
+            RenderTexture.active = target;
+            GL.Clear(true, true, Color.black);
+            RenderTexture.active = prev;
         }
 
         private static void RenderLayer(Camera cam, RenderTexture target)
@@ -409,22 +450,19 @@ namespace Kerbcast
             PollSubscription();
             if (!_subscribed) return;
 
-            // CaptureCore.Publish sets its in-flight flag BEFORE issuing the
-            // AsyncGPUReadback request, which can throw (Deck/Mesa GPU-readback
-            // quirks). Wrap the whole capture attempt so a throw anywhere in
-            // here (including EnsureCapture's BuildTargets) aborts the in-flight
-            // flag instead of leaving it stuck true, which would otherwise make
-            // every later Refresh return early at the ReadbackInFlight guard
-            // forever, silently freezing this camera. Mirrors KerbcastCamera.
+            /* Wrap the whole capture attempt so a throw anywhere in here
+               (including EnsureCapture's BuildTargets or a Deck/Mesa readback
+               quirk) costs this tick only. CaptureCore takes a readback slot
+               only once its request exists, so a throw never leaves one stuck.
+               Mirrors KerbcastCamera. */
             try
             {
                 var capture = EnsureCapture();
                 if (!mayIssueReadback) return;
 
-                // One-in-flight invariant: CaptureCore.Publish assumes at most one
-                // readback outstanding. If the previous one hasn't completed, skip
-                // issuing another this tick (it drains via the Drain above).
-                if (capture.ReadbackInFlight) return;
+                /* Every readback slot still in flight: skip issuing another this
+                   tick (they drain via the Drain above). */
+                if (!capture.HasFreeSlot) return;
 
                 // Where is the kerbal this tick? Never caches the resolved refs.
                 var loc = ResolveLocation(out _, out var eva);
@@ -432,6 +470,16 @@ namespace Kerbcast
                 // None = mid-transition (seat vacated, EVA part not spawned yet, or
                 // vice-versa): no frame this tick, but the feed stays alive.
                 if (loc == CrewLocation.None) return;
+
+                /* On EVA the picture decides first whether the frame can be drawn
+                   without showing a craft early; if not it goes out black. */
+                _evaNow = loc == CrewLocation.Eva ? eva : null;
+                if (_evaNow != null && _picture.Prepare() == RigFrame.Blank)
+                {
+                    ClearBlack(capture.CaptureRt);
+                    capture.Publish(KerbcastCore.FrameClockMs, (c, r) => Graphics.Blit(c, r));
+                    return;
+                }
 
                 // Null Canvas.willRenderCanvases around the manual render(s) (KSP's
                 // own portrait path does this), restoring it in finally. Wraps both
@@ -459,12 +507,11 @@ namespace Kerbcast
                 if (!rendered) return;
 
                 // Plain blit (no Hullcam filter); CaptureCore applies the flip and
-                // issues the readback under the one-in-flight invariant.
-                capture.Publish(Time.unscaledTime * 1000.0, (c, r) => Graphics.Blit(c, r));
+                // issues the readback.
+                capture.Publish(KerbcastCore.FrameClockMs, (c, r) => Graphics.Blit(c, r));
             }
             catch (Exception ex)
             {
-                _capture?.AbortInFlight();
                 LogRateLimited($"capture pipeline threw: {ex.GetType().Name}: {ex.Message}");
             }
         }
@@ -574,6 +621,7 @@ namespace Kerbcast
                 catch (Exception ex) { Debug.LogWarning($"[Kerbcast] kerbal cam={FlightId} destroyed manifest write failed: {ex.Message}"); }
             }
 
+            _picture.Dispose();
             // Release the capture tail's pooled RTs before the ring: the camera
             // is torn down so no further readbacks issue.
             _capture?.Dispose();
