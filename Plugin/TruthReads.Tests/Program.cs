@@ -154,6 +154,8 @@ var truthPins = new[]
         "the launch site a created lens is placed at"),
     Pin.Line("CommandCameraProvider.cs", "Feed.NetworkLaunchedFrom", "return _p._spaceCenter ? _track.LaunchedFrom : FlightGlobals.ActiveVessel?.launchedFrom;", 1,
         "the launch site a network's unnamed launch site vantage is placed at"),
+    Pin.Line("CommandLineOfSight.cs", "CommandLineOfSight.EntryFor", "string launchedFrom = cv.Name.Length > 0 ? cv.Name : FlightGlobals.ActiveVessel?.launchedFrom;", 1,
+        "the launch site a host's unnamed launch site vantage stands beside, as a created lens's does"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.PrepareRender", "if (rides != null && rides.loaded) cam.Picture.HideOwn(rides);", 1,
         "whether the lens's own craft is drawn in the scene, to hide its parts from this camera"),
     Pin.Line("CommandCameraMarker.cs", "CommandCameraMarker.Place", "_go.transform.position = new Vector3((float)p.X, (float)p.Y, (float)p.Z);", 1, "places the marker object, not a craft read"),

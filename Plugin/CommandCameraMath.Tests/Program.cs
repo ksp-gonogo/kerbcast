@@ -782,6 +782,57 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         $"mask: out of budget, the sea-level skyline stands in and nothing is kept (got {fb:G6}, dip {dip:G6})");
 }
 
+// Line of sight at one instant: bodies where they are then, the skyline turned with its body.
+{
+    double seaR = 600000, rMax = 606800, rs = seaR + 30;
+    var up = new DVec3(1, 0, 0);
+    var axis = new DVec3(0, 1, 0);
+    var losEast = new DVec3(0, 0, 1);
+    var losCentre = new DVec3(0, 0, 0);
+    var relS = up * rs;
+
+    /* A moon on a circular orbit crosses the line to a far craft and moves on. */
+    double moonOrbit = 1.2e7, moonR = 200000, period = 138984;
+    DVec3 MoonAt(double ut)
+    {
+        double a = 2 * Math.PI * ut / period;
+        return new DVec3(Math.Cos(a), 0, Math.Sin(a)) * moonOrbit;
+    }
+    var craft = up * 3e7;
+    string FirstBlocker(double ut) =>
+        !CommandCameraMath.SegmentClearOfSphere(relS, craft, MoonAt(ut), moonR) ? "Mun"
+        : !CommandCameraMath.SegmentClearOfSphere(relS, craft, losCentre, seaR) ? "Kerbin" : null;
+    var blocked = LineOfSightMath.Answer(relS, craft, FirstBlocker(0), "Kerbin");
+    var clear = LineOfSightMath.Answer(relS, craft, FirstBlocker(period / 8), "Kerbin");
+    Check(blocked.Known && !blocked.Visible && blocked.Occluder == "Mun" && !blocked.BelowHorizon,
+        "sight: a moon on the line at one instant hides the craft");
+    Check(clear.Known && clear.Visible && clear.Occluder == null && Near(clear.RangeM, 3e7 - rs, 1e-6),
+        "sight: an eighth of an orbit later it has moved clear, with the range to the craft");
+    var under = LineOfSightMath.Answer(relS, up * -3e7, "Kerbin", "Kerbin");
+    Check(!under.Visible && under.BelowHorizon, "sight: the vantage's own body in the way is below the horizon");
+    Check(!LineOfSightMath.Unknown.Known && double.IsNaN(LineOfSightMath.Unknown.RangeM), "sight: unknown says nothing");
+
+    /* A 1 km ridge 20 km east; a far craft fixed in space just under its crest rises over it as the body turns. */
+    var ridgeDir = (up * Math.Cos(20000 / seaR) + losEast * Math.Sin(20000 / seaR)).Normalized;
+    var mask = new HorizonMask(rs, seaR, rMax, 0.25, d =>
+        CommandCameraMath.AngleBetween(d, ridgeDir) < 1500 / seaR ? seaR + 1000 : seaR);
+    HorizonMask.Basis(relS, axis, out var mu, out var mn, out var me);
+    double crest = mask.MaskAt(Math.PI / 2, Math.PI / 4, mu, mn, me);
+    var target = relS + (up * Math.Sin(crest - 0.002) + losEast * Math.Cos(crest - 0.002)) * 2e6;
+    double losW = 2 * Math.PI / 21549.425;
+    var losSpin = new DVec3(0, -losW, 0);
+    double dt = 0.006 / losW;
+    var stationLater = CommandCameraMath.CarriedByBody(relS, losCentre, losSpin, dt);
+    Check(DVec3.Dot(stationLater - relS, losEast) > 0, "sight: the body turns its stations eastward");
+    Check(LineOfSightMath.SkylineBlocks(mask, relS, target, losCentre, losCentre, losSpin, 0, axis, 0),
+        "sight: at the first instant the ridge hides the craft");
+    Check(!LineOfSightMath.SkylineBlocks(mask, stationLater, target, losCentre, losCentre, losSpin, dt, axis, 0),
+        "sight: once the body has turned 0.006 rad the craft has risen over the ridge");
+    var stationEarlier = CommandCameraMath.CarriedByBody(relS, losCentre, losSpin, -dt);
+    Check(LineOfSightMath.SkylineBlocks(mask, stationEarlier, target, losCentre, losCentre, losSpin, -dt, axis, 0),
+        "sight: as long before, it was lower still and hidden");
+}
+
 // A station stands on its own ground, whatever altitude the game stored.
 {
     Check(CommandCameraMath.StationGroundAltitude(-230, 64.8) == 64.8, "station: an altitude under the ground is raised to it");

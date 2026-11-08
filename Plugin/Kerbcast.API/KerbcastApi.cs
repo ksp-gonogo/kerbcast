@@ -66,6 +66,7 @@ namespace Kerbcast.Api
                 case ApiFeature.Optics:
                 case ApiFeature.NetworkCameras:
                 case ApiFeature.GroundStations:
+                case ApiFeature.LineOfSight:
                     return true;
                 default:
                     return false;

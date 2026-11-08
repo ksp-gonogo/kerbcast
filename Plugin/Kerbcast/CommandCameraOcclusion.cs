@@ -154,10 +154,9 @@ namespace Kerbcast
             source = null;
             if (_maskWanted && b == _maskBody && _mask != null)
             {
-                var relS = CommandCameraMath.ToBodyFrameNow(station, centreAtT, centreNow, spin, dt) - centreNow;
-                var relT = CommandCameraMath.ToBodyFrameNow(target, centreAtT, centreNow, spin, dt) - centreNow;
                 var z = b.BodyFrame.Z;
-                if (!_mask.Blocks(relS, relT, new DVec3(z.x, z.z, z.y), targetRadius)) return false;
+                if (!LineOfSightMath.SkylineBlocks(_mask, station, target, centreAtT, centreNow, spin, dt, new DVec3(z.x, z.z, z.y), targetRadius))
+                    return false;
                 source = SourceTerrain;
                 return true;
             }

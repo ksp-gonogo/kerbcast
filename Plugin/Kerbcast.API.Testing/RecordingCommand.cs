@@ -22,6 +22,7 @@ namespace Kerbcast.Api.Testing
         readonly Dictionary<uint, NetworkOptions> networkOptions = new Dictionary<uint, NetworkOptions>();
         readonly Dictionary<uint, List<NetworkVantageStatus>> networkStatus = new Dictionary<uint, List<NetworkVantageStatus>>();
         readonly List<GroundStationInfo> stations = new List<GroundStationInfo>();
+        LineOfSightResult sight = new LineOfSightResult(false, false, null, false, double.NaN);
         uint nextNetworkId = 0x4E000001;
         readonly List<PublishedSnapshot> published = new List<PublishedSnapshot>();
         string lockOwner;
@@ -93,6 +94,9 @@ namespace Kerbcast.Api.Testing
          */
         public void SetNetworkStatus(uint flightId, IEnumerable<NetworkVantageStatus> status) =>
             networkStatus[flightId] = new List<NetworkVantageStatus>(status ?? new NetworkVantageStatus[0]);
+
+        /** <summary>What every LineOfSight call answers: not Known until a test sets it.</summary> */
+        public void SetLineOfSight(LineOfSightResult answer) => sight = answer;
 
         /** <summary>What GroundStations returns: none until a test sets them.</summary> */
         public void SetGroundStations(IEnumerable<GroundStationInfo> list)
@@ -536,6 +540,13 @@ namespace Kerbcast.Api.Testing
                 NodeName = s.NodeName, DisplayName = s.DisplayName, BodyIndex = s.BodyIndex, Latitude = s.Latitude,
                 Longitude = s.Longitude, Altitude = s.Altitude, Enabled = s.Enabled,
             });
+        }
+
+        public LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN)
+        {
+            kc.Enter("LineOfSight", ApiFeature.LineOfSight);
+            kc.Record($"LineOfSight {vantage?.ToString() ?? "null"} {ut} {bodyIndex} {position}");
+            return vantage == null ? new LineOfSightResult(false, false, null, false, double.NaN) : sight;
         }
 
         public IReadOnlyList<CommandTarget> Targets(uint flightId)

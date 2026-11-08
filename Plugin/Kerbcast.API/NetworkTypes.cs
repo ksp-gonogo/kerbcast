@@ -117,6 +117,37 @@ namespace Kerbcast.Api
         public override string ToString() => $"GroundStation({NodeName} '{DisplayName}' body {BodyIndex} {Latitude}, {Longitude}, {Altitude} m{(Enabled ? "" : " off")})";
     }
 
+    /** <summary>Whether a vantage can see a point at one instant, from <see cref="ICommand.LineOfSight"/>.</summary> */
+    public readonly struct LineOfSightResult
+    {
+        public LineOfSightResult(bool known, bool visible, string occluder, bool belowHorizon, double rangeM)
+        {
+            Known = known;
+            Visible = visible;
+            Occluder = occluder;
+            BelowHorizon = belowHorizon;
+            RangeM = rangeM;
+        }
+
+        /** <summary>False when the vantage cannot be placed at the instant, or the point's body is unknown; nothing else is then meaningful.</summary> */
+        public bool Known { get; }
+
+        /** <summary>No body is in the way.</summary> */
+        public bool Visible { get; }
+
+        /** <summary>The first body in the way, by its bodyName, or null.</summary> */
+        public string Occluder { get; }
+
+        /** <summary>The body in the way is the one the vantage stands on or orbits: its own horizon or skyline.</summary> */
+        public bool BelowHorizon { get; }
+
+        /** <summary>Metres from the vantage to the point; NaN when not Known.</summary> */
+        public double RangeM { get; }
+
+        public override string ToString() =>
+            !Known ? "LineOfSight(unknown)" : Visible ? $"LineOfSight(visible, {RangeM} m)" : $"LineOfSight(blocked by {Occluder}{(BelowHorizon ? ", below horizon" : "")}, {RangeM} m)";
+    }
+
     /** <summary>How a tracking network holds after a cut. Every value finite and 0 or more.</summary> */
     public sealed class NetworkOptions
     {

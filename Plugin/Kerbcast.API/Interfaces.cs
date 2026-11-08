@@ -215,6 +215,22 @@ namespace Kerbcast.Api
          */
         IReadOnlyList<GroundStationInfo> GroundStations();
 
+        /**
+         * <summary>
+         * Whether a lens standing at <paramref name="vantage"/> could see a point at game time <paramref name="ut"/>:
+         * the vantage, every body and the vantage's own skyline are placed at that one instant, and the line is tested
+         * with the occlusion command cameras draw with. The point is the caller's, in the world model's state vector
+         * frame (<see cref="WorldModelBuilder.StateVector"/>: about body <paramref name="bodyIndex"/>, z-up, KSP's fixed
+         * inertial frame), with <paramref name="radiusM"/> letting a craft show over a skyline (NaN for a point). There is
+         * no light time or delay in it: the caller picks the instant and the point. A craft vantage is placed on its
+         * orbit, or carried by its body when landed. The skyline is measured lazily, a few bins per call, so the first
+         * calls toward a new direction may read the smooth horizon. It is a read for the host alone: no lock applies,
+         * nothing is shown to viewers and no camera uses it. Check <see cref="KerbcastApi.Supports"/> with
+         * <see cref="ApiFeature.LineOfSight"/> first.
+         * </summary>
+         */
+        LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN);
+
         /** <summary>Every craft a command feed could watch, empty when it is not a command feed.</summary> */
         IReadOnlyList<CommandTarget> Targets(uint flightId);
 

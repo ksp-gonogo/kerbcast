@@ -28,6 +28,8 @@ namespace Kerbcast.Api
         NetworkCameras = 9,
         /** <summary><see cref="ICommand.GroundStations"/>. Added in API 1.5.</summary> */
         GroundStations = 10,
+        /** <summary><see cref="ICommand.LineOfSight"/>. Added in API 1.5.</summary> */
+        LineOfSight = 11,
     }
 
     public enum CameraKind

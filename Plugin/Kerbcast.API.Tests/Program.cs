@@ -44,6 +44,7 @@ Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(Api
 Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.3");
 Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras, from API 1.4");
 Check(KerbcastApi.Supports(ApiFeature.GroundStations) && (int)ApiFeature.GroundStations == 10, "shipped: the ground station list, from API 1.5");
+Check(KerbcastApi.Supports(ApiFeature.LineOfSight) && (int)ApiFeature.LineOfSight == 11, "shipped: line of sight, from API 1.5");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
 
 // Enum numbers are part of the contract.
@@ -219,6 +220,14 @@ using (var kc = RecordingKerbcast.Install())
         Check(status.Count == 2 && status[0].Active && !status[1].Active && status[1].Fallback && status[1].Label == "North dish",
             "NetworkStatus lists every vantage in order");
         Check(cmd.NetworkStatus(500).Count == 0, "a feed at one site has no network status");
+        var relay = NetworkVantage.Vessel(77);
+        var sight = cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0));
+        Check(!sight.Known && double.IsNaN(sight.RangeM), "line of sight is unknown until a test sets an answer");
+        kc.Command.SetLineOfSight(new LineOfSightResult(true, false, "Mun", false, 2.5e6));
+        sight = cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0), 4);
+        Check(sight.Known && !sight.Visible && sight.Occluder == "Mun" && sight.RangeM == 2.5e6, "a test sets what line of sight answers");
+        Check(OnOtherThread(() => Throws<InvalidOperationException>(() => cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0)))),
+            "line of sight keeps to the main thread");
         Check(cmd.GroundStations().Count == 0, "no ground stations until a test sets them");
         kc.Command.SetGroundStations(new[]
         {

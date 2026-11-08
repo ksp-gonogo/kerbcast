@@ -270,6 +270,15 @@ namespace Kerbcast
             return result;
         }
 
+        readonly CommandLineOfSight sight = new CommandLineOfSight();
+
+        public LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN)
+        {
+            Enter(nameof(LineOfSight), ApiFeature.LineOfSight);
+            var a = sight.Check(vantage, ut, bodyIndex, new DVec3(position.X, position.Y, position.Z), radiusM);
+            return new LineOfSightResult(a.Known, a.Visible, a.Occluder, a.BelowHorizon, a.RangeM);
+        }
+
         public IReadOnlyList<GroundStationInfo> GroundStations()
         {
             Enter(nameof(GroundStations), ApiFeature.GroundStations);
@@ -324,20 +333,7 @@ namespace Kerbcast
             var specs = new List<NetworkVantageSpec>(vantages.Count);
             foreach (var v in vantages)
             {
-                CommandVantage cv = null;
-                if (v != null)
-                {
-                    switch (v.Kind)
-                    {
-                        case SiteKind.Station: cv = CommandVantage.Station(v.Name, v.Height); break;
-                        case SiteKind.LaunchSite: cv = CommandVantage.LaunchSite(v.Name, v.Distance, v.Bearing, v.Height); break;
-                        case SiteKind.Vessel: cv = CommandVantage.Vessel(v.PersistentId); break;
-                        case SiteKind.Surface:
-                            var body = BodyByIndex(v.BodyIndex);
-                            if (body != null) cv = CommandVantage.Surface(body.bodyName, v.Latitude, v.Longitude, v.Height);
-                            break;
-                    }
-                }
+                var cv = ToCommandVantage(v);
                 if (cv == null)
                 {
                     bad = NetworkResult.BadVantage;
@@ -346,6 +342,22 @@ namespace Kerbcast
                 specs.Add(new NetworkVantageSpec { Vantage = cv, Label = v.Label, Fallback = v.Fallback });
             }
             return specs;
+        }
+
+        /* The plugin's vantage for an API one; null for a null vantage or a surface on an unknown body. */
+        internal static CommandVantage ToCommandVantage(NetworkVantage v)
+        {
+            if (v == null) return null;
+            switch (v.Kind)
+            {
+                case SiteKind.Station: return CommandVantage.Station(v.Name, v.Height);
+                case SiteKind.LaunchSite: return CommandVantage.LaunchSite(v.Name, v.Distance, v.Bearing, v.Height);
+                case SiteKind.Vessel: return CommandVantage.Vessel(v.PersistentId);
+                case SiteKind.Surface:
+                    var body = BodyByIndex(v.BodyIndex);
+                    return body != null ? CommandVantage.Surface(body.bodyName, v.Latitude, v.Longitude, v.Height) : null;
+            }
+            return null;
         }
 
         static CelestialBody BodyByIndex(int index)
