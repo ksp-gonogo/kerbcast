@@ -29,6 +29,8 @@ namespace Kerbcast
         public VantageState State;
         /* Stops; NaN unless the vantage can see the craft. */
         public double Score;
+        /* The body hiding the craft while State is Occluded, else null. */
+        public string Occluder;
     }
 
     /* What a network needs from the camera it drives, so the provider builds it beside the rig. */
@@ -97,6 +99,7 @@ namespace Kerbcast
         private readonly bool[] _clearAhead = new bool[NetworkMath.MaxVantages];
         private readonly string[] _labels = new string[NetworkMath.MaxVantages];
         private readonly string[] _keys = new string[NetworkMath.MaxVantages];
+        private readonly string[] _occluders = new string[NetworkMath.MaxVantages];
         private float _passAt = float.MinValue;
         /* What a scoring pass costs, smoothed, for the occasional log line a rig check reads. */
         private const float CostLogSeconds = 30f;
@@ -201,6 +204,7 @@ namespace Kerbcast
             {
                 _states[i] = VantageState.Pending;
                 _scores[i] = double.NaN;
+                _occluders[i] = null;
             }
             _switch.Renumber(current != null ? _entries.IndexOf(current) : -1);
             if (current != null && _switch.Current >= 0) _relabel = true;
@@ -364,6 +368,7 @@ namespace Kerbcast
                 var input = Gather(e, ut, rules, maxRange, over, sun);
                 _states[i] = NetworkMath.Gate(input);
                 _scores[i] = _states[i] == VantageState.Ok ? NetworkMath.Score(input, daylight) : double.NaN;
+                _occluders[i] = _states[i] == VantageState.Occluded ? input.Occluder : null;
             }
         }
 
@@ -398,7 +403,11 @@ namespace Kerbcast
             if (occluder != null)
             {
                 if (occluder == body.bodyName) v.BelowHorizon = true;
-                else v.Occluded = true;
+                else
+                {
+                    v.Occluded = true;
+                    v.Occluder = occluder;
+                }
             }
             double air = 0;
             if (body.atmosphere)
@@ -492,6 +501,7 @@ namespace Kerbcast
                     Fallback = i == _fallback,
                     State = _states[i],
                     Score = _scores[i],
+                    Occluder = _occluders[i],
                 });
             }
         }

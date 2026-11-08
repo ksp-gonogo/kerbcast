@@ -70,5 +70,33 @@ Check(ksc != CameraId.CommandCameraWireId("Harvester Massif"), "different statio
 Check(CameraId.SiteHashKey("KSC") == "ground:KSC", "a site's hash input is ground:<name>, so ids never renumber");
 Check(CameraId.SiteHashKey(null) == "ground:", "the hash input tolerates a null name");
 
+/* Saved network ids: one per slot, all in the reserved range, and no other
+   camera id ever lands there. 400k names cover about a dozen hashes that
+   would have fallen in the range before the fold. */
+Check(CameraId.NetworkWireId(0) == 0xFFFF0000u, "slot 0 is the range start");
+Check(CameraId.NetworkWireId(CameraId.NetworkSlots - 1) == 0xFFFFFFFEu, "the last slot stops short of uint.MaxValue");
+bool slotsOk = true;
+var slotIds = new System.Collections.Generic.HashSet<uint>();
+for (int slot = 0; slot < CameraId.NetworkSlots; slot++)
+{
+    uint id = CameraId.NetworkWireId(slot);
+    if (!CameraId.IsNetworkId(id) || !CameraId.IsKerbalId(id) || !slotIds.Add(id)) slotsOk = false;
+}
+Check(slotsOk, "every slot has its own id in the network range");
+bool threw = false;
+try { CameraId.NetworkWireId(CameraId.NetworkSlots); } catch (ArgumentOutOfRangeException) { threw = true; }
+Check(threw, "a slot past the range is refused");
+int inRange = 0;
+for (int i = 0; i < 400000; i++)
+{
+    string name = "Kerman " + i;
+    if (CameraId.IsNetworkId(CameraId.KerbalWireId(name))) inRange++;
+    if (CameraId.IsNetworkId(CameraId.CommandCameraWireId(name))) inRange++;
+    if (CameraId.IsNetworkId(CameraId.CommandCameraWireId(CameraId.CreatedCommandCameraKey(i)))) inRange++;
+    if (CameraId.IsNetworkId(CameraId.Synthetic((uint)i * 2654435761u, i % 4, name))) inRange++;
+}
+Check(inRange == 0, $"no kerbal, command or part camera id lands in the network range ({inRange} did)");
+Check(!CameraId.IsNetworkId(CameraId.KerbalWireId("Jebediah Kerman")), "a kerbal id is outside the network range");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

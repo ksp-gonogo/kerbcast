@@ -489,7 +489,7 @@ namespace Kerbcast
                 for (int i = 0; i < vantages.Count; i++) keys.Add(vantages[i].Key);
                 if (TryResolveNetworkAim(0, keys, null, aim, out orbit) != AimResult.Ok) return Api.NetworkResult.BadAim;
             }
-            flightId = provider.CreateNetwork(vantages, name, tuning, aim, orbit, core.CameraFlightIds(), out string error);
+            flightId = provider.CreateNetwork(vantages, name, tuning, aim, orbit, core.CameraFlightIds(), out string error, owner ?? "");
             if (flightId != 0) return Api.NetworkResult.Ok;
             Debug.LogWarning($"[Kerbcast][CMDCAM] network camera refused: {error}");
             return Api.NetworkResult.BadVantage;
@@ -502,7 +502,7 @@ namespace Kerbcast
             if (core == null || provider == null) return Api.NetworkResult.NotRunning;
             var refused = NetworkLock(core, owner);
             if (refused != Api.NetworkResult.Unknown) return refused;
-            if (!provider.IsNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
+            if (!provider.IsNetwork(flightId) || core.IsSavedNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
             var listed = NetworkListResult(vantages, tuning ?? NetworkTuning.Default);
             if (listed != Api.NetworkResult.Ok) return listed;
             return provider.SetNetworkVantages(flightId, vantages, tuning, out _) ? Api.NetworkResult.Ok : Api.NetworkResult.BadVantage;
@@ -515,8 +515,62 @@ namespace Kerbcast
             if (core == null || provider == null) return Api.NetworkResult.NotRunning;
             var refused = NetworkLock(core, owner);
             if (refused != Api.NetworkResult.Unknown) return refused;
-            if (!provider.IsNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
+            if (!provider.IsNetwork(flightId) || core.IsSavedNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
             return core.DestroyCommandCamera(flightId) ? Api.NetworkResult.Ok : Api.NetworkResult.NotCommandFeed;
+        }
+
+        /*
+         * A saved network's camera for this scene. No lock check: a game with
+         * a reserved lock starts every scene held, and the saved list is the
+         * player's, not a viewer's live request. A watched craft is aimed at
+         * without asking what any site knows of it, so the watch holds under
+         * a world model too; each vantage still sees the craft only by what
+         * its own site knows. A craft no longer in the game leaves the camera
+         * on its default craft.
+         */
+        internal static uint StartSavedNetwork(SavedNetwork n, out string error)
+        {
+            error = null;
+            var core = KerbcastCore.Instance;
+            var provider = core?.CommandProvider;
+            if (provider == null)
+            {
+                error = "Kerbcast is not running in this scene";
+                return 0;
+            }
+            var specs = new List<NetworkVantageSpec>(n.Vantages.Count);
+            foreach (var v in n.Vantages)
+                specs.Add(new NetworkVantageSpec { Vantage = v.Vantage, Label = v.Label, Fallback = v.Fallback });
+            CommandAim aim = null;
+            if (n.WatchPersistentId != 0)
+            {
+                if (CommandCameraSite.VantageExists(n.WatchPersistentId)) aim = CommandAim.Vessel(n.WatchPersistentId);
+                else Debug.LogWarning($"[Kerbcast][CMDCAM] saved network '{n.Name}' watches craft {n.WatchPersistentId}, which no longer exists; "
+                    + "it watches the active vessel until edited");
+            }
+            return provider.CreateSavedNetwork(n.FlightId, specs, n.Name, n.Tuning, aim, core.CameraFlightIds(), out error);
+        }
+
+        /* A saved network's new list and options on its running camera, and its watch when that changed. False when it is not running here. */
+        internal static bool UpdateSavedNetwork(SavedNetwork n, bool watchChanged)
+        {
+            var core = KerbcastCore.Instance;
+            var provider = core?.CommandProvider;
+            if (provider == null || !provider.IsNetwork(n.FlightId)) return false;
+            var specs = new List<NetworkVantageSpec>(n.Vantages.Count);
+            foreach (var v in n.Vantages)
+                specs.Add(new NetworkVantageSpec { Vantage = v.Vantage, Label = v.Label, Fallback = v.Fallback });
+            if (!provider.SetNetworkVantages(n.FlightId, specs, n.Tuning, out string error))
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] saved network '{n.Name}' cam={n.FlightId}: {error}");
+                return false;
+            }
+            if (!watchChanged) return true;
+            CommandAim aim = n.WatchPersistentId != 0 && CommandCameraSite.VantageExists(n.WatchPersistentId)
+                ? CommandAim.Vessel(n.WatchPersistentId) : null;
+            if (Find(n.FlightId)?.Rig is CommandCameraRig gr) gr.SetAim(aim, null);
+            else provider.SetPendingAim(n.FlightId, aim, null);
+            return true;
         }
 
         /* NotLockHolder for anyone but a held lock's owner, else Unknown, after the holder's heartbeat. */
@@ -537,11 +591,12 @@ namespace Kerbcast
         }
 
         /* Removes a command camera CreateCommandCamera (or a client) made,
-           built or not; its feed ends. False for the settings-driven camera or
-           an unknown id, so a repeated call is harmless. */
+           built or not; its feed ends. False for the settings-driven camera, a
+           network a player saved with the game, or an unknown id, so a
+           repeated call is harmless. */
         public static bool DestroyCommandCamera(uint flightId)
         {
-            if (CommandAuthorityOwner != null) return false;
+            if (CommandAuthorityOwner != null || (KerbcastCore.Instance?.IsSavedNetwork(flightId) ?? false)) return false;
             return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
         }
 
@@ -550,6 +605,7 @@ namespace Kerbcast
         {
             var auth = KerbcastCore.Instance?.CommandAuthority;
             if (auth != null && auth.Registered && HeldBy(owner) == null) return false;
+            if (KerbcastCore.Instance?.IsSavedNetwork(flightId) ?? false) return false;
             return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
         }
 
@@ -690,7 +746,7 @@ namespace Kerbcast
             return KerbcastCore.Instance?.CommandProvider?.IsPending(flightId) == true;
         }
 
-        static KerbcastCamera Find(uint flightId) => KerbcastApiImpl.Find(flightId);
+        internal static KerbcastCamera Find(uint flightId) => KerbcastApiImpl.Find(flightId);
 
         [System.Obsolete("Builds the obsolete KerbcastCameraView")]
         static KerbcastCameraView ToView(KerbcastCamera c)

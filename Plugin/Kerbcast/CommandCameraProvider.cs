@@ -90,17 +90,50 @@ namespace Kerbcast
 
         /* Queues a tracking network camera over `vantages` (see CommandCameraNetwork), built once one of them resolves. Returns its flightId, or 0 with `error` set. */
         public uint CreateNetwork(IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning, CommandAim aim, Orbit aimOrbit,
-            IReadOnlyCollection<uint> taken, out string error)
+            IReadOnlyCollection<uint> taken, out string error, string owner = null)
         {
             error = NetworkInvalid(vantages, tuning);
             if (error != null) return 0;
             uint flightId = NextFlightId(taken);
-            var feed = new Feed(this, null, name, "", flightId, new List<NetworkVantageSpec>(vantages), tuning);
+            var feed = new Feed(this, null, name, "", flightId, new List<NetworkVantageSpec>(vantages), tuning) { Owner = owner ?? "" };
             if (aim != null) feed.SetAim(aim, aimOrbit);
             _feeds.Add(feed);
             Debug.Log($"[Kerbcast][CMDCAM] network camera cam={flightId} requested over {vantages.Count} vantage(s)"
                 + (string.IsNullOrEmpty(name) ? "" : $" name='{name}'"));
             return flightId;
+        }
+
+        /* A saved network's camera, under the flightId its slot fixes (CameraId.NetworkWireId). 0 with `error` set when that id is in use or the list is refused. */
+        public uint CreateSavedNetwork(uint flightId, IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning, CommandAim aim,
+            IReadOnlyCollection<uint> taken, out string error)
+        {
+            error = NetworkInvalid(vantages, tuning);
+            if (error == null && (taken.Contains(flightId) || _feeds.Any(f => f.FlightId == flightId))) error = $"cam={flightId} is already in use";
+            if (error != null) return 0;
+            var feed = new Feed(this, null, name, "", flightId, new List<NetworkVantageSpec>(vantages), tuning);
+            if (aim != null) feed.SetAim(aim, null);
+            _feeds.Add(feed);
+            Debug.Log($"[Kerbcast][CMDCAM] saved network camera cam={flightId} requested over {vantages.Count} vantage(s) name='{name}'");
+            return flightId;
+        }
+
+        /* A network a mod made through the API, as the networks file lists it. */
+        internal struct HostNetwork
+        {
+            public uint FlightId;
+            public string Name;
+            public string Owner;
+            public List<NetworkVantageSpec> Vantages;
+            public NetworkTuning Tuning;
+        }
+
+        /* Every network camera a mod made, built or not; saved networks are listed by their store. */
+        public void HostNetworks(List<HostNetwork> into)
+        {
+            into.Clear();
+            foreach (var f in _feeds)
+                if (f.IsNetwork && f.Owner != null)
+                    into.Add(new HostNetwork { FlightId = f.FlightId, Name = f.Name, Owner = f.Owner, Vantages = f.NetworkSpecs, Tuning = f.Tuning });
         }
 
         /* Replaces a network camera's list, built or not. False when `flightId` is no network camera; `error` says why the list is refused. */
@@ -236,6 +269,9 @@ namespace Kerbcast
             private CommandCameraNetwork _network;
             public bool IsNetwork { get; }
             public NetworkTuning Tuning { get; private set; }
+            /* The mod that made this network through the API ("" when it named none); null for a saved network or any other camera. */
+            public string Owner { get; set; }
+            public List<NetworkVantageSpec> NetworkSpecs => _networkSpecs;
 
             public string SiteKey => _site != null ? _site.NodeName
                 : IsNetwork ? (_networkSpecs != null && _networkSpecs.Count > 0 ? _networkSpecs[0].Key : null)

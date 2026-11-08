@@ -196,7 +196,7 @@ namespace Kerbcast.Api
         Unknown = 0,
         Ok = 1,
         NotLockHolder = 2,
-        /** <summary>The flightId is no tracking network camera, built or waiting to be.</summary> */
+        /** <summary>The flightId is no tracking network camera made through the API, built or waiting to be. A network a player saved with the game is theirs alone to change.</summary> */
         NotCommandFeed = 3,
         /** <summary>The list is null or empty: a network always has at least one vantage.</summary> */
         NoVantages = 4,

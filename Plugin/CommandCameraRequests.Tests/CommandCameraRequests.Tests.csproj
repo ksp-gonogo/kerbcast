@@ -8,6 +8,8 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <!-- The network maths compiled in for its tuning type leaves fields only the game assigns. -->
+    <NoWarn>CS0649</NoWarn>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
@@ -15,5 +17,9 @@
     <Compile Include="../Kerbcast/CommandVantage.cs" />
     <Compile Include="../Kerbcast/CommandCameraRequests.cs" />
     <Compile Include="../Kerbcast/ChangeSignal.cs" />
+    <Compile Include="../Kerbcast/SavedNetworks.cs" />
+    <Compile Include="../Kerbcast/CommandCameraNetworkMath.cs" />
+    <Compile Include="../Kerbcast/CraftFixState.cs" />
+    <Compile Include="../Kerbcast/OpticsModel.cs" />
   </ItemGroup>
 </Project>

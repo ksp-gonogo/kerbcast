@@ -10,6 +10,8 @@ namespace Kerbcast
         Create,
         Destroy,
         Aim,
+        SaveNetwork,
+        DeleteNetwork,
     }
 
     /* A command camera aim as a client sent it, before KerbcastControl.AimOf
@@ -65,8 +67,8 @@ namespace Kerbcast
     }
 
     /* One entry of global.commands.json, which the sidecar appends to for
-       every create-command-camera, destroy-command-camera and
-       set-command-aim a client sends. */
+       every create-command-camera, destroy-command-camera, set-command-aim,
+       save-network and delete-network a client sends. */
     internal sealed class CommandCameraRequest
     {
         public ulong Id;
@@ -79,6 +81,18 @@ namespace Kerbcast
         public CommandAimSpec Aim;
         /* Destroy and Aim. */
         public uint FlightId;
+
+        /* SaveNetwork and DeleteNetwork: the network named (empty to create
+           one), the revision the client edited (-1 when it sent none), the
+           vantages and options. Token and Name serve them too, and Aim holds
+           the watch. A request too malformed to apply keeps its token with
+           Refusal set, so the client still hears why. */
+        public string NetworkId = "";
+        public long BaseRevision = -1;
+        public List<SavedVantage> Vantages;
+        public double MinHoldUt = double.NaN, MinHoldRealSeconds = double.NaN, MarginStops = double.NaN;
+        public string RefusalCode;
+        public string RefusalText;
 
         /* The requests in `json`, malformed entries skipped with a reason in
            `skipped`. An unreadable file yields an empty list. */
@@ -130,6 +144,49 @@ namespace Kerbcast
                     req.Op = CommandRequestOp.Aim;
                     req.FlightId = U32(o, "flightId");
                     req.Aim = AimFrom(Obj(o, "aim"));
+                    return req;
+                case "saveNetwork":
+                    req.Op = CommandRequestOp.SaveNetwork;
+                    req.Token = Str(o, "token");
+                    req.NetworkId = Str(o, "networkId");
+                    double rev = Num(o, "baseRevision", -1);
+                    req.BaseRevision = rev >= 0 && rev <= uint.MaxValue && rev == Math.Floor(rev) ? (long)rev : -1;
+                    req.Name = Str(o, "name");
+                    req.Aim = AimFrom(Obj(o, "watch"));
+                    var options = Obj(o, "options");
+                    if (options != null)
+                    {
+                        req.MinHoldUt = Num(options, "minHoldUt", double.NaN);
+                        req.MinHoldRealSeconds = Num(options, "minHoldRealSeconds", double.NaN);
+                        req.MarginStops = Num(options, "marginStops", double.NaN);
+                    }
+                    req.Vantages = new List<SavedVantage>();
+                    if (o.TryGetValue("vantages", out var vs) && vs is List<object> vlist)
+                    {
+                        for (int i = 0; i < vlist.Count; i++)
+                        {
+                            var item = vlist[i] as Dictionary<string, object>;
+                            var vantage = VantageFrom(item != null ? Obj(item, "vantage") : null, out string bad);
+                            if (vantage == null)
+                            {
+                                req.RefusalCode = SavedNetworkCodes.BadVantage;
+                                req.RefusalText = $"vantage {i}: {bad}";
+                                break;
+                            }
+                            string label = Str(item, "label");
+                            req.Vantages.Add(new SavedVantage
+                            {
+                                Vantage = vantage,
+                                Label = label.Length > 0 ? label : null,
+                                Fallback = Bool(item, "fallback"),
+                            });
+                        }
+                    }
+                    return req;
+                case "deleteNetwork":
+                    req.Op = CommandRequestOp.DeleteNetwork;
+                    req.Token = Str(o, "token");
+                    req.NetworkId = Str(o, "networkId");
                     return req;
             }
             why = $"request {req.Id}: unknown op '{op}'";

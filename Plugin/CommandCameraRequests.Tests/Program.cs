@@ -227,5 +227,112 @@ try
 }
 finally { Directory.Delete(signalDir, true); }
 
+/* Saved tracking networks: requests, validation, slots, revisions, the file and the JSON. */
+{
+    string Save(string id = null, int rev = -1, string name = "Polar net", string vantages = null, string watch = null, string options = null) =>
+        "{\"requests\":[{\"id\":1,\"op\":\"saveNetwork\",\"token\":\"t1\""
+        + (id != null ? $",\"networkId\":\"{id}\"" : "")
+        + (rev >= 0 ? $",\"baseRevision\":{rev}" : "")
+        + (name != null ? $",\"name\":\"{name}\"" : "")
+        + (watch != null ? $",\"watch\":{watch}" : "")
+        + (options != null ? $",\"options\":{options}" : "")
+        + ",\"vantages\":" + (vantages ?? "[{\"vantage\":{\"kind\":\"station\",\"station\":\"KSC\"},\"fallback\":true},{\"vantage\":{\"kind\":\"vessel\",\"persistentId\":77},\"label\":\"Relay 1\"}]")
+        + "}]}";
+    CommandCameraRequest One(string json)
+    {
+        var skipped = new List<string>();
+        var list = CommandCameraRequest.ParseFile(json, skipped);
+        Check(list.Count == 1 && skipped.Count == 0, "network request parses: " + string.Join("; ", skipped));
+        return list[0];
+    }
+
+    var req = One(Save());
+    Check(req.Op == CommandRequestOp.SaveNetwork && req.Token == "t1" && req.NetworkId == "" && req.BaseRevision == -1,
+        "a create carries its token and no id or revision");
+    Check(req.Vantages.Count == 2 && req.Vantages[0].Fallback && req.Vantages[0].Vantage.Name == "KSC"
+        && req.Vantages[1].Vantage.PersistentId == 77 && req.Vantages[1].Label == "Relay 1", "vantages, labels and fallback are read");
+
+    var set = new SavedNetworkSet();
+    int ids = 0;
+    Func<string> newId = () => "n" + (++ids);
+    var made = set.Save(req, newId, out var before, out var saved);
+    Check(made.Ok && made.NetworkId == "n1" && before == null, "a create is saved under a new id " + made.Code + " " + made.Text);
+    Check(saved.Slot == 0 && saved.FlightId == 0xFFFF0000u && saved.Revision == 1, "the first network takes slot 0 at revision 1");
+    var second = set.Save(One(Save(name: "  ")), newId, out _, out var saved2);
+    Check(second.Ok && saved2.Slot == 1 && saved2.Name == "Tracking network", "a blank name reads Tracking network, next slot");
+
+    var stale = set.Save(One(Save(id: "n1", rev: 0, name: "Renamed")), newId, out _, out _);
+    Check(!stale.Ok && stale.Code == "stale", "an edit of an old revision is refused as stale");
+    var edit = set.Save(One(Save(id: "n1", rev: 1, name: "Renamed", watch: "{\"kind\":\"vessel\",\"persistentId\":9}")), newId, out before, out saved);
+    Check(edit.Ok && saved.Revision == 2 && saved.Slot == 0 && saved.WatchPersistentId == 9, "an edit keeps the slot and bumps the revision");
+    Check(before.Name == "Polar net" && SavedNetwork.NeedsRebuild(before, saved), "a rename rebuilds the camera");
+    Check(!set.Save(One(Save(id: "n9")), newId, out _, out _).Ok, "an unknown id is refused");
+    Check(set.Save(One(Save(id: "n9")), newId, out _, out _).Code == "notFound", "as notFound");
+
+    Check(set.Save(One(Save(vantages: "[]")), newId, out _, out _).Code == "noVantages", "no vantages refused");
+    Check(set.Save(One(Save(vantages: "[{\"vantage\":{\"kind\":\"station\",\"station\":\"\"}}]")), newId, out _, out _).Code == "badVantage",
+        "a station with no name refused");
+    Check(set.Save(One(Save(vantages: "[{\"vantage\":{\"kind\":\"moon\"}}]")), newId, out _, out _).Code == "badVantage",
+        "an unknown vantage kind is answered, not dropped");
+    Check(set.Save(One(Save(watch: "{\"kind\":\"direction\",\"azimuth\":1,\"elevation\":2}")), newId, out _, out _).Code == "badAim",
+        "only a craft can be watched");
+    Check(set.Save(One(Save(name: new string('x', 49))), newId, out _, out _).Code == "badName", "a 49 character name refused");
+    Check(set.Save(One(Save(options: "{\"marginStops\":-1}")), newId, out _, out _).Code == "badNumber", "a negative margin refused");
+    var many = "[" + string.Join(",", System.Linq.Enumerable.Repeat("{\"vantage\":{\"kind\":\"station\",\"station\":\"KSC\"}}", 65)) + "]";
+    Check(set.Save(One(Save(vantages: many)), newId, out _, out _).Code == "tooManyVantages", "65 vantages refused");
+    Check(set.Networks.Count == 2, "refusals change nothing");
+
+    Check(set.SetWatch(0xFFFF0000u, 0) && set.Find("n1").WatchPersistentId == 0 && set.Find("n1").Revision == 3,
+        "a viewer's retarget writes back and bumps the revision");
+    Check(!set.SetWatch(0xFFFF0000u, 0), "the same watch again is no change");
+    Check(!set.SetWatch(12345u, 7), "a camera that is no saved network is left alone");
+
+    var withOptions = set.Save(One(Save(options: "{\"minHoldUt\":20}")), newId, out _, out var opt);
+    Check(withOptions.Ok && opt.Tuning.MinHoldUt == 20 && opt.Tuning.MarginStops == NetworkTuning.DefaultMarginStops,
+        "options left out keep the defaults");
+
+    var del = set.Delete(One("{\"requests\":[{\"id\":1,\"op\":\"deleteNetwork\",\"token\":\"t2\",\"networkId\":\"n2\"}]}"), out var removed);
+    Check(del.Ok && removed.Slot == 1 && set.Find("n2") == null, "a delete removes the network");
+    var again = set.Save(One(Save()), newId, out _, out var freshNet);
+    Check(again.Ok && freshNet.Slot == 3, "a deleted slot is not handed out again straight away");
+
+    var skippedCfg = new List<string>();
+    string cfg = set.ToCfg();
+    var loaded = SavedNetworkSet.FromCfg(cfg, skippedCfg);
+    Check(skippedCfg.Count == 0 && loaded.Networks.Count == set.Networks.Count, "networks.cfg round trips");
+    var n1 = loaded.Find("n1");
+    Check(n1 != null && n1.Name == "Renamed" && n1.Revision == 3 && n1.Slot == 0 && n1.Vantages.Count == 2
+        && n1.Vantages[0].Fallback && n1.Vantages[1].Label == "Relay 1" && n1.Vantages[1].Vantage.PersistentId == 77,
+        "a loaded network keeps every field");
+    Check(loaded.Find("n3").MinHoldUt == 20 && double.IsNaN(loaded.Find("n3").MarginStops), "options round trip, unset stays unset");
+    var after = loaded.Save(One(Save()), newId, out _, out var nextAfterLoad);
+    Check(after.Ok && nextAfterLoad.Slot == 4, "the next slot survives a reload");
+    var broken = SavedNetworkSet.FromCfg("KERBCAST_NETWORKS\n{\n\tNETWORK\n\t{\n\t\tid = a\n\t\tslot = 2\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = station\n\t\t}\n\t}\n"
+        + "\tNETWORK\n\t{\n\t\tid = b\n\t\tslot = 2\n\t}\n\tNETWORK\n\t{\n\t\tid = c\n\t\tslot = 5\n\t\tname = Ok { net }\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = vessel\n\t\t\tpersistentId = 4\n\t\t}\n\t}\n}\n", skippedCfg);
+    Check(broken.Networks.Count == 1 && broken.Networks[0].NetworkId == "c" && broken.Networks[0].Name == "Ok { net }" && skippedCfg.Count == 2,
+        "a network that no longer parses is skipped alone");
+    Check(SavedNetworkSet.FromCfg("", null).Networks.Count == 0, "an empty file is no networks");
+
+    set.Record(made);
+    set.Record(stale);
+    var host = new SavedNetwork { NetworkId = "host-5", Name = "Mod net", Owner = "some-mod", HostFlightId = 5,
+        Vantages = new List<SavedVantage> { new SavedVantage { Vantage = CommandVantage.Station("KSC") } } };
+    string json = set.Json(id => id == 0xFFFF0000u, new[] { host });
+    var root = (Dictionary<string, object>)MiniJson.Parse(json);
+    var nets = (List<object>)root["networks"];
+    var j1 = (Dictionary<string, object>)nets[0];
+    Check(nets.Count == 4, "every saved network and the mod's are listed");
+    Check((string)j1["networkId"] == "n1" && (double)j1["flightId"] == 0xFFFF0000u && (double)j1["revision"] == 3 && !j1.ContainsKey("watch"),
+        "a running network has its flightId; an active vessel watch is absent");
+    var jv = (Dictionary<string, object>)((List<object>)j1["vantages"])[1];
+    Check((string)((Dictionary<string, object>)jv["vantage"])["kind"] == "vessel" && (string)jv["label"] == "Relay 1" && !(bool)jv["fallback"],
+        "a vantage is written in the wire's shape");
+    Check(!((Dictionary<string, object>)nets[1]).ContainsKey("flightId"), "a network not running has no flightId");
+    var jh = (Dictionary<string, object>)nets[3];
+    Check((string)jh["owner"] == "some-mod" && (double)jh["flightId"] == 5, "a mod's network carries its owner and camera");
+    var results = (List<object>)root["results"];
+    Check(results.Count == 2 && (string)((Dictionary<string, object>)results[1])["code"] == "stale", "outcomes ride beside the networks");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

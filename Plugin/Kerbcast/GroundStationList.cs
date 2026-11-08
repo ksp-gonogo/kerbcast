@@ -19,10 +19,28 @@ namespace Kerbcast
         public double Altitude;
         /* The game has it switched on (CommandCameraSite.StationEnabled). */
         public bool Enabled;
+        /* Why not, when it is off (NetworkMath.StationOffReason). */
+        public string DisabledReason;
+    }
+
+    /* One craft the game knows, for building vantage lists and watches. */
+    internal struct CatalogVessel
+    {
+        public uint PersistentId;
+        public string Name;
+        /* KSP's VesselType and Vessel.Situations names. */
+        public string VesselType;
+        public string Body;
+        public string Situation;
+        public bool Loaded;
+        public bool Active;
+
+        /* Debris and space objects are cut first when the list is too long. */
+        public bool CutFirst => VesselType == "Debris" || VesselType == "SpaceObject";
     }
 
     /*
-     * The ground stations the plugin publishes to the sidecar in
+     * The ground stations and craft the plugin publishes to the sidecar in
      * global.sites.json. Unity-free, so the file's shape is tested without
      * the game.
      */
@@ -30,8 +48,18 @@ namespace Kerbcast
     {
         public const string FileName = "global.sites.json";
 
+        /* The most craft listed: the sidecar sends the list in one message, which must stay well under a data channel's limit. */
+        public const int MaxVessels = 300;
+
         /* The file's body: every station with a finite place, in the order given. */
-        public static string Json(IList<GroundStation> stations)
+        public static string Json(IList<GroundStation> stations) => Json(stations, null);
+
+        /*
+         * Stations as above, then craft: the active one first, the rest in
+         * the order given, and past MaxVessels debris and space objects are
+         * cut before anything else, with vesselsOmitted counting the cut.
+         */
+        public static string Json(IList<GroundStation> stations, IList<CatalogVessel> vessels)
         {
             var inv = CultureInfo.InvariantCulture;
             var sb = new StringBuilder(64 + stations.Count * 160);
@@ -49,11 +77,45 @@ namespace Kerbcast
                     .Append("\",\"latitude\":").Append(s.Latitude.ToString("R", inv))
                     .Append(",\"longitude\":").Append(s.Longitude.ToString("R", inv))
                     .Append(",\"altitude\":").Append(s.Altitude.ToString("R", inv))
-                    .Append(",\"enabled\":").Append(s.Enabled ? "true" : "false")
-                    .Append('}');
+                    .Append(",\"enabled\":").Append(s.Enabled ? "true" : "false");
+                if (!s.Enabled && !string.IsNullOrEmpty(s.DisabledReason))
+                    sb.Append(",\"disabledReason\":\"").Append(Esc(s.DisabledReason)).Append('"');
+                sb.Append('}');
             }
-            sb.Append("]}\n");
+            sb.Append(']');
+            if (vessels != null)
+            {
+                var kept = Kept(vessels, out int omitted);
+                sb.Append(",\"vessels\":[");
+                for (int i = 0; i < kept.Count; i++)
+                {
+                    var v = kept[i];
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"persistentId\":").Append(v.PersistentId.ToString(CultureInfo.InvariantCulture))
+                        .Append(",\"name\":\"").Append(Esc(v.Name ?? ""))
+                        .Append("\",\"vesselType\":\"").Append(Esc(v.VesselType ?? ""))
+                        .Append("\",\"body\":\"").Append(Esc(v.Body ?? ""))
+                        .Append("\",\"situation\":\"").Append(Esc(v.Situation ?? ""))
+                        .Append("\",\"loaded\":").Append(v.Loaded ? "true" : "false")
+                        .Append(",\"active\":").Append(v.Active ? "true" : "false")
+                        .Append('}');
+                }
+                sb.Append(']');
+                if (omitted > 0) sb.Append(",\"vesselsOmitted\":").Append(omitted.ToString(CultureInfo.InvariantCulture));
+            }
+            sb.Append("}\n");
             return sb.ToString();
+        }
+
+        private static List<CatalogVessel> Kept(IList<CatalogVessel> vessels, out int omitted)
+        {
+            var ordered = new List<CatalogVessel>(vessels.Count);
+            foreach (var v in vessels) if (v.Active) ordered.Add(v);
+            foreach (var v in vessels) if (!v.Active && !v.CutFirst) ordered.Add(v);
+            foreach (var v in vessels) if (!v.Active && v.CutFirst) ordered.Add(v);
+            omitted = Math.Max(0, ordered.Count - MaxVessels);
+            if (omitted > 0) ordered.RemoveRange(MaxVessels, omitted);
+            return ordered;
         }
 
         private static bool Finite(double v) => !double.IsNaN(v) && !double.IsInfinity(v);

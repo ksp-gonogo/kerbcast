@@ -92,6 +92,8 @@ namespace Kerbcast
         public bool BelowHorizon;
         /* Another body hides the craft. */
         public bool Occluded;
+        /* Its name. */
+        public string Occluder;
         public OpticsSite Optics;
         public double RangeM;
     }
@@ -205,6 +207,14 @@ namespace Kerbcast
          */
         public static bool StationEnabled(bool extraStationsOn, bool isHome, bool isPermanent, bool otherLaunchSites) =>
             extraStationsOn || isHome || (isPermanent && otherLaunchSites);
+
+        /*
+         * Why StationEnabled has a station off, for the site catalog; null
+         * while it is on. Under stock's rule the extra ground stations option
+         * is always what would turn it on again.
+         */
+        public static string StationOffReason(bool extraStationsOn, bool isHome, bool isPermanent, bool otherLaunchSites) =>
+            StationEnabled(extraStationsOn, isHome, isPermanent, otherLaunchSites) ? null : "extraStationsOff";
 
         /* The best vantage that can see the craft, the current one winning ties; -1 when none can. */
         public static int Best(VantageState[] states, double[] scores, int count, int current, int except = -1)

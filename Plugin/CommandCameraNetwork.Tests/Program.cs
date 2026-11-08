@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Kerbcast;
 
@@ -211,6 +212,25 @@ VantageInput Seeing(double rangeM, double elevationDeg, double sunElevationDeg, 
         + "{\"nodeName\":\"Crater Rim\",\"displayName\":\"Crater Rim\",\"body\":\"Kerbin\",\"latitude\":9.4,\"longitude\":-172.1,\"altitude\":4000,\"enabled\":false}]}\n",
         "the station list is the sidecar's shape: escaped names, a missing name falls back to the node, an unplaceable station is left out");
     Check(GroundStationList.Json(new GroundStation[0]) == "{\"stations\":[]}\n", "no stations is an empty list, not a missing one");
+
+    Check(NetworkMath.StationOffReason(false, false, false, true) == "extraStationsOff", "an extra station off says why");
+    Check(NetworkMath.StationOffReason(true, false, false, false) == null && NetworkMath.StationOffReason(false, true, false, false) == null,
+        "a station on has no reason");
+    var off = new[] { new GroundStation { NodeName = "Crater Rim", Body = "Kerbin", Latitude = 1, Longitude = 2, Altitude = 3, Enabled = false, DisabledReason = "extraStationsOff" },
+        new GroundStation { NodeName = "KSC", Body = "Kerbin", Enabled = true, DisabledReason = "ignored while on" } };
+    string offJson = GroundStationList.Json(off, new CatalogVessel[0]);
+    Check(offJson.Contains("\"enabled\":false,\"disabledReason\":\"extraStationsOff\"}") && !offJson.Contains("ignored")
+        && offJson.EndsWith(",\"vessels\":[]}\n"), "the reason rides only on a station that is off, and craft follow the stations");
+
+    var craft = new List<CatalogVessel>();
+    for (int i = 0; i < GroundStationList.MaxVessels + 5; i++)
+        craft.Add(new CatalogVessel { PersistentId = (uint)(i + 1), Name = "Rock " + i, VesselType = i < 10 ? "SpaceObject" : "Debris", Body = "Kerbin", Situation = "ORBITING" });
+    craft.Add(new CatalogVessel { PersistentId = 9001, Name = "Relay \"A\"", VesselType = "Relay", Body = "Mun", Situation = "ORBITING", Loaded = false });
+    craft.Add(new CatalogVessel { PersistentId = 9002, Name = "Kerbal X", VesselType = "Ship", Body = "Kerbin", Situation = "FLYING", Loaded = true, Active = true });
+    string craftJson = GroundStationList.Json(new GroundStation[0], craft);
+    Check(craftJson.Contains("\"vessels\":[{\"persistentId\":9002,\"name\":\"Kerbal X\",\"vesselType\":\"Ship\",\"body\":\"Kerbin\",\"situation\":\"FLYING\",\"loaded\":true,\"active\":true},"
+        + "{\"persistentId\":9001,\"name\":\"Relay \\\"A\\\"\""), "the active craft leads, then craft that are not debris");
+    Check(craftJson.EndsWith(",\"vesselsOmitted\":7}\n"), "past the cap debris and space objects are cut and counted");
 }
 
 // The log line proves a cut from KSP.log alone.

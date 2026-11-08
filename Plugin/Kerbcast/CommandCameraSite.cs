@@ -405,6 +405,7 @@ namespace Kerbcast
                     Longitude = site.Longitude,
                     Altitude = site.Altitude,
                     Enabled = site.StationEnabled(rules),
+                    DisabledReason = site.StationOffReason(rules),
                 });
             }
         }
@@ -418,6 +419,10 @@ namespace Kerbcast
          */
         public bool StationEnabled(GameStationRules rules) =>
             !IsCommNetHome || NetworkMath.StationEnabled(rules.ExtraStationsOn, StationIsKsc, StationIsPermanent, rules.OtherLaunchSites);
+
+        /* Why StationEnabled is false, by the same rule; null while it is on. */
+        public string StationOffReason(GameStationRules rules) =>
+            !IsCommNetHome ? null : NetworkMath.StationOffReason(rules.ExtraStationsOn, StationIsKsc, StationIsPermanent, rules.OtherLaunchSites);
 
         /* A lens `height` metres above the ground (or the sea) at a point on `body`. */
         public static CommandCameraSite ResolveSurface(CelestialBody body, double lat, double lon, double height)
