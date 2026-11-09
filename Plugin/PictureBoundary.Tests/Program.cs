@@ -286,5 +286,54 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(own.Count == 0, "storage: empty storage gives nothing");
 }
 
+/* ---- body light: the Sun's direction per body, and which body gets the camera's one light ---- */
+{
+    Check(BodyLight.Applies(true, false), "body light: always on under a light speed");
+    Check(BodyLight.Applies(false, true), "body light: on without a light speed when the setting is on");
+    Check(!BodyLight.Applies(false, false), "body light: off without a light speed by default");
+    var sun = new DVec3(10, 0, 0);
+    var d = BodyLight.Direction(sun, new DVec3(10, 5e9, 0), new DVec3(0, 0, 1));
+    Check(Math.Abs(d.Y - 1) < 1e-12 && Math.Abs(d.X) < 1e-12, "body light: the direction runs from the Sun to the drawn centre");
+    var f = BodyLight.Direction(sun, sun, new DVec3(0, 0, 1));
+    Check(f.Z == 1 && f.X == 0, "body light: a star's direction to itself falls back");
+    var rim = PictureBoundary.LightInBodyAxes(new DQuat(0, Math.Sin(Math.PI / 4), 0, Math.Cos(Math.PI / 4)), new DVec3(1, 0, 0));
+    Check(Math.Abs(rim.Z - 1) < 1e-12, "body light: the rim direction is stored in the turned mesh's axes");
+
+    Check(Math.Abs(BodyLight.DiscRadians(2, 1) - Math.PI / 6) < 1e-12, "disc: from twice the radius a sphere spans 30 degrees to its limb");
+    Check(BodyLight.DiscRadians(1, 1) == Math.PI / 2 && BodyLight.DiscRadians(0.5, 1) == Math.PI / 2, "disc: at or inside the sphere it fills half the sky");
+    double half = BodyLight.HalfDiagonalRadians(90, 1);
+    Check(Math.Abs(half - Math.Atan(Math.Sqrt(2))) < 1e-12, "frame: the half diagonal of a square 90 degree frame");
+
+    var eye = new DVec3(0, 0, 0);
+    var ahead = new DVec3(0, 0, 1);
+    double narrow = BodyLight.HalfDiagonalRadians(1, 16.0 / 9);
+    Check(BodyLight.DiscInFrame(eye, new DVec3(0, 0, 1e10), 1e6, ahead, narrow) > 0, "frame: a body ahead is in frame");
+    Check(BodyLight.DiscInFrame(eye, new DVec3(0, 0, -1e10), 1e6, ahead, narrow) == 0, "frame: a body behind is not");
+    Check(BodyLight.DiscInFrame(eye, new DVec3(1e9, 0, 1e10), 1e6, ahead, narrow) == 0, "frame: a body off to the side of a narrow frame is not");
+    Check(BodyLight.DiscInFrame(eye, new DVec3(0, -6.1e5, 0), 6e5, new DVec3(0, 1, 0), narrow) == 0, "frame: a telescope looking straight up does not count the ground under it");
+    Check(BodyLight.DiscInFrame(eye, new DVec3(0, -6.0001e5, 0), 6e5, new DVec3(1, 0, 0), BodyLight.HalfDiagonalRadians(40, 16.0 / 9)) > 0, "frame: a horizon in frame counts its own planet");
+    Check(BodyLight.DiscInFrame(eye, new DVec3(0, -5e5, 0), 6e5, new DVec3(0, 1, 0), narrow) == Math.PI / 2, "frame: a lens inside the sphere always counts it");
+
+    Check(BodyLight.Pick(new double[] { 0, 0, 0 }, 3, 1) == -1, "pick: nothing in frame gives none");
+    Check(BodyLight.Pick(new double[] { 0.1, 0.3, 0.2 }, 3, -1) == 1, "pick: with none held the largest disc wins");
+    Check(BodyLight.Pick(new double[] { 0.2, 0.2 }, 2, -1) == 0, "pick: an exact tie goes to the lower slot");
+    Check(BodyLight.Pick(new double[] { 0.24, 0.2 }, 2, 1) == 1, "pick: a held body keeps the light against a near-equal disc");
+    Check(BodyLight.Pick(new double[] { 0.26, 0.2 }, 2, 1) == 0, "pick: a clearly wider disc takes the light");
+    Check(BodyLight.Pick(new double[] { 0.1, 0 }, 2, 1) == 0, "pick: a held body that left the frame gives up the light");
+    Check(BodyLight.Pick(new double[] { 0.1, 0.2 }, 2, 5) == 1, "pick: a held slot past the list is ignored");
+    int held = -1;
+    double[] sweep = new double[2];
+    int switches = 0;
+    for (int i = 0; i < 200; i++)
+    {
+        sweep[0] = 0.2 + 0.01 * Math.Sin(i * 0.3);
+        sweep[1] = 0.2 + 0.01 * Math.Cos(i * 0.3);
+        int now = BodyLight.Pick(sweep, 2, held);
+        if (held >= 0 && now != held) switches++;
+        held = now;
+    }
+    Check(switches == 0, "pick: two discs wobbling round each other do not swap the light");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

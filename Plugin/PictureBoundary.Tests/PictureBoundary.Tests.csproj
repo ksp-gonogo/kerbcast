@@ -13,6 +13,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../Kerbcast/PictureBoundary.cs" />
+    <Compile Include="../Kerbcast/BodyLight.cs" />
     <Compile Include="../Kerbcast/FarTerrain.cs" />
     <Compile Include="../Kerbcast/LightHistoryMath.cs" />
     <Compile Include="../Kerbcast/CommandCameraMath.cs" />
