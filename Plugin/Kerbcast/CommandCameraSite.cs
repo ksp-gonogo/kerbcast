@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using CommNet;
 using UnityEngine;
+using Upgradeables;
 
 namespace Kerbcast
 {
@@ -48,6 +49,7 @@ namespace Kerbcast
         /* Set for a lens standing beside a launch site rather than at a station. */
         public bool IsLaunchSite { get; private set; }
         /* How the site was found, for the log: launchsite, launchsite-transform,
+           pqscity, pqscity-prefab, pqscity-facility, pqscity-origin,
            commnet-fields, commnet-transform, spacecenter or fallback. */
         public string Source { get; private set; }
         /* Set when the camera rides a vessel instead of standing on a body. */
@@ -216,7 +218,10 @@ namespace Kerbcast
            process happens after Kerbcast starts: until then the stored values
            are zeros. So stored values count only when flagged set and not
            (0,0); otherwise the spawn transform is converted directly and
-           trusted only if it sits on the terrain at its own coordinates. */
+           trusted only if it sits on the terrain at its own coordinates.
+           Far from Kerbin stock never builds the facility's model, so the
+           spawn transform does not exist and the site is placed from the
+           city and the model's prefab instead (PlacedUnbuilt). */
         private static SpawnLookup SpawnPointOf(PSystemSetup setup, string name,
             out CelestialBody body, out double lat, out double lon, out double alt, out string source)
         {
@@ -224,6 +229,8 @@ namespace Kerbcast
             source = "launchsite";
             bool set;
             Func<Transform> spawnTransform;
+            string spawnPath = null;
+            LaunchSite site = null;
             var facility = setup.GetSpaceCenterFacility(name);
             if (facility != null && facility.spawnPoints != null && facility.spawnPoints.Length > 0)
             {
@@ -232,10 +239,12 @@ namespace Kerbcast
                 set = sp.latlonaltSet;
                 body = facility.hostBody;
                 spawnTransform = sp.GetSpawnPointTransform;
+                spawnPath = sp.spawnTransformURL;
             }
             else
             {
-                var site = setup.GetLaunchSite(name);
+                facility = null;
+                site = setup.GetLaunchSite(name);
                 if (site == null || site.spawnPoints == null || site.spawnPoints.Length == 0) return SpawnLookup.Missing;
                 var sp = site.spawnPoints[0];
                 sp.GetSpawnPointLatLonAlt(out lat, out lon, out alt);
@@ -251,46 +260,148 @@ namespace Kerbcast
             Transform t = null;
             try { t = spawnTransform(); }
             catch (Exception) { /* facility transform not built yet */ }
-            if (t == null) return SpawnLookup.Unset;
-            body.GetLatLonAlt(t.position, out double tlat, out double tlon, out double talt);
-            double ground = double.NaN;
-            if (Plausible(tlat, tlon) && !double.IsNaN(talt))
+            if (t != null)
             {
-                try { ground = body.TerrainAltitude(tlat, tlon); }
-                catch (Exception) { /* no terrain to check against */ }
+                body.GetLatLonAlt(t.position, out double tlat, out double tlon, out double talt);
+                double ground = double.NaN;
+                if (Plausible(tlat, tlon) && !double.IsNaN(talt))
+                {
+                    try { ground = body.TerrainAltitude(tlat, tlon); }
+                    catch (Exception) { /* no terrain to check against */ }
+                }
+                if (!double.IsNaN(ground) && Math.Abs(talt - Math.Max(ground, 0.0)) <= MaxSpawnAboveGround)
+                {
+                    lat = tlat;
+                    lon = tlon;
+                    alt = talt;
+                    source = "launchsite-transform";
+                    return SpawnLookup.Found;
+                }
+                if (PlacedByCity(t, Vector3.zero, body, out lat, out lon, out alt))
+                {
+                    source = "pqscity";
+                    return SpawnLookup.Found;
+                }
             }
-            if (!double.IsNaN(ground) && Math.Abs(talt - Math.Max(ground, 0.0)) <= MaxSpawnAboveGround)
-            {
-                lat = tlat;
-                lon = tlon;
-                alt = talt;
-                source = "launchsite-transform";
-                return SpawnLookup.Found;
-            }
-            if (!PlacedByCity(t, body, out lat, out lon, out alt)) return SpawnLookup.Unset;
-            source = "pqscity";
+
+            /* Near the site stock builds the facility within a second or so,
+               and its own placement beats a worked-out one, so keep waiting. */
+            if (body.pqsController == null || body.pqsController.isActive) return SpawnLookup.Unset;
+            if (!PlacedUnbuilt(facility, spawnPath, site, body, out lat, out lon, out alt, out string unbuiltSource))
+                return SpawnLookup.Unset;
+            source = unbuiltSource;
             return SpawnLookup.Found;
         }
 
         /*
-         * Where the spawn transform `t` stands once its PQSCity places itself,
-         * worked out without the city having done so. A scene that starts far
+         * A launch site's spawn point while its body's terrain is unbuilt and
+         * the spawn transform does not exist. Stock keeps a facility's model
+         * as a prefab per upgrade level and instantiates it only when the
+         * Space Center is near, so the spawn point's offset is read from the
+         * current level's prefab and placed where the model would go. Failing
+         * that the facility's own origin stands in, and for a site without a
+         * facility (Making History) its city's origin. Those stand within the
+         * site's own footprint (half a runway at most), still the right
+         * place for a lens that stands 500 m off.
+         */
+        private static bool PlacedUnbuilt(PSystemSetup.SpaceCenterFacility facility, string spawnPath, LaunchSite site,
+            CelestialBody body, out double lat, out double lon, out double alt, out string source)
+        {
+            lat = lon = alt = double.NaN;
+            source = null;
+            if (facility != null && facility.facilityTransform != null)
+            {
+                if (SpawnInPrefab(facility, spawnPath, out Transform model, out Vector3 inModel)
+                    && PlacedByCity(model, inModel, body, out lat, out lon, out alt))
+                {
+                    source = "pqscity-prefab";
+                    return true;
+                }
+                if (PlacedByCity(facility.facilityTransform, Vector3.zero, body, out lat, out lon, out alt))
+                {
+                    source = "pqscity-facility";
+                    return true;
+                }
+                return false;
+            }
+            var city = site?.pqsCity;
+            if (city != null && PlacedByCity(city.transform, Vector3.zero, body, out lat, out lon, out alt))
+            {
+                source = "pqscity-origin";
+                return true;
+            }
+            return false;
+        }
+
+        /* Where the spawn point sits inside the facility's model, read from the
+           current upgrade level's prefab: `model` is the stand-in transform the
+           built model will take the place of, `inModel` the spawn point in its
+           local space. */
+        private static bool SpawnInPrefab(PSystemSetup.SpaceCenterFacility facility, string spawnPath, out Transform model, out Vector3 inModel)
+        {
+            model = null;
+            inModel = Vector3.zero;
+            try
+            {
+                CommandCameraMath.SplitSpawnPath(spawnPath, out string modelName, out string pathInModel);
+                var upgradeable = facility.facilityTransform.GetComponent<UpgradeableObject>();
+                var levels = upgradeable != null ? upgradeable.UpgradeLevels : null;
+                if (levels == null || levels.Length == 0 || pathInModel.Length == 0) return false;
+
+                model = upgradeable.FacilityTransform;
+                if (model == null || model.name != modelName) model = facility.facilityTransform.Find(modelName);
+                if (model == null) return false;
+
+                double level = 0;
+                try { level = facility.GetFacilityLevel(); }
+                catch (Exception) { /* no upgrade scenario: the first level's model */ }
+                var prefab = levels[CommandCameraMath.FacilityLevelIndex(level, levels.Length)]?.facilityPrefab;
+                var spawn = prefab != null ? prefab.transform.Find(pathInModel) : null;
+                if (spawn == null) return false;
+                for (var x = spawn; x != prefab.transform; x = x.parent)
+                {
+                    if (x == null) return false;
+                    inModel = x.localPosition + x.localRotation * Vector3.Scale(x.localScale, inModel);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] spawn point from the facility's model failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /* The first `T` on `t` or a parent, inactive ones included: GetComponentInParent skips inactive objects, and far from Kerbin its whole terrain is. */
+        private static T InParents<T>(Transform t) where T : Component
+        {
+            for (var x = t; x != null; x = x.parent)
+            {
+                var c = x.GetComponent<T>();
+                if (c != null) return c;
+            }
+            return null;
+        }
+
+        /*
+         * Where the point `local` (in `t`'s own space) stands once its PQSCity
+         * places itself, worked out without the city having done so. A scene that starts far
          * from the site (the active craft at Duna) never runs the city's
          * Orientate, so the spawn point keeps no coordinates and its transform
          * sits wherever the prefab left it. This repeats Orientate's placement
          * from the city's own settings, and composes only local transforms:
          * world positions are rounded to kilometres that far from the origin.
          */
-        private static bool PlacedByCity(Transform t, CelestialBody body, out double lat, out double lon, out double alt)
+        private static bool PlacedByCity(Transform t, Vector3 local, CelestialBody body, out double lat, out double lon, out double alt)
         {
             lat = lon = alt = double.NaN;
             try
             {
-                var city = t.GetComponentInParent<PQSCity>();
-                var pqs = city != null ? city.GetComponentInParent<PQS>() : null;
+                var city = InParents<PQSCity>(t);
+                var pqs = city != null ? InParents<PQS>(city.transform) : null;
                 if (city == null || pqs == null || city.transform.parent == null) return false;
 
-                var inCity = Vector3.zero;
+                var inCity = local;
                 for (var x = t; x != city.transform; x = x.parent)
                 {
                     if (x == null) return false;

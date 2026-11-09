@@ -2000,5 +2000,22 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         "an unknown lens resolves nothing");
 }
 
+{
+    CommandCameraMath.SplitSpawnPath("Facility/End09/SpawnPoint", out string model, out string inModel);
+    Check(model == "Facility" && inModel == "End09/SpawnPoint", "runway spawn path splits into its model and the path inside it");
+    CommandCameraMath.SplitSpawnPath("Facility/LaunchPad_spawn", out model, out inModel);
+    Check(model == "Facility" && inModel == "LaunchPad_spawn", "launch pad spawn path splits at the first slash");
+    CommandCameraMath.SplitSpawnPath("Facility", out model, out inModel);
+    Check(model == "Facility" && inModel == "", "a path naming only the model has nothing inside it");
+    CommandCameraMath.SplitSpawnPath(null, out model, out inModel);
+    Check(model == "" && inModel == "", "no path splits into nothing");
+
+    Check(CommandCameraMath.FacilityLevelIndex(0, 3) == 0, "level 0 is the first model");
+    Check(CommandCameraMath.FacilityLevelIndex(0.5, 3) == 1, "level 0.5 of three is the middle model");
+    Check(CommandCameraMath.FacilityLevelIndex(1, 3) == 2, "level 1 is the last model, not past it");
+    Check(CommandCameraMath.FacilityLevelIndex(1.7, 3) == 2 && CommandCameraMath.FacilityLevelIndex(-1, 3) == 0, "out of range levels clamp");
+    Check(CommandCameraMath.FacilityLevelIndex(double.NaN, 3) == 0 && CommandCameraMath.FacilityLevelIndex(0.5, 0) == 0, "no level or no models is the first");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
