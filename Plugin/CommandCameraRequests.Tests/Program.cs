@@ -439,6 +439,12 @@ finally { Directory.Delete(signalDir, true); }
     File.WriteAllText(path + ".bak", firstText);
     Check(SavedNetworkFile.Load(path, null, out var stillRecovers) == SavedNetworkFile.LoadResult.Ok && stillRecovers.Networks.Count > 0,
         "a file truly missing still recovers from its spare");
+    string folderAtPath = Path.Combine(netDir, "folder.cfg");
+    Directory.CreateDirectory(folderAtPath);
+    bool folderThrew = false;
+    try { SavedNetworkFile.Load(folderAtPath, null, out _); }
+    catch (Exception) { folderThrew = true; }
+    Check(folderThrew, "a path that exists but cannot be read is not taken for a missing file");
 
     /* An edit under a held lock is stored, but the live aim is the holder's. */
     var planA = new SavedNetwork { Name = "A", WatchPersistentId = 1 };
@@ -466,11 +472,56 @@ finally { Directory.Delete(signalDir, true); }
     Check(!mergeSet.FollowMerge(77, 99), "KSP's second announcement of a merge is a no-op");
     Check(mergeSet.FollowMerge(88, 99) && mergeNet.WatchPersistentId == 99, "a watch on the merged craft follows it");
     Check(!mergeSet.FollowMerge(0, 99) && !mergeSet.FollowMerge(99, 0) && !mergeSet.FollowMerge(99, 99), "a merge with no craft or into itself is ignored");
+    SavedNetworkSet.TryFromCfg(mergeSet.ToCfg(), null, out var mergeUnsaved);
+    Check(mergeUnsaved.Networks[0].Vantages[0].Vantage.PersistentId == 77 && mergeUnsaved.Networks[0].WatchPersistentId == 88,
+        "until the game saves a merge the file keeps the original craft, so a quickload finds the network there");
+    Check(!mergeSet.SettleMerges(id => id == 77 || id == 88 || id == 99), "a save still holding the absorbed craft, as a quickload's does, settles nothing");
+    Check(!mergeSet.SettleMerges(id => false), "a save without the survivor settles nothing");
+    SavedNetworkSet.TryFromCfg(mergeSet.ToCfg(), null, out mergeUnsaved);
+    Check(mergeUnsaved.Networks[0].Vantages[0].Vantage.PersistentId == 77, "and leaves the file on the original craft");
+    Check(mergeSet.SettleMerges(id => id == 99), "a save holding the merge settles it");
+    Check(!mergeSet.SettleMerges(id => id == 99), "a later save has nothing more to settle");
     SavedNetworkSet.TryFromCfg(mergeSet.ToCfg(), null, out var mergeReload);
-    Check(mergeReload.Networks[0].Vantages[0].Vantage.PersistentId == 99 && mergeReload.Networks[0].WatchPersistentId == 99, "the followed ids reach the file");
+    Check(mergeReload.Networks[0].Vantages[0].Vantage.PersistentId == 99 && mergeReload.Networks[0].WatchPersistentId == 99, "the settled ids reach the file");
     Check(System.Linq.Enumerable.Count(mergeSet.Watching()) == 1, "a network with a craft to watch is put back after a lock change");
     mergeSet.SetWatch(mergeNet.FlightId, 0);
     Check(System.Linq.Enumerable.Count(mergeSet.Watching()) == 0, "a network on the active vessel has no watch to put back");
+
+    /* A form opened before a dock still names the absorbed craft. */
+    string craftSeven = "[{\"vantage\":{\"kind\":\"vessel\",\"persistentId\":7}}]";
+    string watchSeven = "{\"kind\":\"vessel\",\"persistentId\":7}";
+    var formSet = new SavedNetworkSet();
+    formSet.Save(One(Save(vantages: craftSeven, watch: watchSeven)), newId, out _, out var formNet);
+    string formId = formNet.NetworkId;
+    formSet.FollowMerge(7, 9);
+    Check(formSet.Save(One(Save(id: formId, rev: 2, vantages: craftSeven, watch: watchSeven)), newId, out _, out formNet).Ok
+        && formNet.WatchPersistentId == 9 && formNet.Vantages[0].Vantage.PersistentId == 9,
+        "a save naming the absorbed craft lands on the survivor");
+    SavedNetworkSet.TryFromCfg(formSet.ToCfg(), null, out var formFile);
+    Check(formFile.Networks[0].WatchPersistentId == 7 && formFile.Networks[0].Vantages[0].Vantage.PersistentId == 7,
+        "and stays pending for the file until the game saves the merge");
+    string craftNine = "[{\"vantage\":{\"kind\":\"vessel\",\"persistentId\":9}}]";
+    string watchNine = "{\"kind\":\"vessel\",\"persistentId\":9}";
+    formSet.Save(One(Save(id: formId, rev: (int)formNet.Revision, vantages: craftNine, watch: watchNine)), newId, out _, out formNet);
+    SavedNetworkSet.TryFromCfg(formSet.ToCfg(), null, out formFile);
+    Check(formNet.WatchPersistentId == 9 && formFile.Networks[0].WatchPersistentId == 7 && formFile.Networks[0].Vantages[0].Vantage.PersistentId == 7,
+        "a form re-sending the survivor it was shown leaves the merge pending");
+    formSet.FollowMerge(9, 11);
+    SavedNetworkSet.TryFromCfg(formSet.ToCfg(), null, out formFile);
+    Check(formNet.WatchPersistentId == 11 && formFile.Networks[0].WatchPersistentId == 7, "a second dock keeps the id from before the first");
+    Check(formSet.SettleMerges(id => id == 11), "a save holding the chain settles it");
+    Check(formSet.Save(One(Save(id: formId, rev: (int)formNet.Revision, vantages: craftSeven, watch: watchSeven)), newId, out _, out formNet).Ok
+        && formNet.WatchPersistentId == 11, "after the save the absorbed id still resolves through both docks");
+    SavedNetworkSet.TryFromCfg(formSet.ToCfg(), null, out formFile);
+    Check(formFile.Networks[0].WatchPersistentId == 11 && formFile.Networks[0].Vantages[0].Vantage.PersistentId == 11, "and is written as the survivor");
+    Check(formSet.FollowMerge(11, 7) && formNet.WatchPersistentId == 7 && formSet.Save(One(Save(id: formId, rev: (int)formNet.Revision, vantages: craftSeven, watch: watchSeven)), newId, out _, out formNet).Ok
+        && formNet.WatchPersistentId == 7, "a craft absorbed earlier that survives a later dock resolves to itself");
+    var retargetSet = new SavedNetworkSet();
+    retargetSet.Save(One(Save(vantages: craftSeven, watch: watchSeven)), newId, out _, out var retargetNet);
+    retargetSet.FollowMerge(7, 9);
+    retargetSet.SetWatch(retargetNet.FlightId, 5);
+    SavedNetworkSet.TryFromCfg(retargetSet.ToCfg(), null, out var retargetFile);
+    Check(retargetFile.Networks[0].WatchPersistentId == 5, "a viewer's retarget after a dock is written as aimed");
 
     /* A retarget that cannot be written is undone and answered. */
     mergeSet.SetWatch(mergeNet.FlightId, 321);

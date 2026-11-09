@@ -18,6 +18,8 @@ namespace Kerbcast
         public string Name = NetworkMath.DefaultName;
         /* The craft it watches; 0 for the active vessel. */
         public uint WatchPersistentId;
+        /* The craft networks.cfg keeps for the watch until the game saves the merge that moved it; 0 with none pending. */
+        public uint WatchUnsavedMergeOf;
         public List<SavedVantage> Vantages = new List<SavedVantage>();
         /* NaN keeps the game's default. */
         public double MinHoldUt = double.NaN, MinHoldRealSeconds = double.NaN, MarginStops = double.NaN;
@@ -112,6 +114,14 @@ namespace Kerbcast
         private readonly HashSet<int> _keptSlots = new HashSet<int>();
         private readonly List<SavedNetworkOutcome> _outcomes = new List<SavedNetworkOutcome>();
         private int _nextSlot;
+        /* This scene's craft merges by absorbed id, kept after a game save so a form opened before the dock still resolves. */
+        private readonly Dictionary<uint, MergeAlias> _merges = new Dictionary<uint, MergeAlias>();
+
+        private struct MergeAlias
+        {
+            public uint Survivor;
+            public bool InSave;
+        }
 
         public IReadOnlyList<SavedNetwork> Networks => _networks;
         public IReadOnlyList<SavedNetworkOutcome> Outcomes => _outcomes;
@@ -175,10 +185,24 @@ namespace Kerbcast
             var n = existing ?? new SavedNetwork { NetworkId = newId(), Slot = slot, CreateToken = string.IsNullOrEmpty(token) ? null : token };
             if (existing != null) before = Copy(existing);
             n.Name = CleanName(r.Name);
-            n.WatchPersistentId = r.Aim?.PersistentId ?? 0;
+            uint priorWatch = n.WatchPersistentId, priorWatchMerge = n.WatchUnsavedMergeOf;
+            var priorVantages = n.Vantages;
+            n.WatchPersistentId = ThroughMerges(r.Aim?.PersistentId ?? 0, out uint watchMerge);
+            /* A form sending the survivor, as the published definition shows it, leaves a pending merge pending. */
+            n.WatchUnsavedMergeOf = watchMerge != 0 ? watchMerge : n.WatchPersistentId == priorWatch ? priorWatchMerge : 0;
             n.Vantages = new List<SavedVantage>(r.Vantages.Count);
             foreach (var v in r.Vantages)
-                n.Vantages.Add(new SavedVantage { Vantage = v.Vantage, Label = CleanLabel(v.Label), Fallback = v.Fallback });
+            {
+                var vantage = v.Vantage;
+                uint merge = 0;
+                if (vantage.Kind == CommandVantageKind.Vessel)
+                {
+                    uint live = ThroughMerges(vantage.PersistentId, out merge);
+                    if (live != vantage.PersistentId) vantage = CommandVantage.Vessel(live);
+                    if (merge == 0) merge = PendingMergeOf(priorVantages, live);
+                }
+                n.Vantages.Add(new SavedVantage { Vantage = vantage, Label = CleanLabel(v.Label), Fallback = v.Fallback, UnsavedMergeOf = merge });
+            }
             n.MinHoldUt = r.MinHoldUt;
             n.MinHoldRealSeconds = r.MinHoldRealSeconds;
             n.MarginStops = r.MarginStops;
@@ -241,6 +265,7 @@ namespace Kerbcast
             }
             before = Copy(saved);
             saved.WatchPersistentId = persistentId;
+            saved.WatchUnsavedMergeOf = 0;
             saved.Revision++;
             return true;
         }
@@ -254,29 +279,108 @@ namespace Kerbcast
 
         /*
          * A dock or claw grab retired `oldPid` into `newPid`: every craft
-         * vantage and watch on it follows. Like a retarget it bumps only
-         * Revision, so a form already open is not made stale. True when
+         * vantage and watch on it follows in memory, and networks.cfg keeps
+         * the old id until SettleMerges, so a quickload to before the dock
+         * finds the network on the original craft. Like a retarget it bumps
+         * only Revision, so a form already open is not made stale. True when
          * anything changed. KSP announces each merge twice; the second finds
          * nothing to move.
          */
         public bool FollowMerge(uint oldPid, uint newPid)
         {
             if (oldPid == 0 || newPid == 0 || oldPid == newPid) return false;
+            RecordMerge(oldPid, newPid);
             bool any = false;
             foreach (var n in _networks)
             {
                 bool changed = n.WatchPersistentId == oldPid;
-                if (changed) n.WatchPersistentId = newPid;
+                if (changed)
+                {
+                    if (n.WatchUnsavedMergeOf == 0) n.WatchUnsavedMergeOf = oldPid;
+                    n.WatchPersistentId = newPid;
+                }
                 for (int i = 0; i < n.Vantages.Count; i++)
                 {
                     var sv = n.Vantages[i];
                     if (sv.Vantage.Kind != CommandVantageKind.Vessel || sv.Vantage.PersistentId != oldPid) continue;
-                    n.Vantages[i] = new SavedVantage { Vantage = CommandVantage.Vessel(newPid), Label = sv.Label, Fallback = sv.Fallback };
+                    n.Vantages[i] = new SavedVantage
+                    {
+                        Vantage = CommandVantage.Vessel(newPid),
+                        Label = sv.Label,
+                        Fallback = sv.Fallback,
+                        UnsavedMergeOf = sv.UnsavedMergeOf != 0 ? sv.UnsavedMergeOf : oldPid,
+                    };
                     changed = true;
                 }
                 if (!changed) continue;
                 n.Revision++;
                 any = true;
+            }
+            return any;
+        }
+
+        /* Kept flat so a chain of docks resolves in one step, and a craft that was absorbed and now survives cannot form a loop. */
+        private void RecordMerge(uint oldPid, uint newPid)
+        {
+            _merges.Remove(newPid);
+            foreach (var absorbed in new List<uint>(_merges.Keys))
+            {
+                var alias = _merges[absorbed];
+                if (alias.Survivor != oldPid) continue;
+                alias.Survivor = newPid;
+                _merges[absorbed] = alias;
+            }
+            if (!_merges.ContainsKey(oldPid)) _merges[oldPid] = new MergeAlias { Survivor = newPid };
+        }
+
+        /* The craft `sent` is now, with `unsavedMergeOf` set to `sent` when the merge that retired it is not in a game save yet. */
+        private uint ThroughMerges(uint sent, out uint unsavedMergeOf)
+        {
+            unsavedMergeOf = 0;
+            if (!_merges.TryGetValue(sent, out var alias)) return sent;
+            if (!alias.InSave) unsavedMergeOf = sent;
+            return alias.Survivor;
+        }
+
+        private static uint PendingMergeOf(List<SavedVantage> vantages, uint live)
+        {
+            foreach (var sv in vantages)
+                if (sv.UnsavedMergeOf != 0 && sv.Vantage.Kind == CommandVantageKind.Vessel && sv.Vantage.PersistentId == live)
+                    return sv.UnsavedMergeOf;
+            return 0;
+        }
+
+        /*
+         * The game wrote a save holding the craft `inSave` names: merges it
+         * records stop being pending, and the next write carries them. A
+         * merge is in the save only if its survivor is there and the absorbed
+         * craft is not, because KSP also writes the game it is loading, which
+         * may predate the dock. True when a stored id is now settled.
+         */
+        public bool SettleMerges(Func<uint, bool> inSave)
+        {
+            bool Settled(uint absorbed, uint survivor) => inSave(survivor) && !inSave(absorbed);
+            foreach (var absorbed in new List<uint>(_merges.Keys))
+            {
+                var alias = _merges[absorbed];
+                if (alias.InSave || !Settled(absorbed, alias.Survivor)) continue;
+                alias.InSave = true;
+                _merges[absorbed] = alias;
+            }
+            bool any = false;
+            foreach (var n in _networks)
+            {
+                if (n.WatchUnsavedMergeOf != 0 && Settled(n.WatchUnsavedMergeOf, n.WatchPersistentId))
+                {
+                    n.WatchUnsavedMergeOf = 0;
+                    any = true;
+                }
+                foreach (var sv in n.Vantages)
+                {
+                    if (sv.UnsavedMergeOf == 0 || sv.Vantage.Kind != CommandVantageKind.Vessel || !Settled(sv.UnsavedMergeOf, sv.Vantage.PersistentId)) continue;
+                    sv.UnsavedMergeOf = 0;
+                    any = true;
+                }
             }
             return any;
         }
@@ -356,6 +460,7 @@ namespace Kerbcast
             to.Slot = from.Slot;
             to.Name = from.Name;
             to.WatchPersistentId = from.WatchPersistentId;
+            to.WatchUnsavedMergeOf = from.WatchUnsavedMergeOf;
             to.Vantages = new List<SavedVantage>(from.Vantages);
             to.MinHoldUt = from.MinHoldUt;
             to.MinHoldRealSeconds = from.MinHoldRealSeconds;
@@ -385,7 +490,7 @@ namespace Kerbcast
                 Line(sb, 2, "revision", n.Revision.ToString(inv));
                 Line(sb, 2, "contentRevision", n.ContentRevision.ToString(inv));
                 if (n.CreateToken != null) Line(sb, 2, "createToken", n.CreateToken);
-                Line(sb, 2, "watch", n.WatchPersistentId.ToString(inv));
+                Line(sb, 2, "watch", (n.WatchUnsavedMergeOf != 0 ? n.WatchUnsavedMergeOf : n.WatchPersistentId).ToString(inv));
                 if (!double.IsNaN(n.MinHoldUt)) Line(sb, 2, "minHoldUt", n.MinHoldUt.ToString("R", inv));
                 if (!double.IsNaN(n.MinHoldRealSeconds)) Line(sb, 2, "minHoldRealSeconds", n.MinHoldRealSeconds.ToString("R", inv));
                 if (!double.IsNaN(n.MarginStops)) Line(sb, 2, "marginStops", n.MarginStops.ToString("R", inv));
@@ -413,7 +518,7 @@ namespace Kerbcast
                             Line(sb, 3, "height", v.Height.ToString("R", inv));
                             break;
                         default:
-                            Line(sb, 3, "persistentId", v.PersistentId.ToString(inv));
+                            Line(sb, 3, "persistentId", (sv.UnsavedMergeOf != 0 ? sv.UnsavedMergeOf : v.PersistentId).ToString(inv));
                             break;
                     }
                     if (sv.Label != null) Line(sb, 3, "label", sv.Label);
@@ -903,7 +1008,7 @@ namespace Kerbcast
         /* Null only for a file that is not there. Any other read error reaches the caller: taking it for a missing file would recover an older spare and later save over the real one. */
         private static string ReadOrNull(string path)
         {
-            try { return System.IO.File.Exists(path) ? System.IO.File.ReadAllText(path) : null; }
+            try { return System.IO.File.ReadAllText(path); }
             catch (System.IO.FileNotFoundException) { return null; }
             catch (System.IO.DirectoryNotFoundException) { return null; }
         }

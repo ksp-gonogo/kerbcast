@@ -76,6 +76,8 @@ namespace Kerbcast
         /* Null keeps the site's own name. */
         public string Label;
         public bool Fallback;
+        /* The craft networks.cfg keeps for this vantage until the game saves the merge that moved it; 0 with none pending. */
+        public uint UnsavedMergeOf;
     }
 
     /* The codes a NetworkResult carries. */

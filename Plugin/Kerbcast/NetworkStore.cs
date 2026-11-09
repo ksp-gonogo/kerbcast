@@ -8,7 +8,9 @@ namespace Kerbcast
     /*
      * The current save's tracking networks, kept in
      * saves/<game>/Kerbcast/networks.cfg rather than in the save itself, so a
-     * revert or a quickload never takes them back. Applies viewers' saves and
+     * revert or a quickload never takes them back. A craft merge is the
+     * exception: it is game state, so its new ids reach the file only once
+     * the game has saved the merge. Applies viewers' saves and
      * deletes, runs each network's camera in this scene under its fixed
      * flightId, and publishes every network, mods' included, to the sidecar in
      * global.networks.json. A save or delete is all or nothing: if its camera
@@ -29,6 +31,8 @@ namespace Kerbcast
         private SavedNetworkSet _set = new SavedNetworkSet();
         /* The file is there but could not be read: saving now would replace it, so saves are refused. */
         private bool _unreadable;
+        /* A game save settled a merge but the file could not take it: the next game save tries again. */
+        private bool _settledUnwritten;
         private readonly SavedNetworkPublisher _publisher;
         private float _jsonCooldown;
         private readonly List<CommandCameraProvider.HostNetwork> _hosts = new List<CommandCameraProvider.HostNetwork>();
@@ -41,6 +45,7 @@ namespace Kerbcast
                 : Path.Combine(KSPUtil.ApplicationRootPath, "saves", folder, "Kerbcast", SavedNetworkSet.FileName);
             _publisher = new SavedNetworkPublisher(Write);
             GameEvents.onVesselPersistentIdChanged.Add(OnMerged);
+            GameEvents.onGameStateSaved.Add(OnGameSaved);
         }
 
         /* Leaving the scene: no request may change anything now. One that arrives is carried into the next scene. */
@@ -204,14 +209,39 @@ namespace Kerbcast
             foreach (var n in _set.Watching()) KerbcastControl.ApplySavedWatch(n);
         }
 
-        /* The live camera already rides the survivor; this keeps the saved ids from naming a craft that no longer exists. */
+        /* The live camera already rides the survivor; this keeps the definitions from naming a craft that no longer exists. */
         private void OnMerged(uint oldPid, uint newPid)
         {
-            if (Stopped || !_set.FollowMerge(oldPid, newPid)) return;
-            Debug.Log($"{Tag} craft {oldPid} merged into {newPid}; saved networks follow");
-            /* A failed write leaves the new ids in memory for the next save: the old id is dead, so there is nothing to go back to. */
-            Persist();
+            if (Stopped || IsClash(oldPid, newPid) || !_set.FollowMerge(oldPid, newPid)) return;
+            Debug.Log($"{Tag} craft {oldPid} merged into {newPid}; saved networks follow, and the file once the game saves");
             _jsonCooldown = 0f;
+        }
+
+        /* A renumbered newcomer is not a dock: the saved ids still name the right craft. The lookup can throw while a craft registers, inside a GameEvent. */
+        private static bool IsClash(uint oldPid, uint newPid)
+        {
+            try { return VesselIdentity.IsClash(oldPid, newPid); }
+            catch (Exception) { return true; }
+        }
+
+        private void OnGameSaved(Game game)
+        {
+            if (Stopped || _unreadable || _cfgPath == null) return;
+            try
+            {
+                var craft = game?.flightState?.protoVessels;
+                if (craft == null) return;
+                var ids = new HashSet<uint>();
+                foreach (var pv in craft)
+                    if (pv != null) ids.Add(pv.persistentId);
+                if (!_set.SettleMerges(ids.Contains) && !_settledUnwritten) return;
+                _settledUnwritten = !Persist();
+                if (!_settledUnwritten) Debug.Log($"{Tag} the game saved; merged craft ids written to {_cfgPath}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"{Tag} could not settle craft merges on a game save: {ex}");
+            }
         }
 
         /*
@@ -248,6 +278,7 @@ namespace Kerbcast
         {
             if (Stopped) return;
             GameEvents.onVesselPersistentIdChanged.Remove(OnMerged);
+            GameEvents.onGameStateSaved.Remove(OnGameSaved);
             _publisher.Stop(_set.Json(_ => false, null, editable: false));
         }
 
