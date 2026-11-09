@@ -109,6 +109,11 @@ pub fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/* A retried request reuses its token and earns a new outcome, so the token alone does not name one. */
+fn outcome_key(token: &str, at_ms: Option<u64>) -> String {
+    format!("{token}@{}", at_ms.unwrap_or(0))
+}
+
 /// On-disk shape of `global.networks.json`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,8 +147,9 @@ pub struct NetworksNews {
 #[derive(Debug, Default)]
 struct NetworksSeen {
     definitions: Option<NetworkDefinitionsPayload>,
-    /// None until the first read, which sends only outcomes from the last
-    /// `RECENT_RESULT_MS`: older ones predate this process's clients.
+    /// Outcomes already sent, by `outcome_key`. None until the first read,
+    /// which sends only outcomes from the last `RECENT_RESULT_MS`: older
+    /// ones predate this process's clients.
     results: Option<std::collections::VecDeque<String>>,
 }
 
@@ -1929,6 +1935,13 @@ fn fov_limit_moved(was: Option<f32>, now: Option<f32>) -> bool {
     }
 }
 
+/* Whether the field of view moved enough to tell clients: a hundredth of a
+ * degree on a wide lens, and half a percent where that would swallow the
+ * whole of a narrow one's range. */
+fn fov_moved(was: f32, now: f32) -> bool {
+    (was - now).abs() > 0.01_f32.min(0.005 * was.abs().max(now.abs()))
+}
+
 /* The zoom limits the plugin reported live, each where usable, else the manifest's. */
 fn live_fov_limits(min: Option<f32>, max: Option<f32>, cam: &CameraState) -> (f32, f32) {
     let usable = |f: Option<f32>| f.filter(|f| f.is_finite() && *f > 0.0);
@@ -2118,16 +2131,16 @@ impl CameraRegistry {
         let now = unix_ms();
         let sent = seen.results.get_or_insert_with(Default::default);
         for FileResult { result: r, at_ms } in file.results {
-            if sent.contains(&r.token) {
+            let key = outcome_key(&r.token, at_ms);
+            if sent.contains(&key) {
                 continue;
             }
             /* On the first read only outcomes from the last moments are news. */
             let recent = at_ms.is_some_and(|at| now.saturating_sub(at) <= RECENT_RESULT_MS);
+            sent.push_back(key);
             if first && !recent {
-                sent.push_back(r.token);
                 continue;
             }
-            sent.push_back(r.token.clone());
             news.results.push(r);
         }
         while sent.len() > SEEN_RESULTS_KEPT {
@@ -2727,7 +2740,8 @@ impl CameraRegistry {
         }
 
         // Per-camera diffs. Only flag cameras whose effective state moved.
-        for cam_status in &parsed.cameras {
+        let mut unsent_zoom = Vec::new();
+        for (index, cam_status) in parsed.cameras.iter().enumerate() {
             if let Some(cam) = cameras.get(&cam_status.flight_id) {
                 let reported_seq = cam_status.track_report_seq;
                 if reported_seq != 0
@@ -2757,7 +2771,7 @@ impl CameraRegistry {
                         || p.operator_height != cam_status.operator_height
                         || p.layers != cam_status.layers
                         || p.operator_layers != cam_status.operator_layers
-                        || (p.fov - cam_status.fov).abs() > 0.01
+                        || fov_moved(p.fov, cam_status.fov)
                         || fov_limit_moved(p.fov_min, cam_status.fov_min)
                         || fov_limit_moved(p.fov_max, cam_status.fov_max)
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
@@ -2767,6 +2781,9 @@ impl CameraRegistry {
                 }
             };
             if !changed {
+                if let Some(p) = prev {
+                    unsent_zoom.push((index, p.fov, p.fov_min, p.fov_max));
+                }
                 continue;
             }
             let Some(cam) = cameras.get(&cam_status.flight_id) else {
@@ -2867,6 +2884,14 @@ impl CameraRegistry {
             log.push_back(entry);
         }
 
+        /* The next diff has to measure from what clients were last told, or a
+         * slow drift stays under the thresholds on every poll and never sends. */
+        for (index, fov, fov_min, fov_max) in unsent_zoom {
+            let held = &mut parsed.cameras[index];
+            held.fov = fov;
+            held.fov_min = fov_min;
+            held.fov_max = fov_max;
+        }
         *last = Some(parsed);
 
         // Drop the poll locks before adopting: adopt_track_report re-locks the
@@ -4327,6 +4352,7 @@ mod tests {
         let reg = CameraRegistry::new(dir.path().to_path_buf());
         let path = dir.path().join(NETWORKS_FILE);
         assert_eq!(reg.poll_networks().await, NetworksNews::default());
+        assert_eq!(reg.last_networks().await, None, "no file, no networks");
 
         let def = r#"{"networkId":"n1","name":"Polar net","vantages":[{"vantage":{"kind":"station","station":"KSC"},"fallback":true}],"revision":2,"flightId":4294901761}"#;
         let old = r#"{"token":"old","ok":true,"networkId":"n1","atMs":1000}"#;
@@ -4375,6 +4401,39 @@ mod tests {
         tokio::fs::write(&path, "{\"networks\":[").await.unwrap();
         assert_eq!(reg.poll_networks().await, NetworksNews::default());
         assert_eq!(reg.last_networks().await, Some(defs));
+    }
+
+    /// A retry reuses its token, and the game's new answer to it must still
+    /// reach the client that is waiting; a re-read of the same answer must not.
+    #[tokio::test]
+    async fn poll_networks_sends_a_new_outcome_for_a_reused_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+        let path = dir.path().join(NETWORKS_FILE);
+        let at = unix_ms();
+        let refused = |at_ms: u64, code: &str| {
+            format!(r#"{{"token":"same","ok":false,"code":"{code}","atMs":{at_ms}}}"#)
+        };
+        let write = |results: Vec<String>| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"networks":[],"results":[{}]}}"#, results.join(",")),
+            )
+            .unwrap();
+        };
+
+        write(vec![refused(at, "full")]);
+        assert_eq!(reg.poll_networks().await.results.len(), 1);
+        assert!(
+            reg.poll_networks().await.results.is_empty(),
+            "the same answer is sent once"
+        );
+
+        write(vec![refused(at, "full"), refused(at + 1, "badVantage")]);
+        let retried = reg.poll_networks().await;
+        assert_eq!(retried.results.len(), 1, "only the new answer is news");
+        assert_eq!(retried.results[0].token, "same");
+        assert_eq!(retried.results[0].code.as_deref(), Some("badVantage"));
     }
 
     /// A status write whose `captureUt` advanced produces a `settings`
@@ -7667,6 +7726,58 @@ mod tests {
             r#"{{"kspFps":60.0,"shedLevel":0{extra},"cameras":[{{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64}}]}}"#
         );
         std::fs::write(dir.join("global.status.json"), body).unwrap();
+    }
+
+    #[test]
+    fn fov_moves_relatively_on_a_narrow_lens_and_by_a_hundredth_on_a_wide_one() {
+        assert!(fov_moved(0.02, 0.03), "the narrow end of a tracking lens");
+        assert!(fov_moved(0.02, 0.0202));
+        assert!(!fov_moved(0.02, 0.02005), "under half a percent");
+        assert!(!fov_moved(60.0, 60.005));
+        assert!(fov_moved(60.0, 60.02), "a wide lens keeps its 0.01 degrees");
+    }
+
+    /// Each poll moves the field by less than the threshold; the sum of them
+    /// has to reach clients all the same.
+    #[tokio::test]
+    async fn slow_zoom_drift_is_measured_from_the_last_value_sent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 5_003;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let status_path = shm.join("global.status.json");
+        let write = |fov: f32, fov_min: f32| {
+            std::fs::write(
+                &status_path,
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{flight_id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":{fov},"fovMin":{fov_min}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let mut sent = Vec::new();
+        for (fov, fov_min) in [
+            (1.0, 2.0),
+            (1.004, 2.0),
+            (1.008, 2.0),
+            (1.008, 2.015),
+            (1.008, 2.03),
+        ] {
+            write(fov, fov_min);
+            sent.push(!registry.poll_status().await.changed_cameras.is_empty());
+        }
+        assert_eq!(
+            sent,
+            vec![true, false, true, false, true],
+            "each move under a threshold counts toward the next send"
+        );
     }
 
     #[test]

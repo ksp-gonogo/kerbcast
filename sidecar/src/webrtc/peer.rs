@@ -1373,19 +1373,7 @@ async fn handle_client_message(
             info!("control channel: hello received");
             send_server_message(
                 &dc,
-                &ServerMessage::Hello(HelloPayload {
-                    sidecar_version: crate::VERSION.to_owned(),
-                    encoder_backend: selected_backend_name().to_owned(),
-                    frame_stamps: Some(true),
-                    anchors: Some(true),
-                    frame_command: Some(true),
-                    max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
-                    size_hold: Some(true),
-                    resume: Some(true),
-                    renegotiate: Some(true),
-                    max_slots: Some(MAX_SLOTS_PER_PEER as u32),
-                    networks: Some(true),
-                }),
+                &ServerMessage::Hello(hello_payload(registry.last_networks().await.is_some())),
             );
             send_camera_snapshot(&registry, &dc).await;
             /* Prime the client with current global settings (throttle + the
@@ -2060,6 +2048,23 @@ async fn apply_render_size_change(
     push_camera_state(registry, dc, flight_id).await;
 }
 
+/* `networks` is whether the plugin has listed its networks: a plugin too old for them never writes the file. */
+fn hello_payload(networks: bool) -> HelloPayload {
+    HelloPayload {
+        sidecar_version: crate::VERSION.to_owned(),
+        encoder_backend: selected_backend_name().to_owned(),
+        frame_stamps: Some(true),
+        anchors: Some(true),
+        frame_command: Some(true),
+        max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
+        size_hold: Some(true),
+        resume: Some(true),
+        renegotiate: Some(true),
+        max_slots: Some(MAX_SLOTS_PER_PEER as u32),
+        networks: Some(networks),
+    }
+}
+
 async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id: u32, fov: f32) {
     let cam = match registry.get(flight_id).await {
         Some(c) => c,
@@ -2100,6 +2105,7 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
                     message,
                     code,
                     source: ErrorSource::Sidecar,
+                    flight_id: Some(flight_id),
                     ..Default::default()
                 }),
             );
@@ -2314,6 +2320,7 @@ async fn apply_zoom_rate_change(
                 message,
                 code: Some(ErrorCode::CommandLocked),
                 source: ErrorSource::Sidecar,
+                flight_id: Some(flight_id),
                 ..Default::default()
             }),
         );
@@ -2765,6 +2772,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Weak;
     use std::time::Duration;
+
+    #[test]
+    fn hello_offers_networks_only_when_the_plugin_reports_them() {
+        assert_eq!(hello_payload(false).networks, Some(false));
+        assert_eq!(hello_payload(true).networks, Some(true));
+    }
 
     /// The browser's peer connection, with webrtc-rs's default codecs standing
     /// in for a browser's.
