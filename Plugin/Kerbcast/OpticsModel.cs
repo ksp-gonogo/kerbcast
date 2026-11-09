@@ -621,6 +621,10 @@ namespace Kerbcast
             if (double.IsNaN(optics)) return fovMinDeg;
             return Math.Max(NarrowestFovDeg, Math.Min(fovMinDeg, optics));
         }
+
+        /* Where a camera with this lens really stops, for showing a player: FovMin, held wider by the optics floor the rig also applies when the lens's own blur reaches FloorBlurPx before the zoom limit does. */
+        public static double ShownFovMin(double fovMinDeg, double arcsec, int rows) =>
+            OpticsModel.OpticsFovFloor(FovMin(fovMinDeg, arcsec, rows), arcsec, rows);
     }
 
     /* Smooth, looping noise for seeing's motion: whole-cycle sines at a few

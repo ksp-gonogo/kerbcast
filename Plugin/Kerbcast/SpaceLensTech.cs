@@ -120,7 +120,7 @@ namespace Kerbcast
                 if (!step.Valid) continue;
                 if (!first) sb.Append(',');
                 first = false;
-                double fov = optics ? SpaceLens.FovMin(top, step.Arcsec, s.Height) : top;
+                double fov = optics ? SpaceLens.ShownFovMin(top, step.Arcsec, s.Height) : top;
                 sb.Append("{\"techId\":\"").Append(Esc(step.TechId)).Append('"');
                 sb.Append(",\"techTitle\":\"").Append(Esc(SpaceLensTech.Title(step.TechId))).Append('"');
                 sb.Append(",\"unlocked\":").Append(SpaceLensTech.Researched(step.TechId) ? "true" : "false");

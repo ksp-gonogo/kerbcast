@@ -2058,6 +2058,14 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(SpaceLens.FovMin(0.02, 1.0, 576) == 0.02, "space lens: a coarse lens never widens the usual limit");
     Check(SpaceLens.FovMin(0.02, 0.001, 576) == SpaceLens.NarrowestFovDeg, "space lens: a near-perfect lens stops at the narrowest field");
     Check(SpaceLens.FovMin(0.02, double.NaN, 576) == 0.02 && SpaceLens.FovMin(0.02, 0.05, 0) == 0.02, "space lens: no lens or no frame keeps the usual limit");
+
+    double firstStep = SpaceLens.ShownFovMin(0.02, 0.5, 576);
+    Check(SpaceLens.FovMin(0.02, 0.5, 576) == 0.02 && firstStep > 0.039 && firstStep < 0.041,
+        $"space lens: the first step shows where the optics floor really stops it, near 0.04 degrees ({firstStep:F4})");
+    Check(Near(firstStep, Math.Max(SpaceLens.FovMin(0.02, 0.5, 576), OpticsModel.OpticsFovFloor(0, 0.5, 576)), 1e-12),
+        "space lens: the shown limit is the rig's, the lens limit or the optics floor whichever is wider");
+    Check(Near(SpaceLens.ShownFovMin(0.02, 0.05, 576), SpaceLens.FovMin(0.02, 0.05, 576), 1e-12), "space lens: a fine step's shown limit is its own");
+    Check(SpaceLens.ShownFovMin(0.02, 0.001, 576) == SpaceLens.NarrowestFovDeg, "space lens: a near-perfect lens shows the narrowest field");
 }
 
 {
