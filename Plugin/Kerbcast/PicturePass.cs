@@ -357,7 +357,7 @@ namespace Kerbcast
                 _moved[i] = m;
                 if (view != null && !m.Body.isStar)
                 {
-                    _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, halfDiagonal);
+                    _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, BodyLight.ConeFor(halfDiagonal, m.Slot == _litSlot));
                     if (m.Body == lens.Body && BodyLight.FillsFrame(_discs[m.Slot], halfDiagonal))
                     {
                         underfoot = m.Slot;
@@ -372,7 +372,7 @@ namespace Kerbcast
                 for (int i = 0; i < _moved.Count; i++)
                 {
                     var m = _moved[i];
-                    if (m.Slot != underfoot && _discs[m.Slot] > 0 && !BodyLight.OutranksOwn(lens.Point, ownCentre, lens.Body.Radius, m.Centre, _discs[m.Slot], view.fieldOfView, rows))
+                    if (m.Slot != underfoot && _discs[m.Slot] > 0 && !BodyLight.OutranksOwn(lens.Point, ownCentre, lens.Body.Radius, m.Centre, _discs[m.Slot], view.fieldOfView, rows, m.Slot == _litSlot))
                         _discs[m.Slot] = 0;
                 }
             }

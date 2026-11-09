@@ -346,7 +346,7 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
             BodyLight.DiscInFrame(groundEye, centre, dunaRadius, aim, halfD)
         };
         int own = BodyLight.FillsFrame(discs[0], halfD) ? 0 : -1;
-        if (own == 0 && discs[1] > 0 && !BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, centre, discs[1], fov, 1080)) discs[1] = 0;
+        if (own == 0 && discs[1] > 0 && !BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, centre, discs[1], fov, 1080, heldSlot == 1)) discs[1] = 0;
         return BodyLight.Pick(discs, 2, heldSlot, own);
     }
     double horizon = 3 * Math.PI / 180;
@@ -364,8 +364,35 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(!BodyLight.BehindLimb(groundEye, ownCentre, ownRadius, belowGround * 5), "limb: a body nearer than the limb is not hidden by it");
     var offNadir = new DVec3(Math.Cos(-1.2), Math.Sin(-1.2), 0);
     var bigBehind = offNadir * 1e9;
-    Check(!BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, bigBehind, BodyLight.DiscRadians(1e9, 6e5), teleFov, 1080), "limb: a planet well over two pixels behind the own planet cannot outrank it");
-    Check(BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, overHorizon * 1e9, BodyLight.DiscRadians(1e9, 6e5), teleFov, 1080), "limb: the same planet above the horizon can");
+    Check(!BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, bigBehind, BodyLight.DiscRadians(1e9, 6e5), teleFov, 1080, false), "limb: a planet well over two pixels behind the own planet cannot outrank it");
+    Check(BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, overHorizon * 1e9, BodyLight.DiscRadians(1e9, 6e5), teleFov, 1080, false), "limb: the same planet above the horizon can");
+    double teleHalf = BodyLight.HalfDiagonalRadians(teleFov, 16.0 / 9);
+    var aimEast = new DVec3(1, 0, 0);
+    DVec3 Off(double angle) => new DVec3(Math.Cos(angle), Math.Sin(angle), 0) * dunaRange;
+    double EdgeDisc(double angle, bool widen) => BodyLight.DiscInFrame(groundEye, Off(angle), dunaRadius, aimEast, BodyLight.ConeFor(teleHalf, widen));
+    Check(BodyLight.ConeFor(1, false) == 1 && Math.Abs(BodyLight.ConeFor(1, true) - 1.1) < 1e-12, "edge: only the held body's cone is widened");
+    Check(EdgeDisc(teleHalf * 1.05, false) == 0 && EdgeDisc(teleHalf * 1.05, true) > 0, "edge: just outside the frame only the held body still counts");
+    Check(EdgeDisc(teleHalf * 1.2, true) == 0, "edge: clearly outside the frame even the held body does not");
+    int EdgeSwitches(bool hold)
+    {
+        int heldSlot = 1, flips = 0;
+        var pair = new double[2];
+        for (int i = 0; i < 200; i++)
+        {
+            pair[0] = Math.PI / 2;
+            pair[1] = EdgeDisc(teleHalf * (1 + 0.04 * Math.Sin(i * 0.7)), hold && heldSlot == 1);
+            int now = BodyLight.Pick(pair, 2, heldSlot, 0);
+            if (now != heldSlot) flips++;
+            heldSlot = now;
+        }
+        return flips;
+    }
+    Check(EdgeSwitches(true) == 0, "edge: a lens jittering at the frame's edge keeps the light where it is");
+    Check(EdgeSwitches(false) > 0, "edge: without the widened cone the same jitter flips it");
+    double FovFor(double px) => 2 * Math.Atan(540 * Math.Tan(dunaDisc) / px) * 180 / Math.PI;
+    Check(!BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, overHorizon * dunaRange, dunaDisc, FovFor(1.8), 1080, false), "edge: a newcomer under two pixels does not take the light");
+    Check(BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, overHorizon * dunaRange, dunaDisc, FovFor(1.8), 1080, true), "edge: the held body keeps it just under two pixels");
+    Check(!BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, overHorizon * dunaRange, dunaDisc, FovFor(1.4), 1080, true), "edge: and gives it up when clearly smaller");
     int held = -1;
     double[] sweep = new double[2];
     int switches = 0;

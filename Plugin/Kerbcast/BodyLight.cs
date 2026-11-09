@@ -18,6 +18,12 @@ namespace Kerbcast
         /* The smallest disc radius, in pixels, that can take the light from the lens's own planet. */
         public const double MinOutrankPixels = 2;
 
+        /* How far past the frame's corner, as a multiple of the half diagonal, the held body stays a candidate, so a lens jittering at the frame's edge does not flip the light. */
+        public const double HeldConeWidth = 1.1;
+
+        /* The half diagonal to test a body against: the held body's is widened by HeldConeWidth, every other body's is the frame's own. */
+        public static double ConeFor(double halfDiagonal, bool held) => held ? halfDiagonal * HeldConeWidth : halfDiagonal;
+
         /* Whether this camera lights bodies per body: always under a light speed, otherwise as the player's setting says. */
         public static bool Applies(bool lightSpeedSet, bool phasesSetting) => lightSpeedSet || phasesSetting;
 
@@ -72,10 +78,11 @@ namespace Kerbcast
          * planet filling that frame. It must be big enough to see and not
          * hidden by the planet: a speck in a wide frame is not what the
          * picture shows, and the planet's own ground would be lit from the
-         * wrong side for its sake.
+         * wrong side for its sake. A body already `held` needs StayMargin
+         * fewer pixels, so a zoom resting at the threshold does not flip it.
          */
-        public static bool OutranksOwn(DVec3 eye, DVec3 ownCentre, double ownRadiusM, DVec3 centre, double disc, double verticalFovDeg, int rows) =>
-            DiscPixels(disc, verticalFovDeg, rows) >= MinOutrankPixels && !BehindLimb(eye, ownCentre, ownRadiusM, centre);
+        public static bool OutranksOwn(DVec3 eye, DVec3 ownCentre, double ownRadiusM, DVec3 centre, double disc, double verticalFovDeg, int rows, bool held) =>
+            DiscPixels(disc, verticalFovDeg, rows) >= (held ? MinOutrankPixels / StayMargin : MinOutrankPixels) && !BehindLimb(eye, ownCentre, ownRadiusM, centre);
 
         /*
          * The slot of the body to aim the light at, from `discs` where 0 means
