@@ -63,7 +63,8 @@ namespace Kerbcast.Api
      * A command feed's optics, for <see cref="ICommand.SetOptics"/>: how blurred the far planets and craft it
      * sees are. NaN, the default for every value, keeps Kerbcast's own for it (from the player's settings and
      * the Tracking Station level). Blur is the full width at half maximum, in arcseconds. The player's
-     * DeepSpaceOptics setting turns the effect on; while it is off these values are kept but change nothing.
+     * DeepSpaceOptics setting, on by default, turns the effect on; while the player has it off, or the game cannot draw
+     * it, these values are kept but change nothing.
      * </summary>
      */
     public sealed class OpticsSettings

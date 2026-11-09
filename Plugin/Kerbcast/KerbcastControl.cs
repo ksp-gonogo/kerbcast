@@ -302,8 +302,9 @@ namespace Kerbcast
         /* Overrides command feed `flightId`'s deep-space optics; NaN keeps
            Kerbcast's own value for that knob and all NaN returns to them.
            The lock applies as for SetCommandAim. The values take effect only
-           while the player's DeepSpaceOptics setting is on, and last until
-           replaced, the lock is taken or released, or the scene changes. False
+           while the player's DeepSpaceOptics setting is on (the default) and
+           the game can draw it, and last until replaced, the lock is taken or
+           released, or the scene changes. False
            when Kerbcast is not running, `owner` does not hold a held lock, the
            camera is not a command feed, or a value is infinite, negative, or
            (brightnessHold) above 1. */

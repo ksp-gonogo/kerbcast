@@ -157,10 +157,10 @@ namespace Kerbcast
         public double CommandCameraFovMax { get; private set; } = 30.0;
         /* Deep-space optics: command cameras blur what they see in space by a
            lens limit (by Tracking Station level) and, from the ground, by the
-           air. Off until it has been seen on real hardware. With it on, every
-           level zooms to CommandCameraFovMin and the blur holds a low level
-           back instead. */
-        public bool DeepSpaceOptics { get; private set; } = false;
+           air. On by default; a GPU that cannot draw it keeps the plain look.
+           With it on, the lens rather than the level sets the zoom limit: a
+           camera stops where its blur spans OpticsModel.FloorBlurPx. */
+        public bool DeepSpaceOptics { get; private set; } = true;
         /* The lens per Tracking Station level, in arcseconds (FWHM). Satellites
            and other vantages follow the level too; the camera beside the launch
            site always has level 1's. */

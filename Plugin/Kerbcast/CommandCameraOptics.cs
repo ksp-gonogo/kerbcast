@@ -143,11 +143,18 @@ namespace Kerbcast
         }
 
         /* Null when this GPU cannot draw the effect; the feed then renders as it always has. */
+        private static bool _unavailableLogged;
+
         public static CommandCameraOptics Create(uint flightId)
         {
             if (!EnsureMaterials())
             {
-                Debug.LogWarning($"{Tag} cam={flightId} deep-space optics off: the shaders it needs are missing or failed their test draw");
+                /* On by default, so a GPU that cannot draw them says so once, not for every camera. */
+                if (!_unavailableLogged)
+                {
+                    _unavailableLogged = true;
+                    Debug.LogWarning($"{Tag} cam={flightId} deep-space optics off: the shaders it needs are missing or failed their test draw; command cameras keep their plain look");
+                }
                 return null;
             }
             Debug.Log($"{Tag} cam={flightId} deep-space optics ready: additive shader '{_texAdd.shader.name}' scale={_texAddScale:G3}"
