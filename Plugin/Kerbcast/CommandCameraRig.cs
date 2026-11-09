@@ -1879,7 +1879,7 @@ namespace Kerbcast
                     + $"station={station} aim={aim} kspSurfaceCheckErr={err:F4}m craftRadius={KnownRadius:F1} fov={_fov:G4}");
             }
 
-            if (now - _skyProbeAt >= SkyProbeSeconds)
+            if (KerbcastSettings.DebugSkyProbe && now - _skyProbeAt >= SkyProbeSeconds)
             {
                 _skyProbeAt = now;
                 cam.RigScaledProbe = true;
@@ -2308,8 +2308,9 @@ namespace Kerbcast
                 var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
                 if (rt != null)
                 {
-                    _optics.BeginScaled(cam.ScaledLayer, rt.width, rt.height);
+                    /* Marked first, so a throw partway through still hands the layer back in AfterScaledRender. */
                     _opticsBegun = true;
+                    _optics.BeginScaled(cam.ScaledLayer, rt.width, rt.height);
                 }
             }
             _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");

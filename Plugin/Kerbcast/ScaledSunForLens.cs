@@ -81,18 +81,24 @@ namespace Kerbcast
 
         public void End()
         {
-            for (int i = 0; i < _saved.Count; i++)
+            try
             {
-                var s = _saved[i];
-                if (s.Renderer == null) continue;
-                s.Renderer.GetPropertyBlock(_block);
-                _block.SetVector(s.Property, s.Value);
-                s.Renderer.SetPropertyBlock(_block);
+                for (int i = 0; i < _saved.Count; i++)
+                {
+                    var s = _saved[i];
+                    if (s.Renderer == null) continue;
+                    s.Renderer.GetPropertyBlock(_block);
+                    _block.SetVector(s.Property, s.Value);
+                    s.Renderer.SetPropertyBlock(_block);
+                }
             }
-            _saved.Clear();
-            if (_sun != null) _sun.rotation = _sunWas;
-            _sun = null;
-            Turn = Quaternion.identity;
+            finally
+            {
+                _saved.Clear();
+                if (_sun != null) _sun.rotation = _sunWas;
+                _sun = null;
+                Turn = Quaternion.identity;
+            }
         }
     }
 }

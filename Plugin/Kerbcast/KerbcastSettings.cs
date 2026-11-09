@@ -355,6 +355,9 @@ namespace Kerbcast
            reads it without the settings instance. */
         public static bool DebugShowOwnCraft { get; private set; } = false;
 
+        /* Debug: every 10 seconds each command camera re-renders its backdrop several ways and logs what its sky is made of. A visible hitch with several cameras, so off for normal play. Static so the rig reads it without the settings instance. */
+        public static bool DebugSkyProbe { get; private set; } = false;
+
         // Low-overhead in-plugin performance telemetry (Recommendation 1 from
         // the profiling study). When true, KerbcastCamera.Refresh times each
         // render phase (galaxy / scaled / near / blit / readback) with
@@ -539,6 +542,8 @@ namespace Kerbcast
                 Debug.Log("[Kerbcast] EnableGalaxySkip=false: every camera renders its galaxy layer, even when the sky is black");
             if (DebugShowOwnCraft)
                 Debug.Log("[Kerbcast] DebugShowOwnCraft=true: command cameras on a craft draw that craft instead of hiding it");
+            if (DebugSkyProbe)
+                Debug.Log("[Kerbcast] DebugSkyProbe=true: every command camera re-renders its backdrop every 10 seconds to log its sky");
             if (!IsLoopback(settings.BindAddress))
             {
                 Debug.LogWarning($"[Kerbcast] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
@@ -639,6 +644,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             ApplyBool(node, "DebugShowOwnCraft", v => DebugShowOwnCraft = v);
+            ApplyBool(node, "DebugSkyProbe", v => DebugSkyProbe = v);
             ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
             ApplyVector3(node, "DebugWindDirection", v => DebugWindDirection = v);
