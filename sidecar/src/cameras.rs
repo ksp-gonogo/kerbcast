@@ -2867,13 +2867,26 @@ impl CameraRegistry {
             });
         }
 
-        // Push the snapshot to the run-log ring iff it's actually new
-        // (the consume loop polls way faster than the plugin writes).
-        // Capped at STATUS_LOG_CAP entries; oldest evicted when full.
+        let raw_export = GlobalStatusFileExport::from(&parsed);
+
+        /* The next diff has to measure from what clients were last told, or a
+         * slow drift stays under the thresholds on every poll and never sends. */
+        for (index, fov, fov_min, fov_max) in unsent_zoom {
+            let held = &mut parsed.cameras[index];
+            held.fov = fov;
+            held.fov_min = fov_min;
+            held.fov_max = fov_max;
+        }
+
+        /* Push the snapshot to the run-log ring iff it's actually new (the
+         * consume loop polls way faster than the plugin writes). Compared with
+         * the held values applied, or a camera resting under the threshold
+         * would differ on every poll; the entry keeps the raw export. Capped
+         * at STATUS_LOG_CAP entries; oldest evicted when full. */
         if last.as_ref() != Some(&parsed) {
             let entry = StatusLogEntry {
                 t_ms: self.epoch.elapsed().as_millis() as u64,
-                status: GlobalStatusFileExport::from(&parsed),
+                status: raw_export,
             };
             // VecDeque: pop_front is O(1); a Vec::remove(0) here would
             // shift 12k entries on every append once the cap is hit.
@@ -2884,14 +2897,6 @@ impl CameraRegistry {
             log.push_back(entry);
         }
 
-        /* The next diff has to measure from what clients were last told, or a
-         * slow drift stays under the thresholds on every poll and never sends. */
-        for (index, fov, fov_min, fov_max) in unsent_zoom {
-            let held = &mut parsed.cameras[index];
-            held.fov = fov;
-            held.fov_min = fov_min;
-            held.fov_max = fov_max;
-        }
         *last = Some(parsed);
 
         // Drop the poll locks before adopting: adopt_track_report re-locks the
@@ -7777,6 +7782,25 @@ mod tests {
             sent,
             vec![true, false, true, false, true],
             "each move under a threshold counts toward the next send"
+        );
+
+        let entries = registry.dump_run_logs().await.len();
+        write(1.0085, 2.03);
+        registry.poll_status().await;
+        registry.poll_status().await;
+        assert_eq!(
+            registry.dump_run_logs().await.len(),
+            entries,
+            "a camera at rest under the threshold adds no log entries"
+        );
+        write(1.5, 2.03);
+        registry.poll_status().await;
+        let log = registry.dump_run_logs().await;
+        assert_eq!(log.len(), entries + 1, "a real move is logged");
+        assert_eq!(
+            log.last().unwrap().status.cameras[0].fov,
+            1.5,
+            "the log keeps what the game reported"
         );
     }
 
