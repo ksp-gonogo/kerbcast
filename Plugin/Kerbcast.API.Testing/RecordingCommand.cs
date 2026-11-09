@@ -17,6 +17,7 @@ namespace Kerbcast.Api.Testing
         readonly List<CommandFeed> feeds = new List<CommandFeed>();
         readonly Dictionary<uint, List<CommandTarget>> targets = new Dictionary<uint, List<CommandTarget>>();
         readonly Dictionary<uint, Aim> aims = new Dictionary<uint, Aim>();
+        readonly Dictionary<uint, OpticsSettings> optics = new Dictionary<uint, OpticsSettings>();
         readonly List<PublishedSnapshot> published = new List<PublishedSnapshot>();
         string lockOwner;
         int scene;
@@ -57,6 +58,9 @@ namespace Kerbcast.Api.Testing
 
         /** <summary>The aim on each feed, as set and not cleared.</summary> */
         public IReadOnlyDictionary<uint, Aim> Aims => aims;
+
+        /** <summary>The optics override on each feed, as set and not cleared.</summary> */
+        public IReadOnlyDictionary<uint, OpticsSettings> Optics => optics;
 
         /** <summary>Every accepted snapshot, oldest first, from any thread.</summary> */
         public IReadOnlyList<PublishedSnapshot> Published
@@ -215,6 +219,7 @@ namespace Kerbcast.Api.Testing
                 bindings = null;
             }
             aims.Clear();
+            optics.Clear();
             ReturnedToTruth = false;
             return LockResult.Taken;
         }
@@ -295,6 +300,41 @@ namespace Kerbcast.Api.Testing
             return result;
         }
 
+        public OpticsResult SetOptics(uint flightId, OpticsSettings settings, string owner)
+        {
+            kc.Enter("SetOptics", ApiFeature.Optics);
+            kc.Record($"SetOptics {flightId} {settings?.ToString() ?? "null"} {owner}");
+            string holder = LockOwner;
+            if (holder != null)
+            {
+                if (holder != owner) return OpticsResult.NotLockHolder;
+                Heartbeats++;
+            }
+            if (!feeds.Exists(f => f.FlightId == flightId)) return OpticsResult.NotCommandFeed;
+            if (settings != null && (!AtLeastZero(settings.ResolutionArcsec) || !AtLeastZero(settings.SeeingArcsec) || !AtLeastZero(settings.SeeingAirmassPower)
+                || !AtLeastZero(settings.DaySkyStrength) || !AtLeastZero(settings.BrightnessHold) || settings.BrightnessHold > 1))
+                return OpticsResult.BadNumber;
+            /* As in Kerbcast, settings with every value NaN are no override at all. */
+            if (settings == null || (double.IsNaN(settings.ResolutionArcsec) && double.IsNaN(settings.SeeingArcsec)
+                && double.IsNaN(settings.SeeingAirmassPower) && double.IsNaN(settings.BrightnessHold) && double.IsNaN(settings.DaySkyStrength)))
+            {
+                optics.Remove(flightId);
+                return OpticsResult.Ok;
+            }
+            optics[flightId] = new OpticsSettings
+            {
+                ResolutionArcsec = settings.ResolutionArcsec,
+                SeeingArcsec = settings.SeeingArcsec,
+                SeeingAirmassPower = settings.SeeingAirmassPower,
+                BrightnessHold = settings.BrightnessHold,
+                DaySkyStrength = settings.DaySkyStrength,
+            };
+            return OpticsResult.Ok;
+        }
+
+        /* NaN (Kerbcast's own value) or finite and not negative. */
+        static bool AtLeastZero(double v) => double.IsNaN(v) || (!double.IsInfinity(v) && v >= 0);
+
         public IReadOnlyList<CommandFeed> Feeds()
         {
             kc.Enter("Feeds", ApiFeature.CommandFeeds);
@@ -333,6 +373,7 @@ namespace Kerbcast.Api.Testing
         void EndTenure()
         {
             aims.Clear();
+            optics.Clear();
             Heartbeats = 0;
             LightSpeed = null;
             LockOptions = LockOptions.None;

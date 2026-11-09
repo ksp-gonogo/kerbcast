@@ -155,6 +155,36 @@ namespace Kerbcast
         public double CommandCameraFovMinLevel1 { get; private set; } = 1.0;
         public double CommandCameraFovMinLevel2 { get; private set; } = 0.1;
         public double CommandCameraFovMax { get; private set; } = 30.0;
+        /* Deep-space optics: command cameras blur what they see in space by a
+           lens limit (by Tracking Station level) and, from the ground, by the
+           air. On by default; a GPU that cannot draw it keeps the plain look.
+           With it on, the lens rather than the level sets the zoom limit: a
+           camera stops where its blur spans OpticsModel.FloorBlurPx. */
+        public bool DeepSpaceOptics { get; private set; } = true;
+        /* The lens per Tracking Station level, in arcseconds (FWHM). Satellites
+           and other vantages follow the level too; the camera beside the launch
+           site always has level 1's. */
+        public double OpticsResolutionLevel1 { get; private set; } = 15.0;
+        public double OpticsResolutionLevel2 { get; private set; } = 4.0;
+        public double OpticsResolutionLevel3 { get; private set; } = 1.0;
+        /* Seeing at the zenith through Kerbin's sea-level air, in arcseconds,
+           and how fast it worsens towards the horizon. */
+        public double OpticsSeeing { get; private set; } = 1.0;
+        public double OpticsSeeingAirmassPower { get; private set; } = 0.6;
+        /* 0 keeps a blurred object's light strictly (a far planet goes dim), 1 keeps its surface brightness. */
+        public double OpticsBrightnessHold { get; private set; } = 1.0;
+        /* How strongly a daylit sky washes out faint things. */
+        public double OpticsDaySky { get; private set; } = 0.3;
+
+        /* The settings' optics knobs for a lens of `resolutionArcsec`. */
+        internal OpticsKnobs OpticsDefaults(double resolutionArcsec) => new OpticsKnobs
+        {
+            ResolutionArcsec = resolutionArcsec,
+            SeeingArcsec = OpticsSeeing,
+            SeeingAirmassPower = OpticsSeeingAirmassPower,
+            BrightnessHold = OpticsBrightnessHold,
+            DaySkyStrength = OpticsDaySky,
+        };
         /* Where the lens stands: "launchsite" (beside the pad or runway the
            active craft launched from) or "ksc" (the home CommNet station). */
         public string CommandCameraAnchor { get; private set; } = "launchsite";
@@ -299,6 +329,9 @@ namespace Kerbcast
            rendering the black sky (see GalaxyBlackout). Off renders it every
            frame, an escape hatch should a visual mod ever expect the render. */
         public static bool EnableGalaxySkip { get; private set; } = true;
+
+        /* With no light speed set, still light each camera's planets from the Sun as they really stand. Under a light speed they always are. */
+        public static bool PlanetPhases { get; private set; } = true;
 
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
@@ -543,6 +576,14 @@ namespace Kerbcast
             ApplyFloat(node, "CommandCameraFovMinLevel1", v => settings.CommandCameraFovMinLevel1 = Mathf.Max(0.001f, v));
             ApplyFloat(node, "CommandCameraFovMinLevel2", v => settings.CommandCameraFovMinLevel2 = Mathf.Max(0.001f, v));
             ApplyFloat(node, "CommandCameraFovMax", v => settings.CommandCameraFovMax = Mathf.Min(120f, v));
+            ApplyBool(node, "DeepSpaceOptics", v => settings.DeepSpaceOptics = v);
+            ApplyFloat(node, "OpticsResolutionLevel1", v => settings.OpticsResolutionLevel1 = Mathf.Max(0f, v));
+            ApplyFloat(node, "OpticsResolutionLevel2", v => settings.OpticsResolutionLevel2 = Mathf.Max(0f, v));
+            ApplyFloat(node, "OpticsResolutionLevel3", v => settings.OpticsResolutionLevel3 = Mathf.Max(0f, v));
+            ApplyFloat(node, "OpticsSeeing", v => settings.OpticsSeeing = Mathf.Max(0f, v));
+            ApplyFloat(node, "OpticsSeeingAirmassPower", v => settings.OpticsSeeingAirmassPower = Mathf.Clamp(v, 0f, 3f));
+            ApplyFloat(node, "OpticsBrightnessHold", v => settings.OpticsBrightnessHold = Mathf.Clamp01(v));
+            ApplyFloat(node, "OpticsDaySky", v => settings.OpticsDaySky = Mathf.Max(0f, v));
             ApplyString(node, "CommandCameraAnchor", v =>
             {
                 var a = v.Trim().ToLowerInvariant();
@@ -573,6 +614,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableFirefly", v => EnableFirefly = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
+            ApplyBool(node, "PlanetPhases", v => PlanetPhases = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);

@@ -16,6 +16,7 @@ namespace Kerbcast
     {
         private const string Tag = "[Kerbcast][CMDCAM]";
         private const float SizePixels = 3f;
+        internal const float DotSizePixels = SizePixels;
         private const double PreferredDistance = 5000.0;
         private const double MinUlps = 4.0;
         private const int TexSize = 16;
@@ -42,6 +43,8 @@ namespace Kerbcast
         private readonly List<MarkerRenderHook> _hooks = new List<MarkerRenderHook>();
         private readonly uint _flightId;
         private bool _show;
+        /* The marker last drew under deep-space optics, with their texture. */
+        private bool _optics;
         private bool _shownLogged;
 
         private CommandCameraMarker(Camera[] localLayers, int layer, uint flightId, Shader shader)
@@ -118,13 +121,30 @@ namespace Kerbcast
         }
 
         /* Places and sizes the impostor for this tick. `show` false keeps it
-           hidden (eclipse, occluded, a loaded target, no fix). */
+           hidden (eclipse, occluded, a loaded target, no fix). Under deep-space
+           optics it takes the blur's shape, size and light, and moves with
+           seeing. */
         public void Place(bool show, DVec3 station, DVec3 towardTarget, double rangeM, Quaternion facing,
-            float fovDeg, int renderHeight)
+            float fovDeg, int renderHeight, MarkerOptics optics = default)
         {
             _show = show;
             if (!show || _go == null) return;
-            double sizeAtUnit = CommandCameraMath.PixelSizeAtUnit(fovDeg, renderHeight) * SizePixels;
+            if (optics.Active != _optics)
+            {
+                _optics = optics.Active;
+                _material.mainTexture = optics.Active && optics.Texture != null ? optics.Texture : _texture;
+            }
+            else if (optics.Active && optics.Texture != null && _material.mainTexture != optics.Texture)
+                _material.mainTexture = optics.Texture;
+            double perPx = CommandCameraMath.PixelSizeAtUnit(fovDeg, renderHeight);
+            if (optics.Active && (optics.OffsetX != 0f || optics.OffsetY != 0f))
+            {
+                var right = facing * Vector3.right;
+                var up = facing * Vector3.up;
+                towardTarget = (towardTarget + new DVec3(right.x, right.y, right.z) * (optics.OffsetX * perPx)
+                    + new DVec3(up.x, up.y, up.z) * (optics.OffsetY * perPx)).Normalized;
+            }
+            double sizeAtUnit = perPx * (optics.Active ? optics.SizePx : SizePixels);
             double extent = station.Magnitude + PreferredDistance;
             double d = CommandCameraMath.ImpostorDistance(rangeM, PreferredDistance, sizeAtUnit, extent, MinUlps);
             var p = station + towardTarget * d;
@@ -137,6 +157,7 @@ namespace Kerbcast
             double k = 1.0 - 0.25 * Math.Log10(Math.Max(1.0, rangeM / 100000.0));
             float b = Mathf.Clamp((float)k, 0.5f, 1f);
             var c = new Color(Warm.r * b, Warm.g * b, Warm.b * b, 1f);
+            if (optics.Active) c = new Color(c.r * optics.Scale.r, c.g * optics.Scale.g, c.b * optics.Scale.b, 1f);
             if (_material.HasProperty(TintColorId)) _material.SetColor(TintColorId, c * 0.5f);
             if (_material.HasProperty(ColorId)) _material.SetColor(ColorId, c);
 
@@ -179,6 +200,26 @@ namespace Kerbcast
         }
 
         /* Bright centre with a soft edge, so a few pixels read as a point. */
+        private static float Dot(float x, float y)
+        {
+            float c = (TexSize - 1) * 0.5f;
+            float d = Mathf.Sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+            return Mathf.Clamp01(1.4f - d);
+        }
+
+        /* The dot's mean added light per texel: the additive shader multiplies its colour by its alpha. */
+        internal static double DotEnergy()
+        {
+            double sum = 0;
+            for (int y = 0; y < TexSize; y++)
+                for (int x = 0; x < TexSize; x++)
+                {
+                    double a = Dot(x, y);
+                    sum += a * a;
+                }
+            return sum / (TexSize * TexSize);
+        }
+
         internal static Texture2D BuildDot()
         {
             var tex = new Texture2D(TexSize, TexSize, TextureFormat.RGBA32, false)
@@ -187,13 +228,11 @@ namespace Kerbcast
                 wrapMode = TextureWrapMode.Clamp,
                 filterMode = FilterMode.Bilinear,
             };
-            float c = (TexSize - 1) * 0.5f;
             for (int y = 0; y < TexSize; y++)
             {
                 for (int x = 0; x < TexSize; x++)
                 {
-                    float d = Mathf.Sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
-                    float a = Mathf.Clamp01(1.4f - d);
+                    float a = Dot(x, y);
                     tex.SetPixel(x, y, new Color(a, a, a, a));
                 }
             }

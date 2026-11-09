@@ -204,6 +204,20 @@ namespace Kerbcast
             return KerbcastControl.SetAimCore(flightId, command, owner);
         }
 
+        public OpticsResult SetOptics(uint flightId, OpticsSettings optics, string owner)
+        {
+            Enter(nameof(SetOptics), ApiFeature.Optics);
+            var knobs = optics == null ? OpticsKnobs.Unset : new OpticsKnobs
+            {
+                ResolutionArcsec = optics.ResolutionArcsec,
+                SeeingArcsec = optics.SeeingArcsec,
+                SeeingAirmassPower = optics.SeeingAirmassPower,
+                BrightnessHold = optics.BrightnessHold,
+                DaySkyStrength = optics.DaySkyStrength,
+            };
+            return KerbcastControl.SetOpticsCore(flightId, knobs, owner);
+        }
+
         /* Kerbcast.API names bodies by flightGlobalsIndex; the rig by name. */
         static AimResult ToCommandAim(Aim a, out CommandAim command)
         {

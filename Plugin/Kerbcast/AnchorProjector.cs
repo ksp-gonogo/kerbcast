@@ -421,8 +421,9 @@ namespace Kerbcast
         /* A point fixed to body `b`, carried from where it is now to where this camera draws it: on the body at its past instant, turned back by its spin. */
         private static DVec3 OnDrawnBody(PicturePass picture, CelestialBody b, DVec3 live)
         {
-            if (!picture.TryDrawnBody(b, out var centre, out double dt)) return live;
-            return CommandCameraMath.CarriedByBody(live - ToD(b.position), centre, CommandCameraOcclusion.Spin(b), dt);
+            bool placed = picture.TryDrawnBody(b, out var centre, out double dt);
+            if (!placed && dt == 0) return live;
+            return CommandCameraMath.CarriedByBody(live - ToD(b.position), placed ? centre : ToD(b.position), CommandCameraOcclusion.Spin(b), dt);
         }
 
         /* A kinematic anchor's offset from its body's centre at `ut`, in KSP's fixed frame. */

@@ -108,6 +108,9 @@ namespace Kerbcast
         private readonly Func<Vector3> _eye;
         private readonly Func<Camera> _view;
         private readonly Func<RenderTexture> _target;
+        private readonly Func<double> _nativeFar;
+        private readonly Func<double> _reachFar;
+        private readonly Func<Camera> _scaled;
         private readonly CraftHider _hider;
         private readonly CraftStandIns _standIns;
         private readonly HashSet<uint> _walked = new HashSet<uint>();
@@ -117,6 +120,14 @@ namespace Kerbcast
         /* The scaled transforms this camera moved, as stock had them, to put back after its scaled render. */
         private readonly List<MovedBody> _moved = new List<MovedBody>();
         private int _scaledDepth;
+        /* Terrain renderers this camera switched off for its local layers. */
+        private readonly List<Renderer> _terrainOff = new List<Renderer>();
+        private static readonly SharedWalk<PQS, Renderer> s_terrain = new SharedWalk<PQS, Renderer>();
+        private static readonly Action<PQS, List<Renderer>> s_walkTerrain = WalkTerrain;
+        private static readonly List<PQ> s_storedQuads = new List<PQ>();
+        private static readonly List<PQ> s_ownQuads = new List<PQ>();
+        private static readonly List<Renderer> s_quadRenderers = new List<Renderer>();
+        private static readonly Func<PQ, PQS> s_sphereOf = q => q.sphereRoot;
 
         private struct MovedBody
         {
@@ -127,21 +138,93 @@ namespace Kerbcast
             /* The atmosphere shell's renderer and the centre stock gave its shader, or null for a body with none. */
             public Renderer Afg;
             public Vector4 AfgOffset;
+            /* The renderer whose sun direction was rewritten for its spun-back axes, and the value stock left in its block, or null for none. */
+            public Renderer Lit;
+            public int LitProperty;
+            public Vector4 LitValue;
+            /* The shell's light inputs as stock left them, or a null renderer for a body with no shell. */
+            public Renderer ShellLit;
+            public Vector4 ShellDir;
+            public float ShellDot;
+            /* The body, its list slot and where it is drawn this frame, for its light. Transform stays null for a body left in place. */
+            public CelestialBody Body;
+            public int Slot;
+            public DVec3 Centre;
+            public bool Hidden;
         }
+
+        /* The components LightBodies writes to for one body, found once. */
+        private sealed class LightSources
+        {
+            public GameObject Scaled;
+            public MaterialSetDirection Setter;
+            public Renderer Rim;
+            public string ValueName;
+            public int RimProperty;
+            public AtmosphereFromGround Afg;
+            public Renderer Shell;
+        }
+
+        private struct HeldCorona
+        {
+            public Transform Transform;
+            public Vector3 LocalPosition;
+            public Quaternion Local;
+            public Vector3 WorldPosition;
+            public Quaternion World;
+        }
+
+        /* Bodies, by index, whose terrain this camera left out last frame, so each change is logged once. */
+        private readonly HashSet<int> _farTerrainOff = new HashSet<int>();
+
+        private readonly List<HeldCorona> _coronas = new List<HeldCorona>();
+        private readonly List<SunCoronas> _coronaScratch = new List<SunCoronas>();
 
         private static readonly int AfgOffsetId = Shader.PropertyToID("_OffsetTransform");
         private readonly MaterialPropertyBlock _afgBlock = new MaterialPropertyBlock();
+        private readonly MaterialPropertyBlock _lightBlock = new MaterialPropertyBlock();
+        private static readonly int ShellLightDirId = Shader.PropertyToID("_v4LightDir");
+        private static readonly int ShellLightDotId = Shader.PropertyToID("_lightDot");
+        private static readonly HashSet<string> s_lightLogged = new HashSet<string>();
+        private readonly Dictionary<CelestialBody, LightSources> _lightSources = new Dictionary<CelestialBody, LightSources>();
+        private GameScenes _lightSourcesScene;
+        private double[] _discs = new double[0];
+        /* The list slot of the body this camera aimed the light at last frame, so the choice holds between frames. */
+        private int _litSlot = -1;
+        private readonly SystemLights _systems = new SystemLights();
+        private int[] _parents = new int[0];
+        private bool[] _stars = new bool[0];
+        private double[] _best = new double[0];
+        private int[] _assigned = new int[0];
+        /* The spare layer each system root held last frame, or -1, so a system keeps its light between frames. */
+        private int[] _systemLayer = new int[0];
+        private DVec3[] _centres = new DVec3[0];
+        private readonly int[] _spareLayers = new int[3];
+        private readonly List<CelestialBody> _systemBodies = new List<CelestialBody>();
+        private readonly List<int> _systemLayers = new List<int>();
+        private readonly List<Vector3> _systemDirs = new List<Vector3>();
+        private int _loggedMainRoot = -2;
+        private Transform _sunHeld;
+        private Quaternion _sunHeldLocal;
 
         /* `craft` is the craft the lens rides, `eye` where it looks from and
            `view` the camera whose frustum the stand-ins are drawn for, drawing
            into `target` if it targets that only while it renders; null `craft`
-           leaves the lens to Place. */
-        public PicturePass(Func<Vessel> craft, Func<Vector3> eye, Func<Camera> view, Func<RenderTexture> target = null)
+           leaves the lens to Place. `nativeFar` is how far the local layers
+           reach of themselves, the terrain they exist to draw, and `reachFar`
+           how far they reach this frame, stretched to a subject; both default
+           to the view camera's far plane. `scaled` is the camera that
+           draws the scaled layer, for a light per planetary system. */
+        public PicturePass(Func<Vessel> craft, Func<Vector3> eye, Func<Camera> view, Func<RenderTexture> target = null,
+            Func<double> nativeFar = null, Func<double> reachFar = null, Func<Camera> scaled = null)
         {
+            _scaled = scaled;
             _craft = craft;
             _eye = eye;
             _view = view;
             _target = target;
+            _nativeFar = nativeFar;
+            _reachFar = reachFar;
             _hider = new CraftHider(this);
             _standIns = new CraftStandIns(this);
         }
@@ -186,40 +269,60 @@ namespace Kerbcast
          * transform back exactly as stock had it, for the other cameras and the
          * main view. A call nested inside the pair (a probe re-render) does
          * nothing, and AfterScaledLayer undoes only what was moved, so a throw
-         * part way through leaves nothing behind.
+         * part way through leaves nothing behind. Each body is then lit from
+         * the Sun as this camera draws it (LightBodies); with no light speed
+         * set, that alone runs, and only if the player's setting asks for it.
          */
         public void BeforeScaledLayer()
         {
             if (_scaledDepth++ > 0) return;
-            double? c = LightTime.LightSpeed;
-            if (!c.HasValue || !TryFrameLens(out var lens)) return;
-            var plan = BodiesFor(lens, c.Value);
             var bodies = FlightGlobals.Bodies;
-            if (plan == null || (plan.Moved == 0 && plan.Hidden == 0) || bodies == null) return;
+            LogBodyLight(bodies);
+            double? c = LightTime.LightSpeed;
+            if (bodies == null || !BodyLight.Applies(c.HasValue, KerbcastSettings.PlanetPhases) || !TryFrameLens(out var lens)) return;
+            var plan = c.HasValue ? BodiesFor(lens, c.Value) : null;
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
                 var t = b != null && b.scaledBody != null ? b.scaledBody.transform : null;
                 if (t == null) continue;
-                var moved = new MovedBody { Transform = t, Position = t.localPosition, Rotation = t.localRotation, Scale = t.localScale };
+                _moved.Add(new MovedBody { Body = b, Slot = i, Centre = ToD(b.position) });
+                if (plan == null || KeepsPresent(b, lens)) continue;
+                var moved = _moved[_moved.Count - 1];
+                moved.Transform = t;
+                moved.Position = t.localPosition;
+                moved.Rotation = t.localRotation;
+                moved.Scale = t.localScale;
                 /* No instant to draw it at yet: shrunk to nothing, its atmosphere shell with it, rather than drawn early. */
                 if (plan.Hides(b.flightGlobalsIndex))
                 {
-                    _moved.Add(moved);
+                    moved.Hidden = true;
+                    _moved[_moved.Count - 1] = moved;
                     t.localScale = Vector3.zero;
                     continue;
                 }
-                if (!plan.TryDrawn(b.flightGlobalsIndex, out var centre, out double dt)) continue;
-                _moved.Add(moved);
-                t.position = ScaledSpace.LocalToScaledSpace(new Vector3d(centre.X, centre.Y, centre.Z));
+                bool placed = plan.TryDrawn(b.flightGlobalsIndex, out var centre, out double dt);
+                if (!placed && !plan.TrySpin(b.flightGlobalsIndex, out dt))
+                {
+                    moved.Transform = null;
+                    _moved[_moved.Count - 1] = moved;
+                    continue;
+                }
+                if (placed) moved.Centre = centre;
+                _moved[_moved.Count - 1] = moved;
+                if (placed) t.position = ScaledSpace.LocalToScaledSpace(new Vector3d(centre.X, centre.Y, centre.Z));
                 /* ScaledMovement gives the mesh the body transform's rotation; this is that rotation dt seconds earlier. */
                 if (b.rotates && b.bodyTransform != null)
                 {
                     var parent = t.parent;
                     var spun = DQuat.FromRotationVector(ToD(b.angularVelocity) * dt);
                     var q = new Quaternion((float)spun.X, (float)spun.Y, (float)spun.Z, (float)spun.W);
+                    int held = _coronas.Count;
+                    if (b.isStar) HoldCoronas(b);
                     t.rotation = q * (parent != null ? parent.rotation : Quaternion.identity) * b.bodyTransform.rotation;
+                    for (int h = held; h < _coronas.Count; h++) _coronas[h].Transform.SetPositionAndRotation(_coronas[h].WorldPosition, _coronas[h].World);
                 }
+                if (!placed) continue;
                 /* AtmosphereFromGround gave its shader the shell's centre in LateUpdate, before the move. */
                 var afg = b.afg != null ? b.afg.GetComponent<Renderer>() : null;
                 if (afg != null)
@@ -232,12 +335,321 @@ namespace Kerbcast
                     afg.SetPropertyBlock(_afgBlock);
                 }
             }
+            LightBodies(bodies, plan, lens);
+        }
+
+        /* Whether this camera's scaled render lights each body from the Sun itself this frame, so a rig leaves the Sun and the shells' light alone. */
+        public bool BodiesLit { get; private set; }
+
+        /*
+         * Lights every body from the Sun as this camera draws it. The rim and
+         * the atmosphere shell read per-renderer inputs and take each body's
+         * own direction. The surface's terminator comes from Unity's one
+         * directional light, which can only face one way per render, so it is
+         * turned to the body with the widest disc in frame, passing over a
+         * lens's own planet while it fills the frame and another body that
+         * can be seen is in it. Every input is put back in AfterScaledLayer.
+         */
+        private void LightBodies(List<CelestialBody> bodies, BodyPlan plan, PictureLens lens)
+        {
+            var sunBody = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (sunBody == null || sunBody.scaledBody == null) return;
+            BodiesLit = true;
+            var sun = ToD(sunBody.position);
+            if (plan != null && plan.TryDrawn(sunBody.flightGlobalsIndex, out var sunDrawn, out _)) sun = sunDrawn;
+            var view = View;
+            var ahead = default(DVec3);
+            double halfDiagonal = 0;
+            if (view != null)
+            {
+                var f = view.transform.forward;
+                ahead = new DVec3(f.x, f.y, f.z);
+                halfDiagonal = BodyLight.HalfDiagonalRadians(view.fieldOfView, view.aspect);
+            }
+            if (_discs.Length < bodies.Count) _discs = new double[bodies.Count];
+            Array.Clear(_discs, 0, _discs.Length);
+            Vector3 lensScaled = ScaledSpace.LocalToScaledSpace(new Vector3d(lens.Point.X, lens.Point.Y, lens.Point.Z));
+            Vector3 sunScaled = sunBody.scaledBody.transform.position;
+            int underfoot = -1;
+            var ownCentre = default(DVec3);
+            for (int i = 0; i < _moved.Count; i++)
+            {
+                var m = _moved[i];
+                if (m.Hidden) continue;
+                var sources = SourcesFor(m.Body);
+                LightRim(ref m, sun, sources);
+                _moved[i] = m;
+                LightShell(ref m, sun, lensScaled, sunScaled, sources);
+                _moved[i] = m;
+                if (view != null && !m.Body.isStar)
+                {
+                    _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ReachOf(m.Body), ahead, BodyLight.ConeFor(halfDiagonal, m.Slot == _litSlot));
+                    if (m.Body == lens.Body && BodyLight.FillsFrame(BodyLight.AngleFrom(lens.Point, m.Centre, ahead), _discs[m.Slot], halfDiagonal))
+                    {
+                        underfoot = m.Slot;
+                        ownCentre = m.Centre;
+                    }
+                }
+            }
+            if (underfoot >= 0)
+            {
+                var rt = Target ?? view.targetTexture;
+                int rows = rt != null ? rt.height : view.pixelHeight;
+                for (int i = 0; i < _moved.Count; i++)
+                {
+                    var m = _moved[i];
+                    if (m.Slot != underfoot && _discs[m.Slot] > 0 && !BodyLight.OutranksOwn(lens.Point, ownCentre, lens.Body.Radius, m.Centre, _discs[m.Slot], view.fieldOfView, rows, m.Slot == _litSlot))
+                        _discs[m.Slot] = 0;
+                }
+            }
+            _litSlot = BodyLight.Pick(_discs, bodies.Count, _litSlot, underfoot);
+            for (int i = 0; i < _moved.Count; i++)
+                if (_moved[i].Slot == _litSlot && !_moved[i].Hidden)
+                {
+                    TurnSunTo(BodyLight.Direction(sun, _moved[i].Centre, default));
+                    break;
+                }
+            if (view != null) LightSystems(bodies, lens, sun, ahead, halfDiagonal, underfoot, ownCentre);
+        }
+
+        /*
+         * Gives each other planetary system in frame a light of its own, from
+         * the Sun to its planet as drawn, so a second planet in the picture
+         * shows its true phase too (SystemLights). The main light's system,
+         * and any past the spare layers, keep the main light.
+         */
+        private void LightSystems(List<CelestialBody> bodies, PictureLens lens, DVec3 sun, DVec3 ahead, double halfDiagonal, int underfoot, DVec3 ownCentre)
+        {
+            int n = bodies.Count;
+            if (_parents.Length < n)
+            {
+                _parents = new int[n];
+                _stars = new bool[n];
+                _best = new double[n];
+                _assigned = new int[n];
+                _centres = new DVec3[n];
+                int[] grown = new int[n];
+                for (int i = 0; i < n; i++) grown[i] = i < _systemLayer.Length ? _systemLayer[i] : -1;
+                _systemLayer = grown;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                var b = bodies[i];
+                var up = b != null ? b.referenceBody : null;
+                _parents[i] = up != null && up != b ? up.flightGlobalsIndex : -1;
+                _stars[i] = b == null || b.isStar;
+                _best[i] = 0;
+                _centres[i] = b != null ? ToD(b.position) : default;
+            }
+            int mainRoot = _litSlot >= 0 ? BodyLight.SystemRoot(_parents, _stars, _litSlot) : -1;
+            for (int i = 0; i < _moved.Count; i++)
+            {
+                var m = _moved[i];
+                _centres[m.Slot] = m.Centre;
+                if (m.Hidden || m.Body.isStar) continue;
+                int root = BodyLight.SystemRoot(_parents, _stars, m.Slot);
+                if (root < 0) continue;
+                bool held = root == mainRoot || _systemLayer[root] >= 0;
+                double disc = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ReachOf(m.Body), ahead, BodyLight.ConeFor(halfDiagonal, held));
+                if (disc > 0 && underfoot >= 0 && m.Slot != underfoot && BodyLight.BehindLimb(lens.Point, ownCentre, lens.Body.Radius, m.Centre)) disc = 0;
+                if (disc > _best[root]) _best[root] = disc;
+            }
+            int spares = SystemLights.Spares(_spareLayers);
+            BodyLight.AssignLayers(_best, n, mainRoot, _systemLayer, _spareLayers, spares, _assigned);
+            _systemBodies.Clear();
+            _systemLayers.Clear();
+            _systemDirs.Clear();
+            for (int i = 0; i < _moved.Count; i++)
+            {
+                var m = _moved[i];
+                int root = m.Body.isStar ? -1 : BodyLight.SystemRoot(_parents, _stars, m.Slot);
+                if (root < 0 || _assigned[root] < 0 || m.Hidden) continue;
+                var d = BodyLight.Direction(sun, _centres[root], default);
+                if (d.Magnitude <= 0) continue;
+                _systemBodies.Add(m.Body);
+                _systemLayers.Add(_assigned[root]);
+                _systemDirs.Add(new Vector3((float)d.X, (float)d.Y, (float)d.Z));
+            }
+            if (_systemBodies.Count == 0 || !_systems.Begin(_scaled?.Invoke(), ScaledSunLightHelper.GetScaledSunLight(), _systemBodies, _systemLayers, _systemDirs))
+                for (int i = 0; i < n; i++) _assigned[i] = -1;
+            LogSystems(bodies, mainRoot);
+            Array.Copy(_assigned, _systemLayer, n);
+        }
+
+        /* How far from its centre `b` is drawn, for whether any of it reaches the frame. */
+        private static double ReachOf(CelestialBody b)
+        {
+            var pqs = b.pqsController;
+            return BodyLight.ReachRadius(b.Radius, pqs != null ? pqs.radiusMax : 0, b.atmosphere, b.atmosphereDepth);
+        }
+
+        /* One line whenever this camera's systems change light, for checking a capture against what lit it. */
+        private void LogSystems(List<CelestialBody> bodies, int mainRoot)
+        {
+            bool changed = mainRoot != _loggedMainRoot;
+            for (int i = 0; i < bodies.Count && !changed; i++) changed = _assigned[i] != _systemLayer[i];
+            if (!changed) return;
+            _loggedMainRoot = mainRoot;
+            var line = new System.Text.StringBuilder();
+            line.Append($"{Tag} view={(View != null ? View.name : "none")} event=body-light main={(mainRoot >= 0 ? bodies[mainRoot].bodyName : "none")}@{SystemLights.ScaledLayer}(Scaledspace SunLight)");
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                if (_assigned[i] >= 0) line.Append($" group={bodies[i].bodyName}@{_assigned[i]}(Kerbcast system light {_assigned[i]})");
+                else if (_best[i] > 0 && i != mainRoot) line.Append($" shared={bodies[i].bodyName}");
+            }
+            Debug.Log(line.ToString());
+        }
+
+        /* Turns the Sun, and the scaled light that hangs from it, to shine along `direction`, unless stock's light is already that close. */
+        private void TurnSunTo(DVec3 direction)
+        {
+            var sun = Sun.Instance != null ? Sun.Instance.transform : null;
+            if (sun == null || direction.Magnitude <= 0) return;
+            var stock = sun.forward;
+            if (CommandCameraMath.SunTurnDeg(new DVec3(stock.x, stock.y, stock.z), direction) <= CommandCameraMath.SunTurnMinDeg) return;
+            _sunHeld = sun;
+            _sunHeldLocal = sun.localRotation;
+            var forward = new Vector3((float)direction.X, (float)direction.Y, (float)direction.Z).normalized;
+            sun.rotation = Quaternion.FromToRotation(stock, forward) * sun.rotation;
+        }
+
+        /* The shell's light inputs for this body, as AtmosphereFromGround derives them, from the Sun to the body as drawn and the lens as placed. */
+        private void LightShell(ref MovedBody m, DVec3 sun, Vector3 lensScaled, Vector3 sunScaled, LightSources sources)
+        {
+            var afg = m.Body.afg;
+            var r = sources.Shell;
+            if (r == null) return;
+            r.GetPropertyBlock(_afgBlock);
+            m.ShellLit = r;
+            m.ShellDir = _afgBlock.GetVector(ShellLightDirId);
+            m.ShellDot = _afgBlock.GetFloat(ShellLightDotId);
+            var stock = afg.sunLightDirection;
+            var toSun = BodyLight.Direction(m.Centre, sun, new DVec3(stock.x, stock.y, stock.z));
+            _afgBlock.SetVector(ShellLightDirId, new Vector4((float)toSun.X, (float)toSun.Y, (float)toSun.Z, 0f));
+            Vector3 down = m.Body.scaledBody.transform.position - lensScaled;
+            _afgBlock.SetFloat(ShellLightDotId, Mathf.Clamp01(Vector3.Dot(down, lensScaled - sunScaled) * afg.dawnFactor));
+            r.SetPropertyBlock(_afgBlock);
+        }
+
+        /*
+         * A star's coronas hang under its mesh, and stock turns them to a
+         * camera in FixedUpdate. Noted before the mesh is turned back, so they
+         * keep the place and orientation stock gave them while the mesh alone
+         * turns. Stock never sets their local position, so that comes from the
+         * prefab or a planet pack and may be anything.
+         */
+        private void HoldCoronas(CelestialBody b)
+        {
+            b.scaledBody.GetComponentsInChildren(false, _coronaScratch);
+            for (int i = 0; i < _coronaScratch.Count; i++)
+            {
+                var t = _coronaScratch[i].transform;
+                _coronas.Add(new HeldCorona { Transform = t, LocalPosition = t.localPosition, Local = t.localRotation, WorldPosition = t.position, World = t.rotation });
+            }
+            _coronaScratch.Clear();
+        }
+
+        /*
+         * The rim's light direction, from the Sun to this body's drawn centre.
+         * MaterialSetDirection stored one shared direction in the mesh's own
+         * axes in Update, from the rotation the mesh had then, so a mesh
+         * turned back would carry it round with it. Written for the axes the
+         * mesh has now, in the property block the setter uses, and put back
+         * in AfterScaledLayer.
+         */
+        private void LightRim(ref MovedBody m, DVec3 sun, LightSources sources)
+        {
+            var setter = sources.Setter;
+            var r = setter != null && setter.target != null ? sources.Rim : null;
+            if (r == null || string.IsNullOrEmpty(setter.valueName)) return;
+            if (sources.ValueName != setter.valueName)
+            {
+                sources.ValueName = setter.valueName;
+                sources.RimProperty = Shader.PropertyToID(setter.valueName);
+            }
+            int id = sources.RimProperty;
+            r.GetPropertyBlock(_lightBlock);
+            m.Lit = r;
+            m.LitProperty = id;
+            m.LitValue = _lightBlock.GetVector(id);
+            var rot = m.Body.scaledBody.transform.rotation;
+            var f = setter.target.forward;
+            var away = BodyLight.Direction(sun, m.Centre, new DVec3(f.x, f.y, f.z));
+            var local = PictureBoundary.LightInBodyAxes(new DQuat(rot.x, rot.y, rot.z, rot.w), away);
+            _lightBlock.SetVector(id, new Vector4((float)local.X, (float)local.Y, (float)local.Z, 0f));
+            r.SetPropertyBlock(_lightBlock);
+        }
+
+        /*
+         * This camera's components for a body, looked up again when one was
+         * destroyed or the body was given another. A body with no setter or
+         * shell renderer is looked up every time, so one added late is found.
+         */
+        private LightSources SourcesFor(CelestialBody b)
+        {
+            if (_lightSourcesScene != HighLogic.LoadedScene)
+            {
+                _lightSourcesScene = HighLogic.LoadedScene;
+                _lightSources.Clear();
+            }
+            if (!_lightSources.TryGetValue(b, out var s))
+            {
+                s = new LightSources();
+                _lightSources[b] = s;
+            }
+            if (s.Scaled != b.scaledBody || s.Setter == null || s.Rim == null)
+            {
+                s.Scaled = b.scaledBody;
+                s.Setter = b.scaledBody.GetComponent<MaterialSetDirection>();
+                s.Rim = s.Setter != null ? s.Setter.GetComponent<Renderer>() : null;
+            }
+            if (s.Afg != b.afg || s.Shell == null)
+            {
+                s.Afg = b.afg;
+                s.Shell = b.afg != null ? b.afg.GetComponent<Renderer>() : null;
+            }
+            return s;
+        }
+
+        /* Names, once per body, what lights it, for checking a planet pack or a game update against what this pass writes. */
+        private static void LogBodyLight(List<CelestialBody> bodies)
+        {
+            if (bodies == null || s_lightLogged.Count >= bodies.Count) return;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null || b.scaledBody == null || !s_lightLogged.Add(b.bodyName)) continue;
+                var setter = b.scaledBody.GetComponent<MaterialSetDirection>();
+                var r = b.scaledBody.GetComponent<Renderer>();
+                var shader = r != null && r.sharedMaterial != null ? r.sharedMaterial.shader : null;
+                Debug.Log($"[Kerbcast] event=body-light body={b.bodyName} valueName={(setter != null ? setter.valueName : "none")} target={(setter != null && setter.target != null ? setter.target.name : "none")} shader={(shader != null ? shader.name : "none")}");
+            }
         }
 
         public void AfterScaledLayer()
         {
             if (--_scaledDepth > 0) return;
             _scaledDepth = 0;
+            try { _systems.End(); }
+            finally { RestoreScaled(); }
+        }
+
+        private void RestoreScaled()
+        {
+            BodiesLit = false;
+            if (_sunHeld != null)
+            {
+                _sunHeld.localRotation = _sunHeldLocal;
+                _sunHeld = null;
+            }
+            for (int i = 0; i < _coronas.Count; i++)
+            {
+                var held = _coronas[i];
+                if (held.Transform == null) continue;
+                held.Transform.localPosition = held.LocalPosition;
+                held.Transform.localRotation = held.Local;
+            }
+            _coronas.Clear();
             for (int i = _moved.Count - 1; i >= 0; i--)
             {
                 var m = _moved[i];
@@ -246,6 +658,19 @@ namespace Kerbcast
                     m.Afg.GetPropertyBlock(_afgBlock);
                     _afgBlock.SetVector(AfgOffsetId, m.AfgOffset);
                     m.Afg.SetPropertyBlock(_afgBlock);
+                }
+                if (m.ShellLit != null)
+                {
+                    m.ShellLit.GetPropertyBlock(_afgBlock);
+                    _afgBlock.SetVector(ShellLightDirId, m.ShellDir);
+                    _afgBlock.SetFloat(ShellLightDotId, m.ShellDot);
+                    m.ShellLit.SetPropertyBlock(_afgBlock);
+                }
+                if (m.Lit != null)
+                {
+                    m.Lit.GetPropertyBlock(_lightBlock);
+                    _lightBlock.SetVector(m.LitProperty, m.LitValue);
+                    m.Lit.SetPropertyBlock(_lightBlock);
                 }
                 if (m.Transform == null) continue;
                 m.Transform.localPosition = m.Position;
@@ -261,7 +686,34 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (!c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && (plan.Moved > 0 || plan.Hidden > 0);
+            var bodies = FlightGlobals.Bodies;
+            if (plan == null || bodies == null) return false;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b != null && !KeepsPresent(b, lens) && (plan.Moves(b.flightGlobalsIndex) || plan.Hides(b.flightGlobalsIndex) || plan.TrySpin(b.flightGlobalsIndex, out _))) return true;
+            }
+            return false;
+        }
+
+        /*
+         * Whether this camera leaves body `b` at the present: its terrain is
+         * built in local space, where stock has it, and is close enough to
+         * this lens for the local layers to draw it, so the scaled sphere must
+         * stay with its ground. Only the local layers' own reach counts, not a
+         * far plane stretched to a subject, or a telescope on a craft at a
+         * planet would keep that planet at the present for as long as it
+         * looked at the craft.
+         */
+        private bool KeepsPresent(CelestialBody b, PictureLens lens) => TerrainLocal(b, lens.Point);
+
+        /* Whether terrain of `b` is built and within this camera's own reach of `eye`, so the local layers draw that body's ground. */
+        public bool TerrainLocal(CelestialBody b, DVec3 eye)
+        {
+            var pqs = b != null ? b.pqsController : null;
+            if (pqs == null || !pqs.isActive) return false;
+            double far = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
+            return PictureBoundary.TerrainInReach((eye - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), far);
         }
 
         /* Whether this camera leaves body `b` out of its picture this frame, its light not yet placed. */
@@ -270,13 +722,14 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (b == null || !c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && plan.Hides(b.flightGlobalsIndex);
+            return plan != null && !KeepsPresent(b, lens) && plan.Hides(b.flightGlobalsIndex);
         }
 
         /* Where this camera draws body `b` this frame when it is drawn at its
            past instant: its centre in world space, and the seconds from the
            render UT back to that instant. False for a body drawn where stock
-           has it, and with no light speed. */
+           has it, and with no light speed, with `dt` still its spin back when
+           only its spin moves (the lens's own body and those above it). */
         public bool TryDrawnBody(CelestialBody b, out DVec3 centre, out double dt)
         {
             centre = default;
@@ -284,7 +737,10 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (b == null || !c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && plan.TryDrawn(b.flightGlobalsIndex, out centre, out dt);
+            if (plan == null || KeepsPresent(b, lens)) return false;
+            if (plan.TryDrawn(b.flightGlobalsIndex, out centre, out dt)) return true;
+            plan.TrySpin(b.flightGlobalsIndex, out dt);
+            return false;
         }
 
         /*
@@ -301,14 +757,16 @@ namespace Kerbcast
             if (centres == null || centres.Length < list.Count) centres = new DVec3[list.Count];
             if (radii == null || radii.Length < list.Count) radii = new double[list.Count];
             double? c = LightTime.LightSpeed;
-            var plan = c.HasValue && TryFrameLens(out var lens) ? BodiesFor(lens, c.Value) : null;
+            PictureLens lens = default;
+            var plan = c.HasValue && TryFrameLens(out lens) ? BodiesFor(lens, c.Value) : null;
             for (int i = 0; i < list.Count; i++)
             {
                 var b = list[i];
                 radii[i] = b != null ? b.Radius * (1.0 - 1e-7) : 0;
-                if (b == null || (plan != null && plan.Hides(b.flightGlobalsIndex)))
+                bool kept = b != null && plan != null && KeepsPresent(b, lens);
+                if (b == null || (plan != null && !kept && plan.Hides(b.flightGlobalsIndex)))
                     centres[i] = new DVec3(double.NaN, double.NaN, double.NaN);
-                else if (plan == null || !plan.TryDrawn(b.flightGlobalsIndex, out centres[i], out _))
+                else if (plan == null || kept || !plan.TryDrawn(b.flightGlobalsIndex, out centres[i], out _))
                     centres[i] = ToD(b.position);
             }
             return list.Count;
@@ -324,12 +782,110 @@ namespace Kerbcast
         {
             _hider.Hide();
             _standIns.Show();
+            HideFarTerrain();
         }
 
         public void AfterLayers()
         {
             try { _hider.Restore(); }
-            finally { _standIns.Restore(); }
+            finally
+            {
+                try { _standIns.Restore(); }
+                finally { RestoreFarTerrain(); }
+            }
+        }
+
+        /*
+         * A local layer stretched to a far subject can reach terrain built in
+         * local space far beyond the reach stock builds it for, where it draws
+         * wrongly over the scaled sphere (FarTerrain.StretchedOnly). Its
+         * renderers are switched off for this camera's local layers alone, as
+         * the craft hider does, and only those that were on are put back.
+         */
+        private void HideFarTerrain()
+        {
+            var bodies = FlightGlobals.Bodies;
+            if (bodies == null)
+            {
+                _farTerrainOff.Clear();
+                return;
+            }
+            if (!TryFrameLens(out var lens)) return;
+            double native = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
+            double reach = _reachFar != null ? _reachFar() : View != null ? View.farClipPlane : 0;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null) continue;
+                var pqs = b.pqsController;
+                double distance = (lens.Point - ToD(b.position)).Magnitude;
+                bool off = pqs != null && pqs.isActive
+                    && FarTerrain.StretchedOnly(distance, Math.Max(b.Radius, pqs.radiusMax), native, reach);
+                NoteFarTerrain(b, off, distance, native, reach);
+                if (!off) continue;
+                SwitchOff(pqs);
+                var children = pqs.ChildSpheres;
+                if (children == null) continue;
+                for (int s = 0; s < children.Length; s++)
+                    if (children[s] != null) SwitchOff(children[s]);
+            }
+        }
+
+        /* Logs body `b`'s terrain being left out or drawn again by this camera, once per change. */
+        private void NoteFarTerrain(CelestialBody b, bool off, double distance, double native, double reach)
+        {
+            int index = b.flightGlobalsIndex;
+            if (off ? !_farTerrainOff.Add(index) : !_farTerrainOff.Remove(index)) return;
+            Debug.Log($"{Tag} view={(View != null ? View.name : "none")} event=far-terrain body={b.bodyName} state={(off ? "off" : "on")} "
+                + $"distance={distance:F0} nativeFar={native:F0} reach={reach:F0}");
+        }
+
+        private void SwitchOff(PQS sphere)
+        {
+            var renderers = s_terrain.For(sphere, Time.frameCount, QuadsInUse(), s_walkTerrain);
+            for (int i = 0; i < renderers.Count; i++)
+            {
+                var r = renderers[i];
+                if (r == null || r.forceRenderingOff) continue;
+                r.forceRenderingOff = true;
+                _terrainOff.Add(r);
+            }
+        }
+
+        /* Stock's count of quads handed out to spheres, which moves when a sphere builds or drops one. */
+        private static int QuadsInUse()
+        {
+            var cache = PQSCache.Instance;
+            return cache != null ? cache.cachePQAssignedCount : 0;
+        }
+
+        private static void WalkTerrain(PQS sphere, List<Renderer> into)
+        {
+            sphere.GetComponentsInChildren(false, into);
+            AddStoredQuads(sphere, into);
+        }
+
+        /* Adds the renderers of `sphere`'s quads in the storage all spheres share, where stock keeps the most detailed ones. */
+        private static void AddStoredQuads(PQS sphere, List<Renderer> into)
+        {
+            if (sphere.LocalSpacePQStorage == null) return;
+            sphere.LocalSpacePQStorage.GetComponentsInChildren(false, s_storedQuads);
+            FarTerrain.OwnedQuads(s_storedQuads, sphere, s_sphereOf, s_ownQuads);
+            for (int i = 0; i < s_ownQuads.Count; i++)
+            {
+                s_ownQuads[i].GetComponentsInChildren(false, s_quadRenderers);
+                into.AddRange(s_quadRenderers);
+            }
+            s_storedQuads.Clear();
+            s_ownQuads.Clear();
+            s_quadRenderers.Clear();
+        }
+
+        private void RestoreFarTerrain()
+        {
+            for (int i = 0; i < _terrainOff.Count; i++)
+                if (_terrainOff[i] != null) _terrainOff[i].forceRenderingOff = false;
+            _terrainOff.Clear();
         }
 
         /*
@@ -591,7 +1147,7 @@ namespace Kerbcast
                 var plan = BodiesFor(lens, c.Value);
                 int frame = sight.Frame;
                 DQuat q;
-                if (plan != null && (plan.Moves(index) || plan.Hides(index)) && frame >= 0 && frame < bodies.Count && bodies[frame] != null)
+                if (plan != null && !KeepsPresent(seen.Body, lens) && (plan.Moves(index) || plan.Hides(index)) && frame >= 0 && frame < bodies.Count && bodies[frame] != null)
                 {
                     seen.World = ToD(bodies[frame].position) + back.Rotate(sight.About);
                     seen.About = bodies[frame];
@@ -600,9 +1156,12 @@ namespace Kerbcast
                 else
                 {
                     var spin = ring.SpinOf(lens.Body.flightGlobalsIndex);
-                    seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, lens.Ut, spin));
+                    /* A body whose spin is drawn turned back (the lens's own or one above it) carries the craft on it only as far as it is drawn. */
+                    double drawnAt = lens.Ut;
+                    if (plan != null && !KeepsPresent(seen.Body, lens) && plan.TrySpin(index, out double spinBack)) drawnAt += spinBack;
+                    seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, drawnAt, spin));
                     seen.About = seen.Body;
-                    q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, lens.Ut, spin)).Normalized;
+                    q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, drawnAt, spin)).Normalized;
                 }
                 seen.Rotation = new Quaternion((float)q.X, (float)q.Y, (float)q.Z, (float)q.W);
                 seen.Parts = sight.Parts;
@@ -624,11 +1183,13 @@ namespace Kerbcast
 
         /*
          * Where every body is drawn from `lens` this frame, solved once per lens
-         * point and shared by every camera that solves from it. A body stays
-         * where stock has it when its terrain is drawn in local space, so its
-         * scaled sphere never parts from its ground, or when the world's frame
-         * turns with it. A body that has left its Kepler path is read from its
-         * ring track while the track covers the instant.
+         * point and shared by every camera that solves from it. Each camera
+         * then leaves a body at the present for itself where its local layers
+         * can draw that body's terrain (KeepsPresent). The solve and the move
+         * read every position through Planetarium's rotation, so a body the
+         * world's axes turn with (inverseRotation) is solved like any other.
+         * A body that has left its Kepler path is read from its ring track
+         * while the track covers the instant.
          *
          * A body that may outrun light is followed by the plan's trace for it,
          * within the lens's fair share of the frame's reads, the bodies taking
@@ -663,7 +1224,7 @@ namespace Kerbcast
             {
                 int i = (first + n) % bodies.Count;
                 var b = bodies[i];
-                if (b == null || b.scaledBody == null || b.inverseRotation || (b.pqsController != null && b.pqsController.isActive)) continue;
+                if (b == null || b.scaledBody == null) continue;
                 int index = b.flightGlobalsIndex;
                 var trace = plan.Trace(index);
                 if (trace == null) continue;
@@ -683,6 +1244,9 @@ namespace Kerbcast
                 if (trace.Carried) carried++;
                 int frame = sight.Frame;
                 if (!sight.Found && frame >= 0 && frame != index) plan.Hide(index);
+                /* The lens's own body and those above it are the frame's centre: placed right already, so only the spin goes back. */
+                if (sight.Found && frame == index && b.rotates)
+                    plan.Spin(index, PictureBoundary.SpinBackS((lens.Point - ToD(b.position)).Magnitude, b.Radius, c));
                 if (!sight.Found || frame == index || frame < 0 || frame >= bodies.Count || bodies[frame] == null) continue;
                 plan.Place(index, ToD(bodies[frame].position) + deRot.Conjugate.Rotate(sight.About), sight.Ut - lens.Ut);
             }
@@ -753,6 +1317,8 @@ namespace Kerbcast
             private double[] _dt = new double[0];
             private bool[] _moves = new bool[0];
             private bool[] _hidden = new bool[0];
+            private bool[] _spins = new bool[0];
+            private double[] _spinDt = new double[0];
             private BodyTrace[] _traces = new BodyTrace[0];
             private double _t = double.NaN, _c;
             private DVec3 _point;
@@ -764,6 +1330,7 @@ namespace Kerbcast
 
             public int Moved { get; private set; }
             public int Hidden { get; private set; }
+            public int Spun { get; private set; }
             /* The frame this plan was last asked for, so the longest unused is dropped first. */
             public int UsedFrame;
 
@@ -787,11 +1354,14 @@ namespace Kerbcast
                     _dt = new double[count];
                     _moves = new bool[count];
                     _hidden = new bool[count];
+                    _spins = new bool[count];
+                    _spinDt = new double[count];
                     Array.Resize(ref _traces, count);
                 }
                 Array.Clear(_moves, 0, _moves.Length);
                 Array.Clear(_hidden, 0, _hidden.Length);
-                Moved = Hidden = 0;
+                Array.Clear(_spins, 0, _spins.Length);
+                Moved = Hidden = Spun = 0;
             }
 
             public BodyTrace Trace(int index)
@@ -884,6 +1454,22 @@ namespace Kerbcast
                 _dt[index] = dt;
                 if (!_moves[index]) Moved++;
                 _moves[index] = true;
+            }
+
+            public void Spin(int index, double dt)
+            {
+                if (index < 0 || index >= _spins.Length) return;
+                if (!_spins[index]) Spun++;
+                _spins[index] = true;
+                _spinDt[index] = dt;
+            }
+
+            /* A body left where it is, its spin alone drawn `dt` seconds back. */
+            public bool TrySpin(int index, out double dt)
+            {
+                bool spins = index >= 0 && index < _spins.Length && _spins[index];
+                dt = spins ? _spinDt[index] : 0;
+                return spins;
             }
 
             public bool Moves(int index) => index >= 0 && index < _moves.Length && _moves[index];

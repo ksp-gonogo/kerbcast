@@ -168,6 +168,7 @@ namespace Kerbcast
         /* Every aim dropped, and every feed's request resolved again for what the lock now allows. */
         static void ResetFeeds(KerbcastCore core)
         {
+            core.CommandAuthority?.ClearOptics();
             var cams = core.Cameras;
             for (int i = 0; i < cams.Count; i++)
                 if (cams[i] is KerbcastCamera c && c.Rig is CommandCameraRig gr) gr.SetAim(null, null);
@@ -266,6 +267,46 @@ namespace Kerbcast
             if (gr != null) gr.SetAim(aim, orbit);
             else provider.SetPendingAim(flightId, aim, orbit);
             return AimResult.Ok;
+        }
+
+        /* Overrides command feed `flightId`'s deep-space optics; NaN keeps
+           Kerbcast's own value for that knob and all NaN returns to them.
+           The lock applies as for SetCommandAim. The values take effect only
+           while the player's DeepSpaceOptics setting is on (the default) and
+           the game can draw it, and last until replaced, the lock is taken or
+           released, or the scene changes. False
+           when Kerbcast is not running, `owner` does not hold a held lock, the
+           camera is not a command feed, or a value is infinite, negative, or
+           (brightnessHold) above 1. */
+        public static bool SetCommandOptics(uint flightId, double resolutionArcsec = double.NaN, double seeingArcsec = double.NaN,
+            double seeingAirmassPower = double.NaN, double brightnessHold = double.NaN, double daySkyStrength = double.NaN,
+            string owner = null)
+            => SetOpticsCore(flightId, new OpticsKnobs
+            {
+                ResolutionArcsec = resolutionArcsec,
+                SeeingArcsec = seeingArcsec,
+                SeeingAirmassPower = seeingAirmassPower,
+                BrightnessHold = brightnessHold,
+                DaySkyStrength = daySkyStrength,
+            }, owner) == Api.OpticsResult.Ok;
+
+        internal static Api.OpticsResult SetOpticsCore(uint flightId, OpticsKnobs knobs, string owner)
+        {
+            var core = KerbcastCore.Instance;
+            if (core == null) return Api.OpticsResult.NotRunning;
+            var auth = core.CommandAuthority;
+            if (auth != null && auth.Registered)
+            {
+                if (!string.Equals(owner, auth.Owner, System.StringComparison.Ordinal)) return Api.OpticsResult.NotLockHolder;
+                auth.Heartbeat(Time.realtimeSinceStartup);
+            }
+            if (!IsCommandFeed(flightId)) return Api.OpticsResult.NotCommandFeed;
+            if (!knobs.Valid) return Api.OpticsResult.BadNumber;
+            if (auth == null) return Api.OpticsResult.NotRunning;
+            auth.SetOptics(flightId, knobs);
+            Debug.Log($"[Kerbcast][CMDCAM] cam={flightId} optics {(knobs.IsUnset ? "back to defaults" : "set: " + knobs)}"
+                + (string.IsNullOrEmpty(owner) ? "" : $" by {owner}"));
+            return Api.OpticsResult.Ok;
         }
 
         /* Replaces `owner`'s anchors on camera `flightId`, or clears them with

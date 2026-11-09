@@ -40,6 +40,41 @@ namespace Kerbcast.Api
         public bool Created { get; set; }
     }
 
+    /**
+     * <summary>
+     * A command feed's optics, for <see cref="ICommand.SetOptics"/>: how blurred the far planets and craft it
+     * sees are. NaN, the default for every value, keeps Kerbcast's own for it (from the player's settings and
+     * the Tracking Station level). Blur is the full width at half maximum, in arcseconds. The player's
+     * DeepSpaceOptics setting, on by default, turns the effect on; while the player has it off, or the game cannot draw
+     * it, these values are kept but change nothing.
+     * </summary>
+     */
+    public sealed class OpticsSettings
+    {
+        /** <summary>The lens's own blur. 0 is a perfect lens; a bigger value is a smaller or worse lens.</summary> */
+        public double ResolutionArcsec { get; set; } = double.NaN;
+
+        /**
+         * <summary>
+         * Blur from the air looking straight up at sea level on Kerbin; 0 turns it off. It scales with the air at
+         * the lens (none in space) and grows towards the horizon.
+         * </summary>
+         */
+        public double SeeingArcsec { get; set; } = double.NaN;
+
+        /** <summary>How fast the air's blur grows towards the horizon: it is multiplied by airmass to this power.</summary> */
+        public double SeeingAirmassPower { get; set; } = double.NaN;
+
+        /** <summary>From 0, where a blurred object keeps its light strictly and a far planet goes dim, to 1, where it keeps its surface brightness.</summary> */
+        public double BrightnessHold { get; set; } = double.NaN;
+
+        /** <summary>How strongly a daylit sky at the lens washes out faint things; 0 for none.</summary> */
+        public double DaySkyStrength { get; set; } = double.NaN;
+
+        public override string ToString() =>
+            $"Optics(resolution={ResolutionArcsec}, seeing={SeeingArcsec}, airmassPower={SeeingAirmassPower}, hold={BrightnessHold}, daySky={DaySkyStrength})";
+    }
+
     /** <summary>One craft a command feed could watch.</summary> */
     public sealed class CommandTarget
     {

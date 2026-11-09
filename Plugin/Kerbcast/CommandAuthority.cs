@@ -205,6 +205,7 @@ namespace Kerbcast
         public const float TimeoutSeconds = CommandLock.TimeoutSeconds;
 
         private readonly Dictionary<uint, CommandFeedOrders> _feeds = new Dictionary<uint, CommandFeedOrders>();
+        private readonly Dictionary<uint, OpticsKnobs> _optics = new Dictionary<uint, OpticsKnobs>();
 
         /* The scene's one lock, whichever API takes it. */
         public CommandLock Lock { get; }
@@ -239,6 +240,7 @@ namespace Kerbcast
             Lock.Clear();
             Sites.Clear();
             _feeds.Clear();
+            _optics.Clear();
             SubjectAnchorVisible = true;
             _defaultAnchorPolicy = AnchorPolicy.ObservedOnly;
             _anchorPolicies.Clear();
@@ -269,6 +271,18 @@ namespace Kerbcast
         public void SetAnchorPolicy(uint flightId, AnchorPolicy policy) => _anchorPolicies[flightId] = policy;
 
         public void Heartbeat(float realNow) => Lock.Heartbeat(realNow);
+
+        /* A host's optics for a feed, set with or without the lock; they go when the lock is taken or released. */
+        public OpticsKnobs OpticsFor(uint flightId) =>
+            _optics.TryGetValue(flightId, out var k) ? k : OpticsKnobs.Unset;
+
+        public void SetOptics(uint flightId, OpticsKnobs knobs)
+        {
+            if (knobs.IsUnset) _optics.Remove(flightId);
+            else _optics[flightId] = knobs;
+        }
+
+        public void ClearOptics() => _optics.Clear();
 
         public CommandFeedOrders Orders(uint flightId) =>
             _feeds.TryGetValue(flightId, out var o) ? o : null;

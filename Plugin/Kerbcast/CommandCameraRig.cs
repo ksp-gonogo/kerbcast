@@ -90,6 +90,26 @@ namespace Kerbcast
         private bool _subpixelLogged;
         private bool _subpixelWas;
         private float _subpixelNear, _subpixelFar;
+        private int _subpixelWindow = CommandCameraSubpixel.WindowPx;
+        private double _subpixelAcross;
+
+        /* Deep-space optics: null with the setting off or no shaders for it. */
+        private readonly Func<OpticsLens> _opticsLens;
+        private readonly CommandCameraOptics _optics;
+        private readonly SeeingNoise _seeingNoise;
+        private OpticsLens _lens;
+        private float _lensCheckedAt = float.MinValue;
+        private OpticsFrame _opticsFrame;
+        private OpticsReading _opticsReading;
+        private double _opticsBlurPx;
+        private bool _opticsBegun;
+        private bool _opticsLogged;
+        private bool _opticsWasActive;
+        private string _opticsLoggedLens;
+        private OpticsKnobs _opticsLoggedOver;
+        private int _opticsLoggedBucket;
+        private bool _opticsLoggedAir;
+        private float _opticsLoggedAt = float.MinValue;
 
         private CommandClipPlan _plan;
         private double _fov;
@@ -410,7 +430,7 @@ namespace Kerbcast
         public CommandCameraRig(KerbcastCamera cam, CommandCameraMount mount, SubjectSelection selection, IFixSource known,
             DrawnSubject drawn,
             CommandAuthority authority, double frameFraction, Func<double> fovMin, double fovMax, bool targetMarker, bool targetModel,
-            bool utStripe)
+            bool utStripe, Func<OpticsLens> opticsLens = null)
         {
             _cam = cam;
             _slew = new AimSlew(_frames);
@@ -448,6 +468,12 @@ namespace Kerbcast
                 _marker = CommandCameraMarker.Create(new[] { cam.NearLayer, cam.FarLayer, _midCam }, cam.FlightId);
             if (utStripe)
                 _utStripe = CommandCameraUtStripe.Create(cam.FlightId);
+            _opticsLens = opticsLens;
+            if (opticsLens != null)
+            {
+                _optics = CommandCameraOptics.Create(cam.FlightId);
+                _seeingNoise = new SeeingNoise(unchecked((int)cam.FlightId));
+            }
 
             var scaled = cam.ScaledLayer;
             if (scaled != null)
@@ -476,6 +502,12 @@ namespace Kerbcast
         /* A clone of the far layer covering native-near..just-short-of-the-craft
            once the split is on. Rendered by hand between far and near, so its
            depth value is irrelevant; it inherits clear-depth from Camera 01. */
+        /* The local layers' far planes as they were before any plan stretched them. */
+        public float LocalFarNativeM => Mathf.Max(_nearNativeFar, _hasFar ? _farNativeFar : 0f);
+
+        /* The mid layer's far plane this frame, 0 when it does not render. */
+        public float MidFarNowM => _midCam != null && _plan.MidActive ? _midCam.farClipPlane : 0f;
+
         private Camera BuildMidLayer(Camera far)
         {
             var go = new GameObject($"Kerbcast_{_flightId}_Mid");
@@ -636,7 +668,7 @@ namespace Kerbcast
                 {
                     _aimedBody = aimBody;
                     _aimedAbout = KinematicsWorld.Now().Zup.FromWorld(aim - ToD(aimBody.position));
-                    _aimedAt = ut;
+                    _aimedAt = _knownDrawnAt;
                     var w = new Vector3d(aim.X, aim.Y, aim.Z);
                     /* Against the body the place hangs from, so a Hold stays where the craft was last drawn rather than riding a body drawn elsewhere. */
                     _heldBody = _holdAbout ?? aimBody;
@@ -651,20 +683,25 @@ namespace Kerbcast
                 aim = DirectionPoint(body, station, localUp, _aim.Azimuth, _aim.Elevation, range);
                 aimBody = body;
             }
-            else if (!ResolveAim(_aim, _aimOrbit, ut, out aim, out aimBody))
+            else
             {
-                ForgetDrawn();
-                return false;
+                bool resolved = ResolveAim(_aim, _aimOrbit, ut, station, body, out aim, out aimBody, out double aimLightS);
+                NoteAimLight(ut, resolved, aimLightS);
+                if (!resolved)
+                {
+                    ForgetDrawn();
+                    return false;
+                }
             }
             _lastAimPoint = aim;
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
-            /* An aim at the picture's place, drawn or kept, is read against the bodies where the picture draws them, as it shows the craft. */
-            bool aimDrawn = !aimed && AimFromPicture;
+            /* An aim at the picture's place, drawn or kept, is read against the bodies where the picture draws them, as it shows the craft; with a light speed a Surface, Orbit or PositionAt aim is at the picture's place too. */
+            bool aimDrawn = aimed ? _aim.Kind != CommandAimKind.Direction && LightTime.LightSpeed.HasValue : AimFromPicture;
             string occluderSource;
             occluder = aimDrawn
-                ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, KnownRadius)
+                ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, aimed ? 0 : KnownRadius)
                 : _occlusion.FindOccluder(station, aim, out occluderSource, aimed ? 0 : KnownRadius);
             double distance = (aim - station).Magnitude;
             _lastDistance = distance;
@@ -861,14 +898,7 @@ namespace Kerbcast
            and the drawn one must be solved the same way to agree with it. */
         private void LocateDrawn(double ut, DVec3 station, CelestialBody lensBody)
         {
-            var lens = new PictureLens
-            {
-                Key = PictureLens.OwnKey(_flightId),
-                Ut = ut,
-                Point = station,
-                Body = lensBody,
-                Rides = _mount.Site.VantagePersistentId,
-            };
+            var lens = LensAt(ut, station, lensBody);
             _cam.Picture.Place(lens);
             _drawnOk = _drawn.TryLocate(lens, out _drawnPos, out _drawnBody);
             _drawnAbout = _drawn.ShownAbout;
@@ -882,14 +912,42 @@ namespace Kerbcast
             if (light == _drawnLight || now - _lightLoggedAt < LightLogSeconds) return;
             _drawnLight = light;
             _lightLoggedAt = now;
-            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={(light == 2 ? "past" : light == 1 ? "live" : "none")} "
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={CommandCameraMath.DrawnLightName(light)} "
                 + $"lightTimeS={(light == 2 ? (ut - _drawn.ShownUt).ToString("F3", CultureInfo.InvariantCulture) : "0")}");
         }
+
+        /* The drawn-light line for a Surface, Orbit or PositionAt aim, whose place is drawn in the past as a craft is, so its light time can be read from the log. */
+        private void NoteAimLight(double ut, bool placed, double lightS)
+        {
+            int light = CommandCameraMath.DrawnLightState(LightTime.LightSpeed.HasValue, placed, lightS);
+            bool newAim = !ReferenceEquals(_aim, _aimLightFor);
+            if (!CommandCameraMath.AimLightLogDue(light, _aimLight, newAim)) return;
+            float now = Time.unscaledTime;
+            if (!newAim && now - _aimLightLoggedAt < LightLogSeconds) return;
+            _aimLight = light;
+            _aimLightFor = _aim;
+            _aimLightLoggedAt = now;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={CommandCameraMath.DrawnLightName(light)} "
+                + $"lightTimeS={(light == 2 ? lightS.ToString("F3", CultureInfo.InvariantCulture) : "0")} aim={_aim.Kind}");
+        }
+
+        private PictureLens LensAt(double ut, DVec3 station, CelestialBody lensBody) => new PictureLens
+        {
+            Key = PictureLens.OwnKey(_flightId),
+            Ut = ut,
+            Point = station,
+            Body = lensBody,
+            Rides = _mount.Site.VantagePersistentId,
+        };
 
         /* Whether the drawn craft was last none, live or at its past instant (0, 1, 2), for the log. */
         private int _drawnLight = -1;
         private float _lightLoggedAt = float.MinValue;
         private const float LightLogSeconds = 5f;
+        /* The same for an aim at no craft, and the aim it was last said for. */
+        private int _aimLight = -1;
+        private CommandAim _aimLightFor;
+        private float _aimLightLoggedAt = float.MinValue;
 
         /* A kept record's speed about its body, bounded in the frame the solve now runs in; NaN for a body the game no longer has. */
         private double KeptToFrame(double ownSpeed, int bodyIndex)
@@ -948,6 +1006,7 @@ namespace Kerbcast
             var tree = KeplerBodyTree.World;
             int lensIndex = lensBody.flightGlobalsIndex;
             _lensSpin = SpinOf(lensBody);
+            _knownDrawnAt = LensBodyDrawnAt(ut, station, lensBody);
             bool moves = _known.SubjectMotion(ut, out var motion, out double validFrom, out _) && motion.Body != null;
             if (moves && motion.Kind == BodyMotionKind.Surface && motion.Body == lensBody && !double.IsInfinity(validFrom))
             {
@@ -961,6 +1020,8 @@ namespace Kerbcast
                 var then = _known.Subject(fixedAt);
                 if (then.Positioned) now.UncertaintyM = then.UncertaintyM;
                 _subjectUt = fixedAt;
+                /* The picture draws that ground turned back by its light time, and a craft on it with it. */
+                if (!_known.KnowsWhatIsDrawn && AimOnDrawnBody(lensBody, now.World, out var onDrawnGround)) now.World = onDrawnGround;
                 return now;
             }
             /* The frame from the body the subject is at by now, then again from
@@ -1049,6 +1110,7 @@ namespace Kerbcast
         {
             _placed = TruthAimPlace.Source;
             _holdAbout = null;
+            _knownDrawnAt = ut;
             if (!_known.KnowsWhatIsDrawn || !LightTime.LightSpeed.HasValue)
             {
                 _truthPlace.Reset();
@@ -1146,8 +1208,26 @@ namespace Kerbcast
             _knownHold.Shown(ut, tr, 0, c, lensIndex, path.Frame);
             _subjectUt = tr;
             _subjectPlacedUt = tr;
-            return Turned(_known.SubjectAlong(tr), path.Spin, tr, ut);
+            return Turned(_known.SubjectAlong(tr), path.Spin, tr, _knownDrawnAt);
         }
+
+        /*
+         * The instant the picture has turned the lens's own body to, which a
+         * world model's aim must follow to stay on the craft drawn on or about
+         * that body: `ut` less its spin back, or `ut` where it is not turned.
+         * A source that knows what is drawn only comes here for a craft the
+         * scene draws live, as it is now, so it stays at `ut`. The lens is
+         * placed here because the aim is solved before LocateDrawn places it.
+         */
+        private double LensBodyDrawnAt(double ut, DVec3 station, CelestialBody lensBody)
+        {
+            if (_known.KnowsWhatIsDrawn) return ut;
+            _cam.Picture.Place(LensAt(ut, station, lensBody));
+            return _cam.Picture.TryDrawnBody(lensBody, out _, out double dt) ? ut : ut + dt;
+        }
+
+        /* The instant a known subject is placed at this solve, for the aim to meet the craft as drawn. */
+        private double _knownDrawnAt;
 
         private InstantHold _knownHold;
         private uint _knownHoldPid;
@@ -1264,11 +1344,17 @@ namespace Kerbcast
 
         /* An Orbit, Surface or PositionAt aim's point in world space, on the
            same UT (and so the same physics tick) as the station and the
-           scaled bodies. */
-        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, out DVec3 world, out CelestialBody body)
+           scaled bodies. With a light speed it is where the picture draws that
+           point for a lens at `station` on `lensBody`, as a craft aim is:
+           a Surface aim on the body as drawn, an Orbit or PositionAt aim at its
+           own light time. `lightS` is how long ago the light the picture
+           shows of that point left it, 0 when it is drawn as it is now. */
+        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, DVec3 station, CelestialBody lensBody, out DVec3 world, out CelestialBody body,
+            out double lightS)
         {
             world = default;
             body = null;
+            lightS = 0;
             switch (aim.Kind)
             {
                 case CommandAimKind.Orbit:
@@ -1277,6 +1363,8 @@ namespace Kerbcast
                     if (orbit == null || orbit.referenceBody == null) return false;
                     body = orbit.referenceBody;
                     world = ToD(orbit.getPositionAtUT(ut));
+                    double? c = LightTime.LightSpeed;
+                    if (c.HasValue) return PastAimPlace(new AimLightPath { Orbit = orbit, OnOrbit = true }, BodyMotion.OnOrbit(orbit), body, ut, station, lensBody, c.Value, out world, out lightS);
                     return true;
                 }
                 case CommandAimKind.Surface:
@@ -1284,6 +1372,8 @@ namespace Kerbcast
                     body = FlightGlobals.GetBodyByName(aim.Body);
                     if (body == null) return false;
                     world = ToD(body.GetWorldSurfacePosition(aim.Latitude, aim.Longitude, aim.Altitude));
+                    if (!AimOnDrawnBody(body, world, out world, out double dt)) return false;
+                    lightS = -dt;
                     return true;
                 }
                 case CommandAimKind.PositionAt:
@@ -1291,10 +1381,103 @@ namespace Kerbcast
                     body = FlightGlobals.GetBodyByName(aim.Body);
                     if (body == null || !AimPath(aim, body, out var path) || !path.TryAt(ut, out var rel, out _)) return false;
                     world = KinematicsWorld.Now().ToWorld(body, rel);
+                    double? c = LightTime.LightSpeed;
+                    if (c.HasValue) return PastAimPlace(new AimLightPath { Kepler = path, Zup = KinematicsWorld.Now().Zup }, BodyMotion.OnPath(body, path, KinematicsWorld.Now().Zup), body, ut, station, lensBody, c.Value, out world, out lightS);
                     return true;
                 }
             }
             return false;
+        }
+
+        /* A point fixed to body `b`, at `live` now, where the picture draws it; false while the picture leaves the body out. */
+        private bool AimOnDrawnBody(CelestialBody b, DVec3 live, out DVec3 world) => AimOnDrawnBody(b, live, out world, out _);
+
+        /* `dt` is the seconds from now back to the instant the body is drawn at, or spun back to, 0 when drawn as it is. */
+        private bool AimOnDrawnBody(CelestialBody b, DVec3 live, out DVec3 world, out double dt)
+        {
+            world = live;
+            dt = 0;
+            if (_cam.Picture.HidesBody(b)) return false;
+            bool placed = _cam.Picture.TryDrawnBody(b, out var centre, out dt);
+            if (placed || dt != 0)
+                world = CommandCameraMath.CarriedByBody(live - ToD(b.position), placed ? centre : ToD(b.position), CommandCameraOcclusion.Spin(b), dt);
+            return true;
+        }
+
+        /*
+         * An Orbit or PositionAt aim where the light arriving at the lens now
+         * left it, solved in the frame of the lens's and the aim's common
+         * body, and placed as the picture places a craft: against a body drawn
+         * at its past instant, or left out, at its own past place in that
+         * frame; otherwise on the body as drawn.
+         */
+        private bool PastAimPlace(AimLightPath path, BodyMotion motion, CelestialBody body, double ut, DVec3 station, CelestialBody lensBody, double c, out DVec3 world,
+            out double lightS)
+        {
+            world = default;
+            lightS = 0;
+            var tree = KeplerBodyTree.World;
+            int bodyIndex = body.flightGlobalsIndex;
+            int frame = PastInstant.CommonAncestor(ref tree, lensBody.flightGlobalsIndex, bodyIndex);
+            var frameBody = tree.Body(frame);
+            if (frameBody == null) return false;
+            var spin = SpinOf(lensBody);
+            path.Tree = tree;
+            path.BodyIndex = bodyIndex;
+            path.Frame = frame;
+            path.Spin = spin;
+            path.T = ut;
+            double bound = CommandCameraForecast.SpeedBound(motion, frameBody);
+            bound += PastInstant.TurnSpeedBoundAbout(spin, bodyIndex, bound, double.PositiveInfinity, double.NaN, (station - ToD(lensBody.position)).Magnitude, c);
+            if (PastInstant.Solve(ref path, station - ToD(frameBody.position), ut, c, bound, double.NegativeInfinity, ut, out double at) != PastStatus.Found)
+                return false;
+            lightS = ut - at;
+            if (_cam.Picture.HidesBody(body) || _cam.Picture.TryDrawnBody(body, out _, out _))
+            {
+                if (!path.TryAt(at, out var about)) return false;
+                world = ToD(frameBody.position) + about;
+                return true;
+            }
+            if (!path.Offset(at, out var rel)) return false;
+            return AimOnDrawnBody(body, ToD(body.position) + PastInstant.Turned(spin, bodyIndex, rel, false, at, ut), out world);
+        }
+
+        /* An aim's own path back through time about the frame body, for the light-time solve. */
+        private struct AimLightPath : IPastPath
+        {
+            public Orbit Orbit;
+            public bool OnOrbit;
+            public KeplerPath Kepler;
+            public ZupFrame Zup;
+            public KeplerBodyTree Tree;
+            public int BodyIndex;
+            public int Frame;
+            /* About the lens's body the path is carried round with it to render UT `T`, as a craft's is. */
+            public BodySpin Spin;
+            public double T;
+
+            /* The aim's offset from its body's centre at `ut`, in world axes. */
+            public bool Offset(double ut, out DVec3 offset)
+            {
+                offset = default;
+                if (OnOrbit)
+                {
+                    var r = Orbit.getRelativePositionAtUT(ut).xzy;
+                    offset = new DVec3(r.x, r.y, r.z);
+                    return true;
+                }
+                if (!Kepler.TryAt(ut, out var rel, out _)) return false;
+                offset = Zup.ToWorld(rel);
+                return true;
+            }
+
+            public bool TryAt(double ut, out DVec3 position)
+            {
+                position = default;
+                if (!Offset(ut, out var rel) || !PastInstant.TryAbout(ref Tree, BodyIndex, Frame, ut, out var centre)) return false;
+                position = centre + PastInstant.Turned(Spin, BodyIndex, rel, false, ut, T);
+                return true;
+            }
         }
 
         /* A PositionAt aim's ballistic path under its body's gravity, built once per aim. */
@@ -1477,6 +1660,7 @@ namespace Kerbcast
            watching the feed (PrepareRender only runs for a granted capture). */
         public void Poll()
         {
+            _optics?.Idle();
             float now = Time.unscaledTime;
             if (now - _solvedAt < PollStaleSeconds) return;
             if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
@@ -1606,7 +1790,7 @@ namespace Kerbcast
             _poseUp = up;
             SyncScaledBodies(cam, anchor.position);
             SyncScaledPose(cam);
-            UpdateStationBodyMesh(cam, ut, _lastDistance);
+            UpdateStationBodyMesh(cam, station, ut, _lastDistance);
 
             double distance = _lastDistance;
             var drawn = PlaceDrawn(cam, ut, now, station, aim, occluder, distance);
@@ -1645,6 +1829,7 @@ namespace Kerbcast
             _shape = shape;
             cam.SetRigFov((float)_fov);
             UpdateBracket(now);
+            UpdateOptics(ut, station, localUp, distance, now);
             FinishDrawn(cam, ut, station, anchor.rotation, drawn);
 
             if (_first)
@@ -1791,8 +1976,9 @@ namespace Kerbcast
             if (_marker != null)
             {
                 var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+                var optics = _optics != null && _opticsFrame.Active ? _optics.Marker(_opticsFrame, CommandCameraMarker.DotSizePixels) : default;
                 _marker.Place(p.Lit && p.StandIn && !p.Model && !p.Blocked, station, p.Toward, p.Distance, lensRotation,
-                    (float)_fov, rt != null ? rt.height : cam.RenderHeight);
+                    (float)_fov, rt != null ? rt.height : cam.RenderHeight, optics);
             }
         }
 
@@ -1930,13 +2116,15 @@ namespace Kerbcast
            from the main view still sees them. The main camera standing on a
            body never draws that body's scaled mesh while its terrain is local
            (the fader turns it off), and the command camera stands on it too, so
-           while the station's PQS is active its mesh is left as stock has it.
-           With the PQS inactive the mesh is the only ground there is. */
-        private void UpdateStationBodyMesh(KerbcastCamera cam, double ut, double d)
+           while that terrain is within the layers' own reach the mesh is left
+           as stock has it. Beyond it, or with the PQS inactive, the mesh is
+           the only ground there is. That is the reach PicturePass tests before
+           it hides terrain, so terrain it hides always has this mesh in its
+           place. */
+        private void UpdateStationBodyMesh(KerbcastCamera cam, DVec3 station, double ut, double d)
         {
             var body = _mount.Site.Body;
-            var pqs = body != null ? body.pqsController : null;
-            bool stock = pqs != null && pqs.isActive;
+            bool stock = cam.Picture.TerrainLocal(body, station);
             var r = stock && body.scaledBody != null ? body.scaledBody.GetComponent<Renderer>() : null;
             cam.RigStockFaderRenderer = r;
             bool nowStock = r != null;
@@ -1945,7 +2133,7 @@ namespace Kerbcast
                 _stationMeshLogged = true;
                 _stationMeshStock = nowStock;
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={d:F0} event=station-body-mesh "
-                    + (nowStock ? "stock (left to the fader, terrain is local)" : "forced on (no local terrain)"));
+                    + (nowStock ? "stock (left to the fader, terrain is local)" : "forced on (no local terrain in reach)"));
             }
         }
 
@@ -2071,7 +2259,17 @@ namespace Kerbcast
 
         public void BeforeScaledRender(KerbcastCamera cam)
         {
-            _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");
+            if (_optics != null && _opticsFrame.Active && !_opticsBegun)
+            {
+                var rt = cam.NearLayer != null ? cam.NearLayer.targetTexture : null;
+                if (rt != null)
+                {
+                    _optics.BeginScaled(cam.ScaledLayer, rt.width, rt.height);
+                    _opticsBegun = true;
+                }
+            }
+            /* When the picture lights each body itself, it has already aimed the Sun and given the shells their light. */
+            if (!cam.Picture.BodiesLit) _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");
             DrawStationGround(cam);
             _afgOverridden = null;
             var body = _mount.Site.Body;
@@ -2084,18 +2282,40 @@ namespace Kerbcast
             _afgOurs = _poseValid
                 ? AfgInputsForLens(afg, _poseEye - ToD(body.position))
                 : AfgInputsFor(afg, scaled.transform.position);
-            _afgOurs.LightDir = _sun.Turn * _afgOurs.LightDir;
-            if (!_afgOverride) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
+            _afgOurs.LightDir = cam.Picture.BodiesLit ? (Vector3)_afgBlock.GetVector(LightDirId) : _sun.Turn * _afgOurs.LightDir;
+            if (!_afgOverride) return;
             ApplyAfg(_afgBlock, _afgOurs);
             _afgRenderer.SetPropertyBlock(_afgBlock);
             _afgOverridden = afg;
         }
 
+        /* Runs after any partial BeforeScaledRender too, and each restore runs even when one before it throws: the scaled target, the ground, the Sun and the atmosphere are shared with the main camera. */
         public void AfterScaledRender(KerbcastCamera cam)
         {
-            _ground?.Hide();
-            _sun.End();
+            try { EndOpticsLayer(cam); }
+            finally
+            {
+                try { _ground?.Hide(); }
+                finally
+                {
+                    try { _sun.End(); }
+                    finally { RestoreAfg(); }
+                }
+            }
+        }
+
+        private void EndOpticsLayer(KerbcastCamera cam)
+        {
+            if (!_opticsBegun) return;
+            _opticsBegun = false;
+            var home = _poseValid ? _mount.Site.StationBody : null;
+            var toHome = home != null ? ToD(home.position) - _poseEye : default;
+            _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame, home, toHome, cam.Picture);
+        }
+
+        private void RestoreAfg()
+        {
             if (_afgOverridden == null || _afgRenderer == null) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
             ApplyAfg(_afgBlock, _afgStock);
@@ -2276,8 +2496,12 @@ namespace Kerbcast
             {
                 var rt = near.targetTexture;
                 var pose = cam.FarLayer != null ? cam.FarLayer.transform : near.transform;
-                _subpixel.Render(pose, (float)_fov, rt != null ? rt.height : cam.RenderHeight, _subpixelNear, _subpixelFar);
-                _subpixel.Composite(rt);
+                _subpixel.Render(pose, (float)_fov, rt != null ? rt.height : cam.RenderHeight, _subpixelNear, _subpixelFar, _subpixelWindow);
+                if (_optics != null && _opticsFrame.Active)
+                {
+                    if (_subpixel.HasLight) _optics.DrawCraft(rt, _subpixel.LastLight, _subpixel.LastCoverage, _subpixelAcross, _opticsFrame);
+                }
+                else _subpixel.Composite(rt);
             }
         }
 
@@ -2303,7 +2527,17 @@ namespace Kerbcast
             int rows = rt != null ? rt.height : cam.RenderHeight;
             double perPx = CommandCameraMath.PixelSizeAtUnit(_fov, rows);
             double across = perPx > 0 && distance > 0 ? 2.0 * _standIn.Radius / (distance * perPx) : 0;
-            bool sub = across < SubpixelBelowPx;
+            /* Under optics a craft the blur covers is drawn as the blur, through a window wide enough for its light. */
+            double below = SubpixelBelowPx;
+            int window = CommandCameraSubpixel.WindowPx;
+            if (_opticsFrame.Active)
+            {
+                below = Math.Max(SubpixelBelowPx, Math.Min(_opticsFrame.BlurFwhmPx, CommandCameraSubpixel.MaxWindowPx * 0.75));
+                if (across >= SubpixelBelowPx) window = Math.Min(CommandCameraSubpixel.MaxWindowPx, (int)Math.Ceiling(across * 1.3) + 4);
+            }
+            _subpixelWindow = window;
+            _subpixelAcross = across;
+            bool sub = across < below;
             _standIn.SubpixelMode = sub;
             _subpixelActive = sub && across >= SubpixelFloorPx && lit && !occluded;
             double span = CommandCameraMath.ClipSpan(_standIn.Radius * planScale);
@@ -2315,7 +2549,8 @@ namespace Kerbcast
                 _subpixelLogged = true;
                 _subpixelWas = sub;
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={distance:F0} event=model-{(sub ? "subpixel" : "direct")} "
-                    + $"across={across:G3}px fov={_fov:F4} rows={rows} clip=[{_subpixelNear:F1},{_subpixelFar:F1}]");
+                    + $"across={across:G3}px fov={_fov:F4} rows={rows} clip=[{_subpixelNear:F1},{_subpixelFar:F1}]"
+                    + (_opticsFrame.Active ? $" opticsBlurPx={_opticsFrame.BlurFwhmPx:F2} window={window}px" : ""));
             }
         }
 
@@ -2434,6 +2669,8 @@ namespace Kerbcast
                     + $"handoverM={_handover.Offset.Magnitude:F2} split={_plan.Split} occluded={Occluded} "
                     + (_hasFar ? $"far={(_plan.FarRender ? $"[{_plan.FarNear:F0},{_plan.FarFar:F0}]" : "skipped")} mid={(_plan.MidActive ? $"[{_plan.MidNear:F0},{_plan.MidFar:F0}]" : "off")} " : "")
                     + (_subpixelActive && _subpixel != null ? $"subpixelEnergy={_subpixel.LastEnergy:G3} subpixelCoverPx={_subpixel.LastCoverage:G3} subpixelPeak={_subpixel.LastPeak:G3} " : "")
+                    + (_optics != null ? $"optics={(_opticsFrame.Active ? "on" : "off")} opticsBlurPx={_opticsBlurPx:F2} opticsLevel={_optics.LastLevel} "
+                        + $"opticsBodies={_optics.LastBodies} opticsCraftGain={_optics.LastCraftGain:F2} opticsMs={_optics.CpuMs:F3} " : "")
                     + $"nearFar={_plan.NearFar:F0} originShifts={_originShifts} scaledSkewMaxPx={_scaledSkewMaxPx:F2} scaledSkewFrames={_scaledSkewFrames} "
                     + $"trueOffsetPx={(TrueOffsetPx.HasValue ? TrueOffsetPx.Value.ToString("F2", CultureInfo.InvariantCulture) : "none")} "
                     + $"forecast={_forecastCount} forecastMs={_forecastMs:F2} forecastSamples={_forecast.LastSamples} "
@@ -2490,8 +2727,117 @@ namespace Kerbcast
             _midCam = null;
             _subpixel?.Dispose();
             _subpixel = null;
+            _optics?.Dispose();
             _mount.DestroyAnchor();
             Debug.Log($"{Tag} cam={_flightId} rig down");
+        }
+
+        /*
+         * Settles this frame's optics from the lens, the air at the lens and
+         * the field: the blur in pixels, seeing's shift and flicker, the
+         * colour the air leaves and the daylight. Under a pixel of blur the
+         * frame renders exactly as without optics.
+         */
+        private void UpdateOptics(double ut, DVec3 station, DVec3 localUp, double rangeM, float now)
+        {
+            _opticsFrame = default;
+            if (_optics == null) return;
+            float real = Time.realtimeSinceStartup;
+            if (real - _lensCheckedAt >= 1f || _lens.Label == null)
+            {
+                _lensCheckedAt = real;
+                _lens = _opticsLens();
+            }
+            var over = _authority != null ? _authority.OpticsFor(_flightId) : OpticsKnobs.Unset;
+            var knobs = over.Over(_lens.Defaults);
+
+            var body = _mount.Site.StationBody;
+            double air = 0;
+            if (body != null && body.atmosphere)
+            {
+                double alt = (station - ToD(body.position)).Magnitude - body.Radius;
+                if (alt < body.atmosphereDepth) air = OpticsModel.AirFactor(body.GetPressure(Math.Max(0.0, alt)));
+            }
+            double sunElev = double.NaN;
+            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (sun != null && sun != body)
+            {
+                var toSun = (ToD(sun.position) - station).Normalized;
+                sunElev = Math.Asin(Math.Max(-1.0, Math.Min(1.0, DVec3.Dot(toSun, localUp)))) * 180.0 / Math.PI;
+            }
+            var r = OpticsModel.Assess(new OpticsSite
+            {
+                ResolutionArcsec = knobs.ResolutionArcsec,
+                ZenithSeeingArcsec = knobs.SeeingArcsec,
+                SeeingAirmassPower = knobs.SeeingAirmassPower,
+                AirFactor = air,
+                ElevationDeg = ElevationDeg,
+                SunElevationDeg = sunElev,
+            }, rangeM);
+            _opticsReading = r;
+            int rows = FrameRows();
+            double pixArc = OpticsModel.PixelArcsec(_fov, rows);
+            double blurPx = r.BlurArcsec / pixArc;
+            _opticsBlurPx = double.IsNaN(blurPx) ? 0 : blurPx;
+            bool active = OpticsModel.Worthwhile(blurPx);
+            if (active)
+            {
+                /* The pyramid's deepest level caps the blur the picture can show, so the masks and the craft are capped with it. */
+                var rt = _cam.NearLayer != null ? _cam.NearLayer.targetTexture : null;
+                int cols = rt != null ? rt.width : _cam.RenderWidth;
+                double capPx = OpticsModel.PyramidSigma(OpticsModel.MaxLevelFor(cols, rows)) * OpticsModel.FwhmPerSigma;
+                double scale = blurPx > capPx ? capPx / blurPx : 1.0;
+                double shownPx = blurPx * scale;
+                double ramp = OpticsModel.Ramp(blurPx);
+                double seeingPx = r.SeeingArcsec / pixArc * scale;
+                OpticsModel.SeeingMotion(r.ResolutionArcsec, out double wobble, out double boil, out double twinkle);
+                double amp = air > 0 ? 0.5 * seeingPx * Math.Sqrt(wobble * wobble + 0.31 * boil * boil) * ramp : 0;
+                _opticsFrame = new OpticsFrame
+                {
+                    Active = true,
+                    SigmaPx = shownPx / OpticsModel.FwhmPerSigma,
+                    BlurFwhmPx = shownPx,
+                    DiffFwhmPx = r.ResolutionArcsec / pixArc * scale,
+                    SeeingFwhmPx = seeingPx,
+                    OffsetX = (float)(amp * _seeingNoise.At(real, 0)),
+                    OffsetY = (float)(amp * _seeingNoise.At(real, 1)),
+                    Twinkle = air > 0 ? Mathf.Max(0f, (float)(1.0 + twinkle * ramp * _seeingNoise.At(real, 2))) : 1f,
+                    Tint = new Color(Faded(OpticsModel.Transmission(r.Airmass, air, 0), ramp), Faded(OpticsModel.Transmission(r.Airmass, air, 1), ramp),
+                        Faded(OpticsModel.Transmission(r.Airmass, air, 2), ramp), 1f),
+                    BrightnessHold = knobs.BrightnessHold,
+                    DaySky = r.DaySky,
+                    DaySkyStrength = knobs.DaySkyStrength * ramp,
+                    PixelRad = pixArc / OpticsModel.ArcsecPerRadian,
+                    Ramp = ramp,
+                };
+            }
+            else _optics.Idle();
+            NoteOptics(ut, active, blurPx, over, air, now);
+        }
+
+        /* A transmission faded in from none (1) by `ramp`. */
+        private static float Faded(double transmission, double ramp) => (float)(1.0 + (transmission - 1.0) * ramp);
+
+        /* One line each time the feed's optics turn on or off, its lens or override changes, or the blur moves by half a stop. */
+        private void NoteOptics(double ut, bool active, double blurPx, OpticsKnobs over, double air, float now)
+        {
+            int bucket = active ? (int)Math.Round(Math.Log(blurPx, 2.0) * 2.0) : 0;
+            if (_opticsLogged && active == _opticsWasActive && _lens.Label == _opticsLoggedLens && over.SameAs(_opticsLoggedOver)
+                && bucket == _opticsLoggedBucket && (air > 0) == _opticsLoggedAir) return;
+            bool flip = !_opticsLogged || active != _opticsWasActive;
+            if (!flip && now - _opticsLoggedAt < 1f) return;
+            _opticsLogged = true;
+            _opticsWasActive = active;
+            _opticsLoggedLens = _lens.Label;
+            _opticsLoggedOver = over;
+            _opticsLoggedBucket = bucket;
+            _opticsLoggedAir = air > 0;
+            _opticsLoggedAt = now;
+            var r = _opticsReading;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={_lastDistance:F0} event=optics state={(active ? "on" : "off")} lens='{_lens.Label}' "
+                + $"res={r.ResolutionArcsec:F2}arcsec seeing={r.SeeingArcsec:F2}arcsec air={air:F2} airmass={r.Airmass:F2} elev={ElevationDeg:F1} "
+                + $"blur={r.BlurArcsec:F2}arcsec blurPx={blurPx:F2} onTargetM={r.BlurOnTargetM:G3} day={r.DaySky:F2} fov={_fov:F4} "
+                + $"override={(over.IsUnset ? "none" : over.ToString())}");
         }
 
         private static string F(double ut) => ut.ToString("F2", CultureInfo.InvariantCulture);

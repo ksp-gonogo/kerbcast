@@ -34,6 +34,27 @@ namespace Kerbcast
             return wasHidden && farthestM >= ReturnFraction * boundary;
         }
 
+        /*
+         * Whether a body's terrain, reaching at most `terrainRadiusM` from its
+         * centre, can fall inside a local layer's far plane `farClipM` for a
+         * lens `distanceM` from that centre. A distance that cannot be read is
+         * out of reach.
+         */
+        public static bool TerrainInReach(double distanceM, double terrainRadiusM, double farClipM) =>
+            distanceM - terrainRadiusM <= farClipM;
+
+        /*
+         * How many seconds back the spin of the lens's own body, or one above
+         * it, is drawn: negative, the light time from the surface facing the
+         * lens, so a lens on the ground sees the ground beneath it where it
+         * stands, and far out it is the distance over c.
+         */
+        public static double SpinBackS(double distanceM, double radiusM, double lightSpeed) =>
+            lightSpeed > 0 ? -Math.Max(0, distanceM - radiusM) / lightSpeed : 0;
+
+        /* The world direction `forward` in the axes of a mesh turned to `rotation`, as a stored sun direction holds it. */
+        public static DVec3 LightInBodyAxes(DQuat rotation, DVec3 forward) => rotation.Conjugate.Rotate(forward).Normalized;
+
         /* A point on a live craft (pivot `livePivot`, turned `liveRotation`) carried to where the craft is drawn. */
         public static DVec3 Carry(DVec3 point, DVec3 livePivot, DQuat liveRotation, DVec3 drawnPivot, DQuat drawnRotation) =>
             drawnPivot + Turn(liveRotation, drawnRotation).Rotate(point - livePivot);

@@ -835,6 +835,24 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(worst > 95, $"lens depth: read from float scaled positions it can be off by more than the lens's height ({worst:F0} m)");
 }
 
+// The body a lens stands on, and the quad that adds a layer under seeing's shift.
+{
+    Check(Near(OpticsModel.HomeAngularRadius(2000, 1000), Math.PI / 6, 1e-12), "home body: the angular radius is the disc's");
+    double justAbove = OpticsModel.HomeAngularRadius(600030, 600000);
+    Check(justAbove > 1.5 && justAbove < Math.PI * 0.5, "home body: a lens 30 m up still has the body filling almost half the sky");
+    Check(OpticsModel.HomeAngularRadius(599000, 600000) == Math.PI * 0.5, "home body: a lens under the datum has it filling half the sky");
+
+    OpticsModel.OverscanAxis(0f, 1024f, out float qx0, out float qx1, out float qu0, out float qu1);
+    Check(qx0 == 0f && qx1 == 1024f && qu0 == 0f && qu1 == 1f, "overscan: no shift draws exactly over the frame");
+    foreach (float shift in new[] { 3.5f, -3.5f, 0.25f, -40f })
+    {
+        OpticsModel.OverscanAxis(shift, 1024f, out qx0, out qx1, out qu0, out qu1);
+        Check(qx0 <= 0f && qx1 >= 1024f, $"overscan: a shift of {shift} leaves no bare strip");
+        double perPx = (qu1 - qu0) / (qx1 - qx0);
+        Check(Near(qu0 + (0f - qx0) * perPx, -shift / 1024f, 1e-5) && Near(perPx, 1.0 / 1024, 1e-7), $"overscan: a shift of {shift} moves the picture by that much, unstretched");
+    }
+}
+
 // The Sun's light turned to face a lens far from the main camera.
 {
     /* The Sun at the origin, Kerbin and Duna on their orbits 137 degrees apart: stock lights from the Sun toward the main camera at Duna. */
@@ -1676,6 +1694,190 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     var high = CommandCameraMath.PlanStationGround(R + 80000, R, SF, below, downUp, nadirUp, 20, 1.5, false);
     Check(!high.Draw, "a lens high enough to clear the near plane leaves the real mesh alone");
 }
+
+// Deep-space optics.
+{
+    const double KerbinPressure = 101.325;
+    Check(OpticsModel.AirFactor(KerbinPressure) == 1.0 && OpticsModel.AirFactor(0) == 0.0 && OpticsModel.AirFactor(500) == 1.0,
+        "air factor: 1 at Kerbin sea level, 0 in vacuum, capped in thick air");
+    Check(OpticsModel.AirFactor(KerbinPressure / 4) > 0.49 && OpticsModel.AirFactor(KerbinPressure / 4) < 0.51,
+        "thin air sees better (square root of the pressure)");
+
+    Check(Near(OpticsModel.Airmass(90), 1.0, 1e-3), "airmass 1 at the zenith");
+    Check(Near(OpticsModel.Airmass(30), 2.0, 0.01), "about 2 at 30 degrees");
+    Check(Near(OpticsModel.Airmass(4), 12.4, 0.5), "about 12 at 4 degrees");
+    Check(OpticsModel.Airmass(0) > 30 && OpticsModel.Airmass(-5) == OpticsModel.Airmass(0), "finite at and below the horizon");
+
+    Check(Near(OpticsModel.Seeing(1.0, OpticsModel.Airmass(90), 0.6, 1.0), 1.0, 1e-3), "seeing at the zenith is the knob");
+    Check(Near(OpticsModel.Seeing(1.0, OpticsModel.Airmass(35), 0.6, 1.0), 1.4, 0.05), "about 1.4 arcsec at 35 degrees");
+    Check(Near(OpticsModel.Seeing(1.0, OpticsModel.Airmass(4), 0.6, 1.0), 4.5, 0.2), "about 4.5 arcsec at 4 degrees");
+    Check(OpticsModel.Seeing(1.0, 5, 0.6, 0) == 0, "no air, no seeing");
+
+    Check(Near(OpticsModel.CombinedBlur(15, 1.4), Math.Sqrt(15 * 15 + 1.4 * 1.4), 1e-12), "lens and seeing add in quadrature");
+    Check(OpticsModel.CombinedBlur(15, 1.4) < 15.1, "level 1: the lens dominates, the air barely adds");
+    Check(OpticsModel.CombinedBlur(1, 1.4) > 1.7, "level 3: the air is the limit");
+
+    Check(Near(OpticsModel.ResolutionForLevel(0, 15, 4, 1), 15, 1e-9) && Near(OpticsModel.ResolutionForLevel(0.5, 15, 4, 1), 4, 1e-9)
+        && Near(OpticsModel.ResolutionForLevel(1, 15, 4, 1), 1, 1e-9), "stock's three levels land on their lenses");
+    double betweenRes = OpticsModel.ResolutionForLevel(0.25, 15, 4, 1);
+    Check(betweenRes < 15 && betweenRes > 4, "a modded level falls between");
+
+    var site = new OpticsSite { ResolutionArcsec = 15, ZenithSeeingArcsec = 1, SeeingAirmassPower = 0.6, AirFactor = 1, ElevationDeg = 35, SunElevationDeg = -30 };
+    var r = OpticsModel.Assess(site, 10_197_207_000);
+    Check(Near(r.BlurOnTargetM, 10_197_207_000 * r.BlurArcsec / OpticsModel.ArcsecPerRadian, 1e-3), "blur on the target is range times the blur angle");
+    Check(r.BlurOnTargetM > 700_000, "level 1 at Duna's range blurs over 700 km, wider than Duna itself");
+    Check(r.DaySky == 0, "night: no day sky");
+    site.SunElevationDeg = 40;
+    Check(Near(OpticsModel.Assess(site, 1e6).DaySky, 1, 1e-12), "full day under full air");
+    site.AirFactor = 0;
+    var space = OpticsModel.Assess(site, 1e6);
+    Check(space.SeeingArcsec == 0 && space.DaySky == 0 && space.ExtinctionStops == 0 && space.Airmass == 1,
+        "a lens with no air around it pays only for its lens and range");
+
+    // Symmetry from real geometry: a lens on Kerbin and one on Duna, placed point-symmetrically about the midpoint.
+    var kerbinC = new DVec3(0, 0, 0);
+    var dunaC = new DVec3(2.0e10, 0, 0);
+    double tilt = 40 * Math.PI / 180;
+    var upA = new DVec3(Math.Cos(tilt), Math.Sin(tilt), 0);
+    var upB = new DVec3(-Math.Cos(tilt), -Math.Sin(tilt), 0);
+    var lensA = kerbinC + upA * 600_000;
+    var lensB = dunaC + upB * 320_000;
+    double elevAB = CommandCameraMath.ElevationDeg((lensB - lensA).Normalized, upA);
+    double elevBA = CommandCameraMath.ElevationDeg((lensA - lensB).Normalized, upB);
+    double sameAir = OpticsModel.AirFactor(6.75);
+    OpticsReading Look(double elev, double air, double range) => OpticsModel.Assess(new OpticsSite
+        { ResolutionArcsec = 4, ZenithSeeingArcsec = 1, SeeingAirmassPower = 0.6, AirFactor = air, ElevationDeg = elev, SunElevationDeg = -20 }, range);
+    var fromKerbin = Look(elevAB, sameAir, (lensB - lensA).Magnitude);
+    var fromDuna = Look(elevBA, sameAir, (lensA - lensB).Magnitude);
+    Check(elevAB > 40 && elevAB < 60 && Near(elevAB, elevBA, 1e-6), "mirrored lenses see each other at the same elevation");
+    Check(Near(fromKerbin.BlurArcsec, fromDuna.BlurArcsec, 1e-9) && Near(fromKerbin.BlurOnTargetM, fromDuna.BlurOnTargetM, 1e-3)
+        && Near(fromKerbin.ClarityStops, fromDuna.ClarityStops, 1e-9), "a Kerbin lens and a Duna lens in the same air read each other the same");
+    var kerbinAir = Look(elevAB, OpticsModel.AirFactor(101.325), (lensB - lensA).Magnitude);
+    var dunaAir = Look(elevBA, OpticsModel.AirFactor(6.75), (lensA - lensB).Magnitude);
+    Check(kerbinAir.SeeingArcsec > dunaAir.SeeingArcsec && kerbinAir.ClarityStops < dunaAir.ClarityStops,
+        "each in its own air, Kerbin's thicker air makes its view of Duna the worse one");
+    var kscAtDuna = new OpticsSite { ResolutionArcsec = 4, ZenithSeeingArcsec = 1, SeeingAirmassPower = 0.6, AirFactor = 1, ElevationDeg = 50, SunElevationDeg = -20 };
+    var a1 = OpticsModel.Assess(kscAtDuna, 2.0e10);
+    var thinAir = kscAtDuna; thinAir.AirFactor = OpticsModel.AirFactor(6.75);
+    Check(OpticsModel.Assess(thinAir, 2.0e10).SeeingArcsec < a1.SeeingArcsec, "Duna's thin air blurs less than Kerbin's");
+    Check(OpticsModel.Assess(kscAtDuna, 1000).BlurOnTargetM < 0.03, "a near object stays sharp: 1 km away the blur is a couple of centimetres");
+
+    // The network note's worked example (level 3): night at 45 degrees beats overhead in full day.
+    double Score(double res, double range, double elev, double sun) => OpticsModel.Assess(
+        new OpticsSite { ResolutionArcsec = res, ZenithSeeingArcsec = 1, SeeingAirmassPower = 0.6, AirFactor = 1, ElevationDeg = elev, SunElevationDeg = sun }, range).ClarityStops;
+    Check(Score(1, 133_000, 45, -30) > Score(1, 100_000, 90, 40), "night at 45 degrees beats overhead by day");
+    Check(Near(Score(1, 100_000, 90, 40), -0.96, 0.05), "overhead by day scores about -0.96 stops at level 3");
+
+    // Pixels and the skip.
+    double pix = OpticsModel.PixelArcsec(30, 576);
+    Check(pix > 180 && pix < 200, "a 30 degree view is about 190 arcsec a pixel");
+    Check(!OpticsModel.Worthwhile(15 / pix), "a wide view skips the blur entirely");
+    Check(OpticsModel.Worthwhile(15 / OpticsModel.PixelArcsec(0.02, 576)), "a zoomed view at level 1 blurs");
+    Check(!OpticsModel.Worthwhile(0.99) && OpticsModel.Worthwhile(1.0), "under a pixel of blur does nothing");
+    Check(OpticsModel.Ramp(1.0) == 0 && OpticsModel.Ramp(0.5) == 0 && OpticsModel.Ramp(1.0 + OpticsModel.RampPx) == 1 && OpticsModel.Ramp(50) == 1,
+        "the effect fades in from nothing at the threshold");
+    double rprev = 0; bool rises = true;
+    for (double bp = 1.0; bp < 3.0; bp += 0.01) { double rv = OpticsModel.Ramp(bp); rises &= rv >= rprev && rv - rprev < 0.03; rprev = rv; }
+    Check(rises, "and rises smoothly, with no step");
+    Check(OpticsModel.MaxLevelFor(1024, 576) == 8 && OpticsModel.MaxLevelFor(64, 36) == 4 && OpticsModel.MaxLevelFor(2, 2) == 1,
+        "the pyramid goes as deep as the frame allows");
+
+    // Discs and keeping the light.
+    Check(Near(OpticsModel.DiscPeak(10, 1), 1, 1e-9), "a disc far wider than the blur keeps its centre");
+    Check(OpticsModel.DiscPeak(1, 10) < 0.01, "a speck under a wide blur keeps under a hundredth of its peak");
+    Check(Near(OpticsModel.DiscCoverage(0, 3, 2), OpticsModel.DiscPeak(3, 2), 1e-4), "coverage at the centre is the disc's peak");
+    Check(Near(OpticsModel.DiscCoverage(100, 100, 1), 0.5, 0.01), "a big disc's blurred edge is half covered");
+    Check(OpticsModel.DiscCoverage(110, 100, 1) < 1e-6 && OpticsModel.DiscCoverage(90, 100, 1) > 0.999999, "and falls off within a few sigma");
+    double prev = 2;
+    bool falls = true;
+    for (double rr = 0; rr < 30; rr += 0.5) { double c = OpticsModel.DiscCoverage(rr, 5, 3); falls &= c <= prev + 1e-9; prev = c; }
+    Check(falls, "blurred coverage only falls outward");
+    // Energy kept: the blurred disc's coverage integrates to the disc's area.
+    double area = 0;
+    for (double rr = 0.05; rr < 40; rr += 0.1) area += OpticsModel.DiscCoverage(rr, 5, 3) * 2 * Math.PI * rr * 0.1;
+    Check(Near(area, Math.PI * 25, Math.PI * 25 * 0.01), "the blur keeps the disc's light");
+
+    Check(OpticsModel.Gain(1, 1, 2.2, 10) == 1, "a resolved body gets no gain");
+    Check(Near(OpticsModel.Gain(0.2, 1, 0, 10), 5, 1e-9), "hold 1 restores the surface brightness");
+    Check(OpticsModel.Gain(0.2, 0, 0, 10) == 1, "hold 0 keeps the light strictly");
+    Check(OpticsModel.Gain(1e-4, 1, 2.2, 10) == 10, "the cap stops a speck becoming a beacon");
+    Check(OpticsModel.DayGain(10, 1) == 1 && OpticsModel.DayGain(10, 0) == 10, "no gain in full daylight, where the sky would brighten with it");
+
+    // The blur pyramid matches a target width.
+    Check(Near(OpticsModel.PyramidSigma(1), Math.Sqrt(0.75), 1e-12) && Near(OpticsModel.PyramidSigma(2), Math.Sqrt(3.75), 1e-12),
+        "pyramid widths match the measured box-down, bilinear-up chain");
+    OpticsModel.PyramidPlan(0.4, 8, out int lv0, out double w0);
+    Check(lv0 == 0 && w0 > 0 && w0 < 1, "a small blur mixes the sharp layer with level 1");
+    foreach (double target in new[] { 0.5, 1.3, 5.0, 17.0, 40.0 })
+    {
+        OpticsModel.PyramidPlan(target, 8, out int lv, out double share);
+        double mixVar = (1 - share) * Math.Pow(OpticsModel.PyramidSigma(lv), 2) + share * Math.Pow(OpticsModel.PyramidSigma(lv + 1), 2);
+        Check(Near(Math.Sqrt(mixVar), target, 1e-9), $"pyramid plan reproduces a {target}px blur");
+    }
+    OpticsModel.PyramidPlan(1e6, 8, out int lvMax, out double wMax);
+    Check(lvMax == 7 && wMax == 1, "a blur past the deepest level is capped there");
+
+    // The craft's blur: Airy rings without air, washed out with it.
+    var airy = OpticsModel.PsfProfile(1, 0, 4, 401);
+    Check(Near(airy[0], 1, 1e-12) && Near(airy[50], 0.5, 0.01), "the Airy core falls to half at half its FWHM");
+    int ringAt = 0;
+    for (int i = 2; i < airy.Length - 1; i++) if (airy[i] > airy[i - 1] && airy[i] > airy[i + 1]) { ringAt = i; break; }
+    Check(ringAt > 0 && Near(ringAt / 100.0, 1.58, 0.05), "a first ring near 1.6 FWHM out");
+    var washed = OpticsModel.PsfProfile(1, 3, 4, 401);
+    bool monotone = true;
+    for (int i = 1; i < washed.Length; i++) monotone &= washed[i] <= washed[i - 1] + 1e-9;
+    Check(monotone, "seeing far wider than the lens washes the rings out");
+    Check(Near(OpticsModel.BesselJ1(1.0), 0.4400505857, 1e-7) && Near(OpticsModel.BesselJ1(10.0), 0.0434727462, 1e-7), "J1 matches tables");
+    Check(Near(OpticsModel.BesselI0e(1.0), 1.2660658778 * Math.Exp(-1), 1e-6) && Near(OpticsModel.BesselI0e(10.0), 2815.716628 * Math.Exp(-10), 1e-6),
+        "I0e matches tables");
+
+    OpticsModel.SeeingMotion(15, out double wob1, out _, out double tw1);
+    OpticsModel.SeeingMotion(1, out double wob3, out _, out double tw3);
+    Check(wob1 > wob3 && tw1 > tw3, "small lenses dance and twinkle more");
+
+    var noise = new SeeingNoise(7);
+    double ss = 0;
+    int n = 0;
+    for (double t = 0; t < 2; t += 0.001) { ss += noise.At(t, 0) * noise.At(t, 0); n++; }
+    Check(Near(Math.Sqrt(ss / n), 1, 0.05), "seeing noise has unit RMS");
+    Check(Near(noise.At(0.3, 1), noise.At(2.3, 1), 1e-9), "and loops every 2 s");
+
+    var knobs = new OpticsKnobs { ResolutionArcsec = 30, SeeingArcsec = double.NaN, SeeingAirmassPower = double.NaN, BrightnessHold = double.NaN, DaySkyStrength = double.NaN };
+    var merged = knobs.Over(OpticsModel.Defaults);
+    Check(merged.ResolutionArcsec == 30 && merged.SeeingArcsec == OpticsModel.Defaults.SeeingArcsec, "a host's knob wins; the rest stay default");
+    Check(OpticsKnobs.Unset.IsUnset && !knobs.IsUnset && knobs.Valid, "unset knobs read as unset");
+    var bad = OpticsKnobs.Unset; bad.BrightnessHold = 2;
+    var bad2 = OpticsKnobs.Unset; bad2.ResolutionArcsec = double.PositiveInfinity;
+    Check(!bad.Valid && !bad2.Valid, "out of range or infinite knobs are refused");
+}
+
+{
+    /* A Surface aim at a body drawn at its past instant: on the drawn body, 8 minutes of spin back, at the same height. */
+    var aimSpin = new DVec3(0, -2.9e-4, 0);
+    var liveCentre = new DVec3(5e9, 1e8, -3e9);
+    var drawnCentre = liveCentre + new DVec3(-3.6e9, 0, 2e6);
+    var surface = new DVec3(320000, 0, 0);
+    var aimed = CommandCameraMath.CarriedByBody(surface, drawnCentre, aimSpin, -480);
+    Check(Near((aimed - drawnCentre).Magnitude, 320000, 1e-6), "surface aim: stays on the drawn body at its height");
+    Check(Near(CommandCameraMath.AngleBetween(aimed - drawnCentre, surface), 2.9e-4 * 480, 1e-9), "surface aim: turned back by the body's spin over its light time");
+    Check(VNear(CommandCameraMath.ToBodyFrameNow(aimed, drawnCentre, liveCentre, aimSpin, -480), liveCentre + surface, 1e-6), "surface aim: undoing the carry lands on the live ground point");
+    Check(VNear(CommandCameraMath.CarriedByBody(surface, drawnCentre, aimSpin, 0), drawnCentre + surface, 1e-9), "surface aim: a body with no light time keeps the ground point");
+}
+
+/* The drawn-light line, for a craft and for an aim at no craft. */
+Check(CommandCameraMath.DrawnLightState(false, true, 45000) == -1, "no light speed reads off");
+Check(CommandCameraMath.DrawnLightState(true, false, 45000) == 0, "a place not drawn reads none");
+Check(CommandCameraMath.DrawnLightState(true, true, double.NaN) == 0, "a place with no light time reads none");
+Check(CommandCameraMath.DrawnLightState(true, true, 0) == 1, "a place drawn as it is now reads live");
+Check(CommandCameraMath.DrawnLightState(true, true, 45000) == 2, "a Sun aim 45000 s of light away reads past");
+Check(CommandCameraMath.DrawnLightName(2) == "past" && CommandCameraMath.DrawnLightName(1) == "live"
+    && CommandCameraMath.DrawnLightName(0) == "none" && CommandCameraMath.DrawnLightName(-1) == "off", "states name as the craft line does");
+Check(CommandCameraMath.AimLightLogDue(2, -1, true), "the first aim under a light speed is said");
+Check(CommandCameraMath.AimLightLogDue(2, 2, true), "a new aim in the same state is said again, with its own light time");
+Check(!CommandCameraMath.AimLightLogDue(2, 2, false), "the same aim in the same state is said once");
+Check(CommandCameraMath.AimLightLogDue(1, 2, false), "a change of state is said");
+Check(!CommandCameraMath.AimLightLogDue(-1, -1, true), "a new aim with no light speed says nothing");
+Check(CommandCameraMath.AimLightLogDue(-1, 2, false), "a light speed going away is said");
 
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

@@ -33,6 +33,7 @@ namespace Kerbcast
         private static Light _cachedScaledSunLight;
         private static Light _cachedNearSunLight;
         private static bool _sunLightsResolved;
+        private static Sun _resolvedFor;
 
         // Saved for exact restore: one entry per stripped (light, event, buffer).
         private struct StrippedBuffer
@@ -61,7 +62,7 @@ namespace Kerbcast
 
         /// <summary>
         /// The scaled-space sun light from <c>Sun.Instance</c>, resolved via
-        /// reflection on first use and cached. Null if Sun.Instance is not yet
+        /// reflection on first use and cached for that Sun. Null if Sun.Instance is not yet
         /// available or the field is absent in this KSP version.
         /// </summary>
         public static Light GetScaledSunLight()
@@ -73,12 +74,14 @@ namespace Kerbcast
         // Resolve both sun lights once Sun.Instance exists. scaledSunLight is a
         // protected field; sunLight is a public property returning the near-scene
         // local light. Retries each call until Sun.Instance is available, then
-        // caches (even a null result) so reflection runs at most once.
+        // caches (even a null result) so reflection runs once per Sun.
         private static void ResolveSunLights()
         {
-            if (_sunLightsResolved) return;
+            /* A scene change makes a new Sun with new lights. */
+            if (_sunLightsResolved && _resolvedFor == Sun.Instance) return;
             if (Sun.Instance == null) return;
             _sunLightsResolved = true;
+            _resolvedFor = Sun.Instance;
             _cachedScaledSunLight = ResolveLight("scaledSunLight");
             _cachedNearSunLight = ResolveLight("sunLight");
         }
