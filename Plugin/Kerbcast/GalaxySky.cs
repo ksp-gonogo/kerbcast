@@ -22,17 +22,11 @@ namespace Kerbcast
         private static Color s_tint;
 
         /// <summary>Whether clearing <paramref name="galaxyCam"/>'s target to its
-        /// background gives the frame its render would, this frame.</summary>
-        public static bool CanClear(Camera galaxyCam)
+        /// background gives the frame its render would, this frame, with the
+        /// cube tinted <paramref name="tint"/> instead of as KSP left it when one is given.</summary>
+        public static bool CanClear(Camera galaxyCam, Color? tint = null)
         {
-            var cube = GalaxyCubeControl.Instance;
-            if (cube == null || !cube.isActiveAndEnabled) return false;
-            if (cube != s_cube)
-            {
-                s_cube = cube;
-                s_faces = cube.GetComponentsInChildren<Renderer>();
-                s_scanned = false;
-            }
+            if (!Cube()) return false;
             /* A vessel switch can load renderers the scene did not have when it was scanned. */
             var vessel = FlightGlobals.ready ? FlightGlobals.ActiveVessel : null;
             if (vessel != s_vessel)
@@ -51,8 +45,76 @@ namespace Kerbcast
             }
             ReadTint();
             var bg = galaxyCam.backgroundColor;
+            bool tinted = tint.HasValue ? s_faces.Length > 0 : s_tinted;
+            var t = tint ?? s_tint;
             return GalaxyBlackout.CanClear(galaxyCam.clearFlags == CameraClearFlags.SolidColor, bg.r, bg.g, bg.b,
-                s_alone, s_tinted, s_tint.r, s_tint.g, s_tint.b);
+                s_alone, tinted, t.r, t.g, t.b);
+        }
+
+        private static bool Cube()
+        {
+            var cube = GalaxyCubeControl.Instance;
+            if (cube == null || !cube.isActiveAndEnabled) return false;
+            if (cube != s_cube)
+            {
+                s_cube = cube;
+                s_faces = cube.GetComponentsInChildren<Renderer>();
+                s_scanned = false;
+            }
+            return true;
+        }
+
+        private static readonly System.Collections.Generic.List<Color> s_pushed = new System.Collections.Generic.List<Color>();
+        private static MaterialPropertyBlock s_pushBlock;
+
+        /* Tints every cube face `tint` for one render; PopTint puts KSP's tint back. Read the stock tint (CanClear) before this, not between. */
+        public static void PushTint(Color tint)
+        {
+            s_pushed.Clear();
+            if (!Cube()) return;
+            if (s_pushBlock == null) s_pushBlock = new MaterialPropertyBlock();
+            for (int i = 0; i < s_faces.Length; i++)
+            {
+                var face = s_faces[i];
+                if (face == null) { s_pushed.Add(Color.clear); continue; }
+                face.GetPropertyBlock(s_pushBlock);
+                s_pushed.Add(s_pushBlock.isEmpty ? Color.clear : s_pushBlock.GetColor(ColorId));
+                s_pushBlock.SetColor(ColorId, tint);
+                face.SetPropertyBlock(s_pushBlock);
+            }
+        }
+
+        public static void PopTint()
+        {
+            if (s_faces == null) return;
+            for (int i = 0; i < s_pushed.Count && i < s_faces.Length; i++)
+            {
+                var face = s_faces[i];
+                if (face == null) continue;
+                face.GetPropertyBlock(s_pushBlock);
+                s_pushBlock.SetColor(ColorId, s_pushed[i]);
+                face.SetPropertyBlock(s_pushBlock);
+            }
+            s_pushed.Clear();
+        }
+
+        /* The cube's tint for a fade of `fade`, between the colours KSP fades it between; null with no cube. */
+        public static Color? TintFor(float fade)
+        {
+            var cube = GalaxyCubeControl.Instance;
+            if (cube == null) return null;
+            return Color.Lerp(cube.maxGalaxyColor, cube.minGalaxyColor, fade);
+        }
+
+        /* The limits KSP's cube fades the stars by, so a lens fades them as stock would where it stands. */
+        public static bool Limits(out float atmos, out float daytime, out float airPressure, out float glare)
+        {
+            var cube = GalaxyCubeControl.Instance;
+            atmos = cube != null ? cube.atmosFadeLimit : 0f;
+            daytime = cube != null ? cube.daytimeFadeLimit : 0f;
+            airPressure = cube != null ? cube.airPressureFade : 0f;
+            glare = cube != null ? cube.glareFadeLimit : 0f;
+            return cube != null;
         }
 
         /* Once per cube, mask and active vessel: a full renderer scan is too slow

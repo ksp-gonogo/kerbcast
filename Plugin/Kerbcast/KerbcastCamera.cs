@@ -67,6 +67,8 @@ namespace Kerbcast
         Vessel LensCraft { get; }
         /* A viewer's set-fov, which the rig takes under its own rules rather than as a part camera's zoom. */
         void ViewerFov(float fov);
+        /* The galaxy cube's tint for this camera's next galaxy render; null leaves KSP's. */
+        Color? GalaxyTint();
         void Dispose();
     }
 
@@ -99,7 +101,7 @@ namespace Kerbcast
            where the frame's own scaled render drew them. */
         internal Color RenderBackdropForProbe()
         {
-            if (_galaxyCam != null) _galaxyCam.Render();
+            if (_galaxyCam != null) RenderGalaxyTinted(Rig?.GalaxyTint());
             if (_scaledCam != null)
             {
                 try
@@ -110,6 +112,19 @@ namespace Kerbcast
                 finally { Picture.AfterScaledLayer(); }
             }
             return SampleCaptureCentre();
+        }
+
+        /* The galaxy layer with the cube tinted `tint` for this render alone, or as KSP left it when null. */
+        private void RenderGalaxyTinted(Color? tint)
+        {
+            if (!tint.HasValue)
+            {
+                _galaxyCam.Render();
+                return;
+            }
+            GalaxySky.PushTint(tint.Value);
+            try { _galaxyCam.Render(); }
+            finally { GalaxySky.PopTint(); }
         }
 
         private void RenderScaledWithRig()
@@ -2144,9 +2159,10 @@ namespace Kerbcast
                     /* By day in an atmosphere KSP tints the galaxy cube black, and a
                        black cube over a black clear is the clear: clearing gives the
                        same frame without a camera render (see GalaxyBlackout). */
+                    var tint = Rig?.GalaxyTint();
                     if (KerbcastSettings.EnableGalaxySkip
                         && (_integrationHost == null || !_integrationHost.Touches(CameraLayers.Galaxy))
-                        && GalaxySky.CanClear(_galaxyCam))
+                        && GalaxySky.CanClear(_galaxyCam, tint))
                     {
                         var previous = RenderTexture.active;
                         RenderTexture.active = _galaxyCam.targetTexture;
@@ -2157,7 +2173,7 @@ namespace Kerbcast
                     else
                     {
                         _integrationHost?.PerFrame(_galaxyCam, CameraLayers.Galaxy, BuildIntegrationFrameState(CameraLayers.Galaxy));
-                        _galaxyCam.Render();
+                        RenderGalaxyTinted(tint);
                     }
                     if (_telemetry)
                         _phaseTimings.Record(RenderPhase.Galaxy,
