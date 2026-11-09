@@ -676,10 +676,11 @@ mod tests {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(!body.is_empty());
-        // index.html must stay lean: nowhere near Mediabunny's own bundle
-        // size, i.e. it was never inlined into the single-file page.
+        /* index.html must stay well under the page plus Mediabunny's own
+        bundle (about 627 KB minified), so an inlined Mediabunny fails
+        this; the page alone is about 500 KB. */
         assert!(
-            body.len() < 500_000,
+            body.len() < 800_000,
             "index.html grew to {} bytes -- did Mediabunny get inlined?",
             body.len(),
         );
