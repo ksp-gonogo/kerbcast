@@ -36,6 +36,7 @@ namespace Kerbcast
         private readonly SavedNetworkPublisher _publisher;
         private float _jsonCooldown;
         private readonly List<CommandCameraProvider.HostNetwork> _hosts = new List<CommandCameraProvider.HostNetwork>();
+        private readonly SavedWatchWaits _watchWaits = new SavedWatchWaits();
 
         public NetworkStore(string ringDir)
         {
@@ -79,8 +80,12 @@ namespace Kerbcast
         {
             try
             {
-                uint id = KerbcastControl.StartSavedNetwork(n, out string error, carried);
-                if (id != 0) return true;
+                uint id = KerbcastControl.StartSavedNetwork(n, out string error, out bool waitsForCraft, carried);
+                if (id != 0)
+                {
+                    if (waitsForCraft) _watchWaits.Add(n);
+                    return true;
+                }
                 Debug.LogWarning($"{Tag} '{n.Name}' ({n.NetworkId}) not started: {error}");
             }
             catch (Exception ex)
@@ -268,6 +273,8 @@ namespace Kerbcast
         public void Tick(KerbcastCore core)
         {
             if (Stopped) return;
+            if (_watchWaits.Any && KerbcastControl.SceneCraftLoaded)
+                foreach (var n in _watchWaits.Take(_set.Find)) KerbcastControl.SettleSavedWatch(n);
             _jsonCooldown -= Time.unscaledDeltaTime;
             if (_jsonCooldown > 0f) return;
             Publish(core, force: false);

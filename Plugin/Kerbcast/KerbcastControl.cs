@@ -557,11 +557,13 @@ namespace Kerbcast
          * without asking what any site knows of it, so the watch holds under
          * a world model too; each vantage still sees the craft only by what
          * its own site knows. A craft no longer in the game leaves the camera
-         * on its default craft.
+         * on its default craft. `waitsForCraft` is set when the watch can only
+         * be checked once the scene's craft are loaded (SettleSavedWatch).
          */
-        internal static uint StartSavedNetwork(SavedNetwork n, out string error, LiveAim carried = null)
+        internal static uint StartSavedNetwork(SavedNetwork n, out string error, out bool waitsForCraft, LiveAim carried = null)
         {
             error = null;
+            waitsForCraft = false;
             var core = KerbcastCore.Instance;
             var provider = core?.CommandProvider;
             if (provider == null)
@@ -573,14 +575,31 @@ namespace Kerbcast
             foreach (var v in n.Vantages)
                 specs.Add(new NetworkVantageSpec { Vantage = v.Vantage, Label = v.Label, Fallback = v.Fallback });
             CommandAim aim = carried?.Aim;
-            if (carried == null && n.WatchPersistentId != 0)
+            if (carried == null)
             {
-                if (CommandCameraSite.VantageExists(n.WatchPersistentId)) aim = CommandAim.Vessel(n.WatchPersistentId);
-                else Debug.LogWarning($"[Kerbcast][CMDCAM] saved network '{n.Name}' watches craft {n.WatchPersistentId}, which no longer exists; "
-                    + "it watches the active vessel until edited");
+                switch (SavedNetwork.WatchAtStart(n.WatchPersistentId, CommandCameraSite.VantageExists(n.WatchPersistentId), SceneCraftLoaded))
+                {
+                    case SavedWatchStart.Aim: aim = CommandAim.Vessel(n.WatchPersistentId); break;
+                    case SavedWatchStart.Missing: WarnWatchGone(n); break;
+                    case SavedWatchStart.Wait: waitsForCraft = true; break;
+                }
             }
             return provider.CreateSavedNetwork(n.FlightId, specs, n.Name, n.Tuning, aim, core.CameraFlightIds(), out error,
                 carried?.Orbit, carried?.Fov ?? double.NaN, carried?.Shown ?? double.NaN);
+        }
+
+        /* False while a flight scene is still putting its craft in place; every other scene has them from the game state it starts with. */
+        internal static bool SceneCraftLoaded => !HighLogic.LoadedSceneIsFlight || FlightGlobals.ready;
+
+        private static void WarnWatchGone(SavedNetwork n) =>
+            Debug.LogWarning($"[Kerbcast][CMDCAM] saved network '{n.Name}' watches craft {n.WatchPersistentId}, which no longer exists; "
+                + "it watches the active vessel until edited");
+
+        /* The scene's craft have loaded: a watch that had to wait is applied, unless the camera was aimed meanwhile, or warned about if its craft really is gone. */
+        internal static void SettleSavedWatch(SavedNetwork n)
+        {
+            if (!CommandCameraSite.VantageExists(n.WatchPersistentId)) WarnWatchGone(n);
+            else if (LiveAimOf(n.FlightId)?.Aim == null) ApplySavedWatch(n);
         }
 
         /* A camera's aim and held zoom now, built or waiting to be; null when there is no such camera. */

@@ -53,6 +53,18 @@ namespace Kerbcast
         public static bool NeedsRebuild(SavedNetwork before, SavedNetwork after) => before.Name != after.Name;
 
         /*
+         * What a saved watch does as its camera starts. A scene's camera list
+         * is built before KSP has put the save's craft in place (a quickload's
+         * are not even in the game state yet), so a craft not found by then
+         * says nothing until the scene's craft are loaded.
+         */
+        public static SavedWatchStart WatchAtStart(uint watch, bool craftKnown, bool sceneCraftLoaded) =>
+            watch == 0 ? SavedWatchStart.None
+            : craftKnown ? SavedWatchStart.Aim
+            : sceneCraftLoaded ? SavedWatchStart.Missing
+            : SavedWatchStart.Wait;
+
+        /*
          * How an edit reaches the running camera. A browser may edit under a
          * held command lock, but the live aim stays the holder's: the edit is
          * stored, its watch is not applied, and a rebuild keeps what the
@@ -78,6 +90,31 @@ namespace Kerbcast
         public bool ApplyWatch;
         /* A rebuild restores the camera's current aim and zoom rather than starting on the saved watch. */
         public bool CarryLiveAim;
+    }
+
+    internal enum SavedWatchStart { None, Aim, Wait, Missing }
+
+    /* Saved networks whose watched craft could not be found while their scene loaded, each with the craft it waits for. */
+    internal sealed class SavedWatchWaits
+    {
+        private readonly Dictionary<string, uint> _waiting = new Dictionary<string, uint>();
+
+        public bool Any => _waiting.Count > 0;
+
+        public void Add(SavedNetwork n) => _waiting[n.NetworkId] = n.WatchPersistentId;
+
+        /* Ends every wait and returns the networks to settle: one since deleted or given another watch has nothing left to wait for. */
+        public List<SavedNetwork> Take(Func<string, SavedNetwork> find)
+        {
+            var settle = new List<SavedNetwork>(_waiting.Count);
+            foreach (var wait in _waiting)
+            {
+                var n = find(wait.Key);
+                if (n != null && n.WatchPersistentId == wait.Value) settle.Add(n);
+            }
+            _waiting.Clear();
+            return settle;
+        }
     }
 
     /* The answer to one save or delete, sent back by the client's token. */

@@ -577,6 +577,24 @@ finally { Directory.Delete(signalDir, true); }
     Check(!NetworkMath.MayChangeHostNetwork("modA", "modB") && !NetworkMath.MayChangeHostNetwork("modA", null), "no other caller may change or remove it");
     Check(NetworkMath.MayChangeHostNetwork("", null) && NetworkMath.MayChangeHostNetwork("", "modB"), "a network made under no name can be changed or removed by anyone");
 
+    Check(SavedNetwork.WatchAtStart(0, false, false) == SavedWatchStart.None, "no watch: nothing to check at a scene's start");
+    Check(SavedNetwork.WatchAtStart(7, true, false) == SavedWatchStart.Aim, "a watched craft already known is aimed at while the scene loads");
+    Check(SavedNetwork.WatchAtStart(7, false, false) == SavedWatchStart.Wait, "a watched craft not known yet waits for the scene's craft instead of warning");
+    Check(SavedNetwork.WatchAtStart(7, false, true) == SavedWatchStart.Missing, "a watched craft missing once the craft have loaded is really gone");
+
+    var waits = new SavedWatchWaits();
+    Check(!waits.Any, "no networks wait to begin with");
+    var waitingOn7 = new SavedNetwork { NetworkId = "a", WatchPersistentId = 7 };
+    var retargeted = new SavedNetwork { NetworkId = "b", WatchPersistentId = 8 };
+    var deleted = new SavedNetwork { NetworkId = "c", WatchPersistentId = 9 };
+    waits.Add(waitingOn7);
+    waits.Add(retargeted);
+    waits.Add(deleted);
+    retargeted.WatchPersistentId = 80;
+    var settled = waits.Take(id => id == "a" ? waitingOn7 : id == "b" ? retargeted : null);
+    Check(settled.Count == 1 && settled[0] == waitingOn7, "only a network still watching what it waited for is settled");
+    Check(!waits.Any && waits.Take(_ => waitingOn7).Count == 0, "each wait is settled once");
+
     Directory.Delete(netDir, true);
 }
 
