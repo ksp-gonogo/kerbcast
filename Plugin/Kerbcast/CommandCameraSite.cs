@@ -253,17 +253,83 @@ namespace Kerbcast
             catch (Exception) { /* facility transform not built yet */ }
             if (t == null) return SpawnLookup.Unset;
             body.GetLatLonAlt(t.position, out double tlat, out double tlon, out double talt);
-            if (!Plausible(tlat, tlon) || double.IsNaN(talt)) return SpawnLookup.Unset;
-            double ground;
-            try { ground = body.TerrainAltitude(tlat, tlon); }
-            catch (Exception) { return SpawnLookup.Unset; }
-            if (Math.Abs(talt - Math.Max(ground, 0.0)) > MaxSpawnAboveGround) return SpawnLookup.Unset;
-            lat = tlat;
-            lon = tlon;
-            alt = talt;
-            source = "launchsite-transform";
+            double ground = double.NaN;
+            if (Plausible(tlat, tlon) && !double.IsNaN(talt))
+            {
+                try { ground = body.TerrainAltitude(tlat, tlon); }
+                catch (Exception) { /* no terrain to check against */ }
+            }
+            if (!double.IsNaN(ground) && Math.Abs(talt - Math.Max(ground, 0.0)) <= MaxSpawnAboveGround)
+            {
+                lat = tlat;
+                lon = tlon;
+                alt = talt;
+                source = "launchsite-transform";
+                return SpawnLookup.Found;
+            }
+            if (!PlacedByCity(t, body, out lat, out lon, out alt)) return SpawnLookup.Unset;
+            source = "pqscity";
             return SpawnLookup.Found;
         }
+
+        /*
+         * Where the spawn transform `t` stands once its PQSCity places itself,
+         * worked out without the city having done so. A scene that starts far
+         * from the site (the active craft at Duna) never runs the city's
+         * Orientate, so the spawn point keeps no coordinates and its transform
+         * sits wherever the prefab left it. This repeats Orientate's placement
+         * from the city's own settings, and composes only local transforms:
+         * world positions are rounded to kilometres that far from the origin.
+         */
+        private static bool PlacedByCity(Transform t, CelestialBody body, out double lat, out double lon, out double alt)
+        {
+            lat = lon = alt = double.NaN;
+            try
+            {
+                var city = t.GetComponentInParent<PQSCity>();
+                var pqs = city != null ? city.GetComponentInParent<PQS>() : null;
+                if (city == null || pqs == null || city.transform.parent == null) return false;
+
+                var inCity = Vector3.zero;
+                for (var x = t; x != city.transform; x = x.parent)
+                {
+                    if (x == null) return false;
+                    inCity = x.localPosition + x.localRotation * Vector3.Scale(x.localScale, inCity);
+                }
+
+                var ct = city.transform;
+                Vector3d radial = ((Vector3d)city.repositionRadial).normalized;
+                var cityPos = (Vector3d)ct.localPosition;
+                if (city.repositionToSphere) cityPos = radial * (pqs.radius + city.repositionRadiusOffset);
+                if (city.repositionToSphereSurface)
+                {
+                    double h = pqs.GetSurfaceHeight(radial);
+                    if (city.repositionToSphereSurfaceAddHeight) h += city.repositionRadiusOffset;
+                    cityPos = radial * h;
+                }
+                var cityRot = city.reorientToSphere
+                    ? Quaternion.FromToRotation(city.reorientInitialUp, ((Vector3)cityPos).normalized) * Quaternion.AngleAxis(city.reorientFinalAngle, Vector3.up)
+                    : ct.localRotation;
+                Vector3d p = cityPos + (Vector3d)(cityRot * Vector3.Scale(ct.localScale, inCity));
+
+                for (var x = ct.parent; x != pqs.transform; x = x.parent)
+                {
+                    if (x == null) return false;
+                    p = (Vector3d)x.localPosition + (Vector3d)(x.localRotation * Vector3.Scale(x.localScale, (Vector3)p));
+                }
+                var offset = (Vector3d)pqs.transform.TransformVector((Vector3)p);
+                body.GetLatLonAlt(body.position + offset, out lat, out lon, out alt);
+                return Plausible(lat, lon) && !double.IsNaN(alt) && Math.Abs(offset.magnitude - pqs.radius) < MaxCityFromSurface;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][CMDCAM] spawn point from its PQSCity failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /* A worked-out spawn point further than this from the PQS's sea-level sphere is not a place on the planet. */
+        private const double MaxCityFromSurface = 20000.0;
 
         /* A spawn transform further than this from the terrain at its own
            coordinates has not been placed on the planet yet. */
