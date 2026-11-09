@@ -137,6 +137,43 @@ Check(!CommandCameraMath.SegmentClearOfTerrain(new DVec3(0, -(MunR + 200000), 0)
 Check(!CommandCameraMath.SegmentInsideSphere(scope, new DVec3(0, MunR + 9000, 0), mun, MunR + 7500, out _, out _),
     "a line above the shell never enters it");
 
+/* A Surface aim at sea level on a world whose land stands above it, seen from another planet. */
+{
+    const double DunaR = 320000, DunaTop = 330500;
+    var duna = new DVec3(0, 0, 0);
+    var far = new DVec3(-3.2e10, 1e9, 0);
+    Func<DVec3, double> dunaLand = p => DunaR + 500;
+    var facing = new DVec3(-DunaR, 0, 0);
+    var facingOblique = new DVec3(-DunaR * Math.Cos(1.0), DunaR * Math.Sin(1.0), 0);
+    var behind = new DVec3(DunaR, 0, 0);
+    Check(!CommandCameraMath.SegmentClearOfTerrain(far, facing, duna, DunaR, DunaTop, dunaLand, 64),
+        "tested to the point itself, a sea-level point under land reads hidden");
+    Check(CommandCameraMath.SegmentClearOfTerrain(far, CommandCameraMath.SurfaceSightEnd(far, facing, duna, DunaR, DunaTop),
+        duna, DunaR, DunaTop, dunaLand, 64), "a sea-level point on the facing side is not hidden by its own ground");
+    Check(CommandCameraMath.SegmentClearOfTerrain(far, CommandCameraMath.SurfaceSightEnd(far, facingOblique, duna, DunaR, DunaTop),
+        duna, DunaR, DunaTop, dunaLand, 64), "nor one 57 degrees off the disc's centre");
+    Check(!CommandCameraMath.SegmentClearOfTerrain(far, CommandCameraMath.SurfaceSightEnd(far, behind, duna, DunaR, DunaTop),
+        duna, DunaR, DunaTop, dunaLand, 64), "a point on the far side is still hidden by the planet");
+    var craft = new DVec3(-DunaR - 50000, 0, 0);
+    Check(VNear(CommandCameraMath.SurfaceSightEnd(far, craft, duna, DunaR, DunaTop), craft, 0), "a target above the shell is tested to its place");
+    Check(VNear(CommandCameraMath.SurfaceSightEnd(new DVec3(-DunaR - 10, 0, 0), facing, duna, DunaR, DunaTop), new DVec3(-DunaR - 10, 0, 0), 0),
+        "a sight line shorter than the stretch left out collapses to its start");
+
+    /* The Sun: no terrain, a sphere at its radius, a point on it in double precision. */
+    const double SunR = 261600000;
+    var sun = new DVec3(1e9, 2e9, 3e9);
+    var kerbin = sun + new DVec3(1.36e10, 0, 0);
+    var sunFacing = sun + new DVec3(SunR, 0, 0);
+    var sunEdge = sun + new DVec3(SunR * Math.Cos(1.5), SunR * Math.Sin(1.5), 0);
+    var sunBehind = sun + new DVec3(-SunR, 0, 0);
+    Check(CommandCameraMath.SegmentClearOfSphere(kerbin, CommandCameraMath.SurfaceSightEnd(kerbin, sunFacing, sun, SunR, SunR), sun, SunR),
+        "a point on the Sun's facing side is seen");
+    Check(CommandCameraMath.SegmentClearOfSphere(kerbin, CommandCameraMath.SurfaceSightEnd(kerbin, sunEdge, sun, SunR, SunR), sun, SunR),
+        "a point near the Sun's limb on the facing side is seen");
+    Check(!CommandCameraMath.SegmentClearOfSphere(kerbin, CommandCameraMath.SurfaceSightEnd(kerbin, sunBehind, sun, SunR, SunR), sun, SunR),
+        "a point on the Sun's far side is hidden by the Sun");
+}
+
 // Bounding radius.
 var parts = new List<DVec3> { new DVec3(0, 10, 0), new DVec3(0, -5, 0), new DVec3(2, 0, 0) };
 Check(Near(CommandCameraMath.BoundingRadius(parts, origin, 1.5, 2), 11.5, 1e-9), "farthest part plus pad");

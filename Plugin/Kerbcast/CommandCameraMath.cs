@@ -833,6 +833,32 @@ namespace Kerbcast
             return true;
         }
 
+        /* Share of a body's radius a target may sit above its sea-level sphere and still count as on its surface. */
+        public const double SurfaceTolerance = 1e-6;
+
+        /*
+         * Where a sight line from `from` to `target` stops being tested against
+         * a body of sea-level `radius` whose ground reaches `radiusMax`. A
+         * target inside that shell sits on or under the ground (a point at sea
+         * level lies beneath any land), and the ground at and around it is its
+         * own place, not a body hiding it, so the last stretch before it, twice
+         * the shell's depth, is left out, as ScaledMeshOccluder.Blocks leaves
+         * out the mesh's relief. The far hemisphere is still behind the body.
+         * A target above the shell is tested to its own place; `from` itself
+         * comes back when the whole segment is within the stretch.
+         */
+        public static DVec3 SurfaceSightEnd(DVec3 from, DVec3 target, DVec3 centre, double radius, double radiusMax)
+        {
+            double top = Math.Max(radius, radiusMax);
+            double tol = radius * SurfaceTolerance;
+            if ((target - centre).Magnitude >= top + tol) return target;
+            double slack = 2.0 * (top - radius) + tol;
+            var d = target - from;
+            double len = d.Magnitude;
+            if (len <= slack) return from;
+            return target - d * (slack / len);
+        }
+
         /* Parameter range [t0, t1] (clamped to the segment) where a-b lies inside
            the sphere; false when it never enters. */
         public static bool SegmentInsideSphere(DVec3 a, DVec3 b, DVec3 centre, double radius,
