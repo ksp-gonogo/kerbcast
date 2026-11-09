@@ -777,22 +777,12 @@ namespace Kerbcast
             var ground = new LensChoice(OpticsModel.ResolutionForLevel(gated ? CommandCameraTargets.NormLevel() : 1, l1, l2, l3),
                 LensKind.TrackingStation, level, named ? $"Tracking Station level {level}" : null,
                 gated ? $"Tracking Station level {level}" : $"top lens ({TopLensWhy()})");
-            if (!InVacuum(site)) return ground;
+            if (!site.VantageInVacuum) return ground;
             int step = SpaceLens.BestStep(s.SpaceLensSteps, SpaceLensTech.Researched);
             if (step < 0 || !SpaceLens.Beats(s.SpaceLensSteps[step].Arcsec, ground.Arcsec)) return ground;
             string tech = s.SpaceLensSteps[step].TechId;
             return new LensChoice(s.SpaceLensSteps[step].Arcsec, LensKind.SpaceLens, step + 1,
                 named ? SpaceLensTech.Title(tech) : null, $"space lens step {step + 1} ({tech})");
-        }
-
-        /* A craft vantage outside its body's atmosphere, or on or over a body with none. Ground stations and surface points never are. */
-        private static bool InVacuum(CommandCameraSite site)
-        {
-            if (!site.HasVantage) return false;
-            var v = site.Vantage;
-            if (v == null || v.state == Vessel.State.DEAD) return false;
-            var body = v.mainBody;
-            return body == null || !body.atmosphere || v.altitude >= body.atmosphereDepth;
         }
 
         private static string TopLensWhy()

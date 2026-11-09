@@ -738,6 +738,17 @@ namespace Kerbcast
         }
 
         /* The body the lens stands on or orbits. */
+        /* A craft vantage outside its body's atmosphere, or at a body with none: where a space lens works. Ground stations and surface points never are. */
+        public bool VantageInVacuum
+        {
+            get
+            {
+                if (!HasVantage || Vantage == null || Vantage.state == Vessel.State.DEAD) return false;
+                var body = Vantage.mainBody;
+                return body == null || !body.atmosphere || Vantage.altitude >= body.atmosphereDepth;
+            }
+        }
+
         public CelestialBody StationBody => HasVantage ? (Vantage != null ? Vantage.mainBody : null) : Body;
 
         public string VantageName => Vantage != null ? Vantage.vesselName : "";
