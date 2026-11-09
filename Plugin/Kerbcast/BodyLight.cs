@@ -6,8 +6,9 @@ namespace Kerbcast
      * The maths of lighting scaled bodies from the Sun as each camera draws
      * them. The scaled shaders take the terminator from Unity's one directional
      * light, so a camera can aim that light at one body only: the one whose
-     * disc fills most of its frame. A moon's Sun direction is within a fraction
-     * of a degree of its planet's, so the whole planetary system stays right.
+     * disc fills most of its frame, not counting the ground the lens stands
+     * over. A moon's Sun direction is within a fraction of a degree of its
+     * planet's, so the whole planetary system stays right.
      */
     internal static class BodyLight
     {
@@ -45,20 +46,25 @@ namespace Kerbcast
             return Math.Acos(cos) <= halfDiagonal + disc ? disc : 0;
         }
 
+        /* Whether a disc reaches past half the way from a frame's centre to its corner, about half the frame's area, which is what a planet underfoot does. */
+        public static bool FillsFrame(double disc, double halfDiagonal) => disc > halfDiagonal / 2;
+
         /*
          * The slot of the body to aim the light at, from `discs` where 0 means
          * not a candidate, or -1 for none. The body in slot `held` keeps the
          * light while it is in frame unless another's disc is StayMargin times
          * wider. Ties go to the lower slot, so the choice does not depend on
-         * float noise between two equal discs.
+         * float noise between two equal discs. Slot `underfoot`, a lens's own
+         * planet filling its frame, takes the light only when no other body
+         * is in frame, so a telescope low over the horizon lights its target.
          */
-        public static int Pick(double[] discs, int count, int held)
+        public static int Pick(double[] discs, int count, int held, int underfoot = -1)
         {
             int best = -1;
             for (int i = 0; i < count; i++)
-                if (discs[i] > 0 && (best < 0 || discs[i] > discs[best])) best = i;
-            if (best < 0) return -1;
-            if (held >= 0 && held < count && discs[held] > 0 && discs[best] < discs[held] * StayMargin) return held;
+                if (i != underfoot && discs[i] > 0 && (best < 0 || discs[i] > discs[best])) best = i;
+            if (best < 0) return underfoot >= 0 && underfoot < count && discs[underfoot] > 0 ? underfoot : -1;
+            if (held != underfoot && held >= 0 && held < count && discs[held] > 0 && discs[best] < discs[held] * StayMargin) return held;
             return best;
         }
     }

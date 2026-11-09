@@ -322,8 +322,9 @@ namespace Kerbcast
          * the atmosphere shell read per-renderer inputs and take each body's
          * own direction. The surface's terminator comes from Unity's one
          * directional light, which can only face one way per render, so it is
-         * turned to the body with the widest disc in frame. Every input is put
-         * back in AfterScaledLayer.
+         * turned to the body with the widest disc in frame, passing over a
+         * lens's own planet while it fills the frame and another body is in
+         * it. Every input is put back in AfterScaledLayer.
          */
         private void LightBodies(List<CelestialBody> bodies, BodyPlan plan, PictureLens lens)
         {
@@ -345,6 +346,7 @@ namespace Kerbcast
             Array.Clear(_discs, 0, _discs.Length);
             Vector3 lensScaled = ScaledSpace.LocalToScaledSpace(new Vector3d(lens.Point.X, lens.Point.Y, lens.Point.Z));
             Vector3 sunScaled = sunBody.scaledBody.transform.position;
+            int underfoot = -1;
             for (int i = 0; i < _moved.Count; i++)
             {
                 var m = _moved[i];
@@ -353,9 +355,12 @@ namespace Kerbcast
                 LightShell(ref m, sun, lensScaled, sunScaled);
                 _moved[i] = m;
                 if (view != null && !m.Body.isStar)
+                {
                     _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, halfDiagonal);
+                    if (m.Body == lens.Body && BodyLight.FillsFrame(_discs[m.Slot], halfDiagonal)) underfoot = m.Slot;
+                }
             }
-            _litSlot = BodyLight.Pick(_discs, bodies.Count, _litSlot);
+            _litSlot = BodyLight.Pick(_discs, bodies.Count, _litSlot, underfoot);
             for (int i = 0; i < _moved.Count; i++)
                 if (_moved[i].Slot == _litSlot && !_moved[i].Hidden)
                 {
