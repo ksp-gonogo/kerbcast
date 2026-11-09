@@ -967,6 +967,24 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(Near(lens.ResolutionArcsec(1, 45), blur, 1e-9), "optics floor: the resolution toward a point is still the blur, not the pixel");
 }
 
+// The body a lens stands on, and the quad that adds a layer under seeing's shift.
+{
+    Check(Near(OpticsModel.HomeAngularRadius(2000, 1000), Math.PI / 6, 1e-12), "home body: the angular radius is the disc's");
+    double justAbove = OpticsModel.HomeAngularRadius(600030, 600000);
+    Check(justAbove > 1.5 && justAbove < Math.PI * 0.5, "home body: a lens 30 m up still has the body filling almost half the sky");
+    Check(OpticsModel.HomeAngularRadius(599000, 600000) == Math.PI * 0.5, "home body: a lens under the datum has it filling half the sky");
+
+    OpticsModel.OverscanAxis(0f, 1024f, out float qx0, out float qx1, out float qu0, out float qu1);
+    Check(qx0 == 0f && qx1 == 1024f && qu0 == 0f && qu1 == 1f, "overscan: no shift draws exactly over the frame");
+    foreach (float shift in new[] { 3.5f, -3.5f, 0.25f, -40f })
+    {
+        OpticsModel.OverscanAxis(shift, 1024f, out qx0, out qx1, out qu0, out qu1);
+        Check(qx0 <= 0f && qx1 >= 1024f, $"overscan: a shift of {shift} leaves no bare strip");
+        double perPx = (qu1 - qu0) / (qx1 - qx0);
+        Check(Near(qu0 + (0f - qx0) * perPx, -shift / 1024f, 1e-5) && Near(perPx, 1.0 / 1024, 1e-7), $"overscan: a shift of {shift} moves the picture by that much, unstretched");
+    }
+}
+
 // The Sun's light turned to face a lens far from the main camera.
 {
     /* The Sun at the origin, Kerbin and Duna on their orbits 137 degrees apart: stock lights from the Sun toward the main camera at Duna. */

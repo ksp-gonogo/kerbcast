@@ -249,15 +249,20 @@ namespace Kerbcast
             EnsureTargets(width, height);
             _savedTarget = scaled.targetTexture;
             scaled.targetTexture = _scaledRt;
+            _redirected = true;
             var prev = RenderTexture.active;
             RenderTexture.active = _scaledRt;
             GL.Clear(true, true, new Color(0f, 0f, 0f, 0f));
             RenderTexture.active = prev;
-            _redirected = true;
         }
 
-        /* Hands the scaled layer back and draws the blurred bodies over the galaxy already in `capture`. */
-        public void EndScaled(Camera scaled, RenderTexture capture, OpticsFrame f)
+        /*
+         * Hands the scaled layer back and draws the blurred bodies over the
+         * galaxy already in `capture`. `home` is the body the lens stands by,
+         * `toHome` its centre from the lens in metres; null when the pose is
+         * not known.
+         */
+        public void EndScaled(Camera scaled, RenderTexture capture, OpticsFrame f, CelestialBody home, DVec3 toHome)
         {
             if (!_redirected) return;
             _redirected = false;
@@ -269,7 +274,7 @@ namespace Kerbcast
             try
             {
                 _lastActive = Time.realtimeSinceStartup;
-                Composite(scaled, capture, f);
+                Composite(scaled, capture, f, home, toHome);
             }
             finally
             {
@@ -293,9 +298,9 @@ namespace Kerbcast
             Debug.Log($"{Tag} cam={_flightId} deep-space optics targets released (idle)");
         }
 
-        private void Composite(Camera scaled, RenderTexture capture, OpticsFrame f)
+        private void Composite(Camera scaled, RenderTexture capture, OpticsFrame f, CelestialBody home, DVec3 toHome)
         {
-            CollectBodies(scaled, f);
+            CollectBodies(scaled, f, home, toHome);
 
             /* Bodies smaller than the blur get some of their spread light back, on their own disc before the blur. */
             if (BodyGains(f, out float maxGain))
@@ -355,7 +360,7 @@ namespace Kerbcast
         }
 
         /* Each body that could reach the frame, as a direction from the lens and an angular radius. */
-        private void CollectBodies(Camera scaled, OpticsFrame f)
+        private void CollectBodies(Camera scaled, OpticsFrame f, CelestialBody home, DVec3 toHome)
         {
             _discs.Clear();
             LastBodies = 0;
@@ -370,12 +375,28 @@ namespace Kerbcast
             {
                 var body = bodies[i];
                 if (body == null || body.scaledBody == null) continue;
-                var c = body.scaledBody.transform.position - eye;
-                double d = c.magnitude;
-                double r = body.Radius * inv;
-                if (!(d > r * 1.0001)) continue;
-                double cx = c.x / d, cy = c.y / d, cz = c.z / d;
-                double rho = Math.Asin(r / d);
+                double d, cx, cy, cz, rho;
+                if (body == home)
+                {
+                    /* A float scaled position rounds to hundreds of metres far from the origin, more than a lens's height above its ground, so the home body is placed in double. */
+                    d = toHome.Magnitude;
+                    if (!(d > 0)) continue;
+                    cx = toHome.X / d;
+                    cy = toHome.Y / d;
+                    cz = toHome.Z / d;
+                    rho = OpticsModel.HomeAngularRadius(d, body.Radius);
+                }
+                else
+                {
+                    var c = body.scaledBody.transform.position - eye;
+                    d = c.magnitude;
+                    double r = body.Radius * inv;
+                    if (!(d > r * 1.0001)) continue;
+                    cx = c.x / d;
+                    cy = c.y / d;
+                    cz = c.z / d;
+                    rho = Math.Asin(r / d);
+                }
                 double off = Angle(cx, cy, cz, axis.x, axis.y, axis.z);
                 if (off - rho - 6.0 * sigma > halfDiag) continue;
                 _discs.Add(new Disc { Cx = cx, Cy = cy, Cz = cz, Radius = rho, Gain = 1.0 });
@@ -538,12 +559,14 @@ namespace Kerbcast
         {
             if (weight <= 0f) return;
             float k = weight / _texAddScale;
+            OpticsModel.OverscanAxis(dx, dst.width, out float x0, out float x1, out float u0, out float u1);
+            OpticsModel.OverscanAxis(dy, dst.height, out float y0, out float y1, out float v0, out float v1);
             DrawTextured(dst, src, _texAdd, new Color(tint.r * k, tint.g * k, tint.b * k, 0.5f),
-                dx, dy, dst.width + dx, dst.height + dy, _texAddReversed);
+                x0, y0, x1, y1, _texAddReversed, u0, v0, u1, v1);
         }
 
         private static void DrawTextured(RenderTexture dst, Texture src, Material m, Color tint, float x0, float y0, float x1, float y1,
-            bool reversed)
+            bool reversed, float u0 = 0f, float v0 = 0f, float u1 = 1f, float v1 = 1f)
         {
             RenderTexture.active = dst;
             m.mainTexture = src;
@@ -555,17 +578,17 @@ namespace Kerbcast
             GL.Color(Color.white);
             if (!reversed)
             {
-                GL.TexCoord2(0, 0); GL.Vertex3(x0, y0, 0);
-                GL.TexCoord2(1, 0); GL.Vertex3(x1, y0, 0);
-                GL.TexCoord2(1, 1); GL.Vertex3(x1, y1, 0);
-                GL.TexCoord2(0, 1); GL.Vertex3(x0, y1, 0);
+                GL.TexCoord2(u0, v0); GL.Vertex3(x0, y0, 0);
+                GL.TexCoord2(u1, v0); GL.Vertex3(x1, y0, 0);
+                GL.TexCoord2(u1, v1); GL.Vertex3(x1, y1, 0);
+                GL.TexCoord2(u0, v1); GL.Vertex3(x0, y1, 0);
             }
             else
             {
-                GL.TexCoord2(0, 0); GL.Vertex3(x0, y0, 0);
-                GL.TexCoord2(0, 1); GL.Vertex3(x0, y1, 0);
-                GL.TexCoord2(1, 1); GL.Vertex3(x1, y1, 0);
-                GL.TexCoord2(1, 0); GL.Vertex3(x1, y0, 0);
+                GL.TexCoord2(u0, v0); GL.Vertex3(x0, y0, 0);
+                GL.TexCoord2(u0, v1); GL.Vertex3(x0, y1, 0);
+                GL.TexCoord2(u1, v1); GL.Vertex3(x1, y1, 0);
+                GL.TexCoord2(u1, v0); GL.Vertex3(x1, y0, 0);
             }
             GL.End();
             GL.PopMatrix();

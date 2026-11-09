@@ -2333,15 +2333,32 @@ namespace Kerbcast
             _afgOverridden = afg;
         }
 
+        /* Runs after any partial BeforeScaledRender too, and each restore runs even when one before it throws: the scaled target, the ground, the Sun and the atmosphere are shared with the main camera. */
         public void AfterScaledRender(KerbcastCamera cam)
         {
-            if (_opticsBegun)
+            try { EndOpticsLayer(cam); }
+            finally
             {
-                _opticsBegun = false;
-                _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame);
+                try { _ground?.Hide(); }
+                finally
+                {
+                    try { _sun.End(); }
+                    finally { RestoreAfg(); }
+                }
             }
-            _ground?.Hide();
-            _sun.End();
+        }
+
+        private void EndOpticsLayer(KerbcastCamera cam)
+        {
+            if (!_opticsBegun) return;
+            _opticsBegun = false;
+            var home = _poseValid ? _mount.Site.StationBody : null;
+            var toHome = home != null ? ToD(home.position) - _poseEye : default;
+            _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame, home, toHome);
+        }
+
+        private void RestoreAfg()
+        {
             if (_afgOverridden == null || _afgRenderer == null) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
             ApplyAfg(_afgBlock, _afgStock);
