@@ -805,17 +805,29 @@ namespace Kerbcast
          * A grazing line of sight past a limb with mountains is the case the
          * sphere test misses.
          *
-         * The last `targetRadius` of the line is the craft itself: a landed
-         * craft rests on the drawn ground, which can sit a few metres above
-         * or below TerrainAltitude, so its own patch of ground must not hide
-         * it. Seen from straight above, that patch was the only terrain the
-         * line ever met.
+         * The last `targetRadius` of the line is the craft itself. A landed
+         * craft rests on the drawn ground, which can sit metres above or
+         * below TerrainAltitude, so its own patch of ground must not hide it.
+         * Clipping the line by the craft's radius alone is not enough: until
+         * the craft's size is known that radius is a nominal couple of metres,
+         * less than the craft's centre can sit under the sampled ground. So
+         * the sampled ground is also lowered until, under the craft, it sits
+         * `targetRadius` below the craft's centre, as the drawn ground there
+         * does. The lowering is capped at LandedGroundSlackM so a craft sunk
+         * deep under the ground stays hidden. It is the craft's own patch
+         * only: whole within LandedGroundReach(lower) of the craft along the
+         * line, easing to nothing over as far again, so a low ridge or crater
+         * rim kilometres away is tested against its true height.
          */
         public static bool SegmentClearOfTerrain(DVec3 a, DVec3 b, DVec3 centre, double radius, double radiusMax,
             Func<DVec3, double> surfaceRadiusAt, int samples, double targetRadius = 0)
         {
+            double lower = 0;
             if (targetRadius > 0)
             {
+                double rb = (b - centre).Magnitude;
+                if (surfaceRadiusAt != null && rb < radiusMax)
+                    lower = Math.Max(0, Math.Min(surfaceRadiusAt(b) - rb, LandedGroundSlackM) + targetRadius);
                 var back = a - b;
                 double len = back.Magnitude;
                 b = len > targetRadius ? b + back * (targetRadius / len) : a;
@@ -825,13 +837,23 @@ namespace Kerbcast
             if (!SegmentInsideSphere(a, b, centre, radiusMax, out double t0, out double t1)) return true;
 
             var ab = b - a;
+            double abLen = ab.Magnitude;
+            double reach = LandedGroundReach(lower);
             for (int i = 0; i <= samples; i++)
             {
-                var p = a + ab * (t0 + (t1 - t0) * i / samples);
-                if ((p - centre).Magnitude < surfaceRadiusAt(p)) return false;
+                double t = t0 + (t1 - t0) * i / samples;
+                var p = a + ab * t;
+                double near = lower > 0 ? Math.Max(0, Math.Min(1, 2 - (1 - t) * abLen / reach)) : 0;
+                if ((p - centre).Magnitude < surfaceRadiusAt(p) - lower * near) return false;
             }
             return true;
         }
+
+        /* How far along the line from a craft its ground is lowered in full by `lower`. */
+        public static double LandedGroundReach(double lower) => Math.Max(200.0, 4.0 * lower);
+
+        /* The most a craft's centre may sit under the sampled ground and still count as resting on it. */
+        public const double LandedGroundSlackM = 30.0;
 
         /* Share of a body's radius a target may sit above its sea-level sphere and still count as on its surface. */
         public const double SurfaceTolerance = 1e-6;

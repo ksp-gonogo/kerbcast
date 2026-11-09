@@ -134,6 +134,46 @@ Check(CommandCameraMath.SegmentClearOfTerrain(orbiter, sunk, mun, MunR, MunR + 7
     "a craft sunk under the sea-level sphere by less than its radius is seen from overhead");
 Check(!CommandCameraMath.SegmentClearOfTerrain(new DVec3(0, -(MunR + 200000), 0), landed, mun, MunR, MunR + 7500, plateau, 64, 13.3),
     "a craft radius never sees through the body from the far side");
+/*
+ * The rc.19 Deck run: an orbiter 197483 m from a lander, 89.46 degrees below
+ * its horizon, before the lander's size is known (the nominal radius). The
+ * lander's centre sits 3 m under the sampled ground, more than that radius.
+ */
+double nominal = CommandCameraMath.NominalCraftRadiusM;
+double nadirTilt = (90 - 89.46) * Math.PI / 180;
+var nadirOrbiter = landed + new DVec3(Math.Sin(nadirTilt), Math.Cos(nadirTilt), 0) * 197483;
+Check(CommandCameraMath.SegmentClearOfTerrain(nadirOrbiter, landed, mun, MunR, MunR + 7500, plateau, 64, nominal),
+    "a lander under its sampled ground by more than the nominal radius is seen from an orbiter overhead");
+double kerbinElev = 44.28 * Math.PI / 180;
+var kerbinward = landed + new DVec3(Math.Cos(kerbinElev), Math.Sin(kerbinElev), 0) * 11437113;
+Check(CommandCameraMath.SegmentClearOfTerrain(kerbinward, landed, mun, MunR, MunR + 7500, plateau, 4096, nominal),
+    "a lander under its sampled ground is seen 44 degrees up from Kerbin with the nominal radius");
+Func<DVec3, double> slope = p => MunR + 2530 + Math.Max(0, p.X) * 0.1;
+Check(CommandCameraMath.SegmentClearOfTerrain(kerbinward, landed, mun, MunR, MunR + 7500, slope, 4096, nominal),
+    "a gentle slope rising toward the viewer does not hide a lander resting on it");
+var lowSun = landed + new DVec3(Math.Cos(Math.PI / 180), Math.Sin(Math.PI / 180), 0) * 1e6;
+Func<DVec3, double> ridgeNear = p => p.X > 4000 && p.X < 6000 ? MunR + 2830 : MunR + 2530;
+Check(CommandCameraMath.SegmentClearOfTerrain(lowSun, landed, mun, MunR, MunR + 7500, plateau, 4096, nominal),
+    "a line 1 degree up over flat ground reaches a lander under its sampled ground");
+Check(!CommandCameraMath.SegmentClearOfTerrain(lowSun, landed, mun, MunR, MunR + 7500, ridgeNear, 4096, nominal),
+    "a 300 m ridge 5 km away still hides a lander under its sampled ground");
+var deepCraft = new DVec3(0, MunR + 2430, 0);
+Check(!CommandCameraMath.SegmentClearOfTerrain(nadirOrbiter, deepCraft, mun, MunR, MunR + 7500, plateau, 64, nominal),
+    "a craft 100 m under the ground stays hidden from overhead");
+var hovering = new DVec3(0, MunR + 2600, 0);
+Check(!CommandCameraMath.SegmentClearOfTerrain(lowSun, hovering, mun, MunR, MunR + 7500, ridgeNear, 4096, nominal),
+    "a craft above the ground lowers nothing, so the ridge still hides it");
+/* A lander 20 m under its sampled plain, seen along a line that clears a 25 m ridge 3 km off only if the ridge is lowered with the lander's own ground. */
+var sunkLander = new DVec3(0, MunR + 2510, 0);
+var grazer = sunkLander + new DVec3(1, 0.004, 0).Normalized * 1e6;
+Func<DVec3, double> lowRidge = p => p.X > 2900 && p.X < 3100 ? MunR + 2555 : MunR + 2530;
+Check(!CommandCameraMath.SegmentClearOfTerrain(grazer, sunkLander, mun, MunR, MunR + 7500, lowRidge, 4096, nominal),
+    "a 25 m ridge 3 km away still hides a lander 20 m under its sampled ground");
+Func<DVec3, double> lowRidgeOnly = p => p.X > 2900 && p.X < 3100 ? MunR + 2555 : p.X < 150 ? MunR + 2530 : MunR;
+Check(!CommandCameraMath.SegmentClearOfTerrain(grazer, sunkLander, mun, MunR, MunR + 7500, lowRidgeOnly, 4096, nominal),
+    "the ridge alone, with no plain beyond the lander's patch, still hides it");
+Check(CommandCameraMath.SegmentClearOfTerrain(grazer, sunkLander, mun, MunR, MunR + 7500, p => p.X < 150 ? MunR + 2530 : MunR, 4096, nominal),
+    "without the ridge the same line reaches the lander through its own lowered patch");
 Check(!CommandCameraMath.SegmentInsideSphere(scope, new DVec3(0, MunR + 9000, 0), mun, MunR + 7500, out _, out _),
     "a line above the shell never enters it");
 
