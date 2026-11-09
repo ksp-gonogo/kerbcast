@@ -2450,7 +2450,8 @@ namespace Kerbcast
                     _optics.BeginScaled(cam.ScaledLayer, rt.width, rt.height);
                 }
             }
-            _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");
+            /* When the picture lights each body itself, it has already aimed the Sun and given the shells their light. */
+            if (!cam.Picture.BodiesLit) _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");
             DrawStationGround(cam);
             _afgOverridden = null;
             var body = _mount.Site.Body;
@@ -2463,9 +2464,9 @@ namespace Kerbcast
             _afgOurs = _poseValid
                 ? AfgInputsForLens(afg, _poseEye - ToD(body.position))
                 : AfgInputsFor(afg, scaled.transform.position);
-            _afgOurs.LightDir = _sun.Turn * _afgOurs.LightDir;
-            if (!_afgOverride) return;
             _afgRenderer.GetPropertyBlock(_afgBlock);
+            _afgOurs.LightDir = cam.Picture.BodiesLit ? (Vector3)_afgBlock.GetVector(LightDirId) : _sun.Turn * _afgOurs.LightDir;
+            if (!_afgOverride) return;
             ApplyAfg(_afgBlock, _afgOurs);
             _afgRenderer.SetPropertyBlock(_afgBlock);
             _afgOverridden = afg;

@@ -141,6 +141,15 @@ namespace Kerbcast
             public Renderer Lit;
             public int LitProperty;
             public Vector4 LitValue;
+            /* The shell's light inputs as stock left them, or a null renderer for a body with no shell. */
+            public Renderer ShellLit;
+            public Vector4 ShellDir;
+            public float ShellDot;
+            /* The body, its list slot and where it is drawn this frame, for its light. Transform stays null for a body left in place. */
+            public CelestialBody Body;
+            public int Slot;
+            public DVec3 Centre;
+            public bool Hidden;
         }
 
         private struct HeldCorona
@@ -161,6 +170,13 @@ namespace Kerbcast
         private static readonly int AfgOffsetId = Shader.PropertyToID("_OffsetTransform");
         private readonly MaterialPropertyBlock _afgBlock = new MaterialPropertyBlock();
         private readonly MaterialPropertyBlock _lightBlock = new MaterialPropertyBlock();
+        private static readonly int ShellLightDirId = Shader.PropertyToID("_v4LightDir");
+        private static readonly int ShellLightDotId = Shader.PropertyToID("_lightDot");
+        private double[] _discs = new double[0];
+        /* The list slot of the body this camera aimed the light at last frame, so the choice holds between frames. */
+        private int _litSlot = -1;
+        private Transform _sunHeld;
+        private Quaternion _sunHeldLocal;
 
         /* `craft` is the craft the lens rides, `eye` where it looks from and
            `view` the camera whose frustum the stand-ins are drawn for, drawing
@@ -228,33 +244,46 @@ namespace Kerbcast
          * transform back exactly as stock had it, for the other cameras and the
          * main view. A call nested inside the pair (a probe re-render) does
          * nothing, and AfterScaledLayer undoes only what was moved, so a throw
-         * part way through leaves nothing behind.
+         * part way through leaves nothing behind. Each body is then lit from
+         * the Sun as this camera draws it (LightBodies); with no light speed
+         * set, that alone runs, and only if the player's setting asks for it.
          */
         public void BeforeScaledLayer()
         {
             if (_scaledDepth++ > 0) return;
-            double? c = LightTime.LightSpeed;
-            if (!c.HasValue || !TryFrameLens(out var lens)) return;
-            var plan = BodiesFor(lens, c.Value);
             var bodies = FlightGlobals.Bodies;
-            if (plan == null || (plan.Moved == 0 && plan.Hidden == 0 && plan.Spun == 0) || bodies == null) return;
+            double? c = LightTime.LightSpeed;
+            if (bodies == null || !BodyLight.Applies(c.HasValue, KerbcastSettings.PlanetPhases) || !TryFrameLens(out var lens)) return;
+            var plan = c.HasValue ? BodiesFor(lens, c.Value) : null;
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
                 var t = b != null && b.scaledBody != null ? b.scaledBody.transform : null;
                 if (t == null) continue;
-                if (KeepsPresent(b, lens)) continue;
-                var moved = new MovedBody { Transform = t, Position = t.localPosition, Rotation = t.localRotation, Scale = t.localScale };
+                _moved.Add(new MovedBody { Body = b, Slot = i, Centre = ToD(b.position) });
+                if (plan == null || KeepsPresent(b, lens)) continue;
+                var moved = _moved[_moved.Count - 1];
+                moved.Transform = t;
+                moved.Position = t.localPosition;
+                moved.Rotation = t.localRotation;
+                moved.Scale = t.localScale;
                 /* No instant to draw it at yet: shrunk to nothing, its atmosphere shell with it, rather than drawn early. */
                 if (plan.Hides(b.flightGlobalsIndex))
                 {
-                    _moved.Add(moved);
+                    moved.Hidden = true;
+                    _moved[_moved.Count - 1] = moved;
                     t.localScale = Vector3.zero;
                     continue;
                 }
                 bool placed = plan.TryDrawn(b.flightGlobalsIndex, out var centre, out double dt);
-                if (!placed && !plan.TrySpin(b.flightGlobalsIndex, out dt)) continue;
-                _moved.Add(moved);
+                if (!placed && !plan.TrySpin(b.flightGlobalsIndex, out dt))
+                {
+                    moved.Transform = null;
+                    _moved[_moved.Count - 1] = moved;
+                    continue;
+                }
+                if (placed) moved.Centre = centre;
+                _moved[_moved.Count - 1] = moved;
                 if (placed) t.position = ScaledSpace.LocalToScaledSpace(new Vector3d(centre.X, centre.Y, centre.Z));
                 /* ScaledMovement gives the mesh the body transform's rotation; this is that rotation dt seconds earlier. */
                 if (b.rotates && b.bodyTransform != null)
@@ -266,8 +295,6 @@ namespace Kerbcast
                     if (b.isStar) HoldCoronas(b);
                     t.rotation = q * (parent != null ? parent.rotation : Quaternion.identity) * b.bodyTransform.rotation;
                     for (int h = held; h < _coronas.Count; h++) _coronas[h].Transform.SetPositionAndRotation(_coronas[h].WorldPosition, _coronas[h].World);
-                    LightTurnedBody(b, t, ref moved);
-                    _moved[_moved.Count - 1] = moved;
                 }
                 if (!placed) continue;
                 /* AtmosphereFromGround gave its shader the shell's centre in LateUpdate, before the move. */
@@ -282,6 +309,88 @@ namespace Kerbcast
                     afg.SetPropertyBlock(_afgBlock);
                 }
             }
+            LightBodies(bodies, plan, lens);
+        }
+
+        /* Whether this camera's scaled render lights each body from the Sun itself this frame, so a rig leaves the Sun and the shells' light alone. */
+        public bool BodiesLit { get; private set; }
+
+        /*
+         * Lights every body from the Sun as this camera draws it. The rim and
+         * the atmosphere shell read per-renderer inputs and take each body's
+         * own direction. The surface's terminator comes from Unity's one
+         * directional light, which can only face one way per render, so it is
+         * turned to the body with the widest disc in frame. Every input is put
+         * back in AfterScaledLayer.
+         */
+        private void LightBodies(List<CelestialBody> bodies, BodyPlan plan, PictureLens lens)
+        {
+            var sunBody = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+            if (sunBody == null || sunBody.scaledBody == null) return;
+            BodiesLit = true;
+            var sun = ToD(sunBody.position);
+            if (plan != null && plan.TryDrawn(sunBody.flightGlobalsIndex, out var sunDrawn, out _)) sun = sunDrawn;
+            var view = View;
+            var ahead = default(DVec3);
+            double halfDiagonal = 0;
+            if (view != null)
+            {
+                var f = view.transform.forward;
+                ahead = new DVec3(f.x, f.y, f.z);
+                halfDiagonal = BodyLight.HalfDiagonalRadians(view.fieldOfView, view.aspect);
+            }
+            if (_discs.Length < bodies.Count) _discs = new double[bodies.Count];
+            Array.Clear(_discs, 0, _discs.Length);
+            Vector3 lensScaled = ScaledSpace.LocalToScaledSpace(new Vector3d(lens.Point.X, lens.Point.Y, lens.Point.Z));
+            Vector3 sunScaled = sunBody.scaledBody.transform.position;
+            for (int i = 0; i < _moved.Count; i++)
+            {
+                var m = _moved[i];
+                if (m.Hidden) continue;
+                LightRim(ref m, sun);
+                LightShell(ref m, sun, lensScaled, sunScaled);
+                _moved[i] = m;
+                if (view != null && !m.Body.isStar)
+                    _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, halfDiagonal);
+            }
+            _litSlot = BodyLight.Pick(_discs, bodies.Count, _litSlot);
+            for (int i = 0; i < _moved.Count; i++)
+                if (_moved[i].Slot == _litSlot && !_moved[i].Hidden)
+                {
+                    TurnSunTo(BodyLight.Direction(sun, _moved[i].Centre, default));
+                    break;
+                }
+        }
+
+        /* Turns the Sun, and the scaled light that hangs from it, to shine along `direction`, unless stock's light is already that close. */
+        private void TurnSunTo(DVec3 direction)
+        {
+            var sun = Sun.Instance != null ? Sun.Instance.transform : null;
+            if (sun == null || direction.Magnitude <= 0) return;
+            var stock = sun.forward;
+            if (CommandCameraMath.SunTurnDeg(new DVec3(stock.x, stock.y, stock.z), direction) <= CommandCameraMath.SunTurnMinDeg) return;
+            _sunHeld = sun;
+            _sunHeldLocal = sun.localRotation;
+            var forward = new Vector3((float)direction.X, (float)direction.Y, (float)direction.Z).normalized;
+            sun.rotation = Quaternion.FromToRotation(stock, forward) * sun.rotation;
+        }
+
+        /* The shell's light inputs for this body, as AtmosphereFromGround derives them, from the Sun to the body as drawn and the lens as placed. */
+        private void LightShell(ref MovedBody m, DVec3 sun, Vector3 lensScaled, Vector3 sunScaled)
+        {
+            var afg = m.Body.afg;
+            var r = afg != null ? afg.GetComponent<Renderer>() : null;
+            if (r == null) return;
+            r.GetPropertyBlock(_afgBlock);
+            m.ShellLit = r;
+            m.ShellDir = _afgBlock.GetVector(ShellLightDirId);
+            m.ShellDot = _afgBlock.GetFloat(ShellLightDotId);
+            var stock = afg.sunLightDirection;
+            var toSun = BodyLight.Direction(m.Centre, sun, new DVec3(stock.x, stock.y, stock.z));
+            _afgBlock.SetVector(ShellLightDirId, new Vector4((float)toSun.X, (float)toSun.Y, (float)toSun.Z, 0f));
+            Vector3 down = m.Body.scaledBody.transform.position - lensScaled;
+            _afgBlock.SetFloat(ShellLightDotId, Mathf.Clamp01(Vector3.Dot(down, lensScaled - sunScaled) * afg.dawnFactor));
+            r.SetPropertyBlock(_afgBlock);
         }
 
         /*
@@ -303,25 +412,27 @@ namespace Kerbcast
         }
 
         /*
-         * MaterialSetDirection stored the Sun's direction in the mesh's own
+         * The rim's light direction, from the Sun to this body's drawn centre.
+         * MaterialSetDirection stored one shared direction in the mesh's own
          * axes in Update, from the rotation the mesh had then, so a mesh
-         * turned back carries the light round with it and shows the terminator
-         * shifted by the spin. Written again for the turned axes, in the
-         * property block the setter uses, and put back in AfterScaledLayer.
+         * turned back would carry it round with it. Written for the axes the
+         * mesh has now, in the property block the setter uses, and put back
+         * in AfterScaledLayer.
          */
-        private void LightTurnedBody(CelestialBody b, Transform t, ref MovedBody moved)
+        private void LightRim(ref MovedBody m, DVec3 sun)
         {
-            var setter = b.scaledBody.GetComponent<MaterialSetDirection>();
+            var setter = m.Body.scaledBody.GetComponent<MaterialSetDirection>();
             var r = setter != null && setter.target != null ? setter.GetComponent<Renderer>() : null;
             if (r == null || string.IsNullOrEmpty(setter.valueName)) return;
             int id = Shader.PropertyToID(setter.valueName);
             r.GetPropertyBlock(_lightBlock);
-            moved.Lit = r;
-            moved.LitProperty = id;
-            moved.LitValue = _lightBlock.GetVector(id);
-            var rot = t.rotation;
+            m.Lit = r;
+            m.LitProperty = id;
+            m.LitValue = _lightBlock.GetVector(id);
+            var rot = m.Body.scaledBody.transform.rotation;
             var f = setter.target.forward;
-            var local = PictureBoundary.LightInBodyAxes(new DQuat(rot.x, rot.y, rot.z, rot.w), new DVec3(f.x, f.y, f.z));
+            var away = BodyLight.Direction(sun, m.Centre, new DVec3(f.x, f.y, f.z));
+            var local = PictureBoundary.LightInBodyAxes(new DQuat(rot.x, rot.y, rot.z, rot.w), away);
             _lightBlock.SetVector(id, new Vector4((float)local.X, (float)local.Y, (float)local.Z, 0f));
             r.SetPropertyBlock(_lightBlock);
         }
@@ -330,6 +441,12 @@ namespace Kerbcast
         {
             if (--_scaledDepth > 0) return;
             _scaledDepth = 0;
+            BodiesLit = false;
+            if (_sunHeld != null)
+            {
+                _sunHeld.localRotation = _sunHeldLocal;
+                _sunHeld = null;
+            }
             for (int i = 0; i < _coronas.Count; i++)
             {
                 var held = _coronas[i];
@@ -346,6 +463,13 @@ namespace Kerbcast
                     m.Afg.GetPropertyBlock(_afgBlock);
                     _afgBlock.SetVector(AfgOffsetId, m.AfgOffset);
                     m.Afg.SetPropertyBlock(_afgBlock);
+                }
+                if (m.ShellLit != null)
+                {
+                    m.ShellLit.GetPropertyBlock(_afgBlock);
+                    _afgBlock.SetVector(ShellLightDirId, m.ShellDir);
+                    _afgBlock.SetFloat(ShellLightDotId, m.ShellDot);
+                    m.ShellLit.SetPropertyBlock(_afgBlock);
                 }
                 if (m.Lit != null)
                 {

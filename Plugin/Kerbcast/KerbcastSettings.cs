@@ -342,6 +342,9 @@ namespace Kerbcast
            frame, an escape hatch should a visual mod ever expect the render. */
         public static bool EnableGalaxySkip { get; private set; } = true;
 
+        /* With no light speed set, still light each camera's planets from the Sun as they really stand. Under a light speed they always are. */
+        public static bool PlanetPhases { get; private set; } = false;
+
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
         // (atmospheric FX missing from streams, layer mismatches
@@ -642,6 +645,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableFirefly", v => EnableFirefly = v);
             ApplyBool(node, "EnableHullcamLinuxShaderSwap", v => EnableHullcamLinuxShaderSwap = v);
             ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
+            ApplyBool(node, "PlanetPhases", v => PlanetPhases = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
             ApplyBool(node, "DebugShowOwnCraft", v => DebugShowOwnCraft = v);
             ApplyBool(node, "DebugSkyProbe", v => DebugSkyProbe = v);

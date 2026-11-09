@@ -164,6 +164,8 @@ var truthPins = new[]
         "whether the lens's own craft is drawn in the scene, to hide its parts from this camera"),
     Pin.Line("CommandCameraMarker.cs", "CommandCameraMarker.Place", "_go.transform.position = new Vector3((float)p.X, (float)p.Y, (float)p.Z);", 1, "places the marker object, not a craft read"),
     Pin.Line("PicturePass.cs", "PicturePass.BeforeScaledLayer", "_afgBlock.SetVector(AfgOffsetId, b.afg.transform.position);", 1, "a moved body's atmosphere shell"),
+    Pin.Line("PicturePass.cs", "PicturePass.LightBodies", "Vector3 sunScaled = sunBody.scaledBody.transform.position;", 1, "the Sun's scaled mesh, for a shell's light"),
+    Pin.Line("PicturePass.cs", "PicturePass.LightShell", "Vector3 down = m.Body.scaledBody.transform.position - lensScaled;", 1, "a body's scaled mesh as drawn, for its shell's light"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SyncScaledPose", "t.position = ScaledSpace.LocalToScaledSpace(near.transform.position);", 1, "the lens's own layer cameras"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AfgInputsFor", "var lhs = afg.planet.scaledBody.transform.position - camPos;", 1, "a body's scaled mesh"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.AfgInputsFor", "? Mathf.Clamp01(Vector3.Dot(lhs, camPos - sun.scaledBody.transform.position) * afg.dawnFactor)", 1, "the Sun's scaled mesh"),
