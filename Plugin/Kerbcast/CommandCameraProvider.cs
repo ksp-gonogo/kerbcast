@@ -790,14 +790,16 @@ namespace Kerbcast
             if (site == null) return LensLimits.Unknown;
             /* LensKnobs picks the lens by the same level LensOptics does, without the label. */
             bool on = _settings.DeepSpaceOptics && CommandCameraOptics.Available();
+            var knobs = on ? LensKnobs(site) : OpticsKnobs.Unset;
+            double fovMin = FovMinAt(site);
             return new LensLimits
             {
                 Known = true,
-                FovMinDeg = FovMinAt(site),
+                FovMinDeg = on ? OpticsModel.OpticsFovFloor(fovMin, knobs.ResolutionArcsec, _settings.Height) : fovMin,
                 WidthPx = _settings.Width,
                 HeightPx = _settings.Height,
                 OpticsOn = on,
-                Knobs = on ? LensKnobs(site) : OpticsKnobs.Unset,
+                Knobs = knobs,
             };
         }
 

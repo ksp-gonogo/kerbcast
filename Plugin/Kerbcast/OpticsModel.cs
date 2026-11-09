@@ -99,7 +99,7 @@ namespace Kerbcast
     internal struct LensLimits
     {
         public bool Known;
-        /* The tightest vertical field of view, degrees. */
+        /* The tightest vertical field of view, degrees. With the optics drawn, the build sets it no narrower than the lens's own blur over FloorBlurPx (OpticsModel.OpticsFovFloor), the best case with no air in the way. */
         public double FovMinDeg;
         public int WidthPx;
         public int HeightPx;
@@ -283,6 +283,24 @@ namespace Kerbcast
             double f = t <= 0.5 ? t * 2.0 : (t - 0.5) * 2.0;
             if (from <= 0 || to <= 0) return from + (to - from) * f;
             return from * Math.Pow(to / from, f);
+        }
+
+        /* With the optics drawn, the zoom stops where the blur spans this many pixels, as a telescope's lens sets how far it is worth magnifying. */
+        public const double FloorBlurPx = 2.0;
+
+        /* The vertical field of view at which a blur of `blurArcsec` spans `px` pixels of a `rows`-high frame: PixelArcsec turned round. NaN without a blur or a frame. */
+        public static double FovForBlurPx(double blurArcsec, int rows, double px)
+        {
+            if (!(blurArcsec > 0) || rows <= 0 || !(px > 0) || double.IsInfinity(blurArcsec)) return double.NaN;
+            double pixelRad = blurArcsec / px / ArcsecPerRadian;
+            return 2.0 * Math.Atan(pixelRad * rows * 0.5) * 180.0 / Math.PI;
+        }
+
+        /* A lens's narrowest field with the optics drawn: the zoom limit `fovMinDeg`, or where a blur of `blurArcsec` spans FloorBlurPx of a `rows`-high frame when that is wider. */
+        public static double OpticsFovFloor(double fovMinDeg, double blurArcsec, int rows)
+        {
+            double optics = FovForBlurPx(blurArcsec, rows, FloorBlurPx);
+            return double.IsNaN(optics) ? fovMinDeg : Math.Max(fovMinDeg, optics);
         }
 
         /* Arcseconds one pixel covers at the frame's centre. */

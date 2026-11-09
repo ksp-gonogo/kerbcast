@@ -1915,6 +1915,15 @@ pub struct PerCameraStatusExport {
     pub pan_pitch: f32,
 }
 
+/* Whether a live zoom limit moved enough to tell clients: the optics floor
+ * follows the aim's elevation, so it drifts a little on every status write. */
+fn fov_limit_moved(was: Option<f32>, now: Option<f32>) -> bool {
+    match (was, now) {
+        (Some(a), Some(b)) => (a - b).abs() > 0.01 * a.abs().max(b.abs()),
+        (a, b) => a != b,
+    }
+}
+
 /* The zoom limits the plugin reported live, each where usable, else the manifest's. */
 fn live_fov_limits(min: Option<f32>, max: Option<f32>, cam: &CameraState) -> (f32, f32) {
     let usable = |f: Option<f32>| f.filter(|f| f.is_finite() && *f > 0.0);
@@ -2742,8 +2751,8 @@ impl CameraRegistry {
                         || p.layers != cam_status.layers
                         || p.operator_layers != cam_status.operator_layers
                         || (p.fov - cam_status.fov).abs() > 0.01
-                        || p.fov_min != cam_status.fov_min
-                        || p.fov_max != cam_status.fov_max
+                        || fov_limit_moved(p.fov_min, cam_status.fov_min)
+                        || fov_limit_moved(p.fov_max, cam_status.fov_max)
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
                         || command_track_changed(&p.command_track, &cam_status.command_track)
@@ -7573,6 +7582,14 @@ mod tests {
             r#"{{"kspFps":60.0,"shedLevel":0{extra},"cameras":[{{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64}}]}}"#
         );
         std::fs::write(dir.join("global.status.json"), body).unwrap();
+    }
+
+    #[test]
+    fn a_live_fov_limit_moves_only_past_one_percent() {
+        assert!(!fov_limit_moved(Some(1.2), Some(1.205)));
+        assert!(fov_limit_moved(Some(1.2), Some(1.22)));
+        assert!(fov_limit_moved(None, Some(1.2)));
+        assert!(!fov_limit_moved(None, None));
     }
 
     #[test]

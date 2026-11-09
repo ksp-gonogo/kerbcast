@@ -417,9 +417,34 @@ namespace Kerbcast
         /* A Direction or Surface aim: no craft of its own, so no craft sizes its view. */
         private bool AimIsPoint => _aim != null && (_aim.Kind == CommandAimKind.Direction || _aim.Kind == CommandAimKind.Surface);
 
+        /* The narrowest field now: the lens's zoom limit, or with the optics drawn where their blur toward the aim spans OpticsModel.FloorBlurPx, when that is wider. */
+        private double FovMinNow()
+        {
+            double lens = LensFovMinNow();
+            return double.IsNaN(_opticsFloor) ? lens : Math.Max(lens, _opticsFloor);
+        }
+
+        /* The optics floor eases toward the blur's, so seeing that changes with the aim's elevation never pumps the zoom. */
+        private const double OpticsFloorTau = 1.0;
+        private double _opticsFloor = double.NaN;
+        private float _opticsFloorAt = -1f;
+
+        private void UpdateOpticsFloor(double blurArcsec, float now)
+        {
+            double target = OpticsModel.OpticsFovFloor(0, blurArcsec, _cam.MaxHeight);
+            if (!(target > 0))
+            {
+                _opticsFloor = double.NaN;
+                return;
+            }
+            double dt = _opticsFloorAt < 0 ? double.MaxValue : now - _opticsFloorAt;
+            _opticsFloorAt = now;
+            _opticsFloor = double.IsNaN(_opticsFloor) ? target : CommandCameraMath.SmoothFov(_opticsFloor, target, dt, OpticsFloorTau, FovSnapAfter);
+        }
+
         /* The lens limit can change mid-scene (a Tracking Station upgrade), so
            it is re-read once a second. */
-        private double FovMinNow()
+        private double LensFovMinNow()
         {
             float now = Time.realtimeSinceStartup;
             if (now - _fovMinCheckedAt < 1f) return _fovMin;
@@ -2597,11 +2622,11 @@ namespace Kerbcast
                 Debug.Log($"{at} event={(farExtended ? "far-plane-extended" : "far-plane-native")} "
                     + (_hasFar ? $"far=[{_plan.FarNear:F0},{_plan.FarFar:F0}]" : $"nearFar={_plan.NearFar:F0}"));
             }
-            bool atFloor = _fov <= _fovMin * 1.0001;
+            bool atFloor = _fov <= FovMinNow() * 1.0001;
             if (atFloor != _wasFovFloor)
             {
                 _wasFovFloor = atFloor;
-                Debug.Log($"{at} event={(atFloor ? "fov-floor-reached" : "fov-floor-left")} fov={_fov:F4} craftRadius={KnownRadius:F1}");
+                Debug.Log($"{at} event={(atFloor ? "fov-floor-reached" : "fov-floor-left")} fov={_fov:F4} floor={FovMinNow():F4} opticsFloor={_opticsFloor:F4} craftRadius={KnownRadius:F1}");
             }
             bool atCeiling = _fov >= _fovMax * 0.9999;
             if (atCeiling != _wasFovCeiling)
@@ -2753,6 +2778,7 @@ namespace Kerbcast
                 SunElevationDeg = sunElev,
             }, rangeM);
             _opticsReading = r;
+            UpdateOpticsFloor(r.BlurArcsec, now);
             int rows = FrameRows();
             double pixArc = OpticsModel.PixelArcsec(_fov, rows);
             double blurPx = r.BlurArcsec / pixArc;

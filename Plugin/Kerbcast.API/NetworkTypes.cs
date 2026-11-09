@@ -183,7 +183,13 @@ namespace Kerbcast.Api
         /** <summary>False when the vantage does not resolve to a place now; nothing else is then meaningful.</summary> */
         public bool Known { get; set; }
 
-        /** <summary>The narrowest vertical field of view the camera there zooms to, degrees. NaN when not Known.</summary> */
+        /**
+         * <summary>
+         * The narrowest vertical field of view the camera there zooms to, degrees. With OpticsOn the lens sets it, as
+         * in a telescope: no narrower than where its own blur spans 2 pixels of the frame, the best case with no air in
+         * the way (a camera looking through air stops a little wider, by the seeing toward its aim). NaN when not Known.
+         * </summary>
+         */
         public double FovMinDeg { get; set; } = double.NaN;
 
         /** <summary>The frame a command camera renders at full quality, in pixels. Under load it may render smaller for a while.</summary> */

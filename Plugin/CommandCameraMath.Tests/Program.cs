@@ -931,6 +931,37 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(Fade(0, 40, false, 5, 30) == 0, "galaxy fade: a Sun below the horizon gives no glare");
 }
 
+// With the optics drawn the zoom stops where the blur spans two pixels of a 576-row frame.
+{
+    double Floor(double lensArcsec, double air, double elev) =>
+        OpticsModel.OpticsFovFloor(0.02, OpticsModel.Assess(new OpticsSite
+        {
+            ResolutionArcsec = lensArcsec, ZenithSeeingArcsec = 1.0, SeeingAirmassPower = 0.6, AirFactor = air, ElevationDeg = elev,
+            SunElevationDeg = double.NaN,
+        }, double.NaN).BlurArcsec, 576);
+    double l1Ground = Floor(15, 1, 45), l3Ground = Floor(1, 1, 45), l3Space = Floor(1, 0, 45);
+    Check(l1Ground > 1.15 && l1Ground < 1.3, $"optics floor: level 1 from the ground stops near 1.2 deg ({l1Ground:F3})");
+    Check(l3Ground > 0.09 && l3Ground < 0.13, $"optics floor: level 3 from the ground stops near 0.1 deg ({l3Ground:F3})");
+    Check(l3Space < l3Ground && Near(l3Space, OpticsModel.FovForBlurPx(1, 576, 2), 1e-12),
+        $"optics floor: with no air only the lens holds it, narrower ({l3Space:F3})");
+    Check(Floor(1, 1, 5) > l3Ground, "optics floor: seeing low in the sky holds the zoom wider");
+    Check(OpticsModel.OpticsFovFloor(0.02, 0.01, 576) == 0.02, "optics floor: a lens sharper than the zoom limit leaves the limit");
+    Check(OpticsModel.OpticsFovFloor(1.0, double.NaN, 576) == 1.0, "optics floor: no blur leaves the zoom limit");
+    double pix = OpticsModel.PixelArcsec(l1Ground, 576);
+    double blur = OpticsModel.CombinedBlur(15, OpticsModel.Seeing(1, OpticsModel.Airmass(45), 0.6, 1));
+    Check(Near(blur / pix, OpticsModel.FloorBlurPx, 1e-9), "optics floor: at the floor the blur spans FloorBlurPx pixels");
+    Check(CommandCameraMath.HeldFov(0.05, l1Ground, 30) == l1Ground && CommandCameraMath.ZoomedFov(1.3, 1, 4, 1, l1Ground, 30) == l1Ground,
+        "optics floor: a manual zoom past it clamps there");
+    var lens = new LensLimits
+    {
+        Known = true, WidthPx = 1024, HeightPx = 576, OpticsOn = true,
+        Knobs = new OpticsKnobs { ResolutionArcsec = 15, SeeingArcsec = 1, SeeingAirmassPower = 0.6 },
+    };
+    lens.FovMinDeg = OpticsModel.OpticsFovFloor(0.02, 15, 576);
+    Check(Near(lens.PixelArcsec, 7.5, 1e-6), "optics floor: a vantage's pixel at the floor is half the lens's blur");
+    Check(Near(lens.ResolutionArcsec(1, 45), blur, 1e-9), "optics floor: the resolution toward a point is still the blur, not the pixel");
+}
+
 // The Sun's light turned to face a lens far from the main camera.
 {
     /* The Sun at the origin, Kerbin and Duna on their orbits 137 degrees apart: stock lights from the Sun toward the main camera at Duna. */
