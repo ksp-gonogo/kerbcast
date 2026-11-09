@@ -58,7 +58,9 @@ namespace Kerbcast
                 s_scannedAt = Time.realtimeSinceStartup;
                 int used = 0;
                 var all = Object.FindObjectsOfType<Renderer>();
-                for (int i = 0; i < all.Length; i++) used |= 1 << all[i].gameObject.layer;
+                /* Only what can draw: a station's ground keeps its planet's last layer while hidden. */
+                for (int i = 0; i < all.Length; i++)
+                    if (all[i].enabled) used |= 1 << all[i].gameObject.layer;
                 int free = BodyLight.FreeLayers(Candidates, used);
                 if (free != s_free) Debug.Log($"[Kerbcast] event=body-light spare-layers=0x{free:X} (in use 0x{used & ~free & SpareMaskAll():X})");
                 s_free = free;
