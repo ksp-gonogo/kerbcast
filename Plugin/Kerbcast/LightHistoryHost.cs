@@ -133,7 +133,7 @@ namespace Kerbcast
             }
             History.SetLightSpeed(mps);
             Debug.LogWarning($"{Tag} DEV LIGHT SPEED ON: {mps} m/s from devLightSpeedMps, because {marker} exists. "
-                + "Command cameras draw distant unloaded craft where their arriving light left them. Delete the marker for normal play.");
+                + "Kerbcast cameras draw craft and bodies where their arriving light left them, once it is more than a frame old. Delete the marker for normal play.");
         }
 
         private void OnDestroy()

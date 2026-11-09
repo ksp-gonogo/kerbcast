@@ -53,6 +53,15 @@ namespace Kerbcast
             else warn($"[Kerbcast] settings.cfg: {key}='{raw}' is not a number; keeping current value");
         }
 
+        public static void ApplyDouble(Func<string, string> get, string key, Action<double> set, Action<string> warn)
+        {
+            var raw = get(key);
+            if (string.IsNullOrEmpty(raw)) return;
+            if (double.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double v))
+                set(v);
+            else warn($"[Kerbcast] settings.cfg: {key}='{raw}' is not a number; keeping current value");
+        }
+
         // Parses three comma-separated floats: `x, y, z`. The plugin wraps
         // the setter to build a UnityEngine.Vector3; this class stays
         // Unity-free by handing the components over individually.

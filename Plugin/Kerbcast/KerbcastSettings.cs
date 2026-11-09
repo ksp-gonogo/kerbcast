@@ -587,7 +587,7 @@ namespace Kerbcast
             ApplyBool(node, "LighterStreamsForSlowViewers", v => settings.LighterStreamsForSlowViewers = v);
             ApplyBool(node, "AdaptiveQuality", v => settings.AdaptiveQuality = v);
             ApplyBool(node, "AutoSpawnSidecar", v => settings.AutoSpawnSidecar = v);
-            ApplyFloat(node, "devLightSpeedMps", v => settings.DevLightSpeedMps = v);
+            ApplyDouble(node, "devLightSpeedMps", v => settings.DevLightSpeedMps = v);
             ApplyFloat(node, "MaxCaptureFps", v => settings.MaxCaptureFps = v);
             ApplyFloat(node, "BackgroundCaptureFps", v => settings.BackgroundCaptureFps = v);
             ApplyBool(node, "EnableCommandCamera", v => settings.EnableCommandCamera = v);
@@ -758,6 +758,9 @@ namespace Kerbcast
 
         private static void ApplyFloat(ConfigNode node, string key, System.Action<float> set)
             => SettingsLayer.ApplyFloat(node.GetValue, key, set, Warn);
+
+        private static void ApplyDouble(ConfigNode node, string key, System.Action<double> set)
+            => SettingsLayer.ApplyDouble(node.GetValue, key, set, Warn);
 
         // Parses three comma-separated floats: `x, y, z`.
         private static void ApplyVector3(ConfigNode node, string key, System.Action<Vector3> set)

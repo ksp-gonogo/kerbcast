@@ -156,6 +156,8 @@ namespace Kerbcast
             return true;
         }
 
+        private static double? s_loggedLightSpeed;
+
         /* The holder's light speed, which the light-time history reads. */
         internal static bool SetLightSpeedCore(string owner, double? metresPerSecond)
         {
@@ -163,6 +165,9 @@ namespace Kerbcast
             if (auth == null) return false;
             if (!auth.Lock.SetLightSpeed(owner, metresPerSecond, Time.realtimeSinceStartup)) return false;
             LightHistoryHost.History.SetLightSpeed(metresPerSecond);
+            if (metresPerSecond == s_loggedLightSpeed) return true;
+            s_loggedLightSpeed = metresPerSecond;
+            Debug.Log($"[Kerbcast] light speed set by '{owner}': {(metresPerSecond.HasValue ? metresPerSecond.Value.ToString("R", System.Globalization.CultureInfo.InvariantCulture) + " m/s" : "none")}");
             return true;
         }
 
