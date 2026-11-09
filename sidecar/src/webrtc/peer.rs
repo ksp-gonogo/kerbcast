@@ -1704,6 +1704,7 @@ async fn handle_subscribe(
             } else {
                 ErrorCode::CameraNotFound
             };
+            warn!(flight_id, code = ?code, "subscribe refused: no live camera");
             send_server_message(
                 dc,
                 &ServerMessage::Error(refusal(
@@ -1728,6 +1729,7 @@ async fn handle_subscribe(
             (slot.track.clone(), slot.mid.clone(), true)
         } else {
             drop(guard);
+            warn!(flight_id, "subscribe refused: no free slot");
             send_server_message(
                 dc,
                 &ServerMessage::Error(refusal(

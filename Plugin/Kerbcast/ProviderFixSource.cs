@@ -39,6 +39,7 @@ namespace Kerbcast
         private string _scopeSiteKey;
         private string _scopeName;
         private int _scope = -1;
+        private string _unboundSiteKey;
 
         private long _subjectFrame = long.MinValue;
         private long _subjectGeneration = -1;
@@ -450,8 +451,17 @@ namespace Kerbcast
             _scopeName = view.Snapshot?.ScopeForSite(key);
             if (kind.HasValue) _store.NoteSite(key, kind.Value);
             _scope = ModelLookup.ScopeFor(view, key, out bool bound);
-            if (!bound && view.Snapshot != null && _sites != null && key != null && _sites.FirstUnbound(_flightId, key))
-                Debug.Log($"{Tag} cam={_flightId} site '{key}' is not bound to any scope; every craft is unknown to it");
+            if (!bound && view.Snapshot != null && _sites != null && key != null)
+            {
+                if (_sites.FirstUnbound(_flightId, key))
+                    Debug.Log($"{Tag} cam={_flightId} site '{key}' is not bound to any scope; every craft is unknown to it");
+                _unboundSiteKey = key;
+            }
+            else if (bound && key != null && string.Equals(_unboundSiteKey, key, StringComparison.Ordinal))
+            {
+                Debug.Log($"{Tag} cam={_flightId} site '{key}' bound to scope '{_scopeName}'");
+                _unboundSiteKey = null;
+            }
             return _scope;
         }
 
