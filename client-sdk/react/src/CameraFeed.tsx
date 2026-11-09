@@ -879,6 +879,10 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       if (showZoom && !manualDisabled) return;
       controllerRef.current?.setZoomRate(0);
       controllerRef.current?.setFovSliderDragging(false);
+      /* The control is gone from the user, and a stationary camera sends no echo to settle a setpoint or show the state a drag ignored. */
+      controllerRef.current?.fovRefused();
+      if (camera) controllerRef.current?.syncFromState(camera);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [showZoom, manualDisabled]);
 
     // -------------------------------------------------------------------------
@@ -1766,8 +1770,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                       controllerRef.current?.fovSliderInput(v);
                     }}
                     onKeyDown={(e) => {
-                      /* One position of a thousand is too small a press. Up and right zoom in, as the + above the slider does. */
-                      if (sliderScale.keyStep === sliderScale.step) return;
+                      /* Up and right zoom in, as the + above the slider does, where a browser's own keys would raise the value and widen the view. One position of a log scale's thousand is also too small a press. */
                       const direction =
                         e.key === "ArrowUp" || e.key === "ArrowRight" ? -1 : e.key === "ArrowDown" || e.key === "ArrowLeft" ? 1 : 0;
                       if (direction === 0) return;

@@ -273,6 +273,26 @@ describe("NetworksPanel form", () => {
       });
       expect(save.mock.calls[1]![1]).toEqual(save.mock.calls[0]![1]);
     });
+
+    it("sends what changed after a timeout as an edit of the network the game made", async () => {
+      const { client, sidecar } = await newForm();
+      const save = vi.spyOn(client, "saveNetwork").mockRejectedValueOnce(Object.assign(new Error("late"), { code: "timeout" }));
+      await act(async () => {
+        create();
+      });
+      const token = save.mock.calls[0]![1]!.token!;
+      await act(async () => {
+        sidecar.fireNetworkDefinitions([{ networkId: "made", name: "", vantages: [], revision: 4, createToken: token }]);
+      });
+      await waitFor(() => expect((screen.getByRole("button", { name: /create network/i }) as HTMLButtonElement).disabled).toBe(false));
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Changed" } });
+      save.mockResolvedValueOnce({ networkId: "made" });
+      await act(async () => {
+        create();
+      });
+      expect(save.mock.calls[1]![0]).toMatchObject({ networkId: "made", baseRevision: 4, name: "Changed" });
+      expect(save.mock.calls[1]![1]).toEqual({});
+    });
   });
 
   describe("closing with entries in the form", () => {

@@ -502,24 +502,25 @@ function NetworkForm({ catalog, editing, gone, dirtyRef, onDone, locked }: Netwo
           ? form.base?.watch
           : { kind: CommandAimKind.Vessel, persistentId: Number(form.watch) };
     const name = form.name.trim();
+    /* A create that timed out may have reached the game, and a repeat of its token changes nothing there, so the form's entries go as an edit of what it made. */
+    const base = form.base ?? client.networks().find((n) => n.createToken === createToken.current);
     setBusy(true);
     try {
       await client.saveNetwork({
-        ...(form.base ? { networkId: form.base.networkId } : {}),
-        ...(form.base?.revision !== undefined ? { baseRevision: form.base.revision } : {}),
+        ...(base ? { networkId: base.networkId } : {}),
+        ...(base?.revision !== undefined ? { baseRevision: base.revision } : {}),
         ...(name ? { name } : {}),
         ...(watch ? { watch } : {}),
         vantages,
-        ...(form.base?.options ? { options: form.base.options } : {}),
-      }, form.base ? {} : { token: createToken.current });
+        ...(base?.options ? { options: base.options } : {}),
+      }, base ? {} : { token: createToken.current });
       onDone();
     } catch (err) {
       setBusy(false);
       const code = (err as { code?: string }).code ?? "unknown";
       /* A refused try's token is spent: the game answers a repeat of it with nothing new. */
-      if (!form.base && !UNSETTLED_CODES.has(code)) createToken.current = newCreateToken();
+      if (!base && !UNSETTLED_CODES.has(code)) createToken.current = newCreateToken();
       /* Read now: the definitions that made this stale arrived after the click. */
-      const base = form.base;
       const now = base ? client.networks().find((n) => n.networkId === base.networkId) : undefined;
       if (code === "stale" && now) {
         const fresh = formStateFrom(now);

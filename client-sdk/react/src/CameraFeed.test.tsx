@@ -3199,6 +3199,34 @@ describe("CameraFeed - command camera target brackets", () => {
       expect(zoomedIn).toBeGreaterThan(20);
       await waitFor(() => expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(zoomedIn, 0));
     });
+
+    it("zooms in on Up on a part camera's linear slider too", async () => {
+      const { client, sidecar } = await buildConnectedSource([{ ...zoomable(), fov: 40, fovMin: 10, fovMax: 60 }]);
+      renderFeed(client, { flightId: 301 });
+
+      await act(async () => {
+        fireEvent.keyDown(slider(), { key: "ArrowUp" });
+      });
+      await waitFor(() => expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(39.5, 3));
+      await act(async () => {
+        fireEvent.keyDown(slider(), { key: "ArrowDown" });
+      });
+      await waitFor(() => expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(40, 3));
+    });
+
+    it("lets go of a dragged value when the lock arrives mid drag with nothing left to send", async () => {
+      const { client, sidecar } = await buildConnectedSource([zoomable()]);
+      renderFeed(client, { flightId: 301 });
+      fireEvent.pointerDown(slider());
+      await act(async () => {
+        fireEvent.change(slider(), { target: { value: "500" } });
+      });
+      await waitFor(() => expect(sidecar.lastCommand("set-fov")).toBeDefined());
+      await act(async () => {
+        sidecar.updateCamera(301, { fov: 30, commandTrack: commandTrack({ authority: { owner: "mission-control" } }) });
+      });
+      expect(Number(slider().value)).toBeCloseTo(1000, 0);
+    });
   });
 
   it("offers no toggle on a part feed", async () => {
