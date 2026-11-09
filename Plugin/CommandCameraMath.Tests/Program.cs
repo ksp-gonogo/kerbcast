@@ -950,6 +950,11 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     double pix = OpticsModel.PixelArcsec(l1Ground, 576);
     double blur = OpticsModel.CombinedBlur(15, OpticsModel.Seeing(1, OpticsModel.Airmass(45), 0.6, 1));
     Check(Near(blur / pix, OpticsModel.FloorBlurPx, 1e-9), "optics floor: at the floor the blur spans FloorBlurPx pixels");
+    double floorSpan = OpticsModel.BlurSpanPx(blur, l1Ground, 576);
+    Check(Near(floorSpan, OpticsModel.FloorBlurPx, 1e-9) && OpticsModel.Worthwhile(floorSpan) && OpticsModel.Ramp(floorSpan) > 0,
+        "optics floor: measured on the floor's own rows the effect shows at the floor");
+    Check(OpticsModel.Ramp(OpticsModel.BlurSpanPx(blur, l1Ground, 288)) < 1e-6,
+        "optics floor: measured on half-height rows it would vanish, which is why the rig measures on full rows");
     Check(CommandCameraMath.HeldFov(0.05, l1Ground, 30) == l1Ground && CommandCameraMath.ZoomedFov(1.3, 1, 4, 1, l1Ground, 30) == l1Ground,
         "optics floor: a manual zoom past it clamps there");
     var lens = new LensLimits

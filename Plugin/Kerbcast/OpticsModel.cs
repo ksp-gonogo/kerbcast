@@ -346,6 +346,29 @@ namespace Kerbcast
                 ? 2.0 * Math.Tan(verticalFovDeg * 0.5 * Math.PI / 180.0) / rows * ArcsecPerRadian
                 : double.NaN;
 
+        /* The pixels a blur of `blurArcsec` spans of a `rows`-high frame at this field: NaN without a field or a frame. */
+        public static double BlurSpanPx(double blurArcsec, double verticalFovDeg, int rows) =>
+            blurArcsec / PixelArcsec(verticalFovDeg, rows);
+
+        /* The angular radius, radians, of the body a lens stands on: a lens at or under its datum (ground below sea level) has it filling half the sky. */
+        public static double HomeAngularRadius(double fromCentreM, double radiusM) =>
+            fromCentreM > radiusM ? Math.Asin(radiusM / fromCentreM) : Math.PI * 0.5;
+
+        /*
+         * One axis of the quad that adds a layer shifted by `shift` pixels over
+         * a target `size` pixels across. The quad runs past both edges with
+         * texture coordinates outside 0 to 1, so the shift never bares a strip
+         * of the frame; a clamped target repeats its edge out there.
+         */
+        public static void OverscanAxis(float shift, float size, out float x0, out float x1, out float u0, out float u1)
+        {
+            float pad = shift != 0f ? Math.Abs(shift) + 1f : 0f;
+            x0 = shift - pad;
+            x1 = size + shift + pad;
+            u0 = -pad / size;
+            u1 = 1f + pad / size;
+        }
+
         /* Whether a blur of `blurPx` changes the picture at all. */
         public static bool Worthwhile(double blurPx) => blurPx >= MinBlurPx && !double.IsInfinity(blurPx);
 
