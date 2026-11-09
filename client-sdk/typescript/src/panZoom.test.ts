@@ -635,6 +635,101 @@ describe("PanZoomController: outstanding setpoint", () => {
 // onSliderFov subscription management
 // ---------------------------------------------------------------------------
 
+describe("PanZoomController: narrow end of a wide zoom range", () => {
+  const LENS = { ...DEFAULT_BOUNDS, fov: 1, fovMin: 0.02, fovMax: 30 };
+
+  it("does not take an echo half a degree off as arrival", () => {
+    const { sink } = makeSink();
+    const ctrl = new PanZoomController(sink);
+    ctrl.syncFromState(LENS);
+    ctrl.fovSliderInput(0.03);
+    ctrl.setFovSliderDragging(false);
+
+    ctrl.syncFromState({ ...LENS, fov: 0.4 }); // still slewing in
+    expect(ctrl.sliderFov).toBe(0.03);
+  });
+
+  it("settles on an echo within a small fraction of the setpoint", () => {
+    const { sink } = makeSink();
+    const ctrl = new PanZoomController(sink);
+    ctrl.syncFromState(LENS);
+    ctrl.fovSliderInput(0.03);
+    ctrl.setFovSliderDragging(false);
+
+    ctrl.syncFromState({ ...LENS, fov: 0.0301 });
+    expect(ctrl.sliderFov).toBe(0.0301);
+  });
+
+  it("keeps half a degree on a part camera's linear range", () => {
+    const { sink } = makeSink();
+    const ctrl = new PanZoomController(sink);
+    ctrl.syncFromState(DEFAULT_BOUNDS);
+    ctrl.fovSliderInput(30);
+    ctrl.setFovSliderDragging(false);
+
+    ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 30.4 });
+    expect(ctrl.sliderFov).toBe(30.4);
+  });
+
+  it("steps arrow keys further than one slider position on a wide range only", () => {
+    expect(fovSliderScale(0.02, 30).keyStep).toBeGreaterThan(fovSliderScale(0.02, 30).step);
+    expect(fovSliderScale(10, 120).keyStep).toBe(fovSliderScale(10, 120).step);
+  });
+});
+
+describe("PanZoomController: refused FoV", () => {
+  it("snaps the slider back when the sink rejects the setpoint", async () => {
+    const { sink, setFov } = makeSink();
+    setFov.mockRejectedValue(new Error("locked"));
+    const ctrl = new PanZoomController(sink);
+    ctrl.syncFromState(DEFAULT_BOUNDS);
+    ctrl.fovSliderInput(30);
+    ctrl.setFovSliderDragging(false);
+    expect(ctrl.sliderFov).toBe(30);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ctrl.sliderFov).toBe(60);
+  });
+
+  it("fovRefused snaps back and bases the next nudge on the camera", () => {
+    const { sink, setFov } = makeSink();
+    const ctrl = new PanZoomController(sink, { fovNudgeDeg: 5 });
+    ctrl.syncFromState(DEFAULT_BOUNDS);
+    ctrl.fovSliderInput(30);
+    ctrl.setFovSliderDragging(false);
+
+    ctrl.fovRefused();
+    expect(ctrl.sliderFov).toBe(60);
+    ctrl.nudgeZoom(-1);
+    expect(setFov).toHaveBeenLastCalledWith(55);
+  });
+
+  it("fovRefused leaves the slider alone while the user is on it", () => {
+    const { sink } = makeSink();
+    const ctrl = new PanZoomController(sink);
+    ctrl.syncFromState(DEFAULT_BOUNDS);
+    ctrl.fovSliderInput(30);
+    ctrl.setFovSliderDragging(false);
+    ctrl.setFovSliderDragging(true);
+    ctrl.fovSliderInput(40);
+
+    ctrl.fovRefused();
+    expect(ctrl.sliderFov).toBe(40);
+  });
+
+  it("a rejected zoom rate can be asked for again", async () => {
+    const { sink, setZoomRate } = makeSink();
+    setZoomRate.mockRejectedValueOnce(new Error("locked"));
+    const ctrl = new PanZoomController(sink);
+    ctrl.setZoomRate(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    ctrl.setZoomRate(1);
+    expect(setZoomRate).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("PanZoomController: onSliderFov unsubscribe", () => {
   it("returns an unsubscribe function that stops further notifications", () => {
     const { sink } = makeSink();

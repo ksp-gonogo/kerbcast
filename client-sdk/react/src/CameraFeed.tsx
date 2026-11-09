@@ -3,6 +3,7 @@ import {
   CameraKind,
   CommandAimKind,
   CommandTargetEligibility,
+  ErrorCode,
   PanZoomController,
   fovSliderScale,
   QualityPreset,
@@ -748,7 +749,6 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // (they jitter against the track and are no-ops in practice).
     const trackMode = camera?.trackMode ?? TrackMode.None;
     const tracking = trackMode !== TrackMode.None;
-    const manualDisabled = tracking;
     const supportsPitch =
       !!camera && camera.panPitchMax - camera.panPitchMin > 0;
 
@@ -757,6 +757,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       camera?.kind === CameraKind.Command && !isDestroyed ? camera : null;
     const isCommandFeed = commandCamera !== null;
     const commandTrack = commandCamera?.commandTrack ?? null;
+    const commandLocked = commandTrack?.authority != null;
+    const manualDisabled = tracking || commandLocked;
     /* A host on its own delay names the frame it shows, or its UT for the client to look the frame up by. */
     const hostFrame =
       displayFrame ??
@@ -785,10 +787,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     const [bracketsOn, toggleBrackets] = useTargetBracketsPreference(
       commandCamera
-        ? (commandCamera.commandCentre?.siteKey || commandCamera.commandCentre?.nodeName || String(commandCamera.flightId))
+        ? (commandCamera.commandCentre?.network
+            ? String(commandCamera.flightId) /* A network's site changes with every cut; its camera does not. */
+            : (commandCamera.commandCentre?.siteKey || commandCamera.commandCentre?.nodeName || String(commandCamera.flightId)))
         : null,
       // 1.11 keyed the preference by stationId; carry a saved choice over.
-      commandCamera?.commandCentre?.stationId ?? null,
+      commandCamera?.commandCentre?.network ? null : (commandCamera?.commandCentre?.stationId ?? null),
     );
     const targetBracketsAvailable = enableTargetBrackets && isCommandFeed;
 
@@ -838,12 +842,17 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       controllerRef.current = ctrl;
 
       const unsubSlider = ctrl.onSliderFov(setSliderFov);
+      /* The lock can be taken between the client's last list and a set-fov reaching the sidecar. */
+      const unsubError = client.on("error", (e) => {
+        if (e.code === ErrorCode.CommandLocked && (e.flightId == null || e.flightId === flightId)) ctrl.fovRefused();
+      });
       // Seed the slider from the controller's initial (0). It will be
       // overwritten immediately by syncFromState in the camera-state effect below.
       setSliderFov(ctrl.sliderFov);
 
       return () => {
         unsubSlider();
+        unsubError();
         ctrl.stop();
         ctrl.dispose();
         controllerRef.current = null;
@@ -865,9 +874,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         setBallActive(false);
       }
     }, [showPan]);
+    /* A disabled control fires no pointer-up, so a hold or drag in progress ends here. */
     useEffect(() => {
-      if (!showZoom) controllerRef.current?.setZoomRate(0);
-    }, [showZoom]);
+      if (showZoom && !manualDisabled) return;
+      controllerRef.current?.setZoomRate(0);
+      controllerRef.current?.setFovSliderDragging(false);
+    }, [showZoom, manualDisabled]);
 
     // -------------------------------------------------------------------------
     // Ball drag state (pixel math lives here)
@@ -1075,7 +1087,6 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       : null;
     const commandTargets = shownCentre?.targets ?? [];
     const commandTargetId = shownCentre?.subjectPersistentId ?? 0;
-    const commandLocked = commandCamera?.commandTrack?.authority != null;
     const commandTargetAvailable =
       isCommandFeed && !disableManualControls && !commandLocked && commandTargets.length > 0;
     const commandTargetMenuId = useId();
@@ -1487,9 +1498,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     /* The title stops short of the action bar, however many buttons it
        holds, so its chevron never sits under one; on a tile too narrow for
-       both it drops below the bar instead. The bar's width changes only when
-       it renders, so it is read after each render rather than observed. */
-    useLayoutEffect(() => {
+       both it drops below the bar instead. The bar's width changes when it
+       renders and the stage's on any resize, so both trigger a measure. This
+       only writes CSS variables: a resize must never re-render or remount
+       the live video. */
+    const measureTitle = useCallback(() => {
       const stage = wrapRef.current;
       if (!stage) return;
       const bar = stage.querySelector<HTMLElement>(String(ActionBarRow));
@@ -1499,7 +1512,15 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       const drop = `${beside || !bar ? 0 : bar.offsetHeight + 4}px`;
       if (stage.style.getPropertyValue("--kc-title-pad") !== pad) stage.style.setProperty("--kc-title-pad", pad);
       if (stage.style.getPropertyValue("--kc-title-drop") !== drop) stage.style.setProperty("--kc-title-drop", drop);
-    });
+    }, []);
+    useLayoutEffect(measureTitle);
+    useEffect(() => {
+      const stage = wrapRef.current;
+      if (!stage || typeof ResizeObserver === "undefined") return;
+      const observer = new ResizeObserver(measureTitle);
+      observer.observe(stage);
+      return () => observer.disconnect();
+    }, [measureTitle]);
 
     return (
       <FeedBox style={feedShape}>
@@ -1734,6 +1755,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   <FovSlider
                     type="range"
                     aria-label="Zoom"
+                    aria-valuetext={`${Number(sliderFov.toPrecision(3))} degrees`}
                     min={sliderScale.min}
                     max={sliderScale.max}
                     step={sliderScale.step}
@@ -1742,6 +1764,16 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     onChange={(e) => {
                       const v = sliderScale.toFov(Number(e.target.value));
                       controllerRef.current?.fovSliderInput(v);
+                    }}
+                    onKeyDown={(e) => {
+                      /* One position of a thousand is too small a press. Up and right zoom in, as the + above the slider does. */
+                      if (sliderScale.keyStep === sliderScale.step) return;
+                      const direction =
+                        e.key === "ArrowUp" || e.key === "ArrowRight" ? -1 : e.key === "ArrowDown" || e.key === "ArrowLeft" ? 1 : 0;
+                      if (direction === 0) return;
+                      e.preventDefault();
+                      const position = sliderScale.fromFov(sliderFov) + direction * sliderScale.keyStep;
+                      controllerRef.current?.fovSliderInput(sliderScale.toFov(position));
                     }}
                     onPointerDown={() => {
                       controllerRef.current?.setFovSliderDragging(true);

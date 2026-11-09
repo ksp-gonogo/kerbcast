@@ -181,6 +181,11 @@ export interface KerbcastCameraHandle {
 
   setLayers(layers: Layer[]): Promise<void>;
   setRenderSize(width: number, height: number): Promise<void>;
+  /**
+   * Set the field of view in degrees. Rejects with a
+   * {@link CommandLockedError} on a command camera a command authority in
+   * game holds the lock on.
+   */
   setFov(fov: number): Promise<void>;
   setPan(yaw: number, pitch: number): Promise<void>;
   /**
@@ -195,7 +200,9 @@ export interface KerbcastCameraHandle {
    * Set a persistent zoom velocity (normalised, -1..1; +1 = zoom in,
    * FoV decreasing). Holds until superseded — send `setZoomRate(0)` to
    * stop. Like {@link setPanRate}, call on input change (press-and-hold),
-   * not on a timer.
+   * not on a timer. Rejects with a {@link CommandLockedError} on a command
+   * camera a command authority in game holds the lock on, except for the
+   * stop, which always goes out.
    */
   setZoomRate(rate: number): Promise<void>;
   setDegrade(level: number): Promise<void>;
@@ -640,14 +647,14 @@ interface PendingSend {
 }
 
 /**
- * {@link KerbcastClient.setCommandAim} refused because a command authority in
- * game holds the lock on command camera aims.
+ * {@link KerbcastClient.setCommandAim}, or a zoom on a command camera,
+ * refused because a command authority in game holds the lock.
  */
 export class CommandLockedError extends Error {
   readonly code = ErrorCode.CommandLocked;
 
-  constructor(readonly owner: string) {
-    super(`[kerbcast] ${owner} holds the command camera lock; aim refused`);
+  constructor(readonly owner: string, what = "aim") {
+    super(`[kerbcast] ${owner} holds the command camera lock; ${what} refused`);
     this.name = "CommandLockedError";
   }
 }
@@ -1745,6 +1752,7 @@ class CameraHandle
   }
 
   async setFov(fov: number): Promise<void> {
+    this._refuseIfLocked("fov");
     await this.client._send({
       type: "set-fov",
       content: { flightId: this.flightId, fov },
@@ -1766,10 +1774,16 @@ class CameraHandle
   }
 
   async setZoomRate(rate: number): Promise<void> {
+    if (rate !== 0) this._refuseIfLocked("zoom");
     await this.client._send({
       type: "set-zoom-rate",
       content: { flightId: this.flightId, rate },
     });
+  }
+
+  private _refuseIfLocked(what: string): void {
+    const owner = this._state?.commandTrack?.authority?.owner;
+    if (owner) throw new CommandLockedError(owner, what);
   }
 
   async setDegrade(level: number): Promise<void> {
@@ -1973,8 +1987,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _networksOmitted = 0;
   /** Whether the connected sidecar's `hello` said it takes tracking network saves. */
   private _supportsNetworks = false;
-  /** Save and delete requests awaiting their `network-result`, by token. */
-  private readonly networkRequests = new Map<string, (result: NetworkResultPayload) => void>();
+  /** Save and delete requests awaiting their `network-result`, by token: a retry can overlap the try it repeats. */
+  private readonly networkRequests = new Map<string, Set<(result: NetworkResultPayload) => void>>();
   private _lastContactAt: number | null = null;
   /** Client-side recording controller, lazily built on first `recording` access. */
   private _recording: RecordingController | null = null;
@@ -2248,7 +2262,11 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     return this._networksOmitted;
   }
 
-  /** Whether the connected sidecar takes {@link saveNetwork} and {@link deleteNetwork}. False until its `hello`. */
+  /**
+   * Whether the connected game takes {@link saveNetwork} and
+   * {@link deleteNetwork}. False until its `hello`, and until the game has
+   * listed its networks: `networks` fires when that changes it.
+   */
   get supportsNetworks(): boolean {
     return this._supportsNetworks;
   }
@@ -2295,26 +2313,38 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   ): Promise<NetworkResultPayload> {
     if (!this.control) throw new NetworkRequestError("notConnected");
     if (!this._supportsNetworks) throw new NetworkRequestError("unsupported");
+    const waiters = this.networkRequests.get(token) ?? new Set();
+    this.networkRequests.set(token, waiters);
+    const forget = (waiter: (result: NetworkResultPayload) => void) => {
+      waiters.delete(waiter);
+      if (waiters.size === 0 && this.networkRequests.get(token) === waiters) this.networkRequests.delete(token);
+    };
+    let settle!: (result: NetworkResultPayload) => void;
     const answered = new Promise<NetworkResultPayload>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.networkRequests.delete(token);
+        forget(settle);
         reject(new NetworkRequestError("timeout", `no answer within ${timeoutMs} ms`));
       }, timeoutMs);
-      this.networkRequests.set(token, (result) => {
+      settle = (result) => {
         clearTimeout(timer);
-        this.networkRequests.delete(token);
+        forget(settle);
         if (result.ok) resolve(result);
         else reject(new NetworkRequestError(result.code ?? "refused", result.text));
-      });
+      };
+      waiters.add(settle);
     });
     try {
       await this._send(msg);
     } catch (err) {
-      this.networkRequests.get(token)?.({ token, ok: false, code: "notConnected" });
+      settle({ token, ok: false, code: "notConnected" });
       answered.catch(() => {});
       throw new NetworkRequestError("notConnected", err instanceof Error ? err.message : undefined);
     }
     return answered;
+  }
+
+  private _settleNetworkRequests(result: NetworkResultPayload): void {
+    for (const settle of [...(this.networkRequests.get(result.token) ?? [])]) settle(result);
   }
 
   /**
@@ -3661,17 +3691,19 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         this.emit("site-catalog", msg.content);
         break;
       case "network-definitions":
+        /* A `hello` sent before the game first listed its networks said it had none. */
+        this._supportsNetworks = true;
         this._networks = msg.content.networks ?? [];
         this._networksEditable = msg.content.editable ?? null;
         this._networksOmitted = msg.content.networksOmitted ?? 0;
         /* A create whose answer was lost still settles once its network shows up carrying its token. */
         for (const def of this._networks) {
-          if (def.createToken) this.networkRequests.get(def.createToken)?.({ token: def.createToken, ok: true, networkId: def.networkId });
+          if (def.createToken) this._settleNetworkRequests({ token: def.createToken, ok: true, networkId: def.networkId });
         }
         this.emit("networks", this._networks);
         break;
       case "network-result":
-        this.networkRequests.get(msg.content.token)?.(msg.content);
+        this._settleNetworkRequests(msg.content);
         break;
     }
   }

@@ -38,6 +38,7 @@ import type {
   CommandTrackState,
   DisplayedFrameUt,
 } from "@ksp-gonogo/kerbcast";
+import { ErrorCode } from "@ksp-gonogo/kerbcast";
 import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
   act,
@@ -1787,8 +1788,13 @@ describe("CameraFeed - ResizeObserver render-size feedback", () => {
 
     renderFeed(client, { flightId: 42, renderSize: "none" });
 
-    // The observer is never armed when reporting is disabled.
-    expect(resizeCallback).toBeUndefined();
+    // Only the title's observer is armed when reporting is disabled, and a resize reports nothing.
+    await act(async () => {
+      resizeCallback?.(
+        [{ contentRect: { width: 400, height: 224 } }] as ResizeObserverEntry[],
+        {} as ResizeObserver,
+      );
+    });
     expect(sidecar.commands.some((c) => c.type === "report-display-size")).toBe(false);
   });
 });
@@ -3017,6 +3023,45 @@ describe("CameraFeed: no video slot", () => {
   });
 });
 
+describe("CameraFeed - title padding", () => {
+  it("follows a resize of the stage without touching the video", async () => {
+    const observers: Array<{ cb: ResizeObserverCallback; targets: Element[] }> = [];
+    const original = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      private readonly entry: { cb: ResizeObserverCallback; targets: Element[] };
+      constructor(cb: ResizeObserverCallback) {
+        this.entry = { cb, targets: [] };
+        observers.push(this.entry);
+      }
+      observe(target: Element) {
+        this.entry.targets.push(target);
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      const { client } = await buildConnectedSource();
+      const { container } = renderFeed(client, { flightId: 42 });
+      const stage = container.querySelector<HTMLElement>("[data-kc-signal]")!;
+      const video = container.querySelector("video");
+      const resize = (width: number) => {
+        Object.defineProperty(stage, "clientWidth", { configurable: true, value: width });
+        act(() => {
+          for (const o of observers) if (o.targets.includes(stage)) o.cb([], {} as ResizeObserver);
+        });
+      };
+
+      resize(1000);
+      expect(stage.style.getPropertyValue("--kc-title-pad")).toBe("8px");
+      resize(20);
+      expect(stage.style.getPropertyValue("--kc-title-pad")).toBe("0px");
+      expect(container.querySelector("video")).toBe(video);
+    } finally {
+      globalThis.ResizeObserver = original;
+    }
+  });
+});
+
 describe("CameraFeed - command camera target brackets", () => {
   const STATION: CommandCentreInfo = {
     stationId: "ground:KSC",
@@ -3067,6 +3112,93 @@ describe("CameraFeed - command camera target brackets", () => {
     expect(
       screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed"),
     ).toBe("true");
+  });
+
+  it("keeps a network's brackets choice when the network cuts to another site", async () => {
+    const network = { vantages: [] } as unknown as CommandCentreInfo["network"];
+    const onSite = (siteKey: string) =>
+      ({ ...STATION, siteKey, nodeName: siteKey, stationId: `ground:${siteKey}`, network }) as CommandCentreInfo;
+    const { client, sidecar } = await buildConnectedSource([
+      makeCamera({ flightId: 301, kind: CameraKind.Command, commandCentre: onSite("KSC"), commandTrack: commandTrack() }),
+    ]);
+    renderFeed(client, { flightId: 301 });
+    fireEvent.click(screen.getByRole("button", { name: "Target brackets" }));
+    expect(localStorage.getItem("kerbcast:target-brackets:301")).toBe("0");
+
+    await act(async () => {
+      sidecar.updateCamera(301, { commandCentre: onSite("Crater Rim") });
+    });
+    expect(screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed")).toBe("false");
+  });
+
+  describe("zoom on a command camera", () => {
+    const zoomable = (track = commandTrack()) =>
+      makeCamera({
+        flightId: 301,
+        kind: CameraKind.Command,
+        commandCentre: STATION,
+        commandTrack: track,
+        supportsZoom: true,
+        fov: 30,
+        fovMin: 0.02,
+        fovMax: 30,
+      });
+    const slider = () => screen.getByRole("slider", { name: "Zoom", hidden: true }) as HTMLInputElement;
+
+    it("disables the zoom controls while another owner holds the lock", async () => {
+      const { client } = await buildConnectedSource([zoomable(commandTrack({ authority: { owner: "mission-control" } }))]);
+      renderFeed(client, { flightId: 301 });
+      expect(slider().disabled).toBe(true);
+      expect((screen.getByRole("button", { name: /zoom in/i, hidden: true }) as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("leaves them live with no lock held", async () => {
+      const { client } = await buildConnectedSource([zoomable()]);
+      renderFeed(client, { flightId: 301 });
+      expect(slider().disabled).toBe(false);
+    });
+
+    it("stops a held zoom when the lock is taken mid-press", async () => {
+      const { client, sidecar } = await buildConnectedSource([zoomable()]);
+      renderFeed(client, { flightId: 301 });
+      fireEvent.pointerDown(screen.getByRole("button", { name: /zoom in/i }));
+      expect(sidecar.lastCommand("set-zoom-rate")?.content.rate).toBe(1);
+
+      await act(async () => {
+        sidecar.updateCamera(301, { commandTrack: commandTrack({ authority: { owner: "mission-control" } }) });
+      });
+      expect(sidecar.lastCommand("set-zoom-rate")?.content.rate).toBe(0);
+    });
+
+    it("snaps the slider back when the sidecar refuses the zoom", async () => {
+      const { client, sidecar } = await buildConnectedSource([zoomable()]);
+      renderFeed(client, { flightId: 301 });
+      await act(async () => {
+        fireEvent.pointerDown(slider());
+        fireEvent.change(slider(), { target: { value: "500" } });
+        fireEvent.pointerUp(slider());
+      });
+      expect(Number(slider().value)).toBeCloseTo(500, 0);
+
+      await act(async () => {
+        sidecar.fireError({ message: "locked", code: ErrorCode.CommandLocked, source: "sidecar", flightId: 301 } as Parameters<MockSidecar["fireError"]>[0]);
+      });
+      expect(Number(slider().value)).toBeCloseTo(1000, 0);
+    });
+
+    it("announces the zoom in degrees and steps it a useful amount per arrow key", async () => {
+      const { client, sidecar } = await buildConnectedSource([zoomable()]);
+      renderFeed(client, { flightId: 301 });
+      expect(slider().getAttribute("aria-valuetext")).toBe("30 degrees");
+
+      await act(async () => {
+        fireEvent.keyDown(slider(), { key: "ArrowUp" });
+      });
+      const zoomedIn = Number(slider().getAttribute("aria-valuetext")!.split(" ")[0]);
+      expect(zoomedIn).toBeLessThan(26);
+      expect(zoomedIn).toBeGreaterThan(20);
+      await waitFor(() => expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(zoomedIn, 0));
+    });
   });
 
   it("offers no toggle on a part feed", async () => {

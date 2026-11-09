@@ -862,6 +862,22 @@ describe("KerbcastClient", () => {
       ]);
     });
 
+    it("zoom is refused locally while a command authority holds the lock, but a stop goes out", async () => {
+      const { client, captured, snapshot } = await connected();
+      const locked = {
+        ...commandCamera(300),
+        commandTrack: { ...commandCamera(300).commandTrack, authority: { owner: "mission-control" } },
+      };
+      snapshot([locked]);
+      const cam = client.camera(300);
+      await expect(cam.setFov(5)).rejects.toBeInstanceOf(CommandLockedError);
+      await expect(cam.setZoomRate(1)).rejects.toMatchObject({ owner: "mission-control", code: ErrorCode.CommandLocked });
+      expect(captured.dc?.sent).toEqual([]);
+
+      await cam.setZoomRate(0);
+      expect(captured.dc?.sent).toEqual([JSON.stringify({ type: "set-zoom-rate", content: { flightId: 300, rate: 0 } })]);
+    });
+
     it("setCommandAim rejects while a command authority holds the lock", async () => {
       const { client, captured, snapshot } = await connected();
       const locked = {
@@ -3470,6 +3486,46 @@ describe("KerbcastClient.inboundVideoStats", () => {
       ]);
       await expect(saving).resolves.toEqual({ networkId: "made" });
       expect(sidecar.lastCommand("save-network")?.content.token).toBe("mine");
+    });
+
+    it("a request overlapping one with its token is not cut off by the earlier timer", async () => {
+      vi.useFakeTimers();
+      try {
+        const sidecar = new MockSidecar().withNetworks([], { manual: true });
+        const client = await withNetworks(sidecar);
+        const first = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same", timeoutMs: 1000 });
+        const firstOutcome = expect(first).rejects.toMatchObject({ code: "timeout" });
+        await vi.advanceTimersByTimeAsync(500);
+        const second = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same", timeoutMs: 1000 });
+        await vi.advanceTimersByTimeAsync(600);
+        await firstOutcome;
+
+        sidecar.fireNetworkResult({ token: "same", ok: true, networkId: "made" });
+        await expect(second).resolves.toEqual({ networkId: "made" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("one answer settles every overlapping request with its token", async () => {
+      const sidecar = new MockSidecar().withNetworks([], { manual: true });
+      const client = await withNetworks(sidecar);
+      const first = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same" });
+      const second = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same" });
+      sidecar.fireNetworkResult({ token: "same", ok: false, code: "full" });
+      await expect(first).rejects.toMatchObject({ code: "full" });
+      await expect(second).rejects.toMatchObject({ code: "full" });
+    });
+
+    it("offers networks once the game lists them, after a hello that said it had none", async () => {
+      const sidecar = new MockSidecar();
+      const client = await withNetworks(sidecar);
+      expect(client.supportsNetworks).toBe(false);
+      let fired = 0;
+      client.on("networks", () => fired++);
+      sidecar.fireNetworkDefinitions([]);
+      expect(client.supportsNetworks).toBe(true);
+      expect(fired).toBe(1);
     });
 
     it("a retried create with the same token gets the network the first made", async () => {
