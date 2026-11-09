@@ -719,6 +719,14 @@ namespace Kerbcast
         public static double HeldFov(double fov, double fovMin, double fovMax) =>
             double.IsNaN(fov) ? double.NaN : Math.Max(fovMin, Math.Min(fovMax, fov));
 
+        /* The field of a camera with no frame rendered for `sinceFrame` seconds: a held zoom is taken at once, since no frame would show it easing, and with none held the field stays. */
+        public static double IdleFov(double fov, double held, double fovMin, double fovMax, double sinceFrame, double snapAfter)
+        {
+            if (!(sinceFrame > snapAfter)) return fov;
+            double clamped = HeldFov(held, fovMin, fovMax);
+            return double.IsNaN(clamped) ? fov : clamped;
+        }
+
         /* The field a camera rebuilt under the same flightId opens on: what the one it replaces showed, or its held zoom if it showed none. NaN leaves the lens's default. */
         public static double CarriedFov(double shown, double held) =>
             UsableFov(shown) ? shown : UsableFov(held) ? held : double.NaN;

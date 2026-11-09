@@ -895,7 +895,11 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(CommandCameraMath.HeldFov(30, 1, 30) == 30, "held fov: within the lens it is kept");
     Check(CommandCameraMath.HeldFov(0.001, 0.02, 30) == 0.02 && CommandCameraMath.HeldFov(90, 0.02, 30) == 30,
         "held fov: clamped to the lens's narrowest and widest");
-    Check(CommandCameraMath.CarriedFov(2.5, 0.025) == 2.5, "carried fov: a rebuild opens on the field its camera showed, not the held value behind the lens limit");
+    Check(CommandCameraMath.IdleFov(30, 2, 1, 30, double.PositiveInfinity, 1) == 2, "idle fov: a camera that has never rendered takes a held zoom at once");
+    Check(CommandCameraMath.IdleFov(30, 0.01, 1, 30, 5, 1) == 1, "idle fov: within the lens's limits");
+    Check(CommandCameraMath.IdleFov(30, double.NaN, 1, 30, 5, 1) == 30, "idle fov: with no held zoom the field stays");
+    Check(CommandCameraMath.IdleFov(30, 2, 1, 30, 0.5, 1) == 30, "idle fov: a rendering camera eases as before");
+    Check(CommandCameraMath.CarriedFov(2.5, 0.025) == 2.5,"carried fov: a rebuild opens on the field its camera showed, not the held value behind the lens limit");
     Check(CommandCameraMath.CarriedFov(double.NaN, 4) == 4, "carried fov: with no field shown it opens on the held zoom");
     Check(double.IsNaN(CommandCameraMath.CarriedFov(double.NaN, double.NaN)), "carried fov: nothing carried leaves the lens's default");
     Check(double.IsNaN(CommandCameraMath.CarriedFov(0, double.PositiveInfinity)), "carried fov: an unusable field is not carried");

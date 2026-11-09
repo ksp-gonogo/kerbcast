@@ -1787,9 +1787,20 @@ namespace Kerbcast
             _optics?.Idle();
             float now = Time.unscaledTime;
             Network?.Step(this, false);
+            TakeHeldFovWhileIdle(now);
             if (now - _solvedAt < PollStaleSeconds) return;
             if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
             Solve(Planetarium.GetUniversalTime(), now, out _, out _, out _, out _, out _);
+        }
+
+        /* Only a rendered frame moves the field, so a zoom set on a camera nobody displays is taken here: /cameras reports it and the first frame opens on it. */
+        private void TakeHeldFovWhileIdle(float now)
+        {
+            double sinceFrame = _lastPrepare < 0 ? double.PositiveInfinity : now - _lastPrepare;
+            double field = CommandCameraMath.IdleFov(_fov, _heldFov, FovMinNow(), _fovMax, sinceFrame, FovSnapAfter);
+            if (field == _fov) return;
+            _fov = field;
+            _cam.SetRigFov((float)field);
         }
 
         /* The recorded transitions, oldest first, then the forecast camera-axis

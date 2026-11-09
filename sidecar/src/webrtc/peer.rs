@@ -3860,6 +3860,38 @@ mod tests {
     /// block along with the subscription.
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_set_fov_reaches_a_command_camera_nobody_subscribes_to() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id: u32 = 0x8000_0304;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join(format!("{id}.ring")), cfg).expect("create ring");
+        std::fs::write(
+            dir.path().join(format!("{id}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","supports_zoom":true,"fov":30,"fov_min":1,"fov_max":30,"station_id":"ground:LaunchPad","station_node_name":"LaunchPad"}}"#
+            ),
+        )
+        .expect("write manifest");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let outbox = Outbox::spawn(Arc::new(Mutex::new(None)), "test".into());
+
+        apply_fov_change(&registry, &outbox, id, 1.5).await;
+
+        let bytes =
+            std::fs::read(dir.path().join(format!("{id}.control.bin"))).expect("control written");
+        let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
+        assert!(!snap.subscribed, "no viewer subscribes to this camera");
+        assert_eq!(snap.fov, Some(1.5));
+    }
+
+    #[tokio::test]
     async fn an_in_place_reattach_tells_the_plugin_the_viewers_size() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
 
