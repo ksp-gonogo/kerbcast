@@ -7,12 +7,13 @@ using Time = UnityEngine.Time;
 
 namespace Kerbcast
 {
-    /* A camera's aim and held zoom (NaN for none), carried across a rebuild made under a held command lock. */
+    /* A camera's aim, held zoom and the field it shows (NaN for none), carried across a rebuild made under a held command lock. */
     internal sealed class LiveAim
     {
         public CommandAim Aim;
         public Orbit Orbit;
         public double Fov = double.NaN;
+        public double Shown = double.NaN;
     }
 
     /* The scene's command cameras: the default one from settings, when
@@ -113,7 +114,7 @@ namespace Kerbcast
 
         /* A saved network's camera, under the flightId its slot fixes (CameraId.NetworkWireId). 0 with `error` set when that id is in use or the list is refused. */
         public uint CreateSavedNetwork(uint flightId, IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning, CommandAim aim,
-            IReadOnlyCollection<uint> taken, out string error, Orbit aimOrbit = null, double heldFov = double.NaN)
+            IReadOnlyCollection<uint> taken, out string error, Orbit aimOrbit = null, double heldFov = double.NaN, double shownFov = double.NaN)
         {
             error = NetworkInvalid(vantages, tuning);
             if (error == null && (taken.Contains(flightId) || _feeds.Any(f => f.FlightId == flightId))) error = $"cam={flightId} is already in use";
@@ -121,6 +122,7 @@ namespace Kerbcast
             var feed = new Feed(this, null, name, "", flightId, new List<NetworkVantageSpec>(vantages), tuning);
             if (aim != null) feed.SetAim(aim, aimOrbit);
             feed.PendingFov = heldFov;
+            feed.PendingShownFov = shownFov;
             _feeds.Add(feed);
             Debug.Log($"[Kerbcast][CMDCAM] saved network camera cam={flightId} requested over {vantages.Count} vantage(s) name='{name}'");
             return flightId;
@@ -250,7 +252,7 @@ namespace Kerbcast
         public LiveAim PendingLiveAim(uint flightId)
         {
             var feed = _feeds.FirstOrDefault(f => f.Created && f.FlightId == flightId && !f.Built);
-            return feed == null ? null : new LiveAim { Aim = feed.PendingAim, Orbit = feed.PendingOrbit, Fov = feed.PendingFov };
+            return feed == null ? null : new LiveAim { Aim = feed.PendingAim, Orbit = feed.PendingOrbit, Fov = feed.PendingFov, Shown = feed.PendingShownFov };
         }
 
         /* An aim set before a created camera is built, applied when it is. */
@@ -311,6 +313,8 @@ namespace Kerbcast
             public Orbit PendingOrbit => _pendingOrbit;
             /* A held zoom carried across a rebuild, applied after the aim; any new aim replaces it, as it does on a built rig. */
             public double PendingFov { get; set; } = double.NaN;
+            /* The field the camera before a rebuild showed; the new one opens on it. */
+            public double PendingShownFov { get; set; } = double.NaN;
 
             /* Which craft the feed watches, resolved by _known and drawn by
                _drawn. Under truth both read KSP's handles for it in _track. */
@@ -355,6 +359,7 @@ namespace Kerbcast
                 _pendingAim = aim;
                 _pendingOrbit = orbit;
                 PendingFov = double.NaN;
+                PendingShownFov = double.NaN;
                 uint subject = aim?.SubjectPersistentId ?? 0;
                 if (_selection != null && subject != _selection.ChosenPersistentId) _selection.Choose(subject);
             }
@@ -483,7 +488,7 @@ namespace Kerbcast
                 try
                 {
                     mount = new CommandCameraMount(_site, flightId, (float)S.CommandCameraFovMax, _p.LensFovMin(_site), name,
-                        IsNetwork ? _network.Name : null);
+                        IsNetwork ? _network.Name : null, (float)CommandCameraMath.CarriedFov(PendingShownFov, PendingFov));
                     var cam = new KerbcastCamera(
                         mount,
                         flightId,
@@ -524,6 +529,7 @@ namespace Kerbcast
                         _pendingAim = null;
                         _pendingOrbit = null;
                         PendingFov = double.NaN;
+                        PendingShownFov = double.NaN;
                     }
                     catch
                     {

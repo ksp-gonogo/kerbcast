@@ -252,6 +252,7 @@ namespace Kerbcast
         public CommandAim Aim => _aim;
         internal Orbit AimOrbit => _aimOrbit;
         internal double HeldFov => _heldFov;
+        internal double ShownFov => _fov;
 
         /* The craft this lens rides no longer exists (crashed, recovered, or
            gone some way other than a merge, which the lens follows). */
@@ -548,7 +549,8 @@ namespace Kerbcast
             _fovMin = fovMin();
             _fovMinCheckedAt = Time.realtimeSinceStartup;
             _fovMax = fovMax;
-            _fov = fovMax;
+            /* The field the camera was built at: its lens's widest, or the one a rebuild carried over. */
+            _fov = cam.Fov;
             _occlusion = new CommandCameraOcclusion(TerrainSamples, _flightId);
             _forecast = new CommandCameraForecast(_occlusion);
 

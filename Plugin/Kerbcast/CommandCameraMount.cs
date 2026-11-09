@@ -20,15 +20,19 @@ namespace Kerbcast
         /* The lens's narrowest field now, in degrees: it follows the Tracking Station level and the optics setting. */
         public System.Func<double> FovMinSource { get; }
 
+        /* The field the camera opens on instead of the default, NaN for none: read when the camera is built, before its first manifest goes out. */
+        public float StartFov { get; }
+
         /* `name` replaces the feed name the site would give it, and `group` the site's name clients group it under. */
         public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, System.Func<double> fovMin,
-            string name = null, string group = null)
+            string name = null, string group = null, float startFov = float.NaN)
         {
             Site = site;
             FovMinSource = fovMin;
             _name = name;
             _group = group;
             _defaultFov = defaultFov;
+            StartFov = startFov;
             _anchor = new GameObject($"Kerbcast_{flightId}_CommandAnchor");
         }
 

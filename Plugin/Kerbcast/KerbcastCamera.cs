@@ -544,7 +544,9 @@ namespace Kerbcast
             // Snap both the displayed FoV and the slew target so a fresh camera
             // starts settled (SetFov now only moves _fovTarget; the constructor
             // is the one place that snaps Fov directly).
-            Fov = _fovTarget = Mathf.Clamp(mount.DefaultFieldOfView, FovMin, FovMax);
+            float startFov = mount is CommandCameraMount commandMount && !float.IsNaN(commandMount.StartFov)
+                ? commandMount.StartFov : mount.DefaultFieldOfView;
+            Fov = _fovTarget = Mathf.Clamp(startFov, FovMin, FovMax);
 
             // Cache identity fields now while the Part is guaranteed live. The
             // mount snapshots them off its part; WriteDestroyedManifest (called

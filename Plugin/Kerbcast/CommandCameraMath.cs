@@ -719,6 +719,12 @@ namespace Kerbcast
         public static double HeldFov(double fov, double fovMin, double fovMax) =>
             double.IsNaN(fov) ? double.NaN : Math.Max(fovMin, Math.Min(fovMax, fov));
 
+        /* The field a camera rebuilt under the same flightId opens on: what the one it replaces showed, or its held zoom if it showed none. NaN leaves the lens's default. */
+        public static double CarriedFov(double shown, double held) =>
+            UsableFov(shown) ? shown : UsableFov(held) ? held : double.NaN;
+
+        private static bool UsableFov(double fov) => fov > 0 && !double.IsInfinity(fov);
+
         /* The field for an aim with no craft to frame: a Surface aim's margin
            about the point at `fraction` of the frame, otherwise (a Direction
            aim, or no margin) the widest view. */

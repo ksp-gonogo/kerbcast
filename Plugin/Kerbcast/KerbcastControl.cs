@@ -580,13 +580,13 @@ namespace Kerbcast
                     + "it watches the active vessel until edited");
             }
             return provider.CreateSavedNetwork(n.FlightId, specs, n.Name, n.Tuning, aim, core.CameraFlightIds(), out error,
-                carried?.Orbit, carried?.Fov ?? double.NaN);
+                carried?.Orbit, carried?.Fov ?? double.NaN, carried?.Shown ?? double.NaN);
         }
 
         /* A camera's aim and held zoom now, built or waiting to be; null when there is no such camera. */
         internal static LiveAim LiveAimOf(uint flightId)
         {
-            if (Find(flightId)?.Rig is CommandCameraRig gr) return new LiveAim { Aim = gr.Aim, Orbit = gr.AimOrbit, Fov = gr.HeldFov };
+            if (Find(flightId)?.Rig is CommandCameraRig gr) return new LiveAim { Aim = gr.Aim, Orbit = gr.AimOrbit, Fov = gr.HeldFov, Shown = gr.ShownFov };
             return KerbcastCore.Instance?.CommandProvider?.PendingLiveAim(flightId);
         }
 
