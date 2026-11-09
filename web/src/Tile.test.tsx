@@ -431,6 +431,8 @@ describe("Tile - tracking network name", () => {
       const corner = container!.querySelector("[data-fallback]");
       expect(corner?.textContent).toBe("Crater Rim via Kerbin ground net");
       expect(corner?.getAttribute("data-fallback")).toBe("Kerbin ground net");
+      /* the same fading text as an ordinary tile name, in the same case */
+      expect(getComputedStyle(corner!).textTransform).not.toBe("uppercase");
     });
   });
 });

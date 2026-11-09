@@ -46,6 +46,7 @@ import { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
 import { useRecordings } from "./hooks/useRecordings";
 import { DEFAULT_FEED_ASPECT, useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
+import { NetworkIcon } from "./NetworkIcon";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
 import { claimAnchors } from "./sharedAnchors";
@@ -387,12 +388,11 @@ export interface CameraFeedProps {
    */
   anchorOverlay?: AnchorOverlay;
   /**
-   * Name a tracking network feed in your own layer. A network feed's title
-   * names the network alone, and by default its bottom left corner reads
-   * "<vantage> via <network>" ("Crater Rim via Kerbin ground net"), taken
-   * from the displayed frame so it changes on the cut frame. Given this,
-   * the feed draws no corner name and calls it on every render instead,
-   * with the vantage's label, the frame's network state (`ok`, or
+   * Name a tracking network feed in your own layer. By default a network
+   * feed is named like any other feed: its title (shown on hover, in the
+   * title's usual case) reads "<vantage> via <network>" ("Crater Rim via
+   * Kerbin ground net"), taken from the displayed frame so it changes on
+   * the cut frame. Given this, the feed also calls it on every render, with the vantage's label, the frame's network state (`ok`, or
    * `noView`; treat any other value as `noView`) and the network's name.
    * What it returns is placed over the picture with no position of its
    * own, so return a positioned element, a portal into your own layer, or
@@ -994,8 +994,13 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     });
 
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
-    /* A network feed's title names the network alone; where it shows the craft from goes in the corner name. */
-    const title = !camera ? "Camera Feed" : networkVantage?.networkName || cameraLabel(camera);
+    /* A network feed is named like any other: one compound name in the title,
+       shown on hover, whether or not a host also draws its own corner name. */
+    const title = !camera
+      ? "Camera Feed"
+      : networkVantage
+        ? networkFeedName(networkVantage.siteLabel, networkVantage.networkName)
+        : cameraLabel(camera);
 
     // -------------------------------------------------------------------------
     // Viewer quality control (opt-in). A built-in action button + menu: Auto
@@ -1190,7 +1195,16 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   }}
                 >
                   {/* A network is one feed, named by the network alone: its vantages change under it. */}
-                  {c.commandCentre?.network ? cameraLabel(c) : `${cameraLabel(c)} (${c.vesselName})`}
+                  {c.commandCentre?.network ? (
+                    <>
+                      <MenuItemIcon>
+                        <NetworkIcon size={14} strokeWidth={1.75} />
+                      </MenuItemIcon>
+                      {cameraLabel(c)}
+                    </>
+                  ) : (
+                    `${cameraLabel(c)} (${c.vesselName})`
+                  )}
                   {isCameraDestroyed(c) ? " - signal lost" : ""}
                 </CameraMenuItem>
               ))}
@@ -1647,14 +1661,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
-              {networkVantage && !outOfFlight && !isDestroyed && !commandState?.blank &&
-                (renderNetworkVantage ? (
-                  renderNetworkVantage(networkVantage.siteLabel, networkVantage.networkState, networkVantage.networkName)
-                ) : (
-                  <NetworkCaption data-kc-network-caption>
-                    {networkFeedName(networkVantage.siteLabel, networkVantage.networkName)}
-                  </NetworkCaption>
-                ))}
+              {networkVantage && renderNetworkVantage && !outOfFlight && !isDestroyed && !commandState?.blank &&
+                renderNetworkVantage(networkVantage.siteLabel, networkVantage.networkState, networkVantage.networkName)}
               {waitingForSlot && !outOfFlight && !isDestroyed && noSlotLabel && (
                 <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
               )}
@@ -2144,30 +2152,6 @@ const TitleRow = styled.div`
   margin-top: var(--kc-title-drop, 0px);
 `;
 
-/* A network feed's corner name, bottom left. Always shown, it steps aside while the zoom controls take that corner on hover. */
-const NetworkCaption = styled.div`
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
-  z-index: 2;
-  max-width: calc(100% - 96px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: rgba(255, 255, 255, 0.85);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
-  pointer-events: none;
-  transition: opacity 0.15s;
-
-  @media (prefers-reduced-motion: reduce) {
-    transition: none;
-  }
-`;
-
 const TopTitle = styled.h3`
   margin: 0;
   min-width: 0;
@@ -2249,6 +2233,12 @@ const CameraMenu = styled.div`
   border-radius: 4px;
   overflow-x: hidden;
   overflow-y: auto;
+`;
+
+const MenuItemIcon = styled.span`
+  display: inline-flex;
+  vertical-align: middle;
+  margin-right: 6px;
 `;
 
 const CameraMenuItem = styled.button<{ $selected: boolean }>`
@@ -2483,11 +2473,6 @@ const FeedBox = styled.div`
 
 const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean; $frameless: boolean }>`
   ${(p) => p.$frameless && "border: none; border-radius: 0;"}
-
-  &:hover ${NetworkCaption},
-  &:focus-within ${NetworkCaption} {
-    opacity: 0;
-  }
 
   width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
   height: auto;
