@@ -114,6 +114,26 @@ Check(!CommandCameraMath.SegmentClearOfTerrain(scope, new DVec3(1e7, 0, 0), mun,
     "a line through the body is still hidden");
 Check(CommandCameraMath.SegmentClearOfTerrain(scope, grazing, mun, MunR, MunR, ridge, 64),
     "no terrain headroom falls back to the sphere");
+// A landed craft seen from straight above: its centre sits a few metres under the sampled ground, as the collider and TerrainAltitude disagree.
+var orbiter = new DVec3(0, MunR + 200000, 0);
+var landed = new DVec3(0, MunR + 2527, 0);
+Func<DVec3, double> plateau = p => MunR + 2530;
+Check(!CommandCameraMath.SegmentClearOfTerrain(orbiter, landed, mun, MunR, MunR + 7500, plateau, 64),
+    "with no craft radius the ground under a landed craft hides it");
+Check(CommandCameraMath.SegmentClearOfTerrain(orbiter, landed, mun, MunR, MunR + 7500, plateau, 64, 13.3),
+    "the ground within the craft's radius does not hide a landed craft from overhead");
+var slant = new DVec3(100000, MunR + 2527 + 100000, 0);
+Check(!CommandCameraMath.SegmentClearOfTerrain(slant, landed, mun, MunR, MunR + 7500, plateau, 4096),
+    "with no craft radius a landed craft is hidden by its own ground at 45 degrees");
+Check(CommandCameraMath.SegmentClearOfTerrain(slant, landed, mun, MunR, MunR + 7500, plateau, 4096, 13.3),
+    "a landed craft is seen at 45 degrees");
+Check(!CommandCameraMath.SegmentClearOfTerrain(scope, new DVec3(30000, MunR + 3000, 0), mun, MunR, MunR + 7500, ridge, 64, 13.3),
+    "a ridge far from the craft still hides it with a craft radius");
+var sunk = new DVec3(0, MunR - 5, 0);
+Check(CommandCameraMath.SegmentClearOfTerrain(orbiter, sunk, mun, MunR, MunR + 7500, p => MunR, 64, 13.3),
+    "a craft sunk under the sea-level sphere by less than its radius is seen from overhead");
+Check(!CommandCameraMath.SegmentClearOfTerrain(new DVec3(0, -(MunR + 200000), 0), landed, mun, MunR, MunR + 7500, plateau, 64, 13.3),
+    "a craft radius never sees through the body from the far side");
 Check(!CommandCameraMath.SegmentInsideSphere(scope, new DVec3(0, MunR + 9000, 0), mun, MunR + 7500, out _, out _),
     "a line above the shell never enters it");
 

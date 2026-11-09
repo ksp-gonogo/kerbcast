@@ -804,10 +804,22 @@ namespace Kerbcast
          * compared with `surfaceRadiusAt` (the terrain radius under that point).
          * A grazing line of sight past a limb with mountains is the case the
          * sphere test misses.
+         *
+         * The last `targetRadius` of the line is the craft itself: a landed
+         * craft rests on the drawn ground, which can sit a few metres above
+         * or below TerrainAltitude, so its own patch of ground must not hide
+         * it. Seen from straight above, that patch was the only terrain the
+         * line ever met.
          */
         public static bool SegmentClearOfTerrain(DVec3 a, DVec3 b, DVec3 centre, double radius, double radiusMax,
-            Func<DVec3, double> surfaceRadiusAt, int samples)
+            Func<DVec3, double> surfaceRadiusAt, int samples, double targetRadius = 0)
         {
+            if (targetRadius > 0)
+            {
+                var back = a - b;
+                double len = back.Magnitude;
+                b = len > targetRadius ? b + back * (targetRadius / len) : a;
+            }
             if (!SegmentClearOfSphere(a, b, centre, radius)) return false;
             if (surfaceRadiusAt == null || samples < 1 || radiusMax <= radius) return true;
             if (!SegmentInsideSphere(a, b, centre, radiusMax, out double t0, out double t1)) return true;

@@ -98,7 +98,8 @@ namespace Kerbcast
         public int MaskFallbacks => _mask?.Fallbacks ?? 0;
 
         /* The first body hiding `target` from `station` now, or null. A
-           target radius counts against the station's own skyline only. */
+           target radius counts against terrain only: the station's own
+           skyline and terrain sampled along the line. */
         public string FindOccluder(DVec3 station, DVec3 target, out string source, double targetRadius = 0)
         {
             source = null;
@@ -192,13 +193,13 @@ namespace Kerbcast
                 source = SourceSphere;
                 return true;
             }
-            if (TerrainClear(b, station, target, centreAtT, centreNow, spin, dt)) return false;
+            if (TerrainClear(b, station, target, centreAtT, centreNow, spin, dt, targetRadius)) return false;
             source = SourceTerrain;
             return true;
         }
 
         private bool TerrainClear(CelestialBody b, DVec3 station, DVec3 target, DVec3 centreAtT, DVec3 centreNow,
-            DVec3 spin, double dt)
+            DVec3 spin, double dt, double targetRadius)
         {
             Func<DVec3, double> surface = p =>
             {
@@ -207,7 +208,7 @@ namespace Kerbcast
                 return b.Radius + b.TerrainAltitude(b.GetLatitude(world), b.GetLongitude(world));
             };
             return CommandCameraMath.SegmentClearOfTerrain(station, target, centreAtT, b.Radius, b.pqsController.radiusMax,
-                surface, _terrainSamples);
+                surface, _terrainSamples, targetRadius);
         }
 
         /* The scaled mesh's axes in world space now. ScaledMovement sets its
