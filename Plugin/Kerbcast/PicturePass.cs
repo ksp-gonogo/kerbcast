@@ -466,11 +466,11 @@ namespace Kerbcast
 
         /*
          * A local layer stretched to a far subject can reach terrain built in
-         * local space on a body this camera draws at its past instant or only
-         * turns back, which would paint the body as it is now over the scaled
-         * sphere. Its
-         * renderers are switched off for this camera's local layers alone, as
-         * the craft hider does, and only those that were on are put back.
+         * local space on a body this camera draws at its past instant, or
+         * turns back by enough to see at this field, which would paint the
+         * body as it is now over the scaled sphere. Its renderers are switched
+         * off for this camera's local layers alone, as the craft hider does,
+         * and only those that were on are put back.
          */
         private void HideFarTerrain()
         {
@@ -480,12 +480,17 @@ namespace Kerbcast
             var plan = BodiesFor(lens, c.Value);
             if (plan == null) return;
             double reach = _reachFar != null ? _reachFar() : View != null ? View.farClipPlane : 0;
+            var view = View;
+            var rt = view != null ? Target ?? view.targetTexture : null;
+            int rows = rt != null ? rt.height : view != null ? view.pixelHeight : 0;
+            double fov = view != null ? view.fieldOfView : 0;
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
                 var pqs = b != null ? b.pqsController : null;
                 if (pqs == null || !pqs.isActive || KeepsPresent(b, lens)) continue;
-                if (!FarTerrain.DrawnAway(plan.Moves(b.flightGlobalsIndex), plan.Hides(b.flightGlobalsIndex), plan.TrySpin(b.flightGlobalsIndex, out _))) continue;
+                double slip = FarTerrain.SpinSlipPx(b.angularV, b.Radius, c.Value, fov, rows);
+                if (!FarTerrain.DrawnAway(plan.Moves(b.flightGlobalsIndex), plan.Hides(b.flightGlobalsIndex), plan.TrySpin(b.flightGlobalsIndex, out _), slip)) continue;
                 if (!PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), reach)) continue;
                 SwitchOff(pqs);
                 var children = pqs.ChildSpheres;

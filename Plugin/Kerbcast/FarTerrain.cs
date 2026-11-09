@@ -6,8 +6,28 @@ namespace Kerbcast
     /* Which local-space terrain a camera leaves out of its local layers, apart from Unity so it can be tested. */
     internal static class FarTerrain
     {
-        /* Whether a camera draws a body away from where its terrain stands in local space: moved to its past instant, left out, or only turned back. */
-        public static bool DrawnAway(bool moves, bool hides, bool spins) => moves || hides || spins;
+        /* A turn back smaller than this, in pixels, is not worth losing a body's detailed terrain for. */
+        public const double MinSpinSlipPx = 2.0;
+
+        /*
+         * How many pixels of a `rows`-high picture at vertical `fovDeg` a
+         * body's ground slips when drawn turned back by its light time, at the
+         * point under the lens, for a body turning at `spinRadPerS` of radius
+         * `radiusM`. The ground moves wR for a light time of range / c, seen
+         * from that range, so range cancels and the answer holds at any
+         * distance.
+         */
+        public static double SpinSlipPx(double spinRadPerS, double radiusM, double lightSpeed, double fovDeg, int rows) =>
+            lightSpeed > 0 ? Math.Abs(spinRadPerS * radiusM) / lightSpeed / CommandCameraMath.PixelSizeAtUnit(fovDeg, rows) : double.PositiveInfinity;
+
+        /*
+         * Whether a camera draws a body away from where its terrain stands in
+         * local space: moved to its past instant, left out, or only turned
+         * back by at least MinSpinSlipPx. A slip that cannot be read counts as
+         * a turn worth hiding for.
+         */
+        public static bool DrawnAway(bool moves, bool hides, bool spins, double spinSlipPx) =>
+            moves || hides || (spins && !(spinSlipPx < MinSpinSlipPx));
 
         /*
          * Stock parents a sphere's most detailed quads to a storage object

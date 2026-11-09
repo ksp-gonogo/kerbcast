@@ -234,10 +234,27 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
 
 /* ---- far terrain: which bodies have their terrain left out ---- */
 {
-    Check(!FarTerrain.DrawnAway(false, false, false), "far terrain: a body drawn where it stands keeps its terrain");
-    Check(FarTerrain.DrawnAway(true, false, false), "far terrain: a body moved to its past instant does not");
-    Check(FarTerrain.DrawnAway(false, true, false), "far terrain: nor one left out");
-    Check(FarTerrain.DrawnAway(false, false, true), "far terrain: nor one only turned back, the lens's own or one above it");
+    Check(!FarTerrain.DrawnAway(false, false, false, 100), "far terrain: a body drawn where it stands keeps its terrain");
+    Check(FarTerrain.DrawnAway(true, false, false, 0), "far terrain: a body moved to its past instant does not, whatever the slip");
+    Check(FarTerrain.DrawnAway(false, true, false, 0), "far terrain: nor one left out");
+    Check(FarTerrain.DrawnAway(false, false, true, 2.0), "far terrain: a turn back of two pixels hides it");
+    Check(FarTerrain.DrawnAway(false, false, true, double.NaN), "far terrain: a slip that cannot be read hides it");
+    Check(!FarTerrain.DrawnAway(false, false, true, 1.99), "far terrain: a turn back under two pixels keeps it");
+    Check(!FarTerrain.DrawnAway(false, false, false, double.PositiveInfinity), "far terrain: no turn, nothing to hide for");
+}
+
+/* ---- far terrain: the slip of a body turned back ---- */
+{
+    double w = 2 * Math.PI / 21549.425, R = 600000;
+    double wide = FarTerrain.SpinSlipPx(w, R, 299792458, 30, 1080);
+    Check(wide < 0.01, $"slip: at real light speed a wide view of Kerbin does not move a pixel ({wide:G3})");
+    double top = FarTerrain.SpinSlipPx(w, R, 299792458, 0.005, 1080);
+    Check(top > 2, $"slip: at real light speed the narrowest field does ({top:G3})");
+    Check(Math.Abs(FarTerrain.SpinSlipPx(w, R, 3e5, 1, 576) - FarTerrain.SpinSlipPx(w, R, 3e8, 0.001, 576)) < 0.05, "slip: light speed and field trade one for one");
+    double expect = w * R * 576 / (3e8 * 2 * Math.Tan(0.5 * Math.PI / 180 / 2));
+    Check(Math.Abs(FarTerrain.SpinSlipPx(w, R, 3e8, 0.5, 576) - expect) < 1e-9, "slip: the formula wR * rows / (c * 2 tan(fov/2))");
+    Check(FarTerrain.SpinSlipPx(w, R, 0, 1, 576) == double.PositiveInfinity, "slip: no light speed reads as unbounded");
+    Check(FarTerrain.SpinSlipPx(-w, R, 3e8, 1, 576) > 0, "slip: a backward spin slips the same");
 }
 
 /* ---- far terrain: the quads in storage every sphere shares ---- */
