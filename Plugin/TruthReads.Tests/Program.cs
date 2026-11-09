@@ -185,6 +185,13 @@ var truthPins = new[]
 var picturePins = new[]
 {
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.ForgetDrawn", "picture"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.AimOnDrawnBody", "picture: a point fixed to a body carried to that body's drawn centre and spin at the drawn instant, for an aim as a craft's or an anchor's is placed"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.PastAimPlace", "picture: an aim's own path solved at its light time, placed at the drawn body's position and spin at the drawn instant"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.ResolveAim", "return AimOnDrawnBody(body, world, out world);", 1, "a Surface aim is placed on the drawn body at the drawn instant"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.ResolveAim", "if (c.HasValue) return PastAimPlace(new AimLightPath { Orbit = orbit, OnOrbit = true }, BodyMotion.OnOrbit(orbit), body, ut, station, lensBody, c.Value, out world);", 1,
+        "an Orbit aim is placed at its own light time on the drawn bodies"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.ResolveAim", "if (c.HasValue) return PastAimPlace(new AimLightPath { Kepler = path, Zup = KinematicsWorld.Now().Zup }, BodyMotion.OnPath(body, path, KinematicsWorld.Now().Zup), body, ut, station, lensBody, c.Value, out world);", 1,
+        "a PositionAt aim is placed at its own light time on the drawn bodies"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.IsDrawnSunlit", "picture: sunlight on the drawn craft past the bodies where the camera draws them"),
     Pin.Whole("CommandCameraOcclusion.cs", "CommandCameraOcclusion.FindDrawnOccluder", "picture: occlusion by the bodies where a camera draws them"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig.LocateDrawn", "picture"),
@@ -253,7 +260,7 @@ var picturePins = new[]
         "a craft drawn live takes the picture's instant"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.PlacedSubject", "if (_drawnOk && !_drawn.ShownPast && _drawn.PersistentId == known.PersistentId)", 1,
         "a craft drawn live takes the picture's instant"),
-    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SolveGeometry", "? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, KnownRadius)", 1,
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.SolveGeometry", "? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, aimed ? 0 : KnownRadius)", 1,
         "an aim at the picture's place is occluded by the bodies where the picture draws them"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.UpdateSunlit", "bool lit = drawn ? IsDrawnSunlit(target) : IsSunlit(target);", 1,
         "an aim at the picture's place is lit past the bodies where the picture draws them"),

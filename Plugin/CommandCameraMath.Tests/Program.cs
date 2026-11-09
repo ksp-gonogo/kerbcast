@@ -2130,5 +2130,18 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(CommandCameraMath.ImpostorDistance(1e9, 50000, CommandCameraMath.PixelSizeAtUnit(5, 576), 1e6, 4) == 50000, "proxy: a wide field keeps 50 km");
 }
 
+{
+    /* A Surface aim at a body drawn at its past instant: on the drawn body, 8 minutes of spin back, at the same height. */
+    var aimSpin = new DVec3(0, -2.9e-4, 0);
+    var liveCentre = new DVec3(5e9, 1e8, -3e9);
+    var drawnCentre = liveCentre + new DVec3(-3.6e9, 0, 2e6);
+    var surface = new DVec3(320000, 0, 0);
+    var aimed = CommandCameraMath.CarriedByBody(surface, drawnCentre, aimSpin, -480);
+    Check(Near((aimed - drawnCentre).Magnitude, 320000, 1e-6), "surface aim: stays on the drawn body at its height");
+    Check(Near(CommandCameraMath.AngleBetween(aimed - drawnCentre, surface), 2.9e-4 * 480, 1e-9), "surface aim: turned back by the body's spin over its light time");
+    Check(VNear(CommandCameraMath.ToBodyFrameNow(aimed, drawnCentre, liveCentre, aimSpin, -480), liveCentre + surface, 1e-6), "surface aim: undoing the carry lands on the live ground point");
+    Check(VNear(CommandCameraMath.CarriedByBody(surface, drawnCentre, aimSpin, 0), drawnCentre + surface, 1e-9), "surface aim: a body with no light time keeps the ground point");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

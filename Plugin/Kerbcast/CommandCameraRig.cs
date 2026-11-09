@@ -785,7 +785,7 @@ namespace Kerbcast
                 aim = DirectionPoint(body, station, localUp, _aim.Azimuth, _aim.Elevation, range);
                 aimBody = body;
             }
-            else if (!ResolveAim(_aim, _aimOrbit, ut, out aim, out aimBody))
+            else if (!ResolveAim(_aim, _aimOrbit, ut, station, body, out aim, out aimBody))
             {
                 ForgetDrawn();
                 return false;
@@ -794,11 +794,11 @@ namespace Kerbcast
 
             long occT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             _occlusion.UseSite(site);
-            /* An aim at the picture's place, drawn or kept, is read against the bodies where the picture draws them, as it shows the craft. */
-            bool aimDrawn = !aimed && AimFromPicture;
+            /* An aim at the picture's place, drawn or kept, is read against the bodies where the picture draws them, as it shows the craft; with a light speed a Surface, Orbit or PositionAt aim is at the picture's place too. */
+            bool aimDrawn = aimed ? _aim.Kind != CommandAimKind.Direction && LightTime.LightSpeed.HasValue : AimFromPicture;
             string occluderSource;
             occluder = aimDrawn
-                ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, KnownRadius)
+                ? _occlusion.FindDrawnOccluder(_cam.Picture, station, aim, out occluderSource, aimed ? 0 : KnownRadius)
                 : _occlusion.FindOccluder(station, aim, out occluderSource, aimed ? 0 : KnownRadius);
             double distance = (aim - station).Magnitude;
             _lastDistance = distance;
@@ -1402,8 +1402,11 @@ namespace Kerbcast
 
         /* An Orbit, Surface or PositionAt aim's point in world space, on the
            same UT (and so the same physics tick) as the station and the
-           scaled bodies. */
-        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, out DVec3 world, out CelestialBody body)
+           scaled bodies. With a light speed it is where the picture draws that
+           point for a lens at `station` on `lensBody`, as a craft aim is:
+           a Surface aim on the body as drawn, an Orbit or PositionAt aim at its
+           own light time. */
+        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, DVec3 station, CelestialBody lensBody, out DVec3 world, out CelestialBody body)
         {
             world = default;
             body = null;
@@ -1415,6 +1418,8 @@ namespace Kerbcast
                     if (orbit == null || orbit.referenceBody == null) return false;
                     body = orbit.referenceBody;
                     world = ToD(orbit.getPositionAtUT(ut));
+                    double? c = LightTime.LightSpeed;
+                    if (c.HasValue) return PastAimPlace(new AimLightPath { Orbit = orbit, OnOrbit = true }, BodyMotion.OnOrbit(orbit), body, ut, station, lensBody, c.Value, out world);
                     return true;
                 }
                 case CommandAimKind.Surface:
@@ -1422,17 +1427,102 @@ namespace Kerbcast
                     body = FlightGlobals.GetBodyByName(aim.Body);
                     if (body == null) return false;
                     world = ToD(body.GetWorldSurfacePosition(aim.Latitude, aim.Longitude, aim.Altitude));
-                    return true;
+                    return AimOnDrawnBody(body, world, out world);
                 }
                 case CommandAimKind.PositionAt:
                 {
                     body = FlightGlobals.GetBodyByName(aim.Body);
                     if (body == null || !AimPath(aim, body, out var path) || !path.TryAt(ut, out var rel, out _)) return false;
                     world = KinematicsWorld.Now().ToWorld(body, rel);
+                    double? c = LightTime.LightSpeed;
+                    if (c.HasValue) return PastAimPlace(new AimLightPath { Kepler = path, Zup = KinematicsWorld.Now().Zup }, BodyMotion.OnPath(body, path, KinematicsWorld.Now().Zup), body, ut, station, lensBody, c.Value, out world);
                     return true;
                 }
             }
             return false;
+        }
+
+        /* A point fixed to body `b`, at `live` now, where the picture draws it; false while the picture leaves the body out. */
+        private bool AimOnDrawnBody(CelestialBody b, DVec3 live, out DVec3 world)
+        {
+            world = live;
+            if (_cam.Picture.HidesBody(b)) return false;
+            if (_cam.Picture.TryDrawnBody(b, out var centre, out double dt))
+                world = CommandCameraMath.CarriedByBody(live - ToD(b.position), centre, CommandCameraOcclusion.Spin(b), dt);
+            return true;
+        }
+
+        /*
+         * An Orbit or PositionAt aim where the light arriving at the lens now
+         * left it, solved in the frame of the lens's and the aim's common
+         * body, and placed as the picture places a craft: against a body drawn
+         * at its past instant, or left out, at its own past place in that
+         * frame; otherwise on the body as drawn.
+         */
+        private bool PastAimPlace(AimLightPath path, BodyMotion motion, CelestialBody body, double ut, DVec3 station, CelestialBody lensBody, double c, out DVec3 world)
+        {
+            world = default;
+            var tree = KeplerBodyTree.World;
+            int bodyIndex = body.flightGlobalsIndex;
+            int frame = PastInstant.CommonAncestor(ref tree, lensBody.flightGlobalsIndex, bodyIndex);
+            var frameBody = tree.Body(frame);
+            if (frameBody == null) return false;
+            var spin = SpinOf(lensBody);
+            path.Tree = tree;
+            path.BodyIndex = bodyIndex;
+            path.Frame = frame;
+            path.Spin = spin;
+            path.T = ut;
+            double bound = CommandCameraForecast.SpeedBound(motion, frameBody);
+            bound += PastInstant.TurnSpeedBoundAbout(spin, bodyIndex, bound, double.PositiveInfinity, double.NaN, (station - ToD(lensBody.position)).Magnitude, c);
+            if (PastInstant.Solve(ref path, station - ToD(frameBody.position), ut, c, bound, double.NegativeInfinity, ut, out double at) != PastStatus.Found)
+                return false;
+            if (_cam.Picture.HidesBody(body) || _cam.Picture.TryDrawnBody(body, out _, out _))
+            {
+                if (!path.TryAt(at, out var about)) return false;
+                world = ToD(frameBody.position) + about;
+                return true;
+            }
+            if (!path.Offset(at, out var rel)) return false;
+            return AimOnDrawnBody(body, ToD(body.position) + PastInstant.Turned(spin, bodyIndex, rel, false, at, ut), out world);
+        }
+
+        /* An aim's own path back through time about the frame body, for the light-time solve. */
+        private struct AimLightPath : IPastPath
+        {
+            public Orbit Orbit;
+            public bool OnOrbit;
+            public KeplerPath Kepler;
+            public ZupFrame Zup;
+            public KeplerBodyTree Tree;
+            public int BodyIndex;
+            public int Frame;
+            /* About the lens's body the path is carried round with it to render UT `T`, as a craft's is. */
+            public BodySpin Spin;
+            public double T;
+
+            /* The aim's offset from its body's centre at `ut`, in world axes. */
+            public bool Offset(double ut, out DVec3 offset)
+            {
+                offset = default;
+                if (OnOrbit)
+                {
+                    var r = Orbit.getRelativePositionAtUT(ut).xzy;
+                    offset = new DVec3(r.x, r.y, r.z);
+                    return true;
+                }
+                if (!Kepler.TryAt(ut, out var rel, out _)) return false;
+                offset = Zup.ToWorld(rel);
+                return true;
+            }
+
+            public bool TryAt(double ut, out DVec3 position)
+            {
+                position = default;
+                if (!Offset(ut, out var rel) || !PastInstant.TryAbout(ref Tree, BodyIndex, Frame, ut, out var centre)) return false;
+                position = centre + PastInstant.Turned(Spin, BodyIndex, rel, false, ut, T);
+                return true;
+            }
         }
 
         /* A PositionAt aim's ballistic path under its body's gravity, built once per aim. */
