@@ -69,11 +69,14 @@ namespace Kerbcast
     {
         public OpticsKnobs Defaults;
         public string Label;
+        /* A craft's space lens, whose zoom reaches past every other lens's. */
+        public bool Space;
 
-        public OpticsLens(OpticsKnobs defaults, string label)
+        public OpticsLens(OpticsKnobs defaults, string label, bool space = false)
         {
             Defaults = defaults;
             Label = label;
+            Space = space;
         }
     }
 
@@ -574,6 +577,10 @@ namespace Kerbcast
             }
             return best;
         }
+
+        /* Whether a lens `fromCentreM` from the centre of a body of `radiusM` is outside its air: at or above `atmosphereDepthM`, or at a body with none. */
+        public static bool OutsideAir(double fromCentreM, double radiusM, bool hasAtmosphere, double atmosphereDepthM) =>
+            !hasAtmosphere || fromCentreM - radiusM >= atmosphereDepthM;
 
         /* Whether a space lens of `spaceArcsec` beats the ground lens `groundArcsec`, so a craft camera outside the air takes it. */
         public static bool Beats(double spaceArcsec, double groundArcsec) =>

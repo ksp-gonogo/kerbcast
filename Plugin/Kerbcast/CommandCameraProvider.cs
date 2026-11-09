@@ -462,9 +462,9 @@ namespace Kerbcast
                         _p._ringDir,
                         _p._ringSlots,
                         S.Width,
-                        S.Height,
+                        _p.FrameRows,
                         S.Width,
-                        S.Height,
+                        _p.FrameRows,
                         CameraLayers.All,
                         enableAtmosphericFx: false,
                         fxLayers: AtmoFxLayers.None,
@@ -737,15 +737,23 @@ namespace Kerbcast
            full zoom. */
         private Func<double> LensFovMin(CommandCameraSite site) => () => FovMinAt(site);
 
-        private double FovMinAt(CommandCameraSite site)
+        /*
+         * The frame height every command camera renders at full quality. The
+         * rig's optics floor reads it back as the camera's MaxHeight, so the
+         * lens limit and that floor count the same pixels.
+         */
+        internal int FrameRows => _settings.Height;
+
+        /* `inVacuum` overrides whether a craft vantage is outside the air, for a question asked at another time than now. */
+        private double FovMinAt(CommandCameraSite site, bool? inVacuum = null)
         {
             double top = _settings.CommandCameraFovMin;
             /* Under deep-space optics the blur, not the zoom, holds a low level back; without the shaders for it the level's zoom stays. */
             if (_settings.DeepSpaceOptics && CommandCameraOptics.Available())
             {
                 /* A space lens finer than the top level's zooms past CommandCameraFovMin, to where its own blur spans two pixels. */
-                var lens = LensAt(site, false);
-                return lens.Kind == LensKind.SpaceLens ? SpaceLens.FovMin(top, lens.Arcsec, _settings.Height) : top;
+                var lens = LensAt(site, false, inVacuum);
+                return lens.Kind == LensKind.SpaceLens ? SpaceLens.FovMin(top, lens.Arcsec, FrameRows) : top;
             }
             double middle = Math.Max(_settings.CommandCameraFovMinLevel2, top);
             double lowest = Math.Max(_settings.CommandCameraFovMinLevel1, middle);
@@ -763,9 +771,10 @@ namespace Kerbcast
          * the tracking rules on; sandbox, science and career without the rules
          * get the top lens. A craft outside any atmosphere takes its space lens
          * instead when a researched step makes that finer. `named` fills Name,
-         * which looks up a tech title, so scoring skips it.
+         * which looks up a tech title, so scoring skips it. `inVacuum`
+         * overrides whether the craft is outside the air, for another time.
          */
-        internal LensChoice LensAt(CommandCameraSite site, bool named)
+        internal LensChoice LensAt(CommandCameraSite site, bool named, bool? inVacuum = null)
         {
             var s = _settings;
             double l1 = s.OpticsResolutionLevel1, l2 = s.OpticsResolutionLevel2, l3 = s.OpticsResolutionLevel3;
@@ -777,7 +786,7 @@ namespace Kerbcast
             var ground = new LensChoice(OpticsModel.ResolutionForLevel(gated ? CommandCameraTargets.NormLevel() : 1, l1, l2, l3),
                 LensKind.TrackingStation, level, named ? $"Tracking Station level {level}" : null,
                 gated ? $"Tracking Station level {level}" : $"top lens ({TopLensWhy()})");
-            if (!site.VantageInVacuum) return ground;
+            if (!site.HasVantage || !(inVacuum ?? site.VantageInVacuum)) return ground;
             int step = SpaceLens.BestStep(s.SpaceLensSteps, SpaceLensTech.Researched);
             if (step < 0 || !SpaceLens.Beats(s.SpaceLensSteps[step].Arcsec, ground.Arcsec)) return ground;
             string tech = s.SpaceLensSteps[step].TechId;
@@ -801,7 +810,7 @@ namespace Kerbcast
             return () =>
             {
                 var lens = LensAt(site, false);
-                return new OpticsLens(s.OpticsDefaults(lens.Arcsec), lens.Label);
+                return new OpticsLens(s.OpticsDefaults(lens.Arcsec), lens.Label, lens.Kind == LensKind.SpaceLens);
             };
         }
 
@@ -810,20 +819,22 @@ namespace Kerbcast
          * from the rules its rig is built with: the zoom limit, the frame at
          * full quality, and the optics when this GPU draws them. A feed's
          * SetOptics override is the feed's, not the site's, so it is not in it.
+         * `inVacuum` overrides whether a craft vantage is outside the air, for
+         * a line of sight asked at another time than now.
          */
-        internal LensLimits LensLimitsAt(CommandCameraSite site)
+        internal LensLimits LensLimitsAt(CommandCameraSite site, bool? inVacuum = null)
         {
             if (site == null) return LensLimits.Unknown;
             bool on = _settings.DeepSpaceOptics && CommandCameraOptics.Available();
-            var lens = LensAt(site, true);
+            var lens = LensAt(site, true, inVacuum);
             var knobs = on ? _settings.OpticsDefaults(lens.Arcsec) : OpticsKnobs.Unset;
-            double fovMin = FovMinAt(site);
+            double fovMin = FovMinAt(site, inVacuum);
             return new LensLimits
             {
                 Known = true,
-                FovMinDeg = on ? OpticsModel.OpticsFovFloor(fovMin, knobs.ResolutionArcsec, _settings.Height) : fovMin,
+                FovMinDeg = on ? OpticsModel.OpticsFovFloor(fovMin, knobs.ResolutionArcsec, FrameRows) : fovMin,
                 WidthPx = _settings.Width,
-                HeightPx = _settings.Height,
+                HeightPx = FrameRows,
                 OpticsOn = on,
                 Knobs = knobs,
                 Lens = lens,

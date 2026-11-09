@@ -1764,7 +1764,9 @@ export interface SettingsStatePayload {
 	timeWarpRate?: number;
 	/**
 	 * The lenses command cameras can have in this save and which are
-	 * unlocked. Absent when no game is loaded and from older plugins.
+	 * unlocked. Always sent, as null when the plugin reports none (no game
+	 * loaded, or an older plugin), so a consumer clears what it showed for
+	 * the last save; only an older sidecar leaves the field out.
 	 */
 	lensLevels?: LensLevelsPayload;
 }

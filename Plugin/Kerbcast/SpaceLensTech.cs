@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using KSP.Localization;
@@ -27,16 +28,30 @@ namespace Kerbcast
             catch (Exception) { return false; }
         }
 
+        /* Titles by node id for one save: the tree's titles do not change within it, and the status file asks every second. */
+        private static readonly Dictionary<string, string> Titles = new Dictionary<string, string>();
+        private static Game _titlesFor;
+
         /* The node's title in the player's language, its id when the tree has no such node. */
         public static string Title(string techId)
         {
+            if (string.IsNullOrEmpty(techId)) return "";
+            var game = HighLogic.CurrentGame;
+            if (!ReferenceEquals(game, _titlesFor))
+            {
+                Titles.Clear();
+                _titlesFor = game;
+            }
+            if (Titles.TryGetValue(techId, out var cached)) return cached;
+            string found = techId;
             try
             {
                 var title = ResearchAndDevelopment.GetTechnologyTitle(techId);
-                if (!string.IsNullOrEmpty(title)) return title.StartsWith("#") ? Localizer.Format(title) : title;
+                if (!string.IsNullOrEmpty(title)) found = title.StartsWith("#") ? Localizer.Format(title) : title;
             }
             catch (Exception) { }
-            return techId;
+            Titles[techId] = found;
+            return found;
         }
 
         /* The save's mode as the wire names it: "career", "science", "sandbox", or another mode lowercased; "" with no game. */

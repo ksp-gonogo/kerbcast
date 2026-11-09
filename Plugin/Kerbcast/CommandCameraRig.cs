@@ -433,6 +433,7 @@ namespace Kerbcast
 
         private void UpdateOpticsFloor(double blurArcsec, float now)
         {
+            /* MaxHeight is the provider's FrameRows, which its lens limit counts in too. */
             double target = OpticsModel.OpticsFovFloor(0, blurArcsec, _cam.MaxHeight);
             if (!(target > 0))
             {
@@ -1948,12 +1949,16 @@ namespace Kerbcast
                 /* Beyond ModelProxyDistance the model stands in at that
                    distance on the true ray, shrunk by the same ratio: the
                    same angular size and perspective, with local-space
-                   precision and clip planes that stay simple. A lens far from
-                   the floating origin stands it farther still, so the float
-                   step of the lens's own position stays a fraction of a pixel
-                   on it at the narrowest fields. */
-                p.PlanDistance = CommandCameraMath.ImpostorDistance(p.Distance, ModelProxyDistance,
-                    CommandCameraMath.PixelSizeAtUnit(_fov, RenderRows(cam)), station.Magnitude, ModelProxyMinUlps);
+                   precision and clip planes that stay simple. Under a space
+                   lens, whose fields go narrower than any other, a lens far
+                   from the floating origin stands it farther still, so the
+                   float step of the lens's own position stays a fraction of a
+                   pixel on it. Every other camera keeps the fixed distance,
+                   which depth-based tints such as Scatterer's depend on. */
+                p.PlanDistance = _optics != null && _lens.Space
+                    ? CommandCameraMath.ImpostorDistance(p.Distance, ModelProxyDistance,
+                        CommandCameraMath.PixelSizeAtUnit(_fov, RenderRows(cam)), station.Magnitude, ModelProxyMinUlps)
+                    : Math.Min(p.Distance, ModelProxyDistance);
                 p.PlanScale = p.PlanDistance / p.Distance;
                 var at = station + p.Toward * p.PlanDistance;
                 var rotation = _drawn.SavedRotation(_drawnBody);

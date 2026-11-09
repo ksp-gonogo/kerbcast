@@ -382,7 +382,8 @@ export class MockSidecar {
   private _settingsPayload(): SettingsStatePayload {
     return {
       throttleMainScreen: this._throttleMainScreen,
-      ...(this._lensLevels ? { lensLevels: this._lensLevels } : {}),
+      /* As the sidecar does: always present, null with no game loaded. */
+      lensLevels: this._lensLevels as LensLevelsPayload | undefined,
     };
   }
 
@@ -490,7 +491,7 @@ export class MockSidecar {
   /** Push a `settings-state` event to the client (simulates a plugin-status-change broadcast). */
   fireSettingsState(payload: SettingsStatePayload): void {
     this._throttleMainScreen = payload.throttleMainScreen;
-    if (payload.lensLevels) this._lensLevels = payload.lensLevels;
+    if ("lensLevels" in payload) this._lensLevels = payload.lensLevels ?? null;
     this._sendToClient({ type: "settings-state", content: payload });
   }
 

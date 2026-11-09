@@ -3684,7 +3684,7 @@ describe("KerbcastClient.inboundVideoStats", () => {
     expect(client.throttleMainScreen).toBe(true);
   });
 
-  it("lensLevels arrive on hello, follow settings-state and survive a push without them", async () => {
+  it("lensLevels arrive on hello, follow settings-state, clear on null and survive an older sidecar's push", async () => {
     const lens: LensLevelsPayload = {
       gameMode: "career",
       opticsOn: true,
@@ -3717,6 +3717,10 @@ describe("KerbcastClient.inboundVideoStats", () => {
 
     sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 10 });
     expect(client.lensLevels).toEqual(unlocked);
+
+    /* Back at the main menu the plugin reports none, and the sidecar says so with a null. */
+    sidecar.setLensLevels(null);
+    expect(client.lensLevels).toBeNull();
   });
 
   it("clock.captureUt is null before any settings-state", () => {

@@ -4477,14 +4477,14 @@ mod tests {
     }
 
     #[test]
-    fn lens_levels_absent_stays_absent() {
+    fn lens_levels_absent_goes_out_as_null() {
         let status: GlobalStatusFile =
             serde_json::from_str(r#"{"kspFps":60.0,"shedLevel":0,"cameras":[]}"#).unwrap();
         let settings = settings_from_status_at(&status, 0.0);
         assert_eq!(settings.lens_levels, None);
-        assert!(!serde_json::to_string(&settings)
+        assert!(serde_json::to_string(&settings)
             .unwrap()
-            .contains("lensLevels"));
+            .contains("\"lensLevels\":null"));
     }
 
     /// A lens change (a research unlock, a Tracking Station upgrade) alone
@@ -4521,6 +4521,15 @@ mod tests {
         let lens = registry.poll_status().await.settings.unwrap().lens_levels;
         assert!(lens.unwrap().space_steps[1].unlocked);
         assert!(registry.last_settings().await.lens_levels.is_some());
+
+        /* Back at the main menu the plugin drops the field: a delta clears it. */
+        write("");
+        let delta = registry.poll_status().await.settings;
+        assert_eq!(
+            delta.expect("dropping the lenses is a change").lens_levels,
+            None
+        );
+        assert!(registry.last_settings().await.lens_levels.is_none());
     }
 
     const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"mission-control"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;

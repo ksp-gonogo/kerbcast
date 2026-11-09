@@ -2035,6 +2035,14 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(SpaceLens.BestStep(dropped, id => true) == 0, "space lens: a step with no node is dropped");
     Check(SpaceLens.BestStep(null, id => true) == -1 && SpaceLens.BestStep(steps, null) == -1, "space lens: no steps or no research gives nothing");
 
+    /* Kerbin: 600 km radius, 70 km of air. A craft on an elliptical orbit, placed at two times. */
+    const double airR = 600000, airDepth = 70000;
+    double periapsisAt = airR + 60000, apoapsisAt = airR + 250000;
+    Check(!SpaceLens.OutsideAir(periapsisAt, airR, true, airDepth), "space lens: a craft dipping to 60 km is inside Kerbin's air at that time");
+    Check(SpaceLens.OutsideAir(apoapsisAt, airR, true, airDepth), "space lens: the same craft at 250 km later is outside it");
+    Check(SpaceLens.OutsideAir(airR + airDepth, airR, true, airDepth), "space lens: the edge of the air counts as outside");
+    Check(SpaceLens.OutsideAir(200000 + 10, 200000, false, 0), "space lens: a craft landed on an airless body is outside any air");
+
     Check(SpaceLens.Beats(0.5, 1.0) && !SpaceLens.Beats(1.0, 1.0) && !SpaceLens.Beats(2.0, 1.0), "space lens: taken only when finer than the ground lens");
     Check(!SpaceLens.Beats(double.NaN, 1.0) && !SpaceLens.Beats(0, 1.0) && SpaceLens.Beats(0.5, double.NaN), "space lens: no lens never wins, any lens beats none");
 

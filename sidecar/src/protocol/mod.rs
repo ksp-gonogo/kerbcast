@@ -1815,8 +1815,10 @@ pub struct SettingsStatePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_warp_rate: Option<f64>,
     /// The lenses command cameras can have in this save and which are
-    /// unlocked. Absent when no game is loaded and from older plugins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// unlocked. Always sent, as null when the plugin reports none (no game
+    /// loaded, or an older plugin), so a consumer clears what it showed for
+    /// the last save; only an older sidecar leaves the field out.
+    #[serde(default)]
     pub lens_levels: Option<LensLevelsPayload>,
 }
 
@@ -3267,6 +3269,10 @@ mod tests {
             lens_levels: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
+        assert!(
+            s.contains("\"lensLevels\":null"),
+            "no lenses go out as an explicit null, so a client clears the last save's"
+        );
         assert!(s.contains("\"captureUt\":12345.5"));
         assert!(s.contains("\"captureEpoch\":7"));
         assert!(s.contains("\"timeWarpRate\":4.0"));
