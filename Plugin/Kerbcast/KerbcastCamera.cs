@@ -53,6 +53,12 @@ namespace Kerbcast
 
     internal interface ICameraRig
     {
+        /* The local layers' far planes as they were before any plan stretched them. */
+        float LocalFarNativeM { get; }
+
+        /* The far plane of any local layer the rig adds, 0 when it does not render this frame. */
+        float MidFarNowM { get; }
+
         /* Called right before the layers render. */
         RigFrame PrepareRender(KerbcastCamera cam);
         void RenderBetweenFarAndNear(KerbcastCamera cam);
@@ -89,6 +95,24 @@ namespace Kerbcast
            is hidden behind a body). */
         internal bool RigSkipFar { get; set; }
         internal Camera NearLayer => _nearCam;
+
+        /* How far the local layers reach of themselves: a rig reports its layers' planes before it stretched them. */
+        private double LocalFarNativeM() => Rig != null ? Rig.LocalFarNativeM : LocalFarNow();
+
+        /* How far the local layers reach this frame, a rig's stretched far and mid planes included. */
+        private double LocalFarReachM()
+        {
+            double far = LocalFarNow();
+            return Rig != null ? Math.Max(far, Rig.MidFarNowM) : far;
+        }
+
+        private double LocalFarNow()
+        {
+            double near = _nearCam != null ? _nearCam.farClipPlane : 0;
+            double far = _farCam != null && !RigSkipFar ? _farCam.farClipPlane : 0;
+            return Math.Max(near, far);
+        }
+
         internal Camera FarLayer => _farCam;
         internal Camera ScaledLayer => _scaledCam;
         /* Set by the rig to read the frame centre right after the next scaled
@@ -549,7 +573,7 @@ namespace Kerbcast
             // content size so the sidecar encodes at the current dim.
             _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight, AnchorProjector.MetaSlotBytes);
             _anchors = new AnchorProjector(FlightId);
-            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld, () => _nearCam);
+            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld, () => _nearCam, null, LocalFarNativeM, LocalFarReachM);
             WriteInfoManifest();
 
             // Failure-streak (_consecutiveErrors + LogRateLimited) and the

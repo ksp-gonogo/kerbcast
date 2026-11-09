@@ -127,7 +127,7 @@ namespace Kerbcast
             // first subscribe re-resolves it.
             if (vessel != null && vessel.isEVA) _crewLocation = "eva";
             _picture = new PicturePass(() => _evaNow != null ? _evaNow.vessel : null, EvaEye,
-                () => _evaNow != null ? _evaNow.kerbalCam00 : null, () => _capture?.CaptureRt);
+                () => _evaNow != null ? _evaNow.kerbalCam00 : null, () => _capture?.CaptureRt, EvaFarM, EvaFarM);
             WriteInfoManifest();
         }
 
@@ -398,6 +398,15 @@ namespace Kerbcast
         // portrait render is undisturbed. Returns false if the portrait camera is
         // absent. We drive Render() ourselves, so this does not depend on the
         // EVA_SHOW_PORTRAIT coroutine running.
+        private double EvaFarM()
+        {
+            var eva = _evaNow;
+            if (eva == null) return 0;
+            double near = eva.kerbalCam00 != null ? eva.kerbalCam00.farClipPlane : 0;
+            double far = eva.kerbalCam01 != null ? eva.kerbalCam01.farClipPlane : 0;
+            return Math.Max(near, far);
+        }
+
         private bool RenderEva(KerbalEVA eva, RenderTexture target)
         {
             if (eva == null || eva.kerbalPortraitCamera == null) return false;

@@ -108,6 +108,8 @@ namespace Kerbcast
         private readonly Func<Vector3> _eye;
         private readonly Func<Camera> _view;
         private readonly Func<RenderTexture> _target;
+        private readonly Func<double> _nativeFar;
+        private readonly Func<double> _reachFar;
         private readonly CraftHider _hider;
         private readonly CraftStandIns _standIns;
         private readonly HashSet<uint> _walked = new HashSet<uint>();
@@ -117,6 +119,9 @@ namespace Kerbcast
         /* The scaled transforms this camera moved, as stock had them, to put back after its scaled render. */
         private readonly List<MovedBody> _moved = new List<MovedBody>();
         private int _scaledDepth;
+        /* Terrain renderers this camera switched off for its local layers, and the scratch list they are gathered in. */
+        private readonly List<Renderer> _terrainOff = new List<Renderer>();
+        private readonly List<Renderer> _terrainScratch = new List<Renderer>();
 
         private struct MovedBody
         {
@@ -135,13 +140,19 @@ namespace Kerbcast
         /* `craft` is the craft the lens rides, `eye` where it looks from and
            `view` the camera whose frustum the stand-ins are drawn for, drawing
            into `target` if it targets that only while it renders; null `craft`
-           leaves the lens to Place. */
-        public PicturePass(Func<Vessel> craft, Func<Vector3> eye, Func<Camera> view, Func<RenderTexture> target = null)
+           leaves the lens to Place. `nativeFar` is how far the local layers
+           reach of themselves, the terrain they exist to draw, and `reachFar`
+           how far they reach this frame, stretched to a subject; both default
+           to the view camera's far plane. */
+        public PicturePass(Func<Vessel> craft, Func<Vector3> eye, Func<Camera> view, Func<RenderTexture> target = null,
+            Func<double> nativeFar = null, Func<double> reachFar = null)
         {
             _craft = craft;
             _eye = eye;
             _view = view;
             _target = target;
+            _nativeFar = nativeFar;
+            _reachFar = reachFar;
             _hider = new CraftHider(this);
             _standIns = new CraftStandIns(this);
         }
@@ -207,6 +218,7 @@ namespace Kerbcast
                 var b = bodies[i];
                 var t = b != null && b.scaledBody != null ? b.scaledBody.transform : null;
                 if (t == null) continue;
+                if (KeepsPresent(b, lens)) continue;
                 var moved = new MovedBody { Transform = t, Position = t.localPosition, Rotation = t.localRotation, Scale = t.localScale };
                 /* No instant to draw it at yet: shrunk to nothing, its atmosphere shell with it, rather than drawn early. */
                 if (plan.Hides(b.flightGlobalsIndex))
@@ -267,7 +279,31 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (!c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && (plan.Moved > 0 || plan.Hidden > 0);
+            var bodies = FlightGlobals.Bodies;
+            if (plan == null || bodies == null) return false;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b != null && !KeepsPresent(b, lens) && (plan.Moves(b.flightGlobalsIndex) || plan.Hides(b.flightGlobalsIndex))) return true;
+            }
+            return false;
+        }
+
+        /*
+         * Whether this camera leaves body `b` at the present: its terrain is
+         * built in local space, where stock has it, and is close enough to
+         * this lens for the local layers to draw it, so the scaled sphere must
+         * stay with its ground. Only the local layers' own reach counts, not a
+         * far plane stretched to a subject, or a telescope on a craft at a
+         * planet would keep that planet at the present for as long as it
+         * looked at the craft.
+         */
+        private bool KeepsPresent(CelestialBody b, PictureLens lens)
+        {
+            var pqs = b.pqsController;
+            if (pqs == null || !pqs.isActive) return false;
+            double far = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
+            return PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), far);
         }
 
         /* Whether this camera leaves body `b` out of its picture this frame, its light not yet placed. */
@@ -276,7 +312,7 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (b == null || !c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && plan.Hides(b.flightGlobalsIndex);
+            return plan != null && !KeepsPresent(b, lens) && plan.Hides(b.flightGlobalsIndex);
         }
 
         /* Where this camera draws body `b` this frame when it is drawn at its
@@ -290,7 +326,7 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (b == null || !c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && plan.TryDrawn(b.flightGlobalsIndex, out centre, out dt);
+            return plan != null && !KeepsPresent(b, lens) && plan.TryDrawn(b.flightGlobalsIndex, out centre, out dt);
         }
 
         /*
@@ -307,14 +343,16 @@ namespace Kerbcast
             if (centres == null || centres.Length < list.Count) centres = new DVec3[list.Count];
             if (radii == null || radii.Length < list.Count) radii = new double[list.Count];
             double? c = LightTime.LightSpeed;
-            var plan = c.HasValue && TryFrameLens(out var lens) ? BodiesFor(lens, c.Value) : null;
+            PictureLens lens = default;
+            var plan = c.HasValue && TryFrameLens(out lens) ? BodiesFor(lens, c.Value) : null;
             for (int i = 0; i < list.Count; i++)
             {
                 var b = list[i];
                 radii[i] = b != null ? b.Radius * (1.0 - 1e-7) : 0;
-                if (b == null || (plan != null && plan.Hides(b.flightGlobalsIndex)))
+                bool kept = b != null && plan != null && KeepsPresent(b, lens);
+                if (b == null || (plan != null && !kept && plan.Hides(b.flightGlobalsIndex)))
                     centres[i] = new DVec3(double.NaN, double.NaN, double.NaN);
-                else if (plan == null || !plan.TryDrawn(b.flightGlobalsIndex, out centres[i], out _))
+                else if (plan == null || kept || !plan.TryDrawn(b.flightGlobalsIndex, out centres[i], out _))
                     centres[i] = ToD(b.position);
             }
             return list.Count;
@@ -330,12 +368,68 @@ namespace Kerbcast
         {
             _hider.Hide();
             _standIns.Show();
+            HideFarTerrain();
         }
 
         public void AfterLayers()
         {
             try { _hider.Restore(); }
-            finally { _standIns.Restore(); }
+            finally
+            {
+                try { _standIns.Restore(); }
+                finally { RestoreFarTerrain(); }
+            }
+        }
+
+        /*
+         * A local layer stretched to a far subject can reach terrain built in
+         * local space on a body this camera draws at its past instant, which
+         * would paint the body as it is now over the scaled sphere. Its
+         * renderers are switched off for this camera's local layers alone, as
+         * the craft hider does, and only those that were on are put back.
+         */
+        private void HideFarTerrain()
+        {
+            double? c = LightTime.LightSpeed;
+            var bodies = FlightGlobals.Bodies;
+            if (!c.HasValue || bodies == null || !TryFrameLens(out var lens)) return;
+            var plan = BodiesFor(lens, c.Value);
+            if (plan == null) return;
+            double reach = _reachFar != null ? _reachFar() : View != null ? View.farClipPlane : 0;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                var pqs = b != null ? b.pqsController : null;
+                if (pqs == null || !pqs.isActive || KeepsPresent(b, lens)) continue;
+                if (!plan.Moves(b.flightGlobalsIndex) && !plan.Hides(b.flightGlobalsIndex)) continue;
+                if (!PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), reach)) continue;
+                SwitchOff(pqs);
+                var children = pqs.ChildSpheres;
+                if (children == null) continue;
+                for (int s = 0; s < children.Length; s++)
+                    if (children[s] != null) SwitchOff(children[s]);
+            }
+        }
+
+        private void SwitchOff(PQS sphere)
+        {
+            _terrainScratch.Clear();
+            sphere.GetComponentsInChildren(false, _terrainScratch);
+            for (int i = 0; i < _terrainScratch.Count; i++)
+            {
+                var r = _terrainScratch[i];
+                if (r == null || r.forceRenderingOff) continue;
+                r.forceRenderingOff = true;
+                _terrainOff.Add(r);
+            }
+            _terrainScratch.Clear();
+        }
+
+        private void RestoreFarTerrain()
+        {
+            for (int i = 0; i < _terrainOff.Count; i++)
+                if (_terrainOff[i] != null) _terrainOff[i].forceRenderingOff = false;
+            _terrainOff.Clear();
         }
 
         /*
@@ -597,7 +691,7 @@ namespace Kerbcast
                 var plan = BodiesFor(lens, c.Value);
                 int frame = sight.Frame;
                 DQuat q;
-                if (plan != null && (plan.Moves(index) || plan.Hides(index)) && frame >= 0 && frame < bodies.Count && bodies[frame] != null)
+                if (plan != null && !KeepsPresent(seen.Body, lens) && (plan.Moves(index) || plan.Hides(index)) && frame >= 0 && frame < bodies.Count && bodies[frame] != null)
                 {
                     seen.World = ToD(bodies[frame].position) + back.Rotate(sight.About);
                     seen.About = bodies[frame];
@@ -630,11 +724,13 @@ namespace Kerbcast
 
         /*
          * Where every body is drawn from `lens` this frame, solved once per lens
-         * point and shared by every camera that solves from it. A body stays
-         * where stock has it when its terrain is drawn in local space, so its
-         * scaled sphere never parts from its ground, or when the world's frame
-         * turns with it. A body that has left its Kepler path is read from its
-         * ring track while the track covers the instant.
+         * point and shared by every camera that solves from it. Each camera
+         * then leaves a body at the present for itself where its local layers
+         * can draw that body's terrain (KeepsPresent). The solve and the move
+         * read every position through Planetarium's rotation, so a body the
+         * world's axes turn with (inverseRotation) is solved like any other.
+         * A body that has left its Kepler path is read from its ring track
+         * while the track covers the instant.
          *
          * A body that may outrun light is followed by the plan's trace for it,
          * within the lens's fair share of the frame's reads, the bodies taking
@@ -669,7 +765,7 @@ namespace Kerbcast
             {
                 int i = (first + n) % bodies.Count;
                 var b = bodies[i];
-                if (b == null || b.scaledBody == null || b.inverseRotation || (b.pqsController != null && b.pqsController.isActive)) continue;
+                if (b == null || b.scaledBody == null) continue;
                 int index = b.flightGlobalsIndex;
                 var trace = plan.Trace(index);
                 if (trace == null) continue;

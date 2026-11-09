@@ -34,6 +34,15 @@ namespace Kerbcast
             return wasHidden && farthestM >= ReturnFraction * boundary;
         }
 
+        /*
+         * Whether a body's terrain, reaching at most `terrainRadiusM` from its
+         * centre, can fall inside a local layer's far plane `farClipM` for a
+         * lens `distanceM` from that centre. A distance that cannot be read is
+         * out of reach.
+         */
+        public static bool TerrainInReach(double distanceM, double terrainRadiusM, double farClipM) =>
+            distanceM - terrainRadiusM <= farClipM;
+
         /* A point on a live craft (pivot `livePivot`, turned `liveRotation`) carried to where the craft is drawn. */
         public static DVec3 Carry(DVec3 point, DVec3 livePivot, DQuat liveRotation, DVec3 drawnPivot, DQuat drawnRotation) =>
             drawnPivot + Turn(liveRotation, drawnRotation).Rotate(point - livePivot);

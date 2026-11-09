@@ -179,5 +179,16 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(!into.Contains(9) && !lingering.Contains(9), "a hidden craft that unloads and flies on leaves the set");
 }
 
+{
+    /* KSC at Kerbin looking at Duna: 20 Gm away against a 750 km far plane. */
+    const double DunaR = 320000, DunaMax = 327000, FarClip = 750000;
+    Check(!PictureBoundary.TerrainInReach(2e10, DunaMax, FarClip), "terrain reach: a lens a planet away cannot draw the terrain");
+    Check(PictureBoundary.TerrainInReach(DunaR + 1000, DunaMax, FarClip), "terrain reach: a lens on the ground can");
+    Check(PictureBoundary.TerrainInReach(DunaMax + FarClip, DunaMax, FarClip), "terrain reach: at the far plane exactly, the highest terrain can still draw");
+    Check(!PictureBoundary.TerrainInReach(DunaMax + FarClip + 1, DunaMax, FarClip), "terrain reach: a metre past it, none can");
+    Check(PictureBoundary.TerrainInReach(2e10, DunaMax, 3e10), "terrain reach: a far plane stretched past the planet reaches it, so the camera must hide it");
+    Check(!PictureBoundary.TerrainInReach(double.NaN, DunaMax, FarClip), "terrain reach: an unreadable distance is out of reach");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

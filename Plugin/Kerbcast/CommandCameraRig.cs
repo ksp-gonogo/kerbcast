@@ -603,6 +603,12 @@ namespace Kerbcast
         /* A clone of the far layer covering native-near..just-short-of-the-craft
            once the split is on. Rendered by hand between far and near, so its
            depth value is irrelevant; it inherits clear-depth from Camera 01. */
+        /* The local layers' far planes as they were before any plan stretched them. */
+        public float LocalFarNativeM => Mathf.Max(_nearNativeFar, _hasFar ? _farNativeFar : 0f);
+
+        /* The mid layer's far plane this frame, 0 when it does not render. */
+        public float MidFarNowM => _midCam != null && _plan.MidActive ? _midCam.farClipPlane : 0f;
+
         private Camera BuildMidLayer(Camera far)
         {
             var go = new GameObject($"Kerbcast_{_flightId}_Mid");
