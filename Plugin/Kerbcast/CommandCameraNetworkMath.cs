@@ -128,6 +128,10 @@ namespace Kerbcast
         /* A forecast never looks further ahead than this, in game seconds. */
         public const double ForecastMaxUt = 3600.0;
         public const string DefaultName = "Tracking network";
+
+        /* Whether `caller` may remove a mod's network: its owner may, and one made under no name is anyone's. */
+        public static bool MayDestroyHostNetwork(string owner, string caller) =>
+            string.IsNullOrEmpty(owner) || string.Equals(owner, caller ?? "", StringComparison.Ordinal);
         /* Longest label a vantage shows; a longer one is cut. Labels ride every frame. */
         public const int MaxLabelLength = 64;
 

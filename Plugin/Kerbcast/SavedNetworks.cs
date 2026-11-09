@@ -49,6 +49,33 @@ namespace Kerbcast
 
         /* The camera must be rebuilt for this change: its name is in the manifest. */
         public static bool NeedsRebuild(SavedNetwork before, SavedNetwork after) => before.Name != after.Name;
+
+        /*
+         * How an edit reaches the running camera. A browser may edit under a
+         * held command lock, but the live aim stays the holder's: the edit is
+         * stored, its watch is not applied, and a rebuild keeps what the
+         * holder set.
+         */
+        public static SavedNetworkEditPlan PlanEdit(SavedNetwork before, SavedNetwork after, bool running, bool lockHeld)
+        {
+            bool rebuild = NeedsRebuild(before, after) || !running;
+            return new SavedNetworkEditPlan
+            {
+                Rebuild = rebuild,
+                ApplyWatch = !rebuild && !lockHeld && before.WatchPersistentId != after.WatchPersistentId,
+                CarryLiveAim = lockHeld,
+            };
+        }
+    }
+
+    internal struct SavedNetworkEditPlan
+    {
+        /* The camera is destroyed and started again under its flightId. */
+        public bool Rebuild;
+        /* The edited watch becomes the camera's live aim. */
+        public bool ApplyWatch;
+        /* A rebuild restores the camera's current aim and zoom rather than starting on the saved watch. */
+        public bool CarryLiveAim;
     }
 
     /* The answer to one save or delete, sent back by the client's token. */
@@ -104,9 +131,16 @@ namespace Kerbcast
             return null;
         }
 
+        /* A token keeps one entry: a repeat replaces it with a strictly later atMs, which is how the sidecar tells a new answer from one it has sent. */
         public void Record(SavedNetworkOutcome outcome, long atMs)
         {
             if (string.IsNullOrEmpty(outcome.Token)) return;
+            int earlier = _outcomes.FindIndex(o => o.Token == outcome.Token);
+            if (earlier >= 0)
+            {
+                atMs = Math.Max(atMs, _outcomes[earlier].AtMs + 1);
+                _outcomes.RemoveAt(earlier);
+            }
             outcome.AtMs = atMs;
             _outcomes.Add(outcome);
             if (_outcomes.Count > OutcomesKept) _outcomes.RemoveAt(0);
@@ -193,13 +227,58 @@ namespace Kerbcast
         }
 
         /* A viewer pointed the network's camera at a craft (or back at the active vessel): the saved watch follows. True when it changed. */
-        public bool SetWatch(uint flightId, uint persistentId)
+        public bool SetWatch(uint flightId, uint persistentId) => SetWatch(flightId, persistentId, out _, out _);
+
+        /* SetWatch with what Undo needs if the change cannot be kept. */
+        public bool SetWatch(uint flightId, uint persistentId, out SavedNetwork before, out SavedNetwork saved)
         {
-            var n = FindByFlightId(flightId);
-            if (n == null || n.WatchPersistentId == persistentId) return false;
-            n.WatchPersistentId = persistentId;
-            n.Revision++;
+            before = null;
+            saved = FindByFlightId(flightId);
+            if (saved == null || saved.WatchPersistentId == persistentId)
+            {
+                saved = null;
+                return false;
+            }
+            before = Copy(saved);
+            saved.WatchPersistentId = persistentId;
+            saved.Revision++;
             return true;
+        }
+
+        /* Every network with a craft to watch. */
+        public IEnumerable<SavedNetwork> Watching()
+        {
+            foreach (var n in _networks)
+                if (n.WatchPersistentId != 0) yield return n;
+        }
+
+        /*
+         * A dock or claw grab retired `oldPid` into `newPid`: every craft
+         * vantage and watch on it follows. Like a retarget it bumps only
+         * Revision, so a form already open is not made stale. True when
+         * anything changed. KSP announces each merge twice; the second finds
+         * nothing to move.
+         */
+        public bool FollowMerge(uint oldPid, uint newPid)
+        {
+            if (oldPid == 0 || newPid == 0 || oldPid == newPid) return false;
+            bool any = false;
+            foreach (var n in _networks)
+            {
+                bool changed = n.WatchPersistentId == oldPid;
+                if (changed) n.WatchPersistentId = newPid;
+                for (int i = 0; i < n.Vantages.Count; i++)
+                {
+                    var sv = n.Vantages[i];
+                    if (sv.Vantage.Kind != CommandVantageKind.Vessel || sv.Vantage.PersistentId != oldPid) continue;
+                    n.Vantages[i] = new SavedVantage { Vantage = CommandVantage.Vessel(newPid), Label = sv.Label, Fallback = sv.Fallback };
+                    changed = true;
+                }
+                if (!changed) continue;
+                n.Revision++;
+                any = true;
+            }
+            return any;
         }
 
         /* [code, text] when the request cannot be saved, else null. */
@@ -691,6 +770,70 @@ namespace Kerbcast
     }
 
     /*
+     * The save and delete tokens seen this game session and each one's last
+     * answer. A request carried into the next scene is not applied twice, and
+     * a client retrying a token still hears back, even from an earlier scene.
+     */
+    internal sealed class SavedNetworkTokens
+    {
+        private readonly int _kept;
+        private readonly Queue<string> _order = new Queue<string>();
+        private readonly Dictionary<string, SavedNetworkOutcome> _seen = new Dictionary<string, SavedNetworkOutcome>(StringComparer.Ordinal);
+
+        public SavedNetworkTokens(int kept) { _kept = kept; }
+
+        /* False when the token was claimed before. An empty token is never remembered. */
+        public bool Claim(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return true;
+            if (_seen.ContainsKey(token)) return false;
+            _seen[token] = default;
+            _order.Enqueue(token);
+            while (_order.Count > _kept) _seen.Remove(_order.Dequeue());
+            return true;
+        }
+
+        public void Remember(SavedNetworkOutcome outcome)
+        {
+            if (!string.IsNullOrEmpty(outcome.Token) && _seen.ContainsKey(outcome.Token)) _seen[outcome.Token] = outcome;
+        }
+
+        public bool TryLast(string token, out SavedNetworkOutcome outcome)
+        {
+            outcome = default;
+            return !string.IsNullOrEmpty(token) && _seen.TryGetValue(token, out outcome) && outcome.Token != null;
+        }
+    }
+
+    /*
+     * When global.networks.json is rewritten: only when its text changes or
+     * a change asks for it, and never after Stop, whose read-only listing
+     * must stand until the next scene writes its own.
+     */
+    internal sealed class SavedNetworkPublisher
+    {
+        private readonly Func<string, bool> _write;
+        private string _written;
+
+        public bool Stopped { get; private set; }
+
+        public SavedNetworkPublisher(Func<string, bool> write) { _write = write; }
+
+        public void Publish(string json, bool force)
+        {
+            if (Stopped || (!force && json == _written)) return;
+            if (_write(json)) _written = json;
+        }
+
+        public void Stop(string json)
+        {
+            if (Stopped) return;
+            Stopped = true;
+            if (_write(json)) _written = json;
+        }
+    }
+
+    /*
      * networks.cfg on disk. A save writes a flushed .tmp and swaps it in,
      * keeping the last file as .bak, so a crash at any point leaves a whole
      * file to load. Unity-free, so each case is tested without the game.
@@ -757,10 +900,12 @@ namespace Kerbcast
             }
         }
 
+        /* Null only for a file that is not there. Any other read error reaches the caller: taking it for a missing file would recover an older spare and later save over the real one. */
         private static string ReadOrNull(string path)
         {
             try { return System.IO.File.Exists(path) ? System.IO.File.ReadAllText(path) : null; }
-            catch (System.IO.IOException) { return null; }
+            catch (System.IO.FileNotFoundException) { return null; }
+            catch (System.IO.DirectoryNotFoundException) { return null; }
         }
     }
 }

@@ -22,16 +22,14 @@ namespace Kerbcast
         private const float JsonCheckSeconds = 1f;
         private const int TokensKept = 256;
 
-        /* Tokens applied in this game session, so a request carried into the next scene is not applied twice. */
-        private static readonly Queue<string> AppliedOrder = new Queue<string>();
-        private static readonly HashSet<string> Applied = new HashSet<string>(StringComparer.Ordinal);
+        private static readonly SavedNetworkTokens Tokens = new SavedNetworkTokens(TokensKept);
 
         private readonly string _jsonPath;
         private readonly string _cfgPath;
         private SavedNetworkSet _set = new SavedNetworkSet();
         /* The file is there but could not be read: saving now would replace it, so saves are refused. */
         private bool _unreadable;
-        private string _jsonWritten;
+        private readonly SavedNetworkPublisher _publisher;
         private float _jsonCooldown;
         private readonly List<CommandCameraProvider.HostNetwork> _hosts = new List<CommandCameraProvider.HostNetwork>();
 
@@ -41,7 +39,12 @@ namespace Kerbcast
             string folder = HighLogic.SaveFolder;
             _cfgPath = string.IsNullOrEmpty(folder) ? null
                 : Path.Combine(KSPUtil.ApplicationRootPath, "saves", folder, "Kerbcast", SavedNetworkSet.FileName);
+            _publisher = new SavedNetworkPublisher(Write);
+            GameEvents.onVesselPersistentIdChanged.Add(OnMerged);
         }
+
+        /* Leaving the scene: no request may change anything now. One that arrives is carried into the next scene. */
+        public bool Stopped => _publisher.Stopped;
 
         public void Load()
         {
@@ -66,11 +69,12 @@ namespace Kerbcast
             foreach (var n in _set.Networks) Start(n);
         }
 
-        private bool Start(SavedNetwork n)
+        /* `carried` restores a lock holder's aim and zoom instead of the saved watch. */
+        private bool Start(SavedNetwork n, LiveAim carried = null)
         {
             try
             {
-                uint id = KerbcastControl.StartSavedNetwork(n, out string error);
+                uint id = KerbcastControl.StartSavedNetwork(n, out string error, carried);
                 if (id != 0) return true;
                 Debug.LogWarning($"{Tag} '{n.Name}' ({n.NetworkId}) not started: {error}");
             }
@@ -85,20 +89,27 @@ namespace Kerbcast
         public bool IsSaved(uint flightId) => _set.FindByFlightId(flightId) != null;
 
         /* False when the token was applied earlier this game session, so a carried-over repeat changes nothing. */
-        public static bool Claim(string token)
-        {
-            if (string.IsNullOrEmpty(token)) return true;
-            if (!Applied.Add(token)) return false;
-            AppliedOrder.Enqueue(token);
-            while (AppliedOrder.Count > TokensKept) Applied.Remove(AppliedOrder.Dequeue());
-            return true;
-        }
+        public static bool Claim(string token) => Tokens.Claim(token);
 
         public void Apply(CommandCameraRequest r, KerbcastCore core)
         {
             var outcome = r.Op == CommandRequestOp.DeleteNetwork ? Delete(r, core) : Save(r, core);
             if (!outcome.Ok) Debug.LogWarning($"{Tag} request {r.Id} refused: {outcome.Code}: {outcome.Text}");
+            Tokens.Remember(outcome);
             _set.Record(outcome, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            Publish(core, force: true);
+        }
+
+        /* A token already applied changes nothing, but the client retrying it hears its answer again. */
+        public void Replay(CommandCameraRequest r, KerbcastCore core)
+        {
+            if (!Tokens.TryLast(r.Token, out var last))
+            {
+                Debug.Log($"{Tag} request {r.Id}: token {r.Token} already claimed, with no answer to repeat");
+                return;
+            }
+            Debug.Log($"{Tag} request {r.Id}: token {r.Token} already applied; answering again");
+            _set.Record(last, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             Publish(core, force: true);
         }
 
@@ -126,15 +137,17 @@ namespace Kerbcast
             }
             var outcome = _set.Save(r, NewId, out var before, out var saved);
             if (!outcome.Ok || saved == null) return outcome;
-            if (!Run(core, before, saved))
+            /* Read before the edit touches the camera, so a revert can restore it too. */
+            LiveAim live = before != null && core.CommandAuthority.Registered ? KerbcastControl.LiveAimOf(saved.FlightId) : null;
+            if (!Run(core, before, saved, live))
             {
-                Revert(core, before, saved);
+                Revert(core, before, saved, live);
                 return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.NotRunning,
                     "the game could not start the network's camera; nothing changed");
             }
             if (!Persist())
             {
-                Revert(core, before, saved);
+                Revert(core, before, saved, live);
                 return SavedNetworkOutcome.Refused(r.Token, r.NetworkId, SavedNetworkCodes.WriteFailed,
                     "the networks file could not be written; nothing changed");
             }
@@ -164,23 +177,41 @@ namespace Kerbcast
         }
 
         /* A saved network's camera after a save: started, changed in place, or rebuilt under the same flightId when its name changed. */
-        private bool Run(KerbcastCore core, SavedNetwork before, SavedNetwork saved)
+        private bool Run(KerbcastCore core, SavedNetwork before, SavedNetwork saved, LiveAim live)
         {
             if (before == null) return Start(saved);
-            if (SavedNetwork.NeedsRebuild(before, saved) || !core.CommandProvider.IsNetwork(saved.FlightId))
+            var plan = SavedNetwork.PlanEdit(before, saved, core.CommandProvider.IsNetwork(saved.FlightId), core.CommandAuthority.Registered);
+            if (plan.Rebuild)
             {
                 core.DestroyCommandCamera(saved.FlightId);
-                return Start(saved);
+                return Start(saved, plan.CarryLiveAim ? live : null);
             }
-            return KerbcastControl.UpdateSavedNetwork(saved, before.WatchPersistentId != saved.WatchPersistentId);
+            return KerbcastControl.UpdateSavedNetwork(saved, plan.ApplyWatch);
         }
 
         /* Puts a save back as it was, camera included. */
-        private void Revert(KerbcastCore core, SavedNetwork before, SavedNetwork saved)
+        private void Revert(KerbcastCore core, SavedNetwork before, SavedNetwork saved, LiveAim live)
         {
             _set.Undo(before, saved);
             core.DestroyCommandCamera(saved.FlightId);
-            if (before != null) Start(saved);
+            if (before != null) Start(saved, live);
+        }
+
+        /* The lock changed and every aim was dropped: a saved network goes back to the craft it is saved to watch. */
+        public void ReapplyWatches()
+        {
+            if (Stopped) return;
+            foreach (var n in _set.Watching()) KerbcastControl.ApplySavedWatch(n);
+        }
+
+        /* The live camera already rides the survivor; this keeps the saved ids from naming a craft that no longer exists. */
+        private void OnMerged(uint oldPid, uint newPid)
+        {
+            if (Stopped || !_set.FollowMerge(oldPid, newPid)) return;
+            Debug.Log($"{Tag} craft {oldPid} merged into {newPid}; saved networks follow");
+            /* A failed write leaves the new ids in memory for the next save: the old id is dead, so there is nothing to go back to. */
+            Persist();
+            _jsonCooldown = 0f;
         }
 
         /*
@@ -188,19 +219,25 @@ namespace Kerbcast
          * aim or a return to the default (the active vessel). A path aim is
          * live only, and the lock owner's aims never come through here.
          */
-        public void ViewerAimed(uint flightId, CommandAimSpec aim, KerbcastCore core)
+        public void ViewerAimed(uint flightId, CommandAimSpec aim, string token, KerbcastCore core)
         {
-            if (!CameraId.IsNetworkId(flightId) || _unreadable) return;
+            if (Stopped || !CameraId.IsNetworkId(flightId) || _unreadable) return;
             if (aim != null && aim.Kind != "vessel") return;
-            if (!_set.SetWatch(flightId, aim?.PersistentId ?? 0)) return;
-            Debug.Log($"{Tag} cam={flightId} retargeted by a viewer; its saved watch follows");
-            Persist();
+            if (!_set.SetWatch(flightId, aim?.PersistentId ?? 0, out var before, out var saved)) return;
+            if (Persist()) Debug.Log($"{Tag} cam={flightId} retargeted by a viewer; its saved watch follows");
+            else
+            {
+                _set.Undo(before, saved);
+                _set.Record(SavedNetworkOutcome.Refused(token, saved.NetworkId, SavedNetworkCodes.WriteFailed,
+                    "the networks file could not be written; the saved watch is unchanged"), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            }
             Publish(core, force: true);
         }
 
         /* Once a second, and at once after a change: the file is rewritten only when it differs. */
         public void Tick(KerbcastCore core)
         {
+            if (Stopped) return;
             _jsonCooldown -= Time.unscaledDeltaTime;
             if (_jsonCooldown > 0f) return;
             Publish(core, force: false);
@@ -209,11 +246,14 @@ namespace Kerbcast
         /* Leaving the scene: nothing runs and nothing can be saved until the next one starts. */
         public void Stop()
         {
-            Write(_set.Json(_ => false, null, editable: false));
+            if (Stopped) return;
+            GameEvents.onVesselPersistentIdChanged.Remove(OnMerged);
+            _publisher.Stop(_set.Json(_ => false, null, editable: false));
         }
 
         private void Publish(KerbcastCore core, bool force)
         {
+            if (Stopped) return;
             _jsonCooldown = JsonCheckSeconds;
             var provider = core.CommandProvider;
             var hosts = new List<SavedNetwork>();
@@ -223,8 +263,7 @@ namespace Kerbcast
                 foreach (var h in _hosts) hosts.Add(HostDefinition(h));
             }
             string json = _set.Json(id => provider != null && provider.IsNetwork(id), hosts, editable: !_unreadable && _cfgPath != null);
-            if (!force && json == _jsonWritten) return;
-            Write(json);
+            _publisher.Publish(json, force);
         }
 
         private static SavedNetwork HostDefinition(CommandCameraProvider.HostNetwork h)
@@ -247,7 +286,7 @@ namespace Kerbcast
             return n;
         }
 
-        private void Write(string json)
+        private bool Write(string json)
         {
             try
             {
@@ -255,11 +294,12 @@ namespace Kerbcast
                 File.WriteAllText(tmp, json);
                 if (File.Exists(_jsonPath)) File.Delete(_jsonPath);
                 File.Move(tmp, _jsonPath);
-                _jsonWritten = json;
+                return true;
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"{Tag} {_jsonPath} write failed: {ex.Message}");
+                return false;
             }
         }
 

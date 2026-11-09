@@ -175,6 +175,7 @@ namespace Kerbcast
                     return req;
                 case "aim":
                     req.Op = CommandRequestOp.Aim;
+                    req.Token = Str(o, "token");
                     req.FlightId = U32(o, "flightId");
                     req.Aim = AimFrom(Obj(o, "aim"));
                     return req;

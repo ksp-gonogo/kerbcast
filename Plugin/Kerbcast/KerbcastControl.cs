@@ -101,8 +101,9 @@ namespace Kerbcast
            the same lock as Kerbcast.API's ICommand.TakeLock, without its
            options. While it is held, SetCommandAim accepts only calls that pass
            `owner`; everyone else is refused, browser clients included. Taking
-           it returns every feed to its default aim, and under the lock a
-           feed's default has no subject: it holds pose. The lock holds until
+           it returns every feed to its default aim (a saved network to its
+           saved watch), and under the lock a feed's default has no subject: it
+           holds pose. The lock holds until
            ClearCommandAuthority or a scene change, and never times out: take
            it again on each scene load. It fails closed: if `owner` makes no
            call (this, SetCommandAim with its owner, or SetCommandBlank) for 5 s
@@ -128,8 +129,8 @@ namespace Kerbcast
         }
 
         /* Takes or renews the scene's one lock. Taking it starts a new tenure,
-           returns every feed to its default aim and leaves each default with
-           no subject. */
+           returns every feed to its default aim (a saved network to its saved
+           watch) and leaves each default with no subject. */
         internal static Api.LockResult TakeLockCore(string owner, Api.LockOptions options, string silentText)
         {
             var core = KerbcastCore.Instance;
@@ -165,7 +166,7 @@ namespace Kerbcast
             return true;
         }
 
-        /* Every aim dropped, and every feed's request resolved again for what the lock now allows. */
+        /* Every aim dropped, every feed's request resolved again for what the lock now allows, and every saved network's watch put back. */
         static void ResetFeeds(KerbcastCore core)
         {
             core.CommandAuthority?.ClearOptics();
@@ -174,11 +175,12 @@ namespace Kerbcast
                 if (cams[i] is KerbcastCamera c && c.Rig is CommandCameraRig gr) gr.SetAim(null, null);
             core.CommandProvider?.ClearPendingAims();
             core.CommandProvider?.RefreshSubjects();
+            core.ReapplySavedWatches();
         }
 
         /* Releases `owner`'s lock. Every command feed returns to its default
-           aim: no aim set before or during the lock is restored. Ignored for
-           any other owner. */
+           aim, a saved network to its saved watch: no other aim set before or
+           during the lock is restored. Ignored for any other owner. */
         public static void ClearCommandAuthority(string owner) => ReleaseLockCore(owner);
 
         /* The command feeds in this scene, empty when there are none. */
@@ -544,7 +546,7 @@ namespace Kerbcast
             if (core == null || provider == null) return Api.NetworkResult.NotRunning;
             var refused = NetworkLock(core, owner);
             if (refused != Api.NetworkResult.Unknown) return refused;
-            if (!provider.IsNetwork(flightId) || core.IsSavedNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
+            if (!provider.IsNetwork(flightId) || core.IsSavedNetwork(flightId) || provider.OwnedByOther(flightId, owner)) return Api.NetworkResult.NotCommandFeed;
             return core.DestroyCommandCamera(flightId) ? Api.NetworkResult.Ok : Api.NetworkResult.NotCommandFeed;
         }
 
@@ -557,7 +559,7 @@ namespace Kerbcast
          * its own site knows. A craft no longer in the game leaves the camera
          * on its default craft.
          */
-        internal static uint StartSavedNetwork(SavedNetwork n, out string error)
+        internal static uint StartSavedNetwork(SavedNetwork n, out string error, LiveAim carried = null)
         {
             error = null;
             var core = KerbcastCore.Instance;
@@ -570,14 +572,22 @@ namespace Kerbcast
             var specs = new List<NetworkVantageSpec>(n.Vantages.Count);
             foreach (var v in n.Vantages)
                 specs.Add(new NetworkVantageSpec { Vantage = v.Vantage, Label = v.Label, Fallback = v.Fallback });
-            CommandAim aim = null;
-            if (n.WatchPersistentId != 0)
+            CommandAim aim = carried?.Aim;
+            if (carried == null && n.WatchPersistentId != 0)
             {
                 if (CommandCameraSite.VantageExists(n.WatchPersistentId)) aim = CommandAim.Vessel(n.WatchPersistentId);
                 else Debug.LogWarning($"[Kerbcast][CMDCAM] saved network '{n.Name}' watches craft {n.WatchPersistentId}, which no longer exists; "
                     + "it watches the active vessel until edited");
             }
-            return provider.CreateSavedNetwork(n.FlightId, specs, n.Name, n.Tuning, aim, core.CameraFlightIds(), out error);
+            return provider.CreateSavedNetwork(n.FlightId, specs, n.Name, n.Tuning, aim, core.CameraFlightIds(), out error,
+                carried?.Orbit, carried?.Fov ?? double.NaN);
+        }
+
+        /* A camera's aim and held zoom now, built or waiting to be; null when there is no such camera. */
+        internal static LiveAim LiveAimOf(uint flightId)
+        {
+            if (Find(flightId)?.Rig is CommandCameraRig gr) return new LiveAim { Aim = gr.Aim, Orbit = gr.AimOrbit, Fov = gr.HeldFov };
+            return KerbcastCore.Instance?.CommandProvider?.PendingLiveAim(flightId);
         }
 
         /* A saved network's new list and options on its running camera, and its watch when that changed. False when it is not running here. */
@@ -594,12 +604,17 @@ namespace Kerbcast
                 Debug.LogWarning($"[Kerbcast][CMDCAM] saved network '{n.Name}' cam={n.FlightId}: {error}");
                 return false;
             }
-            if (!watchChanged) return true;
+            if (watchChanged) ApplySavedWatch(n);
+            return true;
+        }
+
+        /* Points a saved network's camera at its watch, or at its default when the craft is gone. Ignores the lock, as StartSavedNetwork does. */
+        internal static void ApplySavedWatch(SavedNetwork n)
+        {
             CommandAim aim = n.WatchPersistentId != 0 && CommandCameraSite.VantageExists(n.WatchPersistentId)
                 ? CommandAim.Vessel(n.WatchPersistentId) : null;
             if (Find(n.FlightId)?.Rig is CommandCameraRig gr) gr.SetAim(aim, null);
-            else provider.SetPendingAim(n.FlightId, aim, null);
-            return true;
+            else KerbcastCore.Instance?.CommandProvider?.SetPendingAim(n.FlightId, aim, null);
         }
 
         /* NotLockHolder for anyone but a held lock's owner, else Unknown, after the holder's heartbeat. */
@@ -621,11 +636,11 @@ namespace Kerbcast
 
         /* Removes a command camera CreateCommandCamera (or a client) made,
            built or not; its feed ends. False for the settings-driven camera, a
-           network a player saved with the game, or an unknown id, so a
-           repeated call is harmless. */
+           network a player saved with the game, a network a mod made under
+           its own name, or an unknown id, so a repeated call is harmless. */
         public static bool DestroyCommandCamera(uint flightId)
         {
-            if (CommandAuthorityOwner != null || (KerbcastCore.Instance?.IsSavedNetwork(flightId) ?? false)) return false;
+            if (CommandAuthorityOwner != null || !MayDestroy(flightId, null)) return false;
             return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
         }
 
@@ -634,8 +649,15 @@ namespace Kerbcast
         {
             var auth = KerbcastCore.Instance?.CommandAuthority;
             if (auth != null && auth.Registered && HeldBy(owner) == null) return false;
-            if (KerbcastCore.Instance?.IsSavedNetwork(flightId) ?? false) return false;
+            if (!MayDestroy(flightId, owner)) return false;
             return KerbcastCore.Instance?.DestroyCommandCamera(flightId) ?? false;
+        }
+
+        /* Not a player's saved network, and not a network another mod made. */
+        static bool MayDestroy(uint flightId, string caller)
+        {
+            var core = KerbcastCore.Instance;
+            return core != null && !core.IsSavedNetwork(flightId) && !(core.CommandProvider?.OwnedByOther(flightId, caller) ?? false);
         }
 
         /* A client's aim as a CommandAim; call only once spec.Invalid() is null. */

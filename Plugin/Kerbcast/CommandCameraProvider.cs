@@ -7,6 +7,14 @@ using Time = UnityEngine.Time;
 
 namespace Kerbcast
 {
+    /* A camera's aim and held zoom (NaN for none), carried across a rebuild made under a held command lock. */
+    internal sealed class LiveAim
+    {
+        public CommandAim Aim;
+        public Orbit Orbit;
+        public double Fov = double.NaN;
+    }
+
     /* The scene's command cameras: the default one from settings, when
        EnableCommandCamera is on, plus any created at runtime through
        KerbcastControl.CreateCommandCamera or a client.
@@ -105,13 +113,14 @@ namespace Kerbcast
 
         /* A saved network's camera, under the flightId its slot fixes (CameraId.NetworkWireId). 0 with `error` set when that id is in use or the list is refused. */
         public uint CreateSavedNetwork(uint flightId, IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning, CommandAim aim,
-            IReadOnlyCollection<uint> taken, out string error)
+            IReadOnlyCollection<uint> taken, out string error, Orbit aimOrbit = null, double heldFov = double.NaN)
         {
             error = NetworkInvalid(vantages, tuning);
             if (error == null && (taken.Contains(flightId) || _feeds.Any(f => f.FlightId == flightId))) error = $"cam={flightId} is already in use";
             if (error != null) return 0;
             var feed = new Feed(this, null, name, "", flightId, new List<NetworkVantageSpec>(vantages), tuning);
-            if (aim != null) feed.SetAim(aim, null);
+            if (aim != null) feed.SetAim(aim, aimOrbit);
+            feed.PendingFov = heldFov;
             _feeds.Add(feed);
             Debug.Log($"[Kerbcast][CMDCAM] saved network camera cam={flightId} requested over {vantages.Count} vantage(s) name='{name}'");
             return flightId;
@@ -192,6 +201,13 @@ namespace Kerbcast
 
         public bool IsCreated(uint flightId) => _feeds.Any(f => f.Created && f.FlightId == flightId);
 
+        /* A network a mod made through the API, which a browser may never remove. */
+        public bool IsHostNetwork(uint flightId) => _feeds.Any(f => f.IsNetwork && f.Owner != null && f.FlightId == flightId);
+
+        /* A mod's network that `caller` is not the owner of (see NetworkMath.MayDestroyHostNetwork). */
+        public bool OwnedByOther(uint flightId, string caller) =>
+            _feeds.Any(f => f.IsNetwork && f.Owner != null && f.FlightId == flightId && !NetworkMath.MayDestroyHostNetwork(f.Owner, caller));
+
         /* The default camera lost the craft it rode: its site is resolved
            afresh from settings on the next enumeration, so it lands on the
            home station unless a craft with the configured name still exists,
@@ -228,6 +244,13 @@ namespace Kerbcast
         {
             foreach (var f in _feeds)
                 if (!f.Built) f.SetAim(null, null);
+        }
+
+        /* The aim waiting for a created camera that is not built yet; null when it is built or unknown. */
+        public LiveAim PendingLiveAim(uint flightId)
+        {
+            var feed = _feeds.FirstOrDefault(f => f.Created && f.FlightId == flightId && !f.Built);
+            return feed == null ? null : new LiveAim { Aim = feed.PendingAim, Orbit = feed.PendingOrbit, Fov = feed.PendingFov };
         }
 
         /* An aim set before a created camera is built, applied when it is. */
@@ -284,6 +307,10 @@ namespace Kerbcast
 
             private CommandAim _pendingAim;
             private Orbit _pendingOrbit;
+            public CommandAim PendingAim => _pendingAim;
+            public Orbit PendingOrbit => _pendingOrbit;
+            /* A held zoom carried across a rebuild, applied after the aim; any new aim replaces it, as it does on a built rig. */
+            public double PendingFov { get; set; } = double.NaN;
 
             /* Which craft the feed watches, resolved by _known and drawn by
                _drawn. Under truth both read KSP's handles for it in _track. */
@@ -327,6 +354,7 @@ namespace Kerbcast
             {
                 _pendingAim = aim;
                 _pendingOrbit = orbit;
+                PendingFov = double.NaN;
                 uint subject = aim?.SubjectPersistentId ?? 0;
                 if (_selection != null && subject != _selection.ChosenPersistentId) _selection.Choose(subject);
             }
@@ -491,9 +519,11 @@ namespace Kerbcast
                         /* A network's aim was checked against every vantage when it was set; one site's verdict never drops it. */
                         if (_pendingAim != null && store.Governed && !IsNetwork && !PendingAimStands(_site.NodeName)) SetAim(null, null);
                         if (_pendingAim != null) rig.SetAim(_pendingAim, _pendingOrbit);
+                        if (!double.IsNaN(PendingFov)) rig.SetFov(PendingFov);
                         /* Applied once: a rebuilt camera must not bring back an aim from before a lock. */
                         _pendingAim = null;
                         _pendingOrbit = null;
+                        PendingFov = double.NaN;
                     }
                     catch
                     {

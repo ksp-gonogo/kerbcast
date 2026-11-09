@@ -251,6 +251,7 @@ namespace Kerbcast
         /* Where the camera points; null for its default craft. */
         public CommandAim Aim => _aim;
         internal Orbit AimOrbit => _aimOrbit;
+        internal double HeldFov => _heldFov;
 
         /* The craft this lens rides no longer exists (crashed, recovered, or
            gone some way other than a merge, which the lens follows). */

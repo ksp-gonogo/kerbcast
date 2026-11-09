@@ -683,6 +683,8 @@ namespace Kerbcast
         /* A network a player saved with the game, which no mod may change. */
         internal bool IsSavedNetwork(uint flightId) => _networks != null && _networks.IsSaved(flightId);
 
+        internal void ReapplySavedWatches() => _networks?.ReapplyWatches();
+
         private void SeedCommandRequests()
         {
             try
@@ -849,8 +851,10 @@ namespace Kerbcast
             /* Saved networks are the player's setup, not a live request, so a held lock does not refuse them. */
             if (r.IsNetworkOp)
             {
-                if (!NetworkStore.Claim(r.Token))
-                    Debug.Log($"[Kerbcast][NETWORK] client request {r.Id}: token {r.Token} already applied; ignored");
+                /* Not claimed, so the next scene's carry-over can still apply it. */
+                if (_networks != null && _networks.Stopped)
+                    Debug.Log($"[Kerbcast][NETWORK] client request {r.Id}: the scene is ending; left for the next one");
+                else if (!NetworkStore.Claim(r.Token)) _networks?.Replay(r, this);
                 else _networks?.Apply(r, this);
                 return;
             }
@@ -884,6 +888,8 @@ namespace Kerbcast
                 case CommandRequestOp.Destroy:
                     if (_networks != null && _networks.IsSaved(r.FlightId))
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is a saved network; deleting the network ends it");
+                    else if (_commandProvider.IsHostNetwork(r.FlightId))
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is a network a mod made; only it can remove it");
                     else if (!DestroyCommandCamera(r.FlightId))
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is not a created command camera; nothing destroyed");
                     return;
@@ -896,7 +902,7 @@ namespace Kerbcast
                         r.Aim != null ? KerbcastControl.AimOf(r.Aim) : null);
                     if (!ok)
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: aim for cam={r.FlightId} refused{(why != null ? ": " + why : "")}");
-                    else _networks?.ViewerAimed(r.FlightId, r.Aim, this);
+                    else _networks?.ViewerAimed(r.FlightId, r.Aim, r.Token, this);
                     return;
                 }
             }
@@ -2204,6 +2210,7 @@ namespace Kerbcast
                 KerbcastApiImpl.Stop();
             }
             EndSceneLock();
+            _networks?.Stop();
             CommandAuthority.WorldModel.Close();
 
             // ALWAYS restore the main flight cameras on scene exit so a

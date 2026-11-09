@@ -424,6 +424,108 @@ finally { Directory.Delete(signalDir, true); }
         "a truncated file is unreadable, so nothing saves over it");
     File.WriteAllText(path, "just some text");
     Check(SavedNetworkFile.Load(path, null, out _) == SavedNetworkFile.LoadResult.Unreadable, "a garbage file is unreadable");
+
+    /* A read that fails is not a missing file: the real file must not be replaced by an older spare. */
+    File.WriteAllText(path, set.ToCfg());
+    File.WriteAllText(path + ".bak", firstText);
+    bool lockedThrew = false;
+    using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    {
+        try { SavedNetworkFile.Load(path, null, out _); }
+        catch (IOException) { lockedThrew = true; }
+    }
+    Check(lockedThrew, "a transient read error reaches the caller, which goes read only");
+    File.Delete(path);
+    File.WriteAllText(path + ".bak", firstText);
+    Check(SavedNetworkFile.Load(path, null, out var stillRecovers) == SavedNetworkFile.LoadResult.Ok && stillRecovers.Networks.Count > 0,
+        "a file truly missing still recovers from its spare");
+
+    /* An edit under a held lock is stored, but the live aim is the holder's. */
+    var planA = new SavedNetwork { Name = "A", WatchPersistentId = 1 };
+    var planWatch = new SavedNetwork { Name = "A", WatchPersistentId = 2 };
+    var planName = new SavedNetwork { Name = "B", WatchPersistentId = 1 };
+    var freePlan = SavedNetwork.PlanEdit(planA, planWatch, running: true, lockHeld: false);
+    Check(!freePlan.Rebuild && freePlan.ApplyWatch && !freePlan.CarryLiveAim, "without a lock a changed watch is aimed at at once");
+    var heldPlan = SavedNetwork.PlanEdit(planA, planWatch, running: true, lockHeld: true);
+    Check(!heldPlan.Rebuild && !heldPlan.ApplyWatch, "under a held lock a changed watch is stored, not aimed at");
+    var heldRename = SavedNetwork.PlanEdit(planA, planName, running: true, lockHeld: true);
+    Check(heldRename.Rebuild && heldRename.CarryLiveAim && !heldRename.ApplyWatch, "a rename under a held lock rebuilds and keeps the holder's aim");
+    var freeRename = SavedNetwork.PlanEdit(planA, planName, running: true, lockHeld: false);
+    Check(freeRename.Rebuild && !freeRename.CarryLiveAim, "a rename without a lock starts on the saved watch");
+    Check(SavedNetwork.PlanEdit(planA, planA, running: false, lockHeld: false).Rebuild, "a camera not running is started");
+
+    /* Docking retires a craft's id: saved vantages and the watch follow into the survivor. */
+    var mergeSet = new SavedNetworkSet();
+    string craftList = "[{\"vantage\":{\"kind\":\"vessel\",\"persistentId\":77},\"label\":\"Relay\",\"fallback\":true},{\"vantage\":{\"kind\":\"station\",\"station\":\"KSC\"}}]";
+    mergeSet.Save(One(Save(vantages: craftList, watch: "{\"kind\":\"vessel\",\"persistentId\":88}")), newId, out _, out var mergeNet);
+    uint mergeRevBefore = mergeNet.Revision, contentBefore = mergeNet.ContentRevision;
+    Check(!mergeSet.FollowMerge(5, 6) && mergeNet.Revision == mergeRevBefore, "a merge of craft no network names changes nothing");
+    Check(mergeSet.FollowMerge(77, 99) && mergeNet.Vantages[0].Vantage.PersistentId == 99 && mergeNet.Vantages[0].Label == "Relay" && mergeNet.Vantages[0].Fallback
+        && mergeNet.WatchPersistentId == 88 && mergeNet.Revision == mergeRevBefore + 1 && mergeNet.ContentRevision == contentBefore,
+        "a merged craft vantage follows the survivor, keeping its label and fallback, and leaves open forms valid");
+    Check(!mergeSet.FollowMerge(77, 99), "KSP's second announcement of a merge is a no-op");
+    Check(mergeSet.FollowMerge(88, 99) && mergeNet.WatchPersistentId == 99, "a watch on the merged craft follows it");
+    Check(!mergeSet.FollowMerge(0, 99) && !mergeSet.FollowMerge(99, 0) && !mergeSet.FollowMerge(99, 99), "a merge with no craft or into itself is ignored");
+    SavedNetworkSet.TryFromCfg(mergeSet.ToCfg(), null, out var mergeReload);
+    Check(mergeReload.Networks[0].Vantages[0].Vantage.PersistentId == 99 && mergeReload.Networks[0].WatchPersistentId == 99, "the followed ids reach the file");
+    Check(System.Linq.Enumerable.Count(mergeSet.Watching()) == 1, "a network with a craft to watch is put back after a lock change");
+    mergeSet.SetWatch(mergeNet.FlightId, 0);
+    Check(System.Linq.Enumerable.Count(mergeSet.Watching()) == 0, "a network on the active vessel has no watch to put back");
+
+    /* A retarget that cannot be written is undone and answered. */
+    mergeSet.SetWatch(mergeNet.FlightId, 321);
+    uint aimedRev = mergeNet.Revision;
+    Check(mergeSet.SetWatch(mergeNet.FlightId, 654, out var aimBefore, out var aimSaved) && mergeNet.WatchPersistentId == 654, "a retarget changes the watch");
+    mergeSet.Undo(aimBefore, aimSaved);
+    Check(mergeNet.WatchPersistentId == 321 && mergeNet.Revision == aimedRev, "a retarget undone restores its watch and revision");
+    Check(!mergeSet.SetWatch(mergeNet.FlightId, 321, out var noBefore, out var noSaved) && noBefore == null && noSaved == null, "no change has nothing to undo");
+    Check(One("{\"requests\":[{\"id\":1,\"op\":\"aim\",\"token\":\"a1\",\"flightId\":5}]}").Token == "a1", "an aim's token is read, so a failed retarget can be answered");
+
+    /* A retried token hears its answer again, with a later atMs, from any scene. */
+    var seenTokens = new SavedNetworkTokens(2);
+    Check(seenTokens.Claim("t1") && !seenTokens.Claim("t1") && seenTokens.Claim(""), "a token is claimed once; an empty token never counts");
+    Check(!seenTokens.TryLast("t1", out _), "no answer to repeat before one is decided");
+    seenTokens.Remember(new SavedNetworkOutcome { Token = "t1", Ok = true, NetworkId = "n9" });
+    Check(seenTokens.TryLast("t1", out var lastAnswer) && lastAnswer.Ok && lastAnswer.NetworkId == "n9", "the last answer is kept for its token");
+    seenTokens.Remember(new SavedNetworkOutcome { Token = "never-claimed", Ok = true });
+    Check(!seenTokens.TryLast("never-claimed", out _), "an unclaimed token keeps nothing");
+    seenTokens.Claim("t2");
+    seenTokens.Claim("t3");
+    Check(!seenTokens.TryLast("t1", out _) && seenTokens.Claim("t1"), "the oldest token is forgotten past the limit");
+    var replaySet = new SavedNetworkSet();
+    var replayOutcome = new SavedNetworkOutcome { Token = "r1", Ok = false, NetworkId = "n1", Code = "stale", Text = "old" };
+    replaySet.Record(replayOutcome, 1000);
+    replaySet.Record(replayOutcome, 1000);
+    Check(replaySet.Outcomes.Count == 1 && replaySet.Outcomes[0].AtMs == 1001, "a repeat replaces its entry with a strictly later atMs");
+    replaySet.Record(replayOutcome, 5000);
+    Check(replaySet.Outcomes.Count == 1 && replaySet.Outcomes[0].AtMs == 5000 && replaySet.Json(_ => false, null, true).Contains("\"atMs\":5000"),
+        "the repeat is published with its new atMs");
+
+    /* The listing written at Stop stands until the next scene. */
+    var writes = new List<string>();
+    bool writeWorks = true;
+    var publisher = new SavedNetworkPublisher(j => { if (writeWorks) writes.Add(j); return writeWorks; });
+    publisher.Publish("a", force: false);
+    publisher.Publish("a", force: false);
+    Check(writes.Count == 1, "the file is rewritten only when it differs");
+    publisher.Publish("a", force: true);
+    Check(writes.Count == 2, "a change can force a rewrite");
+    writeWorks = false;
+    publisher.Publish("b", force: false);
+    writeWorks = true;
+    publisher.Publish("b", force: false);
+    Check(writes.Count == 3 && writes[2] == "b", "a failed write is tried again");
+    publisher.Stop("stopped");
+    publisher.Stop("stopped again");
+    Check(publisher.Stopped && writes.Count == 4 && writes[3] == "stopped", "Stop writes once");
+    publisher.Publish("editable", force: false);
+    publisher.Publish("editable", force: true);
+    Check(writes.Count == 4, "nothing rewrites the file after Stop");
+
+    Check(NetworkMath.MayDestroyHostNetwork("modA", "modA"), "a mod may remove its own network");
+    Check(!NetworkMath.MayDestroyHostNetwork("modA", "modB") && !NetworkMath.MayDestroyHostNetwork("modA", null), "no other caller may remove it");
+    Check(NetworkMath.MayDestroyHostNetwork("", null) && NetworkMath.MayDestroyHostNetwork("", "modB"), "a network made under no name can be removed by anyone");
+
     Directory.Delete(netDir, true);
 }
 
