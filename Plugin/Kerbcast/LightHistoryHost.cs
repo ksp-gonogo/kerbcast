@@ -131,9 +131,10 @@ namespace Kerbcast
                 Debug.Log($"{Tag} dev marker {marker} present, devLightSpeedMps not set: no light speed");
                 return;
             }
-            History.SetLightSpeed(mps);
+            History.SetDevLightSpeed(mps);
             Debug.LogWarning($"{Tag} DEV LIGHT SPEED ON: {mps} m/s from devLightSpeedMps, because {marker} exists. "
-                + "Kerbcast cameras draw craft and bodies where their arriving light left them, once it is more than a frame old. Delete the marker for normal play.");
+                + "Kerbcast cameras draw craft and bodies where their arriving light left them, once it is more than a frame old. "
+                + "A mod holding the camera lock overrides it only while it sets a speed of its own. Delete the marker for normal play.");
         }
 
         private void OnDestroy()

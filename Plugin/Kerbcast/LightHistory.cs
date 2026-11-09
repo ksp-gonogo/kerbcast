@@ -260,6 +260,8 @@ namespace Kerbcast
         private long _capBlockedAt = -1;
         private bool _reservation;
         private double? _lightSpeed;
+        private double? _heldSpeed;
+        private double? _devSpeed;
 
         /* Raised when time went back and the ring dropped what came after. */
         public event Action<double> Rewound;
@@ -303,10 +305,30 @@ namespace Kerbcast
             OnActiveChanged(was);
         }
 
-        /* For ICommand.SetLightSpeed: null clears it. */
+        /* For ICommand.SetLightSpeed: null clears it, leaving the dev speed if one is set. */
         internal void SetLightSpeed(double? mps)
         {
-            if (mps.HasValue && !(mps.Value > 0)) mps = null;
+            _heldSpeed = Positive(mps);
+            ApplyLightSpeed();
+        }
+
+        /*
+         * The dev marker's speed, which stands whenever the lock holder sets
+         * none: a holder that takes the lock with its delay off, or lets it
+         * go, must not end a dev run's light speed. A holder's own speed
+         * still wins while it is set.
+         */
+        internal void SetDevLightSpeed(double? mps)
+        {
+            _devSpeed = Positive(mps);
+            ApplyLightSpeed();
+        }
+
+        private static double? Positive(double? mps) => mps.HasValue && mps.Value > 0 ? mps : null;
+
+        private void ApplyLightSpeed()
+        {
+            var mps = _heldSpeed ?? _devSpeed;
             bool was = Active;
             _lightSpeed = mps;
             if (mps.HasValue && (!SlowestLightSpeed.HasValue || mps.Value < SlowestLightSpeed.Value))
