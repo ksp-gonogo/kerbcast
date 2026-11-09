@@ -202,6 +202,10 @@ quality follows how large it is shown (pass `reportSize={false}` to opt out).
   avoid flashing an out-of-flight state on connect.
 - `useKerbcastClock(): { captureUt, epoch, warpRate }`. The sidecar's
   mission-time capture clock, for aligning playout to sim time.
+- `useLensLevels(): LensLevelsPayload | null`. The command camera lenses
+  in the loaded save: the ground lens per Tracking Station level, the
+  space lens steps research unlocks, and each lens's zoom floor. Null
+  until the game reports them
 - `useKerbcastClient()` and `useKerbcastSubscriptions()`. The client
   and subscription manager from context, for building your own feed UI.
 

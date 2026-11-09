@@ -9,6 +9,7 @@ import type {
   DisplaySizeReport,
   ErrorPayload,
   Layer,
+  LensLevelsPayload,
   NetworkDefinition,
   NetworkResultPayload,
   QualityPreset,
@@ -1944,6 +1945,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _encoderBackend: string | null = null;
   /** Last-received throttle state from `settings-state`. False until the first push. */
   private _throttleMainScreen = false;
+  /** Last lens levels from `settings-state`, kept when a push omits them. */
+  private _lensLevels: LensLevelsPayload | null = null;
   /**
    * Mission-time capture clock from `settings-state`. `_captureUt` is null
    * until the first clock arrives (and against an old sidecar that never
@@ -2032,6 +2035,17 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
    */
   get throttleMainScreen(): boolean {
     return this._throttleMainScreen;
+  }
+
+  /**
+   * The lenses command cameras can have in the loaded save: the ground lens
+   * the Tracking Station level gives, the space lens steps research unlocks,
+   * and each lens's zoom floor. Null until a sidecar reports them; a later
+   * `settings-state` without them keeps the last value, since an older
+   * plugin never sends them. Read it on `settings-change`.
+   */
+  get lensLevels(): LensLevelsPayload | null {
+    return this._lensLevels;
   }
 
   /**
@@ -3613,6 +3627,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
         break;
       case "settings-state":
         this._throttleMainScreen = msg.content.throttleMainScreen;
+        if (msg.content.lensLevels) this._lensLevels = msg.content.lensLevels;
         /*
          * Capture clock: null captureUt means "no clock" (absent field).
          * Epoch is retained across pushes that omit it (only a present

@@ -1351,6 +1351,59 @@ export interface HelloPayload {
 	networks?: boolean;
 }
 
+/** The ground lens at one Tracking Station level. */
+export interface TrackingLensLevelPayload {
+	/** Tracking Station level, 1 based. */
+	level: number;
+	/** Lens resolution, arcseconds. */
+	lensArcsec: number;
+	/** Zoom floor, degrees of field of view. */
+	fovMinDeg: number;
+}
+
+/** One space lens step for craft cameras in vacuum, unlocked by a tech node. */
+export interface SpaceLensStepPayload {
+	/** Tech node id that unlocks the step. */
+	techId: string;
+	/** The tech node's title as the player sees it. */
+	techTitle: string;
+	/** The node is researched (always true in sandbox). */
+	unlocked: boolean;
+	/** Lens resolution, arcseconds. */
+	lensArcsec: number;
+	/** Zoom floor, degrees of field of view. */
+	fovMinDeg: number;
+}
+
+/**
+ * Command camera lenses: the ground lens set by the Tracking Station level
+ * and the space lens steps unlocked by research.
+ */
+export interface LensLevelsPayload {
+	/** KSP game mode, lowercased: "career", "science", "sandbox" or another. */
+	gameMode: string;
+	/**
+	 * Deep-space optics are on and drawable. When false the lens values
+	 * blur nothing and zoom floors are the fixed ones.
+	 */
+	opticsOn: boolean;
+	/**
+	 * The Tracking Station level sets the ground lens. False means every
+	 * ground camera has the best ground lens.
+	 */
+	trackingGated: boolean;
+	/** Current Tracking Station level, 1 based. */
+	trackingLevel: number;
+	/** The ground lens now, arcseconds. */
+	trackingLensArcsec: number;
+	/** The ground zoom floor now, degrees of field of view. */
+	trackingFovMinDeg: number;
+	/** Every Tracking Station level's lens, lowest first. */
+	trackingLevels: TrackingLensLevelPayload[];
+	/** Space lens steps, worst first. Empty when none are configured. */
+	spaceSteps: SpaceLensStepPayload[];
+}
+
 /** One vantage of a saved tracking network. */
 export interface NetworkVantageSpec {
 	vantage: CommandVantage;
@@ -1709,6 +1762,11 @@ export interface SettingsStatePayload {
 	 * `capture_ut` between ~1Hz samples. `None` => treat as 1.0.
 	 */
 	timeWarpRate?: number;
+	/**
+	 * The lenses command cameras can have in this save and which are
+	 * unlocked. Absent when no game is loaded and from older plugins.
+	 */
+	lensLevels?: LensLevelsPayload;
 }
 
 /**

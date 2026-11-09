@@ -30,6 +30,7 @@ export { useKerbcastClock } from "./hooks/useKerbcastClock";
 export { useDisplayedFrameUt } from "./hooks/useDisplayedFrameUt";
 export { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 export { useSiteCatalog } from "./hooks/useSiteCatalog";
+export { useLensLevels } from "./hooks/useLensLevels";
 export { useNetworks } from "./hooks/useNetworks";
 export { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
 export { useReportDisplaySize, MIN_DISPLAY_REPORT_PX } from "./hooks/useReportDisplaySize";

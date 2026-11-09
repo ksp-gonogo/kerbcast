@@ -1,8 +1,9 @@
-import type { KerbcastClient } from "@ksp-gonogo/kerbcast";
-import { CircleDot, Clapperboard, Settings } from "lucide-react";
-import { useEffect, useState } from "react";
+import type { KerbcastClient, LensLevelsPayload } from "@ksp-gonogo/kerbcast";
+import { CircleDot, Clapperboard, FlaskConical, Settings } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 import type { ManagerStatus } from "./connectionManager";
+import { LensPanel, lensPanelApplies } from "./LensPanel";
 
 interface HeaderProps {
   status: ManagerStatus;
@@ -32,6 +33,36 @@ export function Header({
 }: HeaderProps): React.JSX.Element {
   const [sidecarVersion, setSidecarVersion] = useState<string | null>(null);
   const [encoderBackend, setEncoderBackend] = useState<string | null>(null);
+  const [lensLevels, setLensLevels] = useState<LensLevelsPayload | null>(() => client.lensLevels ?? null);
+  const [lensOpen, setLensOpen] = useState(false);
+  const lensButtonRef = useRef<HTMLButtonElement>(null);
+  const lensPanelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setLensLevels(client.lensLevels ?? null);
+    return client.on("settings-change", () => setLensLevels(client.lensLevels ?? null));
+  }, [client]);
+
+  const showLens = lensPanelApplies(lensLevels);
+
+  /* The toggle sits outside the panel, so it is excluded here or its own click would reopen the panel. */
+  useEffect(() => {
+    if (!lensOpen) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setLensOpen(false);
+    };
+    const handlePointer = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (lensPanelRef.current?.contains(target) || lensButtonRef.current?.contains(target)) return;
+      setLensOpen(false);
+    };
+    document.addEventListener("keydown", handleKey);
+    document.addEventListener("pointerdown", handlePointer);
+    return () => {
+      document.removeEventListener("keydown", handleKey);
+      document.removeEventListener("pointerdown", handlePointer);
+    };
+  }, [lensOpen]);
 
   useEffect(() => {
     // cameras-change fires after hello + snapshot, so sidecarVersion and
@@ -72,6 +103,19 @@ export function Header({
         )}
       </StatusArea>
       <Actions>
+        {showLens && (
+          <GearButton
+            ref={lensButtonRef}
+            type="button"
+            aria-label="Camera lenses"
+            title="Camera lenses"
+            aria-haspopup="dialog"
+            aria-expanded={lensOpen}
+            onClick={() => setLensOpen((v) => !v)}
+          >
+            <FlaskConical size={16} strokeWidth={1.75} aria-hidden="true" />
+          </GearButton>
+        )}
         <ToolbarButton
           type="button"
           aria-label="REC+"
@@ -101,6 +145,9 @@ export function Header({
           <Settings size={16} strokeWidth={1.75} aria-hidden="true" />
         </GearButton>
       </Actions>
+      {showLens && lensOpen && (
+        <LensPanel ref={lensPanelRef} lens={lensLevels} onClose={() => setLensOpen(false)} />
+      )}
     </Root>
   );
 }
