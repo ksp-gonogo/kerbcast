@@ -2452,7 +2452,7 @@ namespace Kerbcast
             _opticsBegun = false;
             var home = _poseValid ? _mount.Site.StationBody : null;
             var toHome = home != null ? ToD(home.position) - _poseEye : default;
-            _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame, home, toHome);
+            _optics.EndScaled(cam.ScaledLayer, cam.NearLayer != null ? cam.NearLayer.targetTexture : null, _opticsFrame, home, toHome, cam.Picture);
         }
 
         private void RestoreAfg()

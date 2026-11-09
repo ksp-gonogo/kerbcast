@@ -262,7 +262,7 @@ namespace Kerbcast
          * `toHome` its centre from the lens in metres; null when the pose is
          * not known.
          */
-        public void EndScaled(Camera scaled, RenderTexture capture, OpticsFrame f, CelestialBody home, DVec3 toHome)
+        public void EndScaled(Camera scaled, RenderTexture capture, OpticsFrame f, CelestialBody home, DVec3 toHome, PicturePass picture)
         {
             if (!_redirected) return;
             _redirected = false;
@@ -274,7 +274,7 @@ namespace Kerbcast
             try
             {
                 _lastActive = Time.realtimeSinceStartup;
-                Composite(scaled, capture, f, home, toHome);
+                Composite(scaled, capture, f, home, toHome, picture);
             }
             finally
             {
@@ -298,9 +298,9 @@ namespace Kerbcast
             Debug.Log($"{Tag} cam={_flightId} deep-space optics targets released (idle)");
         }
 
-        private void Composite(Camera scaled, RenderTexture capture, OpticsFrame f, CelestialBody home, DVec3 toHome)
+        private void Composite(Camera scaled, RenderTexture capture, OpticsFrame f, CelestialBody home, DVec3 toHome, PicturePass picture)
         {
-            CollectBodies(scaled, f, home, toHome);
+            CollectBodies(scaled, f, home, toHome, picture);
 
             /* Bodies smaller than the blur get some of their spread light back, on their own disc before the blur. */
             if (BodyGains(f, out float maxGain))
@@ -360,7 +360,7 @@ namespace Kerbcast
         }
 
         /* Each body that could reach the frame, as a direction from the lens and an angular radius. */
-        private void CollectBodies(Camera scaled, OpticsFrame f, CelestialBody home, DVec3 toHome)
+        private void CollectBodies(Camera scaled, OpticsFrame f, CelestialBody home, DVec3 toHome, PicturePass picture)
         {
             _discs.Clear();
             LastBodies = 0;
@@ -374,7 +374,8 @@ namespace Kerbcast
             for (int i = 0; i < bodies.Count; i++)
             {
                 var body = bodies[i];
-                if (body == null || body.scaledBody == null) continue;
+                /* A body the picture leaves out has no disc to blur, and its transform is where the body is now. */
+                if (body == null || body.scaledBody == null || (picture != null && picture.HidesBody(body))) continue;
                 double d, cx, cy, cz, rho;
                 if (body == home)
                 {
