@@ -234,13 +234,28 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
 
 /* ---- far terrain: which bodies have their terrain left out ---- */
 {
-    Check(!FarTerrain.DrawnAway(false, false, false, 100), "far terrain: a body drawn where it stands keeps its terrain");
-    Check(FarTerrain.DrawnAway(true, false, false, 0), "far terrain: a body moved to its past instant does not, whatever the slip");
-    Check(FarTerrain.DrawnAway(false, true, false, 0), "far terrain: nor one left out");
-    Check(FarTerrain.DrawnAway(false, false, true, 2.0), "far terrain: a turn back of two pixels hides it");
-    Check(FarTerrain.DrawnAway(false, false, true, double.NaN), "far terrain: a slip that cannot be read hides it");
-    Check(!FarTerrain.DrawnAway(false, false, true, 1.99), "far terrain: a turn back under two pixels keeps it");
-    Check(!FarTerrain.DrawnAway(false, false, false, double.PositiveInfinity), "far terrain: no turn, nothing to hide for");
+    Check(!FarTerrain.DrawnAway(false, false, false), "far terrain: a body drawn where it stands keeps its terrain");
+    Check(FarTerrain.DrawnAway(true, false, false), "far terrain: a body moved to its past instant does not");
+    Check(FarTerrain.DrawnAway(false, true, false), "far terrain: nor one left out");
+    Check(FarTerrain.DrawnAway(false, false, true), "far terrain: nor one turned back enough to hide for");
+}
+
+/* ---- far terrain: the hold on a body only turned back ---- */
+{
+    Check(!FarTerrain.SpinHides(false, true, 1.99), "hold: rising, shown just under the hide edge");
+    Check(FarTerrain.SpinHides(false, true, 2.0), "hold: rising, hidden at the hide edge");
+    Check(FarTerrain.SpinHides(true, true, 1.5), "hold: falling, still hidden at the show edge");
+    Check(!FarTerrain.SpinHides(true, true, 1.49), "hold: falling, shown below the show edge");
+
+    bool held = false;
+    foreach (double slip in new[] { 1.9, 1.5, 1.75, 1.99 }) { held = FarTerrain.SpinHides(held, true, slip); Check(!held, $"hold: shown stays shown between the edges ({slip})"); }
+    held = true;
+    foreach (double slip in new[] { 1.99, 1.5, 1.75, 1.6 }) { held = FarTerrain.SpinHides(held, true, slip); Check(held, $"hold: hidden stays hidden between the edges ({slip})"); }
+
+    Check(!FarTerrain.SpinHides(true, false, 100), "hold: a body no longer spin-only resets, whatever the slip");
+    Check(!FarTerrain.SpinHides(FarTerrain.SpinHides(true, false, 100), true, 1.75), "hold: after a reset the show edge no longer applies");
+    Check(FarTerrain.SpinHides(false, true, double.NaN), "hold: a slip that cannot be read hides");
+    Check(FarTerrain.SpinHides(true, true, double.NaN), "hold: and keeps hiding");
 }
 
 /* ---- far terrain: the slip of a body turned back ---- */

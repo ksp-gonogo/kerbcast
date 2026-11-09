@@ -152,6 +152,9 @@ namespace Kerbcast
             public Quaternion World;
         }
 
+        /* Bodies, by index, whose spin-only terrain this camera is hiding, for FarTerrain.SpinHides. */
+        private readonly HashSet<int> _spinHiding = new HashSet<int>();
+
         private readonly List<HeldCorona> _coronas = new List<HeldCorona>();
         private readonly List<SunCoronas> _coronaScratch = new List<SunCoronas>();
 
@@ -485,7 +488,12 @@ namespace Kerbcast
         {
             double? c = LightTime.LightSpeed;
             var bodies = FlightGlobals.Bodies;
-            if (!c.HasValue || bodies == null || !TryFrameLens(out var lens)) return;
+            if (!c.HasValue || bodies == null)
+            {
+                _spinHiding.Clear();
+                return;
+            }
+            if (!TryFrameLens(out var lens)) return;
             var plan = BodiesFor(lens, c.Value);
             if (plan == null) return;
             double reach = _reachFar != null ? _reachFar() : View != null ? View.farClipPlane : 0;
@@ -496,10 +504,14 @@ namespace Kerbcast
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
-                var pqs = b != null ? b.pqsController : null;
+                if (b == null) continue;
+                int index = b.flightGlobalsIndex;
+                bool moves = plan.Moves(index), left = plan.Hides(index);
+                /* Before the reach tests, so what is held depends on the field and the light speed alone, never on range. */
+                bool spinHides = StepSpinHide(index, !moves && !left && plan.TrySpin(index, out _), b, c.Value, fov, rows);
+                var pqs = b.pqsController;
                 if (pqs == null || !pqs.isActive || KeepsPresent(b, lens)) continue;
-                double slip = FarTerrain.SpinSlipPx(b.angularV, b.Radius, c.Value, fov, rows);
-                if (!FarTerrain.DrawnAway(plan.Moves(b.flightGlobalsIndex), plan.Hides(b.flightGlobalsIndex), plan.TrySpin(b.flightGlobalsIndex, out _), slip)) continue;
+                if (!FarTerrain.DrawnAway(moves, left, spinHides)) continue;
                 if (!PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), reach)) continue;
                 SwitchOff(pqs);
                 var children = pqs.ChildSpheres;
@@ -507,6 +519,16 @@ namespace Kerbcast
                 for (int s = 0; s < children.Length; s++)
                     if (children[s] != null) SwitchOff(children[s]);
             }
+        }
+
+        /* This camera's held decision for body `index`, moved on by this frame's slip. */
+        private bool StepSpinHide(int index, bool spinOnly, CelestialBody b, double c, double fov, int rows)
+        {
+            bool was = _spinHiding.Contains(index);
+            bool now = FarTerrain.SpinHides(was, spinOnly, spinOnly ? FarTerrain.SpinSlipPx(b.angularV, b.Radius, c, fov, rows) : 0);
+            if (now && !was) _spinHiding.Add(index);
+            else if (was && !now) _spinHiding.Remove(index);
+            return now;
         }
 
         private void SwitchOff(PQS sphere)

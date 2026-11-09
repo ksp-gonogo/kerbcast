@@ -9,6 +9,9 @@ namespace Kerbcast
         /* A turn back smaller than this, in pixels, is not worth losing a body's detailed terrain for. */
         public const double MinSpinSlipPx = 2.0;
 
+        /* Terrain hidden for a turn back stays hidden until the slip is under this, so a field sitting on the edge does not toggle it. */
+        public const double ShowSpinSlipPx = 1.5;
+
         /*
          * How many pixels of a `rows`-high picture at vertical `fovDeg` a
          * body's ground slips when drawn turned back by its light time, at the
@@ -21,13 +24,17 @@ namespace Kerbcast
             lightSpeed > 0 ? Math.Abs(spinRadPerS * radiusM) / lightSpeed / CommandCameraMath.PixelSizeAtUnit(fovDeg, rows) : double.PositiveInfinity;
 
         /*
-         * Whether a camera draws a body away from where its terrain stands in
-         * local space: moved to its past instant, left out, or only turned
-         * back by at least MinSpinSlipPx. A slip that cannot be read counts as
-         * a turn worth hiding for.
+         * Whether a body only turned back has its terrain hidden this frame,
+         * given whether it had last frame. Hides from MinSpinSlipPx and shows
+         * again below ShowSpinSlipPx. A body that is not `spinOnly` has no
+         * state to carry, so false resets it. A slip that cannot be read
+         * counts as a turn worth hiding for.
          */
-        public static bool DrawnAway(bool moves, bool hides, bool spins, double spinSlipPx) =>
-            moves || hides || (spins && !(spinSlipPx < MinSpinSlipPx));
+        public static bool SpinHides(bool wasHiding, bool spinOnly, double spinSlipPx) =>
+            spinOnly && !(spinSlipPx < (wasHiding ? ShowSpinSlipPx : MinSpinSlipPx));
+
+        /* Whether a camera draws a body away from where its terrain stands in local space: moved to its past instant, left out, or turned back enough to hide for (SpinHides). */
+        public static bool DrawnAway(bool moves, bool hides, bool spinHides) => moves || hides || spinHides;
 
         /*
          * Stock parents a sphere's most detailed quads to a storage object
