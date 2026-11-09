@@ -2106,7 +2106,6 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
                     code,
                     source: ErrorSource::Sidecar,
                     flight_id: Some(flight_id),
-                    ..Default::default()
                 }),
             );
             return;
@@ -2321,7 +2320,6 @@ async fn apply_zoom_rate_change(
                 code: Some(ErrorCode::CommandLocked),
                 source: ErrorSource::Sidecar,
                 flight_id: Some(flight_id),
-                ..Default::default()
             }),
         );
         return;
