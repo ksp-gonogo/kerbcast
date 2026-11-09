@@ -435,12 +435,6 @@ namespace Kerbcast
         // per-frame GC pressure. FaderState is a struct, so the list stores them
         // inline (no per-entry GC).
         private readonly List<FaderState> _faderOverrides = new List<FaderState>();
-        // Reused across bodies and frames. Previously the fader loop did
-        // `new MaterialPropertyBlock()` twice per overridden body, per camera,
-        // per frame — a steady stream of Mono garbage (stop-the-world GC ⇒
-        // frametime spikes). GetPropertyBlock overwrites it each call, so a
-        // single shared scratch instance is correct.
-        private readonly MaterialPropertyBlock _faderMpb = new MaterialPropertyBlock();
         // Scaled-body renderers, cached on first use. Celestial bodies don't
         // change during a flight and the camera is recreated on vessel change,
         // so this avoids a GetComponent<Renderer> over every body on every
@@ -2257,9 +2251,8 @@ namespace Kerbcast
                         {
                             _faderOverrides.Add(new FaderState { Renderer = r, WasEnabled = wasEnabled, OriginalFade = fade });
                             if (!wasEnabled) r.enabled = true;
-                            r.GetPropertyBlock(_faderMpb);
-                            _faderMpb.SetFloat(_fadeAltitudeId, 1f);
-                            r.SetPropertyBlock(_faderMpb);
+                            /* On the material, where the fader writes it: a value left in a property block would outrank the fader's for the main view once this body is no longer overridden. */
+                            r.material.SetFloat(_fadeAltitudeId, 1f);
                         }
                     }
                     try
@@ -2296,15 +2289,8 @@ namespace Kerbcast
                         Picture.AfterScaledLayer();
                         foreach (var state in _faderOverrides)
                         {
-                            // Restore _FadeAltitude to ScaledSpaceFader's value in the
-                            // MPB so the main camera sees the correct fade. Get the
-                            // current MPB (which may carry _sunLightDirection etc) and
-                            // only replace the one property we overrode. Reuses the
-                            // shared scratch block — no per-frame allocation.
                             if (state.Renderer == null) continue;
-                            state.Renderer.GetPropertyBlock(_faderMpb);
-                            _faderMpb.SetFloat(_fadeAltitudeId, state.OriginalFade);
-                            state.Renderer.SetPropertyBlock(_faderMpb);
+                            state.Renderer.material.SetFloat(_fadeAltitudeId, state.OriginalFade);
                             state.Renderer.enabled = state.WasEnabled;
                         }
                     }

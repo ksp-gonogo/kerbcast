@@ -374,12 +374,15 @@ namespace Kerbcast
          * planet would keep that planet at the present for as long as it
          * looked at the craft.
          */
-        private bool KeepsPresent(CelestialBody b, PictureLens lens)
+        private bool KeepsPresent(CelestialBody b, PictureLens lens) => TerrainLocal(b, lens.Point);
+
+        /* Whether terrain of `b` is built and within this camera's own reach of `eye`, so the local layers draw that body's ground. */
+        public bool TerrainLocal(CelestialBody b, DVec3 eye)
         {
-            var pqs = b.pqsController;
+            var pqs = b != null ? b.pqsController : null;
             if (pqs == null || !pqs.isActive) return false;
             double far = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
-            return PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), far);
+            return PictureBoundary.TerrainInReach((eye - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), far);
         }
 
         /* Whether this camera leaves body `b` out of its picture this frame, its light not yet placed. */

@@ -1920,7 +1920,7 @@ namespace Kerbcast
             _poseUp = up;
             SyncScaledBodies(cam, anchor.position);
             SyncScaledPose(cam);
-            UpdateStationBodyMesh(cam, ut, _lastDistance);
+            UpdateStationBodyMesh(cam, station, ut, _lastDistance);
 
             double distance = _lastDistance;
             var drawn = PlaceDrawn(cam, ut, now, station, aim, occluder, distance);
@@ -2285,12 +2285,15 @@ namespace Kerbcast
            body never draws that body's scaled mesh while its terrain is local
            (the fader turns it off), and the command camera stands on it too, so
            while the station's PQS is active its mesh is left as stock has it.
-           With the PQS inactive the mesh is the only ground there is. */
-        private void UpdateStationBodyMesh(KerbcastCamera cam, double ut, double d)
+           With the PQS inactive the mesh is the only ground there is. So it is
+           with a light speed once the terrain is beyond the layers' own reach:
+           that is the reach PicturePass tests before it hides terrain, so
+           terrain it hides always has this mesh in its place. */
+        private void UpdateStationBodyMesh(KerbcastCamera cam, DVec3 station, double ut, double d)
         {
             var body = _mount.Site.Body;
             var pqs = body != null ? body.pqsController : null;
-            bool stock = pqs != null && pqs.isActive;
+            bool stock = pqs != null && pqs.isActive && (!LightTime.LightSpeed.HasValue || cam.Picture.TerrainLocal(body, station));
             var r = stock && body.scaledBody != null ? body.scaledBody.GetComponent<Renderer>() : null;
             cam.RigStockFaderRenderer = r;
             bool nowStock = r != null;
@@ -2299,7 +2302,7 @@ namespace Kerbcast
                 _stationMeshLogged = true;
                 _stationMeshStock = nowStock;
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={d:F0} event=station-body-mesh "
-                    + (nowStock ? "stock (left to the fader, terrain is local)" : "forced on (no local terrain)"));
+                    + (nowStock ? "stock (left to the fader, terrain is local)" : "forced on (no local terrain in reach)"));
             }
         }
 
