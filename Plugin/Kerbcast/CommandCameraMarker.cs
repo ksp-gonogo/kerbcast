@@ -165,7 +165,7 @@ namespace Kerbcast
             {
                 _shownLogged = true;
                 Debug.Log($"{Tag} cam={_flightId} target marker first shown: proxyDistance={d:F0}m of range={rangeM:F0}m "
-                    + $"size={size:G3}m ({SizePixels:F0}px at fov={fovDeg:F3} over {renderHeight} rows) stationExtent={station.Magnitude:F0}m");
+                    + $"size={size:G3}m ({SizePixels:F0}px at fov={fovDeg:G4} over {renderHeight} rows) stationExtent={station.Magnitude:F0}m");
             }
         }
 
