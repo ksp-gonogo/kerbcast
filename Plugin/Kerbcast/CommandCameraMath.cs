@@ -489,6 +489,24 @@ namespace Kerbcast
         public static double StationGroundAltitude(double storedAlt, double groundAlt) =>
             double.IsNaN(groundAlt) ? storedAlt : groundAlt;
 
+        /* A facility's spawn path split into the model it lives in ("Facility") and the path inside that model ("End09/SpawnPoint"); `inModel` is empty when the path names only the model. */
+        public static void SplitSpawnPath(string path, out string model, out string inModel)
+        {
+            path = (path ?? "").Trim('/');
+            int slash = path.IndexOf('/');
+            model = slash < 0 ? path : path.Substring(0, slash);
+            inModel = slash < 0 ? "" : path.Substring(slash + 1);
+        }
+
+        /* The upgrade level a facility shows for stock's normalised level (0 to 1) out of `levels`, as the facility itself rounds it. */
+        public static int FacilityLevelIndex(double normalised, int levels)
+        {
+            if (levels <= 0) return 0;
+            if (double.IsNaN(normalised)) normalised = 0;
+            normalised = Math.Max(0.0, Math.Min(1.0, normalised));
+            return Math.Max(0, Math.Min(levels - 1, (int)Math.Floor(normalised * levels)));
+        }
+
         /* How far a lens `lensFromCentreM` metres from a body's centre is under the atmosphere shader's surface, `surfaceUnits` scaled units at `metresPerUnit`; negative above it. */
         public static double LensDepthM(double lensFromCentreM, double surfaceUnits, double metresPerUnit) =>
             surfaceUnits * metresPerUnit - lensFromCentreM;
