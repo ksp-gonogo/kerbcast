@@ -915,6 +915,18 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         "nadir: the lens keeps a finite up, from north, when local up is its axis");
 }
 
+// Stars faded at a lens as KSP fades them at the main camera (stock limits 0.6, 0.9, 1.1, 0.6).
+{
+    double Fade(double p, double zen, bool vis, double off, double fov) => CommandCameraMath.GalaxyFade(p, zen, vis, off, fov, 0.6, 0.9, 1.1, 0.6);
+    Check(Fade(0.99, 40, true, 120, 30) >= 1, "galaxy fade: sea level by day hides the stars");
+    Check(Fade(0.99, 130, false, 120, 30) == 0.6, "galaxy fade: sea level at night keeps the air's own haze only");
+    double dusk = Fade(0.99, 96, true, 120, 30);
+    Check(dusk > 0.6 && dusk < 1.5, "galaxy fade: dusk fades partway");
+    Check(Fade(0, 40, true, 120, 30) == 0, "galaxy fade: in vacuum with the Sun out of view the stars are full");
+    Check(Near(Fade(0, 40, true, 5, 30), 0.6, 1e-12), "galaxy fade: the Sun in the frame glares them away");
+    Check(Fade(0, 40, false, 5, 30) == 0, "galaxy fade: a Sun below the horizon gives no glare");
+}
+
 // With the optics drawn the zoom stops where the blur spans two pixels of a 576-row frame.
 {
     double Floor(double lensArcsec, double air, double elev) =>

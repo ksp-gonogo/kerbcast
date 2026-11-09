@@ -493,6 +493,35 @@ namespace Kerbcast
         public static double LensDepthM(double lensFromCentreM, double surfaceUnits, double metresPerUnit) =>
             surfaceUnits * metresPerUnit - lensFromCentreM;
 
+        /*
+         * How far the stars fade toward the cube's darkest colour (1 and more
+         * is fully dark), as KSP's GalaxyCubeControl works it out for the main
+         * camera, here for a lens: thicker air and a higher Sun fade them, and
+         * so does the Sun's glare in or near the frame. Stock eases the glare
+         * term over frames; this is where it settles.
+         */
+        public static double GalaxyFade(double pressureAtm, double sunZenithDeg, bool sunVisible, double sunOffAxisDeg,
+            double fovDeg, double atmosLimit, double daytimeLimit, double airPressureFade, double glareLimit)
+        {
+            double glare = 0;
+            if (sunVisible)
+            {
+                double half = fovDeg * 0.5;
+                double t = sunOffAxisDeg < half ? 0 : Clamp01((sunOffAxisDeg + 10.0 - half) * 0.05);
+                glare = glareLimit * (1 - t);
+            }
+            double day = 0, atmos = 0;
+            if (pressureAtm > 0)
+            {
+                double s = Clamp01((sunZenithDeg - 75.0) * 0.025);
+                day = pressureAtm * daytimeLimit * (1 - s);
+                atmos = atmosLimit * Clamp01(pressureAtm * airPressureFade);
+            }
+            return atmos + day + glare;
+        }
+
+        private static double Clamp01(double v) => v < 0 ? 0 : v > 1 ? 1 : v;
+
         /* Below this the Sun's light is left facing stock's target: a lens near the active craft sees the Sun from where stock does. */
         public const double SunTurnMinDeg = 0.01;
 

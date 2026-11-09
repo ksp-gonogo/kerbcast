@@ -359,6 +359,23 @@ namespace Kerbcast
             Debug.Log($"{Tag} cam={_flightId} aim {(aim == null ? "default (the default craft)" : aim.ToString())}");
         }
 
+        private bool _galaxyLogged;
+        private bool _galaxyOwn;
+
+        public Color? GalaxyTint()
+        {
+            if (!_poseValid) return null;
+            var tint = GalaxyForLens.Tint(_mount.Site.Body, _poseEye, _poseForward, _fov, out double fade);
+            bool own = tint.HasValue;
+            if (!_galaxyLogged || own != _galaxyOwn)
+            {
+                _galaxyLogged = true;
+                _galaxyOwn = own;
+                Debug.Log($"{Tag} cam={_flightId} event=galaxy-fade {(own ? $"at the lens fade={fade:F2}" : "as stock (the lens is near the main camera)")}");
+            }
+            return tint;
+        }
+
         public float FovFloor => (float)FovMinNow();
 
         private CommandAim _aim;
