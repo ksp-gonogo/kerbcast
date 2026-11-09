@@ -212,6 +212,14 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(Math.Abs(stored.Magnitude - 1) < 1e-12 && Math.Abs(fresh.Magnitude - 1) < 1e-12, "light: stays a unit direction");
 }
 
+/* ---- far terrain: which bodies have their terrain left out ---- */
+{
+    Check(!FarTerrain.DrawnAway(false, false, false), "far terrain: a body drawn where it stands keeps its terrain");
+    Check(FarTerrain.DrawnAway(true, false, false), "far terrain: a body moved to its past instant does not");
+    Check(FarTerrain.DrawnAway(false, true, false), "far terrain: nor one left out");
+    Check(FarTerrain.DrawnAway(false, false, true), "far terrain: nor one only turned back, the lens's own or one above it");
+}
+
 /* ---- far terrain: the quads in storage every sphere shares ---- */
 {
     var terrain = new object();

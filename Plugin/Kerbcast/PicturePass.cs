@@ -430,8 +430,9 @@ namespace Kerbcast
 
         /*
          * A local layer stretched to a far subject can reach terrain built in
-         * local space on a body this camera draws at its past instant, which
-         * would paint the body as it is now over the scaled sphere. Its
+         * local space on a body this camera draws at its past instant or only
+         * turns back, which would paint the body as it is now over the scaled
+         * sphere. Its
          * renderers are switched off for this camera's local layers alone, as
          * the craft hider does, and only those that were on are put back.
          */
@@ -448,7 +449,7 @@ namespace Kerbcast
                 var b = bodies[i];
                 var pqs = b != null ? b.pqsController : null;
                 if (pqs == null || !pqs.isActive || KeepsPresent(b, lens)) continue;
-                if (!plan.Moves(b.flightGlobalsIndex) && !plan.Hides(b.flightGlobalsIndex)) continue;
+                if (!FarTerrain.DrawnAway(plan.Moves(b.flightGlobalsIndex), plan.Hides(b.flightGlobalsIndex), plan.TrySpin(b.flightGlobalsIndex, out _))) continue;
                 if (!PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), reach)) continue;
                 SwitchOff(pqs);
                 var children = pqs.ChildSpheres;
