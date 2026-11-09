@@ -978,6 +978,8 @@ namespace Kerbcast
             _drawnAbout = _drawn.ShownAbout;
             if (!LightTime.LightSpeed.HasValue)
             {
+                /* Said once, so a light speed that went away is not read as a state that never changed. */
+                if (_drawnLight != -1) Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state=off");
                 _drawnLight = -1;
                 return;
             }

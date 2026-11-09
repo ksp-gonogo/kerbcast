@@ -737,6 +737,25 @@ PartRecord[] Parts(uint first, int count)
     Check(h.SlowestLightSpeed == 3e8, "a new game forgets the slowest speed of the last one");
 }
 
+/* ---- A dev speed outlasts the lock holder's ---- */
+{
+    var h = new LightHistory { SystemDiameterM = 2.4e11 };
+    h.SetBodies(bodies);
+    h.SetDevLightSpeed(3e5);
+    Check(h.LightSpeed == 3e5 && h.Active, "the dev speed turns the ring on");
+    h.SetReservationHeld(true);
+    h.Sample(1, State(0, Kerbin, new DVec3(700000, 0, 0), new DVec3(0, 2246, 0)), true, true);
+    h.SetLightSpeed(null);
+    Check(h.LightSpeed == 3e5, "a holder that takes the lock with no speed leaves the dev speed standing");
+    h.SetLightSpeed(299792458.0);
+    Check(h.LightSpeed == 299792458.0, "a holder's own speed wins while it is set");
+    h.SetLightSpeed(null);
+    h.SetReservationHeld(false);
+    Check(h.LightSpeed == 3e5 && h.Active && h.TrackCount == 1, "the lock let go, the dev speed is back and the history kept");
+    h.SetDevLightSpeed(null);
+    Check(!h.LightSpeed.HasValue && !h.Active, "with neither speed the ring is off");
+}
+
 /* ---- Per-tick cost ---- */
 {
     var h = NewRing();
