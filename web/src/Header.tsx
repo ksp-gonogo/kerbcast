@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 import type { ManagerStatus } from "./connectionManager";
 import { LensPanel, lensPanelApplies } from "./LensPanel";
+import { useDialogFocus } from "./useDialogFocus";
 
 interface HeaderProps {
   status: ManagerStatus;
@@ -44,6 +45,13 @@ export function Header({
   }, [client]);
 
   const showLens = lensPanelApplies(lensLevels);
+
+  /* Closed for good when the lenses go away, or it would reopen by itself when they come back. */
+  useEffect(() => {
+    if (!showLens) setLensOpen(false);
+  }, [showLens]);
+
+  useDialogFocus(lensPanelRef, showLens && lensOpen);
 
   /* The toggle sits outside the panel, so it is excluded here or its own click would reopen the panel. */
   useEffect(() => {

@@ -39,10 +39,10 @@ async function mockGame(): Promise<{ client: KerbcastClient; sidecar: MockSideca
   return { client: await connect(sidecar), sidecar };
 }
 
-function renderPanel(client: KerbcastClient, onShowInGrid = vi.fn()) {
+function renderPanel(client: KerbcastClient, onShowInGrid = vi.fn(), onClose: () => void = () => {}) {
   return render(
     <KerbcastProvider client={client}>
-      <NetworksPanel onClose={() => {}} onShowInGrid={onShowInGrid} shownFlightIds={new Set()} />
+      <NetworksPanel onClose={onClose} onShowInGrid={onShowInGrid} shownFlightIds={new Set()} />
     </KerbcastProvider>,
   );
 }
@@ -157,19 +157,19 @@ describe("NetworksPanel form", () => {
 
     const vessels = within(screen.getByRole("region", { name: "Vessels" }));
     expect(vessels.queryByLabelText("Kerbal X Debris")).toBeNull();
-    expect(vessels.queryByRole("radio", { name: "Debris" })).toBeNull();
+    expect(vessels.queryByRole("button", { name: "Debris" })).toBeNull();
     expect(vessels.getByText("Skipped while it is the target")).toBeTruthy();
     expect(vessels.queryByText(/too close/i)).toBeNull();
     expect(vessels.getByText("Craft launched later are not added", { exact: false })).toBeTruthy();
 
-    fireEvent.click(vessels.getByRole("radio", { name: "Relay" }));
+    fireEvent.click(vessels.getByRole("button", { name: "Relay" }));
     fireEvent.click(vessels.getByRole("button", { name: "Add all relays" }));
     expect(screen.getByText("3 of 64 members")).toBeTruthy();
 
     fireEvent.click(vessels.getByLabelText("Show debris, flags and asteroids"));
-    fireEvent.click(vessels.getByRole("radio", { name: "All" }));
+    fireEvent.click(vessels.getByRole("button", { name: "All" }));
     expect(vessels.getByLabelText("Kerbal X Debris")).toBeTruthy();
-    expect(vessels.getByRole("radio", { name: "Asteroid" })).toBeTruthy();
+    expect(vessels.getByRole("button", { name: "Asteroid" })).toBeTruthy();
   });
 
   it("creates a network that every viewer then lists", async () => {
@@ -209,6 +209,139 @@ describe("NetworksPanel form", () => {
 
     await waitFor(() => expect(screen.getByRole("status").textContent).toMatch(/Someone else changed this network/));
     expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Theirs");
+  });
+
+  it("reloads the definitions that arrived after Save was clicked", async () => {
+    const def: NetworkDefinition = {
+      networkId: "x",
+      name: "Mine",
+      vantages: [{ vantage: { kind: CommandVantageKind.Station, station: "KSC" } }],
+      revision: 1,
+    };
+    const sidecar = new MockSidecar().withNetworks([def], { manual: true });
+    const client = await connect(sidecar);
+    renderPanel(client);
+    fireEvent.click(within(card("Mine")).getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await act(async () => {
+      sidecar.fireNetworkDefinitions([{ ...def, name: "Theirs", revision: 2 }]);
+      sidecar.fireNetworkResult({ token: sidecar.lastCommand("save-network")!.content.token, ok: false, code: "stale" });
+    });
+
+    await waitFor(() => expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Theirs"));
+  });
+
+  describe("retrying a create", () => {
+    const ksc: CatalogStation = { nodeName: "KSC", displayName: "KSC", body: "Kerbin", latitude: 0, longitude: 0, altitude: 0, enabled: true };
+
+    async function newForm() {
+      const sidecar = new MockSidecar().withNetworks([], { manual: true });
+      sidecar.fireSiteCatalog({ stations: [ksc], vessels: [] });
+      const client = await connect(sidecar);
+      renderPanel(client);
+      fireEvent.click(screen.getByRole("button", { name: /new network/i }));
+      fireEvent.click(within(screen.getByRole("region", { name: "Ground stations" })).getByRole("button", { name: "Add all" }));
+      return { client, sidecar };
+    }
+    const create = () => fireEvent.click(screen.getByRole("button", { name: /create network/i }));
+
+    it("uses a new token after a definite refusal", async () => {
+      const { sidecar } = await newForm();
+      create();
+      const first = sidecar.lastCommand("save-network")!.content.token;
+      await act(async () => {
+        sidecar.fireNetworkResult({ token: first, ok: false, code: "full" });
+      });
+      await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+
+      await waitFor(() => expect((screen.getByRole("button", { name: /create network/i }) as HTMLButtonElement).disabled).toBe(false));
+      create();
+      await waitFor(() => expect(sidecar.lastCommand("save-network")!.content.token).not.toBe(first));
+    });
+
+    it("keeps its token after a timeout, which may have reached the game", async () => {
+      const { client } = await newForm();
+      const save = vi.spyOn(client, "saveNetwork").mockRejectedValueOnce(Object.assign(new Error("late"), { code: "timeout" }));
+      await act(async () => {
+        create();
+      });
+      save.mockResolvedValueOnce({ networkId: "n" });
+      await waitFor(() => expect((screen.getByRole("button", { name: /create network/i }) as HTMLButtonElement).disabled).toBe(false));
+      await act(async () => {
+        create();
+      });
+      expect(save.mock.calls[1]![1]).toEqual(save.mock.calls[0]![1]);
+    });
+  });
+
+  describe("closing with entries in the form", () => {
+    async function formOpen() {
+      const onClose = vi.fn();
+      const { client } = await mockGame();
+      renderPanel(client, vi.fn(), onClose);
+      fireEvent.click(screen.getByRole("button", { name: /new network/i }));
+      return onClose;
+    }
+    const typeName = () => fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Part filled" } });
+    const confirmRow = () => screen.queryByRole("group", { name: "Discard changes" });
+
+    it("closes at once when nothing has been entered", async () => {
+      const onClose = await formOpen();
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(confirmRow()).toBeNull();
+    });
+
+    it("asks before Escape discards, and Keep editing leaves the form as it was", async () => {
+      const onClose = await formOpen();
+      typeName();
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.click(within(confirmRow()!).getByRole("button", { name: "Keep editing" }));
+      expect(confirmRow()).toBeNull();
+      expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Part filled");
+    });
+
+    it("asks before an outside tap discards, and Discard closes", async () => {
+      const onClose = await formOpen();
+      typeName();
+      fireEvent.pointerDown(document.body);
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.click(within(confirmRow()!).getByRole("button", { name: "Discard" }));
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("treats a second Escape as keep editing", async () => {
+      const onClose = await formOpen();
+      typeName();
+      fireEvent.keyDown(document, { key: "Escape" });
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(confirmRow()).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+    });
+
+    it("does not count a change undone as an entry", async () => {
+      const onClose = await formOpen();
+      typeName();
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "" } });
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("takes focus when it opens and gives it back when it closes", async () => {
+    const { client } = await mockGame();
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+
+    const { unmount } = renderPanel(client);
+    expect(document.activeElement).toBe(screen.getByRole("dialog"));
+
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
   });
 
   it("refuses more than 64 members before sending", async () => {

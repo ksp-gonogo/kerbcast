@@ -38,7 +38,7 @@ export const LensPanel = forwardRef<HTMLDivElement, LensPanelProps>(function Len
   const groundLevel = lens.trackingGated ? lens.trackingLevel : bestLevel;
 
   return (
-    <Panel ref={ref} role="dialog" aria-label="Camera lenses">
+    <Panel ref={ref} role="dialog" aria-label="Camera lenses" tabIndex={-1}>
       <PanelHeader>
         <PanelTitle>Camera lenses</PanelTitle>
         <CloseIconButton type="button" onClick={onClose} aria-label="Close">
@@ -126,12 +126,16 @@ const Panel = styled.div`
   right: 1rem;
   z-index: 100;
   width: min(360px, calc(100vw - 2rem));
-  max-height: calc(100vh - var(--kc-header-h) - 1rem);
+  max-height: calc(100dvh - var(--kc-header-h) - 1rem);
   overflow-y: auto;
   background: var(--kc-surface);
   border: 1px solid var(--kc-border);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.12);
+
+  &:focus {
+    outline: none;
+  }
 `;
 
 const PanelHeader = styled.div`

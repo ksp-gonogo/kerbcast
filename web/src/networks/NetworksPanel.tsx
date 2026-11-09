@@ -17,8 +17,9 @@ import type {
 } from "@ksp-gonogo/kerbcast";
 import { NetworkIcon, useKerbcastCameras, useKerbcastClient, useNetworks, useSiteCatalog } from "@ksp-gonogo/kerbcast-react";
 import { Check, ChevronLeft, LayoutGrid, Lock, Pencil, Plus, RadioTower, Satellite, Trash2, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { css } from "styled-components";
+import { useDialogFocus } from "../useDialogFocus";
 import {
   DEFAULT_NETWORK_NAME,
   disabledReasonText,
@@ -68,6 +69,13 @@ function useNetworksEditable(): boolean | null {
   return editable;
 }
 
+/* Opened from Settings, which closes as this opens, so its gear is the way back. */
+const settingsButton = () => document.querySelector<HTMLElement>('header button[aria-label="Settings"]');
+
+function newCreateToken(): string {
+  return `create-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const READ_ONLY_NOTE =
   "Networks can be changed in flight or at the Space Center. Until the game is in one of those, they show read only.";
 
@@ -79,13 +87,33 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
   const catalog = useSiteCatalog();
   const cameras = useKerbcastCameras();
   const [view, setView] = useState<View>({ kind: "list" });
+  /* Set by the form: Escape or a tap outside would otherwise lose what has been entered. */
+  const formDirty = useRef(false);
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+
+  useDialogFocus(panelRef, true, settingsButton);
+
+  const keepEditing = useCallback(() => {
+    setConfirmingDiscard(false);
+    panelRef.current?.focus({ preventScroll: true });
+  }, []);
+  const toList = () => {
+    setConfirmingDiscard(false);
+    setView({ kind: "list" });
+  };
 
   useEffect(() => {
+    const askToClose = () => {
+      if (formDirty.current) setConfirmingDiscard(true);
+      else onClose();
+    };
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (confirmingDiscard) keepEditing();
+      else askToClose();
     };
     const handlePointer = (e: PointerEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) askToClose();
     };
     document.addEventListener("keydown", handleKey);
     document.addEventListener("pointerdown", handlePointer);
@@ -93,17 +121,17 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
       document.removeEventListener("keydown", handleKey);
       document.removeEventListener("pointerdown", handlePointer);
     };
-  }, [onClose]);
+  }, [onClose, confirmingDiscard, keepEditing]);
 
   const editing = view.kind === "form" && view.networkId !== null ? networks.find((n) => n.networkId === view.networkId) : undefined;
   const title = view.kind === "list" ? "Tracking networks" : view.networkId !== null ? "Edit network" : "New network";
 
   return (
-    <Panel ref={panelRef} role="dialog" aria-label={title}>
+    <Panel ref={panelRef} role="dialog" aria-label={title} tabIndex={-1}>
       <PanelHeader>
         <HeaderLeft>
           {view.kind === "form" && (
-            <IconButton type="button" aria-label="Back to networks" onClick={() => setView({ kind: "list" })}>
+            <IconButton type="button" aria-label="Back to networks" onClick={toList}>
               <ChevronLeft size={14} strokeWidth={1.75} aria-hidden="true" />
             </IconButton>
           )}
@@ -113,6 +141,19 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
           <X size={14} strokeWidth={1.75} aria-hidden="true" />
         </IconButton>
       </PanelHeader>
+      {confirmingDiscard && view.kind === "form" && (
+        <DiscardRow role="group" aria-label="Discard changes">
+          <span>Discard what you have entered?</span>
+          <Actions>
+            <DangerButton type="button" onClick={onClose}>
+              Discard
+            </DangerButton>
+            <GhostButton type="button" autoFocus onClick={keepEditing}>
+              Keep editing
+            </GhostButton>
+          </Actions>
+        </DiscardRow>
+      )}
       {view.kind === "list" ? (
         <Body>
           <ListTop>
@@ -157,8 +198,8 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
           catalog={catalog}
           editing={view.networkId !== null ? (editing ?? null) : null}
           gone={view.networkId !== null && editing === undefined}
-          latest={(id) => networks.find((n) => n.networkId === id)}
-          onDone={() => setView({ kind: "list" })}
+          dirtyRef={formDirty}
+          onDone={toList}
         />
       )}
     </Panel>
@@ -335,6 +376,16 @@ function formStateFrom(def: NetworkDefinition | null): FormState {
   };
 }
 
+/* The form's own fields, so a change and its undoing count as no change. */
+function sameEntries(a: FormState, b: FormState): boolean {
+  return (
+    a.name === b.name &&
+    a.watch === b.watch &&
+    a.fallback === b.fallback &&
+    [...a.selected].sort().join("\n") === [...b.selected].sort().join("\n")
+  );
+}
+
 function vantageFromKey(key: string): CommandVantage {
   const colon = key.indexOf(":");
   const kind = key.slice(0, colon);
@@ -349,19 +400,34 @@ interface NetworkFormProps {
   editing: NetworkDefinition | null;
   /** The network being edited has been deleted meanwhile. */
   gone: boolean;
-  latest: (networkId: string) => NetworkDefinition | undefined;
+  /** Kept true while the form holds entries a close would lose. */
+  dirtyRef: MutableRefObject<boolean>;
   onDone: () => void;
   /** The game stopped applying changes while the form was open (a scene change). */
   locked: boolean;
 }
 
-function NetworkForm({ catalog, editing, gone, latest, onDone, locked }: NetworkFormProps): React.JSX.Element {
+/* The request may have reached the game, so a retry has to reuse its token. */
+const UNSETTLED_CODES = new Set(["timeout", "notConnected", "unknown"]);
+
+function NetworkForm({ catalog, editing, gone, dirtyRef, onDone, locked }: NetworkFormProps): React.JSX.Element {
   const client = useKerbcastClient();
   /* One token per new network, so a retry after a timeout finds the network the first try made instead of making another. */
-  const createToken = useRef(`create-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
+  const createToken = useRef(newCreateToken());
   const stations = catalog?.stations ?? [];
   const vessels = catalog?.vessels ?? [];
   const [form, setForm] = useState<FormState>(() => formStateFrom(editing));
+  const baseline = useRef(form);
+  const dirty = !sameEntries(form, baseline.current);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty, dirtyRef]);
+  useEffect(
+    () => () => {
+      dirtyRef.current = false;
+    },
+    [dirtyRef],
+  );
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [showHidden, setShowHidden] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -450,9 +516,15 @@ function NetworkForm({ catalog, editing, gone, latest, onDone, locked }: Network
     } catch (err) {
       setBusy(false);
       const code = (err as { code?: string }).code ?? "unknown";
-      const now = form.base ? latest(form.base.networkId) : undefined;
+      /* A refused try's token is spent: the game answers a repeat of it with nothing new. */
+      if (!form.base && !UNSETTLED_CODES.has(code)) createToken.current = newCreateToken();
+      /* Read now: the definitions that made this stale arrived after the click. */
+      const base = form.base;
+      const now = base ? client.networks().find((n) => n.networkId === base.networkId) : undefined;
       if (code === "stale" && now) {
-        setForm(formStateFrom(now));
+        const fresh = formStateFrom(now);
+        baseline.current = fresh;
+        setForm(fresh);
         setNote("Someone else changed this network while you were editing. It now shows their version; make your changes again and save");
         return;
       }
@@ -547,13 +619,12 @@ function NetworkForm({ catalog, editing, gone, latest, onDone, locked }: Network
             )}
           </SectionHead>
           {types.length > 1 && (
-            <Chips role="radiogroup" aria-label="Vessel type">
+            <Chips role="group" aria-label="Vessel type">
               {["all", ...types].map((t) => (
                 <Chip
                   key={t}
                   type="button"
-                  role="radio"
-                  aria-checked={activeType === t}
+                  aria-pressed={activeType === t}
                   $on={activeType === t}
                   onClick={() => setTypeFilter(t)}
                 >
@@ -714,6 +785,10 @@ const Panel = styled.div`
   border-radius: 8px;
   overflow: hidden;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.12);
+
+  &:focus {
+    outline: none;
+  }
 
   @media (max-width: 520px) {
     right: 0.5rem;
@@ -995,6 +1070,12 @@ const CardFoot = styled.div`
 const ConfirmRow = styled(CardFoot)`
   font-size: 0.7rem;
   color: var(--kc-text);
+`;
+
+const DiscardRow = styled(ConfirmRow)`
+  padding: 0.5rem 0.85rem;
+  border-bottom: 1px solid var(--kc-border);
+  background: var(--kc-surface-raised);
 `;
 
 const Owner = styled.span`
