@@ -533,7 +533,7 @@ namespace Kerbcast
             if (core == null || provider == null) return Api.NetworkResult.NotRunning;
             var refused = NetworkLock(core, owner);
             if (refused != Api.NetworkResult.Unknown) return refused;
-            if (!provider.IsNetwork(flightId) || core.IsSavedNetwork(flightId)) return Api.NetworkResult.NotCommandFeed;
+            if (!provider.IsNetwork(flightId) || core.IsSavedNetwork(flightId) || provider.OwnedByOther(flightId, owner)) return Api.NetworkResult.NotCommandFeed;
             var listed = NetworkListResult(vantages, tuning ?? NetworkTuning.Default);
             if (listed != Api.NetworkResult.Ok) return listed;
             return provider.SetNetworkVantages(flightId, vantages, tuning, out _) ? Api.NetworkResult.Ok : Api.NetworkResult.BadVantage;

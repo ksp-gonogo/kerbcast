@@ -204,9 +204,9 @@ namespace Kerbcast
         /* A network a mod made through the API, which a browser may never remove. */
         public bool IsHostNetwork(uint flightId) => _feeds.Any(f => f.IsNetwork && f.Owner != null && f.FlightId == flightId);
 
-        /* A mod's network that `caller` is not the owner of (see NetworkMath.MayDestroyHostNetwork). */
+        /* A mod's network that `caller` is not the owner of (see NetworkMath.MayChangeHostNetwork). */
         public bool OwnedByOther(uint flightId, string caller) =>
-            _feeds.Any(f => f.IsNetwork && f.Owner != null && f.FlightId == flightId && !NetworkMath.MayDestroyHostNetwork(f.Owner, caller));
+            _feeds.Any(f => f.IsNetwork && f.Owner != null && f.FlightId == flightId && !NetworkMath.MayChangeHostNetwork(f.Owner, caller));
 
         /* The default camera lost the craft it rode: its site is resolved
            afresh from settings on the next enumeration, so it lands on the

@@ -51,6 +51,12 @@ Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported
 {
     var free = new RecordingKerbcast();
     Check(free.Command.CreateNetworkCamera(new[] { NetworkVantage.Station("KSC") }, null, null, null, "modA", out uint mine) == NetworkResult.Ok, "a network is made with no lock held");
+    var anotherList = new[] { NetworkVantage.Station("Nye Island") };
+    Check(free.Command.SetNetworkVantages(mine, anotherList, null, "modB") == NetworkResult.NotCommandFeed && free.Command.SetNetworkVantages(mine, anotherList, null, null) == NetworkResult.NotCommandFeed
+        && free.Command.Networks[mine][0].Name == "KSC", "another mod may not replace a named network's vantages");
+    Check(free.Command.SetNetworkVantages(mine, anotherList, null, "modA") == NetworkResult.Ok && free.Command.Networks[mine][0].Name == "Nye Island", "its maker may");
+    Check(free.Command.CreateNetworkCamera(new[] { NetworkVantage.Station("KSC") }, null, null, null, null, out uint anyones) == NetworkResult.Ok
+        && free.Command.SetNetworkVantages(anyones, anotherList, null, "modB") == NetworkResult.Ok, "a network made under no name takes anyone's list");
     Check(free.Command.DestroyNetworkCamera(mine, "modB") == NetworkResult.NotCommandFeed && free.Command.DestroyNetworkCamera(mine, null) == NetworkResult.NotCommandFeed,
         "another mod may not remove a named network");
     Check(free.Command.DestroyNetworkCamera(mine, "modA") == NetworkResult.Ok, "its maker may");

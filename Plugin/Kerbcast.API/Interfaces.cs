@@ -207,7 +207,8 @@ namespace Kerbcast.Api
         /**
          * <summary>
          * Replaces a network camera's vantages, and its options unless <paramref name="options"/> is null. A vantage
-         * kept in the list keeps its place; if the camera's current vantage is removed it cuts on its next pass. The
+         * kept in the list keeps its place; if the camera's current vantage is removed it cuts on its next pass. Only
+         * the mod that made it may replace them, unless it was made under no name. The
          * lock applies as for <see cref="CreateNetworkCamera"/>.
          * </summary>
          */

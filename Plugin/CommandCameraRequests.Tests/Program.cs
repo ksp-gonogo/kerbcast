@@ -522,9 +522,9 @@ finally { Directory.Delete(signalDir, true); }
     publisher.Publish("editable", force: true);
     Check(writes.Count == 4, "nothing rewrites the file after Stop");
 
-    Check(NetworkMath.MayDestroyHostNetwork("modA", "modA"), "a mod may remove its own network");
-    Check(!NetworkMath.MayDestroyHostNetwork("modA", "modB") && !NetworkMath.MayDestroyHostNetwork("modA", null), "no other caller may remove it");
-    Check(NetworkMath.MayDestroyHostNetwork("", null) && NetworkMath.MayDestroyHostNetwork("", "modB"), "a network made under no name can be removed by anyone");
+    Check(NetworkMath.MayChangeHostNetwork("modA", "modA"), "a mod may change or remove its own network");
+    Check(!NetworkMath.MayChangeHostNetwork("modA", "modB") && !NetworkMath.MayChangeHostNetwork("modA", null), "no other caller may change or remove it");
+    Check(NetworkMath.MayChangeHostNetwork("", null) && NetworkMath.MayChangeHostNetwork("", "modB"), "a network made under no name can be changed or removed by anyone");
 
     Directory.Delete(netDir, true);
 }

@@ -421,7 +421,7 @@ namespace Kerbcast.Api.Testing
          * As Kerbcast's, without the game: the lock and the list are checked, and a created network camera is listed by
          * Feeds at once, its SiteKey the first vantage's (a station's or launch site's name, "vessel:" and the craft's
          * id, or "surface:", the body's name from BodyNames and its place, and "LaunchPad" for a launch site naming none) and its DisplayName the first vantage's label
-         * or that key. Only the mod that made a network may remove it, unless it was made under no name. A surface vantage on a body BodyNames lacks is a BadVantage, as an unknown body is to Kerbcast. The aim is
+         * or that key. Only the mod that made a network may replace its vantages or remove it, unless it was made under no name. A surface vantage on a body BodyNames lacks is a BadVantage, as an unknown body is to Kerbcast. The aim is
          * recorded in Aims unchecked.
          * </summary>
          */
@@ -460,7 +460,7 @@ namespace Kerbcast.Api.Testing
             kc.Record($"SetNetworkVantages {flightId} {(vantages == null ? "null" : string.Join(", ", vantages))} {owner}");
             var refused = NetworkLock(owner);
             if (refused != NetworkResult.Unknown) return refused;
-            if (!networks.ContainsKey(flightId)) return NetworkResult.NotCommandFeed;
+            if (!networks.ContainsKey(flightId) || OwnedByOther(flightId, owner)) return NetworkResult.NotCommandFeed;
             var bad = Judge(vantages, options);
             if (bad != NetworkResult.Ok) return bad;
             networks[flightId] = new List<NetworkVantage>(vantages);
@@ -474,7 +474,7 @@ namespace Kerbcast.Api.Testing
             kc.Record($"DestroyNetworkCamera {flightId} {owner}");
             var refused = NetworkLock(owner);
             if (refused != NetworkResult.Unknown) return refused;
-            if (networkOwners.TryGetValue(flightId, out var made) && made.Length > 0 && made != (owner ?? "")) return NetworkResult.NotCommandFeed;
+            if (OwnedByOther(flightId, owner)) return NetworkResult.NotCommandFeed;
             if (!networks.Remove(flightId)) return NetworkResult.NotCommandFeed;
             networkOwners.Remove(flightId);
             networkOptions.Remove(flightId);
@@ -499,6 +499,9 @@ namespace Kerbcast.Api.Testing
                 });
             return result;
         }
+
+        bool OwnedByOther(uint flightId, string owner) =>
+            networkOwners.TryGetValue(flightId, out var made) && made.Length > 0 && made != (owner ?? "");
 
         /* NotLockHolder for anyone but a held lock's owner, else Unknown, counting the holder's heartbeat. */
         NetworkResult NetworkLock(string owner)
