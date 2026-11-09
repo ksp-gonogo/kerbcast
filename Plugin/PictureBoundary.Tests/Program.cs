@@ -190,5 +190,14 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(!PictureBoundary.TerrainInReach(double.NaN, DunaMax, FarClip), "terrain reach: an unreadable distance is out of reach");
 }
 
+{
+    Check(Math.Abs(PictureBoundary.SpinBackS(1.2e7, 6e5, 3e8) + 1.14e7 / 3e8) < 1e-12, "spin back: from the Mun, the distance to the near surface over c");
+    Check(PictureBoundary.SpinBackS(6e5, 6e5, 3e8) == 0, "spin back: a lens on the ground sees the ground under it unmoved");
+    Check(PictureBoundary.SpinBackS(5e5, 6e5, 3e8) == 0, "spin back: a lens below the surface does not spin the body forward");
+    Check(PictureBoundary.SpinBackS(1e9, 6e5, 3e8) < PictureBoundary.SpinBackS(1e8, 6e5, 3e8), "spin back: farther, further back");
+    Check(PictureBoundary.SpinBackS(1e9, 6e5, 0) == 0, "spin back: no spin back with no light speed");
+    Check(PictureBoundary.SpinBackS(1e7, 6e5, 3e5) == 1000 * PictureBoundary.SpinBackS(1e7, 6e5, 3e8), "spin back: grows as the light speed drops");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

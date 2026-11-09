@@ -212,7 +212,7 @@ namespace Kerbcast
             if (!c.HasValue || !TryFrameLens(out var lens)) return;
             var plan = BodiesFor(lens, c.Value);
             var bodies = FlightGlobals.Bodies;
-            if (plan == null || (plan.Moved == 0 && plan.Hidden == 0) || bodies == null) return;
+            if (plan == null || (plan.Moved == 0 && plan.Hidden == 0 && plan.Spun == 0) || bodies == null) return;
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
@@ -227,9 +227,10 @@ namespace Kerbcast
                     t.localScale = Vector3.zero;
                     continue;
                 }
-                if (!plan.TryDrawn(b.flightGlobalsIndex, out var centre, out double dt)) continue;
+                bool placed = plan.TryDrawn(b.flightGlobalsIndex, out var centre, out double dt);
+                if (!placed && !plan.TrySpin(b.flightGlobalsIndex, out dt)) continue;
                 _moved.Add(moved);
-                t.position = ScaledSpace.LocalToScaledSpace(new Vector3d(centre.X, centre.Y, centre.Z));
+                if (placed) t.position = ScaledSpace.LocalToScaledSpace(new Vector3d(centre.X, centre.Y, centre.Z));
                 /* ScaledMovement gives the mesh the body transform's rotation; this is that rotation dt seconds earlier. */
                 if (b.rotates && b.bodyTransform != null)
                 {
@@ -238,6 +239,7 @@ namespace Kerbcast
                     var q = new Quaternion((float)spun.X, (float)spun.Y, (float)spun.Z, (float)spun.W);
                     t.rotation = q * (parent != null ? parent.rotation : Quaternion.identity) * b.bodyTransform.rotation;
                 }
+                if (!placed) continue;
                 /* AtmosphereFromGround gave its shader the shell's centre in LateUpdate, before the move. */
                 var afg = b.afg != null ? b.afg.GetComponent<Renderer>() : null;
                 if (afg != null)
@@ -284,7 +286,7 @@ namespace Kerbcast
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
-                if (b != null && !KeepsPresent(b, lens) && (plan.Moves(b.flightGlobalsIndex) || plan.Hides(b.flightGlobalsIndex))) return true;
+                if (b != null && !KeepsPresent(b, lens) && (plan.Moves(b.flightGlobalsIndex) || plan.Hides(b.flightGlobalsIndex) || plan.TrySpin(b.flightGlobalsIndex, out _))) return true;
             }
             return false;
         }
@@ -318,7 +320,8 @@ namespace Kerbcast
         /* Where this camera draws body `b` this frame when it is drawn at its
            past instant: its centre in world space, and the seconds from the
            render UT back to that instant. False for a body drawn where stock
-           has it, and with no light speed. */
+           has it, and with no light speed, with `dt` still its spin back when
+           only its spin moves (the lens's own body and those above it). */
         public bool TryDrawnBody(CelestialBody b, out DVec3 centre, out double dt)
         {
             centre = default;
@@ -326,7 +329,10 @@ namespace Kerbcast
             double? c = LightTime.LightSpeed;
             if (b == null || !c.HasValue || !TryFrameLens(out var lens)) return false;
             var plan = BodiesFor(lens, c.Value);
-            return plan != null && !KeepsPresent(b, lens) && plan.TryDrawn(b.flightGlobalsIndex, out centre, out dt);
+            if (plan == null || KeepsPresent(b, lens)) return false;
+            if (plan.TryDrawn(b.flightGlobalsIndex, out centre, out dt)) return true;
+            plan.TrySpin(b.flightGlobalsIndex, out dt);
+            return false;
         }
 
         /*
@@ -700,9 +706,12 @@ namespace Kerbcast
                 else
                 {
                     var spin = ring.SpinOf(lens.Body.flightGlobalsIndex);
-                    seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, lens.Ut, spin));
+                    /* A body whose spin is drawn turned back (the lens's own or one above it) carries the craft on it only as far as it is drawn. */
+                    double drawnAt = lens.Ut;
+                    if (plan != null && !KeepsPresent(seen.Body, lens) && plan.TrySpin(index, out double spinBack)) drawnAt += spinBack;
+                    seen.World = ToD(seen.Body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, drawnAt, spin));
                     seen.About = seen.Body;
-                    q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, lens.Ut, spin)).Normalized;
+                    q = (back * PastInstant.AttitudeAboutDrawnBody(sight.State, drawnAt, spin)).Normalized;
                 }
                 seen.Rotation = new Quaternion((float)q.X, (float)q.Y, (float)q.Z, (float)q.W);
                 seen.Parts = sight.Parts;
@@ -785,6 +794,9 @@ namespace Kerbcast
                 if (trace.Carried) carried++;
                 int frame = sight.Frame;
                 if (!sight.Found && frame >= 0 && frame != index) plan.Hide(index);
+                /* The lens's own body and those above it are the frame's centre: placed right already, so only the spin goes back. */
+                if (sight.Found && frame == index && b.rotates)
+                    plan.Spin(index, PictureBoundary.SpinBackS((lens.Point - ToD(b.position)).Magnitude, b.Radius, c));
                 if (!sight.Found || frame == index || frame < 0 || frame >= bodies.Count || bodies[frame] == null) continue;
                 plan.Place(index, ToD(bodies[frame].position) + deRot.Conjugate.Rotate(sight.About), sight.Ut - lens.Ut);
             }
@@ -855,6 +867,8 @@ namespace Kerbcast
             private double[] _dt = new double[0];
             private bool[] _moves = new bool[0];
             private bool[] _hidden = new bool[0];
+            private bool[] _spins = new bool[0];
+            private double[] _spinDt = new double[0];
             private BodyTrace[] _traces = new BodyTrace[0];
             private double _t = double.NaN, _c;
             private DVec3 _point;
@@ -866,6 +880,7 @@ namespace Kerbcast
 
             public int Moved { get; private set; }
             public int Hidden { get; private set; }
+            public int Spun { get; private set; }
             /* The frame this plan was last asked for, so the longest unused is dropped first. */
             public int UsedFrame;
 
@@ -889,11 +904,14 @@ namespace Kerbcast
                     _dt = new double[count];
                     _moves = new bool[count];
                     _hidden = new bool[count];
+                    _spins = new bool[count];
+                    _spinDt = new double[count];
                     Array.Resize(ref _traces, count);
                 }
                 Array.Clear(_moves, 0, _moves.Length);
                 Array.Clear(_hidden, 0, _hidden.Length);
-                Moved = Hidden = 0;
+                Array.Clear(_spins, 0, _spins.Length);
+                Moved = Hidden = Spun = 0;
             }
 
             public BodyTrace Trace(int index)
@@ -986,6 +1004,22 @@ namespace Kerbcast
                 _dt[index] = dt;
                 if (!_moves[index]) Moved++;
                 _moves[index] = true;
+            }
+
+            public void Spin(int index, double dt)
+            {
+                if (index < 0 || index >= _spins.Length) return;
+                if (!_spins[index]) Spun++;
+                _spins[index] = true;
+                _spinDt[index] = dt;
+            }
+
+            /* A body left where it is, its spin alone drawn `dt` seconds back. */
+            public bool TrySpin(int index, out double dt)
+            {
+                bool spins = index >= 0 && index < _spins.Length && _spins[index];
+                dt = spins ? _spinDt[index] : 0;
+                return spins;
             }
 
             public bool Moves(int index) => index >= 0 && index < _moves.Length && _moves[index];

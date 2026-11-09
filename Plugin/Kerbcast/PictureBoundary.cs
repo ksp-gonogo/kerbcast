@@ -43,6 +43,15 @@ namespace Kerbcast
         public static bool TerrainInReach(double distanceM, double terrainRadiusM, double farClipM) =>
             distanceM - terrainRadiusM <= farClipM;
 
+        /*
+         * How many seconds back the spin of the lens's own body, or one above
+         * it, is drawn: negative, the light time from the surface facing the
+         * lens, so a lens on the ground sees the ground beneath it where it
+         * stands, and far out it is the distance over c.
+         */
+        public static double SpinBackS(double distanceM, double radiusM, double lightSpeed) =>
+            lightSpeed > 0 ? -Math.Max(0, distanceM - radiusM) / lightSpeed : 0;
+
         /* A point on a live craft (pivot `livePivot`, turned `liveRotation`) carried to where the craft is drawn. */
         public static DVec3 Carry(DVec3 point, DVec3 livePivot, DQuat liveRotation, DVec3 drawnPivot, DQuat drawnRotation) =>
             drawnPivot + Turn(liveRotation, drawnRotation).Rotate(point - livePivot);

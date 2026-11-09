@@ -1447,8 +1447,9 @@ namespace Kerbcast
         {
             world = live;
             if (_cam.Picture.HidesBody(b)) return false;
-            if (_cam.Picture.TryDrawnBody(b, out var centre, out double dt))
-                world = CommandCameraMath.CarriedByBody(live - ToD(b.position), centre, CommandCameraOcclusion.Spin(b), dt);
+            bool placed = _cam.Picture.TryDrawnBody(b, out var centre, out double dt);
+            if (placed || dt != 0)
+                world = CommandCameraMath.CarriedByBody(live - ToD(b.position), placed ? centre : ToD(b.position), CommandCameraOcclusion.Spin(b), dt);
             return true;
         }
 

@@ -126,6 +126,7 @@ namespace Kerbcast
                 var b = bodies[i];
                 if (b == null || picture.HidesBody(b)) continue;
                 var c = ToD(b.position);
+                /* `dt` is the spin back too for a body drawn where it is. */
                 var at = picture.TryDrawnBody(b, out var drawn, out double dt) ? drawn : c;
                 if (Blocks(b, station, target, at, c, Spin(b), dt, out source, targetRadius)) return b.bodyName;
             }
