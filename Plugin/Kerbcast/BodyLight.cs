@@ -76,8 +76,13 @@ namespace Kerbcast
         public static double ReachRadius(double radiusM, double terrainMaxM, bool atmosphere, double atmosphereDepthM) =>
             Math.Max(Math.Max(radiusM, terrainMaxM), atmosphere ? radiusM + atmosphereDepthM : radiusM);
 
-        /* Whether a disc reaches past half the way from a frame's centre to its corner, about half the frame's area, which is what a planet underfoot does. */
-        public static bool FillsFrame(double disc, double halfDiagonal) => disc > halfDiagonal / 2;
+        /*
+         * Whether a disc `angle` from a frame's centre covers that centre and
+         * half the way on to its corner, more than half the frame, which is
+         * what a planet underfoot does. A planet whose limb only crosses the
+         * frame's edge does not, however wide its whole disc.
+         */
+        public static bool FillsFrame(double angle, double disc, double halfDiagonal) => disc - angle > halfDiagonal / 2;
 
         /* The radius in pixels of a disc at the centre of a frame `rows` high. */
         public static double DiscPixels(double disc, double verticalFovDeg, int rows) =>
@@ -112,8 +117,11 @@ namespace Kerbcast
          * wider. Ties go to the lower slot, so the choice does not depend on
          * float noise between two equal discs. Slot `underfoot`, a lens's own
          * planet filling its frame, takes the light only when no other body
-         * is a candidate, so a telescope low over the horizon lights its
-         * target. The caller clears the discs that fail OutranksOwn first.
+         * is a candidate, so a lens looking down over its own ground lights
+         * the planet it watches. One whose limb only crosses the frame is
+         * not underfoot and keeps the light by its width, its target taking
+         * a system light. The caller clears the discs that fail OutranksOwn
+         * first.
          */
         public static int Pick(double[] discs, int count, int held, int underfoot = -1)
         {

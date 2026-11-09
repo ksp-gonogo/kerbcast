@@ -390,7 +390,7 @@ namespace Kerbcast
                 if (view != null && !m.Body.isStar)
                 {
                     _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ReachOf(m.Body), ahead, BodyLight.ConeFor(halfDiagonal, m.Slot == _litSlot));
-                    if (m.Body == lens.Body && BodyLight.FillsFrame(_discs[m.Slot], halfDiagonal))
+                    if (m.Body == lens.Body && BodyLight.FillsFrame(BodyLight.AngleFrom(lens.Point, m.Centre, ahead), _discs[m.Slot], halfDiagonal))
                     {
                         underfoot = m.Slot;
                         ownCentre = m.Centre;

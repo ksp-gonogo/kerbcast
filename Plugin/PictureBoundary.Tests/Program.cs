@@ -327,6 +327,16 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
         Check(BodyLight.ReachRadius(2e5, 2.07e5, false, 0) == 2.07e5, "reach: an airless body reaches its highest ground");
         Check(BodyLight.ReachRadius(6e5, 6.0676e5, true, 7e4) == 6.7e5, "reach: a body with air reaches its top");
         Check(BodyLight.ReachRadius(6e5, 0, false, 0) == 6e5, "reach: a body with no terrain reaches sea level");
+        double eveRange = 3.972e9, eveRadius = 7e5;
+        double[] limbAndEve =
+        {
+            BodyLight.DiscInFrame(probe, default, 6e5, kerbinReach, past, slit),
+            BodyLight.DiscInFrame(probe, past * eveRange, eveRadius, past, slit)
+        };
+        bool fills = BodyLight.FillsFrame(BodyLight.AngleFrom(probe, default, past), limbAndEve[0], slit);
+        Check(!fills, "fills: a limb crossing only the frame's edge does not fill it");
+        Check(BodyLight.Pick(limbAndEve, 2, -1, fills ? 0 : -1) == 0, "fills: so the planet whose limb is in frame keeps the light from the small one it frames");
+        Check(BodyLight.FillsFrame(BodyLight.AngleFrom(probe, default, new DVec3(0, -1, 0)), limbAndEve[0], slit), "fills: the same planet straight down does");
     }
 
     Check(BodyLight.Pick(new double[] { 0, 0, 0 }, 3, 1) == -1, "pick: nothing in frame gives none");
@@ -344,9 +354,9 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(BodyLight.Pick(new double[] { 0, 0 }, 2, -1, 0) == -1, "underfoot: out of frame, nothing takes the light");
     Check(BodyLight.Pick(new double[] { 0.3, 0.2 }, 2, -1) == 0, "underfoot: with none named the widest disc wins");
     double wide = BodyLight.HalfDiagonalRadians(60, 16.0 / 9);
-    Check(BodyLight.FillsFrame(BodyLight.DiscRadians(6.0001e5, 6e5), wide), "fills: a planet under a ground lens fills even a wide frame");
-    Check(BodyLight.FillsFrame(BodyLight.DiscRadians(6.0001e5, 6e5), BodyLight.HalfDiagonalRadians(1, 16.0 / 9)), "fills: and a telescope's narrow frame");
-    Check(!BodyLight.FillsFrame(BodyLight.DiscRadians(2e7, 6e5), wide), "fills: a planet well below a craft in high orbit does not, so it can take the light");
+    Check(BodyLight.FillsFrame(0, BodyLight.DiscRadians(6.0001e5, 6e5), wide), "fills: a planet under a ground lens fills even a wide frame");
+    Check(BodyLight.FillsFrame(0, BodyLight.DiscRadians(6.0001e5, 6e5), BodyLight.HalfDiagonalRadians(1, 16.0 / 9)), "fills: and a telescope's narrow frame");
+    Check(!BodyLight.FillsFrame(0, BodyLight.DiscRadians(2e7, 6e5), wide), "fills: a planet well below a craft in high orbit does not, so it can take the light");
     var groundEye = new DVec3(0, 0, 0);
     var ownCentre = new DVec3(0, -6.0001e5, 0);
     const double ownRadius = 6e5;
@@ -360,7 +370,7 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
             BodyLight.DiscInFrame(groundEye, ownCentre, ownRadius, aim, halfD),
             BodyLight.DiscInFrame(groundEye, centre, dunaRadius, aim, halfD)
         };
-        int own = BodyLight.FillsFrame(discs[0], halfD) ? 0 : -1;
+        int own = BodyLight.FillsFrame(BodyLight.AngleFrom(groundEye, ownCentre, aim), discs[0], halfD) ? 0 : -1;
         if (own == 0 && discs[1] > 0 && !BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, centre, discs[1], fov, 1080, heldSlot == 1)) discs[1] = 0;
         return BodyLight.Pick(discs, 2, heldSlot, own);
     }
