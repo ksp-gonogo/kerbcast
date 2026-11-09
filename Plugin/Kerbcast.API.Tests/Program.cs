@@ -58,6 +58,8 @@ Check((int)AimResult.Ok == 1 && (int)PublishResult.Accepted == 1 && (int)LockRes
 Check((int)AimResult.BadNumber == 10 && (int)PublishResult.Invalid == 6 && (byte)CraftFixState.Listed == 3
     && (int)SiteKind.Vessel == 3 && (int)LockOptions.WorldModelRequired == 1 && (int)ApiFeature.WorldModel == 7
     && (int)IdentityChange.Recover == 3 && (int)IdentityChange.Renumber == 4 && (int)TrackMode.Target == 2, "enum values are pinned");
+Check(default(LensSource) == LensSource.Unknown && (int)LensSource.TrackingStation == 1 && (int)LensSource.LaunchSite == 2
+    && (int)LensSource.SpaceLens == 3, "lens sources are pinned, an unset one Unknown");
 Check(default(OpticsResult) == OpticsResult.Unknown && (int)OpticsResult.Ok == 1 && (int)OpticsResult.NotLockHolder == 2
     && (int)OpticsResult.NotCommandFeed == 3 && (int)OpticsResult.BadNumber == 4 && (int)OpticsResult.NotRunning == 5
     && (int)ApiFeature.Optics == 8, "optics numbers are pinned");
@@ -252,14 +254,17 @@ using (var kc = RecordingKerbcast.Install())
         kc.Command.SetLineOfSight(new LineOfSightResult(true, true, null, false, 1e6, resolutionRad: 2e-6));
         Check(cmd.LineOfSight(relay, 1000, 1, new Vec3d(7e5, 0, 0)).ResolutionRad == 2e-6, "a test sets the resolution line of sight answers");
         var res = cmd.VantageResolution(relay);
-        Check(!res.Known && double.IsNaN(res.FovMinDeg) && double.IsNaN(res.PixelRad) && double.IsNaN(res.LensArcsec) && double.IsNaN(res.BestResolutionRad),
+        Check(!res.Known && double.IsNaN(res.FovMinDeg) && double.IsNaN(res.PixelRad) && double.IsNaN(res.LensArcsec) && double.IsNaN(res.BestResolutionRad)
+            && res.LensSource == LensSource.Unknown && res.LensLevel == 0 && res.LensName == null,
             "vantage resolution is unknown until a test sets an answer");
-        var set = new VantageResolution { Known = true, FovMinDeg = 0.02, FrameWidthPx = 1024, FrameHeightPx = 576, PixelRad = 6.06e-7, OpticsOn = true, LensArcsec = 4, BestResolutionRad = 1.94e-5 };
+        var set = new VantageResolution { Known = true, FovMinDeg = 0.02, FrameWidthPx = 1024, FrameHeightPx = 576, PixelRad = 6.06e-7, OpticsOn = true, LensArcsec = 4, BestResolutionRad = 1.94e-5,
+            LensSource = LensSource.SpaceLens, LensLevel = 3, LensName = "Experimental Science" };
         kc.Command.SetVantageResolution(set);
         set.FovMinDeg = 9;
         res = cmd.VantageResolution(NetworkVantage.Station("KSC"));
         Check(res.Known && res.FovMinDeg == 0.02 && res.FrameWidthPx == 1024 && res.FrameHeightPx == 576 && res.OpticsOn && res.LensArcsec == 4
-            && res.BestResolutionRad == 1.94e-5, "a test sets what vantage resolution answers, kept as it was set");
+            && res.BestResolutionRad == 1.94e-5 && res.LensSource == LensSource.SpaceLens && res.LensLevel == 3 && res.LensName == "Experimental Science",
+            "a test sets what vantage resolution answers, kept as it was set");
         res.FrameWidthPx = 1;
         Check(cmd.VantageResolution(relay).FrameWidthPx == 1024, "each answer is the caller's own copy");
         Check(!cmd.VantageResolution(null).Known, "a null vantage resolves nothing");

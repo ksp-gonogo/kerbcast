@@ -77,6 +77,27 @@ namespace Kerbcast
         }
     }
 
+    /* Where a site's lens comes from. */
+    internal enum LensKind
+    {
+        TrackingStation,
+        LaunchSite,
+        SpaceLens,
+    }
+
+    /* The lens a site has and where it comes from. */
+    internal struct LensChoice
+    {
+        public double Arcsec;
+        public LensKind Kind;
+        /* The Tracking Station level, or the space-lens step, 1 based. */
+        public int Level;
+        /* What a player would call it; null when the caller did not ask. */
+        public string Name;
+        /* What chose it, for the log. */
+        public string Label;
+    }
+
     /* Where a lens stands and what it looks at, for OpticsModel.Assess. */
     internal struct OpticsSite
     {
@@ -106,6 +127,8 @@ namespace Kerbcast
         /* The optics blur is drawn; Knobs means nothing otherwise. */
         public bool OpticsOn;
         public OpticsKnobs Knobs;
+        /* Where the lens comes from, whether or not the optics are drawn. */
+        public LensChoice Lens;
 
         public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset };
 
@@ -500,6 +523,63 @@ namespace Kerbcast
         }
 
         private static double Sq(double v) => v * v;
+    }
+
+    /* One space-lens step: the tech node that unlocks it and the lens it gives, in arcseconds. */
+    internal struct SpaceLensStep
+    {
+        public string TechId;
+        public double Arcsec;
+
+        public SpaceLensStep(string techId, double arcsec)
+        {
+            TechId = techId;
+            Arcsec = arcsec;
+        }
+
+        /* A step with a tech node and a lens; a modder blanks either to drop it. */
+        public bool Valid => !string.IsNullOrEmpty(TechId) && Arcsec > 0 && !double.IsInfinity(Arcsec);
+    }
+
+    /*
+     * The space lens: a camera on a craft outside any atmosphere gets a lens
+     * that improves as research unlocks tech nodes, on top of the Tracking
+     * Station's. Unity-free; the game says which nodes are researched.
+     */
+    internal static class SpaceLens
+    {
+        /* The narrowest field any camera zooms to, degrees, however fine its lens. */
+        public const double NarrowestFovDeg = 0.001;
+
+        /* The step the finest researched lens comes from, -1 when none is. */
+        public static int BestStep(SpaceLensStep[] steps, Func<string, bool> researched)
+        {
+            int best = -1;
+            if (steps == null || researched == null) return best;
+            for (int i = 0; i < steps.Length; i++)
+            {
+                if (!steps[i].Valid || !researched(steps[i].TechId)) continue;
+                if (best < 0 || steps[i].Arcsec < steps[best].Arcsec) best = i;
+            }
+            return best;
+        }
+
+        /* Whether a space lens of `spaceArcsec` beats the ground lens `groundArcsec`, so a craft camera outside the air takes it. */
+        public static bool Beats(double spaceArcsec, double groundArcsec) =>
+            spaceArcsec > 0 && !double.IsInfinity(spaceArcsec) && (double.IsNaN(groundArcsec) || spaceArcsec < groundArcsec);
+
+        /*
+         * The zoom limit for a lens of `arcsec` with the optics drawn: where
+         * its blur spans OpticsModel.FloorBlurPx of a `rows`-high frame, never
+         * wider than `fovMinDeg` (the usual limit) and never narrower than
+         * NarrowestFovDeg.
+         */
+        public static double FovMin(double fovMinDeg, double arcsec, int rows)
+        {
+            double optics = OpticsModel.FovForBlurPx(arcsec, rows, OpticsModel.FloorBlurPx);
+            if (double.IsNaN(optics)) return fovMinDeg;
+            return Math.Max(NarrowestFovDeg, Math.Min(fovMinDeg, optics));
+        }
     }
 
     /* Smooth, looping noise for seeing's motion: whole-cycle sines at a few

@@ -2017,5 +2017,35 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(CommandCameraMath.FacilityLevelIndex(double.NaN, 3) == 0 && CommandCameraMath.FacilityLevelIndex(0.5, 0) == 0, "no level or no models is the first");
 }
 
+{
+    var steps = new[]
+    {
+        new SpaceLensStep("scienceTech", 0.5),
+        new SpaceLensStep("advScienceTech", 0.2),
+        new SpaceLensStep("experimentalScience", 0.05),
+    };
+    Check(SpaceLens.BestStep(steps, id => false) == -1, "space lens: nothing researched gives no step");
+    Check(SpaceLens.BestStep(steps, id => true) == 2, "space lens: everything researched gives the finest step");
+    Check(SpaceLens.BestStep(steps, id => id == "scienceTech") == 0, "space lens: one node researched gives its step");
+    Check(SpaceLens.BestStep(steps, id => id != "advScienceTech") == 2, "space lens: a later node researched past a skipped one still counts");
+    var dropped = (SpaceLensStep[])steps.Clone();
+    dropped[2].Arcsec = 0;
+    Check(SpaceLens.BestStep(dropped, id => true) == 1, "space lens: a step with a lens of 0 is dropped");
+    dropped[1].TechId = "";
+    Check(SpaceLens.BestStep(dropped, id => true) == 0, "space lens: a step with no node is dropped");
+    Check(SpaceLens.BestStep(null, id => true) == -1 && SpaceLens.BestStep(steps, null) == -1, "space lens: no steps or no research gives nothing");
+
+    Check(SpaceLens.Beats(0.5, 1.0) && !SpaceLens.Beats(1.0, 1.0) && !SpaceLens.Beats(2.0, 1.0), "space lens: taken only when finer than the ground lens");
+    Check(!SpaceLens.Beats(double.NaN, 1.0) && !SpaceLens.Beats(0, 1.0) && SpaceLens.Beats(0.5, double.NaN), "space lens: no lens never wins, any lens beats none");
+
+    double fov = SpaceLens.FovMin(0.02, 0.05, 576);
+    double pix = OpticsModel.PixelArcsec(fov, 576);
+    Check(Near(0.05 / pix, OpticsModel.FloorBlurPx, 1e-6), "space lens: the zoom stops where the lens spans FloorBlurPx");
+    Check(Near(fov, 0.004, 1e-4), "space lens: the top step zooms to about 0.004 degrees");
+    Check(SpaceLens.FovMin(0.02, 1.0, 576) == 0.02, "space lens: a coarse lens never widens the usual limit");
+    Check(SpaceLens.FovMin(0.02, 0.001, 576) == SpaceLens.NarrowestFovDeg, "space lens: a near-perfect lens stops at the narrowest field");
+    Check(SpaceLens.FovMin(0.02, double.NaN, 576) == 0.02 && SpaceLens.FovMin(0.02, 0.05, 0) == 0.02, "space lens: no lens or no frame keeps the usual limit");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

@@ -161,12 +161,22 @@ namespace Kerbcast
            With it on, the lens rather than the level sets the zoom limit: a
            camera stops where its blur spans OpticsModel.FloorBlurPx. */
         public bool DeepSpaceOptics { get; private set; } = true;
-        /* The lens per Tracking Station level, in arcseconds (FWHM). Satellites
-           and other vantages follow the level too; the camera beside the launch
-           site always has level 1's. */
+        /* The lens per Tracking Station level, in arcseconds (FWHM). Every
+           vantage follows the level, a craft's unless its space lens is finer;
+           the camera beside the launch site always has level 1's. */
         public double OpticsResolutionLevel1 { get; private set; } = 15.0;
         public double OpticsResolutionLevel2 { get; private set; } = 4.0;
         public double OpticsResolutionLevel3 { get; private set; } = 1.0;
+        /* The space lens: a camera on a craft outside any atmosphere gets the
+           finest lens among the steps whose tech node is researched (all of
+           them outside career and science), when it beats the Tracking
+           Station's. A step with a lens of 0 is dropped. */
+        public SpaceLensStep[] SpaceLensSteps { get; } =
+        {
+            new SpaceLensStep("scienceTech", 0.5),
+            new SpaceLensStep("advScienceTech", 0.2),
+            new SpaceLensStep("experimentalScience", 0.05),
+        };
         /* Seeing at the zenith through Kerbin's sea-level air, in arcseconds,
            and how fast it worsens towards the horizon. */
         public double OpticsSeeing { get; private set; } = 1.0;
@@ -586,6 +596,12 @@ namespace Kerbcast
             ApplyFloat(node, "OpticsResolutionLevel1", v => settings.OpticsResolutionLevel1 = Mathf.Max(0f, v));
             ApplyFloat(node, "OpticsResolutionLevel2", v => settings.OpticsResolutionLevel2 = Mathf.Max(0f, v));
             ApplyFloat(node, "OpticsResolutionLevel3", v => settings.OpticsResolutionLevel3 = Mathf.Max(0f, v));
+            for (int i = 0; i < settings.SpaceLensSteps.Length; i++)
+            {
+                int step = i;
+                ApplyString(node, $"SpaceLensTech{step + 1}", v => settings.SpaceLensSteps[step].TechId = v.Trim());
+                ApplyFloat(node, $"SpaceLensArcsec{step + 1}", v => settings.SpaceLensSteps[step].Arcsec = Mathf.Max(0f, v));
+            }
             ApplyFloat(node, "OpticsSeeing", v => settings.OpticsSeeing = Mathf.Max(0f, v));
             ApplyFloat(node, "OpticsSeeingAirmassPower", v => settings.OpticsSeeingAirmassPower = Mathf.Clamp(v, 0f, 3f));
             ApplyFloat(node, "OpticsBrightnessHold", v => settings.OpticsBrightnessHold = Mathf.Clamp01(v));

@@ -204,8 +204,8 @@ namespace Kerbcast.Api
 
         /**
          * <summary>
-         * The lens's own blur (FWHM) in arcseconds while OpticsOn, Kerbcast's own for the vantage at the Tracking
-         * Station level now, before any feed's <see cref="ICommand.SetOptics"/> override; NaN otherwise. Air adds to it
+         * The lens's own blur (FWHM) in arcseconds while OpticsOn, Kerbcast's own for the vantage now (the Tracking
+         * Station level, or a craft's space lens, see LensSource), before any feed's <see cref="ICommand.SetOptics"/> override; NaN otherwise. Air adds to it
          * from the ground: <see cref="LineOfSightResult.ResolutionRad"/> has the whole blur toward a point.
          * </summary>
          */
@@ -219,9 +219,33 @@ namespace Kerbcast.Api
          */
         public double BestResolutionRad { get; set; } = double.NaN;
 
+        /**
+         * <summary>
+         * Where the vantage's lens comes from: the Tracking Station, the launch site's fixed lens, or a craft's space
+         * lens. Set whether or not OpticsOn; the lens changes the picture only while it is. Unknown when not Known.
+         * </summary>
+         */
+        public LensSource LensSource { get; set; }
+
+        /**
+         * <summary>
+         * The lens's level: the Tracking Station level (1 based) for TrackingStation and LaunchSite, or the space-lens
+         * step (1 based, in Kerbcast's own order) for SpaceLens. 0 when not Known.
+         * </summary>
+         */
+        public int LensLevel { get; set; }
+
+        /**
+         * <summary>
+         * A short name for the lens a player would recognise: "Tracking Station level 2", or for a space lens the title
+         * of the tech node that unlocked it, in the player's language. Null when not Known.
+         * </summary>
+         */
+        public string LensName { get; set; }
+
         public override string ToString() =>
             !Known ? "VantageResolution(unknown)"
-                : $"VantageResolution(fovMin={FovMinDeg} deg, {FrameWidthPx}x{FrameHeightPx}, pixel={PixelRad} rad, optics={(OpticsOn ? LensArcsec + " arcsec" : "off")}, best={BestResolutionRad} rad)";
+                : $"VantageResolution(fovMin={FovMinDeg} deg, {FrameWidthPx}x{FrameHeightPx}, pixel={PixelRad} rad, optics={(OpticsOn ? LensArcsec + " arcsec" : "off")}, best={BestResolutionRad} rad, lens={LensSource} {LensLevel} '{LensName}')";
     }
 
     /** <summary>How a tracking network holds after a cut. Every value finite and 0 or more.</summary> */

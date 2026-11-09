@@ -1598,6 +1598,9 @@ namespace Kerbcast
                 // own per-frame main-thread cost (the regulated quantity).
                 sb.Append($"  \"staggerBudget\": {_staggerBudget},\n");
                 sb.Append($"  \"kerbcastFrameMs\": {_kerbcastFrameMs.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)},\n");
+                /* The lens levels this save offers, for a page to show what research buys; absent with no game loaded. */
+                var lensLevels = LensLevelsStatus.Json(_settings);
+                if (lensLevels != null) sb.Append($"  \"lensLevels\": {lensLevels},\n");
                 sb.Append("  \"cameras\": [\n");
                 // Diagnostic fields are KerbcastCamera-specific; kerbal cameras
                 // contribute no diagnostics this stage. Filter first so the

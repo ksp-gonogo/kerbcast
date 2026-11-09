@@ -596,6 +596,7 @@ namespace Kerbcast.Api.Testing
         {
             Known = r.Known, FovMinDeg = r.FovMinDeg, FrameWidthPx = r.FrameWidthPx, FrameHeightPx = r.FrameHeightPx,
             PixelRad = r.PixelRad, OpticsOn = r.OpticsOn, LensArcsec = r.LensArcsec, BestResolutionRad = r.BestResolutionRad,
+            LensSource = r.LensSource, LensLevel = r.LensLevel, LensName = r.LensName,
         };
 
         public IReadOnlyList<CommandTarget> Targets(uint flightId)

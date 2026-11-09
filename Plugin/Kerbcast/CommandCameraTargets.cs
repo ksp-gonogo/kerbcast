@@ -68,12 +68,15 @@ namespace Kerbcast
             catch (Exception) { return 1f; }
         }
 
-        public static int TrackingLevel()
+        public static int TrackingLevel() => CommandCameraMath.TrackingLevel(NormLevel(), LevelIndexCount());
+
+        /* The Tracking Station's top level, 1 based: the level its lens stands for where the level sets nothing. */
+        public static int TopTrackingLevel() => CommandCameraMath.TrackingLevel(1, LevelIndexCount());
+
+        private static int LevelIndexCount()
         {
-            int maxIndex;
-            try { maxIndex = ScenarioUpgradeableFacilities.GetFacilityLevelCount(SpaceCenterFacility.TrackingStation); }
-            catch (Exception) { maxIndex = -1; }
-            return CommandCameraMath.TrackingLevel(NormLevel(), maxIndex);
+            try { return ScenarioUpgradeableFacilities.GetFacilityLevelCount(SpaceCenterFacility.TrackingStation); }
+            catch (Exception) { return -1; }
         }
 
         public static double RoundRange(double rangeM) =>
