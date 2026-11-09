@@ -45,8 +45,17 @@ namespace Kerbcast.Api
         /** <summary>Whether a client or a mod created the feed, rather than settings.</summary> */
         public bool Created { get; set; }
 
-        /** <summary>A tracking network camera, which moves between vantages (see <see cref="ICommand.NetworkStatus"/>). Added in API 1.4.</summary> */
+        /** <summary>A tracking network camera, which moves between vantages (see <see cref="ICommand.NetworkStatus"/>). Added in API 1.5.</summary> */
         public bool Network { get; set; }
+
+        /**
+         * <summary>
+         * A network a player saved with the game. <see cref="Network"/> and <see cref="Created"/> are true too, but
+         * <see cref="ICommand.SetNetworkVantages"/> and <see cref="ICommand.DestroyNetworkCamera"/> answer NotCommandFeed
+         * for it; aim and field of view work under the lock rules. Added in API 1.5.
+         * </summary>
+         */
+        public bool Saved { get; set; }
 
         /**
          * <summary>

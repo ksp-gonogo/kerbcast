@@ -41,13 +41,20 @@ Check(KerbcastApi.Supports(ApiFeature.CameraControl) && KerbcastApi.Supports(Api
     && KerbcastApi.Supports(ApiFeature.LightSpeed) && KerbcastApi.Supports(ApiFeature.CommandLock)
     && KerbcastApi.Supports(ApiFeature.CommandAim) && KerbcastApi.Supports(ApiFeature.WorldModel),
     "shipped: every feature of API 1.0");
-Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.3");
-Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras, from API 1.4");
+Check(KerbcastApi.Supports(ApiFeature.Optics), "shipped: optics, from API 1.5");
+Check(KerbcastApi.Supports(ApiFeature.NetworkCameras), "shipped: network cameras, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.GroundStations) && (int)ApiFeature.GroundStations == 10, "shipped: the ground station list, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.LineOfSight) && (int)ApiFeature.LineOfSight == 11, "shipped: line of sight, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.VantageResolution) && (int)ApiFeature.VantageResolution == 12, "shipped: vantage resolution, from API 1.5");
 Check(KerbcastApi.Supports(ApiFeature.CommandFov) && (int)ApiFeature.CommandFov == 13, "shipped: a command feed's field of view, from API 1.5");
 Check(!KerbcastApi.Supports((ApiFeature)999), "an unknown feature is unsupported");
+{
+    var free = new RecordingKerbcast();
+    Check(free.Command.CreateNetworkCamera(new[] { NetworkVantage.Station("KSC") }, null, null, null, "modA", out uint mine) == NetworkResult.Ok, "a network is made with no lock held");
+    Check(free.Command.DestroyNetworkCamera(mine, "modB") == NetworkResult.NotCommandFeed && free.Command.DestroyNetworkCamera(mine, null) == NetworkResult.NotCommandFeed,
+        "another mod may not remove a named network");
+    Check(free.Command.DestroyNetworkCamera(mine, "modA") == NetworkResult.Ok, "its maker may");
+}
 
 // Enum numbers are part of the contract.
 Check(default(AimResult) == AimResult.Unknown && default(PublishResult) == PublishResult.Unknown && default(LockResult) == LockResult.Unknown
@@ -273,11 +280,15 @@ using (var kc = RecordingKerbcast.Install())
         kc.Command.SetGroundStations(new[]
         {
             new GroundStationInfo { NodeName = "KSC", DisplayName = "Kerbal Space Center", BodyIndex = 1, Latitude = -0.1, Longitude = -74.6, Altitude = 70, Enabled = true },
-            new GroundStationInfo { NodeName = "Crater Rim", DisplayName = "Crater Rim", BodyIndex = 1, Latitude = 9.4, Longitude = -172.1, Altitude = 4000, Enabled = false },
+            new GroundStationInfo { NodeName = "Crater Rim", DisplayName = "Crater Rim", BodyIndex = 1, Latitude = 9.4, Longitude = -172.1, Altitude = 4000, Enabled = false, DisabledReason = "extra stations are off" },
         });
         var listed = cmd.GroundStations();
         Check(listed.Count == 2 && listed[0].NodeName == "KSC" && listed[0].Enabled && !listed[1].Enabled && listed[1].Altitude == 4000,
             "GroundStations lists every station set, on or off");
+        Check(listed[1].DisabledReason == "extra stations are off" && listed[0].DisabledReason == null, "a station switched off says why");
+        Check(cmd.CreateNetworkCamera(new[] { NetworkVantage.LaunchSite(null) }, null, null, null, "modA", out uint anyPad) == NetworkResult.Ok
+            && cmd.Feeds().First(f => f.FlightId == anyPad).SiteKey == "LaunchPad", "a launch site naming none keys as Kerbcast's own fallback does");
+        cmd.DestroyNetworkCamera(anyPad, "modA");
         Check(cmd.CreateNetworkCamera(listed.Select(s => NetworkVantage.Station(s.NodeName)).ToList(), null, null, null, "modA", out uint fromList) == NetworkResult.Ok
             && kc.Command.Networks[fromList].Count == 2, "a host builds a network from the list");
         cmd.DestroyNetworkCamera(fromList, "modA");
@@ -303,7 +314,14 @@ using (var kc = RecordingKerbcast.Install())
         Check(cmd.SetNetworkVantages(net, new NetworkVantage[0], null, "modA") == NetworkResult.NoVantages && kc.Command.Networks[net].Count == 1,
             "an empty replacement is refused and the list kept");
         kc.Command.SetNetworkStatus(net, new[] { new NetworkVantageStatus { SiteKey = "Nye Island", Label = "Nye Island", Active = true, State = "occluded", Score = double.NaN } });
-        Check(cmd.NetworkStatus(net)[0].State == "occluded", "a test sets the status it wants to read");
+        kc.Command.SetNetworkStatus(net, new[] { new NetworkVantageStatus { SiteKey = "Nye Island", Label = "Nye Island", Active = true, State = "occluded", Score = double.NaN, Occluder = "Mun" } });
+        Check(cmd.NetworkStatus(net)[0].State == "occluded" && cmd.NetworkStatus(net)[0].Occluder == "Mun", "a test sets the status it wants to read, its occluder included");
+        kc.Command.AddFeed(new CommandFeed { FlightId = 0xFFFF0000u, SiteKey = "KSC", SiteKind = SiteKind.Station, Created = true, Network = true, Saved = true });
+        Check(cmd.Feeds().First(f => f.FlightId == 0xFFFF0000u).Saved && cmd.Feeds().First(f => f.FlightId == net).Saved == false, "a saved network is told apart from a host's");
+        Check(cmd.SetNetworkVantages(0xFFFF0000u, new[] { NetworkVantage.Station("KSC") }, null, "modA") == NetworkResult.NotCommandFeed
+            && cmd.DestroyNetworkCamera(0xFFFF0000u, "modA") == NetworkResult.NotCommandFeed, "a saved network's vantages and removal are refused");
+        Check(cmd.SetAim(0xFFFF0000u, Aim.Vessel(42), "modA") == AimResult.Ok && cmd.SetFov(0xFFFF0000u, 10, "modA") == AimResult.Ok, "a saved network still takes an aim and a field of view under the lock rules");
+        cmd.SetAim(0xFFFF0000u, null, "modA");
         Check(cmd.DestroyNetworkCamera(net, "modB") == NetworkResult.NotLockHolder, "only the holder removes it");
         Check(cmd.DestroyNetworkCamera(500, "modA") == NetworkResult.NotCommandFeed, "a feed at one site is no network to remove");
         Check(cmd.DestroyNetworkCamera(net, "modA") == NetworkResult.Ok && cmd.Feeds().All(f => f.FlightId != net)

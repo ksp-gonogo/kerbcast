@@ -22,9 +22,9 @@ namespace Kerbcast.Api
         CommandFeeds = 6,
         /** <summary><see cref="ICommand.AttachWorldModel"/> and the publisher.</summary> */
         WorldModel = 7,
-        /** <summary><see cref="ICommand.SetOptics"/>. Added in API 1.3.</summary> */
+        /** <summary><see cref="ICommand.SetOptics"/>. Added in API 1.5.</summary> */
         Optics = 8,
-        /** <summary><see cref="ICommand.CreateNetworkCamera"/>, <see cref="ICommand.SetNetworkVantages"/>, <see cref="ICommand.DestroyNetworkCamera"/> and <see cref="ICommand.NetworkStatus"/>. Added in API 1.4.</summary> */
+        /** <summary><see cref="ICommand.CreateNetworkCamera"/>, <see cref="ICommand.SetNetworkVantages"/>, <see cref="ICommand.DestroyNetworkCamera"/> and <see cref="ICommand.NetworkStatus"/>. Added in API 1.5.</summary> */
         NetworkCameras = 9,
         /** <summary><see cref="ICommand.GroundStations"/>. Added in API 1.5.</summary> */
         GroundStations = 10,
@@ -212,7 +212,14 @@ namespace Kerbcast.Api
         Unknown = 0,
         Ok = 1,
         NotLockHolder = 2,
-        /** <summary>The flightId is no tracking network camera made through the API, built or waiting to be. A network a player saved with the game is theirs alone to change.</summary> */
+        /**
+         * <summary>
+         * The flightId is no tracking network camera this caller can change: not one made through the API, built or
+         * waiting to be, or one another mod made under its own name for a removal, or one a player saved with the game
+         * (<see cref="CommandFeed.Saved"/>). A saved network's vantages and its removal are the player's alone; its aim
+         * and field of view still follow <see cref="ICommand.SetAim"/> and <see cref="ICommand.SetFov"/> under the lock rules.
+         * </summary>
+         */
         NotCommandFeed = 3,
         /** <summary>The list is null or empty: a network always has at least one vantage.</summary> */
         NoVantages = 4,

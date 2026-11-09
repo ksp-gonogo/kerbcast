@@ -272,6 +272,7 @@ namespace Kerbcast
                     Fallback = r.Fallback,
                     State = NetworkMath.Code(r.State),
                     Score = r.Score,
+                    Occluder = r.Occluder,
                 });
             return result;
         }
@@ -334,6 +335,7 @@ namespace Kerbcast
                     Longitude = s.Longitude,
                     Altitude = s.Altitude,
                     Enabled = s.Enabled,
+                    DisabledReason = s.DisabledReason,
                 });
             return result;
         }
@@ -480,6 +482,7 @@ namespace Kerbcast
                     SubjectPersistentId = gr.SubjectPersistentId,
                     Created = core.CommandProvider?.IsCreated(c.FlightId) ?? false,
                     Network = gr.Network != null,
+                    Saved = core.IsSavedNetwork(c.FlightId),
                     FollowsActiveVessel = gr.Aim == null,
                 });
             }

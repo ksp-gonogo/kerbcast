@@ -23,6 +23,7 @@ namespace Kerbcast.Api.Testing
         readonly Dictionary<uint, NetworkOptions> networkOptions = new Dictionary<uint, NetworkOptions>();
         readonly Dictionary<uint, List<NetworkVantageStatus>> networkStatus = new Dictionary<uint, List<NetworkVantageStatus>>();
         readonly List<GroundStationInfo> stations = new List<GroundStationInfo>();
+        readonly Dictionary<uint, string> networkOwners = new Dictionary<uint, string>();
         LineOfSightResult sight = new LineOfSightResult(false, false, null, false, double.NaN);
         VantageResolution resolution = new VantageResolution();
         uint nextNetworkId = 0x4E000001;
@@ -419,8 +420,8 @@ namespace Kerbcast.Api.Testing
          * <summary>
          * As Kerbcast's, without the game: the lock and the list are checked, and a created network camera is listed by
          * Feeds at once, its SiteKey the first vantage's (a station's or launch site's name, "vessel:" and the craft's
-         * id, or "surface:", the body's name from BodyNames and its place) and its DisplayName the first vantage's label
-         * or that key. A surface vantage on a body BodyNames lacks is a BadVantage, as an unknown body is to Kerbcast. The aim is
+         * id, or "surface:", the body's name from BodyNames and its place, and "LaunchPad" for a launch site naming none) and its DisplayName the first vantage's label
+         * or that key. Only the mod that made a network may remove it, unless it was made under no name. A surface vantage on a body BodyNames lacks is a BadVantage, as an unknown body is to Kerbcast. The aim is
          * recorded in Aims unchecked.
          * </summary>
          */
@@ -436,6 +437,7 @@ namespace Kerbcast.Api.Testing
             if (bad != NetworkResult.Ok) return bad;
             flightId = nextNetworkId++;
             networks[flightId] = new List<NetworkVantage>(vantages);
+            networkOwners[flightId] = owner ?? "";
             networkOptions[flightId] = Copy(options ?? new NetworkOptions());
             if (aim != null) aims[flightId] = aim;
             string key = Key(vantages[0]);
@@ -472,7 +474,9 @@ namespace Kerbcast.Api.Testing
             kc.Record($"DestroyNetworkCamera {flightId} {owner}");
             var refused = NetworkLock(owner);
             if (refused != NetworkResult.Unknown) return refused;
+            if (networkOwners.TryGetValue(flightId, out var made) && made.Length > 0 && made != (owner ?? "")) return NetworkResult.NotCommandFeed;
             if (!networks.Remove(flightId)) return NetworkResult.NotCommandFeed;
+            networkOwners.Remove(flightId);
             networkOptions.Remove(flightId);
             networkStatus.Remove(flightId);
             aims.Remove(flightId);
@@ -539,6 +543,8 @@ namespace Kerbcast.Api.Testing
                 case SiteKind.Vessel: return "vessel:" + v.PersistentId;
                 case SiteKind.Surface:
                     return string.Format(System.Globalization.CultureInfo.InvariantCulture, "surface:{0}:{1:F5}:{2:F5}", BodyNames[v.BodyIndex], v.Latitude, v.Longitude);
+                /* With no craft to read a launch site from, Kerbcast's own fallback: the stock pad. */
+                case SiteKind.LaunchSite: return string.IsNullOrEmpty(v.Name) ? "LaunchPad" : v.Name;
                 default: return v.Name;
             }
         }
@@ -551,7 +557,7 @@ namespace Kerbcast.Api.Testing
         static NetworkVantageStatus Copy(NetworkVantageStatus s) => new NetworkVantageStatus
         {
             SiteKey = s.SiteKey, Label = s.Label, SiteKind = s.SiteKind, VantagePersistentId = s.VantagePersistentId,
-            Active = s.Active, Fallback = s.Fallback, State = s.State, Score = s.Score,
+            Active = s.Active, Fallback = s.Fallback, State = s.State, Score = s.Score, Occluder = s.Occluder,
         };
 
         public IReadOnlyList<CommandFeed> Feeds()
@@ -574,7 +580,7 @@ namespace Kerbcast.Api.Testing
             return stations.ConvertAll(s => new GroundStationInfo
             {
                 NodeName = s.NodeName, DisplayName = s.DisplayName, BodyIndex = s.BodyIndex, Latitude = s.Latitude,
-                Longitude = s.Longitude, Altitude = s.Altitude, Enabled = s.Enabled,
+                Longitude = s.Longitude, Altitude = s.Altitude, Enabled = s.Enabled, DisabledReason = s.DisabledReason,
             });
         }
 
@@ -681,7 +687,7 @@ namespace Kerbcast.Api.Testing
         {
             FlightId = f.FlightId, DisplayName = f.DisplayName, SiteKey = f.SiteKey, SiteKind = f.SiteKind,
             VantagePersistentId = f.VantagePersistentId, Scope = f.Scope, SubjectPersistentId = f.SubjectPersistentId,
-            Created = f.Created, Network = f.Network, FollowsActiveVessel = f.FollowsActiveVessel,
+            Created = f.Created, Network = f.Network, Saved = f.Saved, FollowsActiveVessel = f.FollowsActiveVessel,
         };
 
         static CommandTarget Copy(CommandTarget t) => new CommandTarget

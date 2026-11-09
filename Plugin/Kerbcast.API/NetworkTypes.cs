@@ -61,7 +61,13 @@ namespace Kerbcast.Api
         public static NetworkVantage Station(string nodeName, string label = null, double height = DefaultStationHeight) =>
             new NetworkVantage(SiteKind.Station, nodeName, label, false, height);
 
-        /** <summary>Beside a launch site ("LaunchPad", "Runway" or a modded site), as the Launchpad camera stands.</summary> */
+        /**
+         * <summary>
+         * Beside a launch site ("LaunchPad", "Runway" or a modded site), as the Launchpad camera stands. Null or empty
+         * <paramref name="site"/> takes the launch site of the active craft in flight, or of the craft the camera
+         * watches at the Space Center, and the stock launch pad when that craft has none.
+         * </summary>
+         */
         public static NetworkVantage LaunchSite(string site, string label = null, double distance = DefaultLaunchSiteDistance,
             double bearing = DefaultLaunchSiteBearing, double height = DefaultLaunchSiteHeight) =>
             new NetworkVantage(SiteKind.LaunchSite, site, label, false, height, distance, bearing);
@@ -113,6 +119,9 @@ namespace Kerbcast.Api
 
         /** <summary>The game has the station switched on. A vantage at one switched off reads "disabled".</summary> */
         public bool Enabled { get; set; }
+
+        /** <summary>Why the game has it switched off, a short text fit to show a player; null while it is on. Added in API 1.5.</summary> */
+        public string DisabledReason { get; set; }
 
         public override string ToString() => $"GroundStation({NodeName} '{DisplayName}' body {BodyIndex} {Latitude}, {Longitude}, {Altitude} m{(Enabled ? "" : " off")})";
     }
@@ -302,5 +311,8 @@ namespace Kerbcast.Api
 
         /** <summary>Picture quality in stops, higher is clearer; NaN unless State is "ok".</summary> */
         public double Score { get; set; }
+
+        /** <summary>The name of the body hiding the craft while State is "occluded", else null. Added in API 1.5.</summary> */
+        public string Occluder { get; set; }
     }
 }

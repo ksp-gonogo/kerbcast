@@ -107,7 +107,8 @@ namespace Kerbcast.Api
     {
         /**
          * <summary>
-         * Takes the lock on every command feed in this scene for <paramref name="owner"/>. While held, only
+         * Takes the lock on every command feed in this scene for <paramref name="owner"/>. Every feed returns to its
+         * default aim, a network a player saved to its saved watch. While held, only
          * the owner aims command feeds; every owner call is a heartbeat, and 5 s of real time without one
          * blanks every governed feed with <paramref name="silentText"/> (or Kerbcast's default), never the
          * truth. NotRunning when Kerbcast is not running in this scene, as through a reference kept from an
@@ -119,7 +120,7 @@ namespace Kerbcast.Api
          */
         LockResult TakeLock(string owner, LockOptions options, string silentText = null);
 
-        /** <summary>Releases the lock; every feed returns to truth and its default aim. Ignored for anyone but the holder.</summary> */
+        /** <summary>Releases the lock; every feed returns to truth and its default aim, a network a player saved to its saved watch. Ignored for anyone but the holder.</summary> */
         void ReleaseLock(string owner);
 
         /**
@@ -212,7 +213,7 @@ namespace Kerbcast.Api
          */
         NetworkResult SetNetworkVantages(uint flightId, IReadOnlyList<NetworkVantage> vantages, NetworkOptions options, string owner);
 
-        /** <summary>Removes a network camera, built or not; its feed ends. The lock applies as for <see cref="CreateNetworkCamera"/>.</summary> */
+        /** <summary>Removes a network camera, built or not; its feed ends. Only the mod that made it may, unless it was made under no name. The lock applies as for <see cref="CreateNetworkCamera"/>.</summary> */
         NetworkResult DestroyNetworkCamera(uint flightId, string owner);
 
         /** <summary>Every vantage of a network camera as its last pass scored them, in list order; empty when it is no network camera or not built yet.</summary> */
