@@ -143,6 +143,16 @@ namespace Kerbcast
             public Vector4 LitValue;
         }
 
+        private struct HeldCorona
+        {
+            public Transform Transform;
+            public Quaternion Local;
+            public Quaternion World;
+        }
+
+        private readonly List<HeldCorona> _coronas = new List<HeldCorona>();
+        private readonly List<SunCoronas> _coronaScratch = new List<SunCoronas>();
+
         private static readonly int AfgOffsetId = Shader.PropertyToID("_OffsetTransform");
         private readonly MaterialPropertyBlock _afgBlock = new MaterialPropertyBlock();
         private readonly MaterialPropertyBlock _lightBlock = new MaterialPropertyBlock();
@@ -247,7 +257,10 @@ namespace Kerbcast
                     var parent = t.parent;
                     var spun = DQuat.FromRotationVector(ToD(b.angularVelocity) * dt);
                     var q = new Quaternion((float)spun.X, (float)spun.Y, (float)spun.Z, (float)spun.W);
+                    int held = _coronas.Count;
+                    if (b.isStar) HoldCoronas(b);
                     t.rotation = q * (parent != null ? parent.rotation : Quaternion.identity) * b.bodyTransform.rotation;
+                    for (int h = held; h < _coronas.Count; h++) _coronas[h].Transform.rotation = _coronas[h].World;
                     LightTurnedBody(b, t, ref moved);
                     _moved[_moved.Count - 1] = moved;
                 }
@@ -264,6 +277,22 @@ namespace Kerbcast
                     afg.SetPropertyBlock(_afgBlock);
                 }
             }
+        }
+
+        /*
+         * A star's coronas hang under its mesh, and stock turns them to a
+         * camera in FixedUpdate. Noted before the mesh is turned back, so they
+         * keep the orientation stock gave them while the mesh alone turns.
+         */
+        private void HoldCoronas(CelestialBody b)
+        {
+            b.scaledBody.GetComponentsInChildren(false, _coronaScratch);
+            for (int i = 0; i < _coronaScratch.Count; i++)
+            {
+                var t = _coronaScratch[i].transform;
+                _coronas.Add(new HeldCorona { Transform = t, Local = t.localRotation, World = t.rotation });
+            }
+            _coronaScratch.Clear();
         }
 
         /*
@@ -294,6 +323,9 @@ namespace Kerbcast
         {
             if (--_scaledDepth > 0) return;
             _scaledDepth = 0;
+            for (int i = 0; i < _coronas.Count; i++)
+                if (_coronas[i].Transform != null) _coronas[i].Transform.localRotation = _coronas[i].Local;
+            _coronas.Clear();
             for (int i = _moved.Count - 1; i >= 0; i--)
             {
                 var m = _moved[i];
