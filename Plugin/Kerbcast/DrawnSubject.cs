@@ -68,7 +68,8 @@ namespace Kerbcast
            Under a light speed an unloaded craft is drawn where its arriving
            light left it, or not at all; so is one truth has lost (destroyed,
            recovered), by its last id, until its last light arrives. A loaded
-           one is still live. */
+           one is still live. A craft on rails whose history is too young to
+           hold its light is drawn on the conic it is on now at that instant. */
         public bool TryLocate(PictureLens lens, out DVec3 world, out CelestialBody body)
         {
             uint pid = _selection.ResolvedPersistentId;
@@ -77,6 +78,7 @@ namespace Kerbcast
                 /* Under the lock a feed with no subject draws no craft, whatever the track last held. */
                 ShownUt = lens.Ut;
                 ShownPast = false;
+                ShownOnConic = false;
                 world = default;
                 body = null;
                 return false;
@@ -89,6 +91,7 @@ namespace Kerbcast
             }
             ShownUt = lens.Ut;
             ShownPast = false;
+            ShownOnConic = false;
             ShownParts = null;
             Hidden = false;
             LightGone = false;
@@ -104,7 +107,13 @@ namespace Kerbcast
             if (!seen)
             {
                 LightGone = past.Status == PastStatus.Gone;
-                return false;
+                if (!PastInstant.DrawnOnConic(past.Status, Loaded == null || Loaded.packed)
+                    || !_truth.TryMotion(out var orbit, out _) || orbit == null
+                    || !_picture.TrySeeOnConic(orbit, lens, out past))
+                    return false;
+                /* The conic places the craft but holds none of its parts then, so no stand-in is built from today's record. */
+                past.Pid = _truth.PersistentId;
+                ShownOnConic = true;
             }
             world = past.World;
             body = past.Body;
@@ -135,6 +144,8 @@ namespace Kerbcast
         public double ShownUt { get; private set; }
         /* Drawn from the ring at its past instant, sized by its parts then. */
         public bool ShownPast { get; private set; }
+        /* Drawn at its past instant on the conic it is on now, where the history does not reach that far back. */
+        public bool ShownOnConic { get; private set; }
         /* The body whose present centre the drawn place hangs from, which differs from the craft's own body when the picture draws that body moved. */
         public CelestialBody ShownAbout { get; private set; }
 

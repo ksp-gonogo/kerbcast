@@ -226,6 +226,7 @@ var picturePins = new[]
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnOccluded", "picture field"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnSunlit", "picture field"),
     Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnLight", "picture field, for the log"),
+    Pin.Whole("CommandCameraRig.cs", "CommandCameraRig._drawnOnConic", "picture field, for the log"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig._drawn", "private readonly DrawnSubject _drawn;", 1, "the rig holds its picture"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.CommandCameraRig", "DrawnSubject drawn,", 1, "the rig is handed its picture"),
     Pin.Line("CommandCameraRig.cs", "CommandCameraRig.CommandCameraRig", "_drawn = drawn;", 1, "the rig is handed its picture"),

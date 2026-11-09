@@ -984,12 +984,15 @@ namespace Kerbcast
                 return;
             }
             int light = !_drawnOk ? 0 : _drawn.ShownPast ? 2 : 1;
+            bool onConic = light == 2 && _drawn.ShownOnConic;
             float now = Time.unscaledTime;
-            if (light == _drawnLight || now - _lightLoggedAt < LightLogSeconds) return;
+            if ((light == _drawnLight && onConic == _drawnOnConic) || now - _lightLoggedAt < LightLogSeconds) return;
             _drawnLight = light;
+            _drawnOnConic = onConic;
             _lightLoggedAt = now;
             Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={CommandCameraMath.DrawnLightName(light)} "
-                + $"lightTimeS={(light == 2 ? (ut - _drawn.ShownUt).ToString("F3", CultureInfo.InvariantCulture) : "0")}");
+                + $"lightTimeS={(light == 2 ? (ut - _drawn.ShownUt).ToString("F3", CultureInfo.InvariantCulture) : "0")}"
+                + (light == 2 ? $" source={(onConic ? "orbit" : "history")}" : ""));
         }
 
         /* The drawn-light line for a Surface, Orbit or PositionAt aim, whose place is drawn in the past as a craft is, so its light time can be read from the log. */
@@ -1018,6 +1021,8 @@ namespace Kerbcast
 
         /* Whether the drawn craft was last none, live or at its past instant (0, 1, 2), for the log. */
         private int _drawnLight = -1;
+        /* Whether that past instant was placed on the craft's conic rather than from its history. */
+        private bool _drawnOnConic;
         private float _lightLoggedAt = float.MinValue;
         private const float LightLogSeconds = 5f;
         /* The same for an aim at no craft, and the aim it was last said for. */

@@ -8,6 +8,12 @@ namespace Kerbcast
         bool TryAt(double ut, out DVec3 position);
     }
 
+    /* A craft's conic: its offset from its body's centre at `ut`, in the axes the body tree uses. */
+    internal interface IConic
+    {
+        bool Offset(double ut, out DVec3 offset);
+    }
+
     /* The bodies as a tree: each body's parent, and its offset about that parent at `ut`. */
     internal interface IBodyTree
     {
@@ -451,6 +457,66 @@ namespace Kerbcast
                 track = ring.EarlierLife(track);
             }
             return sight;
+        }
+
+        /*
+         * Whether a craft the history does not show is drawn on the conic it
+         * is on now instead: only where the history is too young to hold its
+         * light (`history` Unseen) and only while it coasts on rails, so a
+         * craft whose last light has gone, or one under thrust, is left as
+         * the history leaves it.
+         */
+        public static bool DrawnOnConic(PastStatus history, bool onRails) => history == PastStatus.Unseen && onRails;
+
+        /*
+         * A craft on `conic` about body `body`, as light arriving at t at a
+         * lens `lensOffset` from the centre of body `lensBody` shows it: solved
+         * in the frame of their common ancestor, with each chain of bodies at
+         * its own instant, as Craft solves a recorded past. The conic is the
+         * one the craft is on now, so a craft that burned or changed its body
+         * in the light time is drawn where that conic puts it.
+         * `speedBound` bounds its speed about `frame`, which the caller has
+         * from CommonAncestor; the turn of the lens's body is added here.
+         * State holds the craft's offset about `body` at the instant.
+         */
+        public static PastSight OnConic<TB, TC>(ref TB tree, TC conic, int body, int frame, int lensBody, DVec3 lensOffset,
+            double t, double c, double speedBound, in BodySpin spin) where TB : IBodyTree where TC : IConic
+        {
+            var sight = new PastSight { Status = PastStatus.Unsolved, Ut = double.NaN, Frame = frame };
+            if (frame < 0 || !TryAbout(ref tree, lensBody, frame, t, out var lensAt)) return sight;
+            var path = new ConicPath<TB, TC> { Tree = tree, Conic = conic, Body = body, Frame = frame, Spin = spin, T = t };
+            double bound = speedBound + TurnSpeedBoundAbout(spin, body, speedBound, double.PositiveInfinity, double.NaN, lensOffset.Magnitude, c);
+            var status = Solve(ref path, lensAt + lensOffset, t, c, bound, double.NegativeInfinity, t, out double tr);
+            if (status == PastStatus.Found)
+            {
+                if (path.TryAt(tr, out sight.About) && conic.Offset(tr, out var rel))
+                {
+                    sight.Ut = tr;
+                    sight.State = new HistoryState { Ut = tr, Body = body, Kind = HistoryKind.Conic, Position = rel, Attitude = DQuat.Identity };
+                }
+                else status = PastStatus.Unsolved;
+            }
+            sight.Status = status;
+            return sight;
+        }
+
+        /* A conic's path about the frame body, carried round with the lens's body to `T` as a recorded one is. */
+        private struct ConicPath<TB, TC> : IPastPath where TB : IBodyTree where TC : IConic
+        {
+            public TB Tree;
+            public TC Conic;
+            public int Body;
+            public int Frame;
+            public BodySpin Spin;
+            public double T;
+
+            public bool TryAt(double ut, out DVec3 position)
+            {
+                position = default;
+                if (!Conic.Offset(ut, out var rel) || !TryAbout(ref Tree, Body, Frame, ut, out var centre)) return false;
+                position = centre + Turned(Spin, Body, rel, false, ut, T);
+                return true;
+            }
         }
 
         private static PastStatus SolveInFrames<TB>(ref RingPath<TB> path, ref TB tree, LightHistory ring, HistoryTrack track,
