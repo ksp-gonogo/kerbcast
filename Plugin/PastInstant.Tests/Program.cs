@@ -1674,6 +1674,33 @@ bool IsLatest<T>(ref T path, DVec3 lens, double tt, double c, double k, double t
     }
 }
 
+/* ---- a world model's aim meets a craft drawn on a body turned back ---- */
+{
+    /*
+     * With the lens's own body drawn turned back by dt, the picture places a
+     * craft at the drawn instant, and a rig aiming from a world model must
+     * land on the same point: carried to the drawn instant from its solved
+     * instant in flight, and carried with the ground on the surface.
+     */
+    const double radius = 600000, w = 2 * Math.PI / 21549.425, t = 1e6, dt = -40;
+    var rate = new DVec3(0, 0, w);
+    var spin = BodySpin.Of(Kerbin, rate, radius, 70000);
+    double drawnAt = t + dt;
+
+    var flying = new HistoryState { Kind = HistoryKind.Conic, Body = Kerbin, Ut = t - 41, Position = new DVec3(radius + 20000, 3000, 500) };
+    var drawn = PastInstant.AboutDrawnBody(flying, drawnAt, spin);
+    var aimed = PastInstant.KnownTurned(spin, Kerbin, flying.Position, false, flying.Ut, drawnAt);
+    Check((aimed - drawn).Magnitude < 1e-9, "world model: an aim in flight about the lens's body lands on the craft as drawn");
+    var unturned = PastInstant.KnownTurned(spin, Kerbin, flying.Position, false, flying.Ut, t);
+    Check((unturned - drawn).Magnitude > 1000, $"world model: left at the render instant it would miss by the spin ({(unturned - drawn).Magnitude:F0} m)");
+
+    var pad = new DVec3(radius + 70, 0, 0);
+    var landed = new HistoryState { Kind = HistoryKind.Surface, Body = Kerbin, Ut = t, Position = pad, AngularVelocity = rate };
+    var ground = PastInstant.AboutDrawnBody(landed, drawnAt, spin);
+    var carried = CommandCameraMath.CarriedByBody(pad, new DVec3(0, 0, 0), rate, dt);
+    Check((carried - ground).Magnitude < 1e-6, "world model: a place on the lens's ground is carried with the ground as drawn");
+}
+
 /* ---- a craft just launched beside the lens, solved on the turning body ---- */
 {
     /*

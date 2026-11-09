@@ -770,7 +770,7 @@ namespace Kerbcast
                 {
                     _aimedBody = aimBody;
                     _aimedAbout = KinematicsWorld.Now().Zup.FromWorld(aim - ToD(aimBody.position));
-                    _aimedAt = ut;
+                    _aimedAt = _knownDrawnAt;
                     var w = new Vector3d(aim.X, aim.Y, aim.Z);
                     /* Against the body the place hangs from, so a Hold stays where the craft was last drawn rather than riding a body drawn elsewhere. */
                     _heldBody = _holdAbout ?? aimBody;
@@ -999,14 +999,7 @@ namespace Kerbcast
            and the drawn one must be solved the same way to agree with it. */
         private void LocateDrawn(double ut, DVec3 station, CelestialBody lensBody)
         {
-            var lens = new PictureLens
-            {
-                Key = PictureLens.OwnKey(_flightId),
-                Ut = ut,
-                Point = station,
-                Body = lensBody,
-                Rides = _mount.Site.VantagePersistentId,
-            };
+            var lens = LensAt(ut, station, lensBody);
             _cam.Picture.Place(lens);
             _drawnOk = _drawn.TryLocate(lens, out _drawnPos, out _drawnBody);
             _drawnAbout = _drawn.ShownAbout;
@@ -1023,6 +1016,15 @@ namespace Kerbcast
             Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={(light == 2 ? "past" : light == 1 ? "live" : "none")} "
                 + $"lightTimeS={(light == 2 ? (ut - _drawn.ShownUt).ToString("F3", CultureInfo.InvariantCulture) : "0")}");
         }
+
+        private PictureLens LensAt(double ut, DVec3 station, CelestialBody lensBody) => new PictureLens
+        {
+            Key = PictureLens.OwnKey(_flightId),
+            Ut = ut,
+            Point = station,
+            Body = lensBody,
+            Rides = _mount.Site.VantagePersistentId,
+        };
 
         /* Whether the drawn craft was last none, live or at its past instant (0, 1, 2), for the log. */
         private int _drawnLight = -1;
@@ -1086,6 +1088,7 @@ namespace Kerbcast
             var tree = KeplerBodyTree.World;
             int lensIndex = lensBody.flightGlobalsIndex;
             _lensSpin = SpinOf(lensBody);
+            _knownDrawnAt = LensBodyDrawnAt(ut, station, lensBody);
             bool moves = _known.SubjectMotion(ut, out var motion, out double validFrom, out _) && motion.Body != null;
             if (moves && motion.Kind == BodyMotionKind.Surface && motion.Body == lensBody && !double.IsInfinity(validFrom))
             {
@@ -1099,6 +1102,8 @@ namespace Kerbcast
                 var then = _known.Subject(fixedAt);
                 if (then.Positioned) now.UncertaintyM = then.UncertaintyM;
                 _subjectUt = fixedAt;
+                /* The picture draws that ground turned back by its light time, and a craft on it with it. */
+                if (!_known.KnowsWhatIsDrawn && AimOnDrawnBody(lensBody, now.World, out var onDrawnGround)) now.World = onDrawnGround;
                 return now;
             }
             /* The frame from the body the subject is at by now, then again from
@@ -1187,6 +1192,7 @@ namespace Kerbcast
         {
             _placed = TruthAimPlace.Source;
             _holdAbout = null;
+            _knownDrawnAt = ut;
             if (!_known.KnowsWhatIsDrawn || !LightTime.LightSpeed.HasValue)
             {
                 _truthPlace.Reset();
@@ -1284,8 +1290,26 @@ namespace Kerbcast
             _knownHold.Shown(ut, tr, 0, c, lensIndex, path.Frame);
             _subjectUt = tr;
             _subjectPlacedUt = tr;
-            return Turned(_known.SubjectAlong(tr), path.Spin, tr, ut);
+            return Turned(_known.SubjectAlong(tr), path.Spin, tr, _knownDrawnAt);
         }
+
+        /*
+         * The instant the picture has turned the lens's own body to, which a
+         * world model's aim must follow to stay on the craft drawn on or about
+         * that body: `ut` less its spin back, or `ut` where it is not turned.
+         * A source that knows what is drawn only comes here for a craft the
+         * scene draws live, as it is now, so it stays at `ut`. The lens is
+         * placed here because the aim is solved before LocateDrawn places it.
+         */
+        private double LensBodyDrawnAt(double ut, DVec3 station, CelestialBody lensBody)
+        {
+            if (_known.KnowsWhatIsDrawn) return ut;
+            _cam.Picture.Place(LensAt(ut, station, lensBody));
+            return _cam.Picture.TryDrawnBody(lensBody, out _, out double dt) ? ut : ut + dt;
+        }
+
+        /* The instant a known subject is placed at this solve, for the aim to meet the craft as drawn. */
+        private double _knownDrawnAt;
 
         private InstantHold _knownHold;
         private uint _knownHoldPid;
