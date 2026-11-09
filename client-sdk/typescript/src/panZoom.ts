@@ -357,7 +357,7 @@ export class PanZoomController {
     // A rate supersedes any absolute we were still waiting on, including the
     // zero that ends the hold: the camera is wherever the rate left it.
     this.panSetpoint = null;
-    void this.sink.setPanRate(y, p);
+    void Promise.resolve(this.sink.setPanRate(y, p)).catch(() => {});
   }
 
   /**
@@ -521,11 +521,11 @@ export class PanZoomController {
   stop(): void {
     if (this.sentPanRate.yaw !== 0 || this.sentPanRate.pitch !== 0) {
       this.sentPanRate = { yaw: 0, pitch: 0 };
-      void this.sink.setPanRate(0, 0);
+      void Promise.resolve(this.sink.setPanRate(0, 0)).catch(() => {});
     }
     if (this.sentZoomRate !== 0) {
       this.sentZoomRate = 0;
-      void this.sink.setZoomRate(0);
+      void Promise.resolve(this.sink.setZoomRate(0)).catch(() => {});
     }
     this.ballDragging = false;
     this.sliderDragging = false;

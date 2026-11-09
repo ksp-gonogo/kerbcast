@@ -375,6 +375,35 @@ describe("PanZoomController: stop", () => {
     expect(setZoomRate).toHaveBeenCalledWith(0);
   });
 
+  it("handles a failed send from stop so it never becomes an unhandled rejection", () => {
+    /* Plain functions, not vi.fn: a vi.fn chains onto every promise it returns, which would hide the bug. */
+    const sent: string[] = [];
+    const chained: string[] = [];
+    const failed = (what: string) => {
+      sent.push(what);
+      const p = Promise.reject(new Error("not connected"));
+      p.catch(() => {});
+      const then = p.then.bind(p);
+      return Object.assign(p, {
+        then: ((a?: never, b?: never) => {
+          chained.push(what);
+          return then(a, b);
+        }) as typeof p.then,
+      });
+    };
+    const { sink } = makeSink();
+    const ctrl = new PanZoomController(sink);
+    ctrl.setPanRate(0.5, 0);
+    ctrl.setZoomRate(1);
+    sink.setPanRate = () => failed("pan");
+    sink.setZoomRate = () => failed("zoom");
+
+    ctrl.stop();
+
+    expect(sent).toEqual(["pan", "zoom"]);
+    expect(chained).toEqual(["pan", "zoom"]);
+  });
+
   it("does not send zero zoom rate when rate is already 0", () => {
     const { sink, setZoomRate } = makeSink();
     const ctrl = new PanZoomController(sink);
