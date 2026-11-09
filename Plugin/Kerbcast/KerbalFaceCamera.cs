@@ -127,7 +127,8 @@ namespace Kerbcast
             // first subscribe re-resolves it.
             if (vessel != null && vessel.isEVA) _crewLocation = "eva";
             _picture = new PicturePass(() => _evaNow != null ? _evaNow.vessel : null, EvaEye,
-                () => _evaNow != null ? _evaNow.kerbalCam00 : null, () => _capture?.CaptureRt, EvaFarM, EvaFarM);
+                () => _evaNow != null ? _evaNow.kerbalCam00 : null, () => _capture?.CaptureRt, EvaFarM, EvaFarM,
+                () => _evaNow != null ? _evaNow.kerbalCamAtmos : null);
             WriteInfoManifest();
         }
 

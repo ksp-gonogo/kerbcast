@@ -103,5 +103,91 @@ namespace Kerbcast
             if (held != underfoot && held >= 0 && held < count && discs[held] > 0 && discs[best] < discs[held] * StayMargin) return held;
             return best;
         }
+
+        /* The slot of the planet whose system `slot` is part of, from each body's `parent` slot: the body under a star or with no parent. A star is in none, -1. */
+        public static int SystemRoot(int[] parent, bool[] star, int slot)
+        {
+            if (slot < 0 || slot >= parent.Length || star[slot]) return -1;
+            for (int steps = 0; steps < parent.Length; steps++)
+            {
+                int up = parent[slot];
+                if (up < 0 || up >= parent.Length || star[up] || up == slot) return slot;
+                slot = up;
+            }
+            return slot;
+        }
+
+        /*
+         * Gives the systems in frame the spare layers, each with its own light.
+         * `best` is each root slot's widest disc in frame (0 for none), `held`
+         * the layer each root had last frame or -1. The main light's system
+         * takes none. The widest take a layer, a held one needing StayMargin
+         * less so near-equal discs do not swap them, and keep the layer they
+         * had; the rest share the main light. Fills `layer` per root with the
+         * layer or -1 and returns how many were given one.
+         */
+        public static int AssignLayers(double[] best, int count, int mainRoot, int[] held, int[] spares, int spareCount, int[] layer)
+        {
+            for (int i = 0; i < count; i++) layer[i] = -1;
+            int given = 0;
+            /* Picked in rank order without sorting: the next is the best score not yet given, ties to the lower slot. */
+            for (; given < spareCount; given++)
+            {
+                int pick = -1;
+                double pickScore = 0;
+                for (int r = 0; r < count; r++)
+                {
+                    if (r == mainRoot || best[r] <= 0 || layer[r] != -1) continue;
+                    double score = held[r] >= 0 ? best[r] * StayMargin : best[r];
+                    if (pick < 0 || score > pickScore)
+                    {
+                        pick = r;
+                        pickScore = score;
+                    }
+                }
+                if (pick < 0) break;
+                layer[pick] = -2;
+            }
+            int taken = 0;
+            for (int r = 0; r < count; r++)
+            {
+                if (layer[r] != -2) continue;
+                int at = Array.IndexOf(spares, held[r], 0, spareCount);
+                if (held[r] < 0 || at < 0 || (taken & (1 << at)) != 0) continue;
+                layer[r] = held[r];
+                taken |= 1 << at;
+            }
+            for (int r = 0; r < count; r++)
+            {
+                if (layer[r] != -2) continue;
+                int at = 0;
+                while ((taken & (1 << at)) != 0) at++;
+                layer[r] = spares[at];
+                taken |= 1 << at;
+            }
+            return given;
+        }
+
+        /* A light or projector `mask` that reaches the spare layers in `spareMask` exactly as it reaches layer `from`, so a body moved off it is treated as before. */
+        public static int MirrorMask(int mask, int from, int spareMask) =>
+            (mask & ~spareMask) | ((mask & (1 << from)) != 0 ? spareMask : 0);
+
+        /* The layers of `candidates` with nothing on them in `usedMask`, as a mask. */
+        public static int FreeLayers(int[] candidates, int usedMask)
+        {
+            int free = 0;
+            for (int i = 0; i < candidates.Length; i++)
+                if ((usedMask & (1 << candidates[i])) == 0) free |= 1 << candidates[i];
+            return free;
+        }
+
+        /* The layers set in `mask`, lowest first, into `layers`; returns how many. */
+        public static int LayersIn(int mask, int[] layers)
+        {
+            int n = 0;
+            for (int l = 0; l < 32 && n < layers.Length; l++)
+                if ((mask & (1 << l)) != 0) layers[n++] = l;
+            return n;
+        }
     }
 }

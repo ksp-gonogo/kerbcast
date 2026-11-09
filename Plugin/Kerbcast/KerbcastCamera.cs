@@ -569,7 +569,7 @@ namespace Kerbcast
             // content size so the sidecar encodes at the current dim.
             _ring = MmapFrameRing.Create(_ringPath, slotCount, maxWidth, maxHeight, AnchorProjector.MetaSlotBytes);
             _anchors = new AnchorProjector(FlightId);
-            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld, () => _nearCam, null, LocalFarNativeM, LocalFarReachM);
+            Picture = new PicturePass(() => Rig == null ? Mount.Vessel : null, () => PositionWorld, () => _nearCam, null, LocalFarNativeM, LocalFarReachM, () => _scaledCam);
             WriteInfoManifest();
 
             // Failure-streak (_consecutiveErrors + LogRateLimited) and the

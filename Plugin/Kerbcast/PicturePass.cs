@@ -110,6 +110,7 @@ namespace Kerbcast
         private readonly Func<RenderTexture> _target;
         private readonly Func<double> _nativeFar;
         private readonly Func<double> _reachFar;
+        private readonly Func<Camera> _scaled;
         private readonly CraftHider _hider;
         private readonly CraftStandIns _standIns;
         private readonly HashSet<uint> _walked = new HashSet<uint>();
@@ -190,6 +191,19 @@ namespace Kerbcast
         private double[] _discs = new double[0];
         /* The list slot of the body this camera aimed the light at last frame, so the choice holds between frames. */
         private int _litSlot = -1;
+        private readonly SystemLights _systems = new SystemLights();
+        private int[] _parents = new int[0];
+        private bool[] _stars = new bool[0];
+        private double[] _best = new double[0];
+        private int[] _assigned = new int[0];
+        /* The spare layer each system root held last frame, or -1, so a system keeps its light between frames. */
+        private int[] _systemLayer = new int[0];
+        private DVec3[] _centres = new DVec3[0];
+        private readonly int[] _spareLayers = new int[3];
+        private readonly List<CelestialBody> _systemBodies = new List<CelestialBody>();
+        private readonly List<int> _systemLayers = new List<int>();
+        private readonly List<Vector3> _systemDirs = new List<Vector3>();
+        private int _loggedMainRoot = -2;
         private Transform _sunHeld;
         private Quaternion _sunHeldLocal;
 
@@ -199,10 +213,12 @@ namespace Kerbcast
            leaves the lens to Place. `nativeFar` is how far the local layers
            reach of themselves, the terrain they exist to draw, and `reachFar`
            how far they reach this frame, stretched to a subject; both default
-           to the view camera's far plane. */
+           to the view camera's far plane. `scaled` is the camera that
+           draws the scaled layer, for a light per planetary system. */
         public PicturePass(Func<Vessel> craft, Func<Vector3> eye, Func<Camera> view, Func<RenderTexture> target = null,
-            Func<double> nativeFar = null, Func<double> reachFar = null)
+            Func<double> nativeFar = null, Func<double> reachFar = null, Func<Camera> scaled = null)
         {
+            _scaled = scaled;
             _craft = craft;
             _eye = eye;
             _view = view;
@@ -399,6 +415,88 @@ namespace Kerbcast
                     TurnSunTo(BodyLight.Direction(sun, _moved[i].Centre, default));
                     break;
                 }
+            if (view != null) LightSystems(bodies, lens, sun, ahead, halfDiagonal, underfoot, ownCentre);
+        }
+
+        /*
+         * Gives each other planetary system in frame a light of its own, from
+         * the Sun to its planet as drawn, so a second planet in the picture
+         * shows its true phase too (SystemLights). The main light's system,
+         * and any past the spare layers, keep the main light.
+         */
+        private void LightSystems(List<CelestialBody> bodies, PictureLens lens, DVec3 sun, DVec3 ahead, double halfDiagonal, int underfoot, DVec3 ownCentre)
+        {
+            int n = bodies.Count;
+            if (_parents.Length < n)
+            {
+                _parents = new int[n];
+                _stars = new bool[n];
+                _best = new double[n];
+                _assigned = new int[n];
+                _centres = new DVec3[n];
+                int[] grown = new int[n];
+                for (int i = 0; i < n; i++) grown[i] = i < _systemLayer.Length ? _systemLayer[i] : -1;
+                _systemLayer = grown;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                var b = bodies[i];
+                var up = b != null ? b.referenceBody : null;
+                _parents[i] = up != null && up != b ? up.flightGlobalsIndex : -1;
+                _stars[i] = b == null || b.isStar;
+                _best[i] = 0;
+                _centres[i] = b != null ? ToD(b.position) : default;
+            }
+            int mainRoot = _litSlot >= 0 ? BodyLight.SystemRoot(_parents, _stars, _litSlot) : -1;
+            for (int i = 0; i < _moved.Count; i++)
+            {
+                var m = _moved[i];
+                _centres[m.Slot] = m.Centre;
+                if (m.Hidden || m.Body.isStar) continue;
+                int root = BodyLight.SystemRoot(_parents, _stars, m.Slot);
+                if (root < 0) continue;
+                bool held = root == mainRoot || _systemLayer[root] >= 0;
+                double disc = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, BodyLight.ConeFor(halfDiagonal, held));
+                if (disc > 0 && underfoot >= 0 && m.Slot != underfoot && BodyLight.BehindLimb(lens.Point, ownCentre, lens.Body.Radius, m.Centre)) disc = 0;
+                if (disc > _best[root]) _best[root] = disc;
+            }
+            int spares = SystemLights.Spares(_spareLayers);
+            BodyLight.AssignLayers(_best, n, mainRoot, _systemLayer, _spareLayers, spares, _assigned);
+            _systemBodies.Clear();
+            _systemLayers.Clear();
+            _systemDirs.Clear();
+            for (int i = 0; i < _moved.Count; i++)
+            {
+                var m = _moved[i];
+                int root = m.Body.isStar ? -1 : BodyLight.SystemRoot(_parents, _stars, m.Slot);
+                if (root < 0 || _assigned[root] < 0 || m.Hidden) continue;
+                var d = BodyLight.Direction(sun, _centres[root], default);
+                if (d.Magnitude <= 0) continue;
+                _systemBodies.Add(m.Body);
+                _systemLayers.Add(_assigned[root]);
+                _systemDirs.Add(new Vector3((float)d.X, (float)d.Y, (float)d.Z));
+            }
+            if (_systemBodies.Count == 0 || !_systems.Begin(_scaled?.Invoke(), ScaledSunLightHelper.GetScaledSunLight(), _systemBodies, _systemLayers, _systemDirs))
+                for (int i = 0; i < n; i++) _assigned[i] = -1;
+            LogSystems(bodies, mainRoot);
+            Array.Copy(_assigned, _systemLayer, n);
+        }
+
+        /* One line whenever this camera's systems change light, for checking a capture against what lit it. */
+        private void LogSystems(List<CelestialBody> bodies, int mainRoot)
+        {
+            bool changed = mainRoot != _loggedMainRoot;
+            for (int i = 0; i < bodies.Count && !changed; i++) changed = _assigned[i] != _systemLayer[i];
+            if (!changed) return;
+            _loggedMainRoot = mainRoot;
+            var line = new System.Text.StringBuilder();
+            line.Append($"{Tag} view={(View != null ? View.name : "none")} event=body-light main={(mainRoot >= 0 ? bodies[mainRoot].bodyName : "none")}@{SystemLights.ScaledLayer}(Scaledspace SunLight)");
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                if (_assigned[i] >= 0) line.Append($" group={bodies[i].bodyName}@{_assigned[i]}(Kerbcast system light {_assigned[i]})");
+                else if (_best[i] > 0 && i != mainRoot) line.Append($" shared={bodies[i].bodyName}");
+            }
+            Debug.Log(line.ToString());
         }
 
         /* Turns the Sun, and the scaled light that hangs from it, to shine along `direction`, unless stock's light is already that close. */
@@ -531,6 +629,12 @@ namespace Kerbcast
         {
             if (--_scaledDepth > 0) return;
             _scaledDepth = 0;
+            try { _systems.End(); }
+            finally { RestoreScaled(); }
+        }
+
+        private void RestoreScaled()
+        {
             BodiesLit = false;
             if (_sunHeld != null)
             {

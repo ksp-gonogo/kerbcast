@@ -407,5 +407,79 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(switches == 0, "pick: two discs wobbling round each other do not swap the light");
 }
 
+/* ---- one light per planetary system ---- */
+{
+    /* Slots: 0 Sun, 1 Kerbin, 2 Mun, 3 Duna, 4 Ike, 5 Jool, 6 Laythe, 7 a moon of Laythe, 8 Eeloo, 9 a rogue with no parent. */
+    int[] parent = { -1, 0, 1, 0, 3, 0, 5, 6, 0, -1 };
+    bool[] star = { true, false, false, false, false, false, false, false, false, false };
+    Check(BodyLight.SystemRoot(parent, star, 0) == -1, "system: a star belongs to no system");
+    Check(BodyLight.SystemRoot(parent, star, 1) == 1, "system: a planet is its own system");
+    Check(BodyLight.SystemRoot(parent, star, 2) == 1, "system: a moon belongs to its planet's");
+    Check(BodyLight.SystemRoot(parent, star, 7) == 5, "system: a moon's moon belongs to the planet at the top");
+    Check(BodyLight.SystemRoot(parent, star, 9) == 9, "system: a body with no parent is its own system");
+    int[] loop = { 1, 0 };
+    Check(BodyLight.SystemRoot(loop, new bool[2], 0) >= 0, "system: a parent loop ends");
+
+    int[] spares = { 3, 6, 7 };
+    int[] none = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+    int[] layer = new int[10];
+    double[] best = new double[10];
+    best[1] = 0.9; best[3] = 0.002; best[5] = 0.01;
+    int n = BodyLight.AssignLayers(best, 10, 3, none, spares, 3, layer);
+    Check(n == 2 && layer[3] == -1, "assign: the main light's system takes no spare layer");
+    Check(layer[1] == 3 && layer[5] == 6, "assign: the others take spare layers, widest first");
+    Check(layer[8] == -1 && layer[0] == -1, "assign: a system out of frame takes none");
+
+    best[8] = 0.005; best[9] = 0.0045;
+    BodyLight.AssignLayers(best, 10, 3, none, spares, 3, layer);
+    Check(layer[1] == 3 && layer[5] == 6 && layer[8] == 7 && layer[9] == -1, "assign: past the spare layers the narrowest share the main light");
+
+    int[] held = (int[])none.Clone();
+    held[9] = 7; held[5] = 3;
+    BodyLight.AssignLayers(best, 10, 3, held, spares, 3, layer);
+    Check(layer[9] == 7, "assign: a held system keeps its place against a near-equal disc");
+    Check(layer[5] == 3, "assign: and keeps the layer it had");
+    Check(layer[8] == -1 && layer[1] == 6, "assign: a newcomer takes a free layer, the narrowest newcomer shares");
+
+    best[8] = 0.02;
+    BodyLight.AssignLayers(best, 10, 3, held, spares, 3, layer);
+    Check(layer[8] >= 0 && layer[9] == -1, "assign: a clearly wider disc takes the place");
+
+    BodyLight.AssignLayers(best, 10, 3, none, spares, 0, layer);
+    Check(Array.TrueForAll(layer, l => l == -1), "assign: with no spare layers every system shares the main light");
+
+    double[] tie = new double[10];
+    tie[1] = 0.1; tie[5] = 0.1;
+    BodyLight.AssignLayers(tie, 10, -1, none, spares, 1, layer);
+    Check(layer[1] == 3 && layer[5] == -1, "assign: an exact tie goes to the lower slot");
+
+    int heldNow = -1, swaps = 0;
+    double[] wobble = new double[10];
+    int[] h = (int[])none.Clone();
+    for (int i = 0; i < 200; i++)
+    {
+        wobble[1] = 0.2 + 0.01 * Math.Sin(i * 0.3);
+        wobble[5] = 0.2 + 0.01 * Math.Cos(i * 0.3);
+        BodyLight.AssignLayers(wobble, 10, -1, h, spares, 1, layer);
+        int now = layer[1] >= 0 ? 1 : 5;
+        if (heldNow >= 0 && now != heldNow) swaps++;
+        heldNow = now;
+        Array.Copy(layer, h, 10);
+    }
+    Check(swaps == 0, "assign: two systems wobbling round each other do not swap the spare layer");
+
+    const int scaled = 10;
+    int spareMask = (1 << 3) | (1 << 6) | (1 << 7);
+    Check(BodyLight.MirrorMask(~(1 << scaled), scaled, spareMask) == (~(1 << scaled) & ~spareMask), "mirror: the local sun light, which skips the scaled layer, skips the spare layers too");
+    Check(BodyLight.MirrorMask(-1, scaled, spareMask) == -1, "mirror: a light on every layer stays on every layer");
+    Check(BodyLight.MirrorMask(1 << scaled, scaled, spareMask) == ((1 << scaled) | spareMask), "mirror: a light on the scaled layer alone reaches the spare layers");
+    Check(BodyLight.MirrorMask(1, scaled, spareMask) == 1, "mirror: a light off the scaled layer is left alone");
+
+    Check(BodyLight.FreeLayers(spares, 0) == spareMask, "free: an unused spare layer is free");
+    Check(BodyLight.FreeLayers(spares, 1 << 6) == ((1 << 3) | (1 << 7)), "free: a spare layer something draws on is not");
+    int[] got = new int[3];
+    Check(BodyLight.LayersIn(spareMask & ~(1 << 6), got) == 2 && got[0] == 3 && got[1] == 7, "free: the layers of a mask, lowest first");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
