@@ -6,35 +6,20 @@ namespace Kerbcast
     /* Which local-space terrain a camera leaves out of its local layers, apart from Unity so it can be tested. */
     internal static class FarTerrain
     {
-        /* A turn back smaller than this, in pixels, is not worth losing a body's detailed terrain for. */
-        public const double MinSpinSlipPx = 2.0;
-
-        /* Terrain hidden for a turn back stays hidden until the slip is under this, so a field sitting on the edge does not toggle it. */
-        public const double ShowSpinSlipPx = 1.5;
-
         /*
-         * How many pixels of a `rows`-high picture at vertical `fovDeg` a
-         * body's ground slips when drawn turned back by its light time, at the
-         * point under the lens, for a body turning at `spinRadPerS` of radius
-         * `radiusM`. The ground moves wR for a light time of range / c, seen
-         * from that range, so range cancels and the answer holds at any
-         * distance.
+         * Whether a camera leaves a body's local-space terrain, `distanceM`
+         * from the lens and reaching at most `terrainRadiusM` from the body's
+         * centre, out of its local layers: when only a far plane stretched to
+         * `reachFarM` reaches it, not the layers' native `nativeFarM`. Stock
+         * terrain is built to be seen from inside that native reach. From
+         * farther, the stretched layer's depth cannot part the ocean from the
+         * land under it and stock's near shading no longer holds, so the
+         * scaled sphere stands for the body there, light speed or not. Range
+         * alone decides it, never the field, so a zoom never switches it.
          */
-        public static double SpinSlipPx(double spinRadPerS, double radiusM, double lightSpeed, double fovDeg, int rows) =>
-            lightSpeed > 0 ? Math.Abs(spinRadPerS * radiusM) / lightSpeed / CommandCameraMath.PixelSizeAtUnit(fovDeg, rows) : double.PositiveInfinity;
-
-        /*
-         * Whether a body only turned back has its terrain hidden this frame,
-         * given whether it had last frame. Hides from MinSpinSlipPx and shows
-         * again below ShowSpinSlipPx. A body that is not `spinOnly` has no
-         * state to carry, so false resets it. A slip that cannot be read
-         * counts as a turn worth hiding for.
-         */
-        public static bool SpinHides(bool wasHiding, bool spinOnly, double spinSlipPx) =>
-            spinOnly && !(spinSlipPx < (wasHiding ? ShowSpinSlipPx : MinSpinSlipPx));
-
-        /* Whether a camera draws a body away from where its terrain stands in local space: moved to its past instant, left out, or turned back enough to hide for (SpinHides). */
-        public static bool DrawnAway(bool moves, bool hides, bool spinHides) => moves || hides || spinHides;
+        public static bool StretchedOnly(double distanceM, double terrainRadiusM, double nativeFarM, double reachFarM) =>
+            !PictureBoundary.TerrainInReach(distanceM, terrainRadiusM, nativeFarM)
+            && PictureBoundary.TerrainInReach(distanceM, terrainRadiusM, reachFarM);
 
         /*
          * Stock parents a sphere's most detailed quads to a storage object

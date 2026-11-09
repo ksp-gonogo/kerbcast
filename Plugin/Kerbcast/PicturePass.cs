@@ -174,8 +174,8 @@ namespace Kerbcast
             public Quaternion World;
         }
 
-        /* Bodies, by index, whose spin-only terrain this camera is hiding, for FarTerrain.SpinHides. */
-        private readonly HashSet<int> _spinHiding = new HashSet<int>();
+        /* Bodies, by index, whose terrain this camera left out last frame, so each change is logged once. */
+        private readonly HashSet<int> _farTerrainOff = new HashSet<int>();
 
         private readonly List<HeldCorona> _coronas = new List<HeldCorona>();
         private readonly List<SunCoronas> _coronaScratch = new List<SunCoronas>();
@@ -803,41 +803,32 @@ namespace Kerbcast
 
         /*
          * A local layer stretched to a far subject can reach terrain built in
-         * local space on a body this camera draws at its past instant, or
-         * turns back by enough to see at this field, which would paint the
-         * body as it is now over the scaled sphere. Its renderers are switched
-         * off for this camera's local layers alone, as the craft hider does,
-         * and only those that were on are put back.
+         * local space far beyond the reach stock builds it for, where it draws
+         * wrongly over the scaled sphere (FarTerrain.StretchedOnly). Its
+         * renderers are switched off for this camera's local layers alone, as
+         * the craft hider does, and only those that were on are put back.
          */
         private void HideFarTerrain()
         {
-            double? c = LightTime.LightSpeed;
             var bodies = FlightGlobals.Bodies;
-            if (!c.HasValue || bodies == null)
+            if (bodies == null)
             {
-                _spinHiding.Clear();
+                _farTerrainOff.Clear();
                 return;
             }
             if (!TryFrameLens(out var lens)) return;
-            var plan = BodiesFor(lens, c.Value);
-            if (plan == null) return;
+            double native = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
             double reach = _reachFar != null ? _reachFar() : View != null ? View.farClipPlane : 0;
-            var view = View;
-            var rt = view != null ? Target ?? view.targetTexture : null;
-            int rows = rt != null ? rt.height : view != null ? view.pixelHeight : 0;
-            double fov = view != null ? view.fieldOfView : 0;
             for (int i = 0; i < bodies.Count; i++)
             {
                 var b = bodies[i];
                 if (b == null) continue;
-                int index = b.flightGlobalsIndex;
-                bool moves = plan.Moves(index), left = plan.Hides(index);
-                /* Before the reach tests, so what is held depends on the field and the light speed alone, never on range. */
-                bool spinHides = StepSpinHide(index, !moves && !left && plan.TrySpin(index, out _), b, c.Value, fov, rows);
                 var pqs = b.pqsController;
-                if (pqs == null || !pqs.isActive || KeepsPresent(b, lens)) continue;
-                if (!FarTerrain.DrawnAway(moves, left, spinHides)) continue;
-                if (!PictureBoundary.TerrainInReach((lens.Point - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), reach)) continue;
+                double distance = (lens.Point - ToD(b.position)).Magnitude;
+                bool off = pqs != null && pqs.isActive
+                    && FarTerrain.StretchedOnly(distance, Math.Max(b.Radius, pqs.radiusMax), native, reach);
+                NoteFarTerrain(b, off, distance, native, reach);
+                if (!off) continue;
                 SwitchOff(pqs);
                 var children = pqs.ChildSpheres;
                 if (children == null) continue;
@@ -846,14 +837,13 @@ namespace Kerbcast
             }
         }
 
-        /* This camera's held decision for body `index`, moved on by this frame's slip. */
-        private bool StepSpinHide(int index, bool spinOnly, CelestialBody b, double c, double fov, int rows)
+        /* Logs body `b`'s terrain being left out or drawn again by this camera, once per change. */
+        private void NoteFarTerrain(CelestialBody b, bool off, double distance, double native, double reach)
         {
-            bool was = _spinHiding.Contains(index);
-            bool now = FarTerrain.SpinHides(was, spinOnly, spinOnly ? FarTerrain.SpinSlipPx(b.angularV, b.Radius, c, fov, rows) : 0);
-            if (now && !was) _spinHiding.Add(index);
-            else if (was && !now) _spinHiding.Remove(index);
-            return now;
+            int index = b.flightGlobalsIndex;
+            if (off ? !_farTerrainOff.Add(index) : !_farTerrainOff.Remove(index)) return;
+            Debug.Log($"{Tag} view={(View != null ? View.name : "none")} event=far-terrain body={b.bodyName} state={(off ? "off" : "on")} "
+                + $"distance={distance:F0} nativeFar={native:F0} reach={reach:F0}");
         }
 
         private void SwitchOff(PQS sphere)

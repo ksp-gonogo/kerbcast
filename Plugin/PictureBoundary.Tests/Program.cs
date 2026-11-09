@@ -234,42 +234,16 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
 
 /* ---- far terrain: which bodies have their terrain left out ---- */
 {
-    Check(!FarTerrain.DrawnAway(false, false, false), "far terrain: a body drawn where it stands keeps its terrain");
-    Check(FarTerrain.DrawnAway(true, false, false), "far terrain: a body moved to its past instant does not");
-    Check(FarTerrain.DrawnAway(false, true, false), "far terrain: nor one left out");
-    Check(FarTerrain.DrawnAway(false, false, true), "far terrain: nor one turned back enough to hide for");
-}
-
-/* ---- far terrain: the hold on a body only turned back ---- */
-{
-    Check(!FarTerrain.SpinHides(false, true, 1.99), "hold: rising, shown just under the hide edge");
-    Check(FarTerrain.SpinHides(false, true, 2.0), "hold: rising, hidden at the hide edge");
-    Check(FarTerrain.SpinHides(true, true, 1.5), "hold: falling, still hidden at the show edge");
-    Check(!FarTerrain.SpinHides(true, true, 1.49), "hold: falling, shown below the show edge");
-
-    bool held = false;
-    foreach (double slip in new[] { 1.9, 1.5, 1.75, 1.99 }) { held = FarTerrain.SpinHides(held, true, slip); Check(!held, $"hold: shown stays shown between the edges ({slip})"); }
-    held = true;
-    foreach (double slip in new[] { 1.99, 1.5, 1.75, 1.6 }) { held = FarTerrain.SpinHides(held, true, slip); Check(held, $"hold: hidden stays hidden between the edges ({slip})"); }
-
-    Check(!FarTerrain.SpinHides(true, false, 100), "hold: a body no longer spin-only resets, whatever the slip");
-    Check(!FarTerrain.SpinHides(FarTerrain.SpinHides(true, false, 100), true, 1.75), "hold: after a reset the show edge no longer applies");
-    Check(FarTerrain.SpinHides(false, true, double.NaN), "hold: a slip that cannot be read hides");
-    Check(FarTerrain.SpinHides(true, true, double.NaN), "hold: and keeps hiding");
-}
-
-/* ---- far terrain: the slip of a body turned back ---- */
-{
-    double w = 2 * Math.PI / 21549.425, R = 600000;
-    double wide = FarTerrain.SpinSlipPx(w, R, 299792458, 30, 1080);
-    Check(wide < 0.01, $"slip: at real light speed a wide view of Kerbin does not move a pixel ({wide:G3})");
-    double top = FarTerrain.SpinSlipPx(w, R, 299792458, 0.005, 1080);
-    Check(top > 2, $"slip: at real light speed the narrowest field does ({top:G3})");
-    Check(Math.Abs(FarTerrain.SpinSlipPx(w, R, 3e5, 1, 576) - FarTerrain.SpinSlipPx(w, R, 3e8, 0.001, 576)) < 0.05, "slip: light speed and field trade one for one");
-    double expect = w * R * 576 / (3e8 * 2 * Math.Tan(0.5 * Math.PI / 180 / 2));
-    Check(Math.Abs(FarTerrain.SpinSlipPx(w, R, 3e8, 0.5, 576) - expect) < 1e-9, "slip: the formula wR * rows / (c * 2 tan(fov/2))");
-    Check(FarTerrain.SpinSlipPx(w, R, 0, 1, 576) == double.PositiveInfinity, "slip: no light speed reads as unbounded");
-    Check(FarTerrain.SpinSlipPx(-w, R, 3e8, 1, 576) > 0, "slip: a backward spin slips the same");
+    /* A network lens on the Mun near side watching a craft at KSC: the far plane is stretched to the craft, 11.26 Mm out. */
+    const double KerbinR = 600000, KerbinMax = 606000, NativeFar = 750000, ToKsc = 11262210;
+    double munToKerbin = ToKsc + KerbinR;
+    Check(FarTerrain.StretchedOnly(munToKerbin, KerbinMax, NativeFar, ToKsc), "far terrain: Kerbin's ground reached only by a plane stretched to KSC from the Mun is left out");
+    Check(!FarTerrain.StretchedOnly(munToKerbin, KerbinMax, NativeFar, NativeFar), "far terrain: with the plane native it is out of reach and nothing is switched");
+    Check(!FarTerrain.StretchedOnly(KerbinR + 100000, KerbinMax, NativeFar, ToKsc), "far terrain: a lens within native reach keeps its ground, however far the plane is stretched");
+    Check(!FarTerrain.StretchedOnly(KerbinR + 70, KerbinMax, NativeFar, NativeFar), "far terrain: a lens on the ground keeps it");
+    Check(FarTerrain.StretchedOnly(KerbinMax + NativeFar + 1, KerbinMax, NativeFar, NativeFar + 2), "far terrain: a metre past native reach, a stretched plane that reaches it leaves it out");
+    Check(!FarTerrain.StretchedOnly(KerbinMax + NativeFar, KerbinMax, NativeFar, 3e7), "far terrain: at native reach exactly it is kept");
+    Check(!FarTerrain.StretchedOnly(double.NaN, KerbinMax, NativeFar, 3e7), "far terrain: an unreadable distance switches nothing");
 }
 
 /* ---- far terrain: the quads in storage every sphere shares ---- */
