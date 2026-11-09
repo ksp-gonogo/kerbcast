@@ -172,6 +172,7 @@ namespace Kerbcast
         private readonly MaterialPropertyBlock _lightBlock = new MaterialPropertyBlock();
         private static readonly int ShellLightDirId = Shader.PropertyToID("_v4LightDir");
         private static readonly int ShellLightDotId = Shader.PropertyToID("_lightDot");
+        private static readonly HashSet<string> s_lightLogged = new HashSet<string>();
         private double[] _discs = new double[0];
         /* The list slot of the body this camera aimed the light at last frame, so the choice holds between frames. */
         private int _litSlot = -1;
@@ -252,6 +253,7 @@ namespace Kerbcast
         {
             if (_scaledDepth++ > 0) return;
             var bodies = FlightGlobals.Bodies;
+            LogBodyLight(bodies);
             double? c = LightTime.LightSpeed;
             if (bodies == null || !BodyLight.Applies(c.HasValue, KerbcastSettings.PlanetPhases) || !TryFrameLens(out var lens)) return;
             var plan = c.HasValue ? BodiesFor(lens, c.Value) : null;
@@ -435,6 +437,21 @@ namespace Kerbcast
             var local = PictureBoundary.LightInBodyAxes(new DQuat(rot.x, rot.y, rot.z, rot.w), away);
             _lightBlock.SetVector(id, new Vector4((float)local.X, (float)local.Y, (float)local.Z, 0f));
             r.SetPropertyBlock(_lightBlock);
+        }
+
+        /* Names, once per body, what lights it, for checking a planet pack or a game update against what this pass writes. */
+        private static void LogBodyLight(List<CelestialBody> bodies)
+        {
+            if (bodies == null || s_lightLogged.Count >= bodies.Count) return;
+            for (int i = 0; i < bodies.Count; i++)
+            {
+                var b = bodies[i];
+                if (b == null || b.scaledBody == null || !s_lightLogged.Add(b.bodyName)) continue;
+                var setter = b.scaledBody.GetComponent<MaterialSetDirection>();
+                var r = b.scaledBody.GetComponent<Renderer>();
+                var shader = r != null && r.sharedMaterial != null ? r.sharedMaterial.shader : null;
+                Debug.Log($"[Kerbcast] event=body-light body={b.bodyName} valueName={(setter != null ? setter.valueName : "none")} target={(setter != null && setter.target != null ? setter.target.name : "none")} shader={(shader != null ? shader.name : "none")}");
+            }
         }
 
         public void AfterScaledLayer()
