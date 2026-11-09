@@ -122,6 +122,10 @@ namespace Kerbcast
         /* Terrain renderers this camera switched off for its local layers, and the scratch list they are gathered in. */
         private readonly List<Renderer> _terrainOff = new List<Renderer>();
         private readonly List<Renderer> _terrainScratch = new List<Renderer>();
+        private static readonly List<PQ> s_storedQuads = new List<PQ>();
+        private static readonly List<PQ> s_ownQuads = new List<PQ>();
+        private static readonly List<Renderer> s_quadRenderers = new List<Renderer>();
+        private static readonly Func<PQ, PQS> s_sphereOf = q => q.sphereRoot;
 
         private struct MovedBody
         {
@@ -458,6 +462,7 @@ namespace Kerbcast
         {
             _terrainScratch.Clear();
             sphere.GetComponentsInChildren(false, _terrainScratch);
+            AddStoredQuads(sphere, _terrainScratch);
             for (int i = 0; i < _terrainScratch.Count; i++)
             {
                 var r = _terrainScratch[i];
@@ -466,6 +471,22 @@ namespace Kerbcast
                 _terrainOff.Add(r);
             }
             _terrainScratch.Clear();
+        }
+
+        /* Adds the renderers of `sphere`'s quads in the storage all spheres share, where stock keeps the most detailed ones. */
+        private static void AddStoredQuads(PQS sphere, List<Renderer> into)
+        {
+            if (sphere.LocalSpacePQStorage == null) return;
+            sphere.LocalSpacePQStorage.GetComponentsInChildren(false, s_storedQuads);
+            FarTerrain.OwnedQuads(s_storedQuads, sphere, s_sphereOf, s_ownQuads);
+            for (int i = 0; i < s_ownQuads.Count; i++)
+            {
+                s_ownQuads[i].GetComponentsInChildren(false, s_quadRenderers);
+                into.AddRange(s_quadRenderers);
+            }
+            s_storedQuads.Clear();
+            s_ownQuads.Clear();
+            s_quadRenderers.Clear();
         }
 
         private void RestoreFarTerrain()

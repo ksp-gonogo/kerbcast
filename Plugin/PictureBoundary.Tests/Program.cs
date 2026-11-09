@@ -212,5 +212,19 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(Math.Abs(stored.Magnitude - 1) < 1e-12 && Math.Abs(fresh.Magnitude - 1) < 1e-12, "light: stays a unit direction");
 }
 
+/* ---- far terrain: the quads in storage every sphere shares ---- */
+{
+    var terrain = new object();
+    var ocean = new object();
+    var storage = new List<(string Name, object Root)> { ("a", terrain), ("b", ocean), ("c", new object()), ("d", null), ("e", terrain) };
+    var own = new List<(string Name, object Root)> { ("stale", terrain) };
+    FarTerrain.OwnedQuads(storage, terrain, q => q.Root, own);
+    Check(own.Count == 2 && own[0].Name == "a" && own[1].Name == "e", "storage: only the sphere's own quads are kept, and the list is refilled");
+    FarTerrain.OwnedQuads(storage, ocean, q => q.Root, own);
+    Check(own.Count == 1 && own[0].Name == "b", "storage: a child sphere such as the ocean finds its own quads there");
+    FarTerrain.OwnedQuads(new List<(string Name, object Root)>(), terrain, q => q.Root, own);
+    Check(own.Count == 0, "storage: empty storage gives nothing");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
