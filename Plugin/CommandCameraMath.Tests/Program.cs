@@ -2208,5 +2208,20 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(VNear(CommandCameraMath.CarriedByBody(surface, drawnCentre, aimSpin, 0), drawnCentre + surface, 1e-9), "surface aim: a body with no light time keeps the ground point");
 }
 
+/* The drawn-light line, for a craft and for an aim at no craft. */
+Check(CommandCameraMath.DrawnLightState(false, true, 45000) == -1, "no light speed reads off");
+Check(CommandCameraMath.DrawnLightState(true, false, 45000) == 0, "a place not drawn reads none");
+Check(CommandCameraMath.DrawnLightState(true, true, double.NaN) == 0, "a place with no light time reads none");
+Check(CommandCameraMath.DrawnLightState(true, true, 0) == 1, "a place drawn as it is now reads live");
+Check(CommandCameraMath.DrawnLightState(true, true, 45000) == 2, "a Sun aim 45000 s of light away reads past");
+Check(CommandCameraMath.DrawnLightName(2) == "past" && CommandCameraMath.DrawnLightName(1) == "live"
+    && CommandCameraMath.DrawnLightName(0) == "none" && CommandCameraMath.DrawnLightName(-1) == "off", "states name as the craft line does");
+Check(CommandCameraMath.AimLightLogDue(2, -1, true), "the first aim under a light speed is said");
+Check(CommandCameraMath.AimLightLogDue(2, 2, true), "a new aim in the same state is said again, with its own light time");
+Check(!CommandCameraMath.AimLightLogDue(2, 2, false), "the same aim in the same state is said once");
+Check(CommandCameraMath.AimLightLogDue(1, 2, false), "a change of state is said");
+Check(!CommandCameraMath.AimLightLogDue(-1, -1, true), "a new aim with no light speed says nothing");
+Check(CommandCameraMath.AimLightLogDue(-1, 2, false), "a light speed going away is said");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

@@ -787,10 +787,15 @@ namespace Kerbcast
                 aim = DirectionPoint(body, station, localUp, _aim.Azimuth, _aim.Elevation, range);
                 aimBody = body;
             }
-            else if (!ResolveAim(_aim, _aimOrbit, ut, station, body, out aim, out aimBody))
+            else
             {
-                ForgetDrawn();
-                return false;
+                bool resolved = ResolveAim(_aim, _aimOrbit, ut, station, body, out aim, out aimBody, out double aimLightS);
+                NoteAimLight(ut, resolved, aimLightS);
+                if (!resolved)
+                {
+                    ForgetDrawn();
+                    return false;
+                }
             }
             _lastAimPoint = aim;
 
@@ -1017,8 +1022,23 @@ namespace Kerbcast
             if (light == _drawnLight || now - _lightLoggedAt < LightLogSeconds) return;
             _drawnLight = light;
             _lightLoggedAt = now;
-            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={(light == 2 ? "past" : light == 1 ? "live" : "none")} "
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={CommandCameraMath.DrawnLightName(light)} "
                 + $"lightTimeS={(light == 2 ? (ut - _drawn.ShownUt).ToString("F3", CultureInfo.InvariantCulture) : "0")}");
+        }
+
+        /* The drawn-light line for a Surface, Orbit or PositionAt aim, whose place is drawn in the past as a craft is, so its light time can be read from the log. */
+        private void NoteAimLight(double ut, bool placed, double lightS)
+        {
+            int light = CommandCameraMath.DrawnLightState(LightTime.LightSpeed.HasValue, placed, lightS);
+            bool newAim = !ReferenceEquals(_aim, _aimLightFor);
+            if (!CommandCameraMath.AimLightLogDue(light, _aimLight, newAim)) return;
+            float now = Time.unscaledTime;
+            if (!newAim && now - _aimLightLoggedAt < LightLogSeconds) return;
+            _aimLight = light;
+            _aimLightFor = _aim;
+            _aimLightLoggedAt = now;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} event=drawn-light state={CommandCameraMath.DrawnLightName(light)} "
+                + $"lightTimeS={(light == 2 ? lightS.ToString("F3", CultureInfo.InvariantCulture) : "0")} aim={_aim.Kind}");
         }
 
         private PictureLens LensAt(double ut, DVec3 station, CelestialBody lensBody) => new PictureLens
@@ -1034,6 +1054,10 @@ namespace Kerbcast
         private int _drawnLight = -1;
         private float _lightLoggedAt = float.MinValue;
         private const float LightLogSeconds = 5f;
+        /* The same for an aim at no craft, and the aim it was last said for. */
+        private int _aimLight = -1;
+        private CommandAim _aimLightFor;
+        private float _aimLightLoggedAt = float.MinValue;
 
         /* A kept record's speed about its body, bounded in the frame the solve now runs in; NaN for a body the game no longer has. */
         private double KeptToFrame(double ownSpeed, int bodyIndex)
@@ -1433,11 +1457,14 @@ namespace Kerbcast
            scaled bodies. With a light speed it is where the picture draws that
            point for a lens at `station` on `lensBody`, as a craft aim is:
            a Surface aim on the body as drawn, an Orbit or PositionAt aim at its
-           own light time. */
-        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, DVec3 station, CelestialBody lensBody, out DVec3 world, out CelestialBody body)
+           own light time. `lightS` is how long ago the light the picture
+           shows of that point left it, 0 when it is drawn as it is now. */
+        private bool ResolveAim(CommandAim aim, Orbit aimOrbit, double ut, DVec3 station, CelestialBody lensBody, out DVec3 world, out CelestialBody body,
+            out double lightS)
         {
             world = default;
             body = null;
+            lightS = 0;
             switch (aim.Kind)
             {
                 case CommandAimKind.Orbit:
@@ -1447,7 +1474,7 @@ namespace Kerbcast
                     body = orbit.referenceBody;
                     world = ToD(orbit.getPositionAtUT(ut));
                     double? c = LightTime.LightSpeed;
-                    if (c.HasValue) return PastAimPlace(new AimLightPath { Orbit = orbit, OnOrbit = true }, BodyMotion.OnOrbit(orbit), body, ut, station, lensBody, c.Value, out world);
+                    if (c.HasValue) return PastAimPlace(new AimLightPath { Orbit = orbit, OnOrbit = true }, BodyMotion.OnOrbit(orbit), body, ut, station, lensBody, c.Value, out world, out lightS);
                     return true;
                 }
                 case CommandAimKind.Surface:
@@ -1455,7 +1482,9 @@ namespace Kerbcast
                     body = FlightGlobals.GetBodyByName(aim.Body);
                     if (body == null) return false;
                     world = ToD(body.GetWorldSurfacePosition(aim.Latitude, aim.Longitude, aim.Altitude));
-                    return AimOnDrawnBody(body, world, out world);
+                    if (!AimOnDrawnBody(body, world, out world, out double dt)) return false;
+                    lightS = -dt;
+                    return true;
                 }
                 case CommandAimKind.PositionAt:
                 {
@@ -1463,7 +1492,7 @@ namespace Kerbcast
                     if (body == null || !AimPath(aim, body, out var path) || !path.TryAt(ut, out var rel, out _)) return false;
                     world = KinematicsWorld.Now().ToWorld(body, rel);
                     double? c = LightTime.LightSpeed;
-                    if (c.HasValue) return PastAimPlace(new AimLightPath { Kepler = path, Zup = KinematicsWorld.Now().Zup }, BodyMotion.OnPath(body, path, KinematicsWorld.Now().Zup), body, ut, station, lensBody, c.Value, out world);
+                    if (c.HasValue) return PastAimPlace(new AimLightPath { Kepler = path, Zup = KinematicsWorld.Now().Zup }, BodyMotion.OnPath(body, path, KinematicsWorld.Now().Zup), body, ut, station, lensBody, c.Value, out world, out lightS);
                     return true;
                 }
             }
@@ -1471,11 +1500,15 @@ namespace Kerbcast
         }
 
         /* A point fixed to body `b`, at `live` now, where the picture draws it; false while the picture leaves the body out. */
-        private bool AimOnDrawnBody(CelestialBody b, DVec3 live, out DVec3 world)
+        private bool AimOnDrawnBody(CelestialBody b, DVec3 live, out DVec3 world) => AimOnDrawnBody(b, live, out world, out _);
+
+        /* `dt` is the seconds from now back to the instant the body is drawn at, or spun back to, 0 when drawn as it is. */
+        private bool AimOnDrawnBody(CelestialBody b, DVec3 live, out DVec3 world, out double dt)
         {
             world = live;
+            dt = 0;
             if (_cam.Picture.HidesBody(b)) return false;
-            bool placed = _cam.Picture.TryDrawnBody(b, out var centre, out double dt);
+            bool placed = _cam.Picture.TryDrawnBody(b, out var centre, out dt);
             if (placed || dt != 0)
                 world = CommandCameraMath.CarriedByBody(live - ToD(b.position), placed ? centre : ToD(b.position), CommandCameraOcclusion.Spin(b), dt);
             return true;
@@ -1488,9 +1521,11 @@ namespace Kerbcast
          * at its past instant, or left out, at its own past place in that
          * frame; otherwise on the body as drawn.
          */
-        private bool PastAimPlace(AimLightPath path, BodyMotion motion, CelestialBody body, double ut, DVec3 station, CelestialBody lensBody, double c, out DVec3 world)
+        private bool PastAimPlace(AimLightPath path, BodyMotion motion, CelestialBody body, double ut, DVec3 station, CelestialBody lensBody, double c, out DVec3 world,
+            out double lightS)
         {
             world = default;
+            lightS = 0;
             var tree = KeplerBodyTree.World;
             int bodyIndex = body.flightGlobalsIndex;
             int frame = PastInstant.CommonAncestor(ref tree, lensBody.flightGlobalsIndex, bodyIndex);
@@ -1506,6 +1541,7 @@ namespace Kerbcast
             bound += PastInstant.TurnSpeedBoundAbout(spin, bodyIndex, bound, double.PositiveInfinity, double.NaN, (station - ToD(lensBody.position)).Magnitude, c);
             if (PastInstant.Solve(ref path, station - ToD(frameBody.position), ut, c, bound, double.NegativeInfinity, ut, out double at) != PastStatus.Found)
                 return false;
+            lightS = ut - at;
             if (_cam.Picture.HidesBody(body) || _cam.Picture.TryDrawnBody(body, out _, out _))
             {
                 if (!path.TryAt(at, out var about)) return false;

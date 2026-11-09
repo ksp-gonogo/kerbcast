@@ -1146,6 +1146,21 @@ namespace Kerbcast
             return null;
         }
 
+        /*
+         * The drawn-light log's state for a place the picture draws: -1 with
+         * no light speed, 0 when it is not placed, 1 when drawn as it is now
+         * and 2 when drawn `lightS` seconds in the past.
+         */
+        public static int DrawnLightState(bool lightSpeed, bool placed, double lightS) =>
+            !lightSpeed ? -1 : !placed || double.IsNaN(lightS) ? 0 : lightS > 0 ? 2 : 1;
+
+        public static string DrawnLightName(int state) =>
+            state == 2 ? "past" : state == 1 ? "live" : state == 0 ? "none" : "off";
+
+        /* Whether the drawn-light line for an aim at no craft is due: on a change of state, and for each new aim while a light speed is set. */
+        public static bool AimLightLogDue(int state, int logged, bool newAim) =>
+            state != logged || (newAim && state != -1);
+
         /* The UT the view's target became occluded, carried from `since` while it stays occluded (whatever now blocks it), NaN while it is not. */
         public static double OccludedSince(bool occluded, double since, double ut) =>
             !occluded ? double.NaN : double.IsNaN(since) ? ut : since;
