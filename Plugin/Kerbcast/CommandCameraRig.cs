@@ -31,6 +31,8 @@ namespace Kerbcast
         private const float StatusLogSeconds = 1.0f;
         private const float SkyProbeSeconds = 10.0f;
         private const double ModelProxyDistance = 50000.0;
+        /* Float steps of the lens's position a pixel spans at the stand-in model. */
+        private const double ModelProxyMinUlps = 4.0;
         private const int TerrainSamples = 48;
         internal const int TerrainSampleCount = TerrainSamples;
         /* Below this many pixels across, the model is drawn by the supersampled
@@ -424,7 +426,7 @@ namespace Kerbcast
             double next = _fovMinSource();
             if (next != _fovMin)
             {
-                Debug.Log($"{Tag} cam={_flightId} lens limit {_fovMin:F3} -> {next:F3} deg");
+                Debug.Log($"{Tag} cam={_flightId} lens limit {_fovMin:G4} -> {next:G4} deg");
                 _fovMin = next;
             }
             return _fovMin;
@@ -1910,7 +1912,8 @@ namespace Kerbcast
             var fwd = _solveForward;
             var up = _solveUp;
             anchor.position = new Vector3((float)station.X, (float)station.Y, (float)station.Z);
-            anchor.rotation = Quaternion.LookRotation(ToF(fwd), ToF(up));
+            CommandCameraMath.LookRotation(fwd, up, out double qx, out double qy, out double qz, out double qw);
+            anchor.rotation = new Quaternion((float)qx, (float)qy, (float)qz, (float)qw);
             _poseValid = true;
             _poseEye = station;
             /* A lens riding a craft in the scene stands inside its parts, so that craft is hidden from this camera's own render. */
@@ -1984,7 +1987,7 @@ namespace Kerbcast
                 var ksp = site.Body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
                 double err = (ToD(ksp) - station).Magnitude;
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={distance:F0} event=first-frame "
-                    + $"station={station} aim={aim} kspSurfaceCheckErr={err:F4}m craftRadius={KnownRadius:F1} fov={_fov:F3}");
+                    + $"station={station} aim={aim} kspSurfaceCheckErr={err:F4}m craftRadius={KnownRadius:F1} fov={_fov:G4}");
             }
 
             if (now - _skyProbeAt >= SkyProbeSeconds)
@@ -2065,8 +2068,16 @@ namespace Kerbcast
                 /* Beyond ModelProxyDistance the model stands in at that
                    distance on the true ray, shrunk by the same ratio: the
                    same angular size and perspective, with local-space
-                   precision and clip planes that stay simple. */
-                p.PlanDistance = Math.Min(p.Distance, ModelProxyDistance);
+                   precision and clip planes that stay simple. Under a space
+                   lens, whose fields go narrower than any other, a lens far
+                   from the floating origin stands it farther still, so the
+                   float step of the lens's own position stays a fraction of a
+                   pixel on it. Every other camera keeps the fixed distance,
+                   which depth-based tints such as Scatterer's depend on. */
+                p.PlanDistance = _optics != null && _lens.Space
+                    ? CommandCameraMath.ImpostorDistance(p.Distance, ModelProxyDistance,
+                        CommandCameraMath.PixelSizeAtUnit(_fov, RenderRows(cam)), station.Magnitude, ModelProxyMinUlps)
+                    : Math.Min(p.Distance, ModelProxyDistance);
                 p.PlanScale = p.PlanDistance / p.Distance;
                 var at = station + p.Toward * p.PlanDistance;
                 var rotation = _drawn.SavedRotation(_drawnBody);

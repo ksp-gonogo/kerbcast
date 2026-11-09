@@ -1359,6 +1359,58 @@ namespace Kerbcast
             return new DVec3(DVec3.Dot(v, right), DVec3.Dot(v, up), DVec3.Dot(v, forward));
         }
 
+        /*
+         * Unity's Quaternion.LookRotation(forward, up) worked in double, so the
+         * lens's turn is rounded to float once rather than through Unity's
+         * single-precision orthonormalise and matrix conversion, whose few
+         * ulps of error are a pixel or more at the narrowest fields.
+         */
+        public static void LookRotation(DVec3 forward, DVec3 up, out double x, out double y, out double z, out double w)
+        {
+            var f = forward.Normalized;
+            var side = DVec3.Cross(up, f);
+            /* An up along the view takes any square axis rather than giving NaN. */
+            if (!(side.Magnitude > 1e-12)) side = DVec3.Cross(Math.Abs(f.Y) < 0.9 ? new DVec3(0, 1, 0) : new DVec3(1, 0, 0), f);
+            var r = side.Normalized;
+            var u = DVec3.Cross(f, r);
+            double m00 = r.X, m01 = u.X, m02 = f.X;
+            double m10 = r.Y, m11 = u.Y, m12 = f.Y;
+            double m20 = r.Z, m21 = u.Z, m22 = f.Z;
+            double trace = m00 + m11 + m22;
+            if (trace > 0)
+            {
+                double s = 0.5 / Math.Sqrt(trace + 1.0);
+                w = 0.25 / s;
+                x = (m21 - m12) * s;
+                y = (m02 - m20) * s;
+                z = (m10 - m01) * s;
+            }
+            else if (m00 > m11 && m00 > m22)
+            {
+                double s = 2.0 * Math.Sqrt(1.0 + m00 - m11 - m22);
+                w = (m21 - m12) / s;
+                x = 0.25 * s;
+                y = (m01 + m10) / s;
+                z = (m02 + m20) / s;
+            }
+            else if (m11 > m22)
+            {
+                double s = 2.0 * Math.Sqrt(1.0 + m11 - m00 - m22);
+                w = (m02 - m20) / s;
+                x = (m01 + m10) / s;
+                y = 0.25 * s;
+                z = (m12 + m21) / s;
+            }
+            else
+            {
+                double s = 2.0 * Math.Sqrt(1.0 + m22 - m00 - m11);
+                w = (m10 - m01) / s;
+                x = (m02 + m20) / s;
+                y = (m12 + m21) / s;
+                z = 0.25 * s;
+            }
+        }
+
         /* The m00 and m11 terms of a symmetric perspective projection with
            vertical `fovDeg` over a frame `aspect` wide per unit high, for a
            lens with no projection matrix to read. */

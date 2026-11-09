@@ -2081,6 +2081,50 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
 }
 
 {
+    /* LookRotation: Unity's convention (z along forward, y the up squared to it), worked in double. */
+    DVec3 Turn(double qx, double qy, double qz, double qw, DVec3 v)
+    {
+        var u = new DVec3(qx, qy, qz);
+        var t = DVec3.Cross(u, v) * 2;
+        return v + t * qw + DVec3.Cross(u, t);
+    }
+    var rng = new Random(7);
+    bool allAxes = true, allUnit = true;
+    double worstFloat = 0;
+    for (int i = 0; i < 2000; i++)
+    {
+        var f = new DVec3(rng.NextDouble() * 2 - 1, rng.NextDouble() * 2 - 1, rng.NextDouble() * 2 - 1).Normalized;
+        var up0 = new DVec3(rng.NextDouble() * 2 - 1, rng.NextDouble() * 2 - 1, rng.NextDouble() * 2 - 1);
+        CommandCameraMath.LookRotation(f, up0, out double qx, out double qy, out double qz, out double qw);
+        var upSquared = (up0 - f * DVec3.Dot(up0, f)).Normalized;
+        if (!VNear(Turn(qx, qy, qz, qw, new DVec3(0, 0, 1)), f, 1e-12) || !VNear(Turn(qx, qy, qz, qw, new DVec3(0, 1, 0)), upSquared, 1e-12)
+            || !VNear(Turn(qx, qy, qz, qw, new DVec3(1, 0, 0)), DVec3.Cross(upSquared, f), 1e-12))
+            allAxes = false;
+        if (!Near(qx * qx + qy * qy + qz * qz + qw * qw, 1, 1e-12)) allUnit = false;
+        var fq = Turn((float)qx, (float)qy, (float)qz, (float)qw, new DVec3(0, 0, 1));
+        double err = Math.Atan2(DVec3.Cross(fq, f).Magnitude, DVec3.Dot(fq, f));
+        if (err > worstFloat) worstFloat = err;
+    }
+    Check(allAxes, "look rotation: forward, up and right land on Unity's axes");
+    Check(allUnit, "look rotation: a unit quaternion");
+    Check(worstFloat < 1.5e-7, $"look rotation: one float rounding turns the view by at most a pixel at 0.004 degrees (worst {worstFloat:G3} rad)");
+    CommandCameraMath.LookRotation(new DVec3(0, 1, 0), new DVec3(0, 1, 0), out double dx, out double dy, out double dz, out double dw);
+    Check(VNear(Turn(dx, dy, dz, dw, new DVec3(0, 0, 1)), new DVec3(0, 1, 0), 1e-12), "look rotation: an up along the view still looks along it");
+    CommandCameraMath.LookRotation(new DVec3(0, 0, 1), new DVec3(0, 1, 0), out double ix0, out double iy0, out double iz0, out double iw0);
+    Check(Near(iw0, 1, 1e-15) && ix0 == 0 && iy0 == 0 && iz0 == 0, "look rotation: looking along z with y up is no turn");
+    CommandCameraMath.LookRotation(new DVec3(0, 0, -1), new DVec3(0, 1, 0), out double bx, out double by, out double bz, out double bw);
+    Check(Near(Math.Abs(by), 1, 1e-15), "look rotation: looking back is a half turn about y");
+
+    /* The stand-in model's distance: 50 km near the origin, farther for a lens far from it at a narrow field. */
+    double perPx = CommandCameraMath.PixelSizeAtUnit(0.004, 576);
+    Check(CommandCameraMath.ImpostorDistance(1e9, 50000, perPx, 10, 4) == 50000, "proxy: a lens at the origin keeps 50 km");
+    double far = CommandCameraMath.ImpostorDistance(1e9, 50000, perPx, 1e6, 4);
+    Check(CommandCameraMath.FloatEpsilon * 1e6 / far <= perPx / 4 * 1.0001, "proxy: a lens 1000 km out stands it where its float step is a quarter pixel");
+    Check(CommandCameraMath.ImpostorDistance(2e5, 50000, perPx, 1e6, 4) == 2e5, "proxy: never beyond the craft itself");
+    Check(CommandCameraMath.ImpostorDistance(1e9, 50000, CommandCameraMath.PixelSizeAtUnit(5, 576), 1e6, 4) == 50000, "proxy: a wide field keeps 50 km");
+}
+
+{
     /* A Surface aim at a body drawn at its past instant: on the drawn body, 8 minutes of spin back, at the same height. */
     var aimSpin = new DVec3(0, -2.9e-4, 0);
     var liveCentre = new DVec3(5e9, 1e8, -3e9);
