@@ -1,4 +1,4 @@
-import type { CommandCentreInfo, FrameCommandState } from "@ksp-gonogo/kerbcast";
+import type { CameraState, CommandCentreInfo, FrameCommandState, NetworkDefinition } from "@ksp-gonogo/kerbcast";
 
 /** What a tracking network camera shows the craft from, on the displayed frame. */
 export interface NetworkVantageReading {
@@ -18,6 +18,26 @@ export const NETWORK_FEED_TEXT = {
 /** A network feed's name: "Crater Rim via Kerbin ground net". */
 export function networkFeedName(siteLabel: string, networkName: string): string {
   return NETWORK_FEED_TEXT.name(siteLabel, networkName);
+}
+
+const SAVED_NETWORK_FIRST_ID = 0xffff0000;
+const SAVED_NETWORK_LAST_ID = 0xfffffffe;
+
+/**
+ * Whether a camera is a tracking network, whether or not it has a picture.
+ * `commandCentre.network` is only sent while the camera's rig is up, so a
+ * network at rest is recognised by its reserved flight id (a saved network)
+ * or its definition (a mod's, from {@link useNetworks}).
+ */
+export function isNetworkCamera(
+  camera: Pick<CameraState, "flightId" | "commandCentre">,
+  networks: readonly NetworkDefinition[] = [],
+): boolean {
+  return (
+    !!camera.commandCentre?.network ||
+    (camera.flightId >= SAVED_NETWORK_FIRST_ID && camera.flightId <= SAVED_NETWORK_LAST_ID) ||
+    networks.some((n) => n.flightId === camera.flightId)
+  );
 }
 
 /** Whether a network state means the craft is seen. Anything but `ok` is no view. */

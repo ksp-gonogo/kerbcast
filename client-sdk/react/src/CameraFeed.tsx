@@ -27,7 +27,8 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
-import { networkFeedName, readNetworkVantage } from "./networkVantage";
+import { isNetworkCamera, networkFeedName, readNetworkVantage } from "./networkVantage";
+import { useNetworks } from "./hooks/useNetworks";
 import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider, useKerbcastClient } from "./context";
 import {
   ActionBarRow,
@@ -402,6 +403,16 @@ export interface CameraFeedProps {
    */
   renderNetworkVantage?: (siteLabel: string, networkState: string, networkName: string) => ReactNode;
   /**
+   * What sits before the name in the feed's title. Left unset, a network
+   * feed shows {@link NetworkIcon} and any other feed nothing. A node shows
+   * on every feed and null shows nothing; a function chooses per camera,
+   * given the camera and whether it is a network (see
+   * {@link isNetworkCamera}, which holds while the feed has no picture). It
+   * never shrinks, and adds to the title's accessible name only what the
+   * host's own content names.
+   */
+  titleLeading?: ReactNode | ((camera: CameraState, isNetwork: boolean) => ReactNode);
+  /**
    * Drop the feed's own 1px border and rounded corners, for a host that
    * frames the feed itself. Default false.
    */
@@ -453,6 +464,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       anchors,
       anchorOverlay,
       renderNetworkVantage,
+      titleLeading,
       frameless = false,
     },
     ref,
@@ -1009,6 +1021,19 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       align: "start",
     });
 
+    const networks = useNetworks();
+    const isNetwork = camera ? isNetworkCamera(camera, networks) : false;
+    const titleLeadingContent =
+      typeof titleLeading === "function"
+        ? camera
+          ? titleLeading(camera, isNetwork)
+          : null
+        : titleLeading !== undefined
+          ? titleLeading
+          : isNetwork
+            ? <NetworkIcon size={12} strokeWidth={1.75} />
+            : null;
+
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
     /* A network feed is named like any other: one compound name in the title,
        shown on hover, whether or not a host also draws its own corner name. */
@@ -1177,6 +1202,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 title={recordingActive ? "Stop recording to change camera" : undefined}
                 onClick={recordingActive ? undefined : cameraMenu.toggle}
               >
+                {titleLeadingContent != null && titleLeadingContent !== false && (
+                  <TitleButton__Leading>{titleLeadingContent}</TitleButton__Leading>
+                )}
                 <TitleButton__Text>{title}</TitleButton__Text>
                 <ChevronDownIcon aria-hidden="true" />
               </TitleButton>
@@ -1210,7 +1238,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   }}
                 >
                   {/* A network is one feed, named by the network alone: its vantages change under it. */}
-                  {c.commandCentre?.network ? (
+                  {isNetworkCamera(c, networks) ? (
                     <>
                       <MenuItemIcon>
                         <NetworkIcon size={14} strokeWidth={1.75} />
@@ -2215,19 +2243,20 @@ const TitleButton = styled.button`
   text-shadow: inherit;
   text-align: left;
 
-  svg {
+  /* Direct children only: the chevron turns, what sits in the leading slot does not. */
+  > svg {
     width: 12px;
     height: 12px;
     flex-shrink: 0;
     transition: transform 0.15s;
   }
 
-  &[aria-expanded="true"] svg {
+  &[aria-expanded="true"] > svg {
     transform: rotate(180deg);
   }
 
   @media (prefers-reduced-motion: reduce) {
-    svg {
+    > svg {
       transition: none;
     }
   }
@@ -2236,6 +2265,12 @@ const TitleButton = styled.button`
     outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: 2px;
   }
+`;
+
+const TitleButton__Leading = styled.span`
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
 `;
 
 const TitleButton__Text = styled.span`

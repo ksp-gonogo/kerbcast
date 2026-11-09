@@ -269,6 +269,29 @@ import { NetworkIcon } from "@ksp-gonogo/kerbcast-react";
 <NetworkIcon size={16} />;
 ```
 
+`CameraFeed` shows it before the name in a network feed's title. The
+`titleLeading` prop changes what sits there:
+
+```tsx
+<CameraFeed flightId={id} />;                          // default: icon on network feeds only
+<CameraFeed flightId={id} titleLeading={null} />;      // nothing on any feed
+<CameraFeed flightId={id} titleLeading={<MyGlyph />} />; // this node on every feed
+<CameraFeed
+  flightId={id}
+  titleLeading={(camera, isNetwork) => (isNetwork ? <MyGlyph /> : null)}
+/>;
+```
+
+The slot never shrinks, so a long name ellipsizes instead. It adds to the
+title button's accessible name only what your content names: `NetworkIcon`
+is `aria-hidden`, so give your own node an `aria-label` if it should be
+announced.
+
+`isNetworkCamera(camera, networks?)` answers whether a camera is a network,
+and holds while the feed is blanked or on standby. Pass `useNetworks()` as
+`networks` so a network made by a mod is recognised while its camera is
+down; a saved network is recognised without it.
+
 ## License
 
 [MIT](./LICENSE). This SDK is the interface to kerbcast, so it is permissive:

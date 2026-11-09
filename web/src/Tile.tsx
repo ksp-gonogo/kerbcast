@@ -1,8 +1,10 @@
 import {
   buildCameraLabeler,
   CameraFeed,
+  isNetworkCamera,
   networkFeedName,
   useKerbcastCameras,
+  useNetworks,
 } from "@ksp-gonogo/kerbcast-react";
 import type { FeedAction } from "@ksp-gonogo/kerbcast-react";
 import { Check, ListPlus, ListX, Pencil, Pin, PinOff, Plus, Trash2, WifiOff, X } from "lucide-react";
@@ -133,7 +135,9 @@ export function Tile({
    * the feed draws that name into this slot. Empty (the feed blanked or not
    * yet drawn) it shows the network's own name.
    */
-  const displaysNetwork = !!cameras.find((c) => c.flightId === displayedFlightId)?.commandCentre?.network;
+  const networks = useNetworks();
+  const displayedCamera = cameras.find((c) => c.flightId === displayedFlightId);
+  const displaysNetwork = !!displayedCamera && isNetworkCamera(displayedCamera, networks);
   const [networkSlot, setNetworkSlot] = useState<HTMLSpanElement | null>(null);
   const namesNetwork = displaysNetwork && customLabel === null;
 

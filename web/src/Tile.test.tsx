@@ -435,4 +435,15 @@ describe("Tile - tracking network name", () => {
       expect(getComputedStyle(corner!).textTransform).not.toBe("uppercase");
     });
   });
+
+  it("shows the network icon in the feed's title", async () => {
+    const { client } = await buildConnectedFixture([network()]);
+    let container: HTMLElement;
+    await act(async () => {
+      ({ container } = renderTile(client, 7));
+    });
+    await waitFor(() => {
+      expect(container!.querySelector("h3 button svg[data-kc-network-icon]")).not.toBeNull();
+    });
+  });
 });
