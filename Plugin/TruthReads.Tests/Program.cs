@@ -140,6 +140,7 @@ var truthPins = new[]
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.TryVantageForward", "the way the lens's own craft points, for its placeholder aim"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.TryStationMotion", "the lens's motion from its own craft, for the forecast"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.StationBody", "the body the lens's craft is at"),
+    Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.VantageInVacuum", "whether the lens's own craft is outside the air, for its space lens"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.VantageName", "the lens's craft's name, for logs"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.VantageExists", "whether a craft a lens could ride exists"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.ToString", "the lens's craft in log lines"),

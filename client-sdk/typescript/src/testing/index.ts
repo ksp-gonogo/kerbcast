@@ -1,4 +1,4 @@
-import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, ServerMessage, SettingsStatePayload, SiteCatalogPayload } from "../__generated__/types";
+import type { AdaptiveShedPayload, Anchor, CameraState, ClientMessage, CommandAim, ErrorPayload, CommandCentreInfo, CommandTrackState, FrameStampPayload, LensLevelsPayload, ServerMessage, SettingsStatePayload, SiteCatalogPayload } from "../__generated__/types";
 import { CameraKind, CameraLifecycle, CommandAimKind, CommandVantageKind, CrewLocation, ErrorCode, ErrorSource, Layer, QualityPreset, SiteKind, TrackMode } from "../__generated__/types";
 import type {
   CreateCommandCameraPayload,
@@ -209,6 +209,8 @@ export class MockSidecar {
   private _defaultSubject = 0;
   private readonly _commands: ClientMessage[] = [];
   private _throttleMainScreen = false;
+  /** Lens levels the mock plugin reports; null sends none, like a pre-feature plugin. */
+  private _lensLevels: LensLevelsPayload | null = null;
   private readonly _forceBumpDelayMs: number;
   /** Per-flight ceiling (ceiling render size), served by `discoveredCameras()`. */
   private readonly _maxRenderSizes = new Map<number, { maxWidth: number; maxHeight: number }>();
@@ -375,7 +377,15 @@ export class MockSidecar {
     if (this._networks !== null) {
       this._sendToClient({ type: "network-definitions", content: this._definitionsPayload() });
     }
-    this._sendToClient({ type: "settings-state", content: { throttleMainScreen: this._throttleMainScreen } });
+    this._sendToClient({ type: "settings-state", content: this._settingsPayload() });
+  }
+
+  private _settingsPayload(): SettingsStatePayload {
+    return {
+      throttleMainScreen: this._throttleMainScreen,
+      /* As the sidecar does: always present, null with no game loaded. */
+      lensLevels: this._lensLevels as LensLevelsPayload | undefined,
+    };
   }
 
   /**
@@ -482,7 +492,18 @@ export class MockSidecar {
   /** Push a `settings-state` event to the client (simulates a plugin-status-change broadcast). */
   fireSettingsState(payload: SettingsStatePayload): void {
     this._throttleMainScreen = payload.throttleMainScreen;
+    if ("lensLevels" in payload) this._lensLevels = payload.lensLevels ?? null;
     this._sendToClient({ type: "settings-state", content: payload });
+  }
+
+  /**
+   * Set the lens levels the mock plugin reports and broadcast them, as the
+   * sidecar does when a status write changes them. Later hellos and
+   * settings echoes carry them too.
+   */
+  setLensLevels(lensLevels: LensLevelsPayload | null): void {
+    this._lensLevels = lensLevels;
+    this._sendToClient({ type: "settings-state", content: this._settingsPayload() });
   }
 
   /**
@@ -1108,10 +1129,7 @@ export class MockSidecar {
       case "set-throttle-main-screen": {
         /* Flip state and echo SettingsState back, mirroring the sidecar's broadcast. */
         this._throttleMainScreen = msg.content.enabled;
-        this._sendToClient({
-          type: "settings-state",
-          content: { throttleMainScreen: this._throttleMainScreen },
-        });
+        this._sendToClient({ type: "settings-state", content: this._settingsPayload() });
         break;
       }
       case "set-force-full-resolution": {

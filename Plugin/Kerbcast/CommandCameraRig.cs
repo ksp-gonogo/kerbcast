@@ -402,6 +402,7 @@ namespace Kerbcast
 
         private void UpdateOpticsFloor(double blurArcsec, float now)
         {
+            /* FullRows is the provider's FrameRows, which its lens limit counts in too. */
             double target = OpticsModel.OpticsFovFloor(0, blurArcsec, FullRows);
             if (!(target > 0))
             {

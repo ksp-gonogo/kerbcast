@@ -19,6 +19,7 @@ import {
   CommandTargetEligibility,
   CrewLocation,
   KerbcastClient,
+  type LensLevelsPayload,
   SiteKind,
 } from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
@@ -35,6 +36,26 @@ import {
 const COMMAND_FLIGHT_ID = 301;
 const COMMAND_SCENARIO_MS = 4000;
 const MOCK_START_UT = 637_599_000;
+
+/** A career save with the Tracking Station at level 2 and the first space lens researched. */
+export const MOCK_LENS_LEVELS: LensLevelsPayload = {
+  gameMode: "career",
+  opticsOn: true,
+  trackingGated: true,
+  trackingLevel: 2,
+  trackingLensArcsec: 4,
+  trackingFovMinDeg: 0.32,
+  trackingLevels: [
+    { level: 1, lensArcsec: 15, fovMinDeg: 1.2 },
+    { level: 2, lensArcsec: 4, fovMinDeg: 0.32 },
+    { level: 3, lensArcsec: 1, fovMinDeg: 0.08 },
+  ],
+  spaceSteps: [
+    { techId: "scienceTech", techTitle: "Scanning Tech", unlocked: true, lensArcsec: 0.5, fovMinDeg: 0.04 },
+    { techId: "advScienceTech", techTitle: "Advanced Science Tech", unlocked: false, lensArcsec: 0.2, fovMinDeg: 0.016 },
+    { techId: "experimentalScience", techTitle: "Experimental Science", unlocked: false, lensArcsec: 0.05, fovMinDeg: 0.004 },
+  ],
+};
 
 const MOCK_CAMERAS: MockCameraInit[] = [
   {
@@ -307,6 +328,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
   for (const cam of networks.cameras) {
     sidecar.addCamera(cam);
   }
+  sidecar.setLensLevels(MOCK_LENS_LEVELS);
 
   /*
    * Canvas tracks are built once per camera (keyed by flightId, drawing that
@@ -442,6 +464,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
       throttleMainScreen: sidecar.throttleMainScreen,
       captureUt: ut,
       timeWarpRate: 1,
+      lensLevels: MOCK_LENS_LEVELS,
     });
     sidecar.updateCamera(COMMAND_FLIGHT_ID, {
       commandTrack: mockCommandTrack(scenario, ut, switchedAtUt),

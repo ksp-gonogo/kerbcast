@@ -69,12 +69,47 @@ namespace Kerbcast
     {
         public OpticsKnobs Defaults;
         public string Label;
+        /* A craft's space lens, whose zoom reaches past every other lens's. */
+        public bool Space;
 
-        public OpticsLens(OpticsKnobs defaults, string label)
+        public OpticsLens(OpticsKnobs defaults, string label, bool space = false)
         {
             Defaults = defaults;
             Label = label;
+            Space = space;
         }
+    }
+
+    /* Where a site's lens comes from. */
+    internal enum LensKind
+    {
+        TrackingStation,
+        LaunchSite,
+        SpaceLens,
+    }
+
+    /* The lens a site has and where it comes from. */
+    internal struct LensChoice
+    {
+        public double Arcsec;
+        public LensKind Kind;
+        /* The Tracking Station level, or the space-lens step, 1 based. */
+        public int Level;
+        /* What a player would call it; null when the caller did not ask. */
+        public string Name;
+        /* What chose it, for the log. */
+        public string Label;
+
+        public LensChoice(double arcsec, LensKind kind, int level, string name, string label)
+        {
+            Arcsec = arcsec;
+            Kind = kind;
+            Level = level;
+            Name = name;
+            Label = label;
+        }
+
+        public static LensChoice Unknown => new LensChoice(double.NaN, LensKind.TrackingStation, 0, null, null);
     }
 
     /* Where a lens stands and what it looks at, for OpticsModel.Assess. */
@@ -106,8 +141,10 @@ namespace Kerbcast
         /* The optics blur is drawn; Knobs means nothing otherwise. */
         public bool OpticsOn;
         public OpticsKnobs Knobs;
+        /* Where the lens comes from, whether or not the optics are drawn. */
+        public LensChoice Lens;
 
-        public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset };
+        public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset, Lens = LensChoice.Unknown };
 
         /* Arcseconds one pixel covers at the frame's centre at the tightest zoom. */
         public double PixelArcsec => Known ? OpticsModel.PixelArcsec(FovMinDeg, HeightPx) : double.NaN;
@@ -523,6 +560,71 @@ namespace Kerbcast
         }
 
         private static double Sq(double v) => v * v;
+    }
+
+    /* One space-lens step: the tech node that unlocks it and the lens it gives, in arcseconds. */
+    internal struct SpaceLensStep
+    {
+        public string TechId;
+        public double Arcsec;
+
+        public SpaceLensStep(string techId, double arcsec)
+        {
+            TechId = techId;
+            Arcsec = arcsec;
+        }
+
+        /* A step with a tech node and a lens; a modder blanks either to drop it. */
+        public bool Valid => !string.IsNullOrEmpty(TechId) && Arcsec > 0 && !double.IsInfinity(Arcsec);
+    }
+
+    /*
+     * The space lens: a camera on a craft outside any atmosphere gets a lens
+     * that improves as research unlocks tech nodes, on top of the Tracking
+     * Station's. Unity-free; the game says which nodes are researched.
+     */
+    internal static class SpaceLens
+    {
+        /* The narrowest field any camera zooms to, degrees, however fine its lens. */
+        public const double NarrowestFovDeg = 0.001;
+
+        /* The step the finest researched lens comes from, -1 when none is. */
+        public static int BestStep(SpaceLensStep[] steps, Func<string, bool> researched)
+        {
+            int best = -1;
+            if (steps == null || researched == null) return best;
+            for (int i = 0; i < steps.Length; i++)
+            {
+                if (!steps[i].Valid || !researched(steps[i].TechId)) continue;
+                if (best < 0 || steps[i].Arcsec < steps[best].Arcsec) best = i;
+            }
+            return best;
+        }
+
+        /* Whether a lens `fromCentreM` from the centre of a body of `radiusM` is outside its air: at or above `atmosphereDepthM`, or at a body with none. */
+        public static bool OutsideAir(double fromCentreM, double radiusM, bool hasAtmosphere, double atmosphereDepthM) =>
+            !hasAtmosphere || fromCentreM - radiusM >= atmosphereDepthM;
+
+        /* Whether a space lens of `spaceArcsec` beats the ground lens `groundArcsec`, so a craft camera outside the air takes it. */
+        public static bool Beats(double spaceArcsec, double groundArcsec) =>
+            spaceArcsec > 0 && !double.IsInfinity(spaceArcsec) && (double.IsNaN(groundArcsec) || spaceArcsec < groundArcsec);
+
+        /*
+         * The zoom limit for a lens of `arcsec` with the optics drawn: where
+         * its blur spans OpticsModel.FloorBlurPx of a `rows`-high frame, never
+         * wider than `fovMinDeg` (the usual limit) and never narrower than
+         * NarrowestFovDeg.
+         */
+        public static double FovMin(double fovMinDeg, double arcsec, int rows)
+        {
+            double optics = OpticsModel.FovForBlurPx(arcsec, rows, OpticsModel.FloorBlurPx);
+            if (double.IsNaN(optics)) return fovMinDeg;
+            return Math.Max(NarrowestFovDeg, Math.Min(fovMinDeg, optics));
+        }
+
+        /* Where a camera with this lens really stops, for showing a player: FovMin, held wider by the optics floor the rig also applies when the lens's own blur reaches FloorBlurPx before the zoom limit does. */
+        public static double ShownFovMin(double fovMinDeg, double arcsec, int rows) =>
+            OpticsModel.OpticsFovFloor(FovMin(fovMinDeg, arcsec, rows), arcsec, rows);
     }
 
     /* Smooth, looping noise for seeing's motion: whole-cycle sines at a few

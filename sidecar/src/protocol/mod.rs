@@ -1811,6 +1811,68 @@ pub struct SettingsStatePayload {
     /// `capture_ut` between ~1Hz samples. `None` => treat as 1.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_warp_rate: Option<f64>,
+    /// The lenses command cameras can have in this save and which are
+    /// unlocked. Always sent, as null when the plugin reports none (no game
+    /// loaded, or an older plugin), so a consumer clears what it showed for
+    /// the last save; only an older sidecar leaves the field out.
+    #[serde(default)]
+    pub lens_levels: Option<LensLevelsPayload>,
+}
+
+/// Command camera lenses: the ground lens set by the Tracking Station level
+/// and the space lens steps unlocked by research.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LensLevelsPayload {
+    /// KSP game mode, lowercased: "career", "science", "sandbox" or another.
+    pub game_mode: String,
+    /// Deep-space optics are on and drawable. When false the lens values
+    /// blur nothing and zoom floors are the fixed ones.
+    pub optics_on: bool,
+    /// The Tracking Station level sets the ground lens. False means every
+    /// ground camera has the best ground lens.
+    pub tracking_gated: bool,
+    /// Current Tracking Station level, 1 based.
+    pub tracking_level: u32,
+    /// The ground lens now, arcseconds.
+    pub tracking_lens_arcsec: f64,
+    /// The ground zoom floor now, degrees of field of view.
+    pub tracking_fov_min_deg: f64,
+    /// Every Tracking Station level's lens, lowest first.
+    pub tracking_levels: Vec<TrackingLensLevelPayload>,
+    /// Space lens steps, worst first. Empty when none are configured.
+    pub space_steps: Vec<SpaceLensStepPayload>,
+}
+
+/// The ground lens at one Tracking Station level.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingLensLevelPayload {
+    /// Tracking Station level, 1 based.
+    pub level: u32,
+    /// Lens resolution, arcseconds.
+    pub lens_arcsec: f64,
+    /// Zoom floor, degrees of field of view.
+    pub fov_min_deg: f64,
+}
+
+/// One space lens step for craft cameras in vacuum, unlocked by a tech node.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceLensStepPayload {
+    /// Tech node id that unlocks the step.
+    pub tech_id: String,
+    /// The tech node's title as the player sees it.
+    pub tech_title: String,
+    /// The node is researched (always true in sandbox).
+    pub unlocked: bool,
+    /// Lens resolution, arcseconds.
+    pub lens_arcsec: f64,
+    /// Zoom floor, degrees of field of view.
+    pub fov_min_deg: f64,
 }
 
 /// Mission-time stamp of one video frame, sent on the control channel just
@@ -3135,6 +3197,7 @@ mod tests {
             capture_ut: None,
             capture_epoch: None,
             time_warp_rate: None,
+            lens_levels: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
         assert!(s.contains("\"type\":\"settings-state\""));
@@ -3167,6 +3230,7 @@ mod tests {
             capture_ut: None,
             capture_epoch: None,
             time_warp_rate: None,
+            lens_levels: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
         assert!(!s.contains("captureUt"));
@@ -3196,8 +3260,13 @@ mod tests {
             capture_ut: Some(12345.5),
             capture_epoch: Some(7),
             time_warp_rate: Some(4.0),
+            lens_levels: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
+        assert!(
+            s.contains("\"lensLevels\":null"),
+            "no lenses go out as an explicit null, so a client clears the last save's"
+        );
         assert!(s.contains("\"captureUt\":12345.5"));
         assert!(s.contains("\"captureEpoch\":7"));
         assert!(s.contains("\"timeWarpRate\":4.0"));
@@ -3208,6 +3277,45 @@ mod tests {
                 assert_eq!(p.capture_epoch, Some(7));
                 assert_eq!(p.time_warp_rate, Some(4.0));
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn settings_state_lens_levels_roundtrip() {
+        let lens = LensLevelsPayload {
+            game_mode: "science".into(),
+            optics_on: false,
+            tracking_gated: false,
+            tracking_level: 3,
+            tracking_lens_arcsec: 1.0,
+            tracking_fov_min_deg: 0.08,
+            tracking_levels: vec![TrackingLensLevelPayload {
+                level: 3,
+                lens_arcsec: 1.0,
+                fov_min_deg: 0.08,
+            }],
+            space_steps: vec![SpaceLensStepPayload {
+                tech_id: "scienceTech".into(),
+                tech_title: "Scanning Tech".into(),
+                unlocked: true,
+                lens_arcsec: 0.5,
+                fov_min_deg: 0.04,
+            }],
+        };
+        let msg = ServerMessage::SettingsState(SettingsStatePayload {
+            throttle_main_screen: false,
+            capture_ut: None,
+            capture_epoch: None,
+            time_warp_rate: None,
+            lens_levels: Some(lens.clone()),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"lensLevels\":{\"gameMode\":\"science\""));
+        assert!(s.contains("\"techTitle\":\"Scanning Tech\""));
+        assert!(s.contains("\"fovMinDeg\":0.04"));
+        match serde_json::from_str::<ServerMessage>(&s).unwrap() {
+            ServerMessage::SettingsState(p) => assert_eq!(p.lens_levels, Some(lens)),
             _ => panic!("wrong variant"),
         }
     }

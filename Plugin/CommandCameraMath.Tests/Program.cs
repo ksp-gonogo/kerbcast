@@ -2035,6 +2035,52 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
 }
 
 {
+    var steps = new[]
+    {
+        new SpaceLensStep("scienceTech", 0.5),
+        new SpaceLensStep("advScienceTech", 0.2),
+        new SpaceLensStep("experimentalScience", 0.05),
+    };
+    Check(SpaceLens.BestStep(steps, id => false) == -1, "space lens: nothing researched gives no step");
+    Check(SpaceLens.BestStep(steps, id => true) == 2, "space lens: everything researched gives the finest step");
+    Check(SpaceLens.BestStep(steps, id => id == "scienceTech") == 0, "space lens: one node researched gives its step");
+    Check(SpaceLens.BestStep(steps, id => id != "advScienceTech") == 2, "space lens: a later node researched past a skipped one still counts");
+    var dropped = (SpaceLensStep[])steps.Clone();
+    dropped[2].Arcsec = 0;
+    Check(SpaceLens.BestStep(dropped, id => true) == 1, "space lens: a step with a lens of 0 is dropped");
+    dropped[1].TechId = "";
+    Check(SpaceLens.BestStep(dropped, id => true) == 0, "space lens: a step with no node is dropped");
+    Check(SpaceLens.BestStep(null, id => true) == -1 && SpaceLens.BestStep(steps, null) == -1, "space lens: no steps or no research gives nothing");
+
+    /* Kerbin: 600 km radius, 70 km of air. A craft on an elliptical orbit, placed at two times. */
+    const double airR = 600000, airDepth = 70000;
+    double periapsisAt = airR + 60000, apoapsisAt = airR + 250000;
+    Check(!SpaceLens.OutsideAir(periapsisAt, airR, true, airDepth), "space lens: a craft dipping to 60 km is inside Kerbin's air at that time");
+    Check(SpaceLens.OutsideAir(apoapsisAt, airR, true, airDepth), "space lens: the same craft at 250 km later is outside it");
+    Check(SpaceLens.OutsideAir(airR + airDepth, airR, true, airDepth), "space lens: the edge of the air counts as outside");
+    Check(SpaceLens.OutsideAir(200000 + 10, 200000, false, 0), "space lens: a craft landed on an airless body is outside any air");
+
+    Check(SpaceLens.Beats(0.5, 1.0) && !SpaceLens.Beats(1.0, 1.0) && !SpaceLens.Beats(2.0, 1.0), "space lens: taken only when finer than the ground lens");
+    Check(!SpaceLens.Beats(double.NaN, 1.0) && !SpaceLens.Beats(0, 1.0) && SpaceLens.Beats(0.5, double.NaN), "space lens: no lens never wins, any lens beats none");
+
+    double fov = SpaceLens.FovMin(0.02, 0.05, 576);
+    double pix = OpticsModel.PixelArcsec(fov, 576);
+    Check(Near(0.05 / pix, OpticsModel.FloorBlurPx, 1e-6), "space lens: the zoom stops where the lens spans FloorBlurPx");
+    Check(Near(fov, 0.004, 1e-4), "space lens: the top step zooms to about 0.004 degrees");
+    Check(SpaceLens.FovMin(0.02, 1.0, 576) == 0.02, "space lens: a coarse lens never widens the usual limit");
+    Check(SpaceLens.FovMin(0.02, 0.001, 576) == SpaceLens.NarrowestFovDeg, "space lens: a near-perfect lens stops at the narrowest field");
+    Check(SpaceLens.FovMin(0.02, double.NaN, 576) == 0.02 && SpaceLens.FovMin(0.02, 0.05, 0) == 0.02, "space lens: no lens or no frame keeps the usual limit");
+
+    double firstStep = SpaceLens.ShownFovMin(0.02, 0.5, 576);
+    Check(SpaceLens.FovMin(0.02, 0.5, 576) == 0.02 && firstStep > 0.039 && firstStep < 0.041,
+        $"space lens: the first step shows where the optics floor really stops it, near 0.04 degrees ({firstStep:F4})");
+    Check(Near(firstStep, Math.Max(SpaceLens.FovMin(0.02, 0.5, 576), OpticsModel.OpticsFovFloor(0, 0.5, 576)), 1e-12),
+        "space lens: the shown limit is the rig's, the lens limit or the optics floor whichever is wider");
+    Check(Near(SpaceLens.ShownFovMin(0.02, 0.05, 576), SpaceLens.FovMin(0.02, 0.05, 576), 1e-12), "space lens: a fine step's shown limit is its own");
+    Check(SpaceLens.ShownFovMin(0.02, 0.001, 576) == SpaceLens.NarrowestFovDeg, "space lens: a near-perfect lens shows the narrowest field");
+}
+
+{
     /* A Surface aim at a body drawn at its past instant: on the drawn body, 8 minutes of spin back, at the same height. */
     var aimSpin = new DVec3(0, -2.9e-4, 0);
     var liveCentre = new DVec3(5e9, 1e8, -3e9);

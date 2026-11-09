@@ -90,7 +90,11 @@ namespace Kerbcast
             var up = station - centre;
             double air = CommandCameraOptics.AirAt(standsOn, up.Magnitude);
             double elevation = CommandCameraMath.ElevationDeg(target - station, up);
-            a.ResolutionRad = provider.LensLimitsAt(site).ResolutionArcsec(air, elevation) / OpticsModel.ArcsecPerRadian;
+            /* A craft's space lens by where it stands at the asked time, as its air is, not where it is now. */
+            bool? vacuum = site.HasVantage && standsOn != null
+                ? SpaceLens.OutsideAir(up.Magnitude, standsOn.Radius, standsOn.atmosphere, standsOn.atmosphereDepth)
+                : (bool?)null;
+            a.ResolutionRad = provider.LensLimitsAt(site, vacuum).ResolutionArcsec(air, elevation) / OpticsModel.ArcsecPerRadian;
             return a;
         }
 

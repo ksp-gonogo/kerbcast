@@ -37,9 +37,9 @@ use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
     CommandAimKind, CommandCentreInfo, CommandNetworkInfo, CommandTarget, CommandTrackState,
     CreateCommandCameraPayload, CrewLocation, DeleteNetworkPayload, DestroyCommandCameraPayload,
-    DisplaySizeReport, ErrorCode, Layer, NetworkDefinitionsPayload, NetworkResultPayload,
-    QualityPreset, ResumePayload, SaveNetworkPayload, SetCommandAimPayload, SettingsStatePayload,
-    SiteCatalogPayload, SiteKind, TrackMode,
+    DisplaySizeReport, ErrorCode, Layer, LensLevelsPayload, NetworkDefinitionsPayload,
+    NetworkResultPayload, QualityPreset, ResumePayload, SaveNetworkPayload, SetCommandAimPayload,
+    SettingsStatePayload, SiteCatalogPayload, SiteKind, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::send_tally::SendTally;
@@ -199,6 +199,10 @@ struct GlobalStatusFile {
     /// up to the moment it sends. Absent in older plugin writes.
     #[serde(default)]
     capture_wall_ms: Option<f64>,
+    /// Command camera lenses in this save. Absent when no game is loaded
+    /// and in older plugin writes.
+    #[serde(default)]
+    lens_levels: Option<LensLevelsPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -462,6 +466,7 @@ fn settings_from_status_at(s: &GlobalStatusFile, now_ms: f64) -> SettingsStatePa
         capture_ut,
         capture_epoch: s.capture_epoch,
         time_warp_rate: s.time_warp_rate,
+        lens_levels: s.lens_levels.clone(),
     }
 }
 
@@ -2162,6 +2167,7 @@ impl CameraRegistry {
                 capture_ut: None,
                 capture_epoch: None,
                 time_warp_rate: None,
+                lens_levels: None,
             })
     }
 
@@ -2696,6 +2702,7 @@ impl CameraRegistry {
                     || s.capture_ut != parsed.capture_ut
                     || s.capture_epoch != parsed.capture_epoch
                     || s.time_warp_rate != parsed.time_warp_rate
+                    || s.lens_levels != parsed.lens_levels
             })
             .unwrap_or(true);
         if settings_changed {
@@ -4473,6 +4480,84 @@ mod tests {
             settings_from_status_at(&old, 90000.0).capture_ut,
             Some(1000.0)
         );
+    }
+
+    const LENS_LEVELS_JSON: &str = r#"{"gameMode":"career","opticsOn":true,"trackingGated":true,"trackingLevel":2,"trackingLensArcsec":4.0,"trackingFovMinDeg":0.32,"trackingLevels":[{"level":1,"lensArcsec":15.0,"fovMinDeg":1.2},{"level":2,"lensArcsec":4.0,"fovMinDeg":0.32},{"level":3,"lensArcsec":1.0,"fovMinDeg":0.08}],"spaceSteps":[{"techId":"scienceTech","techTitle":"Scanning Tech","unlocked":true,"lensArcsec":0.5,"fovMinDeg":0.04},{"techId":"advScienceTech","techTitle":"Advanced Science Tech","unlocked":false,"lensArcsec":0.2,"fovMinDeg":0.016}]}"#;
+
+    #[test]
+    fn lens_levels_parse_from_status_into_settings() {
+        let status: GlobalStatusFile = serde_json::from_str(&format!(
+            r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[],"lensLevels":{LENS_LEVELS_JSON}}}"#
+        ))
+        .unwrap();
+        let lens = settings_from_status_at(&status, 0.0)
+            .lens_levels
+            .expect("lens levels carried");
+        assert_eq!(lens.game_mode, "career");
+        assert!(lens.optics_on && lens.tracking_gated);
+        assert_eq!(lens.tracking_level, 2);
+        assert_eq!(lens.tracking_lens_arcsec, 4.0);
+        assert_eq!(lens.tracking_levels.len(), 3);
+        assert_eq!(lens.tracking_levels[2].fov_min_deg, 0.08);
+        assert_eq!(lens.space_steps.len(), 2);
+        assert_eq!(lens.space_steps[0].tech_title, "Scanning Tech");
+        assert!(lens.space_steps[0].unlocked && !lens.space_steps[1].unlocked);
+    }
+
+    #[test]
+    fn lens_levels_absent_goes_out_as_null() {
+        let status: GlobalStatusFile =
+            serde_json::from_str(r#"{"kspFps":60.0,"shedLevel":0,"cameras":[]}"#).unwrap();
+        let settings = settings_from_status_at(&status, 0.0);
+        assert_eq!(settings.lens_levels, None);
+        assert!(serde_json::to_string(&settings)
+            .unwrap()
+            .contains("\"lensLevels\":null"));
+    }
+
+    /// A lens change (a research unlock, a Tracking Station upgrade) alone
+    /// emits a settings delta, with the clock held still.
+    #[tokio::test]
+    async fn poll_status_emits_settings_on_lens_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = CameraRegistry::new(dir.path().to_path_buf());
+        let status_path = dir.path().join("global.status.json");
+        let write = |lens: &str| {
+            std::fs::write(
+                &status_path,
+                format!(r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[],"captureUt":1000.0{lens}}}"#),
+            )
+            .unwrap();
+        };
+
+        write("");
+        assert_eq!(
+            registry.poll_status().await.settings.unwrap().lens_levels,
+            None
+        );
+        assert!(registry.poll_status().await.settings.is_none());
+
+        write(&format!(r#","lensLevels":{LENS_LEVELS_JSON}"#));
+        let lens = registry.poll_status().await.settings.unwrap().lens_levels;
+        assert_eq!(lens.unwrap().tracking_level, 2);
+        assert!(registry.poll_status().await.settings.is_none());
+
+        write(&format!(
+            r#","lensLevels":{}"#,
+            LENS_LEVELS_JSON.replace(r#""unlocked":false"#, r#""unlocked":true"#)
+        ));
+        let lens = registry.poll_status().await.settings.unwrap().lens_levels;
+        assert!(lens.unwrap().space_steps[1].unlocked);
+        assert!(registry.last_settings().await.lens_levels.is_some());
+
+        /* Back at the main menu the plugin drops the field: a delta clears it. */
+        write("");
+        let delta = registry.poll_status().await.settings;
+        assert_eq!(
+            delta.expect("dropping the lenses is a change").lens_levels,
+            None
+        );
+        assert!(registry.last_settings().await.lens_levels.is_none());
     }
 
     const COMMAND_TRACK_JSON: &str = r#"{"ut":637599435.82,"hasFix":true,"rangeM":11507905.1,"occluded":true,"occluder":"Mun","sunlit":true,"bracketHalfPx":4.2,"frameHeightPx":576,"framingFits":true,"authority":{"owner":"mission-control"},"blank":null,"events":[{"ut":637599435.8,"occluded":false,"occluder":"","sunlit":true,"blank":null},{"ut":637599435.81,"occluded":true,"occluder":"Mun","sunlit":true,"blank":null}]}"#;

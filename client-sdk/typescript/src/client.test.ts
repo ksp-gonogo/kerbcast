@@ -8,6 +8,7 @@ import {
   ErrorCode,
   ErrorSource,
   Layer,
+  type LensLevelsPayload,
   QualityPreset,
   TrackMode,
 } from "./__generated__/types";
@@ -3721,6 +3722,45 @@ describe("KerbcastClient.inboundVideoStats", () => {
     expect(events.length).toBeGreaterThan(0);
     expect(events[events.length - 1].throttleMainScreen).toBe(true);
     expect(client.throttleMainScreen).toBe(true);
+  });
+
+  it("lensLevels arrive on hello, follow settings-state, clear on null and survive an older sidecar's push", async () => {
+    const lens: LensLevelsPayload = {
+      gameMode: "career",
+      opticsOn: true,
+      trackingGated: true,
+      trackingLevel: 2,
+      trackingLensArcsec: 4,
+      trackingFovMinDeg: 0.32,
+      trackingLevels: [
+        { level: 1, lensArcsec: 15, fovMinDeg: 1.2 },
+        { level: 2, lensArcsec: 4, fovMinDeg: 0.32 },
+      ],
+      spaceSteps: [
+        { techId: "scienceTech", techTitle: "Scanning Tech", unlocked: false, lensArcsec: 0.5, fovMinDeg: 0.04 },
+      ],
+    };
+    const sidecar = new MockSidecar();
+    sidecar.setLensLevels(lens);
+    const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+    expect(client.lensLevels).toBeNull();
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    await client.connect();
+    sidecar.open();
+    expect(client.lensLevels).toEqual(lens);
+
+    const unlocked = { ...lens, spaceSteps: [{ ...lens.spaceSteps[0], unlocked: true }] };
+    sidecar.setLensLevels(unlocked);
+    expect(client.lensLevels?.spaceSteps[0].unlocked).toBe(true);
+
+    sidecar.fireSettingsState({ throttleMainScreen: false, captureUt: 10 });
+    expect(client.lensLevels).toEqual(unlocked);
+
+    /* Back at the main menu the plugin reports none, and the sidecar says so with a null. */
+    sidecar.setLensLevels(null);
+    expect(client.lensLevels).toBeNull();
   });
 
   it("clock.captureUt is null before any settings-state", () => {

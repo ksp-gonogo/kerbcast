@@ -114,6 +114,18 @@ namespace Kerbcast.Api
         Vessel = 3,
     }
 
+    /** <summary>Where a command camera's lens comes from, in <see cref="VantageResolution.LensSource"/>. Added in API 1.5.</summary> */
+    public enum LensSource
+    {
+        Unknown = 0,
+        /** <summary>The Tracking Station's lens at its level now, or its top level's where the level sets nothing (outside career, or with the tracking rules off).</summary> */
+        TrackingStation = 1,
+        /** <summary>The camera beside the launch site, which always has the level 1 lens.</summary> */
+        LaunchSite = 2,
+        /** <summary>A craft's space lens: the craft is outside any atmosphere and a researched step gives a finer lens than the Tracking Station's.</summary> */
+        SpaceLens = 3,
+    }
+
     [System.Flags]
     public enum LockOptions
     {

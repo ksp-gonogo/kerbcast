@@ -296,7 +296,21 @@ namespace Kerbcast
                 OpticsOn = lens.OpticsOn,
                 LensArcsec = lens.LensArcsec,
                 BestResolutionRad = lens.ResolutionArcsec(0, 90) / OpticsModel.ArcsecPerRadian,
+                LensSource = Source(lens.Lens.Kind),
+                LensLevel = lens.Lens.Level,
+                LensName = lens.Lens.Name,
             };
+        }
+
+        static LensSource Source(LensKind kind)
+        {
+            switch (kind)
+            {
+                case LensKind.TrackingStation: return LensSource.TrackingStation;
+                case LensKind.LaunchSite: return LensSource.LaunchSite;
+                case LensKind.SpaceLens: return LensSource.SpaceLens;
+                default: return LensSource.Unknown;
+            }
         }
 
         public IReadOnlyList<GroundStationInfo> GroundStations()
