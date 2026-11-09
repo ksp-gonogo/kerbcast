@@ -42,6 +42,30 @@ Command cameras aren't parts on a craft. They stand beside a launch site, at a g
 - Create and aim them from the browser through the TypeScript SDK (`createCommandCamera`, `setCommandAim`)
 - Other mods can drive command cameras from their own game logic through `Kerbcast.API`, published on NuGet
 
+### Lenses
+
+Command cameras see like telescopes. Far planets and craft blur by a fixed amount set by the camera's lens, measured in arcseconds (smaller is sharper), and a camera looking up through air also blurs with the air, more so near the horizon. Stars stay sharp. This is on by default; turn off `DeepSpaceOptics` in `settings.cfg` for sharp views.
+
+A camera stops zooming once the blur covers about two pixels, so a better lens also zooms further.
+
+On the ground, the lens follows your Tracking Station level in career (with the tracking rules on, in the difficulty settings). Science and sandbox saves get the level 3 lens. The camera beside the launch pad always has the level 1 lens.
+
+| Tracking Station | Lens | Zooms to about |
+|---|---|---|
+| Level 1 | 15" | 1.2° |
+| Level 2 | 4" | 0.32° |
+| Level 3 | 1" | 0.08° (a little wider through the air) |
+
+In space, a camera riding a craft outside any atmosphere gets a space lens, which improves as you research these nodes in career and science saves. Sandbox has the best one. A craft camera always uses the sharper of its space lens and the Tracking Station lens. Ground stations, launch sites, spots on the surface and craft still inside an atmosphere keep the Tracking Station lens.
+
+| Research | Space lens | Zooms to about |
+|---|---|---|
+| Scanning Tech | 0.5" | 0.04° |
+| Advanced Science Tech | 0.2" | 0.016° |
+| Experimental Science | 0.05" | 0.004° |
+
+In a career or science save, the flask button at the top of Kerbcast's page shows your current lenses and which space lens steps you have researched. Modded tech trees can point each step at their own node in `settings.cfg`.
+
 ## Install
 
 Easiest is **CKAN**. Otherwise grab the latest `kerbcast-*.zip` from the [releases page](https://github.com/ksp-gonogo/kerbcast/releases) (or the [SpaceDock listing](https://spacedock.info/mod/4366/Kerbcast)) and follow the install steps in that release's notes. For a manual install, ensure you also install [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued) and [Harmony 2](https://github.com/KSPModdingLibs/HarmonyKSP).
