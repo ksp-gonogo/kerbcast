@@ -343,7 +343,7 @@ namespace Kerbcast
         public static bool EnableGalaxySkip { get; private set; } = true;
 
         /* With no light speed set, still light each camera's planets from the Sun as they really stand. Under a light speed they always are. */
-        public static bool PlanetPhases { get; private set; } = false;
+        public static bool PlanetPhases { get; private set; } = true;
 
         // Debug: when true, log additional per-camera diagnostics
         // useful for investigating render-mask / cullingMask issues
