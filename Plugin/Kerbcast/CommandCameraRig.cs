@@ -2284,16 +2284,15 @@ namespace Kerbcast
            from the main view still sees them. The main camera standing on a
            body never draws that body's scaled mesh while its terrain is local
            (the fader turns it off), and the command camera stands on it too, so
-           while the station's PQS is active its mesh is left as stock has it.
-           With the PQS inactive the mesh is the only ground there is. So it is
-           with a light speed once the terrain is beyond the layers' own reach:
-           that is the reach PicturePass tests before it hides terrain, so
-           terrain it hides always has this mesh in its place. */
+           while that terrain is within the layers' own reach the mesh is left
+           as stock has it. Beyond it, or with the PQS inactive, the mesh is
+           the only ground there is. That is the reach PicturePass tests before
+           it hides terrain, so terrain it hides always has this mesh in its
+           place. */
         private void UpdateStationBodyMesh(KerbcastCamera cam, DVec3 station, double ut, double d)
         {
             var body = _mount.Site.Body;
-            var pqs = body != null ? body.pqsController : null;
-            bool stock = pqs != null && pqs.isActive && (!LightTime.LightSpeed.HasValue || cam.Picture.TerrainLocal(body, station));
+            bool stock = cam.Picture.TerrainLocal(body, station);
             var r = stock && body.scaledBody != null ? body.scaledBody.GetComponent<Renderer>() : null;
             cam.RigStockFaderRenderer = r;
             bool nowStock = r != null;
