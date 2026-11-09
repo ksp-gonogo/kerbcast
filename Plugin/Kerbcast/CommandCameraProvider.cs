@@ -770,36 +770,19 @@ namespace Kerbcast
             var s = _settings;
             double l1 = s.OpticsResolutionLevel1, l2 = s.OpticsResolutionLevel2, l3 = s.OpticsResolutionLevel3;
             if (site.IsLaunchSite)
-                return new LensChoice
-                {
-                    Arcsec = OpticsModel.ResolutionForLevel(0, l1, l2, l3),
-                    Kind = LensKind.LaunchSite,
-                    Level = 1,
-                    Name = named ? "Tracking Station level 1" : null,
-                    Label = "launch site, level 1 lens",
-                };
+                return new LensChoice(OpticsModel.ResolutionForLevel(0, l1, l2, l3), LensKind.LaunchSite, 1,
+                    named ? "Tracking Station level 1" : null, "launch site, level 1 lens");
             bool gated = CommandCameraTargets.Gated();
             int level = gated ? CommandCameraTargets.TrackingLevel() : CommandCameraTargets.TopTrackingLevel();
-            var ground = new LensChoice
-            {
-                Arcsec = OpticsModel.ResolutionForLevel(gated ? CommandCameraTargets.NormLevel() : 1, l1, l2, l3),
-                Kind = LensKind.TrackingStation,
-                Level = level,
-                Name = named ? $"Tracking Station level {level}" : null,
-                Label = gated ? $"Tracking Station level {level}" : $"top lens ({TopLensWhy()})",
-            };
+            var ground = new LensChoice(OpticsModel.ResolutionForLevel(gated ? CommandCameraTargets.NormLevel() : 1, l1, l2, l3),
+                LensKind.TrackingStation, level, named ? $"Tracking Station level {level}" : null,
+                gated ? $"Tracking Station level {level}" : $"top lens ({TopLensWhy()})");
             if (!InVacuum(site)) return ground;
             int step = SpaceLens.BestStep(s.SpaceLensSteps, SpaceLensTech.Researched);
             if (step < 0 || !SpaceLens.Beats(s.SpaceLensSteps[step].Arcsec, ground.Arcsec)) return ground;
             string tech = s.SpaceLensSteps[step].TechId;
-            return new LensChoice
-            {
-                Arcsec = s.SpaceLensSteps[step].Arcsec,
-                Kind = LensKind.SpaceLens,
-                Level = step + 1,
-                Name = named ? SpaceLensTech.Title(tech) : null,
-                Label = $"space lens step {step + 1} ({tech})",
-            };
+            return new LensChoice(s.SpaceLensSteps[step].Arcsec, LensKind.SpaceLens, step + 1,
+                named ? SpaceLensTech.Title(tech) : null, $"space lens step {step + 1} ({tech})");
         }
 
         /* A craft vantage outside its body's atmosphere, or on or over a body with none. Ground stations and surface points never are. */

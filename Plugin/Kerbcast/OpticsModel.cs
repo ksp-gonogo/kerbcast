@@ -96,6 +96,17 @@ namespace Kerbcast
         public string Name;
         /* What chose it, for the log. */
         public string Label;
+
+        public LensChoice(double arcsec, LensKind kind, int level, string name, string label)
+        {
+            Arcsec = arcsec;
+            Kind = kind;
+            Level = level;
+            Name = name;
+            Label = label;
+        }
+
+        public static LensChoice Unknown => new LensChoice(double.NaN, LensKind.TrackingStation, 0, null, null);
     }
 
     /* Where a lens stands and what it looks at, for OpticsModel.Assess. */
@@ -130,7 +141,7 @@ namespace Kerbcast
         /* Where the lens comes from, whether or not the optics are drawn. */
         public LensChoice Lens;
 
-        public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset };
+        public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset, Lens = LensChoice.Unknown };
 
         /* Arcseconds one pixel covers at the frame's centre at the tightest zoom. */
         public double PixelArcsec => Known ? OpticsModel.PixelArcsec(FovMinDeg, HeightPx) : double.NaN;
