@@ -323,8 +323,8 @@ namespace Kerbcast
          * own direction. The surface's terminator comes from Unity's one
          * directional light, which can only face one way per render, so it is
          * turned to the body with the widest disc in frame, passing over a
-         * lens's own planet while it fills the frame and another body is in
-         * it. Every input is put back in AfterScaledLayer.
+         * lens's own planet while it fills the frame and another body that
+         * can be seen is in it. Every input is put back in AfterScaledLayer.
          */
         private void LightBodies(List<CelestialBody> bodies, BodyPlan plan, PictureLens lens)
         {
@@ -347,6 +347,7 @@ namespace Kerbcast
             Vector3 lensScaled = ScaledSpace.LocalToScaledSpace(new Vector3d(lens.Point.X, lens.Point.Y, lens.Point.Z));
             Vector3 sunScaled = sunBody.scaledBody.transform.position;
             int underfoot = -1;
+            var ownCentre = default(DVec3);
             for (int i = 0; i < _moved.Count; i++)
             {
                 var m = _moved[i];
@@ -357,7 +358,22 @@ namespace Kerbcast
                 if (view != null && !m.Body.isStar)
                 {
                     _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, halfDiagonal);
-                    if (m.Body == lens.Body && BodyLight.FillsFrame(_discs[m.Slot], halfDiagonal)) underfoot = m.Slot;
+                    if (m.Body == lens.Body && BodyLight.FillsFrame(_discs[m.Slot], halfDiagonal))
+                    {
+                        underfoot = m.Slot;
+                        ownCentre = m.Centre;
+                    }
+                }
+            }
+            if (underfoot >= 0)
+            {
+                var rt = Target ?? view.targetTexture;
+                int rows = rt != null ? rt.height : view.pixelHeight;
+                for (int i = 0; i < _moved.Count; i++)
+                {
+                    var m = _moved[i];
+                    if (m.Slot != underfoot && _discs[m.Slot] > 0 && !BodyLight.OutranksOwn(lens.Point, ownCentre, lens.Body.Radius, m.Centre, _discs[m.Slot], view.fieldOfView, rows))
+                        _discs[m.Slot] = 0;
                 }
             }
             _litSlot = BodyLight.Pick(_discs, bodies.Count, _litSlot, underfoot);

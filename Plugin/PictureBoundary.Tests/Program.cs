@@ -332,6 +332,40 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(BodyLight.FillsFrame(BodyLight.DiscRadians(6.0001e5, 6e5), wide), "fills: a planet under a ground lens fills even a wide frame");
     Check(BodyLight.FillsFrame(BodyLight.DiscRadians(6.0001e5, 6e5), BodyLight.HalfDiagonalRadians(1, 16.0 / 9)), "fills: and a telescope's narrow frame");
     Check(!BodyLight.FillsFrame(BodyLight.DiscRadians(2e7, 6e5), wide), "fills: a planet well below a craft in high orbit does not, so it can take the light");
+    var groundEye = new DVec3(0, 0, 0);
+    var ownCentre = new DVec3(0, -6.0001e5, 0);
+    const double ownRadius = 6e5;
+    const double dunaRadius = 3.2e5, dunaRange = 6.8e9;
+    double wideFov = 60, teleFov = 2 * Math.Atan(Math.Tan(Math.PI / 180) / Math.Sqrt(1 + 16.0 * 16 / 81)) * 180 / Math.PI;
+    int PickFromGround(DVec3 aim, DVec3 centre, double fov, int heldSlot)
+    {
+        double halfD = BodyLight.HalfDiagonalRadians(fov, 16.0 / 9);
+        var discs = new[]
+        {
+            BodyLight.DiscInFrame(groundEye, ownCentre, ownRadius, aim, halfD),
+            BodyLight.DiscInFrame(groundEye, centre, dunaRadius, aim, halfD)
+        };
+        int own = BodyLight.FillsFrame(discs[0], halfD) ? 0 : -1;
+        if (own == 0 && discs[1] > 0 && !BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, centre, discs[1], fov, 1080)) discs[1] = 0;
+        return BodyLight.Pick(discs, 2, heldSlot, own);
+    }
+    double horizon = 3 * Math.PI / 180;
+    var overHorizon = new DVec3(Math.Cos(horizon), Math.Sin(horizon), 0);
+    double dunaDisc = BodyLight.DiscRadians(dunaRange, dunaRadius);
+    Check(Math.Abs(BodyLight.DiscPixels(dunaDisc, teleFov, 1080) - 3) < 0.3, "outrank: Duna is about three pixels on a one degree telescope at 1080p");
+    Check(BodyLight.DiscPixels(dunaDisc, wideFov, 1080) < 0.1, "outrank: and a small fraction of one on a wide camera");
+    Check(PickFromGround(overHorizon, overHorizon * dunaRange, wideFov, -1) == 0, "outrank: a tiny planet in a wide camera's cone leaves the light on the own planet");
+    Check(PickFromGround(overHorizon, overHorizon * dunaRange, wideFov, 1) == 0, "outrank: and cannot go on holding it");
+    Check(PickFromGround(overHorizon, overHorizon * dunaRange, teleFov, -1) == 1, "outrank: Duna at three pixels in a telescope takes the light");
+    Check(PickFromGround(overHorizon, overHorizon * dunaRange, teleFov, 0) == 1, "outrank: from the own planet that held it");
+    var belowGround = new DVec3(0, -1, 0);
+    Check(BodyLight.BehindLimb(groundEye, ownCentre, ownRadius, belowGround * dunaRange), "limb: a planet straight through the ground is behind it");
+    Check(!BodyLight.BehindLimb(groundEye, ownCentre, ownRadius, overHorizon * dunaRange), "limb: a planet above the horizon is not");
+    Check(!BodyLight.BehindLimb(groundEye, ownCentre, ownRadius, belowGround * 5), "limb: a body nearer than the limb is not hidden by it");
+    var offNadir = new DVec3(Math.Cos(-1.2), Math.Sin(-1.2), 0);
+    var bigBehind = offNadir * 1e9;
+    Check(!BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, bigBehind, BodyLight.DiscRadians(1e9, 6e5), teleFov, 1080), "limb: a planet well over two pixels behind the own planet cannot outrank it");
+    Check(BodyLight.OutranksOwn(groundEye, ownCentre, ownRadius, overHorizon * 1e9, BodyLight.DiscRadians(1e9, 6e5), teleFov, 1080), "limb: the same planet above the horizon can");
     int held = -1;
     double[] sweep = new double[2];
     int switches = 0;

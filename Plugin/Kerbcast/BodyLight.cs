@@ -15,6 +15,9 @@ namespace Kerbcast
         /* A challenger's disc must be this much wider than the held body's to take the light, so near-equal discs do not make the lighting jump. */
         public const double StayMargin = 1.25;
 
+        /* The smallest disc radius, in pixels, that can take the light from the lens's own planet. */
+        public const double MinOutrankPixels = 2;
+
         /* Whether this camera lights bodies per body: always under a light speed, otherwise as the player's setting says. */
         public static bool Applies(bool lightSpeedSet, bool phasesSetting) => lightSpeedSet || phasesSetting;
 
@@ -49,6 +52,31 @@ namespace Kerbcast
         /* Whether a disc reaches past half the way from a frame's centre to its corner, about half the frame's area, which is what a planet underfoot does. */
         public static bool FillsFrame(double disc, double halfDiagonal) => disc > halfDiagonal / 2;
 
+        /* The radius in pixels of a disc at the centre of a frame `rows` high. */
+        public static double DiscPixels(double disc, double verticalFovDeg, int rows) =>
+            rows / 2.0 * Math.Tan(disc) / Math.Tan(verticalFovDeg * Math.PI / 360);
+
+        /* Whether a body's centre is hidden by the lens's own planet: inside that planet's disc and no nearer than its limb. */
+        public static bool BehindLimb(DVec3 eye, DVec3 ownCentre, double ownRadiusM, DVec3 centre)
+        {
+            var toOwn = ownCentre - eye;
+            var toBody = centre - eye;
+            double cos = Math.Max(-1, Math.Min(1, DVec3.Dot(toOwn.Normalized, toBody.Normalized)));
+            if (Math.Acos(cos) > DiscRadians(toOwn.Magnitude, ownRadiusM)) return false;
+            double d = toOwn.Magnitude;
+            return toBody.Magnitude >= Math.Sqrt(Math.Max(0, d * d - ownRadiusM * ownRadiusM));
+        }
+
+        /*
+         * Whether a body in frame may take the light from the lens's own
+         * planet filling that frame. It must be big enough to see and not
+         * hidden by the planet: a speck in a wide frame is not what the
+         * picture shows, and the planet's own ground would be lit from the
+         * wrong side for its sake.
+         */
+        public static bool OutranksOwn(DVec3 eye, DVec3 ownCentre, double ownRadiusM, DVec3 centre, double disc, double verticalFovDeg, int rows) =>
+            DiscPixels(disc, verticalFovDeg, rows) >= MinOutrankPixels && !BehindLimb(eye, ownCentre, ownRadiusM, centre);
+
         /*
          * The slot of the body to aim the light at, from `discs` where 0 means
          * not a candidate, or -1 for none. The body in slot `held` keeps the
@@ -56,7 +84,8 @@ namespace Kerbcast
          * wider. Ties go to the lower slot, so the choice does not depend on
          * float noise between two equal discs. Slot `underfoot`, a lens's own
          * planet filling its frame, takes the light only when no other body
-         * is in frame, so a telescope low over the horizon lights its target.
+         * is a candidate, so a telescope low over the horizon lights its
+         * target. The caller clears the discs that fail OutranksOwn first.
          */
         public static int Pick(double[] discs, int count, int held, int underfoot = -1)
         {
