@@ -353,6 +353,7 @@ namespace Kerbcast
                 var m = _moved[i];
                 if (m.Hidden) continue;
                 LightRim(ref m, sun);
+                _moved[i] = m;
                 LightShell(ref m, sun, lensScaled, sunScaled);
                 _moved[i] = m;
                 if (view != null && !m.Body.isStar)
