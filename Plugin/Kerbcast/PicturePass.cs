@@ -1188,6 +1188,84 @@ namespace Kerbcast
             return found;
         }
 
+        /*
+         * A craft on `orbit` as light arriving at `lens` shows it, propagated
+         * back along that conic to its light-time instant (PastInstant.OnConic),
+         * for a coasting craft whose recorded past does not reach that far.
+         * Placed as TrySee places a craft, against its body where the picture
+         * draws it. Pid, Rotation and Parts are left for the caller: the conic
+         * knows only where the craft is.
+         */
+        public bool TrySeeOnConic(Orbit orbit, PictureLens lens, out PastPicture seen)
+        {
+            seen = default;
+            seen.Status = PastStatus.Unsolved;
+            double? c = LightTime.LightSpeed;
+            var bodies = FlightGlobals.Bodies;
+            var body = orbit?.referenceBody;
+            if (!c.HasValue || body == null || bodies == null || !lens.Valid) return false;
+            var ring = LightHistoryHost.History;
+            var r = Planetarium.Rotation;
+            var deRot = new DQuat(r.x, r.y, r.z, r.w).Conjugate;
+            var lensOffset = deRot.Rotate(lens.Point - ToD(lens.Body.position));
+            int index = body.flightGlobalsIndex;
+            int lensBody = lens.Body.flightGlobalsIndex;
+            var spin = ring.SpinOf(lensBody);
+            var conic = new OrbitConic { Orbit = orbit, Turn = deRot };
+            PastSight sight;
+            if (ring.BodiesOffKepler > 0)
+            {
+                var tree = new RingBodies<KeplerBodyTree>(ring, new KeplerBodyTree(bodies, deRot));
+                int frame = PastInstant.CommonAncestor(ref tree, lensBody, index);
+                sight = PastInstant.OnConic(ref tree, conic, index, frame, lensBody, lensOffset, lens.Ut, c.Value, ConicSpeedBound(orbit, bodies, frame), spin);
+            }
+            else
+            {
+                var tree = new KeplerBodyTree(bodies, deRot);
+                int frame = PastInstant.CommonAncestor(ref tree, lensBody, index);
+                sight = PastInstant.OnConic(ref tree, conic, index, frame, lensBody, lensOffset, lens.Ut, c.Value, ConicSpeedBound(orbit, bodies, frame), spin);
+            }
+            seen.Status = sight.Status;
+            if (!sight.Found) return false;
+            var back = deRot.Conjugate;
+            var plan = BodiesFor(lens, c.Value);
+            int f = sight.Frame;
+            seen.Body = body;
+            if (plan != null && !KeepsPresent(body, lens) && (plan.Moves(index) || plan.Hides(index)) && f >= 0 && f < bodies.Count && bodies[f] != null)
+            {
+                seen.World = ToD(bodies[f].position) + back.Rotate(sight.About);
+                seen.About = bodies[f];
+            }
+            else
+            {
+                double drawnAt = lens.Ut;
+                if (plan != null && !KeepsPresent(body, lens) && plan.TrySpin(index, out double spinBack)) drawnAt += spinBack;
+                seen.World = ToD(body.position) + back.Rotate(PastInstant.AboutDrawnBody(sight.State, drawnAt, spin));
+                seen.About = body;
+            }
+            seen.Rotation = Quaternion.identity;
+            seen.Ut = sight.Ut;
+            return true;
+        }
+
+        /* A conic's speed bound in frame `frame`, as an Orbit or PositionAt aim's is taken. */
+        private static double ConicSpeedBound(Orbit orbit, List<CelestialBody> bodies, int frame) =>
+            CommandCameraForecast.SpeedBound(BodyMotion.OnOrbit(orbit), frame >= 0 && frame < bodies.Count ? bodies[frame] : null);
+
+        /* A craft's orbit as a conic for the light-time solve, in the de-rotated axes the body tree is read in. */
+        private struct OrbitConic : IConic
+        {
+            public Orbit Orbit;
+            public DQuat Turn;
+
+            public bool Offset(double ut, out DVec3 offset)
+            {
+                var r = Orbit.getRelativePositionAtUT(ut).xzy;
+                offset = Turn.Rotate(new DVec3(r.x, r.y, r.z));
+                return !double.IsNaN(offset.X) && !double.IsInfinity(offset.X);
+            }
+        }
+
         private static LensSight See<TB>(LensSights sights, LightHistory ring, uint pid, ref uint drawn, bool subject, PictureLens lens,
             DVec3 lensOffset, double c, ref TB tree) where TB : IBodyTree
         {

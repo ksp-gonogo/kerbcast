@@ -715,6 +715,51 @@ PartRecord[] Parts(uint first, int count)
     Check((p - exact).Magnitude < 1, $"a landed craft read 1e8 s on is where the body's turn puts it ({(p - exact).Magnitude:F4} m)");
 }
 
+/* ---- a coasting craft past the history's reach is drawn on its conic ---- */
+{
+    /*
+     * A craft on a 300 km circle about the Mun, seen from Kerbin's surface at
+     * c = 3e5, about 40 s of light time. Its history starts 10 s ago, so the
+     * history cannot show it and its conic must, with the Mun at its own
+     * light-time instant: the Mun moves about 21 km in that time, which is
+     * what placing it about the Mun as it is now gets wrong.
+     */
+    double rc = 300000, wc = Math.Sqrt(MuMun / (rc * rc * rc));
+    var tree = new ConicTree();
+    var conic = new CircleConic { R = rc, W = wc };
+    double t = 1000, c = 3e5;
+    var lensOffset = new DVec3(600000, 0, 0);
+    int frame = PastInstant.CommonAncestor(ref tree, Kerbin, Mun);
+    Check(frame == Kerbin, "the Mun's craft is solved about Kerbin, the common ancestor");
+    double bound = rc * wc * 1.1 + ConicTree.MunR * ConicTree.MunW * 1.1;
+    var sight = PastInstant.OnConic(ref tree, conic, Mun, frame, Kerbin, lensOffset, t, c, bound, default);
+    Check(sight.Found, $"the conic is solved at its light-time instant ({sight.Status})");
+    conic.Offset(sight.Ut, out var rel);
+    var munThen = ConicTree.MunAt(sight.Ut);
+    double g = sight.Ut + (lensOffset - (munThen + rel)).Magnitude / c - t;
+    Check(Math.Abs(g) < 1e-3 && t - sight.Ut > 35 && t - sight.Ut < 45, $"its light left it {t - sight.Ut:F3} s ago and arrives now (residual {g:E1} s)");
+    Check((sight.About - (munThen + rel)).Magnitude < 1e-3, "it hangs from the Mun where the Mun was at that instant");
+    Check((sight.About - (ConicTree.MunAt(t) + rel)).Magnitude > 10000, "not from the Mun as it is now");
+    Check(sight.State.Body == Mun && (sight.State.Position - rel).Magnitude < 1e-9 && sight.State.Ut == sight.Ut,
+        "its state holds its offset about the Mun at the instant, for drawing against the Mun as drawn");
+
+    var ring = NewRing();
+    const uint pid = 77;
+    double start = t - 10;
+    conic.Offset(start, out var r0);
+    var v0 = new DVec3(-r0.Y * wc, r0.X * wc, 0);
+    ring.Record(pid, State(start, Mun, r0, v0), HistoryReason.Start);
+    var far = PastInstant.Craft(ring, pid, t, Kerbin, lensOffset, c, ref tree);
+    Check(far.Status == PastStatus.Unseen && PastInstant.DrawnOnConic(far.Status, true),
+        $"a history 10 s deep cannot show a craft 40 s of light away, so its conic does ({far.Status})");
+    var near = PastInstant.Craft(ring, pid, t, Kerbin, lensOffset, 1e8, ref tree);
+    Check(near.Found && near.Ut >= start && !PastInstant.DrawnOnConic(near.Status, true),
+        $"where the history reaches the instant it is drawn from the history ({near.Status})");
+    Check(!PastInstant.DrawnOnConic(PastStatus.Unseen, false), "a craft under thrust is not put on a conic it is leaving");
+    Check(!PastInstant.DrawnOnConic(PastStatus.Gone, true) && !PastInstant.DrawnOnConic(PastStatus.Unsolved, true),
+        "nor is one whose last light has arrived, or whose solve did not settle");
+}
+
 /* ---- The delay-off gate ---- */
 {
     var h = new LightHistory { SystemDiameterM = 2.4e11 };
@@ -1116,4 +1161,39 @@ struct Walk : IBodyWalk
     public int Child(int body, int i) => Children[body][i];
     public int Parent(int body) => Parents[body];
     bool IBodyWalk.Reversed(int body) => Reversed[body];
+}
+
+/* Kerbin on a circle about the Sun and the Mun on one about Kerbin, in one plane. */
+struct ConicTree : IBodyTree
+{
+    public const double KerbinR = 1.3599840256e10, MunR = 1.2e7;
+    public static readonly double KerbinW = Math.Sqrt(1.1723328e18 / (KerbinR * KerbinR * KerbinR));
+    public static readonly double MunW = Math.Sqrt(3.5316e12 / (MunR * MunR * MunR));
+
+    public static DVec3 MunAt(double ut) => Circle(MunR, MunW, ut);
+    private static DVec3 Circle(double r, double w, double ut) => new DVec3(r * Math.Cos(w * ut), r * Math.Sin(w * ut), 0);
+
+    public bool TryParent(int body, out int parent)
+    {
+        parent = body == 2 ? 1 : 0;
+        return body == 1 || body == 2;
+    }
+
+    public bool TryOffset(int body, double ut, out DVec3 offset)
+    {
+        offset = body == 1 ? Circle(KerbinR, KerbinW, ut) : body == 2 ? MunAt(ut) : default;
+        return body == 1 || body == 2;
+    }
+}
+
+/* A circular conic in the bodies' plane. */
+struct CircleConic : IConic
+{
+    public double R, W;
+
+    public bool Offset(double ut, out DVec3 offset)
+    {
+        offset = new DVec3(R * Math.Cos(W * ut), R * Math.Sin(W * ut), 0);
+        return true;
+    }
 }
