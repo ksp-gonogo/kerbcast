@@ -158,8 +158,11 @@ namespace Kerbcast
                 _scaledCam.Render();
                 return;
             }
-            Rig.BeforeScaledRender(this);
-            try { _scaledCam.Render(); }
+            try
+            {
+                Rig.BeforeScaledRender(this);
+                _scaledCam.Render();
+            }
             finally { Rig.AfterScaledRender(this); }
         }
 
