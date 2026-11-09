@@ -52,6 +52,9 @@ namespace Kerbcast
         public static double SpinBackS(double distanceM, double radiusM, double lightSpeed) =>
             lightSpeed > 0 ? -Math.Max(0, distanceM - radiusM) / lightSpeed : 0;
 
+        /* The world direction `forward` in the axes of a mesh turned to `rotation`, as a stored sun direction holds it. */
+        public static DVec3 LightInBodyAxes(DQuat rotation, DVec3 forward) => rotation.Conjugate.Rotate(forward).Normalized;
+
         /* A point on a live craft (pivot `livePivot`, turned `liveRotation`) carried to where the craft is drawn. */
         public static DVec3 Carry(DVec3 point, DVec3 livePivot, DQuat liveRotation, DVec3 drawnPivot, DQuat drawnRotation) =>
             drawnPivot + Turn(liveRotation, drawnRotation).Rotate(point - livePivot);

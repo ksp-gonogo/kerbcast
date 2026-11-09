@@ -199,5 +199,18 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(PictureBoundary.SpinBackS(1e7, 6e5, 3e5) == 1000 * PictureBoundary.SpinBackS(1e7, 6e5, 3e8), "spin back: grows as the light speed drops");
 }
 
+{
+    var sun = new DVec3(0.6, 0, 0.8);
+    var spin = new DVec3(0, -2.9e-4, 0);
+    var present = DQuat.FromRotationVector(new DVec3(0.3, 1.1, -0.4));
+    var turnedBack = (DQuat.FromRotationVector(spin * -480) * present).Normalized;
+    var stored = PictureBoundary.LightInBodyAxes(present, sun);
+    var fresh = PictureBoundary.LightInBodyAxes(turnedBack, sun);
+    Check(Near(PictureBoundary.LightInBodyAxes(DQuat.Identity, sun), sun, 1e-12), "light: unturned axes keep the direction");
+    Check(Near(turnedBack.Rotate(fresh), sun, 1e-9), "light: written for the turned axes it lands back on the Sun's direction in world space");
+    Check((turnedBack.Rotate(stored) - sun).Magnitude > 0.1, "light: the value left from the present rotation misses it by the spin");
+    Check(Math.Abs(stored.Magnitude - 1) < 1e-12 && Math.Abs(fresh.Magnitude - 1) < 1e-12, "light: stays a unit direction");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

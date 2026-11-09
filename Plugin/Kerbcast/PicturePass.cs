@@ -132,10 +132,15 @@ namespace Kerbcast
             /* The atmosphere shell's renderer and the centre stock gave its shader, or null for a body with none. */
             public Renderer Afg;
             public Vector4 AfgOffset;
+            /* The renderer whose sun direction was rewritten for its spun-back axes, and the value stock left in its block, or null for none. */
+            public Renderer Lit;
+            public int LitProperty;
+            public Vector4 LitValue;
         }
 
         private static readonly int AfgOffsetId = Shader.PropertyToID("_OffsetTransform");
         private readonly MaterialPropertyBlock _afgBlock = new MaterialPropertyBlock();
+        private readonly MaterialPropertyBlock _lightBlock = new MaterialPropertyBlock();
 
         /* `craft` is the craft the lens rides, `eye` where it looks from and
            `view` the camera whose frustum the stand-ins are drawn for, drawing
@@ -238,6 +243,8 @@ namespace Kerbcast
                     var spun = DQuat.FromRotationVector(ToD(b.angularVelocity) * dt);
                     var q = new Quaternion((float)spun.X, (float)spun.Y, (float)spun.Z, (float)spun.W);
                     t.rotation = q * (parent != null ? parent.rotation : Quaternion.identity) * b.bodyTransform.rotation;
+                    LightTurnedBody(b, t, ref moved);
+                    _moved[_moved.Count - 1] = moved;
                 }
                 if (!placed) continue;
                 /* AtmosphereFromGround gave its shader the shell's centre in LateUpdate, before the move. */
@@ -254,6 +261,30 @@ namespace Kerbcast
             }
         }
 
+        /*
+         * MaterialSetDirection stored the Sun's direction in the mesh's own
+         * axes in Update, from the rotation the mesh had then, so a mesh
+         * turned back carries the light round with it and shows the terminator
+         * shifted by the spin. Written again for the turned axes, in the
+         * property block the setter uses, and put back in AfterScaledLayer.
+         */
+        private void LightTurnedBody(CelestialBody b, Transform t, ref MovedBody moved)
+        {
+            var setter = b.scaledBody.GetComponent<MaterialSetDirection>();
+            var r = setter != null && setter.target != null ? setter.GetComponent<Renderer>() : null;
+            if (r == null || string.IsNullOrEmpty(setter.valueName)) return;
+            int id = Shader.PropertyToID(setter.valueName);
+            r.GetPropertyBlock(_lightBlock);
+            moved.Lit = r;
+            moved.LitProperty = id;
+            moved.LitValue = _lightBlock.GetVector(id);
+            var rot = t.rotation;
+            var f = setter.target.forward;
+            var local = PictureBoundary.LightInBodyAxes(new DQuat(rot.x, rot.y, rot.z, rot.w), new DVec3(f.x, f.y, f.z));
+            _lightBlock.SetVector(id, new Vector4((float)local.X, (float)local.Y, (float)local.Z, 0f));
+            r.SetPropertyBlock(_lightBlock);
+        }
+
         public void AfterScaledLayer()
         {
             if (--_scaledDepth > 0) return;
@@ -266,6 +297,12 @@ namespace Kerbcast
                     m.Afg.GetPropertyBlock(_afgBlock);
                     _afgBlock.SetVector(AfgOffsetId, m.AfgOffset);
                     m.Afg.SetPropertyBlock(_afgBlock);
+                }
+                if (m.Lit != null)
+                {
+                    m.Lit.GetPropertyBlock(_lightBlock);
+                    _lightBlock.SetVector(m.LitProperty, m.LitValue);
+                    m.Lit.SetPropertyBlock(_lightBlock);
                 }
                 if (m.Transform == null) continue;
                 m.Transform.localPosition = m.Position;
