@@ -17,10 +17,15 @@ namespace Kerbcast
         /* Set again only by a tracking network's cut; everything that reads the site reads it fresh. */
         public CommandCameraSite Site { get; set; }
 
+        /* The lens's narrowest field now, in degrees: it follows the Tracking Station level and the optics setting. */
+        public System.Func<double> FovMinSource { get; }
+
         /* `name` replaces the feed name the site would give it, and `group` the site's name clients group it under. */
-        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, string name = null, string group = null)
+        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, System.Func<double> fovMin,
+            string name = null, string group = null)
         {
             Site = site;
+            FovMinSource = fovMin;
             _name = name;
             _group = group;
             _defaultFov = defaultFov;

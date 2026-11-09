@@ -365,10 +365,14 @@ The zoom follows the subject on a `vessel`, `orbit` or `positionAt` aim. A
 `surface` aim frames `framingMarginM` about its point, or opens to the widest
 view without one, and a `direction` aim opens to the widest view, so no craft
 sizes either. Any aim takes `fovDeg`, a vertical field of view in degrees to
-hold instead, and `camera.setFov(deg)` sets one on a command camera whatever
-its `supportsZoom`. Either holds until the next aim, clamped in game to the
-lens (the Tracking Station level's narrowest, the camera's widest), and is
-refused with `ErrorCode.CommandLocked` while a command lock is held.
+hold instead, and a command camera reports `supportsZoom`, so
+`camera.setFov(deg)` and `camera.setZoomRate(rate)` zoom it too. Either holds
+until the next aim, clamped in game to the lens: `fovMin` is its narrowest
+now (it moves with the Tracking Station level and the optics setting) and
+`fovMax` its widest. Both are refused with `ErrorCode.CommandLocked` while a
+command lock is held. The range spans more than a thousandfold, so
+`fovSliderScale` and `PanZoomController` zoom it by factors rather than
+degrees.
 
 ```ts
 // Look south, 5 degrees above the horizon, through a 30 degree lens.

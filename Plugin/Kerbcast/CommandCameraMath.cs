@@ -689,6 +689,14 @@ namespace Kerbcast
             return FovForTan(FramingTan(radius, distance), fraction, fovMin, fovMax);
         }
 
+        /* `fov` after `dt` seconds of a hold-to-zoom at `rate` (-1..1, + narrows), changing by `factorPerSecond` each second at full rate, within the lens's limits. */
+        public static double ZoomedFov(double fov, double rate, double factorPerSecond, double dt, double fovMin, double fovMax)
+        {
+            if (!(dt > 0) || !(fov > 0)) return Math.Max(fovMin, Math.Min(fovMax, fov));
+            double next = fov * Math.Exp(-rate * Math.Log(factorPerSecond) * dt);
+            return Math.Max(fovMin, Math.Min(fovMax, next));
+        }
+
         /* A field set by a client, clamped to the lens's limits; NaN (none set) stays NaN. */
         public static double HeldFov(double fov, double fovMin, double fovMax) =>
             double.IsNaN(fov) ? double.NaN : Math.Max(fovMin, Math.Min(fovMax, fov));

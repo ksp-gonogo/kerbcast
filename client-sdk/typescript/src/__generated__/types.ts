@@ -1865,10 +1865,11 @@ export type ClientMessage =
 	 * parts whose Hullcam module is the fixed base (`supportsZoom ==
 	 * false`); clients are expected to clamp to `fovMin / fovMax`
 	 * from the camera's `CameraState` before sending. A command camera
-	 * takes it whatever its `supportsZoom`, as `fovDeg` on its aim would:
-	 * held until the next aim, clamped in game to its lens's limits, and
+	 * (`supportsZoom` true, `fovMin` its lens's narrowest now, which moves
+	 * with the Tracking Station level and the optics setting) holds it as
+	 * `fovDeg` on its aim would: until the next aim, clamped in game, and
 	 * refused with `ErrorCode::CommandLocked` while a command authority
-	 * holds the lock.
+	 * holds the lock, as is its `SetZoomRate`.
 	 */
 	| { type: "set-fov", content: SetFovPayload }
 	/**

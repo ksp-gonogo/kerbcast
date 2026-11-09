@@ -4,6 +4,7 @@ import {
   CommandAimKind,
   CommandTargetEligibility,
   PanZoomController,
+  fovSliderScale,
   QualityPreset,
   TrackMode,
   effectiveCommandTrack,
@@ -819,6 +820,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // -------------------------------------------------------------------------
     const controllerRef = useRef<PanZoomController | null>(null);
     const [sliderFov, setSliderFov] = useState(60);
+    /* A tracking camera's lens spans 0.02 to 30 degrees: slid by factors, so both ends are reachable. */
+    const sliderScale = useMemo(
+      () => fovSliderScale(camera?.fovMin ?? 0, camera?.fovMax ?? 0),
+      [camera?.fovMin, camera?.fovMax],
+    );
 
     useEffect(() => {
       if (flightId === null) {
@@ -1720,13 +1726,13 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   <FovSlider
                     type="range"
                     aria-label="Zoom"
-                    min={camera.fovMin}
-                    max={camera.fovMax}
-                    step={0.5}
-                    value={sliderFov}
+                    min={sliderScale.min}
+                    max={sliderScale.max}
+                    step={sliderScale.step}
+                    value={sliderScale.fromFov(sliderFov)}
                     disabled={manualDisabled}
                     onChange={(e) => {
-                      const v = Number(e.target.value);
+                      const v = sliderScale.toFov(Number(e.target.value));
                       controllerRef.current?.fovSliderInput(v);
                     }}
                     onPointerDown={() => {

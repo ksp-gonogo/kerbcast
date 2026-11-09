@@ -1618,6 +1618,12 @@ namespace Kerbcast
                     sb.Append($"      \"operatorLayers\": {LayersToJson(kc.OperatorLayers)},\n");
                     sb.Append($"      \"enableAtmosphericFx\": {(kc.EnableFx ? "true" : "false")},\n");
                     sb.Append($"      \"fov\": {kc.Fov.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    /* A command camera's narrowest field moves with the Tracking Station level and the optics setting, after the manifest is written. */
+                    if (kc.Rig != null)
+                    {
+                        sb.Append($"      \"fovMin\": {kc.FovMin.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                        sb.Append($"      \"fovMax\": {kc.FovMax.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    }
                     sb.Append($"      \"panYaw\": {kc.PanYaw.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     sb.Append($"      \"panPitch\": {kc.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     // Auto-track echo UP: the plugin's CURRENT applied mode + a

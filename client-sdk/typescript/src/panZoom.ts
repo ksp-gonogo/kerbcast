@@ -116,6 +116,57 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
+/**
+ * A zoom range wider than this ratio (a tracking camera's lens, 0.02 to 30
+ * degrees) is stepped and slid by factors rather than degrees, so the
+ * narrow end is as easy to reach as the wide one. Part cameras sit well
+ * under it and keep steps in degrees.
+ */
+export const LOG_ZOOM_RATIO = 20;
+
+/** The factor one zoom nudge changes the field by on a wide range. */
+export const LOG_ZOOM_NUDGE_FACTOR = 1.5;
+
+/** Whether `fovMin`..`fovMax` is wide enough to zoom by factors. */
+export function isLogZoom(fovMin: number, fovMax: number): boolean {
+  return fovMin > 0 && fovMax / fovMin > LOG_ZOOM_RATIO;
+}
+
+/**
+ * How a zoom slider maps its position to a field of view: linear in degrees
+ * for a part camera's range, logarithmic for a wide one. `min`, `max` and
+ * `step` are the slider's own; `toFov` and `fromFov` convert.
+ */
+export interface FovSliderScale {
+  min: number;
+  max: number;
+  step: number;
+  toFov(position: number): number;
+  fromFov(fov: number): number;
+}
+
+const LOG_SLIDER_STEPS = 1000;
+
+export function fovSliderScale(fovMin: number, fovMax: number): FovSliderScale {
+  if (!isLogZoom(fovMin, fovMax)) {
+    return {
+      min: fovMin,
+      max: fovMax,
+      step: 0.5,
+      toFov: (p) => clamp(p, fovMin, fovMax),
+      fromFov: (f) => clamp(f, fovMin, fovMax),
+    };
+  }
+  const span = Math.log(fovMax / fovMin);
+  return {
+    min: 0,
+    max: LOG_SLIDER_STEPS,
+    step: 1,
+    toFov: (p) => clamp(fovMin * Math.exp((clamp(p, 0, LOG_SLIDER_STEPS) / LOG_SLIDER_STEPS) * span), fovMin, fovMax),
+    fromFov: (f) => (Math.log(clamp(f, fovMin, fovMax) / fovMin) / span) * LOG_SLIDER_STEPS,
+  };
+}
+
 function applyDeadzone(v: number, deadzone: number): number {
   return Math.abs(v) < deadzone ? 0 : v;
 }
@@ -350,16 +401,17 @@ export class PanZoomController {
 
   /**
    * Discrete FoV step. `deltaSign: -1` = zoom in (FoV decreases by
-   * `fovNudgeDeg`), `+1` = zoom out (FoV increases). Clamped to fov bounds.
+   * `fovNudgeDeg`), `+1` = zoom out (FoV increases). On a range wider than
+   * {@link LOG_ZOOM_RATIO} the step is a factor of
+   * {@link LOG_ZOOM_NUDGE_FACTOR} instead. Clamped to fov bounds.
    * Mirrors nudgeZoom (which calls onFovChange internally).
    */
   nudgeZoom(deltaSign: number): void {
     const b = this.bounds;
-    const next = clamp(
-      this.localFov + deltaSign * this.fovNudgeDeg,
-      b.fovMin,
-      b.fovMax,
-    );
+    const stepped = isLogZoom(b.fovMin, b.fovMax)
+      ? this.localFov * Math.pow(LOG_ZOOM_NUDGE_FACTOR, Math.sign(deltaSign))
+      : this.localFov + deltaSign * this.fovNudgeDeg;
+    const next = clamp(stepped, b.fovMin, b.fovMax);
     this.localFov = next;
     this.fovSetpoint = { fov: next, ...newSettling() };
     void this.sink.setFov(next);

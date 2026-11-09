@@ -2307,6 +2307,18 @@ async fn apply_zoom_rate_change(
         );
         return;
     }
+    if let Some(message) = registry.command_zoom_refusal(&cam, rate).await {
+        send_server_message(
+            dc,
+            &ServerMessage::Error(ErrorPayload {
+                message,
+                code: Some(ErrorCode::CommandLocked),
+                source: ErrorSource::Sidecar,
+                ..Default::default()
+            }),
+        );
+        return;
+    }
     let clamped = rate.clamp(-1.0, 1.0);
 
     {

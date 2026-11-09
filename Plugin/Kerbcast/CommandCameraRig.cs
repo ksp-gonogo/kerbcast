@@ -383,6 +383,24 @@ namespace Kerbcast
             return tint;
         }
 
+        public float FovFloor => (float)FovMinNow();
+
+        /* A held zoom narrows or widens by this factor each second at full rate, the same pace at every field. */
+        private const double ZoomFactorPerSecond = 4.0;
+        private float _zoomRate;
+
+        public void ViewerZoomRate(float rate)
+        {
+            if (rate != 0f && _authority != null && _authority.Registered)
+            {
+                if (_zoomRate == 0f) return;
+                rate = 0f;
+            }
+            if (rate == _zoomRate) return;
+            if (rate != 0f && _zoomRate == 0f) Debug.Log($"{Tag} cam={_flightId} viewer zoom {(rate > 0 ? "in" : "out")} at rate {rate:F2}");
+            _zoomRate = rate;
+        }
+
         /* Through the facade, so a viewer is refused while a command authority holds the lock. */
         public void ViewerFov(float fov)
         {
@@ -1761,8 +1779,17 @@ namespace Kerbcast
                 _snapNext = false;
                 step = double.MaxValue;
             }
+            if (_zoomRate != 0f && _authority != null && _authority.Registered) _zoomRate = 0f;
+            if (_zoomRate != 0f)
+                _heldFov = CommandCameraMath.ZoomedFov(double.IsNaN(_heldFov) ? _fov : _heldFov, _zoomRate, ZoomFactorPerSecond,
+                    Math.Min(dt, 0.25), FovMinNow(), _fovMax);
             double held = CommandCameraMath.HeldFov(_heldFov, FovMinNow(), _fovMax);
-            if (!double.IsNaN(held))
+            if (_zoomRate != 0f && !double.IsNaN(held))
+            {
+                _framing.Reset();
+                _fov = held;
+            }
+            else if (!double.IsNaN(held))
             {
                 _framing.Reset();
                 _fov = CommandCameraMath.SmoothFov(_fov, held, step, FovTau, FovSnapAfter);

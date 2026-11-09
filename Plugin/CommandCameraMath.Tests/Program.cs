@@ -895,6 +895,10 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(CommandCameraMath.HeldFov(30, 1, 30) == 30, "held fov: within the lens it is kept");
     Check(CommandCameraMath.HeldFov(0.001, 0.02, 30) == 0.02 && CommandCameraMath.HeldFov(90, 0.02, 30) == 30,
         "held fov: clamped to the lens's narrowest and widest");
+    Check(Near(CommandCameraMath.ZoomedFov(8, 1, 4, 1, 0.02, 30), 2, 1e-9), "zoom rate: a second at full rate in narrows by the factor");
+    Check(Near(CommandCameraMath.ZoomedFov(0.08, -1, 4, 0.5, 0.02, 30), 0.16, 1e-9), "zoom rate: out widens at the same pace at any field");
+    Check(CommandCameraMath.ZoomedFov(0.03, 1, 4, 1, 0.02, 30) == 0.02 && CommandCameraMath.ZoomedFov(20, -1, 4, 1, 0.02, 30) == 30,
+        "zoom rate: held at the lens's limits");
     Check(CommandCameraMath.PointFov(true, 500, 1e4, 0.5, 0.02, 30) == 30, "point fov: a direction opens to the widest view");
     Check(CommandCameraMath.PointFov(false, 0, 1e4, 0.5, 0.02, 30) == 30, "point fov: a surface point without a margin does too");
     double f = CommandCameraMath.PointFov(false, 100, 1e4, 0.5, 0.02, 30);

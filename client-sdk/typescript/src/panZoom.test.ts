@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PanZoomController } from "./panZoom";
+import { PanZoomController, fovSliderScale, isLogZoom } from "./panZoom";
 import type { PanZoomCommandSink } from "./panZoom";
 
 // ---------------------------------------------------------------------------
@@ -157,6 +157,40 @@ describe("PanZoomController: nudgeZoom", () => {
     ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 118 });
     ctrl.nudgeZoom(1); // would go to 123, clamped to 120
     expect(setFov).toHaveBeenLastCalledWith(120);
+  });
+});
+
+describe("PanZoomController: wide zoom ranges", () => {
+  const WIDE = { ...DEFAULT_BOUNDS, fov: 30, fovMin: 0.02, fovMax: 30 };
+
+  it("nudges a tracking camera's lens by a factor, not degrees", () => {
+    const { sink, setFov } = makeSink();
+    const ctrl = new PanZoomController(sink, { fovNudgeDeg: 5 });
+    ctrl.syncFromState({ ...WIDE, fov: 0.3 });
+    ctrl.nudgeZoom(-1);
+    expect(setFov.mock.calls.at(-1)?.[0]).toBeCloseTo(0.2, 10);
+    ctrl.nudgeZoom(1);
+    expect(setFov.mock.calls.at(-1)?.[0]).toBeCloseTo(0.3, 10);
+  });
+
+  it("keeps degree steps on a part camera's range", () => {
+    expect(isLogZoom(10, 120)).toBe(false);
+    expect(isLogZoom(0.02, 30)).toBe(true);
+  });
+
+  it("slides a wide range on a log scale end to end", () => {
+    const s = fovSliderScale(0.02, 30);
+    expect(s.toFov(s.min)).toBeCloseTo(0.02, 10);
+    expect(s.toFov(s.max)).toBeCloseTo(30, 10);
+    expect(s.toFov((s.min + s.max) / 2)).toBeCloseTo(Math.sqrt(0.02 * 30), 6);
+    expect(s.toFov(s.fromFov(1.5))).toBeCloseTo(1.5, 6);
+  });
+
+  it("slides a part camera's range in degrees, as before", () => {
+    const s = fovSliderScale(10, 90);
+    expect([s.min, s.max, s.step]).toEqual([10, 90, 0.5]);
+    expect(s.toFov(42)).toBe(42);
+    expect(s.fromFov(42)).toBe(42);
   });
 });
 

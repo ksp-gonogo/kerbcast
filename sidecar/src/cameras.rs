@@ -209,6 +209,13 @@ struct PerCameraStatus {
     operator_layers: Vec<Layer>,
     #[serde(default)]
     fov: f32,
+    /// A command camera's zoom limits now: its narrowest field follows the
+    /// Tracking Station level and the optics setting, which change after
+    /// the manifest is written. Absent for other cameras.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fov_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fov_max: Option<f32>,
     #[serde(default)]
     pan_yaw: f32,
     #[serde(default)]
@@ -1908,6 +1915,15 @@ pub struct PerCameraStatusExport {
     pub pan_pitch: f32,
 }
 
+/* The zoom limits the plugin reported live, each where usable, else the manifest's. */
+fn live_fov_limits(min: Option<f32>, max: Option<f32>, cam: &CameraState) -> (f32, f32) {
+    let usable = |f: Option<f32>| f.filter(|f| f.is_finite() && *f > 0.0);
+    (
+        usable(min).unwrap_or(cam.fov_min),
+        usable(max).unwrap_or(cam.fov_max),
+    )
+}
+
 /* The plugin's live FoV when it reported a usable one, else the manifest default. */
 fn effective_fov(live: Option<f32>, default: f32) -> f32 {
     live.filter(|f| f.is_finite() && *f > 0.0)
@@ -2507,7 +2523,12 @@ impl CameraRegistry {
     pub async fn list(&self) -> Vec<CameraInfo> {
         let cams = self.snapshot().await;
         let primary_fps = self.primary_capture_fps().await;
-        let (centres, live_fovs): (HashMap<u32, CommandTargetsStatus>, HashMap<u32, f32>) = self
+        #[allow(clippy::type_complexity)]
+        let (centres, live_fovs, live_limits): (
+            HashMap<u32, CommandTargetsStatus>,
+            HashMap<u32, f32>,
+            HashMap<u32, (Option<f32>, Option<f32>)>,
+        ) = self
             .last_status
             .lock()
             .await
@@ -2519,13 +2540,20 @@ impl CameraRegistry {
                     .filter_map(|c| c.command_targets.clone().map(|cc| (c.flight_id, cc)))
                     .collect();
                 let fovs = st.cameras.iter().map(|c| (c.flight_id, c.fov)).collect();
-                (centres, fovs)
+                let limits = st
+                    .cameras
+                    .iter()
+                    .map(|c| (c.flight_id, (c.fov_min, c.fov_max)))
+                    .collect();
+                (centres, fovs, limits)
             })
             .unwrap_or_default();
         let mut out = Vec::with_capacity(cams.len());
         for s in &cams {
             let ctrl = s.control.lock().await.clone();
             let stats = s.stats(&ctrl, primary_fps).await;
+            let (lmin, lmax) = live_limits.get(&s.flight_id).copied().unwrap_or_default();
+            let (fov_min, fov_max) = live_fov_limits(lmin, lmax, s);
             out.push(CameraInfo {
                 flight_id: s.flight_id,
                 lifecycle: if s.destroyed.load(Ordering::Acquire) {
@@ -2546,8 +2574,8 @@ impl CameraRegistry {
                 vessel_name: s.vessel_name.clone(),
                 supports_zoom: s.supports_zoom,
                 fov: effective_fov(live_fovs.get(&s.flight_id).copied(), s.fov_default),
-                fov_min: s.fov_min,
-                fov_max: s.fov_max,
+                fov_min,
+                fov_max,
                 supports_pan: s.supports_pan,
                 pan_yaw_min: s.pan_yaw_min,
                 pan_yaw_max: s.pan_yaw_max,
@@ -2714,6 +2742,8 @@ impl CameraRegistry {
                         || p.layers != cam_status.layers
                         || p.operator_layers != cam_status.operator_layers
                         || (p.fov - cam_status.fov).abs() > 0.01
+                        || p.fov_min != cam_status.fov_min
+                        || p.fov_max != cam_status.fov_max
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
                         || command_track_changed(&p.command_track, &cam_status.command_track)
@@ -2776,8 +2806,8 @@ impl CameraRegistry {
                 max_height: Some(cam.max_height),
                 supports_zoom: cam.supports_zoom,
                 fov: cam_status.fov,
-                fov_min: cam.fov_min,
-                fov_max: cam.fov_max,
+                fov_min: live_fov_limits(cam_status.fov_min, cam_status.fov_max, cam).0,
+                fov_max: live_fov_limits(cam_status.fov_min, cam_status.fov_max, cam).1,
                 supports_pan: cam.supports_pan,
                 pan_yaw: cam_status.pan_yaw,
                 pan_pitch: cam_status.pan_pitch,
@@ -3153,6 +3183,18 @@ impl CameraRegistry {
             );
         }
         CommandFov::Apply(fov)
+    }
+
+    /// Why a hold-to-zoom at `rate` on `cam` is refused: a command camera
+    /// zooms only while no command authority holds the lock. A stop (0)
+    /// always goes through.
+    pub async fn command_zoom_refusal(&self, cam: &CameraState, rate: f32) -> Option<String> {
+        if cam.kind != CameraKind::Command || rate == 0.0 {
+            return None;
+        }
+        self.command_lock_owner(cam.flight_id)
+            .await
+            .map(|owner| format!("{owner} holds the command camera lock; zoom refused"))
     }
 
     /// The command authority the plugin last reported for this camera, if any.
@@ -3898,6 +3940,11 @@ impl CameraRegistry {
             .map(|p| p.fov)
             .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or_else(|| ctrl.fov.unwrap_or(cam.fov_default));
+        let (fov_min, fov_max) = live_fov_limits(
+            per.as_ref().and_then(|p| p.fov_min),
+            per.as_ref().and_then(|p| p.fov_max),
+            &cam,
+        );
         let pan_yaw = per
             .as_ref()
             .map(|p| p.pan_yaw)
@@ -3945,8 +3992,8 @@ impl CameraRegistry {
             max_height: Some(cam.max_height),
             supports_zoom: cam.supports_zoom,
             fov,
-            fov_min: cam.fov_min,
-            fov_max: cam.fov_max,
+            fov_min,
+            fov_max,
             supports_pan: cam.supports_pan,
             pan_yaw,
             pan_pitch,
@@ -5819,6 +5866,18 @@ mod tests {
         )
         .unwrap();
         registry.poll_status().await;
+        assert!(registry
+            .command_zoom_refusal(&part_cam, 1.0)
+            .await
+            .is_none());
+        assert!(
+            registry.command_zoom_refusal(&cam, 0.0).await.is_none(),
+            "a stop always goes through"
+        );
+        assert!(registry
+            .command_zoom_refusal(&cam, -1.0)
+            .await
+            .is_some_and(|m| m.contains("mission-control")));
         match registry.command_fov(&cam, 30.0).await {
             CommandFov::Refused(message, code) => {
                 assert_eq!(code, Some(ErrorCode::CommandLocked));
@@ -7538,6 +7597,38 @@ mod tests {
         registry.poll_status().await;
         assert_eq!(info_for(&registry, 1).await.fov, 23.5);
         assert_ne!(default, 23.5);
+    }
+
+    /// A command camera's zoom limits move after its manifest is written, so
+    /// the status's live limits win over the manifest's in the list and the
+    /// state; a camera whose status has none keeps the manifest's.
+    #[tokio::test]
+    async fn live_status_fov_limits_win_over_the_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let manifest = info_for(&registry, 1).await;
+        std::fs::write(
+            dir.path().join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":30,"fovMin":0.02,"fovMax":30}]}"#,
+        )
+        .unwrap();
+        registry.poll_status().await;
+        let info = info_for(&registry, 1).await;
+        assert_eq!((info.fov_min, info.fov_max), (0.02, 30.0));
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!((state.fov_min, state.fov_max), (0.02, 30.0));
+
+        std::fs::write(
+            dir.path().join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":30}]}"#,
+        )
+        .unwrap();
+        registry.poll_status().await;
+        let info = info_for(&registry, 1).await;
+        assert_eq!(
+            (info.fov_min, info.fov_max),
+            (manifest.fov_min, manifest.fov_max)
+        );
     }
 
     async fn info_for(registry: &CameraRegistry, flight_id: u32) -> CameraInfo {

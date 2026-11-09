@@ -1405,6 +1405,37 @@ describe("CameraFeed - zoom controls", () => {
     expect(screen.getByRole("button", { name: /zoom out/i })).toBeTruthy();
   });
 
+  it("a command camera's wide lens zooms by factors and slides on a log scale", async () => {
+    const { client, sidecar } = await buildConnectedSource();
+
+    await act(async () => {
+      sidecar.updateCamera(42, {
+        kind: CameraKind.Command,
+        supportsZoom: true,
+        fov: 30,
+        fovMin: 0.02,
+        fovMax: 30,
+      });
+    });
+
+    renderFeed(client, { flightId: 42 });
+
+    const slider = screen.getByRole("slider", { name: "Zoom" }) as HTMLInputElement;
+    expect(Number(slider.value)).toBeCloseTo(1000, 6);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /zoom in/i }));
+    });
+    expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(20, 6);
+
+    await act(async () => {
+      fireEvent.pointerDown(slider);
+      fireEvent.change(slider, { target: { value: "500" } });
+      fireEvent.pointerUp(slider);
+    });
+    expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(Math.sqrt(0.02 * 30), 6);
+  });
+
   it("zoom controls absent when camera does not support zoom", async () => {
     const { client } = await buildConnectedSource();
 

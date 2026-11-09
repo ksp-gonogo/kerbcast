@@ -72,6 +72,11 @@ export {
 
 export {
   PanZoomController,
+  fovSliderScale,
+  isLogZoom,
+  LOG_ZOOM_RATIO,
+  LOG_ZOOM_NUDGE_FACTOR,
+  type FovSliderScale,
   type PanZoomCommandSink,
   type PanZoomBounds,
   type PanZoomControllerOptions,
