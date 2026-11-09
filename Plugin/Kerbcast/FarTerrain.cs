@@ -22,4 +22,40 @@ namespace Kerbcast
                 if (ReferenceEquals(rootOf(storage[i]), sphere)) into.Add(storage[i]);
         }
     }
+
+    /*
+     * Each key's items walked once and shared until the frame or `version`
+     * changes, so every camera in a frame reads the one walk. What a camera
+     * does with the items stays its own to undo.
+     */
+    internal sealed class SharedWalk<TKey, TItem> where TKey : class
+    {
+        private readonly Dictionary<TKey, List<TItem>> _lists = new Dictionary<TKey, List<TItem>>();
+        private readonly HashSet<TKey> _walked = new HashSet<TKey>();
+        private int _frame = int.MinValue;
+        private int _version;
+
+        /* How many walks have run, for tests. */
+        public int Walks { get; private set; }
+
+        /* `key`'s items for this frame, filled by `walk` the first time they are asked for since the frame or `version` changed. */
+        public List<TItem> For(TKey key, int frame, int version, Action<TKey, List<TItem>> walk)
+        {
+            if (frame != _frame || version != _version)
+            {
+                _frame = frame;
+                _version = version;
+                _walked.Clear();
+                foreach (var stale in _lists.Values) stale.Clear();
+            }
+            if (!_lists.TryGetValue(key, out var list)) _lists[key] = list = new List<TItem>();
+            if (_walked.Add(key))
+            {
+                list.Clear();
+                walk(key, list);
+                Walks++;
+            }
+            return list;
+        }
+    }
 }

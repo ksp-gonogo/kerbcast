@@ -212,6 +212,26 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(Math.Abs(stored.Magnitude - 1) < 1e-12 && Math.Abs(fresh.Magnitude - 1) < 1e-12, "light: stays a unit direction");
 }
 
+/* ---- far terrain: one walk a frame, shared by every camera ---- */
+{
+    var walk = new SharedWalk<string, int>();
+    int next = 0;
+    Action<string, List<int>> fill = (k, l) => l.Add(++next);
+    var first = walk.For("kerbin", 10, 500, fill);
+    var again = walk.For("kerbin", 10, 500, fill);
+    Check(walk.Walks == 1 && ReferenceEquals(first, again) && again[0] == 1, "walk: a second camera in the frame shares the first camera's walk");
+    walk.For("mun", 10, 500, fill);
+    Check(walk.Walks == 2, "walk: each sphere is walked for itself");
+    Check(walk.For("kerbin", 10, 500, fill)[0] == 1 && walk.Walks == 2, "walk: walking another sphere leaves the first one's list alone");
+    Check(walk.For("kerbin", 11, 500, fill)[0] == 3 && walk.Walks == 3, "walk: a new frame walks again");
+    Check(walk.For("kerbin", 11, 501, fill)[0] == 4 && walk.Walks == 4, "walk: quads changing inside the frame walks again");
+    Check(walk.For("mun", 11, 501, fill)[0] == 5 && walk.Walks == 5, "walk: a change anywhere walks every sphere again, the count being shared");
+    var list = walk.For("kerbin", 12, 501, fill);
+    Check(list.Count == 1, "walk: a new walk replaces the old items rather than adding to them");
+    walk.For("duna", 13, 501, (k, l) => { });
+    Check(walk.For("kerbin", 14, 501, (k, l) => { }).Count == 0, "walk: nothing is kept from an earlier frame");
+}
+
 /* ---- far terrain: which bodies have their terrain left out ---- */
 {
     Check(!FarTerrain.DrawnAway(false, false, false), "far terrain: a body drawn where it stands keeps its terrain");

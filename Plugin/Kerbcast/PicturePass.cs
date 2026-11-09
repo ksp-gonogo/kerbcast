@@ -119,9 +119,10 @@ namespace Kerbcast
         /* The scaled transforms this camera moved, as stock had them, to put back after its scaled render. */
         private readonly List<MovedBody> _moved = new List<MovedBody>();
         private int _scaledDepth;
-        /* Terrain renderers this camera switched off for its local layers, and the scratch list they are gathered in. */
+        /* Terrain renderers this camera switched off for its local layers. */
         private readonly List<Renderer> _terrainOff = new List<Renderer>();
-        private readonly List<Renderer> _terrainScratch = new List<Renderer>();
+        private static readonly SharedWalk<PQS, Renderer> s_terrain = new SharedWalk<PQS, Renderer>();
+        private static readonly Action<PQS, List<Renderer>> s_walkTerrain = WalkTerrain;
         private static readonly List<PQ> s_storedQuads = new List<PQ>();
         private static readonly List<PQ> s_ownQuads = new List<PQ>();
         private static readonly List<Renderer> s_quadRenderers = new List<Renderer>();
@@ -461,17 +462,27 @@ namespace Kerbcast
 
         private void SwitchOff(PQS sphere)
         {
-            _terrainScratch.Clear();
-            sphere.GetComponentsInChildren(false, _terrainScratch);
-            AddStoredQuads(sphere, _terrainScratch);
-            for (int i = 0; i < _terrainScratch.Count; i++)
+            var renderers = s_terrain.For(sphere, Time.frameCount, QuadsInUse(), s_walkTerrain);
+            for (int i = 0; i < renderers.Count; i++)
             {
-                var r = _terrainScratch[i];
+                var r = renderers[i];
                 if (r == null || r.forceRenderingOff) continue;
                 r.forceRenderingOff = true;
                 _terrainOff.Add(r);
             }
-            _terrainScratch.Clear();
+        }
+
+        /* Stock's count of quads handed out to spheres, which moves when a sphere builds or drops one. */
+        private static int QuadsInUse()
+        {
+            var cache = PQSCache.Instance;
+            return cache != null ? cache.cachePQAssignedCount : 0;
+        }
+
+        private static void WalkTerrain(PQS sphere, List<Renderer> into)
+        {
+            sphere.GetComponentsInChildren(false, into);
+            AddStoredQuads(sphere, into);
         }
 
         /* Adds the renderers of `sphere`'s quads in the storage all spheres share, where stock keeps the most detailed ones. */
