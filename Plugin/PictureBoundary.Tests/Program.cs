@@ -313,6 +313,21 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(BodyLight.DiscInFrame(eye, new DVec3(0, -6.1e5, 0), 6e5, new DVec3(0, 1, 0), narrow) == 0, "frame: a telescope looking straight up does not count the ground under it");
     Check(BodyLight.DiscInFrame(eye, new DVec3(0, -6.0001e5, 0), 6e5, new DVec3(1, 0, 0), BodyLight.HalfDiagonalRadians(40, 16.0 / 9)) > 0, "frame: a horizon in frame counts its own planet");
     Check(BodyLight.DiscInFrame(eye, new DVec3(0, -5e5, 0), 6e5, new DVec3(0, 1, 0), narrow) == Math.PI / 2, "frame: a lens inside the sphere always counts it");
+    {
+        /* A probe 5,000 km over Kerbin aims a 0.2 degree frame at Eve, its view grazing the limb: Kerbin's sea level has left the frame, its air and clouds have not. */
+        var probe = new DVec3(0, 5.6e6, 0);
+        double down = -83.62 * Math.PI / 180;
+        var past = new DVec3(Math.Cos(down), Math.Sin(down), 0);
+        double slit = BodyLight.ConeFor(BodyLight.HalfDiagonalRadians(0.2, 800.0 / 448), true);
+        double kerbinReach = BodyLight.ReachRadius(6e5, 6.0676e5, true, 7e4);
+        Check(BodyLight.DiscInFrame(probe, default, 6e5, past, slit) == 0, "reach: a grazing limb's sea level is out of the frame");
+        Check(BodyLight.DiscInFrame(probe, default, 6e5, kerbinReach, past, slit) == BodyLight.DiscRadians(5.6e6, 6e5), "reach: its air keeps it in, with its sea-level disc");
+        double clear = -82.5 * Math.PI / 180;
+        Check(BodyLight.DiscInFrame(probe, default, 6e5, kerbinReach, new DVec3(Math.Cos(clear), Math.Sin(clear), 0), slit) == 0, "reach: a view clear of the air's top leaves it out");
+        Check(BodyLight.ReachRadius(2e5, 2.07e5, false, 0) == 2.07e5, "reach: an airless body reaches its highest ground");
+        Check(BodyLight.ReachRadius(6e5, 6.0676e5, true, 7e4) == 6.7e5, "reach: a body with air reaches its top");
+        Check(BodyLight.ReachRadius(6e5, 0, false, 0) == 6e5, "reach: a body with no terrain reaches sea level");
+    }
 
     Check(BodyLight.Pick(new double[] { 0, 0, 0 }, 3, 1) == -1, "pick: nothing in frame gives none");
     Check(BodyLight.Pick(new double[] { 0.1, 0.3, 0.2 }, 3, -1) == 1, "pick: with none held the largest disc wins");

@@ -46,14 +46,35 @@ namespace Kerbcast
         }
 
         /* The disc of a sphere at `centre` as `eye` sees it, or 0 when no part of it can reach a frame looking along `forward`. */
-        public static double DiscInFrame(DVec3 eye, DVec3 centre, double radiusM, DVec3 forward, double halfDiagonal)
+        public static double DiscInFrame(DVec3 eye, DVec3 centre, double radiusM, DVec3 forward, double halfDiagonal) =>
+            DiscInFrame(eye, centre, radiusM, radiusM, forward, halfDiagonal);
+
+        /*
+         * The disc of a sphere of `radiusM` at `centre` as `eye` sees it, or 0
+         * when nothing drawn of it out to `reachM` (ReachRadius) can reach a
+         * frame looking along `forward`. A planet's limb seen edge on shows
+         * its mountains, clouds and air well above sea level, so a body
+         * whose sea-level disc has just left the frame can still fill its
+         * bottom edge.
+         */
+        public static double DiscInFrame(DVec3 eye, DVec3 centre, double radiusM, double reachM, DVec3 forward, double halfDiagonal)
         {
             var toBody = centre - eye;
             double disc = DiscRadians(toBody.Magnitude, radiusM);
             if (toBody.Magnitude <= radiusM) return disc;
-            double cos = Math.Max(-1, Math.Min(1, DVec3.Dot(toBody.Normalized, forward.Normalized)));
-            return Math.Acos(cos) <= halfDiagonal + disc ? disc : 0;
+            return AngleFrom(eye, centre, forward) <= halfDiagonal + DiscRadians(toBody.Magnitude, Math.Max(radiusM, reachM)) ? disc : 0;
         }
+
+        /* The angle between `forward` and the direction from `eye` to `centre`. */
+        public static double AngleFrom(DVec3 eye, DVec3 centre, DVec3 forward)
+        {
+            double cos = Math.Max(-1, Math.Min(1, DVec3.Dot((centre - eye).Normalized, forward.Normalized)));
+            return Math.Acos(cos);
+        }
+
+        /* How far from its centre a body is drawn: the top of its air, or of its highest ground, whichever is higher. */
+        public static double ReachRadius(double radiusM, double terrainMaxM, bool atmosphere, double atmosphereDepthM) =>
+            Math.Max(Math.Max(radiusM, terrainMaxM), atmosphere ? radiusM + atmosphereDepthM : radiusM);
 
         /* Whether a disc reaches past half the way from a frame's centre to its corner, about half the frame's area, which is what a planet underfoot does. */
         public static bool FillsFrame(double disc, double halfDiagonal) => disc > halfDiagonal / 2;

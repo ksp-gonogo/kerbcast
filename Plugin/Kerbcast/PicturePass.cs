@@ -389,7 +389,7 @@ namespace Kerbcast
                 _moved[i] = m;
                 if (view != null && !m.Body.isStar)
                 {
-                    _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, BodyLight.ConeFor(halfDiagonal, m.Slot == _litSlot));
+                    _discs[m.Slot] = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ReachOf(m.Body), ahead, BodyLight.ConeFor(halfDiagonal, m.Slot == _litSlot));
                     if (m.Body == lens.Body && BodyLight.FillsFrame(_discs[m.Slot], halfDiagonal))
                     {
                         underfoot = m.Slot;
@@ -456,7 +456,7 @@ namespace Kerbcast
                 int root = BodyLight.SystemRoot(_parents, _stars, m.Slot);
                 if (root < 0) continue;
                 bool held = root == mainRoot || _systemLayer[root] >= 0;
-                double disc = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ahead, BodyLight.ConeFor(halfDiagonal, held));
+                double disc = BodyLight.DiscInFrame(lens.Point, m.Centre, m.Body.Radius, ReachOf(m.Body), ahead, BodyLight.ConeFor(halfDiagonal, held));
                 if (disc > 0 && underfoot >= 0 && m.Slot != underfoot && BodyLight.BehindLimb(lens.Point, ownCentre, lens.Body.Radius, m.Centre)) disc = 0;
                 if (disc > _best[root]) _best[root] = disc;
             }
@@ -480,6 +480,13 @@ namespace Kerbcast
                 for (int i = 0; i < n; i++) _assigned[i] = -1;
             LogSystems(bodies, mainRoot);
             Array.Copy(_assigned, _systemLayer, n);
+        }
+
+        /* How far from its centre `b` is drawn, for whether any of it reaches the frame. */
+        private static double ReachOf(CelestialBody b)
+        {
+            var pqs = b.pqsController;
+            return BodyLight.ReachRadius(b.Radius, pqs != null ? pqs.radiusMax : 0, b.atmosphere, b.atmosphereDepth);
         }
 
         /* One line whenever this camera's systems change light, for checking a capture against what lit it. */
