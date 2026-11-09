@@ -152,6 +152,18 @@ namespace Kerbcast
             public bool Hidden;
         }
 
+        /* The components LightBodies writes to for one body, found once. */
+        private sealed class LightSources
+        {
+            public GameObject Scaled;
+            public MaterialSetDirection Setter;
+            public Renderer Rim;
+            public string ValueName;
+            public int RimProperty;
+            public AtmosphereFromGround Afg;
+            public Renderer Shell;
+        }
+
         private struct HeldCorona
         {
             public Transform Transform;
@@ -173,6 +185,8 @@ namespace Kerbcast
         private static readonly int ShellLightDirId = Shader.PropertyToID("_v4LightDir");
         private static readonly int ShellLightDotId = Shader.PropertyToID("_lightDot");
         private static readonly HashSet<string> s_lightLogged = new HashSet<string>();
+        private readonly Dictionary<CelestialBody, LightSources> _lightSources = new Dictionary<CelestialBody, LightSources>();
+        private GameScenes _lightSourcesScene;
         private double[] _discs = new double[0];
         /* The list slot of the body this camera aimed the light at last frame, so the choice holds between frames. */
         private int _litSlot = -1;
@@ -352,9 +366,10 @@ namespace Kerbcast
             {
                 var m = _moved[i];
                 if (m.Hidden) continue;
-                LightRim(ref m, sun);
+                var sources = SourcesFor(m.Body);
+                LightRim(ref m, sun, sources);
                 _moved[i] = m;
-                LightShell(ref m, sun, lensScaled, sunScaled);
+                LightShell(ref m, sun, lensScaled, sunScaled, sources);
                 _moved[i] = m;
                 if (view != null && !m.Body.isStar)
                 {
@@ -400,10 +415,10 @@ namespace Kerbcast
         }
 
         /* The shell's light inputs for this body, as AtmosphereFromGround derives them, from the Sun to the body as drawn and the lens as placed. */
-        private void LightShell(ref MovedBody m, DVec3 sun, Vector3 lensScaled, Vector3 sunScaled)
+        private void LightShell(ref MovedBody m, DVec3 sun, Vector3 lensScaled, Vector3 sunScaled, LightSources sources)
         {
             var afg = m.Body.afg;
-            var r = afg != null ? afg.GetComponent<Renderer>() : null;
+            var r = sources.Shell;
             if (r == null) return;
             r.GetPropertyBlock(_afgBlock);
             m.ShellLit = r;
@@ -443,12 +458,17 @@ namespace Kerbcast
          * mesh has now, in the property block the setter uses, and put back
          * in AfterScaledLayer.
          */
-        private void LightRim(ref MovedBody m, DVec3 sun)
+        private void LightRim(ref MovedBody m, DVec3 sun, LightSources sources)
         {
-            var setter = m.Body.scaledBody.GetComponent<MaterialSetDirection>();
-            var r = setter != null && setter.target != null ? setter.GetComponent<Renderer>() : null;
+            var setter = sources.Setter;
+            var r = setter != null && setter.target != null ? sources.Rim : null;
             if (r == null || string.IsNullOrEmpty(setter.valueName)) return;
-            int id = Shader.PropertyToID(setter.valueName);
+            if (sources.ValueName != setter.valueName)
+            {
+                sources.ValueName = setter.valueName;
+                sources.RimProperty = Shader.PropertyToID(setter.valueName);
+            }
+            int id = sources.RimProperty;
             r.GetPropertyBlock(_lightBlock);
             m.Lit = r;
             m.LitProperty = id;
@@ -459,6 +479,37 @@ namespace Kerbcast
             var local = PictureBoundary.LightInBodyAxes(new DQuat(rot.x, rot.y, rot.z, rot.w), away);
             _lightBlock.SetVector(id, new Vector4((float)local.X, (float)local.Y, (float)local.Z, 0f));
             r.SetPropertyBlock(_lightBlock);
+        }
+
+        /*
+         * This camera's components for a body, looked up again when one was
+         * destroyed or the body was given another. A body with no setter or
+         * shell renderer is looked up every time, so one added late is found.
+         */
+        private LightSources SourcesFor(CelestialBody b)
+        {
+            if (_lightSourcesScene != HighLogic.LoadedScene)
+            {
+                _lightSourcesScene = HighLogic.LoadedScene;
+                _lightSources.Clear();
+            }
+            if (!_lightSources.TryGetValue(b, out var s))
+            {
+                s = new LightSources();
+                _lightSources[b] = s;
+            }
+            if (s.Scaled != b.scaledBody || s.Setter == null || s.Rim == null)
+            {
+                s.Scaled = b.scaledBody;
+                s.Setter = b.scaledBody.GetComponent<MaterialSetDirection>();
+                s.Rim = s.Setter != null ? s.Setter.GetComponent<Renderer>() : null;
+            }
+            if (s.Afg != b.afg || s.Shell == null)
+            {
+                s.Afg = b.afg;
+                s.Shell = b.afg != null ? b.afg.GetComponent<Renderer>() : null;
+            }
+            return s;
         }
 
         /* Names, once per body, what lights it, for checking a planet pack or a game update against what this pass writes. */
