@@ -41,6 +41,7 @@ export { nowMs, formatElapsed } from "./timing";
 
 // Shared standby glyph (used by CameraFeed + downstream dashboards)
 export { StandbyIcon } from "./StandbyIcon";
+export { NetworkIcon } from "./NetworkIcon";
 
 // Camera label utilities
 export { buildCameraLabeler } from "./cameraLabels";

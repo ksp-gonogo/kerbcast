@@ -7,5 +7,6 @@ describe("@ksp-gonogo/kerbcast-react", () => {
   it("module resolves", async () => {
     const mod = await import("./index");
     expect(mod).toBeDefined();
+    expect(typeof mod.NetworkIcon).toBe("function");
   }, 30_000);
 });

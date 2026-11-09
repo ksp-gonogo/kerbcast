@@ -15,8 +15,8 @@ import type {
   NetworkVantageSpec,
   SiteCatalogPayload,
 } from "@ksp-gonogo/kerbcast";
-import { useKerbcastCameras, useKerbcastClient, useNetworks, useSiteCatalog } from "@ksp-gonogo/kerbcast-react";
-import { Check, ChevronLeft, LayoutGrid, Lock, Pencil, Plus, RadioTower, Satellite, Trash2, Waypoints, X } from "lucide-react";
+import { NetworkIcon, useKerbcastCameras, useKerbcastClient, useNetworks, useSiteCatalog } from "@ksp-gonogo/kerbcast-react";
+import { Check, ChevronLeft, LayoutGrid, Lock, Pencil, Plus, RadioTower, Satellite, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled, { css } from "styled-components";
 import {
@@ -202,7 +202,7 @@ function NetworkCard({ def, catalog, camera, onEdit, onShowInGrid, inGrid, locke
     <Card aria-label={`Network ${def.name}`}>
       <CardHead>
         <CardTitle>
-          <Waypoints size={14} strokeWidth={1.75} aria-hidden="true" />
+          <NetworkIcon size={14} />
           <span>{def.name}</span>
         </CardTitle>
         {status === "notRunning" ? (

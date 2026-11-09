@@ -253,6 +253,18 @@ const useDelayedStream: CameraStreamHook = (flightId) => {
 <CameraFeed flightId={null} useStream={useDelayedStream} />;
 ```
 
+## Network icon
+
+`NetworkIcon` is the glyph for a camera network: nodes joined along a
+line. It takes `size` (default 14) and `strokeWidth` (default 1.75), and
+inherits `currentColor`:
+
+```tsx
+import { NetworkIcon } from "@ksp-gonogo/kerbcast-react";
+
+<NetworkIcon size={16} />;
+```
+
 ## License
 
 [MIT](./LICENSE). This SDK is the interface to kerbcast, so it is permissive:
