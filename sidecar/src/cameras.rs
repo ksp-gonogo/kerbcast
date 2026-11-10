@@ -13,7 +13,7 @@
 //! and fans the resulting NALs out to every alive track.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -47,25 +47,32 @@ use crate::shared_mem::{ChangeSignal, ControlBlock, MmapFrameRing};
 
 /// Filesystem identity for a `.ring` file: distinguishes "same path, same
 /// underlying file" from "same path, file was unlinked and a new one
-/// created in its place". Inode is exact on unix; `MetadataExt::file_index`
-/// would give the same on Windows but is still unstable
-/// (`windows_by_handle`, rust-lang/rust#63010), so non-unix falls back to
-/// the mtime in nanoseconds — coarser (a same-tick delete+recreate could in
-/// theory collide) but still a large improvement over never detecting the
-/// swap at all.
+/// created in its place". The inode on unix.
 #[cfg(unix)]
-fn ring_file_identity(meta: &std::fs::Metadata) -> u64 {
+fn ring_file_identity(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
-    meta.ino()
+    Ok(std::fs::metadata(path)?.ino())
 }
 
-#[cfg(not(unix))]
-fn ring_file_identity(meta: &std::fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/** The file index on Windows, read the way std's own `metadata` reads it (std
+keeps `file_index` unstable). A delete and recreate gets a new index even
+within one clock tick, where the last write time can come out the same and
+hide the swap. The handle asks for no access rights, so the plugin's open
+mapping cannot refuse it. */
+#[cfg(windows)]
+fn ring_file_identity(path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file = std::fs::OpenOptions::new().access_mode(0).open(path)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` keeps the handle open across the call and `info` is a valid out pointer
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }?;
+    Ok((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
 }
 
 /// File the host writes ~1Hz with "1" (in a flight scene) or "0" (not).
@@ -2343,9 +2350,13 @@ impl CameraRegistry {
         // no ring file, so they won't appear in `found`).
         let mut attached: Vec<u32> = Vec::new();
         for (id, path) in &found {
-            let found_identity = match tokio::fs::metadata(path).await {
-                Ok(meta) => ring_file_identity(&meta),
-                Err(_) => 0,
+            let found_identity = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || ring_file_identity(&path))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(0)
             };
             // A ring that reappears for a flight_id we already hold as a
             // destroyed tombstone means KSP reused that part.flightID for a
@@ -6659,12 +6670,6 @@ mod tests {
     // check this was silently ignored by rescan (the entry wasn't flagged
     // destroyed) and the old mmap stayed pointed at the unlinked file
     // forever — no browser refresh could recover it.
-    //
-    // unix-only: the identity check is exact there (inode). The non-unix
-    // fallback (mtime) can't distinguish two files created back-to-back
-    // within the same tick, which is exactly what this test does — that's
-    // an inherent limit of the tier-2 fallback, not something to assert on.
-    #[cfg(unix)]
     #[tokio::test]
     async fn live_camera_reattaches_when_ring_recreated_without_destroyed_tombstone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6715,7 +6720,6 @@ mod tests {
     /// The viewers of a camera reattached in place are still connected and do
     /// not report again, so what they asked of it carries over to the new
     /// entry, and leaves with them as before.
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_in_place_reattach_keeps_what_viewers_asked_of_the_camera() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6769,7 +6773,6 @@ mod tests {
     /// delta and the destroyed state, since a 0 from either would leave a
     /// client with no baseline for the next change. Rescans that find the same
     /// ring keep it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_in_place_reattach_bumps_the_attach_number_and_is_announced() {
         let dir = tempfile::tempdir().expect("tempdir");

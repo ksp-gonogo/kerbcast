@@ -3780,9 +3780,7 @@ mod tests {
     its track to the discarded entry, and binds its slot only after the churn
     resync has already run. The live entry never hears of the viewer, so it goes
     idle and the plugin sleeps the camera, and a repeat subscribe only announces
-    the slot again. Unix only: elsewhere a ring is told apart by its mtime, which
-    a delete and recreate in the same tick can share. */
-    #[cfg(unix)]
+    the slot again. */
     #[tokio::test]
     async fn a_slot_bound_through_a_rescan_gets_its_track_back() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
@@ -3857,10 +3855,6 @@ mod tests {
         assert_eq!(live.subscribers.load(Ordering::Acquire), 0);
     }
 
-    /// A ring recreated in place within one rescan keeps its viewers' sizes on
-    /// the new entry, and the rebind passes them to the plugin's new control
-    /// block along with the subscription.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_set_fov_reaches_a_command_camera_nobody_subscribes_to() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
@@ -3893,6 +3887,9 @@ mod tests {
         assert_eq!(snap.fov, Some(1.5));
     }
 
+    /// A ring recreated in place within one rescan keeps its viewers' sizes on
+    /// the new entry, and the rebind passes them to the plugin's new control
+    /// block along with the subscription.
     #[tokio::test]
     async fn an_in_place_reattach_tells_the_plugin_the_viewers_size() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
