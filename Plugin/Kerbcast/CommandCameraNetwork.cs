@@ -108,6 +108,7 @@ namespace Kerbcast
         private double _passMsMax;
         private float _costLoggedAt = float.MinValue;
         private bool _force = true;
+        private bool _loggedHeld;
         private int _fallback = -1;
         private bool _subscribed;
 
@@ -297,6 +298,24 @@ namespace Kerbcast
         {
             float now = Time.realtimeSinceStartup;
             if (!force && !_force && now - _passAt < NetworkMath.PassRealSeconds) return;
+            /*
+             * A flight scene builds its cameras before its first physics tick,
+             * while the game is still putting craft and its rotating frame in
+             * place: a craft on rails and a landed one are then read in frames
+             * that do not agree, and every vantage can read the craft as below
+             * its horizon. The pass waits, still due, and the camera stands at
+             * its first vantage meanwhile.
+             */
+            if (!KerbcastControl.SceneCraftLoaded)
+            {
+                _force = true;
+                if (!_loggedHeld)
+                {
+                    _loggedHeld = true;
+                    Debug.Log($"{Tag} cam={_w.FlightId} UT={Planetarium.GetUniversalTime():F2} event=network-held reason=scene-placing-craft");
+                }
+                return;
+            }
             _passAt = now;
             _force = false;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
