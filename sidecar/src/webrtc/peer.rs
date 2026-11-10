@@ -1514,7 +1514,7 @@ async fn handle_client_message(
             let token = payload.token.clone();
             let network_id = payload.network_id.clone();
             match registry.request_save_network(payload).await {
-                Ok(id) => info!(request = id, token, "tracking network save requested"),
+                Ok(id) => info!(request = id, token, "camera network save requested"),
                 Err(refusal) => send_network_refusal(&dc, token, network_id, refusal),
             }
         }
@@ -1522,7 +1522,7 @@ async fn handle_client_message(
             let token = payload.token.clone();
             let network_id = Some(payload.network_id.clone());
             match registry.request_delete_network(payload).await {
-                Ok(id) => info!(request = id, token, "tracking network delete requested"),
+                Ok(id) => info!(request = id, token, "camera network delete requested"),
                 Err(refusal) => send_network_refusal(&dc, token, network_id, refusal),
             }
         }

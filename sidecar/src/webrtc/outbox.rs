@@ -278,7 +278,7 @@ fn fitted_list(msg: &ServerMessage, limit: usize) -> serde_json::Result<Option<S
                     warn!(
                         cut,
                         limit,
-                        "tracking networks over the control message limit; the last are left out"
+                        "camera networks over the control message limit; the last are left out"
                     );
                     return Ok(Some(body));
                 }

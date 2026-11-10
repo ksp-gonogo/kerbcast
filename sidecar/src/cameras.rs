@@ -2112,7 +2112,7 @@ impl CameraRegistry {
         let file: NetworksFile = match serde_json::from_slice(&bytes) {
             Ok(f) => f,
             Err(e) => {
-                warn!(error = %e, "tracking network file parse failed");
+                warn!(error = %e, "camera network file parse failed");
                 return NetworksNews::default();
             }
         };
