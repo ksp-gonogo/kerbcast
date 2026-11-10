@@ -18,6 +18,14 @@ namespace Kerbcast.Api.Testing
         readonly Dictionary<uint, List<CommandTarget>> targets = new Dictionary<uint, List<CommandTarget>>();
         readonly Dictionary<uint, Aim> aims = new Dictionary<uint, Aim>();
         readonly Dictionary<uint, OpticsSettings> optics = new Dictionary<uint, OpticsSettings>();
+        readonly Dictionary<uint, List<NetworkVantage>> networks = new Dictionary<uint, List<NetworkVantage>>();
+        readonly Dictionary<uint, NetworkOptions> networkOptions = new Dictionary<uint, NetworkOptions>();
+        readonly Dictionary<uint, List<NetworkVantageStatus>> networkStatus = new Dictionary<uint, List<NetworkVantageStatus>>();
+        readonly List<GroundStationInfo> stations = new List<GroundStationInfo>();
+        readonly Dictionary<uint, string> networkOwners = new Dictionary<uint, string>();
+        LineOfSightResult sight = new LineOfSightResult(false, false, null, false, double.NaN);
+        VantageResolution resolution = new VantageResolution();
+        uint nextNetworkId = 0x4E000001;
         readonly List<PublishedSnapshot> published = new List<PublishedSnapshot>();
         string lockOwner;
         int scene;
@@ -62,6 +70,46 @@ namespace Kerbcast.Api.Testing
         /** <summary>The optics override on each feed, as set and not cleared.</summary> */
         public IReadOnlyDictionary<uint, OpticsSettings> Optics => optics;
 
+        /**
+         * <summary>
+         * Body names by flightGlobalsIndex, for a surface vantage's site key ("surface:Kerbin:..."), as Kerbcast names
+         * them. Stock's bodies to start with; a test of a modded system replaces them.
+         * </summary>
+         */
+        public IDictionary<int, string> BodyNames { get; } = new Dictionary<int, string>
+        {
+            [0] = "Sun", [1] = "Kerbin", [2] = "Mun", [3] = "Minmus", [4] = "Moho", [5] = "Eve", [6] = "Duna", [7] = "Ike",
+            [8] = "Jool", [9] = "Laythe", [10] = "Vall", [11] = "Bop", [12] = "Tylo", [13] = "Gilly", [14] = "Pol", [15] = "Dres", [16] = "Eeloo",
+        };
+
+        /** <summary>Each network camera's vantages, as created or last replaced.</summary> */
+        public IReadOnlyDictionary<uint, List<NetworkVantage>> Networks => networks;
+
+        /** <summary>Each network camera's options, as created or last replaced.</summary> */
+        public IReadOnlyDictionary<uint, NetworkOptions> NetworkOptionsSet => networkOptions;
+
+        /**
+         * <summary>
+         * What NetworkStatus returns for a network camera. Unset, it lists the camera's vantages in order with their
+         * kind and craft id, the first active and every one "ok" with a NaN score: a test of cuts and states sets its own here.
+         * </summary>
+         */
+        public void SetNetworkStatus(uint flightId, IEnumerable<NetworkVantageStatus> status) =>
+            networkStatus[flightId] = new List<NetworkVantageStatus>(status ?? new NetworkVantageStatus[0]);
+
+        /** <summary>What every LineOfSight call answers: not Known until a test sets it.</summary> */
+        public void SetLineOfSight(LineOfSightResult answer) => sight = answer;
+
+        /** <summary>What every VantageResolution call answers, a copy each time: not Known until a test sets it.</summary> */
+        public void SetVantageResolution(VantageResolution answer) => resolution = answer != null ? Copy(answer) : new VantageResolution();
+
+        /** <summary>What GroundStations returns: none until a test sets them.</summary> */
+        public void SetGroundStations(IEnumerable<GroundStationInfo> list)
+        {
+            stations.Clear();
+            if (list != null) stations.AddRange(list);
+        }
+
         /** <summary>Every accepted snapshot, oldest first, from any thread.</summary> */
         public IReadOnlyList<PublishedSnapshot> Published
         {
@@ -78,7 +126,8 @@ namespace Kerbcast.Api.Testing
          * <summary>
          * Adds or replaces a command feed by FlightId. Feeds reports each feed's Scope as Kerbcast does:
          * from the bindings of the last snapshot accepted in this lock tenure, null when its SiteKey is
-         * unbound, before any snapshot, and after the lock is released. The Scope given here is ignored.
+         * unbound, before any snapshot, and after the lock is released. FollowsActiveVessel is likewise
+         * Kerbcast's: true while the feed has no aim in Aims. The Scope and FollowsActiveVessel given here are ignored.
          * </summary>
          */
         public void AddFeed(CommandFeed feed)
@@ -335,6 +384,153 @@ namespace Kerbcast.Api.Testing
         /* NaN (Kerbcast's own value) or finite and not negative. */
         static bool AtLeastZero(double v) => double.IsNaN(v) || (!double.IsInfinity(v) && v >= 0);
 
+        /**
+         * <summary>
+         * As Kerbcast's, without the game: the lock and the list are checked, and a created network camera is listed by
+         * Feeds at once, its SiteKey the first vantage's (a station's or launch site's name, "vessel:" and the craft's
+         * id, or "surface:", the body's name from BodyNames and its place, and "LaunchPad" for a launch site naming none) and its DisplayName the first vantage's label
+         * or that key. Only the mod that made a network may replace its vantages or remove it, unless it was made under no name. A surface vantage on a body BodyNames lacks is a BadVantage, as an unknown body is to Kerbcast. The aim is
+         * recorded in Aims unchecked.
+         * </summary>
+         */
+        public NetworkResult CreateNetworkCamera(IReadOnlyList<NetworkVantage> vantages, string name, Aim aim, NetworkOptions options,
+            string owner, out uint flightId)
+        {
+            kc.Enter("CreateNetworkCamera", ApiFeature.NetworkCameras);
+            flightId = 0;
+            kc.Record($"CreateNetworkCamera {(vantages == null ? "null" : string.Join(", ", vantages))} {name ?? "null"} {aim?.ToString() ?? "null"} {owner}");
+            var refused = NetworkLock(owner);
+            if (refused != NetworkResult.Unknown) return refused;
+            var bad = Judge(vantages, options);
+            if (bad != NetworkResult.Ok) return bad;
+            flightId = nextNetworkId++;
+            networks[flightId] = new List<NetworkVantage>(vantages);
+            networkOwners[flightId] = owner ?? "";
+            networkOptions[flightId] = Copy(options ?? new NetworkOptions());
+            if (aim != null) aims[flightId] = aim;
+            string key = Key(vantages[0]);
+            feeds.Add(new CommandFeed
+            {
+                FlightId = flightId,
+                DisplayName = vantages[0].Label ?? key,
+                SiteKey = key,
+                SiteKind = vantages[0].Kind,
+                VantagePersistentId = vantages[0].Kind == SiteKind.Vessel ? vantages[0].PersistentId : 0,
+                Created = true,
+                Network = true,
+            });
+            return NetworkResult.Ok;
+        }
+
+        public NetworkResult SetNetworkVantages(uint flightId, IReadOnlyList<NetworkVantage> vantages, NetworkOptions options, string owner)
+        {
+            kc.Enter("SetNetworkVantages", ApiFeature.NetworkCameras);
+            kc.Record($"SetNetworkVantages {flightId} {(vantages == null ? "null" : string.Join(", ", vantages))} {owner}");
+            var refused = NetworkLock(owner);
+            if (refused != NetworkResult.Unknown) return refused;
+            if (!networks.ContainsKey(flightId) || OwnedByOther(flightId, owner)) return NetworkResult.NotCommandFeed;
+            var bad = Judge(vantages, options);
+            if (bad != NetworkResult.Ok) return bad;
+            networks[flightId] = new List<NetworkVantage>(vantages);
+            if (options != null) networkOptions[flightId] = Copy(options);
+            return NetworkResult.Ok;
+        }
+
+        public NetworkResult DestroyNetworkCamera(uint flightId, string owner)
+        {
+            kc.Enter("DestroyNetworkCamera", ApiFeature.NetworkCameras);
+            kc.Record($"DestroyNetworkCamera {flightId} {owner}");
+            var refused = NetworkLock(owner);
+            if (refused != NetworkResult.Unknown) return refused;
+            if (OwnedByOther(flightId, owner)) return NetworkResult.NotCommandFeed;
+            if (!networks.Remove(flightId)) return NetworkResult.NotCommandFeed;
+            networkOwners.Remove(flightId);
+            networkOptions.Remove(flightId);
+            networkStatus.Remove(flightId);
+            aims.Remove(flightId);
+            feeds.RemoveAll(f => f.FlightId == flightId);
+            return NetworkResult.Ok;
+        }
+
+        public IReadOnlyList<NetworkVantageStatus> NetworkStatus(uint flightId)
+        {
+            kc.Enter("NetworkStatus", ApiFeature.NetworkCameras);
+            if (networkStatus.TryGetValue(flightId, out var set)) return set.ConvertAll(Copy);
+            var result = new List<NetworkVantageStatus>();
+            if (!networks.TryGetValue(flightId, out var list)) return result;
+            for (int i = 0; i < list.Count; i++)
+                result.Add(new NetworkVantageStatus
+                {
+                    SiteKey = Key(list[i]), Label = list[i].Label ?? Key(list[i]), SiteKind = list[i].Kind,
+                    VantagePersistentId = list[i].Kind == SiteKind.Vessel ? list[i].PersistentId : 0,
+                    Active = i == 0, Fallback = list[i].Fallback, State = "ok", Score = 0,
+                });
+            return result;
+        }
+
+        bool OwnedByOther(uint flightId, string owner) =>
+            networkOwners.TryGetValue(flightId, out var made) && made.Length > 0 && made != (owner ?? "");
+
+        /* NotLockHolder for anyone but a held lock's owner, else Unknown, counting the holder's heartbeat. */
+        NetworkResult NetworkLock(string owner)
+        {
+            string holder = LockOwner;
+            if (holder == null) return NetworkResult.Unknown;
+            if (holder != owner) return NetworkResult.NotLockHolder;
+            Heartbeats++;
+            return NetworkResult.Unknown;
+        }
+
+        /* The list and options as Kerbcast checks them before the game: whether a named station or craft exists is not known here. */
+        NetworkResult Judge(IReadOnlyList<NetworkVantage> vantages, NetworkOptions options)
+        {
+            if (vantages == null || vantages.Count == 0) return NetworkResult.NoVantages;
+            if (vantages.Count > 64) return NetworkResult.BadVantage;
+            if (BodyNames == null) return NetworkResult.BadVantage;
+            foreach (var v in vantages)
+            {
+                if (v == null) return NetworkResult.BadVantage;
+                bool ok;
+                switch (v.Kind)
+                {
+                    case SiteKind.Station: ok = !string.IsNullOrWhiteSpace(v.Name) && Vec3d.Finite(v.Height); break;
+                    case SiteKind.LaunchSite: ok = Vec3d.Finite(v.Distance) && v.Distance >= 0 && Vec3d.Finite(v.Bearing) && Vec3d.Finite(v.Height); break;
+                    case SiteKind.Surface: ok = BodyNames.ContainsKey(v.BodyIndex) && Vec3d.Finite(v.Latitude) && v.Latitude >= -90 && v.Latitude <= 90 && Vec3d.Finite(v.Longitude) && Vec3d.Finite(v.Height); break;
+                    default: ok = v.PersistentId != 0; break;
+                }
+                if (!ok) return NetworkResult.BadVantage;
+            }
+            if (options != null && !(NotNegative(options.MinHoldUt) && NotNegative(options.MinHoldRealSeconds) && NotNegative(options.MarginStops)))
+                return NetworkResult.BadNumber;
+            return NetworkResult.Ok;
+        }
+
+        static bool NotNegative(double v) => Vec3d.Finite(v) && v >= 0;
+
+        string Key(NetworkVantage v)
+        {
+            switch (v.Kind)
+            {
+                case SiteKind.Vessel: return "vessel:" + v.PersistentId;
+                case SiteKind.Surface:
+                    return string.Format(System.Globalization.CultureInfo.InvariantCulture, "surface:{0}:{1:F5}:{2:F5}", BodyNames[v.BodyIndex], v.Latitude, v.Longitude);
+                /* With no craft to read a launch site from, Kerbcast's own fallback: the stock pad. */
+                case SiteKind.LaunchSite: return string.IsNullOrEmpty(v.Name) ? "LaunchPad" : v.Name;
+                default: return v.Name;
+            }
+        }
+
+        static NetworkOptions Copy(NetworkOptions o) => new NetworkOptions
+        {
+            MinHoldUt = o.MinHoldUt, MinHoldRealSeconds = o.MinHoldRealSeconds, MarginStops = o.MarginStops,
+        };
+
+        static NetworkVantageStatus Copy(NetworkVantageStatus s) => new NetworkVantageStatus
+        {
+            SiteKey = s.SiteKey, Label = s.Label, SiteKind = s.SiteKind, VantagePersistentId = s.VantagePersistentId,
+            Active = s.Active, Fallback = s.Fallback, State = s.State, Score = s.Score, Occluder = s.Occluder,
+        };
+
         public IReadOnlyList<CommandFeed> Feeds()
         {
             kc.Enter("Feeds", ApiFeature.CommandFeeds);
@@ -344,9 +540,40 @@ namespace Kerbcast.Api.Testing
             {
                 var c = Copy(f);
                 c.Scope = bound != null && c.SiteKey != null && bound.TryGetValue(c.SiteKey, out var scope) ? scope : null;
+                c.FollowsActiveVessel = !aims.ContainsKey(c.FlightId);
                 return c;
             });
         }
+
+        public IReadOnlyList<GroundStationInfo> GroundStations()
+        {
+            kc.Enter("GroundStations", ApiFeature.GroundStations);
+            return stations.ConvertAll(s => new GroundStationInfo
+            {
+                NodeName = s.NodeName, DisplayName = s.DisplayName, BodyIndex = s.BodyIndex, Latitude = s.Latitude,
+                Longitude = s.Longitude, Altitude = s.Altitude, Enabled = s.Enabled, DisabledReason = s.DisabledReason,
+            });
+        }
+
+        public LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN)
+        {
+            kc.Enter("LineOfSight", ApiFeature.LineOfSight);
+            kc.Record($"LineOfSight {vantage?.ToString() ?? "null"} {ut} {bodyIndex} {position}");
+            return vantage == null ? new LineOfSightResult(false, false, null, false, double.NaN) : sight;
+        }
+
+        public VantageResolution VantageResolution(NetworkVantage vantage)
+        {
+            kc.Enter("VantageResolution", ApiFeature.VantageResolution);
+            kc.Record($"VantageResolution {vantage?.ToString() ?? "null"}");
+            return vantage == null ? new VantageResolution() : Copy(resolution);
+        }
+
+        static VantageResolution Copy(VantageResolution r) => new VantageResolution
+        {
+            Known = r.Known, FovMinDeg = r.FovMinDeg, FrameWidthPx = r.FrameWidthPx, FrameHeightPx = r.FrameHeightPx,
+            PixelRad = r.PixelRad, OpticsOn = r.OpticsOn, LensArcsec = r.LensArcsec, BestResolutionRad = r.BestResolutionRad,
+        };
 
         public IReadOnlyList<CommandTarget> Targets(uint flightId)
         {
@@ -429,7 +656,7 @@ namespace Kerbcast.Api.Testing
         {
             FlightId = f.FlightId, DisplayName = f.DisplayName, SiteKey = f.SiteKey, SiteKind = f.SiteKind,
             VantagePersistentId = f.VantagePersistentId, Scope = f.Scope, SubjectPersistentId = f.SubjectPersistentId,
-            Created = f.Created,
+            Created = f.Created, Network = f.Network, Saved = f.Saved, FollowsActiveVessel = f.FollowsActiveVessel,
         };
 
         static CommandTarget Copy(CommandTarget t) => new CommandTarget

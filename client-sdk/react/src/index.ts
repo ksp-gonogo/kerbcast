@@ -29,6 +29,8 @@ export { useKerbcastStream } from "./hooks/useKerbcastStream";
 export { useKerbcastClock } from "./hooks/useKerbcastClock";
 export { useDisplayedFrameUt } from "./hooks/useDisplayedFrameUt";
 export { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
+export { useSiteCatalog } from "./hooks/useSiteCatalog";
+export { useNetworks } from "./hooks/useNetworks";
 export { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
 export { useReportDisplaySize, MIN_DISPLAY_REPORT_PX } from "./hooks/useReportDisplaySize";
 export { useRecordings } from "./hooks/useRecordings";
@@ -39,9 +41,12 @@ export { nowMs, formatElapsed } from "./timing";
 
 // Shared standby glyph (used by CameraFeed + downstream dashboards)
 export { StandbyIcon } from "./StandbyIcon";
+export { NetworkIcon } from "./NetworkIcon";
 
 // Camera label utilities
 export { buildCameraLabeler } from "./cameraLabels";
+export { NETWORK_FEED_TEXT, isNetworkCamera, networkFeedName, networkSees, readNetworkVantage } from "./networkVantage";
+export type { NetworkVantageReading } from "./networkVantage";
 export type { LabelableCamera } from "./cameraLabels";
 
 // Lifecycle utilities
@@ -53,6 +58,7 @@ export { CameraFeed } from "./CameraFeed";
 export type {
   CameraFeedHandle,
   CameraFeedProps,
+  TitleContent,
   CameraStreamHook,
   FeedAction,
 } from "./CameraFeed";

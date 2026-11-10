@@ -1,7 +1,9 @@
 import {
   buildCameraLabeler,
   CameraFeed,
+  isNetworkCamera,
   useKerbcastCameras,
+  useNetworks,
 } from "@ksp-gonogo/kerbcast-react";
 import type { FeedAction } from "@ksp-gonogo/kerbcast-react";
 import { Check, ListPlus, ListX, Pencil, Pin, PinOff, Plus, Trash2, WifiOff, X } from "lucide-react";
@@ -125,6 +127,16 @@ export function Tile({
 
   const label = customLabel ?? autoLabel;
 
+  /*
+   * A network feed names itself in its own always-visible title (the vantage
+   * its frame came from, then "via <network>"), so the corner text would only
+   * repeat it. A custom label still shows in the corner.
+   */
+  const networks = useNetworks();
+  const displayedCamera = cameras.find((c) => c.flightId === displayedFlightId);
+  const displaysNetwork = !!displayedCamera && isNetworkCamera(displayedCamera, networks);
+  const namesNetwork = displaysNetwork && customLabel === null;
+
   // Inline label editor: open state and draft text.
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -220,6 +232,7 @@ export function Tile({
           onSelectCamera={onSelectCamera}
           cameraFilter={mergeCrew && showLaunchpad ? undefined : (c) => isCameraShown(c, { mergeCrew, showLaunchpad })}
           onDisplayedCameraChange={setDisplayedFlightId}
+          alwaysShowTitle={displaysNetwork}
           enableFullscreen
           enablePictureInPicture
           enableQualityControl
@@ -272,7 +285,7 @@ export function Tile({
         </LabelEditor>
       ) : (
         <TileCornerLabel>
-          <TileCornerText>{label}</TileCornerText>
+          {!namesNetwork && <TileCornerText>{label}</TileCornerText>}
           {canRename && (
             <TileRenameButton
               type="button"

@@ -388,3 +388,61 @@ describe("Tile - per-feed recording", () => {
     expect(startSpy).toHaveBeenCalledWith(1, { forceFullResolution: false });
   });
 });
+
+describe("Tile - camera network name", () => {
+  const network = () =>
+    makeCamera({
+      flightId: 7,
+      kind: CameraKind.Command,
+      partName: "kerbcast.commandCamera",
+      partTitle: "Command camera",
+      cameraName: "Kerbin ground net",
+      vesselName: "Kerbin ground net",
+      commandCentre: {
+        stationId: "ground:Crater Rim",
+        siteKey: "Crater Rim",
+        nodeName: "Crater Rim",
+        displayName: "Crater Rim",
+        body: "Kerbin",
+        latitude: 9.4,
+        longitude: -172.1,
+        altitude: 4000,
+        subjectPersistentId: 0,
+        trackingLevel: 3,
+        targets: [],
+        network: {
+          name: "Kerbin ground net",
+          state: "ok",
+          vantages: [
+            { siteKey: "KSC", label: "KSC", state: "occluded", active: false },
+            { siteKey: "Crater Rim", label: "Crater Rim", state: "ok", active: true },
+          ],
+        },
+      },
+    });
+
+  it("names the feed in its always-visible title, not in the corner", async () => {
+    const { client } = await buildConnectedFixture([network()]);
+    let container: HTMLElement;
+    await act(async () => {
+      ({ container } = renderTile(client, 7));
+    });
+    await waitFor(() => {
+      const button = container!.querySelector("h3 button")!;
+      expect(button.textContent).toContain("Crater Rim");
+      expect(button.textContent).toContain("via Kerbin ground net");
+    });
+    expect(container!.querySelector("[data-fallback]")).toBeNull();
+  });
+
+  it("shows the network icon in the feed's title", async () => {
+    const { client } = await buildConnectedFixture([network()]);
+    let container: HTMLElement;
+    await act(async () => {
+      ({ container } = renderTile(client, 7));
+    });
+    await waitFor(() => {
+      expect(container!.querySelector("h3 button svg[data-kc-network-icon]")).not.toBeNull();
+    });
+  });
+});

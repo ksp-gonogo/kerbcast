@@ -782,6 +782,60 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         $"mask: out of budget, the sea-level skyline stands in and nothing is kept (got {fb:G6}, dip {dip:G6})");
 }
 
+// Line of sight at one instant: bodies where they are then, the skyline turned with its body.
+{
+    double seaR = 600000, rMax = 606800, rs = seaR + 30;
+    var up = new DVec3(1, 0, 0);
+    var axis = new DVec3(0, 1, 0);
+    var losEast = new DVec3(0, 0, 1);
+    var losCentre = new DVec3(0, 0, 0);
+    var relS = up * rs;
+
+    /* A moon on a circular orbit crosses the line to a far craft and moves on. */
+    double moonOrbit = 1.2e7, moonR = 200000, period = 138984;
+    DVec3 MoonAt(double ut)
+    {
+        double a = 2 * Math.PI * ut / period;
+        return new DVec3(Math.Cos(a), 0, Math.Sin(a)) * moonOrbit;
+    }
+    var craft = up * 3e7;
+    string FirstBlocker(double ut) =>
+        !CommandCameraMath.SegmentClearOfSphere(relS, craft, MoonAt(ut), moonR) ? "Mun"
+        : !CommandCameraMath.SegmentClearOfSphere(relS, craft, losCentre, seaR) ? "Kerbin" : null;
+    var blocked = LineOfSightMath.Answer(relS, craft, FirstBlocker(0), "Kerbin");
+    var clear = LineOfSightMath.Answer(relS, craft, FirstBlocker(period / 8), "Kerbin");
+    Check(blocked.Known && !blocked.Visible && blocked.Occluder == "Mun" && !blocked.BelowHorizon,
+        "sight: a moon on the line at one instant hides the craft");
+    Check(clear.Known && clear.Visible && clear.Occluder == null && Near(clear.RangeM, 3e7 - rs, 1e-6),
+        "sight: an eighth of an orbit later it has moved clear, with the range to the craft");
+    var under = LineOfSightMath.Answer(relS, up * -3e7, "Kerbin", "Kerbin");
+    Check(!under.Visible && under.BelowHorizon, "sight: the vantage's own body in the way is below the horizon");
+    Check(!LineOfSightMath.Unknown.Known && double.IsNaN(LineOfSightMath.Unknown.RangeM), "sight: unknown says nothing");
+    var off = LineOfSightMath.SwitchedOff(relS, craft);
+    Check(off.Known && off.Disabled && !off.Visible && off.Occluder == null && Near(off.RangeM, 3e7 - rs, 1e-6),
+        "sight: a switched-off station is known to see nothing, with its range");
+
+    /* A 1 km ridge 20 km east; a far craft fixed in space just under its crest rises over it as the body turns. */
+    var ridgeDir = (up * Math.Cos(20000 / seaR) + losEast * Math.Sin(20000 / seaR)).Normalized;
+    var mask = new HorizonMask(rs, seaR, rMax, 0.25, d =>
+        CommandCameraMath.AngleBetween(d, ridgeDir) < 1500 / seaR ? seaR + 1000 : seaR);
+    HorizonMask.Basis(relS, axis, out var mu, out var mn, out var me);
+    double crest = mask.MaskAt(Math.PI / 2, Math.PI / 4, mu, mn, me);
+    var target = relS + (up * Math.Sin(crest - 0.002) + losEast * Math.Cos(crest - 0.002)) * 2e6;
+    double losW = 2 * Math.PI / 21549.425;
+    var losSpin = new DVec3(0, -losW, 0);
+    double dt = 0.006 / losW;
+    var stationLater = CommandCameraMath.CarriedByBody(relS, losCentre, losSpin, dt);
+    Check(DVec3.Dot(stationLater - relS, losEast) > 0, "sight: the body turns its stations eastward");
+    Check(LineOfSightMath.SkylineBlocks(mask, relS, target, losCentre, losCentre, losSpin, 0, axis, 0),
+        "sight: at the first instant the ridge hides the craft");
+    Check(!LineOfSightMath.SkylineBlocks(mask, stationLater, target, losCentre, losCentre, losSpin, dt, axis, 0),
+        "sight: once the body has turned 0.006 rad the craft has risen over the ridge");
+    var stationEarlier = CommandCameraMath.CarriedByBody(relS, losCentre, losSpin, -dt);
+    Check(LineOfSightMath.SkylineBlocks(mask, stationEarlier, target, losCentre, losCentre, losSpin, -dt, axis, 0),
+        "sight: as long before, it was lower still and hidden");
+}
+
 // A station stands on its own ground, whatever altitude the game stored.
 {
     Check(CommandCameraMath.StationGroundAltitude(-230, 64.8) == 64.8, "station: an altitude under the ground is raised to it");
@@ -833,6 +887,66 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         worst = Math.Max(worst, Math.Abs(floatDepth - -95));
     }
     Check(worst > 95, $"lens depth: read from float scaled positions it can be off by more than the lens's height ({worst:F0} m)");
+}
+
+// A command camera's field when no craft sizes it.
+{
+    Check(CommandCameraMath.CarriedFov(2.5) == 2.5, "carried fov: a rebuild opens on the field its camera showed");
+    Check(double.IsNaN(CommandCameraMath.CarriedFov(double.NaN)), "carried fov: nothing carried leaves the lens's default");
+    Check(double.IsNaN(CommandCameraMath.CarriedFov(0)) && double.IsNaN(CommandCameraMath.CarriedFov(double.PositiveInfinity)),
+        "carried fov: an unusable field is not carried");
+    Check(CommandCameraMath.PointFov(true, 500, 1e4, 0.5, 0.02, 30) == 30, "point fov: a direction opens to the widest view");
+    Check(CommandCameraMath.PointFov(false, 0, 1e4, 0.5, 0.02, 30) == 30, "point fov: a surface point without a margin does too");
+    double f = CommandCameraMath.PointFov(false, 100, 1e4, 0.5, 0.02, 30);
+    Check(Near(f, CommandCameraMath.FovForFraction(100, 1e4, 0.5, 0.02, 30), 1e-12) && f < 30,
+        "point fov: a surface point frames its margin, whatever craft is the subject");
+}
+
+// A direction aim straight down from a craft vantage has a pose.
+{
+    var up = new DVec3(0.3, 0.9, 0.1).Normalized;
+    var nNorth = new DVec3(0, 0, 1);
+    var nEast = DVec3.Cross(nNorth, up);
+    var nDown = CommandCameraMath.DirectionVector(up, nNorth, nEast, 0, -90);
+    Check(Near(DVec3.Dot(nDown, up), -1, 1e-12), "nadir: el -90 points straight down");
+    var nStation = new DVec3(7e5, 1e5, 3e4);
+    CommandCameraMath.AimBasis(nStation, nStation + nDown * 50, up, nNorth, out var fwd, out var lensUp);
+    Check(Near(DVec3.Dot(fwd, up), -1, 1e-12) && Near(lensUp.Magnitude, 1, 1e-9) && Math.Abs(DVec3.Dot(lensUp, fwd)) < 1e-9,
+        "nadir: the lens keeps a finite up, from north, when local up is its axis");
+}
+
+// With the optics drawn the zoom stops where the blur spans two pixels of a 576-row frame.
+{
+    double Floor(double lensArcsec, double air, double elev) =>
+        OpticsModel.OpticsFovFloor(0.02, OpticsModel.Assess(new OpticsSite
+        {
+            ResolutionArcsec = lensArcsec, ZenithSeeingArcsec = 1.0, SeeingAirmassPower = 0.6, AirFactor = air, ElevationDeg = elev,
+            SunElevationDeg = double.NaN,
+        }, double.NaN).BlurArcsec, 576);
+    double l1Ground = Floor(15, 1, 45), l3Ground = Floor(1, 1, 45), l3Space = Floor(1, 0, 45);
+    Check(l1Ground > 1.15 && l1Ground < 1.3, $"optics floor: level 1 from the ground stops near 1.2 deg ({l1Ground:F3})");
+    Check(l3Ground > 0.09 && l3Ground < 0.13, $"optics floor: level 3 from the ground stops near 0.1 deg ({l3Ground:F3})");
+    Check(l3Space < l3Ground && Near(l3Space, OpticsModel.FovForBlurPx(1, 576, 2), 1e-12),
+        $"optics floor: with no air only the lens holds it, narrower ({l3Space:F3})");
+    Check(Floor(1, 1, 5) > l3Ground, "optics floor: seeing low in the sky holds the zoom wider");
+    Check(OpticsModel.OpticsFovFloor(0.02, 0.01, 576) == 0.02, "optics floor: a lens sharper than the zoom limit leaves the limit");
+    Check(OpticsModel.OpticsFovFloor(1.0, double.NaN, 576) == 1.0, "optics floor: no blur leaves the zoom limit");
+    double pix = OpticsModel.PixelArcsec(l1Ground, 576);
+    double blur = OpticsModel.CombinedBlur(15, OpticsModel.Seeing(1, OpticsModel.Airmass(45), 0.6, 1));
+    Check(Near(blur / pix, OpticsModel.FloorBlurPx, 1e-9), "optics floor: at the floor the blur spans FloorBlurPx pixels");
+    double floorSpan = OpticsModel.BlurSpanPx(blur, l1Ground, 576);
+    Check(Near(floorSpan, OpticsModel.FloorBlurPx, 1e-9) && OpticsModel.Worthwhile(floorSpan) && OpticsModel.Ramp(floorSpan) > 0,
+        "optics floor: measured on the floor's own rows the effect shows at the floor");
+    Check(OpticsModel.Ramp(OpticsModel.BlurSpanPx(blur, l1Ground, 288)) < 1e-6,
+        "optics floor: measured on half-height rows it would vanish, which is why the rig measures on full rows");
+    var lens = new LensLimits
+    {
+        Known = true, WidthPx = 1024, HeightPx = 576, OpticsOn = true,
+        Knobs = new OpticsKnobs { ResolutionArcsec = 15, SeeingArcsec = 1, SeeingAirmassPower = 0.6 },
+    };
+    lens.FovMinDeg = OpticsModel.OpticsFovFloor(0.02, 15, 576);
+    Check(Near(lens.PixelArcsec, 7.5, 1e-6), "optics floor: a vantage's pixel at the floor is half the lens's blur");
+    Check(Near(lens.ResolutionArcsec(1, 45), blur, 1e-9), "optics floor: the resolution toward a point is still the blur, not the pixel");
 }
 
 // The body a lens stands on, and the quad that adds a layer under seeing's shift.
@@ -1849,6 +1963,46 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     var bad = OpticsKnobs.Unset; bad.BrightnessHold = 2;
     var bad2 = OpticsKnobs.Unset; bad2.ResolutionArcsec = double.PositiveInfinity;
     Check(!bad.Valid && !bad2.Valid, "out of range or infinite knobs are refused");
+}
+
+// How fine a detail a lens resolves at its tightest zoom.
+{
+    var off = new LensLimits { Known = true, FovMinDeg = 0.02, WidthPx = 1024, HeightPx = 576, Knobs = OpticsKnobs.Unset };
+    double pixel = 2 * Math.Tan(0.01 * Math.PI / 180) / 576 * OpticsModel.ArcsecPerRadian;
+    Check(Near(off.PixelArcsec, pixel, 1e-9) && Near(off.PixelArcsec, 0.125, 1e-3), "one pixel at 0.02 degrees over 576 rows is about 0.125 arcsec");
+    Check(off.ResolutionArcsec(0, 90) == off.PixelArcsec && off.ResolutionArcsec(1, 3) == off.PixelArcsec,
+        "with the optics off the pixel is the limit, whatever the air");
+    Check(double.IsNaN(off.LensArcsec), "with the optics off there is no lens blur");
+
+    var knobs = OpticsModel.Defaults;
+    knobs.ResolutionArcsec = 4;
+    var on = off;
+    on.OpticsOn = true;
+    on.Knobs = knobs;
+    Check(on.LensArcsec == 4, "the lens blur is the knob's");
+    Check(Near(on.ResolutionArcsec(0, 10), 4, 1e-12), "in space the lens alone limits, toward any elevation");
+    Check(Near(on.ResolutionArcsec(1, 90), Math.Sqrt(16 + 1), 1e-9), "from Kerbin's sea level at the zenith lens and seeing add in quadrature");
+    double lowBlur = OpticsModel.Assess(new OpticsSite
+    {
+        ResolutionArcsec = 4, ZenithSeeingArcsec = knobs.SeeingArcsec, SeeingAirmassPower = knobs.SeeingAirmassPower,
+        AirFactor = 1, ElevationDeg = 5,
+    }, 1e6).BlurArcsec;
+    Check(on.ResolutionArcsec(1, 5) == lowBlur && lowBlur > on.ResolutionArcsec(1, 90), "low in the sky it is the blur the optics draw, and worse");
+    Check(on.ResolutionArcsec(0.5, 5) < lowBlur, "thinner air blurs less");
+
+    var wide = on;
+    wide.FovMinDeg = 1;
+    wide.Knobs.ResolutionArcsec = 1;
+    Check(Near(wide.ResolutionArcsec(0, 90), wide.PixelArcsec, 1e-12) && wide.PixelArcsec > 6,
+        "a lens finer than its widest pixel is held to the pixel");
+    var sharp = on;
+    sharp.Knobs.ResolutionArcsec = 0;
+    Check(sharp.ResolutionArcsec(0, 90) == sharp.PixelArcsec, "a perfect lens in space is held to the pixel");
+
+    var unknown = LensLimits.Unknown;
+    unknown.OpticsOn = true;
+    Check(double.IsNaN(unknown.PixelArcsec) && double.IsNaN(unknown.ResolutionArcsec(1, 45)) && double.IsNaN(unknown.LensArcsec),
+        "an unknown lens resolves nothing");
 }
 
 {

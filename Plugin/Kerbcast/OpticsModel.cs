@@ -91,6 +91,53 @@ namespace Kerbcast
         public double SunElevationDeg;
     }
 
+    /*
+     * How fine a detail a command camera's lens can show at its tightest zoom:
+     * the zoom limit and frame size it renders with, and its optics when they
+     * are drawn. Unity-free, so the formula is tested without the game.
+     */
+    internal struct LensLimits
+    {
+        public bool Known;
+        /* The tightest vertical field of view, degrees. With the optics drawn, the build sets it no narrower than the lens's own blur over FloorBlurPx (OpticsModel.OpticsFovFloor), the best case with no air in the way. */
+        public double FovMinDeg;
+        public int WidthPx;
+        public int HeightPx;
+        /* The optics blur is drawn; Knobs means nothing otherwise. */
+        public bool OpticsOn;
+        public OpticsKnobs Knobs;
+
+        public static LensLimits Unknown => new LensLimits { Knobs = OpticsKnobs.Unset };
+
+        /* Arcseconds one pixel covers at the frame's centre at the tightest zoom. */
+        public double PixelArcsec => Known ? OpticsModel.PixelArcsec(FovMinDeg, HeightPx) : double.NaN;
+
+        /* The lens's own blur in arcseconds, NaN with the optics off. */
+        public double LensArcsec => Known && OpticsOn ? Math.Max(0.0, Knobs.ResolutionArcsec) : double.NaN;
+
+        /*
+         * The smallest angle, in arcseconds, the lens resolves toward a target
+         * `elevationDeg` above its horizon with `airFactor` air around it (see
+         * OpticsModel.AirFactor): one pixel at the tightest zoom, or the blur
+         * the optics draw there when that is wider.
+         */
+        public double ResolutionArcsec(double airFactor, double elevationDeg)
+        {
+            double pixel = PixelArcsec;
+            if (!OpticsOn || double.IsNaN(pixel)) return pixel;
+            var r = OpticsModel.Assess(new OpticsSite
+            {
+                ResolutionArcsec = Knobs.ResolutionArcsec,
+                ZenithSeeingArcsec = Knobs.SeeingArcsec,
+                SeeingAirmassPower = Knobs.SeeingAirmassPower,
+                AirFactor = airFactor,
+                ElevationDeg = elevationDeg,
+                SunElevationDeg = double.NaN,
+            }, double.NaN);
+            return Math.Max(pixel, r.BlurArcsec);
+        }
+    }
+
     /* What a lens makes of a target. Every number depends only on the lens,
        the range and the air at the lens, so it reads the same whichever body
        the lens stands on and whichever way it looks. */
@@ -201,7 +248,8 @@ namespace Kerbcast
             return t * t * (3.0 - 2.0 * t) * Math.Min(1.0, airFactor);
         }
 
-        public static OpticsReading Assess(OpticsSite site, double rangeM)
+        /* `daySkyStops` is what full daylight at the lens costs the clarity score; a camera network tunes it. */
+        public static OpticsReading Assess(OpticsSite site, double rangeM, double daySkyStops = DaySkyStops)
         {
             double airmass = site.AirFactor > 0 ? Airmass(site.ElevationDeg) : 1.0;
             double seeing = Seeing(site.ZenithSeeingArcsec, airmass, site.SeeingAirmassPower, site.AirFactor);
@@ -218,7 +266,7 @@ namespace Kerbcast
                 BlurOnTargetM = onTarget,
                 ExtinctionStops = extinction,
                 DaySky = day,
-                ClarityStops = -Math.Log(Math.Max(double.IsNaN(onTarget) ? 1.0 : onTarget, 1e-9), 2.0) - extinction - DaySkyStops * day,
+                ClarityStops = -Math.Log(Math.Max(double.IsNaN(onTarget) ? 1.0 : onTarget, 1e-9), 2.0) - extinction - daySkyStops * day,
             };
         }
 
@@ -237,11 +285,33 @@ namespace Kerbcast
             return from * Math.Pow(to / from, f);
         }
 
+        /* With the optics drawn, the zoom stops where the blur spans this many pixels, as a telescope's lens sets how far it is worth magnifying. */
+        public const double FloorBlurPx = 2.0;
+
+        /* The vertical field of view at which a blur of `blurArcsec` spans `px` pixels of a `rows`-high frame: PixelArcsec turned round. NaN without a blur or a frame. */
+        public static double FovForBlurPx(double blurArcsec, int rows, double px)
+        {
+            if (!(blurArcsec > 0) || rows <= 0 || !(px > 0) || double.IsInfinity(blurArcsec)) return double.NaN;
+            double pixelRad = blurArcsec / px / ArcsecPerRadian;
+            return 2.0 * Math.Atan(pixelRad * rows * 0.5) * 180.0 / Math.PI;
+        }
+
+        /* A lens's narrowest field with the optics drawn: the zoom limit `fovMinDeg`, or where a blur of `blurArcsec` spans FloorBlurPx of a `rows`-high frame when that is wider. */
+        public static double OpticsFovFloor(double fovMinDeg, double blurArcsec, int rows)
+        {
+            double optics = FovForBlurPx(blurArcsec, rows, FloorBlurPx);
+            return double.IsNaN(optics) ? fovMinDeg : Math.Max(fovMinDeg, optics);
+        }
+
         /* Arcseconds one pixel covers at the frame's centre. */
         public static double PixelArcsec(double verticalFovDeg, int rows) =>
             rows > 0 && verticalFovDeg > 0
                 ? 2.0 * Math.Tan(verticalFovDeg * 0.5 * Math.PI / 180.0) / rows * ArcsecPerRadian
                 : double.NaN;
+
+        /* The pixels a blur of `blurArcsec` spans of a `rows`-high frame at this field: NaN without a field or a frame. */
+        public static double BlurSpanPx(double blurArcsec, double verticalFovDeg, int rows) =>
+            blurArcsec / PixelArcsec(verticalFovDeg, rows);
 
         /* The angular radius, radians, of the body a lens stands on: a lens at or under its datum (ground below sea level) has it filling half the sky. */
         public static double HomeAngularRadius(double fromCentreM, double radiusM) =>

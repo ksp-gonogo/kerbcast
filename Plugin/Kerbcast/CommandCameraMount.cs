@@ -12,15 +12,27 @@ namespace Kerbcast
         private readonly GameObject _anchor;
         private readonly float _defaultFov;
         private readonly string _name;
+        private readonly string _group;
 
-        public CommandCameraSite Site { get; }
+        /* Set again only by a camera network's cut; everything that reads the site reads it fresh. */
+        public CommandCameraSite Site { get; set; }
 
-        /* `name` replaces the feed name the site would give it. */
-        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, string name = null)
+        /* The lens's narrowest field now, in degrees: it follows the Tracking Station level and the optics setting. */
+        public System.Func<double> FovMinSource { get; }
+
+        /* The field the camera opens on instead of the default, NaN for none: read when the camera is built, before its first manifest goes out. */
+        public float StartFov { get; }
+
+        /* `name` replaces the feed name the site would give it, and `group` the site's name clients group it under. */
+        public CommandCameraMount(CommandCameraSite site, uint flightId, float defaultFov, System.Func<double> fovMin,
+            string name = null, string group = null, float startFov = float.NaN)
         {
             Site = site;
+            FovMinSource = fovMin;
             _name = name;
+            _group = group;
             _defaultFov = defaultFov;
+            StartFov = startFov;
             _anchor = new GameObject($"Kerbcast_{flightId}_CommandAnchor");
         }
 
@@ -51,8 +63,9 @@ namespace Kerbcast
             : Site.NodeName == "LaunchPad" ? "Launchpad camera"
             : $"{Site.DisplayName} camera";
         /* A command camera has no owning craft; the station's name is the stable
-           label clients group and key it by. */
-        public string VesselDisplayName => Site.DisplayName;
+           label clients group and key it by. A camera network's is its own
+           name, which a cut does not change. */
+        public string VesselDisplayName => !string.IsNullOrEmpty(_group) ? _group : Site.DisplayName;
 
         public bool IsAlive => _anchor != null && Site.Body != null;
         public bool OwnsPart(Part part) => false;

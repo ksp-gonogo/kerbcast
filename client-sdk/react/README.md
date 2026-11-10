@@ -253,6 +253,69 @@ const useDelayedStream: CameraStreamHook = (flightId) => {
 <CameraFeed flightId={null} useStream={useDelayedStream} />;
 ```
 
+## Network icon
+
+`NetworkIcon` is the glyph for a camera network: nodes joined along a
+line. It takes `size` (default 14) and `strokeWidth` (default 1.75), and
+inherits `currentColor`:
+
+```tsx
+import { NetworkIcon } from "@ksp-gonogo/kerbcast-react";
+
+<NetworkIcon size={16} />;
+```
+
+`CameraFeed` shows it before the name in a network feed's title. The
+`titleLeading` prop changes what sits there:
+
+```tsx
+<CameraFeed flightId={id} />;                          // default: icon on network feeds only
+<CameraFeed flightId={id} titleLeading={null} />;      // nothing on any feed
+<CameraFeed flightId={id} titleLeading={<MyGlyph />} />; // this node on every feed
+<CameraFeed
+  flightId={id}
+  titleLeading={(camera, isNetwork) => (isNetwork ? <MyGlyph /> : null)}
+/>;
+```
+
+The slot never shrinks, so a long name ellipsizes instead. It adds to the
+title button's accessible name only what your content names: `NetworkIcon`
+is `aria-hidden`, so give your own node an `aria-label` if it should be
+announced.
+
+## Title lines
+
+A network feed's title has two lines inside the one title button. Line 1 is
+the icon, the vantage's label and the camera-menu chevron; line 2, in a
+smaller size, is "via <network>". Each line ellipsizes on its own, and the
+button's accessible name carries both. The second line sits inside the bar
+the title already used, so nothing else moves. Any feed's title can be shaped
+with two props, each a node or a function of
+`(camera, isNetwork, vantage)` (`vantage` is the network's current
+`NetworkVantageReading`, or null):
+
+```tsx
+<CameraFeed flightId={id} titleText="Mission feed" />;             // replaces line 1
+<CameraFeed
+  flightId={id}
+  titleSubtitle={(camera, isNetwork) => (isNetwork ? null : camera.vesselName)}
+/>;                                                                // sets line 2
+```
+
+`titleSubtitle` left unset gives "via <network>" on a network feed and
+nothing elsewhere; null or false draws no second line at all. The wording of
+the default lines is `NETWORK_FEED_TEXT` (`site` and `via`); `networkFeedName`
+joins them for one-line uses.
+
+The title, like the rest of the feed's chrome, shows only while the pointer
+or focus is on the feed. `alwaysShowTitle` keeps it visible; the title stays
+clickable and the picture still pans beneath the rest of the bar.
+
+`isNetworkCamera(camera, networks?)` answers whether a camera is a network,
+and holds while the feed is blanked or on standby. Pass `useNetworks()` as
+`networks` so a network made by a mod is recognised while its camera is
+down; a saved network is recognised without it.
+
 ## License
 
 [MIT](./LICENSE). This SDK is the interface to kerbcast, so it is permissive:

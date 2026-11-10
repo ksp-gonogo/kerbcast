@@ -23,7 +23,12 @@ namespace Kerbcast
        from the camera's local horizon; neither has a subject of its own, so
        the camera's default craft stays the subject. Every kind takes a
        framing margin in metres, added to the subject's own radius for the
-       field of view and the bracket. */
+       field of view and the bracket.
+
+       The field of view follows the subject on a Vessel, Orbit or
+       PositionAt aim. A Surface aim frames its margin about the point, or
+       opens to the widest view without one, and a Direction aim opens to
+       the widest view: neither is sized by a craft. */
     public sealed class CommandAim
     {
         public CommandAimKind Kind { get; }
@@ -122,8 +127,7 @@ namespace Kerbcast
 
         /* Holds a direction from the camera's local horizon: `azimuth` degrees
            clockwise from north, `elevation` degrees above the horizon (-90..90).
-           The view is zoomed for the subject's range, so the subject is framed
-           when it passes through. */
+           The view opens to its widest. */
         public static CommandAim Direction(double azimuth, double elevation, double framingMarginM = 0) =>
             new CommandAim(CommandAimKind.Direction, framingMarginM, az: azimuth, el: elevation);
 

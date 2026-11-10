@@ -67,6 +67,31 @@ describe("MockSidecar", () => {
     expect(client.cameras.map((c) => c.flightId)).toEqual([hill.flightId]);
   });
 
+  it("a command camera takes no manual zoom, as the sidecar answers it", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    sidecar.addCamera({ flightId: 300, kind: CameraKind.Command });
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    const errors: ErrorPayload[] = [];
+    client.on("error", (e) => errors.push(e));
+    await client.connect([42, 300]);
+    sidecar.open();
+
+    expect(client.cameras.find((c) => c.flightId === 300)?.supportsZoom).toBe(false);
+    expect(client.cameras.find((c) => c.flightId === 42)?.supportsZoom).toBe(true);
+
+    await client.camera(300).setFov(5);
+    await client.camera(300).setZoomRate(1);
+    expect(errors.map((e) => e.message)).toEqual([
+      "camera 300 does not support zoom",
+      "camera 300 does not support zoom",
+    ]);
+
+    await client.camera(42).setFov(30);
+    await client.camera(42).setZoomRate(1);
+    expect(errors).toHaveLength(2);
+  });
+
   it("models command camera aims and the authority lock", async () => {
     const sidecar = new MockSidecar();
     sidecar.setDefaultCommandSubject(5);
@@ -269,6 +294,38 @@ describe("MockSidecar", () => {
 
     await client.setTrackTarget(7, TrackMode.None);
     expect(client.cameras.find((c) => c.flightId === 7)?.trackMode).toBe(TrackMode.None);
+  });
+
+  it("removeCamera drops a camera and resends the list; open() resends the site catalog", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    sidecar.addCamera({ flightId: 43 });
+    sidecar.fireSiteCatalog({ stations: [], vessels: [] });
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([42]);
+    sidecar.open();
+    expect(client.siteCatalog()?.vessels).toEqual([]);
+    sidecar.removeCamera(43);
+    expect(client.cameras.map((c) => c.flightId)).toEqual([42]);
+  });
+
+  it("answers network saves through onSave and refuses a mod's network", async () => {
+    const saved: boolean[] = [];
+    const sidecar = new MockSidecar().withNetworks(
+      [{ networkId: "m", name: "Mod net", vantages: [{ vantage: { kind: CommandVantageKind.Station, station: "KSC" } }], owner: "a-mod" }],
+      { onSave: (_def, created) => (saved.push(created), 900) },
+    );
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    await client.connect([]);
+    sidecar.open();
+    const vantages = [{ vantage: { kind: CommandVantageKind.Station, station: "KSC" } }];
+    const { networkId } = await client.saveNetwork({ name: "  ", vantages });
+    const made = client.networks().find((n) => n.networkId === networkId);
+    expect(made).toMatchObject({ name: "Camera network", revision: 1, flightId: 900 });
+    await client.saveNetwork({ networkId, baseRevision: 1, name: "Renamed", vantages });
+    expect(client.networks().find((n) => n.networkId === networkId)?.revision).toBe(2);
+    expect(saved).toEqual([true, false]);
+    await expect(client.saveNetwork({ networkId: "m", vantages })).rejects.toMatchObject({ code: "notOwner" });
   });
 
   it("updateCamera pushes state-change to the client", async () => {

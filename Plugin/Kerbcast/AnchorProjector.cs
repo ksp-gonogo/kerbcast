@@ -598,6 +598,8 @@ namespace Kerbcast
                     if (part == ignorePart || (ignoreVessel != null && part.vessel == ignoreVessel) || f.Cam.OwnsPart(part)) continue;
                     /* A craft this camera hides is not where the frame draws it. */
                     if (f.Cam.Picture.Hides(part.vessel)) continue;
+                    /* Nor is the craft its lens stands in drawn at all. */
+                    if (f.Cam.Picture.HidesOwn(part.vessel)) continue;
                 }
                 return true;
             }

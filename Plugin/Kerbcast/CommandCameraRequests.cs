@@ -10,6 +10,8 @@ namespace Kerbcast
         Create,
         Destroy,
         Aim,
+        SaveNetwork,
+        DeleteNetwork,
     }
 
     /* A command camera aim as a client sent it, before KerbcastControl.AimOf
@@ -64,9 +66,37 @@ namespace Kerbcast
         private static bool Vec3(double[] v) => v != null && v.Length == 3 && Finite(v[0]) && Finite(v[1]) && Finite(v[2]);
     }
 
+    /* One vantage of a saved network, as a client sent it and the save keeps it. */
+    internal sealed class SavedVantage
+    {
+        public CommandVantage Vantage;
+        /* Null keeps the site's own name. */
+        public string Label;
+        public bool Fallback;
+        /* The craft networks.cfg keeps for this vantage until the game saves the merge that moved it; 0 with none pending. */
+        public uint UnsavedMergeOf;
+    }
+
+    /* The codes a NetworkResult carries. */
+    internal static class SavedNetworkCodes
+    {
+        public const string NotOwner = "notOwner";
+        public const string NotFound = "notFound";
+        public const string Stale = "stale";
+        public const string NoVantages = "noVantages";
+        public const string TooManyVantages = "tooManyVantages";
+        public const string BadVantage = "badVantage";
+        public const string BadAim = "badAim";
+        public const string BadName = "badName";
+        public const string BadNumber = "badNumber";
+        public const string Full = "full";
+        public const string NotRunning = "notRunning";
+        public const string WriteFailed = "writeFailed";
+    }
+
     /* One entry of global.commands.json, which the sidecar appends to for
-       every create-command-camera, destroy-command-camera and
-       set-command-aim a client sends. */
+       every create-command-camera, destroy-command-camera, set-command-aim,
+       save-network and delete-network a client sends. */
     internal sealed class CommandCameraRequest
     {
         public ulong Id;
@@ -79,6 +109,22 @@ namespace Kerbcast
         public CommandAimSpec Aim;
         /* Destroy and Aim. */
         public uint FlightId;
+
+        /* SaveNetwork and DeleteNetwork: the network named (empty to create
+           one), the revision the client edited (-1 when it sent none), the
+           vantages and options. Token and Name serve them too, and Aim holds
+           the watch. A request too malformed to apply keeps its token with
+           Refusal set, so the client still hears why. */
+        public string NetworkId = "";
+        public long BaseRevision = -1;
+        public List<SavedVantage> Vantages;
+        public double MinHoldUt = double.NaN, MinHoldRealSeconds = double.NaN, MarginStops = double.NaN;
+        public string RefusalCode;
+        public string RefusalText;
+        /* Unix milliseconds when the sidecar queued it; NaN from a sidecar that does not say. */
+        public double QueuedAtMs = double.NaN;
+
+        public bool IsNetworkOp => Op == CommandRequestOp.SaveNetwork || Op == CommandRequestOp.DeleteNetwork;
 
         /* The requests in `json`, malformed entries skipped with a reason in
            `skipped`. An unreadable file yields an empty list. */
@@ -110,7 +156,7 @@ namespace Kerbcast
             if (o == null) { why = "not an object"; return null; }
             double idNum = Num(o, "id", -1);
             if (idNum < 1 || idNum != Math.Floor(idNum)) { why = "missing id"; return null; }
-            var req = new CommandCameraRequest { Id = (ulong)idNum };
+            var req = new CommandCameraRequest { Id = (ulong)idNum, QueuedAtMs = Num(o, "queuedAtMs", double.NaN) };
             string op = Str(o, "op");
             switch (op)
             {
@@ -128,8 +174,52 @@ namespace Kerbcast
                     return req;
                 case "aim":
                     req.Op = CommandRequestOp.Aim;
+                    req.Token = Str(o, "token");
                     req.FlightId = U32(o, "flightId");
                     req.Aim = AimFrom(Obj(o, "aim"));
+                    return req;
+                case "saveNetwork":
+                    req.Op = CommandRequestOp.SaveNetwork;
+                    req.Token = Str(o, "token");
+                    req.NetworkId = Str(o, "networkId");
+                    double rev = Num(o, "baseRevision", -1);
+                    req.BaseRevision = rev >= 0 && rev <= uint.MaxValue && rev == Math.Floor(rev) ? (long)rev : -1;
+                    req.Name = Str(o, "name");
+                    req.Aim = AimFrom(Obj(o, "watch"));
+                    var options = Obj(o, "options");
+                    if (options != null)
+                    {
+                        req.MinHoldUt = Num(options, "minHoldUt", double.NaN);
+                        req.MinHoldRealSeconds = Num(options, "minHoldRealSeconds", double.NaN);
+                        req.MarginStops = Num(options, "marginStops", double.NaN);
+                    }
+                    req.Vantages = new List<SavedVantage>();
+                    if (o.TryGetValue("vantages", out var vs) && vs is List<object> vlist)
+                    {
+                        for (int i = 0; i < vlist.Count; i++)
+                        {
+                            var item = vlist[i] as Dictionary<string, object>;
+                            var vantage = VantageFrom(item != null ? Obj(item, "vantage") : null, out string bad);
+                            if (vantage == null)
+                            {
+                                req.RefusalCode = SavedNetworkCodes.BadVantage;
+                                req.RefusalText = $"vantage {i}: {bad}";
+                                break;
+                            }
+                            string label = Str(item, "label");
+                            req.Vantages.Add(new SavedVantage
+                            {
+                                Vantage = vantage,
+                                Label = label.Length > 0 ? label : null,
+                                Fallback = Bool(item, "fallback"),
+                            });
+                        }
+                    }
+                    return req;
+                case "deleteNetwork":
+                    req.Op = CommandRequestOp.DeleteNetwork;
+                    req.Token = Str(o, "token");
+                    req.NetworkId = Str(o, "networkId");
                     return req;
             }
             why = $"request {req.Id}: unknown op '{op}'";
@@ -238,6 +328,25 @@ namespace Kerbcast
         {
             foreach (var r in existing)
                 if (r.Id > LastAppliedId) LastAppliedId = r.Id;
+        }
+
+        /* How long before a scene starts a network save or delete is still applied in it. */
+        public const double CarryOverMs = 60000;
+
+        /*
+         * The network saves and deletes in a file a new scene seeds from that
+         * were queued in the last CarryOverMs: sent while the game was loading
+         * or in a scene that could not apply them, they are applied now rather
+         * than lost. Their tokens keep a repeat from applying twice.
+         */
+        public static List<CommandCameraRequest> CarriedOver(List<CommandCameraRequest> existing, double nowMs)
+        {
+            var carried = new List<CommandCameraRequest>();
+            foreach (var r in existing)
+                if (r.IsNetworkOp && !double.IsNaN(r.QueuedAtMs) && nowMs - r.QueuedAtMs <= CarryOverMs && r.QueuedAtMs <= nowMs + 5000)
+                    carried.Add(r);
+            carried.Sort((a, b) => a.Id.CompareTo(b.Id));
+            return carried;
         }
 
         public List<CommandCameraRequest> Fresh(List<CommandCameraRequest> requests)

@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../Kerbcast/CommandCameraMath.cs" />
+    <Compile Include="../Kerbcast/LineOfSightMath.cs" />
     <Compile Include="../Kerbcast/CraftFixState.cs" />
     <Compile Include="../Kerbcast/AimSlew.cs" />
     <Compile Include="../Kerbcast/OpticsModel.cs" />

@@ -77,6 +77,8 @@ static class OutsidePins
             "observed anchor: a hidden craft's axes, turned to its stand-in"),
         Pin.Line("AnchorProjector.cs", "AnchorProjector.Hidden", "if (f.Cam.Picture.Hides(part.vessel)) continue;", 1,
             "observed anchor: a hidden craft's live parts are not in the frame, so they occlude nothing"),
+        Pin.Line("AnchorProjector.cs", "AnchorProjector.Hidden", "if (f.Cam.Picture.HidesOwn(part.vessel)) continue;", 1,
+            "observed anchor: the craft the lens stands in is not drawn, so its parts occlude nothing"),
         Pin.Line("AnchorProjector.cs", "AnchorProjector.HiddenPartFace", "if (!FlightGlobals.FindLoadedPart(partPid, out var part) || part == null || part.transform == null) return false;", 1,
             "observed anchor: a docking port's face on its part, its fixed geometry, carried to the hidden craft's stand-in"),
         Pin.Line("AnchorProjector.cs", "AnchorProjector.HiddenPartFace", "at = inv * (face.position - part.transform.position);", 1,

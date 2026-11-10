@@ -660,6 +660,18 @@ namespace Kerbcast
             return FovForTan(FramingTan(radius, distance), fraction, fovMin, fovMax);
         }
 
+        /* The field a camera rebuilt under the same flightId opens on: what the one it replaces showed. NaN leaves the lens's default. */
+        public static double CarriedFov(double shown) => UsableFov(shown) ? shown : double.NaN;
+
+        private static bool UsableFov(double fov) => fov > 0 && !double.IsInfinity(fov);
+
+        /* The field for an aim with no craft to frame: a Surface aim's margin
+           about the point at `fraction` of the frame, otherwise (a Direction
+           aim, or no margin) the widest view. */
+        public static double PointFov(bool direction, double marginM, double distance, double fraction,
+            double fovMin, double fovMax) =>
+            direction || !(marginM > 0) ? fovMax : FovForFraction(marginM, distance, fraction, fovMin, fovMax);
+
         /* Tangent of the half-angle a sphere of `radius` subtends at `distance`; infinite with the lens inside it. */
         public static double FramingTan(double radius, double distance)
         {
@@ -1006,6 +1018,8 @@ namespace Kerbcast
         public const string BlankNotResponding = DefaultSilentText;
 
         public const string BlankVantageGone = "vantage craft gone";
+        /* A camera network none of whose vantages can stand in now. */
+        public const string BlankNoVantage = "no vantage";
 
         /* Why a command feed is blanked, or null to show it. A lens whose
            vantage craft no longer exists has no position, so that blanks with

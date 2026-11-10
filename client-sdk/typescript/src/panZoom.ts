@@ -85,7 +85,8 @@ export interface PanZoomControllerOptions {
    * How close an echo has to get to an outstanding setpoint (degrees) before
    * the camera counts as having arrived. Wider than the plugin's own 0.01
    * degree reporting threshold so a rounding difference does not hold the
-   * setpoint open.
+   * setpoint open. On a range wider than {@link LOG_ZOOM_RATIO} the FoV uses
+   * the smaller of this and {@link LOG_SETTLE_FRACTION} of the setpoint.
    * Default: 0.5.
    */
   settleEpsilonDeg?: number;
@@ -114,6 +115,68 @@ export interface PanZoomControllerOptions {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+/**
+ * A zoom range wider than this ratio is stepped and slid by factors rather
+ * than degrees, so the narrow end is as easy to reach as the wide one.
+ * Stock part cameras sit well under it and keep steps in degrees.
+ */
+export const LOG_ZOOM_RATIO = 20;
+
+/** The factor one zoom nudge changes the field by on a wide range. */
+export const LOG_ZOOM_NUDGE_FACTOR = 1.5;
+
+/**
+ * How close a FoV echo has to get on a wide range, as a fraction of the
+ * setpoint: on a 0.02 to 30 degree slider half a degree is nearly half of it.
+ */
+export const LOG_SETTLE_FRACTION = 0.02;
+
+/** Whether `fovMin`..`fovMax` is wide enough to zoom by factors. */
+export function isLogZoom(fovMin: number, fovMax: number): boolean {
+  return fovMin > 0 && fovMax / fovMin > LOG_ZOOM_RATIO;
+}
+
+/**
+ * How a zoom slider maps its position to a field of view: linear in degrees
+ * for a part camera's range, logarithmic for a wide one. `min`, `max` and
+ * `step` are the slider's own; `toFov` and `fromFov` convert. `keyStep` is
+ * how far one arrow key press moves it.
+ */
+export interface FovSliderScale {
+  min: number;
+  max: number;
+  step: number;
+  keyStep: number;
+  toFov(position: number): number;
+  fromFov(fov: number): number;
+}
+
+const LOG_SLIDER_STEPS = 1000;
+/* About a fifth of the field per press on a 0.02 to 30 degree range. */
+const LOG_SLIDER_KEY_STEP = 25;
+
+export function fovSliderScale(fovMin: number, fovMax: number): FovSliderScale {
+  if (!isLogZoom(fovMin, fovMax)) {
+    return {
+      min: fovMin,
+      max: fovMax,
+      step: 0.5,
+      keyStep: 0.5,
+      toFov: (p) => clamp(p, fovMin, fovMax),
+      fromFov: (f) => clamp(f, fovMin, fovMax),
+    };
+  }
+  const span = Math.log(fovMax / fovMin);
+  return {
+    min: 0,
+    max: LOG_SLIDER_STEPS,
+    step: 1,
+    keyStep: LOG_SLIDER_KEY_STEP,
+    toFov: (p) => clamp(fovMin * Math.exp((clamp(p, 0, LOG_SLIDER_STEPS) / LOG_SLIDER_STEPS) * span), fovMin, fovMax),
+    fromFov: (f) => (Math.log(clamp(f, fovMin, fovMax) / fovMin) / span) * LOG_SLIDER_STEPS,
+  };
 }
 
 function applyDeadzone(v: number, deadzone: number): number {
@@ -177,6 +240,9 @@ export class PanZoomController {
   private panSetpoint: (Settling & { yaw: number; pitch: number }) | null =
     null;
   private fovSetpoint: (Settling & { fov: number }) | null = null;
+
+  // What the camera last reported, for a refused setpoint to fall back to.
+  private echoFov: number | null = null;
 
   // FoV slider state.
   private _sliderFov = 0;
@@ -253,6 +319,7 @@ export class PanZoomController {
       panPitchMin: state.panPitchMin,
       panPitchMax: state.panPitchMax,
     };
+    this.echoFov = state.fov;
 
     const panIdle =
       !this.ballDragging &&
@@ -316,7 +383,9 @@ export class PanZoomController {
     if (r === this.sentZoomRate) return;
     this.sentZoomRate = r;
     this.fovSetpoint = null; // same reasoning as setPanRate
-    void this.sink.setZoomRate(r);
+    void Promise.resolve(this.sink.setZoomRate(r)).catch(() => {
+      if (this.sentZoomRate === r) this.sentZoomRate = 0;
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -350,19 +419,19 @@ export class PanZoomController {
 
   /**
    * Discrete FoV step. `deltaSign: -1` = zoom in (FoV decreases by
-   * `fovNudgeDeg`), `+1` = zoom out (FoV increases). Clamped to fov bounds.
+   * `fovNudgeDeg`), `+1` = zoom out (FoV increases). On a range wider than
+   * {@link LOG_ZOOM_RATIO} the step is a factor of
+   * {@link LOG_ZOOM_NUDGE_FACTOR} instead. Clamped to fov bounds.
    * Mirrors nudgeZoom (which calls onFovChange internally).
    */
   nudgeZoom(deltaSign: number): void {
     const b = this.bounds;
-    const next = clamp(
-      this.localFov + deltaSign * this.fovNudgeDeg,
-      b.fovMin,
-      b.fovMax,
-    );
+    const stepped = isLogZoom(b.fovMin, b.fovMax)
+      ? this.localFov * Math.pow(LOG_ZOOM_NUDGE_FACTOR, Math.sign(deltaSign))
+      : this.localFov + deltaSign * this.fovNudgeDeg;
+    const next = clamp(stepped, b.fovMin, b.fovMax);
     this.localFov = next;
-    this.fovSetpoint = { fov: next, ...newSettling() };
-    void this.sink.setFov(next);
+    this.sendFov(next);
   }
 
   // ---------------------------------------------------------------------------
@@ -393,6 +462,21 @@ export class PanZoomController {
   setFovSliderDragging(dragging: boolean): void {
     this.sliderDragging = dragging;
     if (!dragging) this.flushFovSlider();
+  }
+
+  /**
+   * The game refused the outstanding FoV setpoint (a command lock, say):
+   * the camera is not going there, so stop holding the slider at it and show
+   * what the camera last reported. A refusal the sink rejects is handled
+   * already; call this for one that arrives some other way. No effect with
+   * no setpoint outstanding, or while the user has the slider.
+   */
+  fovRefused(): void {
+    if (this.fovSetpoint === null) return;
+    this.fovSetpoint = null;
+    if (this.pendingFov !== null || this.sliderDragging || this.echoFov === null) return;
+    this.localFov = this.echoFov;
+    this.setSliderFovInternal(this.echoFov);
   }
 
   /**
@@ -476,9 +560,16 @@ export class PanZoomController {
       const fov = clamp(this.pendingFov, this.bounds.fovMin, this.bounds.fovMax);
       this.localFov = fov;
       this.pendingFov = null;
-      this.fovSetpoint = { fov, ...newSettling() };
-      void this.sink.setFov(fov);
+      this.sendFov(fov);
     }
+  }
+
+  private sendFov(fov: number): void {
+    const setpoint = { fov, ...newSettling() };
+    this.fovSetpoint = setpoint;
+    void Promise.resolve(this.sink.setFov(fov)).catch(() => {
+      if (this.fovSetpoint === setpoint) this.fovRefused();
+    });
   }
 
   /*
@@ -503,7 +594,11 @@ export class PanZoomController {
   private fovEchoWins(fov: number): boolean {
     const sp = this.fovSetpoint;
     if (sp === null) return true;
-    if (!this.settled(sp, Math.abs(fov - sp.fov))) return false;
+    const b = this.bounds;
+    const eps = isLogZoom(b.fovMin, b.fovMax)
+      ? Math.min(this.settleEpsilonDeg, sp.fov * LOG_SETTLE_FRACTION)
+      : this.settleEpsilonDeg;
+    if (!this.settled(sp, Math.abs(fov - sp.fov), eps)) return false;
     this.fovSetpoint = null;
     return true;
   }
@@ -515,8 +610,7 @@ export class PanZoomController {
     short and is reporting the same position forever, which no progress-based
     rule can see). Mutates the settling bookkeeping.
   */
-  private settled(sp: Settling, distance: number): boolean {
-    const eps = this.settleEpsilonDeg;
+  private settled(sp: Settling, distance: number, eps = this.settleEpsilonDeg): boolean {
     if (distance <= eps) return true;
     if (Date.now() - sp.issuedAt >= this.settleTimeoutMs) return true;
     const prev = sp.lastDistance;

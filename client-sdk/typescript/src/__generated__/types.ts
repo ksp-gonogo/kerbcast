@@ -257,7 +257,7 @@ export enum CommandAimKind {
 }
 
 /**
- * Whether a command camera's tracking network could watch a craft. Only
+ * Whether a command camera's camera network could watch a craft. Only
  * `NotTrackable` applies outside career (or with the tracking rules off),
  * and the world-model codes only while a command authority's world model
  * governs the feed.
@@ -296,6 +296,52 @@ export interface CommandTarget {
 	eligibility: CommandTargetEligibility;
 	/** Short display text for `eligibility`. */
 	eligibilityText: string;
+}
+
+/** One vantage of a camera network camera. */
+export interface CommandNetworkVantage {
+	/** The site key the camera reports while it stands here. */
+	siteKey: string;
+	/** The host's label for it, or the site's own name. */
+	label: string;
+	/**
+	 * `ok`, or why it cannot show the craft: `occluded`, `belowHorizon`,
+	 * `tooFar`, `unknown`, `subject`, `gone`, `disabled` (a ground
+	 * station the game has turned off), `unresolved`, `unplaced`, `pending`
+	 * or `noSubject`. New
+	 * values may appear; treat one you do not recognise as unable to see.
+	 */
+	state: string;
+	/** The camera stands here now. */
+	active: boolean;
+	/** Where the camera stands when no vantage can see the craft. */
+	fallback?: boolean;
+	/**
+	 * The body hiding the craft from this vantage while `state` is
+	 * `occluded`. Absent otherwise and from games older than 1.12.
+	 */
+	occluder?: string;
+}
+
+/** A camera network camera's vantages, as its last scoring pass left them. */
+export interface CommandNetworkInfo {
+	/** The camera's own name, which stays the same through every cut. */
+	name: string;
+	/**
+	 * The camera has no aim of its own, so it watches the craft the game
+	 * picks by default (the active vessel in flight); false once it is aimed
+	 * at a chosen craft, the active one included. Absent from a game older
+	 * than 1.12.
+	 */
+	followsActiveVessel?: boolean;
+	/**
+	 * `ok`, or `noView` when no vantage can see the craft and the camera
+	 * stays on its last vantage (or the host's fallback). Treat an
+	 * unrecognised value as `noView`.
+	 */
+	state: string;
+	/** Every vantage in the host's order. */
+	vantages: CommandNetworkVantage[];
 }
 
 /**
@@ -372,7 +418,7 @@ export interface CommandCentreInfo {
 	/**
 	 * Every craft the camera could watch, eligible first, then nearest
 	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
-	 * only reports what the tracking network would allow. A control channel
+	 * only reports what the camera network would allow. A control channel
 	 * message has a size limit, so with hundreds of craft the list over it
 	 * is cut from the end and `targets_omitted` counts what was left out.
 	 * A cut list keeps the feed's subject, appended at the end out of the
@@ -397,6 +443,14 @@ export interface CommandCentreInfo {
 	 * settings camera and for cameras created in game.
 	 */
 	token?: string;
+	/**
+	 * A camera network camera's vantages, which it cuts between to keep
+	 * the clearest view of its craft. On such a camera `site_key`,
+	 * `display_name` and the coordinates describe the vantage it shows now
+	 * and change on every cut; key it by its flight id. Absent on every
+	 * other camera.
+	 */
+	network?: CommandNetworkInfo;
 }
 
 /** The registered command authority. */
@@ -619,7 +673,8 @@ export interface CameraState {
 	/**
 	 * Whether the part's Hullcam module supports runtime FoV changes
 	 * (i.e. it's a `MuMechModuleHullCameraZoom`, not the fixed base
-	 * `MuMechModuleHullCamera`). 19 of 21 stock parts do.
+	 * `MuMechModuleHullCamera`). 19 of 21 stock parts do. Always false on
+	 * a command camera, which zooms itself to frame what it is aimed at.
 	 */
 	supportsZoom: boolean;
 	/** Current effective FoV in degrees. */
@@ -627,7 +682,8 @@ export interface CameraState {
 	/**
 	 * FoV bounds the operator can choose between. Wider than the
 	 * camera's "default" — these come from the Hullcam part config.
-	 * Equal to `fov` when `supports_zoom == false`.
+	 * Equal to `fov` on a part camera without zoom. On a command camera,
+	 * the narrowest and widest its own framing reaches, read only.
 	 */
 	fovMin: number;
 	fovMax: number;
@@ -738,10 +794,65 @@ export interface CameraStateChangedPayload {
 	state: CameraState;
 }
 
+/** One ground station a command camera can stand at, as the game has it. */
+export interface CatalogStation {
+	/**
+	 * The CommNet node name: the key a `station` vantage takes, and the
+	 * camera's `siteKey` while it stands there.
+	 */
+	nodeName: string;
+	/** The name the game shows for it. */
+	displayName: string;
+	/** The body it stands on, by name. */
+	body: string;
+	latitude: number;
+	longitude: number;
+	/** Metres above sea level of the ground (or the sea) at the station. */
+	altitude: number;
+	/**
+	 * The game has the station switched on. A vantage at one switched off
+	 * reads `disabled`.
+	 */
+	enabled: boolean;
+	/**
+	 * Why the game has it off: `extraStationsOff` (the game's extra ground
+	 * stations option is off) or `modDisabled` (the mod that adds it turned
+	 * it off). Absent while it is on. New codes may appear; show a generic
+	 * reason for one you do not recognise.
+	 */
+	disabledReason?: string;
+}
+
+/**
+ * One craft the game knows, as a `vessel` vantage or a `vessel` aim can
+ * name it.
+ */
+export interface CatalogVessel {
+	/** `Vessel.persistentId`, the key a `vessel` vantage or aim takes. */
+	persistentId: number;
+	name: string;
+	/**
+	 * KSP's `VesselType` name: `Relay`, `Probe`, `Ship`, `Debris`,
+	 * `SpaceObject` and so on.
+	 */
+	vesselType: string;
+	/** The body whose sphere of influence it is in, by name. */
+	body: string;
+	/** KSP's `Vessel.Situations` name: `ORBITING`, `LANDED` and so on. */
+	situation: string;
+	/** Within physics range of the active craft. */
+	loaded?: boolean;
+	/** The craft the player is flying. */
+	active?: boolean;
+}
+
 /**
  * Where a command camera points. `kind` says which fields apply. With no
  * subject (`surface`, `direction`, or `orbit` and `positionAt` without
  * `subjectPersistentId`), the camera's default craft stays the subject.
+ * The camera zooms itself: a `vessel`, `orbit` or `positionAt` aim frames
+ * its subject, a `surface` aim frames `framingMarginM` about the point (the
+ * widest view without one) and a `direction` aim opens to the widest view.
  */
 export interface CommandAim {
 	kind: CommandAimKind;
@@ -887,6 +998,12 @@ export interface CreateCommandCameraPayload {
 	 * flight). Not applied while a command authority holds the lock.
 	 */
 	aim?: CommandAim;
+}
+
+/** Delete a saved camera network; its camera ends for every viewer. */
+export interface DeleteNetworkPayload {
+	token: string;
+	networkId: string;
 }
 
 /**
@@ -1085,6 +1202,18 @@ export interface FrameCommandState {
 	 * it is waiting for a target. False from a game that does not send it.
 	 */
 	waitingForTarget?: boolean;
+	/**
+	 * The site the frame was seen from and its label as the feed shows it.
+	 * On a camera network camera both change on exactly the frame of a
+	 * cut. Absent from a game older than 1.12.
+	 */
+	siteKey?: string;
+	siteLabel?: string;
+	/**
+	 * A camera network camera's state on this frame: `ok`, or `noView`
+	 * when no vantage can see the craft. Absent on every other camera.
+	 */
+	networkState?: string;
 }
 
 /**
@@ -1210,6 +1339,103 @@ export interface HelloPayload {
 	 * renegotiation. Absent from sidecars older than 1.12.
 	 */
 	maxSlots?: number;
+	/**
+	 * True when this sidecar sends `NetworkDefinitions` and takes
+	 * `SaveNetwork` and `DeleteNetwork`. Absent from sidecars older than
+	 * 1.12.
+	 */
+	networks?: boolean;
+}
+
+/** One vantage of a saved camera network. */
+export interface NetworkVantageSpec {
+	vantage: CommandVantage;
+	/** Shown for this vantage in place of the site's own name. */
+	label?: string;
+	/** Where the camera stands when no vantage can see the craft. */
+	fallback?: boolean;
+}
+
+/**
+ * How long a camera network holds a vantage and how much clearer another
+ * must be before it cuts. Absent fields keep the game's defaults.
+ */
+export interface NetworkOptionsSpec {
+	/** Least game seconds between cuts. */
+	minHoldUt?: number;
+	/** Least real seconds between cuts. */
+	minHoldRealSeconds?: number;
+	/** How many stops clearer another vantage must be to cut to it. */
+	marginStops?: number;
+}
+
+/**
+ * A camera network: one a viewer saved with the game, or one a mod made
+ * in game (`owner` set), which only that mod can change.
+ */
+export interface NetworkDefinition {
+	/** Stable for the life of the save; made by the game on create. */
+	networkId: string;
+	name: string;
+	/**
+	 * The craft it watches (a `vessel` aim), or absent for the active
+	 * vessel.
+	 */
+	watch?: CommandAim;
+	vantages: NetworkVantageSpec[];
+	options?: NetworkOptionsSpec;
+	/** Bumps on every change; send it back as `baseRevision` to edit. */
+	revision?: number;
+	/**
+	 * The camera it runs as in this scene, absent where command cameras do
+	 * not run. A saved network keeps the same flight id in every scene.
+	 */
+	flightId?: number;
+	/** The mod that made it in game; absent for a saved network. */
+	owner?: string;
+	/**
+	 * The `token` of the `SaveNetwork` that created it, so a client whose
+	 * answer was lost can still find the network it made. A save repeating
+	 * that token returns this network rather than making another.
+	 */
+	createToken?: string;
+}
+
+/**
+ * Every camera network: the saved ones, then those mods made in game.
+ * Sent after `Hello` once known, and whenever one changes.
+ */
+export interface NetworkDefinitionsPayload {
+	networks?: NetworkDefinition[];
+	/**
+	 * False while the game cannot apply `SaveNetwork` or `DeleteNetwork`
+	 * (no scene where command cameras run, or a scene loading); show the
+	 * networks read only then. Absent when unknown.
+	 */
+	editable?: boolean;
+	/**
+	 * Networks left off the end of `networks` to keep the message small.
+	 * Absent when none were.
+	 */
+	networksOmitted?: number;
+}
+
+/** The outcome of one `SaveNetwork` or `DeleteNetwork`, matched by `token`. */
+export interface NetworkResultPayload {
+	token: string;
+	ok: boolean;
+	/** The network saved or deleted. */
+	networkId?: string;
+	/**
+	 * Why it was refused: `notOwner`, `notFound`, `stale`, `noVantages`,
+	 * `tooManyVantages`, `badVantage`, `badAim`, `badName`, `badNumber`,
+	 * `badToken`, `full`, `notRunning` (the game could not start its
+	 * camera) or `writeFailed`. A refusal changes nothing. New codes may
+	 * appear.
+	 */
+	code?: string;
+	/** The refusal in words, for a log. */
+	text?: string;
 }
 
 /**
@@ -1244,6 +1470,29 @@ export interface ResumePayload {
 	forced: number[];
 	/** Cameras this client still holds at their size. */
 	held: number[];
+}
+
+/**
+ * Create or replace a saved camera network. The game answers with a
+ * `NetworkResult` carrying the same token, normally within a second.
+ */
+export interface SaveNetworkPayload {
+	/** Chosen by the client, unique per request (1 to 128 characters). */
+	token: string;
+	/** The network to replace; absent to create one. */
+	networkId?: string;
+	/**
+	 * The `revision` the client edited; refused as `stale` when the network
+	 * has changed since.
+	 */
+	baseRevision?: number;
+	/** 1 to 48 characters; absent or blank for "Camera network". */
+	name?: string;
+	/** A `vessel` aim, or absent to watch the active vessel. */
+	watch?: CommandAim;
+	/** 1 to 64 vantages. */
+	vantages: NetworkVantageSpec[];
+	options?: NetworkOptionsSpec;
 }
 
 /**
@@ -1459,6 +1708,25 @@ export interface SettingsStatePayload {
 }
 
 /**
+ * The places a command camera can stand, as the game has them now. Sent
+ * after `Hello` once the plugin has listed them, and again whenever the
+ * list changes (a game setting or a mod adding or removing stations).
+ */
+export interface SiteCatalogPayload {
+	stations?: CatalogStation[];
+	/**
+	 * Every craft the game knows, the active one first. Absent from games
+	 * older than 1.12.
+	 */
+	vessels?: CatalogVessel[];
+	/**
+	 * Craft left out of `vessels` to keep the message small, debris and
+	 * space objects first. Absent when none were.
+	 */
+	vesselsOmitted?: number;
+}
+
+/**
  * Slot↔camera assignment for the dynamic-subscription model. The sidecar
  * negotiates a pool of recv-only video transceivers up front; `Subscribe`
  * binds a camera to a free one and the sidecar announces the binding here.
@@ -1517,6 +1785,16 @@ export type ClientMessage =
 	| { type: "destroy-command-camera", content: DestroyCommandCameraPayload }
 	/** Point a command camera, or return it to its default. Server-wide. */
 	| { type: "set-command-aim", content: SetCommandAimPayload }
+	/**
+	 * Create or replace a saved camera network. Server-wide; answered
+	 * with `NetworkResult`.
+	 */
+	| { type: "save-network", content: SaveNetworkPayload }
+	/**
+	 * Delete a saved camera network. Server-wide; answered with
+	 * `NetworkResult`.
+	 */
+	| { type: "delete-network", content: DeleteNetworkPayload }
 	/**
 	 * Replace or clear this client's anchors on one camera. Per client:
 	 * other clients never see them, and they go when this client does.
@@ -1582,7 +1860,9 @@ export type ClientMessage =
 	 * Set the camera's field-of-view (degrees). Silently ignored for
 	 * parts whose Hullcam module is the fixed base (`supportsZoom ==
 	 * false`); clients are expected to clamp to `fovMin / fovMax`
-	 * from the camera's `CameraState` before sending.
+	 * from the camera's `CameraState` before sending. A command camera
+	 * zooms itself, so it refuses this and `SetZoomRate` as a fixed-lens
+	 * part camera does.
 	 */
 	| { type: "set-fov", content: SetFovPayload }
 	/**
@@ -1744,5 +2024,17 @@ export type ServerMessage =
 	 * its RTP timestamp. One per frame per track, only to a peer that
 	 * enabled them with `SetFrameStamps`.
 	 */
-	| { type: "frame-stamp", content: FrameStampPayload };
+	| { type: "frame-stamp", content: FrameStampPayload }
+	/**
+	 * The ground stations a command camera can stand at. Sent after
+	 * `Hello` once known, and whenever the list changes.
+	 */
+	| { type: "site-catalog", content: SiteCatalogPayload }
+	/**
+	 * Every camera network. Sent after `Hello` once known, and whenever
+	 * one changes.
+	 */
+	| { type: "network-definitions", content: NetworkDefinitionsPayload }
+	/** The outcome of a `SaveNetwork` or `DeleteNetwork`, by its token. */
+	| { type: "network-result", content: NetworkResultPayload };
 

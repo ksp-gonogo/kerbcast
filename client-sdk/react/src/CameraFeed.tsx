@@ -4,17 +4,20 @@ import {
   CommandAimKind,
   CommandTargetEligibility,
   PanZoomController,
+  fovSliderScale,
   QualityPreset,
   TrackMode,
   effectiveCommandTrack,
   formatCommandRange,
 } from "@ksp-gonogo/kerbcast";
 import {
+  type ReactNode,
   forwardRef,
   useCallback,
   useEffect,
   useId,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -23,6 +26,8 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
+import { NETWORK_FEED_TEXT, isNetworkCamera, networkFeedName, readNetworkVantage, type NetworkVantageReading } from "./networkVantage";
+import { useNetworks } from "./hooks/useNetworks";
 import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider, useKerbcastClient } from "./context";
 import {
   ActionBarRow,
@@ -42,6 +47,7 @@ import { useKerbcastWaitingForSlot } from "./hooks/useKerbcastWaitingForSlot";
 import { useRecordings } from "./hooks/useRecordings";
 import { DEFAULT_FEED_ASPECT, useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { useTargetBracketsPreference } from "./hooks/useTargetBracketsPreference";
+import { NetworkIcon } from "./NetworkIcon";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
 import { claimAnchors } from "./sharedAnchors";
@@ -149,6 +155,11 @@ export type { FeedAction } from "./FeedActionBar";
  * feed stays black.
  */
 export type CameraStreamHook = (flightId: number | null) => MediaStream | null;
+
+/** A title line: a node, or a function that chooses per camera. */
+export type TitleContent =
+  | ReactNode
+  | ((camera: CameraState, isNetwork: boolean, vantage: NetworkVantageReading | null) => ReactNode);
 
 export interface CameraFeedProps {
   /** Override the context client for this feed only. */
@@ -382,6 +393,58 @@ export interface CameraFeedProps {
    * or draw anchors set in game too. See {@link AnchorOverlay}.
    */
   anchorOverlay?: AnchorOverlay;
+  /**
+   * Name a camera network feed in your own layer. By default a network
+   * feed is named like any other feed: its title (shown on hover, in the
+   * title's usual case) reads "<vantage> via <network>" ("Crater Rim via
+   * Kerbin ground net"), taken from the displayed frame so it changes on
+   * the cut frame. Given this, the feed also calls it on every render, with the vantage's label, the frame's network state (`ok`, or
+   * `noView`; treat any other value as `noView`) and the network's name.
+   * What it returns is placed over the picture with no position of its
+   * own, so return a positioned element, a portal into your own layer, or
+   * null. Called only while the feed shows a network camera in flight that
+   * is not blanked.
+   */
+  renderNetworkVantage?: (siteLabel: string, networkState: string, networkName: string) => ReactNode;
+  /**
+   * What sits before the name in the feed's title. Left unset, a network
+   * feed shows {@link NetworkIcon} and any other feed nothing. A node shows
+   * on every feed and null shows nothing; a function chooses per camera,
+   * given the camera and whether it is a network (see
+   * {@link isNetworkCamera}, which holds while the feed has no picture). It
+   * never shrinks, and adds to the title's accessible name only what the
+   * host's own content names.
+   */
+  titleLeading?: ReactNode | ((camera: CameraState, isNetwork: boolean) => ReactNode);
+  /**
+   * Replaces the first line of the feed's title (the camera's name, or on a
+   * network feed the vantage's label). A node shows on every feed; a
+   * function chooses per camera, given the camera, whether it is a network
+   * (see {@link isNetworkCamera}) and the network's current vantage (null on
+   * a feed that is no network, or before a label is known). Called only
+   * while the feed has a camera.
+   */
+  titleText?: TitleContent;
+  /**
+   * Sets a second line under the title, in a smaller size. Left unset, a
+   * network feed shows "via <network>" and any other feed nothing. A node
+   * shows on every feed; a function chooses per camera as in
+   * {@link CameraFeedProps.titleText}. Null or false draws no second line,
+   * not even on a network feed.
+   */
+  titleSubtitle?: TitleContent;
+  /**
+   * Keep the title visible when the pointer is not over the feed. By default
+   * the title, like the rest of the feed's chrome, shows on hover and focus
+   * only. The title stays clickable; the action bar and the rest of the
+   * chrome still wait for hover.
+   */
+  alwaysShowTitle?: boolean;
+  /**
+   * Drop the feed's own 1px border and rounded corners, for a host that
+   * frames the feed itself. Default false.
+   */
+  frameless?: boolean;
 }
 
 export interface CameraFeedHandle {
@@ -428,6 +491,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       displayFrame,
       anchors,
       anchorOverlay,
+      renderNetworkVantage,
+      titleLeading,
+      titleText,
+      titleSubtitle,
+      alwaysShowTitle = false,
+      frameless = false,
     },
     ref,
   ) {
@@ -732,6 +801,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       camera?.kind === CameraKind.Command && !isDestroyed ? camera : null;
     const isCommandFeed = commandCamera !== null;
     const commandTrack = commandCamera?.commandTrack ?? null;
+    const commandLocked = commandTrack?.authority != null;
     /* A host on its own delay names the frame it shows, or its UT for the client to look the frame up by. */
     const hostFrame =
       displayFrame ??
@@ -747,6 +817,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const commandState = commandTrack
       ? effectiveCommandTrack(commandTrack, commandDisplayUt?.ut, commandDisplayUt?.command)
       : null;
+    const networkVantage = commandCamera
+      ? readNetworkVantage(commandDisplayUt?.command, commandCamera.commandCentre, commandCamera.cameraName)
+      : null;
     /* This feed's anchors go to the camera it displays, and leave with it. */
     const anchorsKey = anchors?.length ? JSON.stringify(anchors) : "";
     useEffect(() => {
@@ -757,10 +830,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     const [bracketsOn, toggleBrackets] = useTargetBracketsPreference(
       commandCamera
-        ? (commandCamera.commandCentre?.siteKey || commandCamera.commandCentre?.nodeName || String(commandCamera.flightId))
+        ? (commandCamera.commandCentre?.network
+            ? String(commandCamera.flightId) /* A network's site changes with every cut; its camera does not. */
+            : (commandCamera.commandCentre?.siteKey || commandCamera.commandCentre?.nodeName || String(commandCamera.flightId)))
         : null,
       // 1.11 keyed the preference by stationId; carry a saved choice over.
-      commandCamera?.commandCentre?.stationId ?? null,
+      commandCamera?.commandCentre?.network ? null : (commandCamera?.commandCentre?.stationId ?? null),
     );
     const targetBracketsAvailable = enableTargetBrackets && isCommandFeed;
 
@@ -792,6 +867,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // -------------------------------------------------------------------------
     const controllerRef = useRef<PanZoomController | null>(null);
     const [sliderFov, setSliderFov] = useState(60);
+    /* A range wider than LOG_ZOOM_RATIO slides by factors, so both ends are reachable. */
+    const sliderScale = useMemo(
+      () => fovSliderScale(camera?.fovMin ?? 0, camera?.fovMax ?? 0),
+      [camera?.fovMin, camera?.fovMax],
+    );
 
     useEffect(() => {
       if (flightId === null) {
@@ -832,9 +912,16 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         setBallActive(false);
       }
     }, [showPan]);
+    /* A disabled control fires no pointer-up, so a hold or drag in progress ends here. */
     useEffect(() => {
-      if (!showZoom) controllerRef.current?.setZoomRate(0);
-    }, [showZoom]);
+      if (showZoom && !manualDisabled) return;
+      controllerRef.current?.setZoomRate(0);
+      controllerRef.current?.setFovSliderDragging(false);
+      /* The control is gone from the user, and a stationary camera sends no echo to settle a setpoint or show the state a drag ignored. */
+      controllerRef.current?.fovRefused();
+      if (camera) controllerRef.current?.syncFromState(camera);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [showZoom, manualDisabled]);
 
     // -------------------------------------------------------------------------
     // Ball drag state (pixel math lives here)
@@ -960,8 +1047,39 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       align: "start",
     });
 
+    const networks = useNetworks();
+    const isNetwork = camera ? isNetworkCamera(camera, networks) : false;
+    const titleLeadingContent =
+      typeof titleLeading === "function"
+        ? camera
+          ? titleLeading(camera, isNetwork)
+          : null
+        : titleLeading !== undefined
+          ? titleLeading
+          : isNetwork
+            ? <NetworkIcon size={12} strokeWidth={1.75} />
+            : null;
+
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
-    const title = camera ? cameraLabel(camera) : "Camera Feed";
+    /* A network feed's first line is the vantage's label, its second "via <network>". */
+    const defaultTitle = !camera
+      ? "Camera Feed"
+      : networkVantage
+        ? NETWORK_FEED_TEXT.site(networkVantage.siteLabel)
+        : cameraLabel(camera);
+    const resolveTitle = (content: TitleContent): ReactNode =>
+      typeof content === "function" ? (camera ? content(camera, isNetwork, networkVantage) : null) : content;
+    const title = titleText !== undefined ? resolveTitle(titleText) : defaultTitle;
+    const subtitle =
+      titleSubtitle !== undefined
+        ? resolveTitle(titleSubtitle)
+        : camera && networkVantage
+          ? NETWORK_FEED_TEXT.via(networkVantage.networkName)
+          : null;
+    const leadingNode = titleLeadingContent != null && titleLeadingContent !== false && (
+      <TitleButton__Leading>{titleLeadingContent}</TitleButton__Leading>
+    );
+    const hasSubtitle = subtitle != null && subtitle !== false && subtitle !== "";
 
     // -------------------------------------------------------------------------
     // Viewer quality control (opt-in). A built-in action button + menu: Auto
@@ -1036,7 +1154,6 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       : null;
     const commandTargets = shownCentre?.targets ?? [];
     const commandTargetId = shownCentre?.subjectPersistentId ?? 0;
-    const commandLocked = commandCamera?.commandTrack?.authority != null;
     const commandTargetAvailable =
       isCommandFeed && !disableManualControls && !commandLocked && commandTargets.length > 0;
     const commandTargetMenuId = useId();
@@ -1119,15 +1236,33 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 aria-haspopup="menu"
                 aria-expanded={cameraMenu.open}
                 aria-controls={menuId}
+                $twoLine={hasSubtitle}
                 disabled={recordingActive}
                 title={recordingActive ? "Stop recording to change camera" : undefined}
                 onClick={recordingActive ? undefined : cameraMenu.toggle}
               >
-                <TitleButton__Text>{title}</TitleButton__Text>
-                <ChevronDownIcon aria-hidden="true" />
+                {hasSubtitle ? (
+                  <>
+                    <TitleButton__Row>
+                      {leadingNode}
+                      <TitleButton__Text>{title}</TitleButton__Text>
+                      <ChevronDownIcon aria-hidden="true" />
+                    </TitleButton__Row>
+                    <TitleButton__Sub>{subtitle}</TitleButton__Sub>
+                  </>
+                ) : (
+                  <>
+                    {leadingNode}
+                    <TitleButton__Text>{title}</TitleButton__Text>
+                    <ChevronDownIcon aria-hidden="true" />
+                  </>
+                )}
               </TitleButton>
             ) : (
-              title
+              <>
+                {title}
+                {hasSubtitle && <TitleButton__Sub>{subtitle}</TitleButton__Sub>}
+              </>
             )}
           </TopTitle>
         </TitleRow>
@@ -1155,7 +1290,17 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     cameraMenu.close();
                   }}
                 >
-                  {cameraLabel(c)} ({c.vesselName})
+                  {/* A network is one feed, named by the network alone: its vantages change under it. */}
+                  {isNetworkCamera(c, networks) ? (
+                    <>
+                      <MenuItemIcon>
+                        <NetworkIcon size={14} strokeWidth={1.75} />
+                      </MenuItemIcon>
+                      {cameraLabel(c)}
+                    </>
+                  ) : (
+                    `${cameraLabel(c)} (${c.vesselName})`
+                  )}
                   {isCameraDestroyed(c) ? " - signal lost" : ""}
                 </CameraMenuItem>
               ))}
@@ -1436,12 +1581,40 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       <FeedActionBar leading={stepButtons} entries={entries} />
     ) : null;
 
+    /* The title stops short of the action bar, however many buttons it
+       holds, so its chevron never sits under one; on a tile too narrow for
+       both it drops below the bar instead. The bar's width changes when it
+       renders and the stage's on any resize, so both trigger a measure. This
+       only writes CSS variables: a resize must never re-render or remount
+       the live video. */
+    const measureTitle = useCallback(() => {
+      const stage = wrapRef.current;
+      if (!stage) return;
+      const bar = stage.querySelector<HTMLElement>(String(ActionBarRow));
+      const barW = bar ? bar.offsetWidth : 0;
+      const beside = stage.clientWidth - 16 - (barW + 8) >= TITLE_MIN_WIDTH;
+      const pad = `${beside ? barW + 8 : 0}px`;
+      const drop = `${beside || !bar ? 0 : bar.offsetHeight + 4}px`;
+      if (stage.style.getPropertyValue("--kc-title-pad") !== pad) stage.style.setProperty("--kc-title-pad", pad);
+      if (stage.style.getPropertyValue("--kc-title-drop") !== drop) stage.style.setProperty("--kc-title-drop", drop);
+    }, []);
+    useLayoutEffect(measureTitle);
+    useEffect(() => {
+      const stage = wrapRef.current;
+      if (!stage || typeof ResizeObserver === "undefined") return;
+      const observer = new ResizeObserver(measureTitle);
+      observer.observe(stage);
+      return () => observer.disconnect();
+    }, [measureTitle]);
+
     return (
       <FeedBox style={feedShape}>
         <Stage
           ref={wrapRef}
           $pinned={chromePinned}
+          $alwaysTitle={alwaysShowTitle}
           $fullscreen={isFullscreen}
+          $frameless={frameless}
           data-fullscreen={isFullscreen || undefined}
           data-kc-signal={signal}
         >
@@ -1595,6 +1768,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                     )}
                   </>
                 )}
+              {networkVantage && renderNetworkVantage && !outOfFlight && !isDestroyed && !commandState?.blank &&
+                renderNetworkVantage(networkVantage.siteLabel, networkVantage.networkState, networkVantage.networkName)}
               {waitingForSlot && !outOfFlight && !isDestroyed && noSlotLabel && (
                 <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
               )}
@@ -1666,14 +1841,24 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   <FovSlider
                     type="range"
                     aria-label="Zoom"
-                    min={camera.fovMin}
-                    max={camera.fovMax}
-                    step={0.5}
-                    value={sliderFov}
+                    aria-valuetext={`${Number(sliderFov.toPrecision(3))} degrees`}
+                    min={sliderScale.min}
+                    max={sliderScale.max}
+                    step={sliderScale.step}
+                    value={sliderScale.fromFov(sliderFov)}
                     disabled={manualDisabled}
                     onChange={(e) => {
-                      const v = Number(e.target.value);
+                      const v = sliderScale.toFov(Number(e.target.value));
                       controllerRef.current?.fovSliderInput(v);
+                    }}
+                    onKeyDown={(e) => {
+                      /* Up and right zoom in, as the + above the slider does, where a browser's own keys would raise the value and widen the view. One position of a log scale's thousand is also too small a press. */
+                      const direction =
+                        e.key === "ArrowUp" || e.key === "ArrowRight" ? -1 : e.key === "ArrowDown" || e.key === "ArrowLeft" ? 1 : 0;
+                      if (direction === 0) return;
+                      e.preventDefault();
+                      const position = sliderScale.fromFov(sliderFov) + direction * sliderScale.keyStep;
+                      controllerRef.current?.fovSliderInput(sliderScale.toFov(position));
                     }}
                     onPointerDown={() => {
                       controllerRef.current?.setFovSliderDragging(true);
@@ -2070,14 +2255,18 @@ const TopOverlay = styled.div`
   }
 `;
 
+/* The least room beside the action bar a title takes before it drops below it. */
+const TITLE_MIN_WIDTH = 64;
+
 const TitleRow = styled.div`
   display: flex;
   align-items: flex-start;
   gap: 8px;
   /* Reserve the top-right corner where the ActionBar overlay sits (now home
-     to the camera step buttons too) so a long title ellipsizes rather than
-     sliding underneath the controls. */
-  padding-right: 96px;
+     to the camera step buttons too), measured into --kc-title-pad, so a long
+     title ellipsizes rather than sliding underneath the controls. */
+  padding-right: var(--kc-title-pad, 96px);
+  margin-top: var(--kc-title-drop, 0px);
 `;
 
 const TopTitle = styled.h3`
@@ -2091,10 +2280,53 @@ const TopTitle = styled.h3`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
-const TitleButton = styled.button`
+/* The first line of a two-line title: the leading slot, the name and the chevron. */
+const TitleButton__Row = styled.span`
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+
+  > svg {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    transition: transform 0.15s;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    > svg {
+      transition: none;
+    }
+  }
+`;
+
+/* The second line, smaller than the first so the pair fits the room one line had. */
+const TitleButton__Sub = styled.span`
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: calc(var(--font-size-xs, 11px) - 2px);
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  opacity: 0.85;
+`;
+
+const TitleButton = styled.button<{ $twoLine?: boolean }>`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  ${(p) =>
+    p.$twoLine &&
+    css`
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1px;
+    `}
   max-width: 100%;
   margin: 0;
   padding: 0;
@@ -2108,19 +2340,21 @@ const TitleButton = styled.button`
   text-shadow: inherit;
   text-align: left;
 
-  svg {
+  /* Direct children only: the chevron turns, what sits in the leading slot does not. */
+  > svg {
     width: 12px;
     height: 12px;
     flex-shrink: 0;
     transition: transform 0.15s;
   }
 
-  &[aria-expanded="true"] svg {
+  &[aria-expanded="true"] > svg,
+  &[aria-expanded="true"] > ${TitleButton__Row} > svg {
     transform: rotate(180deg);
   }
 
   @media (prefers-reduced-motion: reduce) {
-    svg {
+    > svg {
       transition: none;
     }
   }
@@ -2129,6 +2363,12 @@ const TitleButton = styled.button`
     outline: 2px solid var(--kerbcast-accent, #00ff88);
     outline-offset: 2px;
   }
+`;
+
+const TitleButton__Leading = styled.span`
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
 `;
 
 const TitleButton__Text = styled.span`
@@ -2161,6 +2401,12 @@ const CameraMenu = styled.div`
   border-radius: 4px;
   overflow-x: hidden;
   overflow-y: auto;
+`;
+
+const MenuItemIcon = styled.span`
+  display: inline-flex;
+  vertical-align: middle;
+  margin-right: 6px;
 `;
 
 const CameraMenuItem = styled.button<{ $selected: boolean }>`
@@ -2393,7 +2639,9 @@ const FeedBox = styled.div`
   justify-content: center;
 `;
 
-const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean }>`
+const Stage = styled(Panel)<{ $pinned: boolean; $alwaysTitle: boolean; $fullscreen: boolean; $frameless: boolean }>`
+  ${(p) => p.$frameless && "border: none; border-radius: 0;"}
+
   width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
   height: auto;
   aspect-ratio: var(--kc-feed-w) / var(--kc-feed-h);
@@ -2421,6 +2669,18 @@ const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean }>`
   &:focus-within ${ActionBarRow} {
     pointer-events: auto;
   }
+
+  ${(p) =>
+    p.$alwaysTitle &&
+    css`
+      /* Only the title row takes the pointer, so the picture beneath still pans. */
+      ${TopOverlay} {
+        opacity: 1;
+      }
+      ${TitleRow} {
+        pointer-events: auto;
+      }
+    `}
 
   ${(p) =>
     p.$pinned &&

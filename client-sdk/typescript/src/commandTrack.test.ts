@@ -202,6 +202,17 @@ describe("per-frame command state", () => {
     expect(s).toMatchObject({ waitingForTarget: true, camera: "noFix" });
   });
 
+  it("carries the site and its label, which change on a network's cut frame", () => {
+    const before = effectiveCommandTrack(track(), 1000, { ...frame, siteKey: "KSC", siteLabel: "Kerbal Space Center", networkState: "ok" });
+    const after = effectiveCommandTrack(track(), 1000, { ...frame, siteKey: "Crater Rim", siteLabel: "North dish", networkState: "noView" });
+    expect(before).toMatchObject({ siteKey: "KSC", siteLabel: "Kerbal Space Center", networkState: "ok" });
+    expect(after).toMatchObject({ siteKey: "Crater Rim", siteLabel: "North dish", networkState: "noView" });
+  });
+
+  it("reads no site or network from a game that sends none", () => {
+    expect(effectiveCommandTrack(track(), 1000, frame)).toMatchObject({ siteKey: null, siteLabel: null, networkState: null });
+  });
+
   it("falls back to the snapshot without one", () => {
     expect(effectiveCommandTrack(track(), 1000, null).fromFrame).toBeUndefined();
   });
@@ -297,6 +308,30 @@ describe("CommandCentreHistory", () => {
     const b = h.at(1, 200)!.targets;
     expect(b[0]).toBe(a[0]);
     expect(b[1]).not.toBe(a[1]);
+  });
+
+  it("keeps a network camera's vantage as it stood at the displayed UT", () => {
+    const network = (site: string, label: string) => ({
+      name: "Ground net",
+      state: "ok",
+      vantages: [
+        { siteKey: "KSC", label: "Kerbal Space Center", state: site === "KSC" ? "ok" : "belowHorizon", active: site === "KSC" },
+        { siteKey: "Crater Rim", label: "North dish", state: "ok", active: site === "Crater Rim" },
+      ],
+    });
+    const at = (ut: number, site: string, label: string): CommandCentreInfo => ({
+      ...centre(ut, 1000),
+      siteKey: site,
+      nodeName: site,
+      displayName: label,
+      network: network(site, label),
+    });
+    const h = new CommandCentreHistory();
+    h.record(1, at(100, "KSC", "Kerbal Space Center"));
+    h.record(1, at(160, "Crater Rim", "North dish"));
+    expect(h.size(1)).toBe(2);
+    expect(h.at(1, 150)?.displayName).toBe("Kerbal Space Center");
+    expect(h.at(1, 160)?.network?.vantages.find((v) => v.active)?.label).toBe("North dish");
   });
 
   it("forgets cameras", () => {

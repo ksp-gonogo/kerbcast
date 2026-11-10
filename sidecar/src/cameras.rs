@@ -25,7 +25,8 @@ use tracing::{info, warn};
 
 use crate::anchors::{boot_nonce, peer_owner, validate_anchor_set, AnchorTable};
 use crate::commands::{
-    validate_aim, validate_create, CommandOp, CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
+    validate_aim, validate_create, validate_delete_network, validate_save_network, CommandOp,
+    CommandQueue, COMMANDS_FILE, COMMANDS_SIGNAL_FILE,
 };
 use crate::encoder::{
     align_down, aligned_cover, EncoderBackend, SessionHealth, MIN_ENCODE_DIMENSION,
@@ -34,10 +35,11 @@ use crate::feed_watch::{FeedVerdict, FeedWatch};
 use crate::ladder::Tier;
 use crate::protocol::{
     CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CommandAim,
-    CommandAimKind, CommandCentreInfo, CommandTarget, CommandTrackState,
-    CreateCommandCameraPayload, CrewLocation, DestroyCommandCameraPayload, DisplaySizeReport,
-    ErrorCode, Layer, QualityPreset, ResumePayload, SetCommandAimPayload, SettingsStatePayload,
-    SiteKind, TrackMode,
+    CommandAimKind, CommandCentreInfo, CommandNetworkInfo, CommandTarget, CommandTrackState,
+    CreateCommandCameraPayload, CrewLocation, DeleteNetworkPayload, DestroyCommandCameraPayload,
+    DisplaySizeReport, ErrorCode, Layer, NetworkDefinitionsPayload, NetworkResultPayload,
+    QualityPreset, ResumePayload, SaveNetworkPayload, SetCommandAimPayload, SettingsStatePayload,
+    SiteCatalogPayload, SiteKind, TrackMode,
 };
 use crate::rate::RateWindow;
 use crate::send_tally::SendTally;
@@ -80,6 +82,75 @@ pub fn parse_in_flight(body: &str) -> Option<bool> {
         "0" => Some(false),
         _ => None,
     }
+}
+
+/// The ground stations the plugin lists, rewritten only when they change.
+/// Kept out of `global.status.json`, which is written every second.
+pub const SITES_FILE: &str = "global.sites.json";
+
+/// The plugin's camera networks and the outcome of the latest network
+/// requests, rewritten on every change.
+pub const NETWORKS_FILE: &str = "global.networks.json";
+
+/// How many request outcomes the sidecar remembers having sent, well above
+/// the few the plugin keeps in the file.
+const SEEN_RESULTS_KEPT: usize = 256;
+
+/// An outcome the plugin wrote this long ago is still sent to the peers
+/// connected when the sidecar first reads the file: a sidecar that restarted
+/// while a request was in flight must not lose its answer.
+const RECENT_RESULT_MS: u64 = 30_000;
+
+/// Milliseconds since the Unix epoch, as the plugin stamps its outcomes.
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/* A retried request reuses its token and earns a new outcome, so the token alone does not name one. */
+fn outcome_key(token: &str, at_ms: Option<u64>) -> String {
+    format!("{token}@{}", at_ms.unwrap_or(0))
+}
+
+/// On-disk shape of `global.networks.json`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworksFile {
+    #[serde(default)]
+    networks: Vec<crate::protocol::NetworkDefinition>,
+    #[serde(default)]
+    editable: Option<bool>,
+    #[serde(default)]
+    results: Vec<FileResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileResult {
+    #[serde(flatten)]
+    result: NetworkResultPayload,
+    #[serde(default)]
+    at_ms: Option<u64>,
+}
+
+/// What one read of `global.networks.json` brought that clients have not seen.
+#[derive(Debug, Default, PartialEq)]
+pub struct NetworksNews {
+    /// The definitions, when they differ from the last read (the first included).
+    pub definitions: Option<NetworkDefinitionsPayload>,
+    /// Request outcomes not sent before.
+    pub results: Vec<NetworkResultPayload>,
+}
+
+#[derive(Debug, Default)]
+struct NetworksSeen {
+    definitions: Option<NetworkDefinitionsPayload>,
+    /// Outcomes already sent, by `outcome_key`. None until the first read,
+    /// which sends only outcomes from the last `RECENT_RESULT_MS`: older
+    /// ones predate this process's clients.
+    results: Option<std::collections::VecDeque<String>>,
 }
 
 /// On-disk shape of `global.status.json` — the plugin → sidecar push
@@ -144,6 +215,13 @@ struct PerCameraStatus {
     operator_layers: Vec<Layer>,
     #[serde(default)]
     fov: f32,
+    /// A command camera's zoom limits now: its narrowest field follows the
+    /// Tracking Station level and the optics setting, which change after
+    /// the manifest is written. Absent for other cameras.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fov_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fov_max: Option<f32>,
     #[serde(default)]
     pan_yaw: f32,
     #[serde(default)]
@@ -203,6 +281,61 @@ struct CommandTargetsStatus {
     targets: Vec<CommandTarget>,
     #[serde(default)]
     vantage_persistent_id: u32,
+    /// Where a camera network camera stands now; the manifest only has
+    /// the site it was built at. Absent on every other camera, and dropped
+    /// alone when malformed.
+    #[serde(
+        default,
+        deserialize_with = "lenient_part",
+        skip_serializing_if = "Option::is_none"
+    )]
+    site: Option<CommandSiteStatus>,
+    /// A camera network camera's vantages; dropped alone when malformed.
+    #[serde(
+        default,
+        deserialize_with = "lenient_part",
+        skip_serializing_if = "Option::is_none"
+    )]
+    network: Option<CommandNetworkInfo>,
+}
+
+/// The site a camera network camera stands at now, as the plugin writes it
+/// beside the camera's targets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandSiteStatus {
+    site_key: String,
+    #[serde(default)]
+    site_kind: SiteKind,
+    display_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    latitude: f64,
+    #[serde(default)]
+    longitude: f64,
+    #[serde(default)]
+    altitude: f64,
+}
+
+/// One optional part of a command camera's status, `None` when it is
+/// malformed, so a bad part never costs the rest of the status.
+fn lenient_part<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value(value) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            tracing::debug!(error = %e, "command status part parse failed; dropping it");
+            Ok(None)
+        }
+    }
 }
 
 /// Whether a command camera's subject, range or targets moved. A later `ut`
@@ -665,6 +798,9 @@ pub struct CameraState {
     /// (a fresh attach is never triggered by the switch). Read via
     /// `crew_location()`.
     crew_location: std::sync::Mutex<Option<CrewLocation>>,
+    /// The site key on the last frame read from a command camera's ring, to
+    /// notice a camera network's cut.
+    frame_site: std::sync::Mutex<Option<String>>,
     /// Station identity for a command camera. Static for the
     /// camera's life (the station does not move).
     pub command_centre: Option<CommandCentreInfo>,
@@ -790,6 +926,13 @@ pub struct CameraState {
 }
 
 impl CameraState {
+    /// Whether a viewer may set this camera's field of view or zoom rate. A
+    /// command camera frames its subject itself, so it never takes a manual
+    /// zoom, whatever its manifest says.
+    pub fn takes_manual_zoom(&self) -> bool {
+        self.supports_zoom && self.kind != CameraKind::Command
+    }
+
     /// Add a track to this camera and bump the subscriber count. Returns
     /// the count after the increment so the caller can request a keyframe
     /// on the 0→1 transition. Adding a track the camera already feeds is a
@@ -1037,6 +1180,19 @@ impl CameraState {
     /// part cameras. Cheap copy out of the interior-mutable cell.
     pub fn crew_location(&self) -> Option<CrewLocation> {
         *self.crew_location.lock().unwrap()
+    }
+
+    /// Notes the site key a frame was seen from; true when it differs from
+    /// the last frame's, which is a camera network's cut. The first frame
+    /// and a frame without a key are no cut.
+    pub fn note_frame_site(&self, key: Option<&str>) -> bool {
+        let Some(key) = key else { return false };
+        let mut last = self.frame_site.lock().unwrap();
+        let cut = last.as_deref().is_some_and(|k| k != key);
+        if last.as_deref() != Some(key) {
+            *last = Some(key.to_string());
+        }
+        cut
     }
 
     /// Current published auto-track mode (lock-free read of the atomic mirror).
@@ -1624,6 +1780,11 @@ pub struct CameraRegistry {
     /// Last-seen value of the `global.inflight` file, cached so the consume
     /// loop broadcasts `scene-state-changed` only when the flag flips.
     last_in_flight: Mutex<Option<bool>>,
+    /// Last `global.sites.json` read, so a change is broadcast once and a
+    /// connecting peer is primed with it.
+    last_sites: Mutex<Option<SiteCatalogPayload>>,
+    /// The camera networks last read and the request outcomes already sent.
+    networks_seen: Mutex<NetworksSeen>,
     /// Capped ring of every distinct `global.status.json` snapshot seen
     /// since the last `reset_run_logs()`. Powers the harness's
     /// `GET /dumpLogs` endpoint so perf runs can replay the full
@@ -1756,6 +1917,31 @@ pub struct PerCameraStatusExport {
     pub pan_pitch: f32,
 }
 
+/* Whether a live zoom limit moved enough to tell clients: the optics floor
+ * follows the aim's elevation, so it drifts a little on every status write. */
+fn fov_limit_moved(was: Option<f32>, now: Option<f32>) -> bool {
+    match (was, now) {
+        (Some(a), Some(b)) => (a - b).abs() > 0.01 * a.abs().max(b.abs()),
+        (a, b) => a != b,
+    }
+}
+
+/* Whether the field of view moved enough to tell clients: a hundredth of a
+ * degree on a wide lens, and half a percent where that would swallow the
+ * whole of a narrow one's range. */
+fn fov_moved(was: f32, now: f32) -> bool {
+    (was - now).abs() > 0.01_f32.min(0.005 * was.abs().max(now.abs()))
+}
+
+/* The zoom limits the plugin reported live, each where usable, else the manifest's. */
+fn live_fov_limits(min: Option<f32>, max: Option<f32>, cam: &CameraState) -> (f32, f32) {
+    let usable = |f: Option<f32>| f.filter(|f| f.is_finite() && *f > 0.0);
+    (
+        usable(min).unwrap_or(cam.fov_min),
+        usable(max).unwrap_or(cam.fov_max),
+    )
+}
+
 /* The plugin's live FoV when it reported a usable one, else the manifest default. */
 fn effective_fov(live: Option<f32>, default: f32) -> f32 {
     live.filter(|f| f.is_finite() && *f > 0.0)
@@ -1826,6 +2012,8 @@ impl CameraRegistry {
             last_status: Mutex::new(None),
             background_requests: Mutex::new(std::collections::HashMap::new()),
             last_in_flight: Mutex::new(None),
+            last_sites: Mutex::new(None),
+            networks_seen: Mutex::new(NetworksSeen::default()),
             status_log: Mutex::new(std::collections::VecDeque::new()),
             epoch: Instant::now(),
             force_render: AtomicBool::new(false),
@@ -1875,6 +2063,86 @@ impl CameraRegistry {
             return current;
         }
         None
+    }
+
+    /// Poll `global.sites.json`. Returns the catalog when it differs from
+    /// the last one read, the first read included. A missing or partial file
+    /// keeps the last catalog, since the plugin writes it only on change.
+    pub async fn poll_sites(&self) -> Option<SiteCatalogPayload> {
+        let path = self.shm_dir.join(SITES_FILE);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        let parsed: SiteCatalogPayload = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "ground station list parse failed");
+                return None;
+            }
+        };
+        let mut last = self.last_sites.lock().await;
+        if last.as_ref() == Some(&parsed) {
+            return None;
+        }
+        *last = Some(parsed.clone());
+        Some(parsed)
+    }
+
+    /// The catalog last read, to prime a connecting peer; `None` until the
+    /// plugin has listed its stations.
+    pub async fn last_sites(&self) -> Option<SiteCatalogPayload> {
+        self.last_sites.lock().await.clone()
+    }
+
+    /// Poll `global.networks.json` for changed definitions and new request
+    /// outcomes. A missing or partial file brings nothing; the last
+    /// definitions stay for new peers.
+    pub async fn poll_networks(&self) -> NetworksNews {
+        let path = self.shm_dir.join(NETWORKS_FILE);
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return NetworksNews::default();
+        };
+        let file: NetworksFile = match serde_json::from_slice(&bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "camera network file parse failed");
+                return NetworksNews::default();
+            }
+        };
+        let mut seen = self.networks_seen.lock().await;
+        let mut news = NetworksNews::default();
+        let defs = NetworkDefinitionsPayload {
+            networks: file.networks,
+            editable: file.editable,
+            networks_omitted: None,
+        };
+        if seen.definitions.as_ref() != Some(&defs) {
+            seen.definitions = Some(defs.clone());
+            news.definitions = Some(defs);
+        }
+        let first = seen.results.is_none();
+        let now = unix_ms();
+        let sent = seen.results.get_or_insert_with(Default::default);
+        for FileResult { result: r, at_ms } in file.results {
+            let key = outcome_key(&r.token, at_ms);
+            if sent.contains(&key) {
+                continue;
+            }
+            /* On the first read only outcomes from the last moments are news. */
+            let recent = at_ms.is_some_and(|at| now.saturating_sub(at) <= RECENT_RESULT_MS);
+            sent.push_back(key);
+            if first && !recent {
+                continue;
+            }
+            news.results.push(r);
+        }
+        while sent.len() > SEEN_RESULTS_KEPT {
+            sent.pop_front();
+        }
+        news
+    }
+
+    /// The definitions last read, to prime a connecting peer.
+    pub async fn last_networks(&self) -> Option<NetworkDefinitionsPayload> {
+        self.networks_seen.lock().await.definitions.clone()
     }
 
     /*
@@ -2152,6 +2420,7 @@ impl CameraRegistry {
                             crew_location: std::sync::Mutex::new(crew_location_from_manifest(
                                 manifest.crew_location.as_deref(),
                             )),
+                            frame_site: std::sync::Mutex::new(None),
                             part_name: manifest.part_name,
                             part_title: manifest.part_title,
                             camera_name: manifest.camera_name,
@@ -2272,7 +2541,12 @@ impl CameraRegistry {
     pub async fn list(&self) -> Vec<CameraInfo> {
         let cams = self.snapshot().await;
         let primary_fps = self.primary_capture_fps().await;
-        let (centres, live_fovs): (HashMap<u32, CommandTargetsStatus>, HashMap<u32, f32>) = self
+        #[allow(clippy::type_complexity)]
+        let (centres, live_fovs, live_limits): (
+            HashMap<u32, CommandTargetsStatus>,
+            HashMap<u32, f32>,
+            HashMap<u32, (Option<f32>, Option<f32>)>,
+        ) = self
             .last_status
             .lock()
             .await
@@ -2284,13 +2558,20 @@ impl CameraRegistry {
                     .filter_map(|c| c.command_targets.clone().map(|cc| (c.flight_id, cc)))
                     .collect();
                 let fovs = st.cameras.iter().map(|c| (c.flight_id, c.fov)).collect();
-                (centres, fovs)
+                let limits = st
+                    .cameras
+                    .iter()
+                    .map(|c| (c.flight_id, (c.fov_min, c.fov_max)))
+                    .collect();
+                (centres, fovs, limits)
             })
             .unwrap_or_default();
         let mut out = Vec::with_capacity(cams.len());
         for s in &cams {
             let ctrl = s.control.lock().await.clone();
             let stats = s.stats(&ctrl, primary_fps).await;
+            let (lmin, lmax) = live_limits.get(&s.flight_id).copied().unwrap_or_default();
+            let (fov_min, fov_max) = live_fov_limits(lmin, lmax, s);
             out.push(CameraInfo {
                 flight_id: s.flight_id,
                 lifecycle: if s.destroyed.load(Ordering::Acquire) {
@@ -2311,8 +2592,8 @@ impl CameraRegistry {
                 vessel_name: s.vessel_name.clone(),
                 supports_zoom: s.supports_zoom,
                 fov: effective_fov(live_fovs.get(&s.flight_id).copied(), s.fov_default),
-                fov_min: s.fov_min,
-                fov_max: s.fov_max,
+                fov_min,
+                fov_max,
                 supports_pan: s.supports_pan,
                 pan_yaw_min: s.pan_yaw_min,
                 pan_yaw_max: s.pan_yaw_max,
@@ -2448,7 +2729,8 @@ impl CameraRegistry {
         }
 
         // Per-camera diffs. Only flag cameras whose effective state moved.
-        for cam_status in &parsed.cameras {
+        let mut unsent_zoom = Vec::new();
+        for (index, cam_status) in parsed.cameras.iter().enumerate() {
             if let Some(cam) = cameras.get(&cam_status.flight_id) {
                 let reported_seq = cam_status.track_report_seq;
                 if reported_seq != 0
@@ -2478,7 +2760,9 @@ impl CameraRegistry {
                         || p.operator_height != cam_status.operator_height
                         || p.layers != cam_status.layers
                         || p.operator_layers != cam_status.operator_layers
-                        || (p.fov - cam_status.fov).abs() > 0.01
+                        || fov_moved(p.fov, cam_status.fov)
+                        || fov_limit_moved(p.fov_min, cam_status.fov_min)
+                        || fov_limit_moved(p.fov_max, cam_status.fov_max)
                         || (p.pan_yaw - cam_status.pan_yaw).abs() > 0.01
                         || (p.pan_pitch - cam_status.pan_pitch).abs() > 0.01
                         || command_track_changed(&p.command_track, &cam_status.command_track)
@@ -2486,6 +2770,9 @@ impl CameraRegistry {
                 }
             };
             if !changed {
+                if let Some(p) = prev {
+                    unsent_zoom.push((index, p.fov, p.fov_min, p.fov_max));
+                }
                 continue;
             }
             let Some(cam) = cameras.get(&cam_status.flight_id) else {
@@ -2541,8 +2828,8 @@ impl CameraRegistry {
                 max_height: Some(cam.max_height),
                 supports_zoom: cam.supports_zoom,
                 fov: cam_status.fov,
-                fov_min: cam.fov_min,
-                fov_max: cam.fov_max,
+                fov_min: live_fov_limits(cam_status.fov_min, cam_status.fov_max, cam).0,
+                fov_max: live_fov_limits(cam_status.fov_min, cam_status.fov_max, cam).1,
                 supports_pan: cam.supports_pan,
                 pan_yaw: cam_status.pan_yaw,
                 pan_pitch: cam_status.pan_pitch,
@@ -2569,13 +2856,26 @@ impl CameraRegistry {
             });
         }
 
-        // Push the snapshot to the run-log ring iff it's actually new
-        // (the consume loop polls way faster than the plugin writes).
-        // Capped at STATUS_LOG_CAP entries; oldest evicted when full.
+        let raw_export = GlobalStatusFileExport::from(&parsed);
+
+        /* The next diff has to measure from what clients were last told, or a
+         * slow drift stays under the thresholds on every poll and never sends. */
+        for (index, fov, fov_min, fov_max) in unsent_zoom {
+            let held = &mut parsed.cameras[index];
+            held.fov = fov;
+            held.fov_min = fov_min;
+            held.fov_max = fov_max;
+        }
+
+        /* Push the snapshot to the run-log ring iff it's actually new (the
+         * consume loop polls way faster than the plugin writes). Compared with
+         * the held values applied, or a camera resting under the threshold
+         * would differ on every poll; the entry keeps the raw export. Capped
+         * at STATUS_LOG_CAP entries; oldest evicted when full. */
         if last.as_ref() != Some(&parsed) {
             let entry = StatusLogEntry {
                 t_ms: self.epoch.elapsed().as_millis() as u64,
-                status: GlobalStatusFileExport::from(&parsed),
+                status: raw_export,
             };
             // VecDeque: pop_front is O(1); a Vec::remove(0) here would
             // shift 12k entries on every append once the cap is hit.
@@ -2797,6 +3097,30 @@ impl CameraRegistry {
         self.append_command(CommandOp::Create(payload))
             .await
             .map_err(|e| format!("command request write failed: {e}"))
+    }
+
+    /// Queue a saved camera network for the plugin to create or replace.
+    /// Errors with a `NetworkResult` code on a malformed request or a failed
+    /// write; everything else is answered by the plugin.
+    pub async fn request_save_network(
+        &self,
+        payload: SaveNetworkPayload,
+    ) -> Result<u64, crate::commands::NetworkRefusal> {
+        validate_save_network(&payload)?;
+        self.append_command(CommandOp::SaveNetwork(payload))
+            .await
+            .map_err(|e| ("writeFailed", format!("command request write failed: {e}")))
+    }
+
+    /// Queue a saved camera network's deletion, as `request_save_network`.
+    pub async fn request_delete_network(
+        &self,
+        payload: DeleteNetworkPayload,
+    ) -> Result<u64, crate::commands::NetworkRefusal> {
+        validate_delete_network(&payload)?;
+        self.append_command(CommandOp::DeleteNetwork(payload))
+            .await
+            .map_err(|e| ("writeFailed", format!("command request write failed: {e}")))
     }
 
     /// Queue the destruction of a created command camera. Errors on an
@@ -3619,6 +3943,11 @@ impl CameraRegistry {
             .map(|p| p.fov)
             .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or_else(|| ctrl.fov.unwrap_or(cam.fov_default));
+        let (fov_min, fov_max) = live_fov_limits(
+            per.as_ref().and_then(|p| p.fov_min),
+            per.as_ref().and_then(|p| p.fov_max),
+            &cam,
+        );
         let pan_yaw = per
             .as_ref()
             .map(|p| p.pan_yaw)
@@ -3666,8 +3995,8 @@ impl CameraRegistry {
             max_height: Some(cam.max_height),
             supports_zoom: cam.supports_zoom,
             fov,
-            fov_min: cam.fov_min,
-            fov_max: cam.fov_max,
+            fov_min,
+            fov_max,
             supports_pan: cam.supports_pan,
             pan_yaw,
             pan_pitch,
@@ -3830,6 +4159,7 @@ fn command_centre_from_manifest(m: &InfoManifest) -> Option<CommandCentreInfo> {
         targets_omitted: None,
         created: m.command_created.unwrap_or(false),
         token: m.command_token.clone().filter(|t| !t.is_empty()),
+        network: None,
     })
 }
 
@@ -3848,6 +4178,22 @@ fn command_centre_with(
         out.ut = s.ut;
         out.targets = s.targets.clone();
         out.vantage_persistent_id = s.vantage_persistent_id;
+        if let Some(site) = &s.site {
+            out.station_id = format!("ground:{}", site.site_key);
+            out.node_name = site.site_key.clone();
+            out.site_key = site.site_key.clone();
+            out.site_kind = site.site_kind;
+            out.display_name = if site.display_name.is_empty() {
+                site.site_key.clone()
+            } else {
+                site.display_name.clone()
+            };
+            out.body = site.body.clone();
+            out.latitude = site.latitude;
+            out.longitude = site.longitude;
+            out.altitude = site.altitude;
+        }
+        out.network = s.network.clone();
     }
     Some(out)
 }
@@ -3907,6 +4253,149 @@ mod tests {
 
         tokio::fs::write(&path, "0").await.unwrap();
         assert_eq!(reg.poll_in_flight().await, Some(false));
+    }
+
+    /// The plugin's ground station list: broadcast on first read and on
+    /// change only, and kept through a missing or half-written file.
+    #[tokio::test]
+    async fn poll_sites_fires_only_on_change_and_keeps_the_last_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let reg = CameraRegistry::new(shm.to_path_buf());
+        let path = shm.join(SITES_FILE);
+
+        assert!(reg.poll_sites().await.is_none());
+        assert!(reg.last_sites().await.is_none());
+
+        let one = r#"{"stations":[{"nodeName":"KSC","displayName":"Kerbal Space Center","body":"Kerbin","latitude":-0.0972,"longitude":-74.5577,"altitude":64.8,"enabled":true}]}"#;
+        tokio::fs::write(&path, one).await.unwrap();
+        let first = reg.poll_sites().await.expect("first read broadcasts");
+        assert_eq!(first.stations.len(), 1);
+        assert_eq!(first.stations[0].node_name, "KSC");
+        assert!(first.stations[0].enabled);
+        assert!(
+            reg.poll_sites().await.is_none(),
+            "the same list again is not news"
+        );
+
+        tokio::fs::write(&path, "{\"stations\":[{\"nodeName\"")
+            .await
+            .unwrap();
+        assert!(
+            reg.poll_sites().await.is_none(),
+            "a partial write is skipped"
+        );
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(
+            reg.poll_sites().await.is_none(),
+            "a missing file is skipped"
+        );
+        assert_eq!(
+            reg.last_sites().await,
+            Some(first.clone()),
+            "and the last list stays for new peers"
+        );
+
+        let off = one.replace("\"enabled\":true", "\"enabled\":false");
+        tokio::fs::write(&path, off).await.unwrap();
+        let changed = reg
+            .poll_sites()
+            .await
+            .expect("a station switched off is news");
+        assert!(!changed.stations[0].enabled);
+    }
+
+    /// Definitions are news on first read and on change; a request outcome
+    /// is sent once, and those already in the file when the sidecar starts
+    /// are not sent at all.
+    #[tokio::test]
+    async fn poll_networks_sends_changes_and_each_outcome_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+        let path = dir.path().join(NETWORKS_FILE);
+        assert_eq!(reg.poll_networks().await, NetworksNews::default());
+        assert_eq!(reg.last_networks().await, None, "no file, no networks");
+
+        let def = r#"{"networkId":"n1","name":"Polar net","vantages":[{"vantage":{"kind":"station","station":"KSC"},"fallback":true}],"revision":2,"flightId":4294901761}"#;
+        let old = r#"{"token":"old","ok":true,"networkId":"n1","atMs":1000}"#;
+        let recent = format!(
+            r#"{{"token":"recent","ok":true,"networkId":"n1","atMs":{}}}"#,
+            unix_ms() - 5_000
+        );
+        tokio::fs::write(
+            &path,
+            format!(r#"{{"networks":[{def}],"editable":true,"results":[{old},{recent}]}}"#),
+        )
+        .await
+        .unwrap();
+        let first = reg.poll_networks().await;
+        let defs = first.definitions.expect("first read is news");
+        assert_eq!(defs.networks[0].network_id, "n1");
+        assert_eq!(defs.networks[0].flight_id, Some(0xFFFF_0001));
+        assert!(defs.networks[0].vantages[0].fallback);
+        assert_eq!(defs.editable, Some(true));
+        assert_eq!(
+            first
+                .results
+                .iter()
+                .map(|r| r.token.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent"],
+            "on the first read only an outcome from the last moments is sent"
+        );
+
+        let fresh = r#"{"token":"t2","ok":false,"code":"stale","text":"changed"}"#;
+        tokio::fs::write(
+            &path,
+            format!(r#"{{"networks":[{def}],"editable":true,"results":[{old},{recent},{fresh}]}}"#),
+        )
+        .await
+        .unwrap();
+        let second = reg.poll_networks().await;
+        assert!(
+            second.definitions.is_none(),
+            "same definitions are not news"
+        );
+        assert_eq!(second.results.len(), 1);
+        assert_eq!(second.results[0].code.as_deref(), Some("stale"));
+        assert!(reg.poll_networks().await.results.is_empty(), "sent once");
+
+        tokio::fs::write(&path, "{\"networks\":[").await.unwrap();
+        assert_eq!(reg.poll_networks().await, NetworksNews::default());
+        assert_eq!(reg.last_networks().await, Some(defs));
+    }
+
+    /// A retry reuses its token, and the game's new answer to it must still
+    /// reach the client that is waiting; a re-read of the same answer must not.
+    #[tokio::test]
+    async fn poll_networks_sends_a_new_outcome_for_a_reused_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+        let path = dir.path().join(NETWORKS_FILE);
+        let at = unix_ms();
+        let refused = |at_ms: u64, code: &str| {
+            format!(r#"{{"token":"same","ok":false,"code":"{code}","atMs":{at_ms}}}"#)
+        };
+        let write = |results: Vec<String>| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"networks":[],"results":[{}]}}"#, results.join(",")),
+            )
+            .unwrap();
+        };
+
+        write(vec![refused(at, "full")]);
+        assert_eq!(reg.poll_networks().await.results.len(), 1);
+        assert!(
+            reg.poll_networks().await.results.is_empty(),
+            "the same answer is sent once"
+        );
+
+        write(vec![refused(at, "full"), refused(at + 1, "badVantage")]);
+        let retried = reg.poll_networks().await;
+        assert_eq!(retried.results.len(), 1, "only the new answer is news");
+        assert_eq!(retried.results[0].token, "same");
+        assert_eq!(retried.results[0].code.as_deref(), Some("badVantage"));
     }
 
     /// A status write whose `captureUt` advanced produces a `settings`
@@ -5611,6 +6100,68 @@ mod tests {
         }
     }
 
+    /// A camera network camera's status names where it stands now, which
+    /// the camera list shows over the site it was built at, so a cut
+    /// relabels it; a malformed network part is dropped alone.
+    #[test]
+    fn a_network_cut_relabels_the_camera_list() {
+        let m: InfoManifest = serde_json::from_str(
+            r#"{"flight_id":9,"kind":"command","site_key":"KSC","site_kind":"station","station_id":"ground:KSC","station_node_name":"KSC","station_name":"Kerbal Space Center","command_created":true}"#,
+        )
+        .unwrap();
+        let built = command_centre_from_manifest(&m);
+        let status = |site: &str, label: &str| -> Option<CommandTargetsStatus> {
+            let per: PerCameraStatus = serde_json::from_str(&format!(
+                r#"{{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{{"subjectPersistentId":42,"trackingLevel":3,"targets":[],"site":{{"siteKey":"{site}","siteKind":"station","displayName":"{label}","body":"Kerbin","latitude":-6.5,"longitude":-141.6,"altitude":3000.0}},"network":{{"name":"Ground net","followsActiveVessel":true,"state":"ok","vantages":[{{"siteKey":"KSC","label":"Kerbal Space Center","state":"belowHorizon","active":false,"fallback":false}},{{"siteKey":"{site}","label":"{label}","state":"ok","active":true,"fallback":true}}]}}}}}}"#
+            ))
+            .unwrap();
+            per.command_targets
+        };
+        let at_rim = status("Crater Rim", "North dish");
+        let merged = command_centre_with(&built, at_rim.as_ref()).expect("merged");
+        assert_eq!(merged.site_key, "Crater Rim");
+        assert_eq!(merged.node_name, "Crater Rim");
+        assert_eq!(merged.station_id, "ground:Crater Rim");
+        assert_eq!(
+            merged.display_name, "North dish",
+            "the host's label names the camera's site"
+        );
+        assert_eq!((merged.latitude, merged.altitude), (-6.5, 3000.0));
+        let network = merged.network.as_ref().expect("network");
+        assert_eq!(network.name, "Ground net");
+        assert_eq!(network.follows_active_vessel, Some(true));
+        assert_eq!(network.state, "ok");
+        assert_eq!(network.vantages.len(), 2);
+        assert!(network.vantages[1].active && network.vantages[1].fallback);
+        assert_eq!(network.vantages[0].state, "belowHorizon");
+
+        let json = serde_json::to_value(&merged).unwrap();
+        assert_eq!(json["network"]["vantages"][1]["siteKey"], "Crater Rim");
+        assert_eq!(json["network"]["followsActiveVessel"], true);
+        assert_eq!(json["displayName"], "North dish");
+
+        assert!(
+            command_targets_changed(&at_rim, &status("Nye Island", "Nye Island")),
+            "a cut is a change viewers hear about"
+        );
+
+        let plain = command_centre_with(&built, None).expect("identity");
+        assert!(
+            plain.network.is_none() && plain.site_key == "KSC",
+            "before any status, the manifest's site"
+        );
+
+        let per: PerCameraStatus = serde_json::from_str(
+            r#"{"flightId":9,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"commandCentre":{"subjectPersistentId":42,"trackingLevel":3,"targets":[],"network":{"name":7},"site":"nope"}}"#,
+        )
+        .unwrap();
+        let kept = per
+            .command_targets
+            .expect("the rest of the status survives");
+        assert!(kept.network.is_none() && kept.site.is_none());
+        assert_eq!(kept.subject_persistent_id, 42);
+    }
+
     /// Station fields on a manifest of another kind are ignored.
     #[test]
     fn command_centre_identity_only_for_command_kind() {
@@ -6978,6 +7529,85 @@ mod tests {
     }
 
     #[test]
+    fn fov_moves_relatively_on_a_narrow_lens_and_by_a_hundredth_on_a_wide_one() {
+        assert!(fov_moved(0.02, 0.03), "the narrow end of a tracking lens");
+        assert!(fov_moved(0.02, 0.0202));
+        assert!(!fov_moved(0.02, 0.02005), "under half a percent");
+        assert!(!fov_moved(60.0, 60.005));
+        assert!(fov_moved(60.0, 60.02), "a wide lens keeps its 0.01 degrees");
+    }
+
+    /// Each poll moves the field by less than the threshold; the sum of them
+    /// has to reach clients all the same.
+    #[tokio::test]
+    async fn slow_zoom_drift_is_measured_from_the_last_value_sent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let flight_id: u32 = 5_003;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&shm.join(format!("{flight_id}.ring")), cfg).expect("ring");
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let status_path = shm.join("global.status.json");
+        let write = |fov: f32, fov_min: f32| {
+            std::fs::write(
+                &status_path,
+                format!(
+                    r#"{{"kspFps":60.0,"shedLevel":0,"cameras":[{{"flightId":{flight_id},"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":{fov},"fovMin":{fov_min}}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let mut sent = Vec::new();
+        for (fov, fov_min) in [
+            (1.0, 2.0),
+            (1.004, 2.0),
+            (1.008, 2.0),
+            (1.008, 2.015),
+            (1.008, 2.03),
+        ] {
+            write(fov, fov_min);
+            sent.push(!registry.poll_status().await.changed_cameras.is_empty());
+        }
+        assert_eq!(
+            sent,
+            vec![true, false, true, false, true],
+            "each move under a threshold counts toward the next send"
+        );
+
+        let entries = registry.dump_run_logs().await.len();
+        write(1.0085, 2.03);
+        registry.poll_status().await;
+        registry.poll_status().await;
+        assert_eq!(
+            registry.dump_run_logs().await.len(),
+            entries,
+            "a camera at rest under the threshold adds no log entries"
+        );
+        write(1.5, 2.03);
+        registry.poll_status().await;
+        let log = registry.dump_run_logs().await;
+        assert_eq!(log.len(), entries + 1, "a real move is logged");
+        assert_eq!(
+            log.last().unwrap().status.cameras[0].fov,
+            1.5,
+            "the log keeps what the game reported"
+        );
+    }
+
+    #[test]
+    fn a_live_fov_limit_moves_only_past_one_percent() {
+        assert!(!fov_limit_moved(Some(1.2), Some(1.205)));
+        assert!(fov_limit_moved(Some(1.2), Some(1.22)));
+        assert!(fov_limit_moved(None, Some(1.2)));
+        assert!(!fov_limit_moved(None, None));
+    }
+
+    #[test]
     fn effective_fov_prefers_a_usable_live_value() {
         assert_eq!(effective_fov(Some(25.0), 60.0), 25.0);
         assert_eq!(effective_fov(None, 60.0), 60.0);
@@ -6999,6 +7629,38 @@ mod tests {
         registry.poll_status().await;
         assert_eq!(info_for(&registry, 1).await.fov, 23.5);
         assert_ne!(default, 23.5);
+    }
+
+    /// A command camera's zoom limits move after its manifest is written, so
+    /// the status's live limits win over the manifest's in the list and the
+    /// state; a camera whose status has none keeps the manifest's.
+    #[tokio::test]
+    async fn live_status_fov_limits_win_over_the_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _cam) = registry_with_one_camera(&dir).await;
+        let manifest = info_for(&registry, 1).await;
+        std::fs::write(
+            dir.path().join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":30,"fovMin":0.02,"fovMax":30}]}"#,
+        )
+        .unwrap();
+        registry.poll_status().await;
+        let info = info_for(&registry, 1).await;
+        assert_eq!((info.fov_min, info.fov_max), (0.02, 30.0));
+        let state = registry.protocol_state(1).await.expect("state");
+        assert_eq!((state.fov_min, state.fov_max), (0.02, 30.0));
+
+        std::fs::write(
+            dir.path().join("global.status.json"),
+            r#"{"kspFps":60.0,"shedLevel":0,"cameras":[{"flightId":1,"renderWidth":64,"renderHeight":64,"operatorWidth":64,"operatorHeight":64,"fov":30}]}"#,
+        )
+        .unwrap();
+        registry.poll_status().await;
+        let info = info_for(&registry, 1).await;
+        assert_eq!(
+            (info.fov_min, info.fov_max),
+            (manifest.fov_min, manifest.fov_max)
+        );
     }
 
     async fn info_for(registry: &CameraRegistry, flight_id: u32) -> CameraInfo {

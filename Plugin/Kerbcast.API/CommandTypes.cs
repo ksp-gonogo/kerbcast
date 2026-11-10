@@ -23,7 +23,13 @@ namespace Kerbcast.Api
         public uint FlightId { get; set; }
         public string DisplayName { get; set; }
 
-        /** <summary>Stable name of the place the lens stands, unchanged when its craft docks.</summary> */
+        /**
+         * <summary>
+         * Stable name of the place the lens stands, unchanged when its craft docks. On a camera network camera
+         * (<see cref="Network"/>) it names the vantage the camera shows now, and changes on every cut: key a
+         * network camera by its FlightId.
+         * </summary>
+         */
         public string SiteKey { get; set; }
         public SiteKind SiteKind { get; set; }
 
@@ -38,6 +44,27 @@ namespace Kerbcast.Api
 
         /** <summary>Whether a client or a mod created the feed, rather than settings.</summary> */
         public bool Created { get; set; }
+
+        /** <summary>A camera network camera, which moves between vantages (see <see cref="ICommand.NetworkStatus"/>). Added in API 1.5.</summary> */
+        public bool Network { get; set; }
+
+        /**
+         * <summary>
+         * A network a player saved with the game. <see cref="Network"/> and <see cref="Created"/> are true too, but
+         * <see cref="ICommand.SetNetworkVantages"/> and <see cref="ICommand.DestroyNetworkCamera"/> answer NotCommandFeed
+         * for it; aim works under the lock rules. Added in API 1.5.
+         * </summary>
+         */
+        public bool Saved { get; set; }
+
+        /**
+         * <summary>
+         * The feed has no aim of its own, so it watches the craft Kerbcast picks by default: the active vessel in
+         * flight, the latest launched craft in the Space Center. An aim set by <see cref="ICommand.SetAim"/> or at
+         * creation, the active vessel's included, makes it false until the aim is cleared. Added in API 1.5.
+         * </summary>
+         */
+        public bool FollowsActiveVessel { get; set; }
     }
 
     /**
@@ -99,7 +126,14 @@ namespace Kerbcast.Api
         public double Ut { get; set; }
     }
 
-    /** <summary>Where a command feed points. Bodies are KSP's flightGlobalsIndex and vectors are body-relative, z-up, in KSP's fixed inertial frame, as <see cref="WorldModelBuilder.StateVector"/> takes them.</summary> */
+    /**
+     * <summary>
+     * Where a command feed points. Bodies are KSP's flightGlobalsIndex and vectors are body-relative, z-up, in KSP's
+     * fixed inertial frame, as <see cref="WorldModelBuilder.StateVector"/> takes them. The feed zooms itself: a Vessel,
+     * Orbit or PositionAt aim frames its subject, a Surface aim frames its margin about the point (the widest view
+     * without one) and a Direction aim opens to the widest view.
+     * </summary>
+     */
     public sealed class Aim
     {
         public AimKind Kind { get; }

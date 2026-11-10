@@ -52,7 +52,7 @@ namespace Kerbcast.Api
          */
         CameraView View(uint flightId);
 
-        /** <summary>Slews a part camera's field of view, clamped to its range. False for an unknown camera, a command feed, or one without zoom.</summary> */
+        /** <summary>Slews a part camera's field of view, clamped to its range. False for an unknown camera, one without zoom, or a command feed, which zooms itself.</summary> */
         bool SetFov(uint flightId, double fov);
 
         /** <summary>Slews a part camera's pan, clamped to its range. False for an unknown camera, a command feed, or one without pan.</summary> */
@@ -107,7 +107,8 @@ namespace Kerbcast.Api
     {
         /**
          * <summary>
-         * Takes the lock on every command feed in this scene for <paramref name="owner"/>. While held, only
+         * Takes the lock on every command feed in this scene for <paramref name="owner"/>. Every feed returns to its
+         * default aim, a network a player saved to its saved watch. While held, only
          * the owner aims command feeds; every owner call is a heartbeat, and 5 s of real time without one
          * blanks every governed feed with <paramref name="silentText"/> (or Kerbcast's default), never the
          * truth. NotRunning when Kerbcast is not running in this scene, as through a reference kept from an
@@ -119,7 +120,7 @@ namespace Kerbcast.Api
          */
         LockResult TakeLock(string owner, LockOptions options, string silentText = null);
 
-        /** <summary>Releases the lock; every feed returns to truth and its default aim. Ignored for anyone but the holder.</summary> */
+        /** <summary>Releases the lock; every feed returns to truth and its default aim, a network a player saved to its saved watch. Ignored for anyone but the holder.</summary> */
         void ReleaseLock(string owner);
 
         /**
@@ -173,6 +174,77 @@ namespace Kerbcast.Api
          * </summary>
          */
         OpticsResult SetOptics(uint flightId, OpticsSettings optics, string owner);
+
+        /**
+         * <summary>
+         * Creates a camera network camera: one command feed that follows its craft through <paramref name="vantages"/>
+         * and shows whichever has the clearest view, cutting between them (see <see cref="NetworkOptions"/> for when).
+         * Each vantage has the lens it would have standing alone, and under a world model is scored only on what its
+         * own site knows. <paramref name="name"/> names the feed ("Camera network" when null); its label, in every
+         * frame, is the current vantage's. It aims by <paramref name="aim"/>, or at the default craft when null. The
+         * feed appears in <see cref="Feeds"/> once a vantage resolves, normally on the next frame, and is dropped if
+         * none has within 30 s. Like any created camera it lasts until destroyed or the scene ends, a revert or quickload
+         * included, so a host makes it again in the next scene. There is no default list: the host passes every vantage. While the lock is held only
+         * its owner may create one, and the call is a heartbeat; without the lock anyone may. Check
+         * <see cref="KerbcastApi.Supports"/> with <see cref="ApiFeature.NetworkCameras"/> first.
+         * </summary>
+         */
+        NetworkResult CreateNetworkCamera(IReadOnlyList<NetworkVantage> vantages, string name, Aim aim, NetworkOptions options,
+            string owner, out uint flightId);
+
+        /**
+         * <summary>
+         * Replaces a network camera's vantages, and its options unless <paramref name="options"/> is null. A vantage
+         * kept in the list keeps its place; if the camera's current vantage is removed it cuts on its next pass. Only
+         * the mod that made it may replace them, unless it was made under no name. The
+         * lock applies as for <see cref="CreateNetworkCamera"/>.
+         * </summary>
+         */
+        NetworkResult SetNetworkVantages(uint flightId, IReadOnlyList<NetworkVantage> vantages, NetworkOptions options, string owner);
+
+        /** <summary>Removes a network camera, built or not; its feed ends. Only the mod that made it may, unless it was made under no name. The lock applies as for <see cref="CreateNetworkCamera"/>.</summary> */
+        NetworkResult DestroyNetworkCamera(uint flightId, string owner);
+
+        /** <summary>Every vantage of a network camera as its last pass scored them, in list order; empty when it is no network camera or not built yet.</summary> */
+        IReadOnlyList<NetworkVantageStatus> NetworkStatus(uint flightId);
+
+        /**
+         * <summary>
+         * Every ground station in the scene a command camera can stand at, once per node name, switched on or not, so
+         * a host can build its own vantage list. Check <see cref="KerbcastApi.Supports"/> with
+         * <see cref="ApiFeature.GroundStations"/> first.
+         * </summary>
+         */
+        IReadOnlyList<GroundStationInfo> GroundStations();
+
+        /**
+         * <summary>
+         * Whether a lens standing at <paramref name="vantage"/> could see a point at game time <paramref name="ut"/>:
+         * the vantage, every body and the vantage's own skyline are placed at that one instant, and the line is tested
+         * with the occlusion command cameras draw with. The point is the caller's, in the world model's state vector
+         * frame (<see cref="WorldModelBuilder.StateVector"/>: about body <paramref name="bodyIndex"/>, z-up, KSP's fixed
+         * inertial frame), with <paramref name="radiusM"/> letting a craft show over a skyline (NaN for a point). There is
+         * no light time or delay in it: the caller picks the instant and the point. A craft vantage is placed on its
+         * current orbit patch, as if nothing changed its course (no thrust, no change of sphere of influence), or carried
+         * by its body when landed. A ground station the game has switched off answers Disabled. Known is false when the
+         * vantage or the body cannot be placed, and whenever any part of the vantage's skyline the line needs is not
+         * measured yet, so a Known answer is always whole. It is a read for the host alone: no lock applies,
+         * nothing is shown to viewers and no camera uses it. Check <see cref="KerbcastApi.Supports"/> with
+         * <see cref="ApiFeature.LineOfSight"/> first.
+         * </summary>
+         */
+        LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN);
+
+        /**
+         * <summary>
+         * How fine a detail a command camera standing at <paramref name="vantage"/> could show now: its tightest zoom,
+         * the frame it renders, and its lens when deep-space optics are drawn, by the rules a camera there would have.
+         * For the blur toward one point, air included, read <see cref="LineOfSightResult.ResolutionRad"/>. A read for the
+         * host alone: no lock applies and no camera uses it. Not Known for a null vantage or one that does not resolve.
+         * Check <see cref="KerbcastApi.Supports"/> with <see cref="ApiFeature.VantageResolution"/> first.
+         * </summary>
+         */
+        VantageResolution VantageResolution(NetworkVantage vantage);
 
         /** <summary>Every craft a command feed could watch, empty when it is not a command feed.</summary> */
         IReadOnlyList<CommandTarget> Targets(uint flightId);

@@ -218,6 +218,178 @@ namespace Kerbcast
             return KerbcastControl.SetOpticsCore(flightId, knobs, owner);
         }
 
+        public NetworkResult CreateNetworkCamera(IReadOnlyList<NetworkVantage> vantages, string name, Aim aim, NetworkOptions options,
+            string owner, out uint flightId)
+        {
+            Enter(nameof(CreateNetworkCamera), ApiFeature.NetworkCameras);
+            flightId = 0;
+            if (KerbcastCore.Instance == null) return NetworkResult.NotRunning;
+            var specs = ToSpecs(vantages, out var bad);
+            if (bad != NetworkResult.Ok) return Refuse(bad, owner);
+            CommandAim command = null;
+            if (aim != null && ToCommandAim(aim, out command) != AimResult.Ok) return Refuse(NetworkResult.BadAim, owner);
+            return KerbcastControl.CreateNetworkCore(specs, name, ToTuning(options), command, owner, out flightId);
+        }
+
+        public NetworkResult SetNetworkVantages(uint flightId, IReadOnlyList<NetworkVantage> vantages, NetworkOptions options, string owner)
+        {
+            Enter(nameof(SetNetworkVantages), ApiFeature.NetworkCameras);
+            if (KerbcastCore.Instance == null) return NetworkResult.NotRunning;
+            var specs = ToSpecs(vantages, out var bad);
+            if (bad != NetworkResult.Ok) return Refuse(bad, owner);
+            return KerbcastControl.SetNetworkCore(flightId, specs, options == null ? (NetworkTuning?)null : ToTuning(options), owner);
+        }
+
+        public NetworkResult DestroyNetworkCamera(uint flightId, string owner)
+        {
+            Enter(nameof(DestroyNetworkCamera), ApiFeature.NetworkCameras);
+            return KerbcastControl.DestroyNetworkCore(flightId, owner);
+        }
+
+        public IReadOnlyList<NetworkVantageStatus> NetworkStatus(uint flightId)
+        {
+            main.Check(nameof(NetworkStatus));
+            var result = new List<NetworkVantageStatus>();
+            if (!KerbcastApi.Supports(ApiFeature.NetworkCameras)) throw MainThread.NotYet(nameof(NetworkStatus));
+            var network = (Find(flightId)?.Rig as CommandCameraRig)?.Network;
+            if (network == null) return result;
+            var readings = new List<NetworkVantageReading>();
+            network.Readings(readings);
+            foreach (var r in readings)
+                result.Add(new NetworkVantageStatus
+                {
+                    SiteKey = r.SiteKey,
+                    Label = r.Label,
+                    SiteKind = r.Kind,
+                    VantagePersistentId = r.VantagePersistentId,
+                    Active = r.Active,
+                    Fallback = r.Fallback,
+                    State = NetworkMath.Code(r.State),
+                    Score = r.Score,
+                    Occluder = r.Occluder,
+                });
+            return result;
+        }
+
+        readonly CommandLineOfSight sight = new CommandLineOfSight();
+
+        public LineOfSightResult LineOfSight(NetworkVantage vantage, double ut, int bodyIndex, Vec3d position, double radiusM = double.NaN)
+        {
+            Enter(nameof(LineOfSight), ApiFeature.LineOfSight);
+            var a = sight.Check(vantage, ut, bodyIndex, new DVec3(position.X, position.Y, position.Z), radiusM);
+            return new LineOfSightResult(a.Known, a.Visible, a.Occluder, a.BelowHorizon, a.RangeM, a.Disabled,
+                KerbcastApi.Supports(ApiFeature.VantageResolution) ? a.ResolutionRad : double.NaN);
+        }
+
+        public VantageResolution VantageResolution(NetworkVantage vantage)
+        {
+            Enter(nameof(VantageResolution), ApiFeature.VantageResolution);
+            var lens = sight.Lens(vantage);
+            if (!lens.Known) return new VantageResolution();
+            return new VantageResolution
+            {
+                Known = true,
+                FovMinDeg = lens.FovMinDeg,
+                FrameWidthPx = lens.WidthPx,
+                FrameHeightPx = lens.HeightPx,
+                PixelRad = lens.PixelArcsec / OpticsModel.ArcsecPerRadian,
+                OpticsOn = lens.OpticsOn,
+                LensArcsec = lens.LensArcsec,
+                BestResolutionRad = lens.ResolutionArcsec(0, 90) / OpticsModel.ArcsecPerRadian,
+            };
+        }
+
+        public IReadOnlyList<GroundStationInfo> GroundStations()
+        {
+            Enter(nameof(GroundStations), ApiFeature.GroundStations);
+            var stations = new List<GroundStation>();
+            CommandCameraSite.GroundStations(stations);
+            var result = new List<GroundStationInfo>(stations.Count);
+            foreach (var s in stations)
+                result.Add(new GroundStationInfo
+                {
+                    NodeName = s.NodeName,
+                    DisplayName = s.DisplayName,
+                    BodyIndex = s.BodyIndex,
+                    Latitude = s.Latitude,
+                    Longitude = s.Longitude,
+                    Altitude = s.Altitude,
+                    Enabled = s.Enabled,
+                    DisabledReason = s.DisabledReason,
+                });
+            return result;
+        }
+
+        /* A refusal found before the lock is checked still answers the lock first, as SetAim does: the holder's call is a heartbeat, anyone else's is NotLockHolder. */
+        static NetworkResult Refuse(NetworkResult why, string owner)
+        {
+            var auth = KerbcastCore.Instance?.CommandAuthority;
+            if (auth == null || !auth.Registered) return why;
+            if (!auth.Lock.Holds(owner)) return NetworkResult.NotLockHolder;
+            auth.Heartbeat(Time.realtimeSinceStartup);
+            return why;
+        }
+
+        static NetworkTuning ToTuning(NetworkOptions o) => o == null ? NetworkTuning.Default : new NetworkTuning
+        {
+            MinHoldUt = o.MinHoldUt,
+            MinHoldRealSeconds = o.MinHoldRealSeconds,
+            MarginStops = o.MarginStops,
+        };
+
+        /* The API's vantages as the plugin's. NoVantages for none, BadVantage for a null entry, too many, or a body index nobody has. */
+        static List<NetworkVantageSpec> ToSpecs(IReadOnlyList<NetworkVantage> vantages, out NetworkResult bad)
+        {
+            bad = NetworkResult.Ok;
+            if (vantages == null || vantages.Count == 0)
+            {
+                bad = NetworkResult.NoVantages;
+                return null;
+            }
+            if (vantages.Count > NetworkMath.MaxVantages)
+            {
+                bad = NetworkResult.BadVantage;
+                return null;
+            }
+            var specs = new List<NetworkVantageSpec>(vantages.Count);
+            foreach (var v in vantages)
+            {
+                var cv = ToCommandVantage(v);
+                if (cv == null)
+                {
+                    bad = NetworkResult.BadVantage;
+                    return null;
+                }
+                specs.Add(new NetworkVantageSpec { Vantage = cv, Label = v.Label, Fallback = v.Fallback });
+            }
+            return specs;
+        }
+
+        /* The plugin's vantage for an API one; null for a null vantage or a surface on an unknown body. */
+        internal static CommandVantage ToCommandVantage(NetworkVantage v)
+        {
+            if (v == null) return null;
+            switch (v.Kind)
+            {
+                case SiteKind.Station: return CommandVantage.Station(v.Name, v.Height);
+                case SiteKind.LaunchSite: return CommandVantage.LaunchSite(v.Name, v.Distance, v.Bearing, v.Height);
+                case SiteKind.Vessel: return CommandVantage.Vessel(v.PersistentId);
+                case SiteKind.Surface:
+                    var body = BodyByIndex(v.BodyIndex);
+                    return body != null ? CommandVantage.Surface(body.bodyName, v.Latitude, v.Longitude, v.Height) : null;
+            }
+            return null;
+        }
+
+        static CelestialBody BodyByIndex(int index)
+        {
+            var bodies = FlightGlobals.Bodies;
+            if (bodies == null) return null;
+            for (int i = 0; i < bodies.Count; i++)
+                if (bodies[i] != null && bodies[i].flightGlobalsIndex == index) return bodies[i];
+            return null;
+        }
+
         /* Kerbcast.API names bodies by flightGlobalsIndex; the rig by name. */
         static AimResult ToCommandAim(Aim a, out CommandAim command)
         {
@@ -281,13 +453,16 @@ namespace Kerbcast
                 result.Add(new CommandFeed
                 {
                     FlightId = c.FlightId,
-                    DisplayName = gr.StationDisplayName,
+                    DisplayName = gr.SiteLabel,
                     SiteKey = site.NodeName,
                     SiteKind = site.Kind,
                     VantagePersistentId = site.VantagePersistentId,
                     Scope = sites.ScopeFor(site.NodeName),
                     SubjectPersistentId = gr.SubjectPersistentId,
                     Created = core.CommandProvider?.IsCreated(c.FlightId) ?? false,
+                    Network = gr.Network != null,
+                    Saved = core.IsSavedNetwork(c.FlightId),
+                    FollowsActiveVessel = gr.Aim == null,
                 });
             }
             return result;

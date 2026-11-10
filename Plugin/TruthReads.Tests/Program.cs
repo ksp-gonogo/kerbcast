@@ -71,6 +71,8 @@ var trackPins = new[]
         "the launch site a created lens is placed at, from the Space Center's chosen craft"),
     Pin.Line("CommandCameraSite.cs", "CommandCameraSite.VantageExists", "if (SubjectTrack.RecordCounts(protos[i]) && protos[i].persistentId == persistentId) return true;", 1,
         "the shared saved-record rule"),
+    Pin.Line("CommandCameraProvider.cs", "Feed.NetworkLaunchedFrom", "return _p._spaceCenter ? _track.LaunchedFrom : FlightGlobals.ActiveVessel?.launchedFrom;", 1,
+        "the launch site a network's unnamed launch site vantage is placed at, from the Space Center's chosen craft"),
 };
 
 /* The light-time history holds truth about every craft, so only the picture reads it. The solve itself is pure and anyone may run it on their own positions. */
@@ -116,6 +118,8 @@ var truthFiles = new Dictionary<string, string>
 /* Members allowed to read truth whole, and single pinned lines. */
 var truthPins = new[]
 {
+    Pin.Whole("KerbcastCore.cs", "KerbcastCore.CatalogVessels",
+        "the site catalog lists every craft the game has, for building vantage lists; scoring still gates each vantage on what its own site knows"),
     Pin.Whole("PicturePass.cs", "PictureLens.OnCraft", "the picture: a camera's lens on the craft it rides"),
     Pin.Whole("PicturePass.cs", "PicturePass.Locate", "the picture: whether a craft draws itself live or is drawn at its past instant"),
     Pin.Whole("PicturePass.cs", "PicturePass.Drawn", "the picture: the craft a tracking camera aims at, where it is drawn"),
@@ -131,6 +135,7 @@ var truthPins = new[]
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.ResolveVessel", "finds the craft a lens rides"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.FromVessel", "a site on the craft a lens rides"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.FollowMerge", "the lens follows its craft through a merge"),
+    Pin.Whole("NetworkStore.cs", "NetworkStore.OnGameSaved", "which craft a game save holds, by id, to tell whether a merge is in it"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.TryVantagePosition", "the lens's position from its own craft"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.TryVantageForward", "the way the lens's own craft points, for its placeholder aim"),
     Pin.Whole("CommandCameraSite.cs", "CommandCameraSite.TryStationMotion", "the lens's motion from its own craft, for the forecast"),
@@ -150,10 +155,12 @@ var truthPins = new[]
         "the launch site the default lens is placed at"),
     Pin.Line("CommandCameraProvider.cs", "Feed.ResolveCreated", ": (FlightGlobals.ActiveVessel ?? vessel)?.launchedFrom;", 1,
         "the launch site a created lens is placed at"),
-    Pin.Line("CommandCameraProvider.cs", "Feed.ResolveDefault", "if (_site.Vantage.loaded)", 1,
-        "warns that the default lens sits inside its own loaded craft"),
-    Pin.Line("CommandCameraProvider.cs", "Feed.ResolveCreated", "if (_site.HasVantage && _site.Vantage.loaded)", 1,
-        "warns that a created lens sits inside its own loaded craft"),
+    Pin.Line("CommandCameraProvider.cs", "Feed.NetworkLaunchedFrom", "return _p._spaceCenter ? _track.LaunchedFrom : FlightGlobals.ActiveVessel?.launchedFrom;", 1,
+        "the launch site a network's unnamed launch site vantage is placed at"),
+    Pin.Line("CommandLineOfSight.cs", "CommandLineOfSight.EntryFor", "string launchedFrom = unnamedSite ? FlightGlobals.ActiveVessel?.launchedFrom : null;", 1,
+        "the launch site a host's unnamed launch site vantage stands beside, as a created lens's does"),
+    Pin.Line("CommandCameraRig.cs", "CommandCameraRig.PrepareRender", "if (rides != null && rides.loaded) cam.Picture.HideOwn(rides);", 1,
+        "whether the lens's own craft is drawn in the scene, to hide its parts from this camera"),
     Pin.Line("CommandCameraMarker.cs", "CommandCameraMarker.Place", "_go.transform.position = new Vector3((float)p.X, (float)p.Y, (float)p.Z);", 1, "places the marker object, not a craft read"),
     Pin.Line("PicturePass.cs", "PicturePass.BeforeScaledLayer", "_afgBlock.SetVector(AfgOffsetId, b.afg.transform.position);", 1, "a moved body's atmosphere shell"),
     Pin.Line("PicturePass.cs", "PicturePass.LightBodies", "Vector3 sunScaled = sunBody.scaledBody.transform.position;", 1, "the Sun's scaled mesh, for a shell's light"),
@@ -334,7 +341,7 @@ string Here([CallerFilePath] string path = "") => path;
 string pluginDir = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Here()), "..", "Kerbcast"));
 Check(Directory.Exists(pluginDir), $"plugin source found at {pluginDir}");
 
-var extraFiles = new[] { "KerbcastControl.cs", "KerbcastCore.cs", "AnchorProjector.cs", "KerbcastApiImpl.cs" };
+var extraFiles = new[] { "KerbcastControl.cs", "KerbcastCore.cs", "AnchorProjector.cs", "KerbcastApiImpl.cs", "NetworkStore.cs" };
 bool InScope(string file) =>
     file.StartsWith("Command", StringComparison.Ordinal) || extraFiles.Contains(file)
     || new[] { "IFixSource.cs", "TruthFixSource.cs", "DrawnSubject.cs", "PicturePass.cs", "PictureHiding.cs", "PictureStandIns.cs", "PictureCull.cs", "LensSights.cs", "SubjectTrack.cs", "SubjectSelection.cs", "CraftFixState.cs",

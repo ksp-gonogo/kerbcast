@@ -94,6 +94,17 @@ namespace Kerbcast
         private bool _disabled;
         private float _statusCooldown;
         private const float StatusWriteIntervalSeconds = 1.0f;
+        /* The ground stations change only with the game's settings or mods, so
+           they are read every few seconds; craft are read every second. The
+           file is written when it differs, so at most once a second. */
+        private string _sitesPath;
+        private string _sitesWritten;
+        private float _sitesCooldown;
+        private float _stationsCooldown;
+        private const float SitesReadIntervalSeconds = 1.0f;
+        private const float StationsReadIntervalSeconds = 5.0f;
+        private readonly List<GroundStation> _stations = new List<GroundStation>();
+        private readonly List<CatalogVessel> _catalogVessels = new List<CatalogVessel>();
 
         /* Control file (sidecar -> plugin). Polled ~1Hz with its own cooldown. */
         private string _controlPath;
@@ -326,6 +337,7 @@ namespace Kerbcast
                 if (swept > 0 || skipped > 0)
                     Debug.Log($"[Kerbcast] swept {swept} stale camera file(s) left by an earlier flight, skipped {skipped} in use");
                 _statusPath = Path.Combine(RingDir, "global.status.json");
+                _sitesPath = Path.Combine(RingDir, GroundStationList.FileName);
                 _controlPath = Path.Combine(RingDir, "global.control.json");
                 _commandsPath = Path.Combine(RingDir, CommandsFileName);
                 _commandsSignalPath = Path.Combine(RingDir, CommandsSignalFileName);
@@ -339,6 +351,20 @@ namespace Kerbcast
                 enabled = false;
                 return;
             }
+
+            /* Its own guard: a network that will not start must not take the rest of Kerbcast down with it. */
+            try
+            {
+                _networks = new NetworkStore(RingDir);
+                _networks.Load();
+                _networks.StartCameras();
+                foreach (var r in _carriedNetworkRequests) ApplyCommandRequest(r);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Kerbcast][NETWORK] saved networks failed to start: {ex}");
+            }
+            _carriedNetworkRequests.Clear();
 
             GameEvents.onVesselChange.Add(OnVesselChange);
             GameEvents.onPartDestroyed.Add(OnPartDestroyed);
@@ -489,6 +515,7 @@ namespace Kerbcast
             _teardown.OnSceneLoadRequested();
             EndSceneLock();
             CommandAuthority.WorldModel.Close();
+            _networks?.Stop();
             /* Restore now, before the scene tears down. Camera ScaledSpace and
                GalaxyCamera survive into the next scene, so a throttle left on
                them would keep the next scene's main view in an 8x8 corner. */
@@ -650,6 +677,13 @@ namespace Kerbcast
         private string _commandsLastJson;
         private readonly CommandFilePoll _commandsPoll = new CommandFilePoll();
         private readonly CommandRequestLedger _commandLedger = new CommandRequestLedger();
+        private NetworkStore _networks;
+        private readonly List<CommandCameraRequest> _carriedNetworkRequests = new List<CommandCameraRequest>();
+
+        /* A network a player saved with the game, which no mod may change. */
+        internal bool IsSavedNetwork(uint flightId) => _networks != null && _networks.IsSaved(flightId);
+
+        internal void ReapplySavedWatches() => _networks?.ReapplyWatches();
 
         private void SeedCommandRequests()
         {
@@ -657,7 +691,11 @@ namespace Kerbcast
             {
                 if (!File.Exists(_commandsPath)) return;
                 _commandsLastJson = ReadCommandsFile();
-                _commandLedger.SeedFrom(CommandCameraRequest.ParseFile(_commandsLastJson, null));
+                var queued = CommandCameraRequest.ParseFile(_commandsLastJson, null);
+                _commandLedger.SeedFrom(queued);
+                _carriedNetworkRequests.AddRange(CommandRequestLedger.CarriedOver(queued, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                if (_carriedNetworkRequests.Count > 0)
+                    Debug.Log($"[Kerbcast][NETWORK] {_carriedNetworkRequests.Count} network request(s) sent while the scene loaded are applied now");
                 /* Anchors are state, not requests: the table on disk applies to this scene too. */
                 ApplyRemoteAnchors(_commandsLastJson);
                 if (_commandLedger.LastAppliedId > 0)
@@ -810,6 +848,16 @@ namespace Kerbcast
 
         private void ApplyCommandRequest(CommandCameraRequest r)
         {
+            /* Saved networks are the player's setup, not a live request, so a held lock does not refuse them. */
+            if (r.IsNetworkOp)
+            {
+                /* Not claimed, so the next scene's carry-over can still apply it. */
+                if (_networks != null && _networks.Stopped)
+                    Debug.Log($"[Kerbcast][NETWORK] client request {r.Id}: the scene is ending; left for the next one");
+                else if (!NetworkStore.Claim(r.Token)) _networks?.Replay(r, this);
+                else _networks?.Apply(r, this);
+                return;
+            }
             string holder = CommandAuthority.Owner;
             if (!BrowserManagesCameras && (r.Op == CommandRequestOp.Create || r.Op == CommandRequestOp.Destroy))
             {
@@ -838,7 +886,11 @@ namespace Kerbcast
                     return;
                 }
                 case CommandRequestOp.Destroy:
-                    if (!DestroyCommandCamera(r.FlightId))
+                    if (_networks != null && _networks.IsSaved(r.FlightId))
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is a saved network; deleting the network ends it");
+                    else if (_commandProvider.IsHostNetwork(r.FlightId))
+                        Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is a network a mod made; only it can remove it");
+                    else if (!DestroyCommandCamera(r.FlightId))
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: cam={r.FlightId} is not a created command camera; nothing destroyed");
                     return;
                 case CommandRequestOp.Aim:
@@ -850,6 +902,7 @@ namespace Kerbcast
                         r.Aim != null ? KerbcastControl.AimOf(r.Aim) : null);
                     if (!ok)
                         Debug.LogWarning($"[Kerbcast][CMDCAM] client request {r.Id}: aim for cam={r.FlightId} refused{(why != null ? ": " + why : "")}");
+                    else _networks?.ViewerAimed(r.FlightId, r.Aim, r.Token, this);
                     return;
                 }
             }
@@ -889,7 +942,7 @@ namespace Kerbcast
             if (_commandProvider == null || _teardown.LostCameraDisposal != CameraDisposal.Destroyed) return;
             List<KerbcastCamera> lost = null;
             foreach (var cam in _cameras)
-                if (cam is KerbcastCamera kc && kc.Rig is CommandCameraRig gr && gr.VantageLost)
+                if (cam is KerbcastCamera kc && kc.Rig is CommandCameraRig gr && gr.VantageLost && gr.Network == null)
                     (lost ?? (lost = new List<KerbcastCamera>())).Add(kc);
             if (lost == null) return;
             foreach (var kc in lost)
@@ -960,6 +1013,7 @@ namespace Kerbcast
             PollPlayerRelease();
             UpdateFpsAverage();
             MaybeApplyCommandRequests();
+            _networks?.Tick(this);
             DropLostVantages();
             RetryPendingCommandCamera();
             PollCommandRigs();
@@ -1166,6 +1220,7 @@ namespace Kerbcast
 
             MaybeApplyGlobalControl();
             MaybeWriteStatusFile();
+            MaybeWriteSitesFile();
         }
 
         private bool RankReady(int rank) => _cameras[_subscribedIdx[rank]].ReadyToCapture;
@@ -1569,6 +1624,12 @@ namespace Kerbcast
                     sb.Append($"      \"operatorLayers\": {LayersToJson(kc.OperatorLayers)},\n");
                     sb.Append($"      \"enableAtmosphericFx\": {(kc.EnableFx ? "true" : "false")},\n");
                     sb.Append($"      \"fov\": {kc.Fov.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    /* A command camera's narrowest field moves with the Tracking Station level and the optics setting, after the manifest is written. */
+                    if (kc.Rig != null)
+                    {
+                        sb.Append($"      \"fovMin\": {kc.FovMin.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                        sb.Append($"      \"fovMax\": {kc.FovMax.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
+                    }
                     sb.Append($"      \"panYaw\": {kc.PanYaw.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     sb.Append($"      \"panPitch\": {kc.PanPitch.ToString(System.Globalization.CultureInfo.InvariantCulture)},\n");
                     // Auto-track echo UP: the plugin's CURRENT applied mode + a
@@ -1615,6 +1676,63 @@ namespace Kerbcast
             catch (Exception ex)
             {
                 Debug.LogWarning($"[Kerbcast] status file write failed: {ex.Message}");
+            }
+        }
+
+        private void MaybeWriteSitesFile()
+        {
+            if (_sitesPath == null) return;
+            _sitesCooldown -= Time.unscaledDeltaTime;
+            if (_sitesCooldown > 0f) return;
+            _stationsCooldown -= SitesReadIntervalSeconds;
+            _sitesCooldown = SitesReadIntervalSeconds;
+            try
+            {
+                if (_stationsCooldown <= 0f)
+                {
+                    _stationsCooldown = StationsReadIntervalSeconds;
+                    CommandCameraSite.GroundStations(_stations);
+                }
+                CatalogVessels(_catalogVessels);
+                string json = GroundStationList.Json(_stations, _catalogVessels);
+                if (json == _sitesWritten) return;
+                var tmp = _sitesPath + ".tmp";
+                File.WriteAllText(tmp, json);
+                if (File.Exists(_sitesPath)) File.Delete(_sitesPath);
+                File.Move(tmp, _sitesPath);
+                _sitesWritten = json;
+                if (_stations.Count != _sitesLoggedStations)
+                    Debug.Log($"[Kerbcast] ground stations: {_stations.Count} listed for the sidecar");
+                _sitesLoggedStations = _stations.Count;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast] ground station list write failed: {ex.Message}");
+            }
+        }
+
+        private int _sitesLoggedStations = -1;
+
+        /* Every craft the game knows that has not been destroyed, for the site catalog. */
+        private static void CatalogVessels(List<CatalogVessel> into)
+        {
+            into.Clear();
+            var all = FlightGlobals.Vessels;
+            if (all == null) return;
+            var active = FlightGlobals.ActiveVessel;
+            foreach (var v in all)
+            {
+                if (v == null || v.state == Vessel.State.DEAD || v.persistentId == 0) continue;
+                into.Add(new CatalogVessel
+                {
+                    PersistentId = v.persistentId,
+                    Name = v.vesselName ?? "",
+                    VesselType = v.vesselType.ToString(),
+                    Body = v.mainBody != null ? v.mainBody.bodyName : "",
+                    Situation = v.situation.ToString(),
+                    Loaded = v.loaded,
+                    Active = v == active,
+                });
             }
         }
 
@@ -1672,6 +1790,7 @@ namespace Kerbcast
             sb.Append($"        \"subjectPersistentId\": {pid},\n");
             sb.Append($"        \"rangeM\": {Range(range)},\n");
             sb.Append($"        \"trackingLevel\": {CommandCameraTargets.TrackingLevel()},\n");
+            if (gr.Network != null) AppendNetwork(sb, gr);
             sb.Append("        \"targets\": [");
             for (int i = 0; i < targets.Count; i++)
             {
@@ -1683,6 +1802,39 @@ namespace Kerbcast
             }
             sb.Append(targets.Count > 0 ? "\n        ]\n" : "]\n");
             sb.Append("      },\n");
+        }
+
+        private static readonly List<NetworkVantageReading> NetworkReadings = new List<NetworkVantageReading>();
+
+        /*
+         * A camera network's site and vantages. The manifest describes the
+         * site the camera was built at; `site` here is where it stands now,
+         * which the sidecar lays over the manifest's so the camera list
+         * follows each cut.
+         */
+        private static void AppendNetwork(System.Text.StringBuilder sb, CommandCameraRig gr)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var s = gr.Site;
+            sb.Append("        \"site\": { ");
+            sb.Append($"\"siteKey\": \"{JsonEsc(s.NodeName)}\", \"siteKind\": \"{CommandCameraProvider.SiteKindTag(s.Kind)}\", ");
+            sb.Append($"\"displayName\": \"{JsonEsc(gr.SiteLabel)}\", \"body\": \"{JsonEsc(s.Body != null ? s.Body.bodyName : "")}\", ");
+            sb.Append($"\"latitude\": {s.Latitude.ToString("R", ci)}, \"longitude\": {s.Longitude.ToString("R", ci)}, \"altitude\": {s.Altitude.ToString("R", ci)}");
+            sb.Append(" },\n");
+            NetworkReadings.Clear();
+            gr.Network.Readings(NetworkReadings);
+            sb.Append("        \"network\": { ");
+            sb.Append($"\"name\": \"{JsonEsc(gr.Network.Name)}\", \"followsActiveVessel\": {(gr.Aim == null ? "true" : "false")}, \"state\": \"{(gr.Network.NoView ? CommandFrameState.NetworkNoView : CommandFrameState.NetworkOk)}\", \"vantages\": [");
+            for (int i = 0; i < NetworkReadings.Count; i++)
+            {
+                var r = NetworkReadings[i];
+                sb.Append(i == 0 ? "" : ", ");
+                sb.Append($"{{ \"siteKey\": \"{JsonEsc(r.SiteKey)}\", \"label\": \"{JsonEsc(r.Label)}\", \"state\": \"{NetworkMath.Code(r.State)}\", "
+                    + $"\"active\": {(r.Active ? "true" : "false")}, \"fallback\": {(r.Fallback ? "true" : "false")}"
+                    + (r.Occluder != null ? $", \"occluder\": \"{JsonEsc(r.Occluder)}\"" : "") + " }");
+            }
+            NetworkReadings.Clear();
+            sb.Append("] },\n");
         }
 
         /* The bracket contract for clients older than 1.12 (CommandTrackJson). Newer clients read the state from each frame. */
@@ -2055,6 +2207,7 @@ namespace Kerbcast
                 KerbcastApiImpl.Stop();
             }
             EndSceneLock();
+            _networks?.Stop();
             CommandAuthority.WorldModel.Close();
 
             // ALWAYS restore the main flight cameras on scene exit so a

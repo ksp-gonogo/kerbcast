@@ -1316,6 +1316,25 @@ fn send_error(dc: &Outbox, message: String) {
     );
 }
 
+/// A network request the sidecar refused before it reached the game.
+fn send_network_refusal(
+    dc: &Outbox,
+    token: String,
+    network_id: Option<String>,
+    (code, text): crate::commands::NetworkRefusal,
+) {
+    send_server_message(
+        dc,
+        &ServerMessage::NetworkResult(crate::protocol::NetworkResultPayload {
+            token,
+            ok: false,
+            network_id,
+            code: Some(code.to_owned()),
+            text: Some(text),
+        }),
+    );
+}
+
 /// Single-message dispatch. Pulled out of the closure so the error
 /// paths and per-variant logic don't drown the construction code.
 async fn handle_client_message(
@@ -1354,18 +1373,7 @@ async fn handle_client_message(
             info!("control channel: hello received");
             send_server_message(
                 &dc,
-                &ServerMessage::Hello(HelloPayload {
-                    sidecar_version: crate::VERSION.to_owned(),
-                    encoder_backend: selected_backend_name().to_owned(),
-                    frame_stamps: Some(true),
-                    anchors: Some(true),
-                    frame_command: Some(true),
-                    max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
-                    size_hold: Some(true),
-                    resume: Some(true),
-                    renegotiate: Some(true),
-                    max_slots: Some(MAX_SLOTS_PER_PEER as u32),
-                }),
+                &ServerMessage::Hello(hello_payload(registry.last_networks().await.is_some())),
             );
             send_camera_snapshot(&registry, &dc).await;
             /* Prime the client with current global settings (throttle + the
@@ -1374,6 +1382,12 @@ async fn handle_client_message(
                 &dc,
                 &ServerMessage::SettingsState(registry.last_settings().await),
             );
+            if let Some(sites) = registry.last_sites().await {
+                send_server_message(&dc, &ServerMessage::SiteCatalog(sites));
+            }
+            if let Some(networks) = registry.last_networks().await {
+                send_server_message(&dc, &ServerMessage::NetworkDefinitions(networks));
+            }
             /* Prime scene state so a peer connecting out of flight shows the
              * standby immediately, not a stale live layout. */
             if let Some(in_flight) = registry.read_in_flight().await {
@@ -1494,6 +1508,22 @@ async fn handle_client_message(
                     flight_id, "command camera destruction requested"
                 ),
                 Err(message) => send_error(&dc, message),
+            }
+        }
+        ClientMessage::SaveNetwork(payload) => {
+            let token = payload.token.clone();
+            let network_id = payload.network_id.clone();
+            match registry.request_save_network(payload).await {
+                Ok(id) => info!(request = id, token, "camera network save requested"),
+                Err(refusal) => send_network_refusal(&dc, token, network_id, refusal),
+            }
+        }
+        ClientMessage::DeleteNetwork(payload) => {
+            let token = payload.token.clone();
+            let network_id = Some(payload.network_id.clone());
+            match registry.request_delete_network(payload).await {
+                Ok(id) => info!(request = id, token, "camera network delete requested"),
+                Err(refusal) => send_network_refusal(&dc, token, network_id, refusal),
             }
         }
         ClientMessage::SetCommandAim(payload) => {
@@ -2018,6 +2048,23 @@ async fn apply_render_size_change(
     push_camera_state(registry, dc, flight_id).await;
 }
 
+/* `networks` is whether the plugin has listed its networks: a plugin too old for them never writes the file. */
+fn hello_payload(networks: bool) -> HelloPayload {
+    HelloPayload {
+        sidecar_version: crate::VERSION.to_owned(),
+        encoder_backend: selected_backend_name().to_owned(),
+        frame_stamps: Some(true),
+        anchors: Some(true),
+        frame_command: Some(true),
+        max_anchors_per_camera: Some(crate::protocol::MAX_ANCHORS_PER_CAMERA as u32),
+        size_hold: Some(true),
+        resume: Some(true),
+        renegotiate: Some(true),
+        max_slots: Some(MAX_SLOTS_PER_PEER as u32),
+        networks: Some(networks),
+    }
+}
+
 async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id: u32, fov: f32) {
     let cam = match registry.get(flight_id).await {
         Some(c) => c,
@@ -2033,7 +2080,7 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
             return;
         }
     };
-    if !cam.supports_zoom {
+    if !cam.takes_manual_zoom() {
         send_server_message(
             dc,
             &ServerMessage::Error(ErrorPayload {
@@ -2237,7 +2284,7 @@ async fn apply_zoom_rate_change(
             return;
         }
     };
-    if !cam.supports_zoom {
+    if !cam.takes_manual_zoom() {
         send_server_message(
             dc,
             &ServerMessage::Error(ErrorPayload {
@@ -2694,6 +2741,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Weak;
     use std::time::Duration;
+
+    #[test]
+    fn hello_offers_networks_only_when_the_plugin_reports_them() {
+        assert_eq!(hello_payload(false).networks, Some(false));
+        assert_eq!(hello_payload(true).networks, Some(true));
+    }
 
     /// The browser's peer connection, with webrtc-rs's default codecs standing
     /// in for a browser's.
@@ -3771,6 +3824,43 @@ mod tests {
             "a freed slot stays free"
         );
         assert_eq!(live.subscribers.load(Ordering::Acquire), 0);
+    }
+
+    /// A command camera frames itself: a set-fov or a zoom rate is refused as
+    /// on a fixed-lens part camera and never reaches the plugin, even from a
+    /// manifest that claims zoom.
+    #[tokio::test]
+    async fn a_command_camera_refuses_set_fov_and_zoom_rate() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id: u32 = 0x8000_0304;
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 64,
+            max_height: 64,
+        };
+        MmapFrameRing::create(&dir.path().join(format!("{id}.ring")), cfg).expect("create ring");
+        std::fs::write(
+            dir.path().join(format!("{id}.info.json")),
+            format!(
+                r#"{{"lifecycle":"active","kind":"command","flight_id":{id},"camera_name":"Launchpad camera","supports_zoom":true,"fov":30,"fov_min":1,"fov_max":30,"station_id":"ground:LaunchPad","station_node_name":"LaunchPad"}}"#
+            ),
+        )
+        .expect("write manifest");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+        let cam = registry.get(id).await.expect("command camera");
+        assert!(!cam.takes_manual_zoom());
+        let outbox = Outbox::spawn(Arc::new(Mutex::new(None)), "test".into());
+
+        apply_fov_change(&registry, &outbox, id, 1.5).await;
+        apply_zoom_rate_change(&registry, &outbox, id, 1.0).await;
+
+        let ctrl = cam.control.lock().await;
+        assert_eq!(ctrl.fov, None, "no field of view is passed on");
+        assert_eq!(ctrl.zoom_rate, None, "no zoom rate is passed on");
+        assert!(!dir.path().join(format!("{id}.control.bin")).exists());
     }
 
     /// A ring recreated in place within one rescan keeps its viewers' sizes on

@@ -235,7 +235,10 @@ client `error` event carrying the camera's `flightId`.
 controls each part actually supports.
 
 - `supportsZoom`, `fov`, `fovMin`, `fovMax`. 19 of 21 stock Hullcam
-  VDS parts support runtime FoV via `MuMechModuleHullCameraZoom`.
+  VDS parts support runtime FoV via `MuMechModuleHullCameraZoom`. A
+  command camera zooms itself, so it reports `supportsZoom` false and
+  refuses `setFov` and `setZoomRate`; its `fovMin` and `fovMax` report the
+  narrowest and widest its framing reaches.
 - `supportsPan`, `panYawMin/Max`, `panPitchMin/Max`. Whether this
   camera's mount steers. Pan/tilt is fully wired end to end (`setPan`,
   `setPanRate`, and the `PanZoomController` helper below); this flag
@@ -357,11 +360,25 @@ The subject is the craft the camera draws (where it truly is, so an aim off
 the craft shows it off centre), brackets, sizes its zoom by and reads out. A
 `vessel` aim's craft is its subject; `orbit` and `positionAt` take an
 optional `subjectPersistentId`; otherwise the default craft stays the
-subject. A `direction` aim zooms for the subject's range, so the subject is
-framed as it passes through. Every kind takes `framingMarginM`, metres of
-view kept around the subject's own size. `commandCentre.aimKind` (absent for
-the default) and `commandCentre.subjectPersistentId` report what the game
-applied.
+subject. Every kind takes `framingMarginM`, metres of view kept around the
+subject's own size. `commandCentre.aimKind` (absent for the default) and
+`commandCentre.subjectPersistentId` report what the game applied.
+
+The camera zooms itself, and nothing sets its field of view by hand. The
+zoom follows the subject on a `vessel`, `orbit` or `positionAt` aim. A
+`surface` aim frames `framingMarginM` about its point, or opens to the widest
+view without one, and a `direction` aim opens to the widest view, so no craft
+sizes either. `fovMin` is the narrowest it reaches now (it moves with the
+Tracking Station level and the optics setting) and `fovMax` its widest.
+
+```ts
+// Look south, 5 degrees above the horizon.
+await client.setCommandAim(flightId, {
+  kind: CommandAimKind.Direction,
+  azimuth: 180,
+  elevation: 5,
+});
+```
 
 ### A launchpad camera
 

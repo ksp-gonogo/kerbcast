@@ -8,6 +8,7 @@ import { DevPanel } from "./DevPanel";
 import { ErrorToast } from "./ErrorToast";
 import { Grid } from "./Grid";
 import { Header } from "./Header";
+import { NetworksPanel } from "./networks/NetworksPanel";
 import { RecGroupBar } from "./RecGroupBar";
 import { RecordingsPanel } from "./RecordingsPanel";
 import { Settings } from "./SettingsPanel";
@@ -38,7 +39,7 @@ import {
   saveTheme,
 } from "./settings";
 import type { CrewBarPlacement, ThemePreference } from "./settings";
-import { isCameraShown, loadTiles, pruneCommandTiles, pruneCrewTiles, reconcileTiles, saveTiles, seedTiles } from "./tiles";
+import { cameraKey, isCameraShown, loadTiles, pruneCommandTiles, pruneCrewTiles, reconcileTiles, saveTiles, seedTiles } from "./tiles";
 import type { Tile as TileData } from "./tiles";
 
 interface AppProps {
@@ -91,14 +92,18 @@ export function App({ client }: AppProps): React.JSX.Element {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [recordingsOpen, setRecordingsOpen] = useState(false);
+  const [networksOpen, setNetworksOpen] = useState(false);
   const toggleSettings = useCallback(() => {
     setRecordingsOpen(false);
+    setNetworksOpen(false);
     setSettingsOpen((v) => !v);
   }, []);
   const toggleRecordings = useCallback(() => {
     setSettingsOpen(false);
+    setNetworksOpen(false);
     setRecordingsOpen((v) => !v);
   }, []);
+  const closeNetworks = useCallback(() => setNetworksOpen(false), []);
 
   /*
    * REC+ grouped recording: `recSelectMode` + `selectedFlightIds` drive the
@@ -217,10 +222,28 @@ export function App({ client }: AppProps): React.JSX.Element {
             onCrewPlacementChange={(p: CrewBarPlacement) => { saveCrewBarPlacement(p); setCrewPlacement(p); }}
             onCrewMergeChange={(m: boolean) => { saveCrewMerge(m); setCrewMerge(m); }}
             onShowLaunchpadChange={(v: boolean) => { saveShowLaunchpad(v); setShowLaunchpad(v); }}
+            onOpenNetworks={() => { setSettingsOpen(false); setNetworksOpen(true); }}
             onClose={() => setSettingsOpen(false)}
           />
         )}
         {recordingsOpen && <RecordingsPanel onClose={() => setRecordingsOpen(false)} />}
+        {networksOpen && (
+          <NetworksPanel
+            onClose={closeNetworks}
+            shownFlightIds={new Set(tileFlightIds.filter((id): id is number => id !== null))}
+            /* The grid hides every command feed while the Launchpad camera is hidden, so a network feed would not stay. */
+            onShowInGrid={
+              showLaunchpad
+                ? (cam) => {
+                    if (tiles.some((t) => t.flightId === cam.flightId)) return;
+                    const next = [...tiles, { flightId: cam.flightId, spotlit: false, key: cameraKey(cam) }];
+                    setTiles(next);
+                    saveTiles(next);
+                  }
+                : undefined
+            }
+          />
+        )}
         <RecGroupBar
           active={recSelectMode}
           selectedFlightIds={selectedFlightIds}

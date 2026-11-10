@@ -42,6 +42,14 @@ namespace Kerbcast
         public string Scope;
         /* The camera has no subject to aim at yet and shows its placeholder framing instead. */
         public bool WaitingForTarget;
+        /* The site the frame was seen from, and its label as the feed shows it. On a camera network both change on the cut frame. */
+        public string SiteKey;
+        public string SiteLabel;
+        /* A camera network's state: NetworkOk, or NetworkNoView when no vantage can see the craft. Null for a camera at one site. */
+        public string NetworkState;
+
+        public const string NetworkOk = "ok";
+        public const string NetworkNoView = "noView";
 
         public static CommandFrameState Empty => new CommandFrameState
         {
@@ -63,6 +71,7 @@ namespace Kerbcast
             "hasFix", "rangeM", "bracketHalfPx", "frameHeightPx", "framingFits", "trueOffsetPx", "occluded",
             "occluder", "sunlit", "blank", "authority", "subjectPersistentId", "aimKind", "refusal", "refusalCode",
             "refusalText", "subjectUt", "worldModel", "worldModelSeq", "knowledgeUt", "scope", "waitingForTarget",
+            "siteKey", "siteLabel", "networkState",
         };
 
         public void AppendJson(StringBuilder sb)
@@ -95,6 +104,9 @@ namespace Kerbcast
             Ut(sb, "knowledgeUt", KnowledgeUt);
             Text(sb, "scope", Scope);
             sb.Append(",\"waitingForTarget\":").Append(WaitingForTarget ? "true" : "false");
+            Text(sb, "siteKey", SiteKey);
+            Text(sb, "siteLabel", SiteLabel);
+            Text(sb, "networkState", NetworkState);
             sb.Append('}');
         }
 

@@ -206,7 +206,7 @@ pub struct CommandCentreInfo {
     pub ut: Option<f64>,
     /// Every craft the camera could watch, eligible first, then nearest
     /// first. Any of them can be aimed at with a `vessel` aim; eligibility
-    /// only reports what the tracking network would allow. A control channel
+    /// only reports what the camera network would allow. A control channel
     /// message has a size limit, so with hundreds of craft the list over it
     /// is cut from the end and `targets_omitted` counts what was left out.
     /// A cut list keeps the feed's subject, appended at the end out of the
@@ -227,6 +227,60 @@ pub struct CommandCentreInfo {
     /// settings camera and for cameras created in game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// A camera network camera's vantages, which it cuts between to keep
+    /// the clearest view of its craft. On such a camera `site_key`,
+    /// `display_name` and the coordinates describe the vantage it shows now
+    /// and change on every cut; key it by its flight id. Absent on every
+    /// other camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<CommandNetworkInfo>,
+}
+
+/// A camera network camera's vantages, as its last scoring pass left them.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandNetworkInfo {
+    /// The camera's own name, which stays the same through every cut.
+    pub name: String,
+    /// The camera has no aim of its own, so it watches the craft the game
+    /// picks by default (the active vessel in flight); false once it is aimed
+    /// at a chosen craft, the active one included. Absent from a game older
+    /// than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows_active_vessel: Option<bool>,
+    /// `ok`, or `noView` when no vantage can see the craft and the camera
+    /// stays on its last vantage (or the host's fallback). Treat an
+    /// unrecognised value as `noView`.
+    pub state: String,
+    /// Every vantage in the host's order.
+    pub vantages: Vec<CommandNetworkVantage>,
+}
+
+/// One vantage of a camera network camera.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandNetworkVantage {
+    /// The site key the camera reports while it stands here.
+    pub site_key: String,
+    /// The host's label for it, or the site's own name.
+    pub label: String,
+    /// `ok`, or why it cannot show the craft: `occluded`, `belowHorizon`,
+    /// `tooFar`, `unknown`, `subject`, `gone`, `disabled` (a ground
+    /// station the game has turned off), `unresolved`, `unplaced`, `pending`
+    /// or `noSubject`. New
+    /// values may appear; treat one you do not recognise as unable to see.
+    pub state: String,
+    /// The camera stands here now.
+    pub active: bool,
+    /// Where the camera stands when no vantage can see the craft.
+    #[serde(default)]
+    pub fallback: bool,
+    /// The body hiding the craft from this vantage while `state` is
+    /// `occluded`. Absent otherwise and from games older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occluder: Option<String>,
 }
 
 /// What kind of place a command camera's site is.
@@ -324,6 +378,9 @@ pub enum CommandAimKind {
 /// Where a command camera points. `kind` says which fields apply. With no
 /// subject (`surface`, `direction`, or `orbit` and `positionAt` without
 /// `subjectPersistentId`), the camera's default craft stays the subject.
+/// The camera zooms itself: a `vessel`, `orbit` or `positionAt` aim frames
+/// its subject, a `surface` aim frames `framingMarginM` about the point (the
+/// widest view without one) and a `direction` aim opens to the widest view.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -400,7 +457,7 @@ pub struct CommandAim {
     pub allow_uncertain: Option<bool>,
 }
 
-/// Whether a command camera's tracking network could watch a craft. Only
+/// Whether a command camera's camera network could watch a craft. Only
 /// `NotTrackable` applies outside career (or with the tracking rules off),
 /// and the world-model codes only while a command authority's world model
 /// governs the feed.
@@ -638,13 +695,15 @@ pub struct CameraState {
     pub max_height: Option<u32>,
     /// Whether the part's Hullcam module supports runtime FoV changes
     /// (i.e. it's a `MuMechModuleHullCameraZoom`, not the fixed base
-    /// `MuMechModuleHullCamera`). 19 of 21 stock parts do.
+    /// `MuMechModuleHullCamera`). 19 of 21 stock parts do. Always false on
+    /// a command camera, which zooms itself to frame what it is aimed at.
     pub supports_zoom: bool,
     /// Current effective FoV in degrees.
     pub fov: f32,
     /// FoV bounds the operator can choose between. Wider than the
     /// camera's "default" — these come from the Hullcam part config.
-    /// Equal to `fov` when `supports_zoom == false`.
+    /// Equal to `fov` on a part camera without zoom. On a command camera,
+    /// the narrowest and widest its own framing reaches, read only.
     pub fov_min: f32,
     pub fov_max: f32,
     /// Whether the part supports pan/tilt. True on parts with a steerable
@@ -1227,6 +1286,17 @@ pub struct FrameCommandState {
     /// it is waiting for a target. False from a game that does not send it.
     #[serde(default)]
     pub waiting_for_target: bool,
+    /// The site the frame was seen from and its label as the feed shows it.
+    /// On a camera network camera both change on exactly the frame of a
+    /// cut. Absent from a game older than 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_label: Option<String>,
+    /// A camera network camera's state on this frame: `ok`, or `noView`
+    /// when no vantage can see the craft. Absent on every other camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_state: Option<String>,
 }
 
 /// A consumer reporting its OWN current display size in px for one camera.
@@ -1383,6 +1453,11 @@ pub struct HelloPayload {
     /// renegotiation. Absent from sidecars older than 1.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_slots: Option<u32>,
+    /// True when this sidecar sends `NetworkDefinitions` and takes
+    /// `SaveNetwork` and `DeleteNetwork`. Absent from sidecars older than
+    /// 1.12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub networks: Option<bool>,
 }
 
 #[typeshare]
@@ -1428,6 +1503,217 @@ pub struct AdaptiveShedPayload {
     pub level: u32,
     pub ksp_fps: f32,
     pub reason: String,
+}
+
+/// One ground station a command camera can stand at, as the game has it.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStation {
+    /// The CommNet node name: the key a `station` vantage takes, and the
+    /// camera's `siteKey` while it stands there.
+    pub node_name: String,
+    /// The name the game shows for it.
+    pub display_name: String,
+    /// The body it stands on, by name.
+    pub body: String,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Metres above sea level of the ground (or the sea) at the station.
+    pub altitude: f64,
+    /// The game has the station switched on. A vantage at one switched off
+    /// reads `disabled`.
+    pub enabled: bool,
+    /// Why the game has it off: `extraStationsOff` (the game's extra ground
+    /// stations option is off) or `modDisabled` (the mod that adds it turned
+    /// it off). Absent while it is on. New codes may appear; show a generic
+    /// reason for one you do not recognise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+/// One craft the game knows, as a `vessel` vantage or a `vessel` aim can
+/// name it.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogVessel {
+    /// `Vessel.persistentId`, the key a `vessel` vantage or aim takes.
+    pub persistent_id: u32,
+    pub name: String,
+    /// KSP's `VesselType` name: `Relay`, `Probe`, `Ship`, `Debris`,
+    /// `SpaceObject` and so on.
+    pub vessel_type: String,
+    /// The body whose sphere of influence it is in, by name.
+    pub body: String,
+    /// KSP's `Vessel.Situations` name: `ORBITING`, `LANDED` and so on.
+    pub situation: String,
+    /// Within physics range of the active craft.
+    #[serde(default)]
+    pub loaded: bool,
+    /// The craft the player is flying.
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// The places a command camera can stand, as the game has them now. Sent
+/// after `Hello` once the plugin has listed them, and again whenever the
+/// list changes (a game setting or a mod adding or removing stations).
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteCatalogPayload {
+    #[serde(default)]
+    pub stations: Vec<CatalogStation>,
+    /// Every craft the game knows, the active one first. Absent from games
+    /// older than 1.12.
+    #[serde(default)]
+    pub vessels: Vec<CatalogVessel>,
+    /// Craft left out of `vessels` to keep the message small, debris and
+    /// space objects first. Absent when none were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessels_omitted: Option<u32>,
+}
+
+/// One vantage of a saved camera network.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkVantageSpec {
+    pub vantage: CommandVantage,
+    /// Shown for this vantage in place of the site's own name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Where the camera stands when no vantage can see the craft.
+    #[serde(default)]
+    pub fallback: bool,
+}
+
+/// How long a camera network holds a vantage and how much clearer another
+/// must be before it cuts. Absent fields keep the game's defaults.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkOptionsSpec {
+    /// Least game seconds between cuts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hold_ut: Option<f64>,
+    /// Least real seconds between cuts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hold_real_seconds: Option<f64>,
+    /// How many stops clearer another vantage must be to cut to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_stops: Option<f64>,
+}
+
+/// A camera network: one a viewer saved with the game, or one a mod made
+/// in game (`owner` set), which only that mod can change.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDefinition {
+    /// Stable for the life of the save; made by the game on create.
+    pub network_id: String,
+    pub name: String,
+    /// The craft it watches (a `vessel` aim), or absent for the active
+    /// vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<CommandAim>,
+    pub vantages: Vec<NetworkVantageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<NetworkOptionsSpec>,
+    /// Bumps on every change; send it back as `baseRevision` to edit.
+    #[serde(default)]
+    pub revision: u32,
+    /// The camera it runs as in this scene, absent where command cameras do
+    /// not run. A saved network keeps the same flight id in every scene.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight_id: Option<u32>,
+    /// The mod that made it in game; absent for a saved network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The `token` of the `SaveNetwork` that created it, so a client whose
+    /// answer was lost can still find the network it made. A save repeating
+    /// that token returns this network rather than making another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_token: Option<String>,
+}
+
+/// Every camera network: the saved ones, then those mods made in game.
+/// Sent after `Hello` once known, and whenever one changes.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkDefinitionsPayload {
+    #[serde(default)]
+    pub networks: Vec<NetworkDefinition>,
+    /// False while the game cannot apply `SaveNetwork` or `DeleteNetwork`
+    /// (no scene where command cameras run, or a scene loading); show the
+    /// networks read only then. Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editable: Option<bool>,
+    /// Networks left off the end of `networks` to keep the message small.
+    /// Absent when none were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub networks_omitted: Option<u32>,
+}
+
+/// The outcome of one `SaveNetwork` or `DeleteNetwork`, matched by `token`.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkResultPayload {
+    pub token: String,
+    pub ok: bool,
+    /// The network saved or deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    /// Why it was refused: `notOwner`, `notFound`, `stale`, `noVantages`,
+    /// `tooManyVantages`, `badVantage`, `badAim`, `badName`, `badNumber`,
+    /// `badToken`, `full`, `notRunning` (the game could not start its
+    /// camera) or `writeFailed`. A refusal changes nothing. New codes may
+    /// appear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The refusal in words, for a log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Create or replace a saved camera network. The game answers with a
+/// `NetworkResult` carrying the same token, normally within a second.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveNetworkPayload {
+    /// Chosen by the client, unique per request (1 to 128 characters).
+    pub token: String,
+    /// The network to replace; absent to create one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    /// The `revision` the client edited; refused as `stale` when the network
+    /// has changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<u32>,
+    /// 1 to 48 characters; absent or blank for "Camera network".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// A `vessel` aim, or absent to watch the active vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<CommandAim>,
+    /// 1 to 64 vantages.
+    pub vantages: Vec<NetworkVantageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<NetworkOptionsSpec>,
+}
+
+/// Delete a saved camera network; its camera ends for every viewer.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteNetworkPayload {
+    pub token: String,
+    pub network_id: String,
 }
 
 /// Scene-state change: whether KSP is currently in a flight scene. Sent
@@ -1631,6 +1917,12 @@ pub enum ClientMessage {
     DestroyCommandCamera(DestroyCommandCameraPayload),
     /// Point a command camera, or return it to its default. Server-wide.
     SetCommandAim(SetCommandAimPayload),
+    /// Create or replace a saved camera network. Server-wide; answered
+    /// with `NetworkResult`.
+    SaveNetwork(SaveNetworkPayload),
+    /// Delete a saved camera network. Server-wide; answered with
+    /// `NetworkResult`.
+    DeleteNetwork(DeleteNetworkPayload),
     /// Replace or clear this client's anchors on one camera. Per client:
     /// other clients never see them, and they go when this client does.
     /// Send only to a sidecar whose `Hello` has `anchors: true`.
@@ -1681,7 +1973,9 @@ pub enum ClientMessage {
     /// Set the camera's field-of-view (degrees). Silently ignored for
     /// parts whose Hullcam module is the fixed base (`supportsZoom ==
     /// false`); clients are expected to clamp to `fovMin / fovMax`
-    /// from the camera's `CameraState` before sending.
+    /// from the camera's `CameraState` before sending. A command camera
+    /// zooms itself, so it refuses this and `SetZoomRate` as a fixed-lens
+    /// part camera does.
     SetFov(SetFovPayload),
     /// Pan/tilt the camera (yaw and pitch, both degrees from the
     /// part's resting forward). Honored by parts with a steerable mount
@@ -1810,11 +2104,83 @@ pub enum ServerMessage {
     /// its RTP timestamp. One per frame per track, only to a peer that
     /// enabled them with `SetFrameStamps`.
     FrameStamp(FrameStampPayload),
+    /// The ground stations a command camera can stand at. Sent after
+    /// `Hello` once known, and whenever the list changes.
+    SiteCatalog(SiteCatalogPayload),
+    /// Every camera network. Sent after `Hello` once known, and whenever
+    /// one changes.
+    NetworkDefinitions(NetworkDefinitionsPayload),
+    /// The outcome of a `SaveNetwork` or `DeleteNetwork`, by its token.
+    NetworkResult(NetworkResultPayload),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_catalog_serialises_for_the_sdk() {
+        let msg = ServerMessage::SiteCatalog(SiteCatalogPayload {
+            stations: vec![CatalogStation {
+                node_name: "Crater Rim".into(),
+                display_name: "Crater Rim".into(),
+                body: "Kerbin".into(),
+                latitude: 9.5,
+                longitude: -172.25,
+                altitude: 4000.0,
+                enabled: false,
+                disabled_reason: Some("extraStationsOff".into()),
+            }],
+            vessels: vec![CatalogVessel {
+                persistent_id: 42,
+                name: "Comms Relay".into(),
+                vessel_type: "Relay".into(),
+                body: "Kerbin".into(),
+                situation: "ORBITING".into(),
+                loaded: false,
+                active: false,
+            }],
+            vessels_omitted: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"site-catalog","content":{"stations":[{"nodeName":"Crater Rim","displayName":"Crater Rim","body":"Kerbin","latitude":9.5,"longitude":-172.25,"altitude":4000.0,"enabled":false,"disabledReason":"extraStationsOff"}],"vessels":[{"persistentId":42,"name":"Comms Relay","vesselType":"Relay","body":"Kerbin","situation":"ORBITING","loaded":false,"active":false}]}}"#
+        );
+        /* A plugin older than 1.12 lists stations only. */
+        let old: SiteCatalogPayload = serde_json::from_str(r#"{"stations":[]}"#).unwrap();
+        assert!(old.vessels.is_empty() && old.vessels_omitted.is_none());
+    }
+
+    /// Network requests arrive as tagged client messages; the outcome goes
+    /// back by token.
+    #[test]
+    fn network_messages_round_trip() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"save-network","content":{"token":"t","vantages":[{"vantage":{"kind":"vessel","persistentId":7}}],"watch":{"kind":"vessel","persistentId":9}}}"#,
+        )
+        .unwrap();
+        let ClientMessage::SaveNetwork(p) = msg else {
+            panic!("not a save")
+        };
+        assert!(p.network_id.is_none() && !p.vantages[0].fallback);
+        assert_eq!(p.watch.unwrap().persistent_id, Some(9));
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"delete-network","content":{"token":"t","networkId":"n1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(msg, ClientMessage::DeleteNetwork(_)));
+        let out = ServerMessage::NetworkResult(NetworkResultPayload {
+            token: "t".into(),
+            ok: false,
+            network_id: None,
+            code: Some("stale".into()),
+            text: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&out).unwrap(),
+            r#"{"type":"network-result","content":{"token":"t","ok":false,"code":"stale"}}"#
+        );
+    }
 
     #[test]
     fn frame_stamp_serialises_camel_case() {
@@ -1944,10 +2310,12 @@ mod tests {
             resume: Some(true),
             renegotiate: Some(true),
             max_slots: Some(32),
+            networks: Some(true),
         });
         let hello = serde_json::to_string(&hello).unwrap();
         assert!(hello.contains(r#""renegotiate":true"#));
         assert!(hello.contains(r#""maxSlots":32"#));
+        assert!(hello.contains(r#""networks":true"#));
         assert!(hello.contains(r#""sizeHold":true"#));
         assert!(hello.contains(r#""resume":true"#));
         assert!(hello.contains(r#""maxAnchorsPerCamera":16"#));
@@ -2011,6 +2379,22 @@ mod tests {
         )
         .unwrap();
         assert!(waiting.waiting_for_target);
+        assert!(
+            waiting.site_key.is_none() && waiting.network_state.is_none(),
+            "a game before 1.12 sends no site"
+        );
+        let cut: FrameCommandState = serde_json::from_str(
+            r#"{"hasFix":true,"frameHeightPx":720,"framingFits":true,"occluded":false,"occluder":"","sunlit":true,"subjectPersistentId":42,"siteKey":"Crater Rim","siteLabel":"North dish","networkState":"noView"}"#,
+        )
+        .unwrap();
+        assert_eq!(cut.site_key.as_deref(), Some("Crater Rim"));
+        assert_eq!(cut.site_label.as_deref(), Some("North dish"));
+        assert_eq!(cut.network_state.as_deref(), Some("noView"));
+        let json = serde_json::to_string(&cut).unwrap();
+        assert!(
+            json.contains(r#""siteLabel":"North dish""#)
+                && json.contains(r#""networkState":"noView""#)
+        );
         assert!(serde_json::to_string(&waiting)
             .unwrap()
             .contains(r#""waitingForTarget":true"#));

@@ -175,6 +175,8 @@ namespace Kerbcast
         public double OpticsBrightnessHold { get; private set; } = 1.0;
         /* How strongly a daylit sky washes out faint things. */
         public double OpticsDaySky { get; private set; } = 0.3;
+        /* What full daylight at a lens costs a camera network's vantage, in stops of picture quality. */
+        public double NetworkDaylightStops { get; private set; } = OpticsModel.DaySkyStops;
 
         /* The settings' optics knobs for a lens of `resolutionArcsec`. */
         internal OpticsKnobs OpticsDefaults(double resolutionArcsec) => new OpticsKnobs
@@ -340,6 +342,11 @@ namespace Kerbcast
         // KSP.log otherwise. Static so KerbcastCamera can read it
         // without needing a back-ref to the settings instance.
         public static bool DebugCameraLogging { get; private set; } = false;
+
+        /* Debug: a command camera standing on a loaded craft draws that craft
+           instead of hiding it, to compare the two views. Static so the rig
+           reads it without the settings instance. */
+        public static bool DebugShowOwnCraft { get; private set; } = false;
 
         // Low-overhead in-plugin performance telemetry (Recommendation 1 from
         // the profiling study). When true, KerbcastCamera.Refresh times each
@@ -523,6 +530,8 @@ namespace Kerbcast
             Debug.Log($"[Kerbcast] settings loaded from {sources}: bind={settings.HttpBind} tier={settings.MaxQuality} dims={settings.Width}x{settings.Height} autoSpawn={settings.AutoSpawnSidecar} cameraOverrides={camCount}");
             if (!EnableGalaxySkip)
                 Debug.Log("[Kerbcast] EnableGalaxySkip=false: every camera renders its galaxy layer, even when the sky is black");
+            if (DebugShowOwnCraft)
+                Debug.Log("[Kerbcast] DebugShowOwnCraft=true: command cameras on a craft draw that craft instead of hiding it");
             if (!IsLoopback(settings.BindAddress))
             {
                 Debug.LogWarning($"[Kerbcast] BindAddress={settings.BindAddress} is not loopback. The camera feeds and the signalling endpoint have no authentication and are reachable by anyone on the network. Only do this on a network you trust.");
@@ -584,6 +593,7 @@ namespace Kerbcast
             ApplyFloat(node, "OpticsSeeingAirmassPower", v => settings.OpticsSeeingAirmassPower = Mathf.Clamp(v, 0f, 3f));
             ApplyFloat(node, "OpticsBrightnessHold", v => settings.OpticsBrightnessHold = Mathf.Clamp01(v));
             ApplyFloat(node, "OpticsDaySky", v => settings.OpticsDaySky = Mathf.Max(0f, v));
+            ApplyFloat(node, "NetworkDaylightStops", v => settings.NetworkDaylightStops = Mathf.Max(0f, v));
             ApplyString(node, "CommandCameraAnchor", v =>
             {
                 var a = v.Trim().ToLowerInvariant();
@@ -616,6 +626,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableGalaxySkip", v => EnableGalaxySkip = v);
             ApplyBool(node, "PlanetPhases", v => PlanetPhases = v);
             ApplyBool(node, "DebugCameraLogging", v => DebugCameraLogging = v);
+            ApplyBool(node, "DebugShowOwnCraft", v => DebugShowOwnCraft = v);
             ApplyBool(node, "EnableTelemetry", v => EnableTelemetry = v);
             ApplyBool(node, "ForceAtmosphericFx", v => ForceAtmosphericFx = v);
             ApplyVector3(node, "DebugWindDirection", v => DebugWindDirection = v);

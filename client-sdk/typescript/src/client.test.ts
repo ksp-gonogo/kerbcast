@@ -16,6 +16,7 @@ import {
   COMMAND_CAMERA_STATE_WAIT_MS,
   CommandLockedError,
   CommandTargetUnknownError,
+  NetworkRequestError,
   CONTROL_OPEN_TIMEOUT_MS,
   CONTACT_GAP_MS,
   type ContactGap,
@@ -3411,6 +3412,226 @@ describe("KerbcastClient.inboundVideoStats", () => {
     sidecar.fireSceneState(true);
     expect(client.inFlight).toBe(true);
     expect(seen).toEqual([false, true]);
+  });
+
+  it("keeps the ground station list from site-catalog and emits site-catalog", async () => {
+    const sidecar = new MockSidecar();
+    const client = new KerbcastClient(
+      { host: "h", port: 1 },
+      sidecar.createTransport(),
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(MockSidecar.makeOfferResponse([])),
+    );
+    const seen: number[] = [];
+    client.on("site-catalog", (c) => seen.push(c.stations.length));
+    await client.connect();
+    sidecar.open();
+    expect(client.siteCatalog()).toBeNull();
+    const ksc = {
+      nodeName: "KSC",
+      displayName: "Kerbal Space Center",
+      body: "Kerbin",
+      latitude: -0.0972,
+      longitude: -74.5577,
+      altitude: 64.8,
+      enabled: true,
+    };
+    sidecar.fireSiteCatalog({ stations: [ksc] });
+    expect(client.siteCatalog()?.stations[0].nodeName).toBe("KSC");
+    sidecar.fireSiteCatalog({
+      stations: [ksc, { ...ksc, nodeName: "Crater Rim", displayName: "Crater Rim", enabled: false }],
+    });
+    expect(client.siteCatalog()?.stations.map((s) => s.enabled)).toEqual([true, false]);
+    expect(seen).toEqual([1, 2]);
+  });
+
+  describe("camera networks", () => {
+    const station = (name: string) => ({ vantage: { kind: CommandVantageKind.Station, station: name } });
+
+    async function withNetworks(sidecar: MockSidecar): Promise<KerbcastClient> {
+      const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+      vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+        Promise.resolve(MockSidecar.makeOfferResponse([])),
+      );
+      await client.connect();
+      sidecar.open();
+      return client;
+    }
+
+    it("a create whose answer is lost settles when its network arrives with its token", async () => {
+      const sidecar = new MockSidecar().withNetworks([], { manual: true });
+      const client = await withNetworks(sidecar);
+      const saving = client.saveNetwork({ vantages: [station("KSC")] }, { token: "mine" });
+      sidecar.fireNetworkDefinitions([
+        { networkId: "other", name: "B", vantages: [station("KSC")], revision: 1, createToken: "theirs" },
+        { networkId: "made", name: "A", vantages: [station("KSC")], revision: 1, createToken: "mine" },
+      ]);
+      await expect(saving).resolves.toEqual({ networkId: "made" });
+      expect(sidecar.lastCommand("save-network")?.content.token).toBe("mine");
+    });
+
+    it("a request overlapping one with its token is not cut off by the earlier timer", async () => {
+      vi.useFakeTimers();
+      try {
+        const sidecar = new MockSidecar().withNetworks([], { manual: true });
+        const client = await withNetworks(sidecar);
+        const first = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same", timeoutMs: 1000 });
+        const firstOutcome = expect(first).rejects.toMatchObject({ code: "timeout" });
+        await vi.advanceTimersByTimeAsync(500);
+        const second = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same", timeoutMs: 1000 });
+        await vi.advanceTimersByTimeAsync(600);
+        await firstOutcome;
+
+        sidecar.fireNetworkResult({ token: "same", ok: true, networkId: "made" });
+        await expect(second).resolves.toEqual({ networkId: "made" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("one answer settles every overlapping request with its token", async () => {
+      const sidecar = new MockSidecar().withNetworks([], { manual: true });
+      const client = await withNetworks(sidecar);
+      const first = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same" });
+      const second = client.saveNetwork({ vantages: [station("KSC")] }, { token: "same" });
+      sidecar.fireNetworkResult({ token: "same", ok: false, code: "full" });
+      await expect(first).rejects.toMatchObject({ code: "full" });
+      await expect(second).rejects.toMatchObject({ code: "full" });
+    });
+
+    it("offers networks once the game lists them, after a hello that said it had none", async () => {
+      const sidecar = new MockSidecar();
+      const client = await withNetworks(sidecar);
+      expect(client.supportsNetworks).toBe(false);
+      let fired = 0;
+      client.on("networks", () => fired++);
+      sidecar.fireNetworkDefinitions([]);
+      expect(client.supportsNetworks).toBe(true);
+      expect(fired).toBe(1);
+    });
+
+    it("a retried create with the same token gets the network the first made", async () => {
+      const sidecar = new MockSidecar().withNetworks();
+      const client = await withNetworks(sidecar);
+      const first = await client.saveNetwork({ name: "A", vantages: [station("KSC")] }, { token: "retry" });
+      const again = await client.saveNetwork({ name: "A", vantages: [station("KSC")] }, { token: "retry" });
+      expect(again.networkId).toBe(first.networkId);
+      expect(client.networks()).toHaveLength(1);
+    });
+
+    it("reports whether saves apply now and how many networks were left out", async () => {
+      const sidecar = new MockSidecar().withNetworks();
+      const client = await withNetworks(sidecar);
+      expect(client.networksEditable).toBeNull();
+      sidecar.setNetworksEditable(false);
+      expect(client.networksEditable).toBe(false);
+      expect(client.networksOmitted).toBe(0);
+    });
+
+    it("reads supportsNetworks from hello", async () => {
+      const plain = await withNetworks(new MockSidecar());
+      expect(plain.supportsNetworks).toBe(false);
+      const able = await withNetworks(new MockSidecar().withNetworks());
+      expect(able.supportsNetworks).toBe(true);
+    });
+
+    it("keeps the definitions and emits networks", async () => {
+      const sidecar = new MockSidecar().withNetworks([
+        { networkId: "a", name: "Ground", vantages: [station("KSC")], revision: 1, flightId: 7 },
+      ]);
+      const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+      vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+        Promise.resolve(MockSidecar.makeOfferResponse([])),
+      );
+      const seen: string[][] = [];
+      client.on("networks", (n) => seen.push(n.map((d) => d.networkId)));
+      expect(client.networks()).toEqual([]);
+      await client.connect();
+      sidecar.open();
+      expect(client.networks()[0].flightId).toBe(7);
+      sidecar.fireNetworkDefinitions([]);
+      expect(client.networks()).toEqual([]);
+      expect(seen).toEqual([["a"], []]);
+    });
+
+    it("saveNetwork sends a token and resolves with the id on ok", async () => {
+      const sidecar = new MockSidecar().withNetworks();
+      const client = await withNetworks(sidecar);
+      const { networkId } = await client.saveNetwork({ name: "Ground", vantages: [station("KSC")] });
+      const sent = sidecar.lastCommand("save-network");
+      expect(sent?.content.token.length).toBeGreaterThan(0);
+      expect(sent?.content.name).toBe("Ground");
+      expect(networkId).toBe(sidecar.networks[0].networkId);
+      expect(client.networks().map((n) => n.name)).toEqual(["Ground"]);
+    });
+
+    it("saveNetwork rejects with the game's code", async () => {
+      const sidecar = new MockSidecar().withNetworks([
+        { networkId: "a", name: "Ground", vantages: [station("KSC")], revision: 3 },
+      ]);
+      const client = await withNetworks(sidecar);
+      const stale = await client
+        .saveNetwork({ networkId: "a", baseRevision: 2, vantages: [station("KSC")] })
+        .catch((e: NetworkRequestError) => e);
+      expect(stale).toBeInstanceOf(NetworkRequestError);
+      expect((stale as NetworkRequestError).code).toBe("stale");
+      await expect(client.saveNetwork({ vantages: [] })).rejects.toMatchObject({ code: "noVantages" });
+    });
+
+    it("saveNetwork ignores results for other tokens and times out", async () => {
+      vi.useFakeTimers();
+      try {
+        const sidecar = new MockSidecar().withNetworks([], { manual: true });
+        const client = await withNetworks(sidecar);
+        const outcome = client
+          .saveNetwork({ vantages: [station("KSC")] }, { timeoutMs: 500 })
+          .then(
+            () => "resolved",
+            (e: NetworkRequestError) => e.code,
+          );
+        sidecar.fireNetworkResult({ token: "someone-else", ok: true, networkId: "x" });
+        await vi.advanceTimersByTimeAsync(499);
+        sidecar.fireNetworkResult({ token: "another", ok: false, code: "stale" });
+        await vi.advanceTimersByTimeAsync(2);
+        expect(await outcome).toBe("timeout");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("saveNetwork settles on the result carrying its own token", async () => {
+      const sidecar = new MockSidecar().withNetworks([], { manual: true });
+      const client = await withNetworks(sidecar);
+      const saved = client.saveNetwork({ vantages: [station("KSC")] });
+      const token = sidecar.lastCommand("save-network")!.content.token;
+      sidecar.fireNetworkResult({ token: "other", ok: false, code: "badName" });
+      sidecar.fireNetworkResult({ token, ok: true, networkId: "n9" });
+      expect(await saved).toEqual({ networkId: "n9" });
+    });
+
+    it("deleteNetwork resolves on ok and rejects for a mod's network", async () => {
+      const sidecar = new MockSidecar().withNetworks([
+        { networkId: "a", name: "Ground", vantages: [station("KSC")], revision: 1 },
+        { networkId: "b", name: "Polar", vantages: [station("KSC")], revision: 1, owner: "some-mod" },
+      ]);
+      const client = await withNetworks(sidecar);
+      await client.deleteNetwork("a");
+      expect(sidecar.lastCommand("delete-network")?.content.networkId).toBe("a");
+      expect(client.networks().map((n) => n.networkId)).toEqual(["b"]);
+      await expect(client.deleteNetwork("b")).rejects.toMatchObject({ code: "notOwner" });
+    });
+
+    it("rejects as unsupported or notConnected without sending", async () => {
+      const sidecar = new MockSidecar();
+      const client = await withNetworks(sidecar);
+      await expect(client.saveNetwork({ vantages: [station("KSC")] })).rejects.toMatchObject({
+        code: "unsupported",
+      });
+      expect(sidecar.lastCommand("save-network")).toBeUndefined();
+      const idle = new KerbcastClient({ host: "h", port: 1 }, makeFakeTransport().transport);
+      await expect(idle.deleteNetwork("a")).rejects.toMatchObject({ code: "notConnected" });
+    });
   });
 
   it("keeps when the sidecar was last heard from across a disconnect", async () => {

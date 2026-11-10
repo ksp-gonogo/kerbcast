@@ -14,6 +14,30 @@ namespace Kerbcast
         private const uint KerbalTag = 0x80000000u;
         private const uint PartMask = 0x7FFFFFFFu;
 
+        /*
+         * Saved camera networks take the top 65536 ids of the bit-31 space,
+         * 0xFFFF0000 to 0xFFFFFFFE, one per slot the save hands out, so a
+         * network keeps its id across scenes, reloads and sidecar restarts.
+         * Part ids clear bit 31 and never reach it. A kerbal or command camera
+         * hash that lands in it has bit 16 cleared (Unreserved), which moves it
+         * just below; only those 1 in 32768 hashes change, and nothing else can
+         * ever produce an id in the range.
+         */
+        public const uint NetworkRangeStart = 0xFFFF0000u;
+        public const int NetworkSlots = 0xFFFF;
+
+        /* The wire id of saved network slot `slot`, 0 to NetworkSlots - 1. */
+        public static uint NetworkWireId(int slot)
+        {
+            if (slot < 0 || slot >= NetworkSlots) throw new System.ArgumentOutOfRangeException(nameof(slot));
+            return NetworkRangeStart | (uint)slot;
+        }
+
+        /* True for an id in the saved network range. */
+        public static bool IsNetworkId(uint flightId) => (flightId & NetworkRangeStart) == NetworkRangeStart;
+
+        private static uint Unreserved(uint id) => IsNetworkId(id) ? id & ~0x00010000u : id;
+
         /* Stable wire id for a camera module, in the PART namespace (bit 31 clear).
            Module 0 uses the part flightID; modules 1+ get a Knuth-hash mix of id +
            index + name so a multi-camera part yields distinct, stable ids. Masked
@@ -42,7 +66,7 @@ namespace Kerbcast
            not stable across Mono / runs). */
         public static uint KerbalWireId(string kerbalName)
         {
-            return (NameHash(kerbalName) & PartMask) | KerbalTag;
+            return Unreserved((NameHash(kerbalName) & PartMask) | KerbalTag);
         }
 
         /* Wire id for a command camera. Shares the bit-31 space
@@ -54,7 +78,7 @@ namespace Kerbcast
            provider logs. The manifest's kind, not the id, says which it is. */
         public static uint CommandCameraWireId(string stationNodeName)
         {
-            return (NameHash(SiteHashKey(stationNodeName)) & PartMask) | KerbalTag;
+            return Unreserved((NameHash(SiteHashKey(stationNodeName)) & PartMask) | KerbalTag);
         }
 
         /* The key a created command camera's wire id hashes, in place of a

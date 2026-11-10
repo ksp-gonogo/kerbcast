@@ -418,6 +418,21 @@ async fn consume_loop(
             {
                 broadcast_status_delta(&peers, delta).await;
             }
+            if let Some(sites) = registry.poll_sites().await {
+                let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+                broadcast(&snapshot, &ServerMessage::SiteCatalog(sites)).await;
+            }
+            let networks = registry.poll_networks().await;
+            if networks.definitions.is_some() || !networks.results.is_empty() {
+                let snapshot: Vec<Arc<KerbcastPeer>> = peers.read().await.clone();
+                if let Some(defs) = networks.definitions {
+                    broadcast(&snapshot, &ServerMessage::NetworkDefinitions(defs)).await;
+                }
+                /* Every peer gets each outcome; only the one holding the token acts on it. */
+                for r in networks.results {
+                    broadcast(&snapshot, &ServerMessage::NetworkResult(r)).await;
+                }
+            }
             // Scene state lives in a separate host-written file (outlives the
             // flight-only status writer). Broadcast only when the flag flips.
             let mut left_flight = false;
@@ -884,6 +899,22 @@ async fn encode_next_frame(
     if let Some(after) = after {
         cam.send_tally
             .note_read(after - last, frame.sequence - after - 1);
+    }
+
+    /* A camera network's cut changes the whole picture at once; a keyframe
+    on it saves viewers a second of smeared prediction from the last site. */
+    let site = frame
+        .capture
+        .command
+        .as_ref()
+        .and_then(|c| c.site_key.as_deref());
+    if cam.note_frame_site(site) {
+        cam.request_keyframe();
+        info!(
+            flight_id = cam.flight_id,
+            site = site.unwrap_or_default(),
+            "command camera changed site: keyframe requested"
+        );
     }
 
     let capture_time = CaptureTime {
@@ -1501,6 +1532,19 @@ mod tests {
         Arc<CameraState>,
         Arc<kerbcast_sidecar::webrtc::video_track::VideoTrack>,
     ) {
+        camera_with_viewer_meta(dir, max_width, max_height, 0).await
+    }
+
+    async fn camera_with_viewer_meta(
+        dir: &std::path::Path,
+        max_width: u32,
+        max_height: u32,
+        meta_slot_bytes: u32,
+    ) -> (
+        kerbcast_sidecar::shared_mem::MmapFrameRing,
+        Arc<CameraState>,
+        Arc<kerbcast_sidecar::webrtc::video_track::VideoTrack>,
+    ) {
         use kerbcast_sidecar::shared_mem::MmapFrameRing;
         use kerbcast_sidecar::webrtc::video_track::VideoTrack;
         use webrtc::api::media_engine::MIME_TYPE_H264;
@@ -1511,7 +1555,8 @@ mod tests {
             max_width,
             max_height,
         };
-        let ring = MmapFrameRing::create(&dir.join("1.ring"), cfg).expect("create ring");
+        let ring = MmapFrameRing::create_with_meta(&dir.join("1.ring"), cfg, meta_slot_bytes)
+            .expect("create ring");
         let registry = CameraRegistry::new(dir.to_path_buf());
         registry.rescan().await;
         let cam = registry.get(1).await.expect("camera attached from ring");
@@ -1570,6 +1615,56 @@ mod tests {
         }
         fn request_keyframe(&mut self) {}
         fn close(&mut self) {}
+    }
+
+    /// A command camera's frame from a new site (a camera network's cut)
+    /// asks for a keyframe; frames from the same site do not.
+    #[tokio::test]
+    async fn a_network_cut_asks_for_a_keyframe() {
+        use kerbcast_sidecar::shared_mem::CaptureStamp;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ring, cam, _track) = camera_with_viewer_meta(dir.path(), 64, 64, 1024).await;
+        let pixels = vec![0x80u8; 64 * 64 * 4];
+        let mut n = 0u32;
+        let mut frame = |ring: &mut kerbcast_sidecar::shared_mem::MmapFrameRing, site: &str| {
+            let meta = format!(
+                r#"{{"command":{{"hasFix":true,"frameHeightPx":64,"framingFits":true,"occluded":false,"occluder":"","sunlit":true,"subjectPersistentId":42,"siteKey":"{site}","siteLabel":"{site}","networkState":"ok"}}}}"#
+            );
+            ring.produce_with_meta(
+                64,
+                64,
+                40.0 * n as f64,
+                &CaptureStamp::at(Some(n as f64), 0),
+                meta.as_bytes(),
+                &pixels,
+            )
+            .unwrap();
+            n += 1;
+        };
+        /* A keyframe just went out, so a request now stays visible as owed. */
+        let just_sent = || {
+            cam.full
+                .keyframe_gate
+                .lock()
+                .unwrap()
+                .note_sent(std::time::Instant::now())
+        };
+        frame(&mut ring, "KSC");
+        tick(&cam).await;
+        just_sent();
+        frame(&mut ring, "KSC");
+        tick(&cam).await;
+        assert!(
+            !cam.full.keyframe_gate.lock().unwrap().pending(),
+            "the same site asks for nothing"
+        );
+        just_sent();
+        frame(&mut ring, "Crater Rim");
+        tick(&cam).await;
+        assert!(
+            cam.full.keyframe_gate.lock().unwrap().pending(),
+            "the cut's keyframe is owed until the gap since the last one ends"
+        );
     }
 
     /// A forced keyframe whose encode fails is asked for again, so the

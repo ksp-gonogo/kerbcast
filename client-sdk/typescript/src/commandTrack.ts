@@ -58,6 +58,19 @@ export interface EffectiveCommandTrack {
    * framing. Only from a frame's own state.
    */
   waitingForTarget?: boolean;
+  /**
+   * The site the displayed frame was seen from and its label. On a tracking
+   * network camera they change on exactly the frame of a cut, so a label
+   * drawn from here never runs ahead of the picture. Only from a frame's own
+   * state.
+   */
+  siteKey?: string | null;
+  siteLabel?: string | null;
+  /**
+   * A camera network camera's state on the displayed frame: `ok`, or
+   * `noView` when no vantage can see the craft. `null` on any other camera.
+   */
+  networkState?: string | null;
   /** True when every field came from the displayed frame's own state. */
   fromFrame?: boolean;
 }
@@ -96,6 +109,9 @@ export function commandTrackFromFrame(frame: FrameCommandState): EffectiveComman
     refusalCode: frame.refusalCode ?? null,
     refusalText: frame.refusalText ?? null,
     waitingForTarget: frame.waitingForTarget ?? false,
+    siteKey: frame.siteKey ?? null,
+    siteLabel: frame.siteLabel ?? null,
+    networkState: frame.networkState ?? null,
     fromFrame: true,
   };
 }

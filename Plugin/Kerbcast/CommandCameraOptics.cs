@@ -134,6 +134,14 @@ namespace Kerbcast
         /* Whether this GPU can draw the effect: the shaders exist and passed their test draw. Main thread. */
         public static bool Available() => EnsureMaterials();
 
+        /* OpticsModel.AirFactor for a lens `fromCentreM` from `body`'s centre: 0 above its air or on an airless body. */
+        public static double AirAt(CelestialBody body, double fromCentreM)
+        {
+            if (body == null || !body.atmosphere) return 0;
+            double alt = fromCentreM - body.Radius;
+            return alt < body.atmosphereDepth ? OpticsModel.AirFactor(body.GetPressure(Math.Max(0.0, alt))) : 0;
+        }
+
         /* Null when this GPU cannot draw the effect; the feed then renders as it always has. */
         private static bool _unavailableLogged;
 
