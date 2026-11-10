@@ -59,6 +59,7 @@ export { CameraFeed } from "./CameraFeed";
 export type {
   CameraFeedHandle,
   CameraFeedProps,
+  TitleContent,
   CameraStreamHook,
   FeedAction,
 } from "./CameraFeed";

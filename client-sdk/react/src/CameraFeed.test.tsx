@@ -3322,14 +3322,19 @@ describe("CameraFeed - command camera target brackets", () => {
       </KerbcastProvider>
     );
 
-    const caption = (container: HTMLElement) => container.querySelector("h3")?.textContent ?? null;
+    const firstLine = (container: HTMLElement) =>
+      container.querySelector("h3 button > span:first-of-type > span:nth-last-child(2)")?.textContent ?? null;
+    const secondLine = (container: HTMLElement) => container.querySelector("h3 button > span:last-child")?.textContent ?? null;
+    const caption = (container: HTMLElement) => `${firstLine(container)} ${secondLine(container)}`;
 
     it("names the feed with the compound name in its ordinary title, renaming it on the cut", async () => {
       const { client } = await buildConnectedSource([networkCamera()]);
       const view = render(feed(client, frameAt("Crater Rim", "ok")));
-      expect(caption(view.container)).toBe("Crater Rim via Camera network");
+      expect(firstLine(view.container)).toBe("Crater Rim");
+      expect(secondLine(view.container)).toBe("via Camera network");
       view.rerender(feed(client, frameAt("Comms Relay", "noView")));
-      expect(caption(view.container)).toBe("Comms Relay via Camera network");
+      expect(firstLine(view.container)).toBe("Comms Relay");
+      expect(secondLine(view.container)).toBe("via Camera network");
       expect(view.container.querySelector("[data-kc-network-caption]")).toBeNull();
     });
 
@@ -3413,6 +3418,101 @@ describe("CameraFeed - command camera target brackets", () => {
       expect(calls).toEqual([]);
     });
 
+    describe("two-line title", () => {
+      const row = (container: HTMLElement) => container.querySelector("h3 button > span:first-of-type")!;
+
+      it("puts the icon before line 1, the one chevron after it and the network on line 2", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        const view = render(feed(client, frameAt("Crater Rim", "ok")));
+        const first = row(view.container);
+        expect(first.querySelector("svg[data-kc-network-icon]")).not.toBeNull();
+        expect(first.children[1]?.textContent).toBe("Crater Rim");
+        expect(first.lastElementChild?.tagName.toLowerCase()).toBe("svg");
+        expect(view.container.querySelectorAll("h3 button > span:first-of-type > svg")).toHaveLength(1);
+        expect(view.container.querySelector("h3 button > span:last-child")?.textContent).toBe("via Camera network");
+      });
+
+      it("truncates each line on its own", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        const view = render(feed(client, frameAt("Crater Rim", "ok")));
+        const l1 = row(view.container).children[1]!;
+        const l2 = view.container.querySelector("h3 button > span:last-child")!;
+        expect(l1).not.toBe(l2);
+        for (const el of [l1, l2]) {
+          const css = getComputedStyle(el);
+          expect(css.overflow).toBe("hidden");
+          expect(css.textOverflow).toBe("ellipsis");
+          expect(css.whiteSpace).toBe("nowrap");
+        }
+      });
+
+      it("carries both lines in the accessible name", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        render(feed(client, frameAt("Crater Rim", "ok")));
+        expect(screen.getByRole("button", { name: "Crater Rim via Camera network" })).toBeTruthy();
+      });
+
+      it("keeps a non-network feed on one line", async () => {
+        const { client } = await buildConnectedSource([makeCamera({ flightId: 42, cameraName: "Starboard Cam" })]);
+        const view = renderFeed(client, { flightId: 42 });
+        const button = view.container.querySelector("h3 button")!;
+        expect([...button.children].map((c) => c.tagName.toLowerCase())).toEqual(["span", "svg"]);
+        expect(button.textContent).toContain("Starboard Cam");
+      });
+
+      it("takes a node for line 1 and a node for line 2", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        const view = render(
+          feed(client, frameAt("Crater Rim", "ok"), { titleText: "Mission feed", titleSubtitle: <b>Pad 2</b> }),
+        );
+        expect(firstLine(view.container)).toBe("Mission feed");
+        expect(secondLine(view.container)).toBe("Pad 2");
+      });
+
+      it("hands functions the camera, the network answer and the vantage", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        const titleText = vi.fn((camera: CameraState, isNetwork: boolean, vantage: unknown) => `${camera.flightId}/${isNetwork}/${(vantage as { siteLabel: string } | null)?.siteLabel}`);
+        const titleSubtitle = vi.fn((_c: CameraState, isNetwork: boolean) => (isNetwork ? "net" : null));
+        const view = render(feed(client, frameAt("Crater Rim", "ok"), { titleText, titleSubtitle }));
+        expect(firstLine(view.container)).toBe("301/true/Crater Rim");
+        expect(secondLine(view.container)).toBe("net");
+      });
+
+      it("draws no second line for null or false, even on a network feed", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        for (const none of [null, false]) {
+          const view = render(feed(client, frameAt("Crater Rim", "ok"), { titleSubtitle: none }));
+          const button = view.container.querySelector("h3 button")!;
+          expect(button.textContent).toBe("Crater Rim");
+          expect(button.querySelectorAll(":scope > span")).toHaveLength(2);
+          view.unmount();
+        }
+      });
+
+      it("gives a part camera a second line when the host asks", async () => {
+        const { client } = await buildConnectedSource([makeCamera({ flightId: 42, cameraName: "Starboard Cam" })]);
+        const view = renderFeed(client, { flightId: 42, titleSubtitle: (c) => `id ${c.flightId}` });
+        expect(secondLine(view.container)).toBe("id 42");
+      });
+
+      it("keeps the title visible without hover only when asked", async () => {
+        const { client } = await buildConnectedSource([networkCamera()]);
+        const faded = (container: HTMLElement) => {
+          let node: Element | null = container.querySelector("h3");
+          while (node) {
+            if (getComputedStyle(node).opacity === "0") return true;
+            node = node.parentElement;
+          }
+          return false;
+        };
+        const plain = render(feed(client, frameAt("Crater Rim", "ok")));
+        expect(faded(plain.container)).toBe(true);
+        plain.unmount();
+        const pinned = render(feed(client, frameAt("Crater Rim", "ok"), { alwaysShowTitle: true }));
+        expect(faded(pinned.container)).toBe(false);
+      });
+    });
+
     describe("title leading slot", () => {
       const icon = (container: HTMLElement) => container.querySelector("h3 button svg[data-kc-network-icon]");
       const SAVED_ID = 0xffff0002;
@@ -3432,8 +3532,9 @@ describe("CameraFeed - command camera target brackets", () => {
         const glyph = icon(view.container)!;
         expect(glyph).not.toBeNull();
         const button = screen.getByRole("button", { name: "Crater Rim via Camera network" });
-        expect(button.firstElementChild?.contains(glyph)).toBe(true);
-        expect(getComputedStyle(button.firstElementChild!).flexShrink).toBe("0");
+        const slot = glyph.parentElement!;
+        expect(button.contains(slot)).toBe(true);
+        expect(getComputedStyle(slot).flexShrink).toBe("0");
       });
 
       it("does not spin the icon with the chevron when the menu opens", async () => {

@@ -10,14 +10,18 @@ export interface NetworkVantageReading {
   networkName: string;
 }
 
-/** Every word a network feed's name uses, kept together so a change of wording is one edit. */
+/**
+ * Every word a network feed's name uses, kept together so a change of wording
+ * is one edit. `site` is the first title line, `via` the second.
+ */
 export const NETWORK_FEED_TEXT = {
-  name: (siteLabel: string, networkName: string) => `${siteLabel} via ${networkName}`,
+  site: (siteLabel: string) => siteLabel,
+  via: (networkName: string) => `via ${networkName}`,
 } as const;
 
-/** A network feed's name: "Crater Rim via Kerbin ground net". */
+/** A network feed's name on one line: "Crater Rim via Kerbin ground net". */
 export function networkFeedName(siteLabel: string, networkName: string): string {
-  return NETWORK_FEED_TEXT.name(siteLabel, networkName);
+  return `${NETWORK_FEED_TEXT.site(siteLabel)} ${NETWORK_FEED_TEXT.via(networkName)}`;
 }
 
 const SAVED_NETWORK_FIRST_ID = 0xffff0000;

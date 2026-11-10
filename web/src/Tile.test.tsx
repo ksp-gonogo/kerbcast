@@ -421,19 +421,18 @@ describe("Tile - camera network name", () => {
       },
     });
 
-  it("names the corner after the vantage the feed shows, via the network", async () => {
+  it("names the feed in its always-visible title, not in the corner", async () => {
     const { client } = await buildConnectedFixture([network()]);
     let container: HTMLElement;
     await act(async () => {
       ({ container } = renderTile(client, 7));
     });
     await waitFor(() => {
-      const corner = container!.querySelector("[data-fallback]");
-      expect(corner?.textContent).toBe("Crater Rim via Kerbin ground net");
-      expect(corner?.getAttribute("data-fallback")).toBe("Kerbin ground net");
-      /* the same fading text as an ordinary tile name, in the same case */
-      expect(getComputedStyle(corner!).textTransform).not.toBe("uppercase");
+      const button = container!.querySelector("h3 button")!;
+      expect(button.textContent).toContain("Crater Rim");
+      expect(button.textContent).toContain("via Kerbin ground net");
     });
+    expect(container!.querySelector("[data-fallback]")).toBeNull();
   });
 
   it("shows the network icon in the feed's title", async () => {

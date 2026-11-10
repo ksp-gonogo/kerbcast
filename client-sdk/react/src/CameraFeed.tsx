@@ -26,7 +26,7 @@ import {
 import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
-import { isNetworkCamera, networkFeedName, readNetworkVantage } from "./networkVantage";
+import { NETWORK_FEED_TEXT, isNetworkCamera, networkFeedName, readNetworkVantage, type NetworkVantageReading } from "./networkVantage";
 import { useNetworks } from "./hooks/useNetworks";
 import { KERBCAST_RELEASE_GRACE_MS, KerbcastProvider, useKerbcastClient } from "./context";
 import {
@@ -155,6 +155,11 @@ export type { FeedAction } from "./FeedActionBar";
  * feed stays black.
  */
 export type CameraStreamHook = (flightId: number | null) => MediaStream | null;
+
+/** A title line: a node, or a function that chooses per camera. */
+export type TitleContent =
+  | ReactNode
+  | ((camera: CameraState, isNetwork: boolean, vantage: NetworkVantageReading | null) => ReactNode);
 
 export interface CameraFeedProps {
   /** Override the context client for this feed only. */
@@ -412,6 +417,30 @@ export interface CameraFeedProps {
    */
   titleLeading?: ReactNode | ((camera: CameraState, isNetwork: boolean) => ReactNode);
   /**
+   * Replaces the first line of the feed's title (the camera's name, or on a
+   * network feed the vantage's label). A node shows on every feed; a
+   * function chooses per camera, given the camera, whether it is a network
+   * (see {@link isNetworkCamera}) and the network's current vantage (null on
+   * a feed that is no network, or before a label is known). Called only
+   * while the feed has a camera.
+   */
+  titleText?: TitleContent;
+  /**
+   * Sets a second line under the title, in a smaller size. Left unset, a
+   * network feed shows "via <network>" and any other feed nothing. A node
+   * shows on every feed; a function chooses per camera as in
+   * {@link CameraFeedProps.titleText}. Null or false draws no second line,
+   * not even on a network feed.
+   */
+  titleSubtitle?: TitleContent;
+  /**
+   * Keep the title visible when the pointer is not over the feed. By default
+   * the title, like the rest of the feed's chrome, shows on hover and focus
+   * only. The title stays clickable; the action bar and the rest of the
+   * chrome still wait for hover.
+   */
+  alwaysShowTitle?: boolean;
+  /**
    * Drop the feed's own 1px border and rounded corners, for a host that
    * frames the feed itself. Default false.
    */
@@ -464,6 +493,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       anchorOverlay,
       renderNetworkVantage,
       titleLeading,
+      titleText,
+      titleSubtitle,
+      alwaysShowTitle = false,
       frameless = false,
     },
     ref,
@@ -1029,13 +1061,25 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             : null;
 
     const cameraLabel = useMemo(() => buildCameraLabeler(cameras), [cameras]);
-    /* A network feed is named like any other: one compound name in the title,
-       shown on hover, whether or not a host also draws its own corner name. */
-    const title = !camera
+    /* A network feed's first line is the vantage's label, its second "via <network>". */
+    const defaultTitle = !camera
       ? "Camera Feed"
       : networkVantage
-        ? networkFeedName(networkVantage.siteLabel, networkVantage.networkName)
+        ? NETWORK_FEED_TEXT.site(networkVantage.siteLabel)
         : cameraLabel(camera);
+    const resolveTitle = (content: TitleContent): ReactNode =>
+      typeof content === "function" ? (camera ? content(camera, isNetwork, networkVantage) : null) : content;
+    const title = titleText !== undefined ? resolveTitle(titleText) : defaultTitle;
+    const subtitle =
+      titleSubtitle !== undefined
+        ? resolveTitle(titleSubtitle)
+        : camera && networkVantage
+          ? NETWORK_FEED_TEXT.via(networkVantage.networkName)
+          : null;
+    const leadingNode = titleLeadingContent != null && titleLeadingContent !== false && (
+      <TitleButton__Leading>{titleLeadingContent}</TitleButton__Leading>
+    );
+    const hasSubtitle = subtitle != null && subtitle !== false && subtitle !== "";
 
     // -------------------------------------------------------------------------
     // Viewer quality control (opt-in). A built-in action button + menu: Auto
@@ -1192,18 +1236,33 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 aria-haspopup="menu"
                 aria-expanded={cameraMenu.open}
                 aria-controls={menuId}
+                $twoLine={hasSubtitle}
                 disabled={recordingActive}
                 title={recordingActive ? "Stop recording to change camera" : undefined}
                 onClick={recordingActive ? undefined : cameraMenu.toggle}
               >
-                {titleLeadingContent != null && titleLeadingContent !== false && (
-                  <TitleButton__Leading>{titleLeadingContent}</TitleButton__Leading>
+                {hasSubtitle ? (
+                  <>
+                    <TitleButton__Row>
+                      {leadingNode}
+                      <TitleButton__Text>{title}</TitleButton__Text>
+                      <ChevronDownIcon aria-hidden="true" />
+                    </TitleButton__Row>
+                    <TitleButton__Sub>{subtitle}</TitleButton__Sub>
+                  </>
+                ) : (
+                  <>
+                    {leadingNode}
+                    <TitleButton__Text>{title}</TitleButton__Text>
+                    <ChevronDownIcon aria-hidden="true" />
+                  </>
                 )}
-                <TitleButton__Text>{title}</TitleButton__Text>
-                <ChevronDownIcon aria-hidden="true" />
               </TitleButton>
             ) : (
-              title
+              <>
+                {title}
+                {hasSubtitle && <TitleButton__Sub>{subtitle}</TitleButton__Sub>}
+              </>
             )}
           </TopTitle>
         </TitleRow>
@@ -1553,6 +1612,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         <Stage
           ref={wrapRef}
           $pinned={chromePinned}
+          $alwaysTitle={alwaysShowTitle}
           $fullscreen={isFullscreen}
           $frameless={frameless}
           data-fullscreen={isFullscreen || undefined}
@@ -2220,10 +2280,53 @@ const TopTitle = styled.h3`
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
 `;
 
-const TitleButton = styled.button`
+/* The first line of a two-line title: the leading slot, the name and the chevron. */
+const TitleButton__Row = styled.span`
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+
+  > svg {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    transition: transform 0.15s;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    > svg {
+      transition: none;
+    }
+  }
+`;
+
+/* The second line, smaller than the first so the pair fits the room one line had. */
+const TitleButton__Sub = styled.span`
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: calc(var(--font-size-xs, 11px) - 2px);
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  opacity: 0.85;
+`;
+
+const TitleButton = styled.button<{ $twoLine?: boolean }>`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  ${(p) =>
+    p.$twoLine &&
+    css`
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1px;
+    `}
   max-width: 100%;
   margin: 0;
   padding: 0;
@@ -2245,7 +2348,8 @@ const TitleButton = styled.button`
     transition: transform 0.15s;
   }
 
-  &[aria-expanded="true"] > svg {
+  &[aria-expanded="true"] > svg,
+  &[aria-expanded="true"] > ${TitleButton__Row} > svg {
     transform: rotate(180deg);
   }
 
@@ -2535,7 +2639,7 @@ const FeedBox = styled.div`
   justify-content: center;
 `;
 
-const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean; $frameless: boolean }>`
+const Stage = styled(Panel)<{ $pinned: boolean; $alwaysTitle: boolean; $fullscreen: boolean; $frameless: boolean }>`
   ${(p) => p.$frameless && "border: none; border-radius: 0;"}
 
   width: min(100cqw, 100cqh * var(--kc-feed-w) / var(--kc-feed-h));
@@ -2565,6 +2669,18 @@ const Stage = styled(Panel)<{ $pinned: boolean; $fullscreen: boolean; $frameless
   &:focus-within ${ActionBarRow} {
     pointer-events: auto;
   }
+
+  ${(p) =>
+    p.$alwaysTitle &&
+    css`
+      /* Only the title row takes the pointer, so the picture beneath still pans. */
+      ${TopOverlay} {
+        opacity: 1;
+      }
+      ${TitleRow} {
+        pointer-events: auto;
+      }
+    `}
 
   ${(p) =>
     p.$pinned &&

@@ -1,6 +1,6 @@
 import type { CameraState, NetworkDefinition } from "@ksp-gonogo/kerbcast";
 import { describe, expect, it } from "vitest";
-import { isNetworkCamera } from "./networkVantage";
+import { NETWORK_FEED_TEXT, isNetworkCamera, networkFeedName } from "./networkVantage";
 
 type Camera = Pick<CameraState, "flightId" | "commandCentre">;
 
@@ -30,5 +30,13 @@ describe("isNetworkCamera", () => {
 
   it("is false for a part camera", () => {
     expect(isNetworkCamera({ flightId: 42 })).toBe(false);
+  });
+});
+
+describe("networkFeedName", () => {
+  it("joins the site and via parts on one line", () => {
+    expect(networkFeedName("Kerbin: KSC", "Playtest network")).toBe("Kerbin: KSC via Playtest network");
+    expect(NETWORK_FEED_TEXT.site("KSC")).toBe("KSC");
+    expect(NETWORK_FEED_TEXT.via("Net")).toBe("via Net");
   });
 });
