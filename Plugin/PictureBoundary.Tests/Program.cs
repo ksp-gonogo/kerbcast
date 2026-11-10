@@ -234,16 +234,37 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
 
 /* ---- far terrain: which bodies have their terrain left out ---- */
 {
-    /* A network lens on the Mun near side watching a craft at KSC: the far plane is stretched to the craft, 11.26 Mm out. */
-    const double KerbinR = 600000, KerbinMax = 606000, NativeFar = 750000, ToKsc = 11262210;
+    /* A network lens on the Mun near side watching a craft at KSC: the far plane is stretched to the craft, 11.26 Mm out. StockTo stands for a stock terrain altitude a little above Kerbin's air. */
+    const double KerbinR = 600000, KerbinMax = 606000, NativeFar = 750000, ToKsc = 11262210, StockTo = 160000;
+    bool LeftOut(double distance, double reach) => FarTerrain.LeftOut(distance, KerbinMax, NativeFar, reach, distance - KerbinR, StockTo);
     double munToKerbin = ToKsc + KerbinR;
-    Check(FarTerrain.StretchedOnly(munToKerbin, KerbinMax, NativeFar, ToKsc), "far terrain: Kerbin's ground reached only by a plane stretched to KSC from the Mun is left out");
-    Check(!FarTerrain.StretchedOnly(munToKerbin, KerbinMax, NativeFar, NativeFar), "far terrain: with the plane native it is out of reach and nothing is switched");
-    Check(!FarTerrain.StretchedOnly(KerbinR + 100000, KerbinMax, NativeFar, ToKsc), "far terrain: a lens within native reach keeps its ground, however far the plane is stretched");
-    Check(!FarTerrain.StretchedOnly(KerbinR + 70, KerbinMax, NativeFar, NativeFar), "far terrain: a lens on the ground keeps it");
-    Check(FarTerrain.StretchedOnly(KerbinMax + NativeFar + 1, KerbinMax, NativeFar, NativeFar + 2), "far terrain: a metre past native reach, a stretched plane that reaches it leaves it out");
-    Check(!FarTerrain.StretchedOnly(KerbinMax + NativeFar, KerbinMax, NativeFar, 3e7), "far terrain: at native reach exactly it is kept");
-    Check(!FarTerrain.StretchedOnly(double.NaN, KerbinMax, NativeFar, 3e7), "far terrain: an unreadable distance switches nothing");
+    Check(LeftOut(munToKerbin, ToKsc), "far terrain: Kerbin's ground reached only by a plane stretched to KSC from the Mun is left out");
+    Check(!LeftOut(munToKerbin, NativeFar), "far terrain: with the plane native it is out of reach and nothing is switched");
+    Check(!LeftOut(KerbinR + 100000, ToKsc), "far terrain: a lens within native reach and below stock's terrain altitude keeps its ground, however far the plane is stretched");
+    Check(!LeftOut(KerbinR + 70, NativeFar), "far terrain: a lens on the ground keeps it");
+    Check(LeftOut(KerbinMax + NativeFar + 1, NativeFar + 2), "far terrain: a metre past native reach, a stretched plane that reaches it leaves it out");
+    Check(!FarTerrain.LeftOut(KerbinMax + NativeFar, KerbinMax, NativeFar, 3e7, KerbinMax + NativeFar - KerbinR, double.PositiveInfinity), "far terrain: at native reach exactly, with no stock altitude, it is kept");
+    Check(!LeftOut(double.NaN, 3e7), "far terrain: an unreadable distance switches nothing");
+
+    /* A probe 300 km over Kerbin watching a craft landed near KSC, 376 km off: in native reach, but higher than stock ever draws terrain from. */
+    Check(LeftOut(KerbinR + 300000, NativeFar), "far terrain: a lens above stock's terrain altitude leaves it out, though within native reach");
+    Check(LeftOut(KerbinR + 300000, 376700), "far terrain: and so with the plane stretched to its subject");
+    Check(!LeftOut(KerbinR + StockTo, NativeFar), "far terrain: at stock's terrain altitude exactly it is kept");
+    Check(LeftOut(KerbinR + StockTo + 1, NativeFar), "far terrain: a metre above it, left out");
+    Check(!FarTerrain.LeftOut(KerbinR + 300000, KerbinMax, NativeFar, NativeFar, 300000, double.PositiveInfinity), "far terrain: a sphere stock never switches by altitude keeps its ground in native reach");
+    Check(!FarTerrain.LeftOut(KerbinR + 300000, KerbinMax, NativeFar, NativeFar, double.NaN, StockTo), "far terrain: an unreadable altitude switches nothing");
+
+    Check(FarTerrain.SeenAsStock(KerbinR + 70, KerbinMax, NativeFar, 70, StockTo), "seen as stock: a lens on the ground");
+    Check(!FarTerrain.SeenAsStock(KerbinR + 300000, KerbinMax, NativeFar, 300000, StockTo), "seen as stock: not from above stock's terrain altitude");
+    Check(!FarTerrain.SeenAsStock(munToKerbin, KerbinMax, NativeFar, munToKerbin - KerbinR, double.PositiveInfinity), "seen as stock: not from beyond native reach");
+}
+
+/* ---- far terrain: the altitude stock switches terrain off above ---- */
+{
+    Check(FarTerrain.StockTerrainTo(90500, -1, 3) == 90500, "stock terrain to: no high-quality altitude, the plain one");
+    Check(FarTerrain.StockTerrainTo(90500, 160000, 1) == 90500, "stock terrain to: below shader quality 2, the plain one");
+    Check(FarTerrain.StockTerrainTo(90500, 160000, 2) == 160000, "stock terrain to: from shader quality 2, the high-quality one");
+    Check(double.IsPositiveInfinity(FarTerrain.StockTerrainTo(90500, 0, 2)), "stock terrain to: a high-quality altitude of 0 never switches off");
 }
 
 /* ---- far terrain: the quads in storage every sphere shares ---- */

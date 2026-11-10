@@ -713,13 +713,26 @@ namespace Kerbcast
          */
         private bool KeepsPresent(CelestialBody b, PictureLens lens) => TerrainLocal(b, lens.Point);
 
-        /* Whether terrain of `b` is built and within this camera's own reach of `eye`, so the local layers draw that body's ground. */
+        /* Whether terrain of `b` is built and `eye` sees it as stock does (FarTerrain.SeenAsStock), so the local layers draw that body's ground. */
         public bool TerrainLocal(CelestialBody b, DVec3 eye)
         {
             var pqs = b != null ? b.pqsController : null;
             if (pqs == null || !pqs.isActive) return false;
             double far = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
-            return PictureBoundary.TerrainInReach((eye - ToD(b.position)).Magnitude, Math.Max(b.Radius, pqs.radiusMax), far);
+            double distance = (eye - ToD(b.position)).Magnitude;
+            return FarTerrain.SeenAsStock(distance, Math.Max(b.Radius, pqs.radiusMax), far, distance - b.Radius, StockTerrainTo(pqs));
+        }
+
+        private static readonly Dictionary<PQS, PQSMod_CelestialBodyTransform> s_bodyTransforms = new Dictionary<PQS, PQSMod_CelestialBodyTransform>();
+
+        /* The altitude above which stock switches `pqs` off (FarTerrain.StockTerrainTo), unbounded for a sphere stock never switches by altitude. */
+        private static double StockTerrainTo(PQS pqs)
+        {
+            /* A sphere without one is remembered as null; one destroyed since is looked up again. */
+            if (!s_bodyTransforms.TryGetValue(pqs, out var mod) || (!ReferenceEquals(mod, null) && mod == null))
+                s_bodyTransforms[pqs] = mod = pqs.GetComponentInChildren<PQSMod_CelestialBodyTransform>(true);
+            if (mod == null || mod.forceActivate) return double.PositiveInfinity;
+            return FarTerrain.StockTerrainTo(mod.deactivateAltitude, mod.highQualityShaderDeactivateAltitude, GameSettings.TERRAIN_SHADER_QUALITY);
         }
 
         /* Whether this camera leaves body `b` out of its picture this frame, its light not yet placed. */
@@ -802,11 +815,12 @@ namespace Kerbcast
         }
 
         /*
-         * A local layer stretched to a far subject can reach terrain built in
-         * local space far beyond the reach stock builds it for, where it draws
-         * wrongly over the scaled sphere (FarTerrain.StretchedOnly). Its
-         * renderers are switched off for this camera's local layers alone, as
-         * the craft hider does, and only those that were on are put back.
+         * A local layer can reach terrain built in local space from where
+         * stock never shows it, stretched to a far subject or from a lens
+         * high above the active craft's planet, and draws it wrongly over the
+         * scaled sphere (FarTerrain.LeftOut). Its renderers are switched off
+         * for this camera's local layers alone, as the craft hider does, and
+         * only those that were on are put back.
          */
         private void HideFarTerrain()
         {
@@ -825,9 +839,10 @@ namespace Kerbcast
                 if (b == null) continue;
                 var pqs = b.pqsController;
                 double distance = (lens.Point - ToD(b.position)).Magnitude;
+                double stockTo = pqs != null && pqs.isActive ? StockTerrainTo(pqs) : double.PositiveInfinity;
                 bool off = pqs != null && pqs.isActive
-                    && FarTerrain.StretchedOnly(distance, Math.Max(b.Radius, pqs.radiusMax), native, reach);
-                NoteFarTerrain(b, off, distance, native, reach);
+                    && FarTerrain.LeftOut(distance, Math.Max(b.Radius, pqs.radiusMax), native, reach, distance - b.Radius, stockTo);
+                NoteFarTerrain(b, off, distance, native, reach, stockTo);
                 if (!off) continue;
                 SwitchOff(pqs);
                 var children = pqs.ChildSpheres;
@@ -838,12 +853,12 @@ namespace Kerbcast
         }
 
         /* Logs body `b`'s terrain being left out or drawn again by this camera, once per change. */
-        private void NoteFarTerrain(CelestialBody b, bool off, double distance, double native, double reach)
+        private void NoteFarTerrain(CelestialBody b, bool off, double distance, double native, double reach, double stockTo)
         {
             int index = b.flightGlobalsIndex;
             if (off ? !_farTerrainOff.Add(index) : !_farTerrainOff.Remove(index)) return;
             Debug.Log($"{Tag} view={(View != null ? View.name : "none")} event=far-terrain body={b.bodyName} state={(off ? "off" : "on")} "
-                + $"distance={distance:F0} nativeFar={native:F0} reach={reach:F0}");
+                + $"distance={distance:F0} nativeFar={native:F0} reach={reach:F0} altitude={distance - b.Radius:F0} stockTerrainTo={stockTo:F0}");
         }
 
         private void SwitchOff(PQS sphere)
