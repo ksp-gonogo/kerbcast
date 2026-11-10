@@ -1149,6 +1149,50 @@ PartRecord[] Parts(uint first, int count)
     Console.WriteLine($"     500 coasting craft of 30 parts: {quietText.Length / 1024} KB of text, save {sw.Elapsed.TotalMilliseconds:F1} ms");
 }
 
+/*
+ * A landed craft knocked off its ground for a tick (a part exploding under it)
+ * gets a conic entry, whose angular velocity is its own tumble, then a surface
+ * entry when it settles, whose angular velocity is its body's spin. A read
+ * between them is a surface state, and a surface state is carried round its
+ * body by that angular velocity for the light time: the tumble must not leak
+ * into it, or the craft is drawn kilometres along the ground.
+ */
+{
+    const int MunIndex = 2;
+    double munSpin = 2 * Math.PI / 138984;
+    var spin = new DVec3(0, 0, munSpin);
+    var ground = new DVec3(202544, 0, 0);
+    var tumble = new DVec3(0, 0.3, 0.1);
+    var bounced = new HistoryState
+    {
+        Ut = 100, Body = MunIndex, Kind = HistoryKind.Conic, Position = ground,
+        Velocity = DVec3.Cross(spin, ground) + ground.Normalized * 0.5, Attitude = DQuat.Identity, AngularVelocity = tumble,
+    };
+    var settledAt = DQuat.FromRotationVector(spin * 0.1).Rotate(ground);
+    var settled = new HistoryState
+    {
+        Ut = 100.1, Body = MunIndex, Kind = HistoryKind.Surface, Position = settledAt,
+        Velocity = DVec3.Cross(spin, settledAt), Attitude = DQuat.Identity, AngularVelocity = spin,
+    };
+    var a = bounced.ToEntry(HistoryReason.Departure);
+    var b = settled.ToEntry(HistoryReason.Departure);
+    var mid = LightHistoryMath.Interpolate(a, b, 100.05);
+    double lightTime = 0.658;
+    var drawn = PastInstant.AboutDrawnBody(mid, 100.05 + lightTime);
+    var expected = DQuat.FromRotationVector(spin * (0.05 + lightTime)).Rotate(ground);
+    Check(mid.Kind == HistoryKind.Surface, "a read between a bounce and the craft settling is a surface state");
+    Check((drawn - expected).Magnitude < 1.0,
+        $"a craft settling after a bounce is carried by its body's spin, not its own tumble ({(drawn - expected).Magnitude:F0} m off)");
+    Check((mid.AngularVelocity - spin).Magnitude < 1e-12, "the surface read takes its body's spin as its angular velocity");
+    var tumbling = LightHistoryMath.Interpolate(b, a, 100.05);
+    Check(tumbling.Kind == HistoryKind.Conic && (tumbling.AngularVelocity - tumble).Magnitude < 1e-6,
+        "a read toward a conic entry keeps the craft's own tumble");
+    var both = settled;
+    both.Ut = 100.2;
+    var surfaceRead = LightHistoryMath.Interpolate(b, both.ToEntry(HistoryReason.Departure), 100.15);
+    Check((surfaceRead.AngularVelocity - spin).Magnitude < 1e-12, "between two surface entries the spin is unchanged");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
 
