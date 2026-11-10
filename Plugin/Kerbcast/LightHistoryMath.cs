@@ -314,7 +314,14 @@ namespace Kerbcast
             return s;
         }
 
-        /* Hermite between two entries on the same body, attitude by slerp. */
+        /*
+         * Hermite between two entries on the same body, attitude by slerp. The
+         * read is of b's kind, and so is its angular velocity: on a surface
+         * entry that is the body's spin, which carries the place round with
+         * the ground, and on a conic entry the craft's own rate. Blending the
+         * two across a landed craft's bounce would carry it round its body at
+         * its tumble rate.
+         */
         public static HistoryState Interpolate(in HistoryEntry a, in HistoryEntry b, double ut)
         {
             double h = b.Ut - a.Ut;
@@ -324,7 +331,7 @@ namespace Kerbcast
             {
                 Ut = ut, Body = a.Body, Kind = b.Kind, Position = p, Velocity = v,
                 Attitude = DQuat.Slerp(a.Attitude, b.Attitude, s),
-                AngularVelocity = a.AngularVelocity + (b.AngularVelocity - a.AngularVelocity) * s,
+                AngularVelocity = a.Kind == b.Kind ? a.AngularVelocity + (b.AngularVelocity - a.AngularVelocity) * s : b.AngularVelocity,
             };
         }
 

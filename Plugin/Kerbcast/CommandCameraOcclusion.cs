@@ -98,7 +98,8 @@ namespace Kerbcast
         public int MaskFallbacks => _mask?.Fallbacks ?? 0;
 
         /* The first body hiding `target` from `station` now, or null. A
-           target radius counts against the station's own skyline only. */
+           target radius counts against terrain only: the station's own
+           skyline and terrain sampled along the line. */
         public string FindOccluder(DVec3 station, DVec3 target, out string source, double targetRadius = 0)
         {
             source = null;
@@ -147,7 +148,9 @@ namespace Kerbcast
         /*
          * Whether body `b` hides `target` from `station`, both in the world
          * of now at time now + dt, with the body's centre then at centreAtT
-         * and now at centreNow, spinning at `spin`.
+         * and now at centreNow, spinning at `spin`. A target on the body's
+         * own surface is not hidden by the ground it stands on, only by the
+         * body between it and the station (SurfaceSightEnd).
          */
         public bool Blocks(CelestialBody b, DVec3 station, DVec3 target, DVec3 centreAtT, DVec3 centreNow, DVec3 spin,
             double dt, out string source, double targetRadius = 0)
@@ -179,7 +182,8 @@ namespace Kerbcast
                         return true;
                     }
                 }
-                else if (!CommandCameraMath.SegmentClearOfSphere(station, target, centreAtT, b.Radius))
+                else if (!CommandCameraMath.SegmentClearOfSphere(station,
+                    CommandCameraMath.SurfaceSightEnd(station, target, centreAtT, b.Radius, b.Radius), centreAtT, b.Radius))
                 {
                     source = SourceSphere;
                     return true;
@@ -188,17 +192,18 @@ namespace Kerbcast
             }
             if (pqs == null)
             {
-                if (CommandCameraMath.SegmentClearOfSphere(station, target, centreAtT, b.Radius)) return false;
+                var end = CommandCameraMath.SurfaceSightEnd(station, target, centreAtT, b.Radius, b.Radius);
+                if (CommandCameraMath.SegmentClearOfSphere(station, end, centreAtT, b.Radius)) return false;
                 source = SourceSphere;
                 return true;
             }
-            if (TerrainClear(b, station, target, centreAtT, centreNow, spin, dt)) return false;
+            if (TerrainClear(b, station, target, centreAtT, centreNow, spin, dt, targetRadius)) return false;
             source = SourceTerrain;
             return true;
         }
 
         private bool TerrainClear(CelestialBody b, DVec3 station, DVec3 target, DVec3 centreAtT, DVec3 centreNow,
-            DVec3 spin, double dt)
+            DVec3 spin, double dt, double targetRadius)
         {
             Func<DVec3, double> surface = p =>
             {
@@ -206,8 +211,13 @@ namespace Kerbcast
                 var world = new Vector3d(now.X, now.Y, now.Z);
                 return b.Radius + b.TerrainAltitude(b.GetLatitude(world), b.GetLongitude(world));
             };
-            return CommandCameraMath.SegmentClearOfTerrain(station, target, centreAtT, b.Radius, b.pqsController.radiusMax,
-                surface, _terrainSamples);
+            /* A craft is kept clear by its own radius; an aim point with no size skips its own shell (SurfaceSightEnd), so a landed craft behind a nearby ridge still reads hidden. */
+            double top = b.pqsController.radiusMax;
+            var end = targetRadius > 0 ? target : CommandCameraMath.SurfaceSightEnd(station, target, centreAtT, b.Radius, top);
+            /* A lens riding a craft landed on this body rests on its ground as a landed target does; its size is not read, so the nominal one stands in. */
+            double stationRadius = b == _vantageBody ? CommandCameraMath.NominalCraftRadiusM : 0;
+            return CommandCameraMath.SegmentClearOfTerrain(station, end, centreAtT, b.Radius, top, surface, _terrainSamples,
+                targetRadius, stationRadius);
         }
 
         /* The scaled mesh's axes in world space now. ScaledMovement sets its

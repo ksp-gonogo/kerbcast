@@ -783,21 +783,99 @@ namespace Kerbcast
          * compared with `surfaceRadiusAt` (the terrain radius under that point).
          * A grazing line of sight past a limb with mountains is the case the
          * sphere test misses.
+         *
+         * The last `targetRadius` of the line is the craft itself. A landed
+         * craft rests on the drawn ground, which can sit metres above or
+         * below TerrainAltitude, so its own patch of ground must not hide it.
+         * Clipping the line by the craft's radius alone is not enough: until
+         * the craft's size is known that radius is a nominal couple of metres,
+         * less than the craft's centre can sit under the sampled ground. So
+         * the sampled ground is also lowered until, under the craft, it sits
+         * `targetRadius` below the craft's centre, as the drawn ground there
+         * does. The lowering is capped at LandedGroundSlackM so a craft sunk
+         * deep under the ground stays hidden. It is the craft's own patch
+         * only: whole within LandedGroundReach(lower) of the craft along the
+         * line, easing to nothing over as far again, so a low ridge or crater
+         * rim kilometres away is tested against its true height.
+         *
+         * `stationRadius` does the same for the lens's end: a lens riding a
+         * landed craft rests on its own patch of ground just as a landed
+         * target does, and a line leaving it level or downhill starts inside
+         * that patch. A lens above the terrain shell lowers nothing.
          */
         public static bool SegmentClearOfTerrain(DVec3 a, DVec3 b, DVec3 centre, double radius, double radiusMax,
-            Func<DVec3, double> surfaceRadiusAt, int samples)
+            Func<DVec3, double> surfaceRadiusAt, int samples, double targetRadius = 0, double stationRadius = 0)
         {
+            double lowerB = LandedGroundLowering(b, centre, radiusMax, surfaceRadiusAt, targetRadius);
+            double lowerA = LandedGroundLowering(a, centre, radiusMax, surfaceRadiusAt, stationRadius);
+            var ends = b - a;
+            double endsLen = ends.Magnitude;
+            if (targetRadius > 0) b = endsLen > targetRadius ? b - ends * (targetRadius / endsLen) : a;
+            if (stationRadius > 0)
+            {
+                var rest = b - a;
+                double restLen = rest.Magnitude;
+                a = restLen > stationRadius ? a + rest * (stationRadius / restLen) : b;
+            }
             if (!SegmentClearOfSphere(a, b, centre, radius)) return false;
             if (surfaceRadiusAt == null || samples < 1 || radiusMax <= radius) return true;
             if (!SegmentInsideSphere(a, b, centre, radiusMax, out double t0, out double t1)) return true;
 
             var ab = b - a;
+            double abLen = ab.Magnitude;
+            double reachB = LandedGroundReach(lowerB), reachA = LandedGroundReach(lowerA);
             for (int i = 0; i <= samples; i++)
             {
-                var p = a + ab * (t0 + (t1 - t0) * i / samples);
-                if ((p - centre).Magnitude < surfaceRadiusAt(p)) return false;
+                double t = t0 + (t1 - t0) * i / samples;
+                var p = a + ab * t;
+                double lower = 0;
+                if (lowerB > 0) lower = Math.Max(lower, lowerB * Math.Max(0, Math.Min(1, 2 - (1 - t) * abLen / reachB)));
+                if (lowerA > 0) lower = Math.Max(lower, lowerA * Math.Max(0, Math.Min(1, 2 - t * abLen / reachA)));
+                if ((p - centre).Magnitude < surfaceRadiusAt(p) - lower) return false;
             }
             return true;
+        }
+
+        /* How far the sampled ground under a craft resting at `end` is lowered, so it sits `craftRadius` below the craft's centre; 0 for no size or a craft above the terrain shell. */
+        private static double LandedGroundLowering(DVec3 end, DVec3 centre, double radiusMax, Func<DVec3, double> surfaceRadiusAt,
+            double craftRadius)
+        {
+            if (!(craftRadius > 0) || surfaceRadiusAt == null) return 0;
+            double r = (end - centre).Magnitude;
+            if (r >= radiusMax) return 0;
+            return Math.Max(0, Math.Min(surfaceRadiusAt(end) - r, LandedGroundSlackM) + craftRadius);
+        }
+
+        /* How far along the line from a craft its ground is lowered in full by `lower`. */
+        public static double LandedGroundReach(double lower) => Math.Max(200.0, 4.0 * lower);
+
+        /* The most a craft's centre may sit under the sampled ground and still count as resting on it. */
+        public const double LandedGroundSlackM = 30.0;
+
+        /* Share of a body's radius a target may sit above its sea-level sphere and still count as on its surface. */
+        public const double SurfaceTolerance = 1e-6;
+
+        /*
+         * Where a sight line from `from` to `target` stops being tested against
+         * a body of sea-level `radius` whose ground reaches `radiusMax`. A
+         * target inside that shell sits on or under the ground (a point at sea
+         * level lies beneath any land), and the ground at and around it is its
+         * own place, not a body hiding it, so the last stretch before it, twice
+         * the shell's depth, is left out, as ScaledMeshOccluder.Blocks leaves
+         * out the mesh's relief. The far hemisphere is still behind the body.
+         * A target above the shell is tested to its own place; `from` itself
+         * comes back when the whole segment is within the stretch.
+         */
+        public static DVec3 SurfaceSightEnd(DVec3 from, DVec3 target, DVec3 centre, double radius, double radiusMax)
+        {
+            double top = Math.Max(radius, radiusMax);
+            double tol = radius * SurfaceTolerance;
+            if ((target - centre).Magnitude >= top + tol) return target;
+            double slack = 2.0 * (top - radius) + tol;
+            var d = target - from;
+            double len = d.Magnitude;
+            if (len <= slack) return from;
+            return target - d * (slack / len);
         }
 
         /* Parameter range [t0, t1] (clamped to the segment) where a-b lies inside
