@@ -251,7 +251,6 @@ namespace Kerbcast
         /* Where the camera points; null for its default craft. */
         public CommandAim Aim => _aim;
         internal Orbit AimOrbit => _aimOrbit;
-        internal double HeldFov => _heldFov;
         internal double ShownFov => _fov;
 
         /* The craft this lens rides no longer exists (crashed, recovered, or
@@ -357,17 +356,9 @@ namespace Kerbcast
         {
             _aim = aim;
             _aimOrbit = orbit;
-            _heldFov = aim?.FovDeg ?? double.NaN;
             uint subject = aim?.SubjectPersistentId ?? 0;
             if (subject != _selection.ChosenPersistentId) _selection.Choose(subject);
             Debug.Log($"{Tag} cam={_flightId} aim {(aim == null ? "default (the default craft)" : aim.ToString())}");
-        }
-
-        /* Holds the lens at `fovDeg` degrees, within its limits, until the next aim; NaN returns it to the aim's own framing. */
-        internal void SetFov(double fovDeg)
-        {
-            _heldFov = fovDeg;
-            Debug.Log($"{Tag} cam={_flightId} fov {(double.IsNaN(fovDeg) ? "back to the aim's framing" : $"held at {fovDeg:G4} deg")}");
         }
 
         private bool _galaxyLogged;
@@ -389,34 +380,9 @@ namespace Kerbcast
 
         public float FovFloor => (float)FovMinNow();
 
-        /* A held zoom narrows or widens by this factor each second at full rate, the same pace at every field. */
-        private const double ZoomFactorPerSecond = 4.0;
-        private float _zoomRate;
-
-        public void ViewerZoomRate(float rate)
-        {
-            if (rate != 0f && _authority != null && _authority.Registered)
-            {
-                if (_zoomRate == 0f) return;
-                rate = 0f;
-            }
-            if (rate == _zoomRate) return;
-            if (rate != 0f && _zoomRate == 0f) Debug.Log($"{Tag} cam={_flightId} viewer zoom {(rate > 0 ? "in" : "out")} at rate {rate:F2}");
-            _zoomRate = rate;
-        }
-
-        /* Through the facade, so a viewer is refused while a command authority holds the lock. */
-        public void ViewerFov(float fov)
-        {
-            var result = KerbcastControl.SetFovCore(_flightId, fov, null);
-            if (result != Kerbcast.Api.AimResult.Ok) Debug.Log($"{Tag} cam={_flightId} viewer fov {fov:G4} deg refused: {result}");
-        }
-
         private CommandAim _aim;
         private Orbit _aimOrbit;
         private DVec3 _lastAimPoint;
-        /* The field a client set, unclamped; NaN while the aim frames itself. */
-        private double _heldFov = double.NaN;
 
         /* A Direction or Surface aim: no craft of its own, so no craft sizes its view. */
         private bool AimIsPoint => _aim != null && (_aim.Kind == CommandAimKind.Direction || _aim.Kind == CommandAimKind.Surface);
@@ -1830,20 +1796,9 @@ namespace Kerbcast
             _optics?.Idle();
             float now = Time.unscaledTime;
             Network?.Step(this, false);
-            TakeHeldFovWhileIdle(now);
             if (now - _solvedAt < PollStaleSeconds) return;
             if (_lastPrepare < 0 || now - _lastPrepare > FovSnapAfter) _frames.Learn(now - _solvedAt);
             Solve(Planetarium.GetUniversalTime(), now, out _, out _, out _, out _, out _);
-        }
-
-        /* Only a rendered frame moves the field, so a zoom set on a camera nobody displays is taken here: /cameras reports it and the first frame opens on it. */
-        private void TakeHeldFovWhileIdle(float now)
-        {
-            double sinceFrame = _lastPrepare < 0 ? double.PositiveInfinity : now - _lastPrepare;
-            double field = CommandCameraMath.IdleFov(_fov, _heldFov, FovMinNow(), _fovMax, sinceFrame, FovSnapAfter);
-            if (field == _fov) return;
-            _fov = field;
-            _cam.SetRigFov((float)field);
         }
 
         /* The recorded transitions, oldest first, then the forecast camera-axis
@@ -1994,22 +1949,7 @@ namespace Kerbcast
                 _snapNext = false;
                 step = double.MaxValue;
             }
-            if (_zoomRate != 0f && _authority != null && _authority.Registered) _zoomRate = 0f;
-            if (_zoomRate != 0f)
-                _heldFov = CommandCameraMath.ZoomedFov(double.IsNaN(_heldFov) ? _fov : _heldFov, _zoomRate, ZoomFactorPerSecond,
-                    Math.Min(dt, 0.25), FovMinNow(), _fovMax);
-            double held = CommandCameraMath.HeldFov(_heldFov, FovMinNow(), _fovMax);
-            if (_zoomRate != 0f && !double.IsNaN(held))
-            {
-                _framing.Reset();
-                _fov = held;
-            }
-            else if (!double.IsNaN(held))
-            {
-                _framing.Reset();
-                _fov = CommandCameraMath.SmoothFov(_fov, held, step, FovTau, FovSnapAfter);
-            }
-            else if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None && !AimIsPoint)
+            if (_mode != SubjectAimMode.Hold && _placeholder == PlaceholderAim.None && !AimIsPoint)
             {
                 /* Not AimJumped, which also fires on every world model publish: the box would start over on each record and pump again. */
                 uint subject = _known.SubjectPersistentId, vantage = site.VantagePersistentId;

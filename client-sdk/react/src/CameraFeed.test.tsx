@@ -38,7 +38,6 @@ import type {
   CommandTrackState,
   DisplayedFrameUt,
 } from "@ksp-gonogo/kerbcast";
-import { ErrorCode } from "@ksp-gonogo/kerbcast";
 import { type MockCameraInit, MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import {
   act,
@@ -1406,12 +1405,11 @@ describe("CameraFeed - zoom controls", () => {
     expect(screen.getByRole("button", { name: /zoom out/i })).toBeTruthy();
   });
 
-  it("a command camera's wide lens zooms by factors and slides on a log scale", async () => {
+  it("a wide lens zooms by factors and slides on a log scale", async () => {
     const { client, sidecar } = await buildConnectedSource();
 
     await act(async () => {
       sidecar.updateCamera(42, {
-        kind: CameraKind.Command,
         supportsZoom: true,
         fov: 30,
         fovMin: 0.02,
@@ -3131,60 +3129,19 @@ describe("CameraFeed - command camera target brackets", () => {
     expect(screen.getByRole("button", { name: "Target brackets" }).getAttribute("aria-pressed")).toBe("false");
   });
 
-  describe("zoom on a command camera", () => {
-    const zoomable = (track = commandTrack()) =>
-      makeCamera({
-        flightId: 301,
-        kind: CameraKind.Command,
-        commandCentre: STATION,
-        commandTrack: track,
-        supportsZoom: true,
-        fov: 30,
-        fovMin: 0.02,
-        fovMax: 30,
-      });
+  it("shows no zoom controls on a command camera, which frames itself", async () => {
+    const { client } = await buildConnectedSource([
+      makeCamera({ ...commandCamera(), supportsZoom: false, fov: 30, fovMin: 0.02, fovMax: 30 }),
+    ]);
+    renderFeed(client, { flightId: 301 });
+    expect(screen.queryByRole("slider", { name: "Zoom", hidden: true })).toBeNull();
+    expect(screen.queryByRole("button", { name: /zoom in/i, hidden: true })).toBeNull();
+  });
+
+  describe("the zoom slider's keys", () => {
+    const zoomable = () =>
+      makeCamera({ flightId: 301, supportsZoom: true, fov: 30, fovMin: 0.02, fovMax: 30 });
     const slider = () => screen.getByRole("slider", { name: "Zoom", hidden: true }) as HTMLInputElement;
-
-    it("disables the zoom controls while another owner holds the lock", async () => {
-      const { client } = await buildConnectedSource([zoomable(commandTrack({ authority: { owner: "mission-control" } }))]);
-      renderFeed(client, { flightId: 301 });
-      expect(slider().disabled).toBe(true);
-      expect((screen.getByRole("button", { name: /zoom in/i, hidden: true }) as HTMLButtonElement).disabled).toBe(true);
-    });
-
-    it("leaves them live with no lock held", async () => {
-      const { client } = await buildConnectedSource([zoomable()]);
-      renderFeed(client, { flightId: 301 });
-      expect(slider().disabled).toBe(false);
-    });
-
-    it("stops a held zoom when the lock is taken mid-press", async () => {
-      const { client, sidecar } = await buildConnectedSource([zoomable()]);
-      renderFeed(client, { flightId: 301 });
-      fireEvent.pointerDown(screen.getByRole("button", { name: /zoom in/i }));
-      expect(sidecar.lastCommand("set-zoom-rate")?.content.rate).toBe(1);
-
-      await act(async () => {
-        sidecar.updateCamera(301, { commandTrack: commandTrack({ authority: { owner: "mission-control" } }) });
-      });
-      expect(sidecar.lastCommand("set-zoom-rate")?.content.rate).toBe(0);
-    });
-
-    it("snaps the slider back when the sidecar refuses the zoom", async () => {
-      const { client, sidecar } = await buildConnectedSource([zoomable()]);
-      renderFeed(client, { flightId: 301 });
-      await act(async () => {
-        fireEvent.pointerDown(slider());
-        fireEvent.change(slider(), { target: { value: "500" } });
-        fireEvent.pointerUp(slider());
-      });
-      expect(Number(slider().value)).toBeCloseTo(500, 0);
-
-      await act(async () => {
-        sidecar.fireError({ message: "locked", code: ErrorCode.CommandLocked, source: "sidecar", flightId: 301 } as Parameters<MockSidecar["fireError"]>[0]);
-      });
-      expect(Number(slider().value)).toBeCloseTo(1000, 0);
-    });
 
     it("announces the zoom in degrees and steps it a useful amount per arrow key", async () => {
       const { client, sidecar } = await buildConnectedSource([zoomable()]);
@@ -3212,20 +3169,6 @@ describe("CameraFeed - command camera target brackets", () => {
         fireEvent.keyDown(slider(), { key: "ArrowDown" });
       });
       await waitFor(() => expect(sidecar.lastCommand("set-fov")?.content.fov).toBeCloseTo(40, 3));
-    });
-
-    it("lets go of a dragged value when the lock arrives mid drag with nothing left to send", async () => {
-      const { client, sidecar } = await buildConnectedSource([zoomable()]);
-      renderFeed(client, { flightId: 301 });
-      fireEvent.pointerDown(slider());
-      await act(async () => {
-        fireEvent.change(slider(), { target: { value: "500" } });
-      });
-      await waitFor(() => expect(sidecar.lastCommand("set-fov")).toBeDefined());
-      await act(async () => {
-        sidecar.updateCamera(301, { fov: 30, commandTrack: commandTrack({ authority: { owner: "mission-control" } }) });
-      });
-      expect(Number(slider().value)).toBeCloseTo(1000, 0);
     });
   });
 

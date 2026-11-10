@@ -3,7 +3,6 @@ import {
   CameraKind,
   CommandAimKind,
   CommandTargetEligibility,
-  ErrorCode,
   PanZoomController,
   fovSliderScale,
   QualityPreset,
@@ -761,6 +760,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // (they jitter against the track and are no-ops in practice).
     const trackMode = camera?.trackMode ?? TrackMode.None;
     const tracking = trackMode !== TrackMode.None;
+    const manualDisabled = tracking;
     const supportsPitch =
       !!camera && camera.panPitchMax - camera.panPitchMin > 0;
 
@@ -770,7 +770,6 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const isCommandFeed = commandCamera !== null;
     const commandTrack = commandCamera?.commandTrack ?? null;
     const commandLocked = commandTrack?.authority != null;
-    const manualDisabled = tracking || commandLocked;
     /* A host on its own delay names the frame it shows, or its UT for the client to look the frame up by. */
     const hostFrame =
       displayFrame ??
@@ -836,7 +835,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     // -------------------------------------------------------------------------
     const controllerRef = useRef<PanZoomController | null>(null);
     const [sliderFov, setSliderFov] = useState(60);
-    /* A tracking camera's lens spans 0.02 to 30 degrees: slid by factors, so both ends are reachable. */
+    /* A range wider than LOG_ZOOM_RATIO slides by factors, so both ends are reachable. */
     const sliderScale = useMemo(
       () => fovSliderScale(camera?.fovMin ?? 0, camera?.fovMax ?? 0),
       [camera?.fovMin, camera?.fovMax],
@@ -854,17 +853,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       controllerRef.current = ctrl;
 
       const unsubSlider = ctrl.onSliderFov(setSliderFov);
-      /* The lock can be taken between the client's last list and a set-fov reaching the sidecar. */
-      const unsubError = client.on("error", (e) => {
-        if (e.code === ErrorCode.CommandLocked && (e.flightId == null || e.flightId === flightId)) ctrl.fovRefused();
-      });
       // Seed the slider from the controller's initial (0). It will be
       // overwritten immediately by syncFromState in the camera-state effect below.
       setSliderFov(ctrl.sliderFov);
 
       return () => {
         unsubSlider();
-        unsubError();
         ctrl.stop();
         ctrl.dispose();
         controllerRef.current = null;

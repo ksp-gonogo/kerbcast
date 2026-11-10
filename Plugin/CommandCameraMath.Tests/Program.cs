@@ -1017,22 +1017,10 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
 
 // A command camera's field when no craft sizes it.
 {
-    Check(double.IsNaN(CommandCameraMath.HeldFov(double.NaN, 0.02, 30)), "held fov: none set stays none");
-    Check(CommandCameraMath.HeldFov(30, 1, 30) == 30, "held fov: within the lens it is kept");
-    Check(CommandCameraMath.HeldFov(0.001, 0.02, 30) == 0.02 && CommandCameraMath.HeldFov(90, 0.02, 30) == 30,
-        "held fov: clamped to the lens's narrowest and widest");
-    Check(CommandCameraMath.IdleFov(30, 2, 1, 30, double.PositiveInfinity, 1) == 2, "idle fov: a camera that has never rendered takes a held zoom at once");
-    Check(CommandCameraMath.IdleFov(30, 0.01, 1, 30, 5, 1) == 1, "idle fov: within the lens's limits");
-    Check(CommandCameraMath.IdleFov(30, double.NaN, 1, 30, 5, 1) == 30, "idle fov: with no held zoom the field stays");
-    Check(CommandCameraMath.IdleFov(30, 2, 1, 30, 0.5, 1) == 30, "idle fov: a rendering camera eases as before");
-    Check(CommandCameraMath.CarriedFov(2.5, 0.025) == 2.5,"carried fov: a rebuild opens on the field its camera showed, not the held value behind the lens limit");
-    Check(CommandCameraMath.CarriedFov(double.NaN, 4) == 4, "carried fov: with no field shown it opens on the held zoom");
-    Check(double.IsNaN(CommandCameraMath.CarriedFov(double.NaN, double.NaN)), "carried fov: nothing carried leaves the lens's default");
-    Check(double.IsNaN(CommandCameraMath.CarriedFov(0, double.PositiveInfinity)), "carried fov: an unusable field is not carried");
-    Check(Near(CommandCameraMath.ZoomedFov(8, 1, 4, 1, 0.02, 30), 2, 1e-9), "zoom rate: a second at full rate in narrows by the factor");
-    Check(Near(CommandCameraMath.ZoomedFov(0.08, -1, 4, 0.5, 0.02, 30), 0.16, 1e-9), "zoom rate: out widens at the same pace at any field");
-    Check(CommandCameraMath.ZoomedFov(0.03, 1, 4, 1, 0.02, 30) == 0.02 && CommandCameraMath.ZoomedFov(20, -1, 4, 1, 0.02, 30) == 30,
-        "zoom rate: held at the lens's limits");
+    Check(CommandCameraMath.CarriedFov(2.5) == 2.5, "carried fov: a rebuild opens on the field its camera showed");
+    Check(double.IsNaN(CommandCameraMath.CarriedFov(double.NaN)), "carried fov: nothing carried leaves the lens's default");
+    Check(double.IsNaN(CommandCameraMath.CarriedFov(0)) && double.IsNaN(CommandCameraMath.CarriedFov(double.PositiveInfinity)),
+        "carried fov: an unusable field is not carried");
     Check(CommandCameraMath.PointFov(true, 500, 1e4, 0.5, 0.02, 30) == 30, "point fov: a direction opens to the widest view");
     Check(CommandCameraMath.PointFov(false, 0, 1e4, 0.5, 0.02, 30) == 30, "point fov: a surface point without a margin does too");
     double f = CommandCameraMath.PointFov(false, 100, 1e4, 0.5, 0.02, 30);
@@ -1089,8 +1077,6 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
         "optics floor: measured on the floor's own rows the effect shows at the floor");
     Check(OpticsModel.Ramp(OpticsModel.BlurSpanPx(blur, l1Ground, 288)) < 1e-6,
         "optics floor: measured on half-height rows it would vanish, which is why the rig measures on full rows");
-    Check(CommandCameraMath.HeldFov(0.05, l1Ground, 30) == l1Ground && CommandCameraMath.ZoomedFov(1.3, 1, 4, 1, l1Ground, 30) == l1Ground,
-        "optics floor: a manual zoom past it clamps there");
     var lens = new LensLimits
     {
         Known = true, WidthPx = 1024, HeightPx = 576, OpticsOn = true,

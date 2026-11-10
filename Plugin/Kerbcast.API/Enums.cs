@@ -32,8 +32,6 @@ namespace Kerbcast.Api
         LineOfSight = 11,
         /** <summary><see cref="ICommand.VantageResolution"/> and <see cref="LineOfSightResult.ResolutionRad"/>. Added in API 1.5.</summary> */
         VantageResolution = 12,
-        /** <summary><see cref="ICommand.SetFov"/> and <see cref="Aim.WithFov"/>. Added in API 1.5.</summary> */
-        CommandFov = 13,
     }
 
     public enum CameraKind
@@ -217,7 +215,7 @@ namespace Kerbcast.Api
          * The flightId is no camera network camera this caller can change: not one made through the API, built or
          * waiting to be, or one another mod made under its own name, or one a player saved with the game
          * (<see cref="CommandFeed.Saved"/>). A saved network's vantages and its removal are the player's alone; its aim
-         * and field of view still follow <see cref="ICommand.SetAim"/> and <see cref="ICommand.SetFov"/> under the lock rules.
+         * still follows <see cref="ICommand.SetAim"/> under the lock rules.
          * </summary>
          */
         NotCommandFeed = 3,

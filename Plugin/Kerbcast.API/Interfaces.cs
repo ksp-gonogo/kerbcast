@@ -52,7 +52,7 @@ namespace Kerbcast.Api
          */
         CameraView View(uint flightId);
 
-        /** <summary>Slews a part camera's field of view, clamped to its range. False for an unknown camera, a command feed, or one without zoom.</summary> */
+        /** <summary>Slews a part camera's field of view, clamped to its range. False for an unknown camera, one without zoom, or a command feed, which zooms itself.</summary> */
         bool SetFov(uint flightId, double fov);
 
         /** <summary>Slews a part camera's pan, clamped to its range. False for an unknown camera, a command feed, or one without pan.</summary> */
@@ -162,18 +162,6 @@ namespace Kerbcast.Api
         bool SetLightSpeed(string owner, double? metresPerSecond);
 
         AimResult SetAim(uint flightId, Aim aim, string owner);
-
-        /**
-         * <summary>
-         * Holds command feed <paramref name="flightId"/>'s lens at <paramref name="fovDeg"/> degrees of vertical field
-         * of view until its next aim, clamped to its limits (the Tracking Station level's narrowest and the camera's
-         * widest); NaN returns it to the aim's own framing. The lock applies as for <see cref="SetAim"/>, and a viewer's
-         * zoom is refused while it is held. NotCommandFeed for a feed not built yet: give it the field with its aim
-         * (<see cref="Aim.WithFov"/>). BadNumber unless NaN or finite and above 0. Check <see cref="KerbcastApi.Supports"/>
-         * with <see cref="ApiFeature.CommandFov"/> first.
-         * </summary>
-         */
-        AimResult SetFov(uint flightId, double fovDeg, string owner);
 
         IReadOnlyList<CommandFeed> Feeds();
 

@@ -182,9 +182,8 @@ export interface KerbcastCameraHandle {
   setLayers(layers: Layer[]): Promise<void>;
   setRenderSize(width: number, height: number): Promise<void>;
   /**
-   * Set the field of view in degrees. Rejects with a
-   * {@link CommandLockedError} on a command camera a command authority in
-   * game holds the lock on.
+   * Set the field of view in degrees. Only a camera with `supportsZoom`
+   * takes it; a command camera zooms itself and refuses it.
    */
   setFov(fov: number): Promise<void>;
   setPan(yaw: number, pitch: number): Promise<void>;
@@ -200,9 +199,7 @@ export interface KerbcastCameraHandle {
    * Set a persistent zoom velocity (normalised, -1..1; +1 = zoom in,
    * FoV decreasing). Holds until superseded — send `setZoomRate(0)` to
    * stop. Like {@link setPanRate}, call on input change (press-and-hold),
-   * not on a timer. Rejects with a {@link CommandLockedError} on a command
-   * camera a command authority in game holds the lock on, except for the
-   * stop, which always goes out.
+   * not on a timer. Only a camera with `supportsZoom` takes it.
    */
   setZoomRate(rate: number): Promise<void>;
   setDegrade(level: number): Promise<void>;
@@ -647,14 +644,14 @@ interface PendingSend {
 }
 
 /**
- * {@link KerbcastClient.setCommandAim}, or a zoom on a command camera,
- * refused because a command authority in game holds the lock.
+ * {@link KerbcastClient.setCommandAim} refused because a command authority in
+ * game holds the lock on command camera aims.
  */
 export class CommandLockedError extends Error {
   readonly code = ErrorCode.CommandLocked;
 
-  constructor(readonly owner: string, what = "aim") {
-    super(`[kerbcast] ${owner} holds the command camera lock; ${what} refused`);
+  constructor(readonly owner: string) {
+    super(`[kerbcast] ${owner} holds the command camera lock; aim refused`);
     this.name = "CommandLockedError";
   }
 }
@@ -1752,7 +1749,6 @@ class CameraHandle
   }
 
   async setFov(fov: number): Promise<void> {
-    this._refuseIfLocked("fov");
     await this.client._send({
       type: "set-fov",
       content: { flightId: this.flightId, fov },
@@ -1774,16 +1770,10 @@ class CameraHandle
   }
 
   async setZoomRate(rate: number): Promise<void> {
-    if (rate !== 0) this._refuseIfLocked("zoom");
     await this.client._send({
       type: "set-zoom-rate",
       content: { flightId: this.flightId, rate },
     });
-  }
-
-  private _refuseIfLocked(what: string): void {
-    const owner = this._state?.commandTrack?.authority?.owner;
-    if (owner) throw new CommandLockedError(owner, what);
   }
 
   async setDegrade(level: number): Promise<void> {

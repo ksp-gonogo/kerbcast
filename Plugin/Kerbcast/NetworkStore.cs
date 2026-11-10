@@ -75,7 +75,7 @@ namespace Kerbcast
             foreach (var n in _set.Networks) Start(n);
         }
 
-        /* `carried` restores a lock holder's aim and zoom instead of the saved watch. */
+        /* `carried` restores a lock holder's aim instead of the saved watch, and the new camera opens on the field the old one showed. */
         private bool Start(SavedNetwork n, LiveAim carried = null)
         {
             try

@@ -68,7 +68,6 @@ namespace Kerbcast.Api
                 case ApiFeature.GroundStations:
                 case ApiFeature.LineOfSight:
                 case ApiFeature.VantageResolution:
-                case ApiFeature.CommandFov:
                     return true;
                 default:
                     return false;

@@ -204,12 +204,6 @@ namespace Kerbcast
             return KerbcastControl.SetAimCore(flightId, command, owner);
         }
 
-        public AimResult SetFov(uint flightId, double fovDeg, string owner)
-        {
-            Enter(nameof(SetFov), ApiFeature.CommandFov);
-            return KerbcastControl.SetFovCore(flightId, fovDeg, owner);
-        }
-
         public OpticsResult SetOptics(uint flightId, OpticsSettings optics, string owner)
         {
             Enter(nameof(SetOptics), ApiFeature.Optics);
@@ -447,7 +441,6 @@ namespace Kerbcast
                 default:
                     return AimResult.BadNumber;
             }
-            command = command.WithFov(a.FovDeg);
             return AimResult.Ok;
         }
 

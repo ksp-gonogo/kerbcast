@@ -106,11 +106,8 @@ Check(new CommandAimSpec { Kind = "moon" }.Invalid() != null, "unknown aim kind 
 var dir = AimOf(@"{""kind"":""direction"",""azimuth"":90,""elevation"":30,""framingMarginM"":5}");
 Check(dir.Kind == "direction" && dir.Azimuth == 90 && dir.Elevation == 30 && dir.FramingMarginM == 5 && dir.Invalid() == null,
     "direction aim fields");
-Check(double.IsNaN(dir.FovDeg), "an aim without fovDeg leaves the field to its framing");
-var wide = AimOf(@"{""kind"":""direction"",""azimuth"":180,""elevation"":5,""fovDeg"":30}");
-Check(wide.FovDeg == 30 && wide.Invalid() == null, "an aim carries a field of view");
-Check(AimOf(@"{""kind"":""direction"",""azimuth"":180,""elevation"":5,""fovDeg"":0}").Invalid() != null, "a field of 0 refused");
-Check(AimOf(@"{""kind"":""vessel"",""persistentId"":7,""fovDeg"":-2}").Invalid() != null, "a negative field refused");
+Check(AimOf(@"{""kind"":""direction"",""azimuth"":180,""elevation"":5,""fovDeg"":0}").Invalid() == null,
+    "an aim's field of view is not read: the camera frames itself");
 Check(AimOf(@"{""kind"":""direction"",""azimuth"":90}").Invalid() != null, "direction needs an elevation");
 Check(AimOf(@"{""kind"":""direction"",""azimuth"":90,""elevation"":95}").Invalid() != null, "elevation above 90 refused");
 var pos = AimOf(@"{""kind"":""positionAt"",""body"":""Kerbin"",""ut"":100,""position"":[1,2,3],""velocity"":[0,0,1],""subjectPersistentId"":4000000001}");
@@ -313,6 +310,11 @@ finally { Directory.Delete(signalDir, true); }
         && n1.Vantages[0].Fallback && n1.Vantages[1].Label == "Relay 1" && n1.Vantages[1].Vantage.PersistentId == 77,
         "a loaded network keeps every field");
     Check(loaded.Find("n3").MinHoldUt == 20 && double.IsNaN(loaded.Find("n3").MarginStops), "options round trip, unset stays unset");
+    string withZoom = cfg.Replace("id = n1", "id = n1\n\t\tfov = 2.5\n\t\tzoom = 4");
+    skippedCfg.Clear();
+    Check(withZoom != cfg && SavedNetworkSet.TryFromCfg(withZoom, skippedCfg, out var zoomed) && skippedCfg.Count == 0
+        && zoomed.Networks.Count == set.Networks.Count && zoomed.Find("n1")?.Name == "Renamed" && zoomed.Find("n1").Vantages.Count == 2,
+        "a file from a build that kept a network's zoom loads with the zoom ignored");
     var after = loaded.Save(One(Save()), newId, out _, out var nextAfterLoad);
     Check(after.Ok && nextAfterLoad.Slot == 4, "the next slot survives a reload");
     string brokenText = "KERBCAST_NETWORKS\n{\n\tNETWORK\n\t{\n\t\tid = a\n\t\tslot = 2\n\t\tVANTAGE\n\t\t{\n\t\t\tkind = telescope\n\t\t\tmirror = 8\n\t\t}\n\t}\n"

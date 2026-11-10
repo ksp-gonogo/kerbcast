@@ -142,7 +142,7 @@ const MOCK_CAMERAS: MockCameraInit[] = [
     partName: "kerbcast.commandCamera",
     partTitle: "Command camera",
     lifecycle: CameraLifecycle.Active,
-    supportsZoom: true,
+    supportsZoom: false,
     fov: 30,
     fovMin: 0.02,
     fovMax: 30,

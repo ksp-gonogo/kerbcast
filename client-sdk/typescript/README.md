@@ -235,7 +235,10 @@ client `error` event carrying the camera's `flightId`.
 controls each part actually supports.
 
 - `supportsZoom`, `fov`, `fovMin`, `fovMax`. 19 of 21 stock Hullcam
-  VDS parts support runtime FoV via `MuMechModuleHullCameraZoom`.
+  VDS parts support runtime FoV via `MuMechModuleHullCameraZoom`. A
+  command camera zooms itself, so it reports `supportsZoom` false and
+  refuses `setFov` and `setZoomRate`; its `fovMin` and `fovMax` report the
+  narrowest and widest its framing reaches.
 - `supportsPan`, `panYawMin/Max`, `panPitchMin/Max`. Whether this
   camera's mount steers. Pan/tilt is fully wired end to end (`setPan`,
   `setPanRate`, and the `PanZoomController` helper below); this flag
@@ -361,26 +364,19 @@ subject. Every kind takes `framingMarginM`, metres of view kept around the
 subject's own size. `commandCentre.aimKind` (absent for the default) and
 `commandCentre.subjectPersistentId` report what the game applied.
 
-The zoom follows the subject on a `vessel`, `orbit` or `positionAt` aim. A
+The camera zooms itself, and nothing sets its field of view by hand. The
+zoom follows the subject on a `vessel`, `orbit` or `positionAt` aim. A
 `surface` aim frames `framingMarginM` about its point, or opens to the widest
 view without one, and a `direction` aim opens to the widest view, so no craft
-sizes either. Any aim takes `fovDeg`, a vertical field of view in degrees to
-hold instead, and a command camera reports `supportsZoom`, so
-`camera.setFov(deg)` and `camera.setZoomRate(rate)` zoom it too. Either holds
-until the next aim, clamped in game to the lens: `fovMin` is its narrowest
-now (it moves with the Tracking Station level and the optics setting) and
-`fovMax` its widest. Both are refused with `ErrorCode.CommandLocked` while a
-command lock is held. The range spans more than a thousandfold, so
-`fovSliderScale` and `PanZoomController` zoom it by factors rather than
-degrees.
+sizes either. `fovMin` is the narrowest it reaches now (it moves with the
+Tracking Station level and the optics setting) and `fovMax` its widest.
 
 ```ts
-// Look south, 5 degrees above the horizon, through a 30 degree lens.
+// Look south, 5 degrees above the horizon.
 await client.setCommandAim(flightId, {
   kind: CommandAimKind.Direction,
   azimuth: 180,
   elevation: 5,
-  fovDeg: 30,
 });
 ```
 

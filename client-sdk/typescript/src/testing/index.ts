@@ -105,7 +105,8 @@ function buildCamera(init: MockCameraInit): CameraState {
     operatorHeight: init.operatorHeight ?? 720,
     maxWidth: init.maxWidth ?? init.operatorWidth ?? 1280,
     maxHeight: init.maxHeight ?? init.operatorHeight ?? 720,
-    supportsZoom: init.supportsZoom ?? true,
+    /* A command camera zooms itself, so it takes no manual zoom unless a test says otherwise. */
+    supportsZoom: init.supportsZoom ?? (init.kind ?? CameraKind.Part) !== CameraKind.Command,
     fov: init.fov ?? 60,
     fovMin: init.fovMin ?? 10,
     fovMax: init.fovMax ?? 120,
@@ -864,11 +865,24 @@ export class MockSidecar {
     this._clientMsgHandler?.(JSON.stringify(msg));
   }
 
+  /* As the sidecar answers a zoom on a camera that frames itself. */
+  private _refuseZoom(flightId: number): void {
+    this._sendToClient({
+      type: "error",
+      content: { message: `camera ${flightId} does not support zoom`, source: ErrorSource.Sidecar },
+    });
+  }
+
   private _handleClientMessage(msg: ClientMessage): void {
     switch (msg.type) {
       case "set-fov": {
         const cam = this._cameras.get(msg.content.flightId);
-        if (cam) this._cameras.set(msg.content.flightId, { ...cam, fov: msg.content.fov });
+        if (cam?.kind === CameraKind.Command) this._refuseZoom(msg.content.flightId);
+        else if (cam) this._cameras.set(msg.content.flightId, { ...cam, fov: msg.content.fov });
+        break;
+      }
+      case "set-zoom-rate": {
+        if (this._cameras.get(msg.content.flightId)?.kind === CameraKind.Command) this._refuseZoom(msg.content.flightId);
         break;
       }
       case "set-layers": {
@@ -1106,7 +1120,6 @@ export class MockSidecar {
         break;
       }
       case "set-pan-rate":
-      case "set-zoom-rate":
       case "hello":
       case "pong":
       case "request-keyframe":

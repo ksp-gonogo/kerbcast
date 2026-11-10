@@ -55,7 +55,7 @@ use webrtc::track::track_local::TrackLocal;
 use super::outbox::{ControlChannel, Outbox};
 use super::video_track::VideoTrack;
 
-use crate::cameras::{CameraRegistry, CommandFov};
+use crate::cameras::CameraRegistry;
 use crate::encoder::selected_backend_name;
 use crate::ladder::{Ladder, LadderConfig, LadderState, SlotTier, SlotView, Tier, TierChange};
 use crate::link::{LinkMonitor, LinkWindow, SlotCounters, LINK_WINDOW};
@@ -2082,37 +2082,20 @@ async fn apply_fov_change(registry: &Arc<CameraRegistry>, dc: &Outbox, flight_id
             return;
         }
     };
-    let clamped = match registry.command_fov(&cam, fov).await {
-        CommandFov::NotCommand => {
-            if !cam.supports_zoom {
-                send_server_message(
-                    dc,
-                    &ServerMessage::Error(ErrorPayload {
-                        message: format!("camera {flight_id} does not support zoom"),
-                        source: ErrorSource::Sidecar,
-                        ..Default::default()
-                    }),
-                );
-                return;
-            }
-            // Clamp to the part's declared FoV range so the plugin doesn't get
-            // a value the Hullcam module would reject.
-            fov.clamp(cam.fov_min, cam.fov_max)
-        }
-        CommandFov::Apply(fov) => fov,
-        CommandFov::Refused(message, code) => {
-            send_server_message(
-                dc,
-                &ServerMessage::Error(ErrorPayload {
-                    message,
-                    code,
-                    source: ErrorSource::Sidecar,
-                    flight_id: Some(flight_id),
-                }),
-            );
-            return;
-        }
-    };
+    if !cam.takes_manual_zoom() {
+        send_server_message(
+            dc,
+            &ServerMessage::Error(ErrorPayload {
+                message: format!("camera {flight_id} does not support zoom"),
+                source: ErrorSource::Sidecar,
+                ..Default::default()
+            }),
+        );
+        return;
+    }
+    // Clamp to the part's declared FoV range so the plugin doesn't get
+    // a value the Hullcam module would reject.
+    let clamped = fov.clamp(cam.fov_min, cam.fov_max);
 
     {
         let mut ctrl = cam.control.lock().await;
@@ -2303,25 +2286,13 @@ async fn apply_zoom_rate_change(
             return;
         }
     };
-    if !cam.supports_zoom {
+    if !cam.takes_manual_zoom() {
         send_server_message(
             dc,
             &ServerMessage::Error(ErrorPayload {
                 message: format!("camera {flight_id} does not support zoom"),
                 source: ErrorSource::Sidecar,
                 ..Default::default()
-            }),
-        );
-        return;
-    }
-    if let Some(message) = registry.command_zoom_refusal(&cam, rate).await {
-        send_server_message(
-            dc,
-            &ServerMessage::Error(ErrorPayload {
-                message,
-                code: Some(ErrorCode::CommandLocked),
-                source: ErrorSource::Sidecar,
-                flight_id: Some(flight_id),
             }),
         );
         return;
@@ -3855,8 +3826,11 @@ mod tests {
         assert_eq!(live.subscribers.load(Ordering::Acquire), 0);
     }
 
+    /// A command camera frames itself: a set-fov or a zoom rate is refused as
+    /// on a fixed-lens part camera and never reaches the plugin, even from a
+    /// manifest that claims zoom.
     #[tokio::test]
-    async fn a_set_fov_reaches_a_command_camera_nobody_subscribes_to() {
+    async fn a_command_camera_refuses_set_fov_and_zoom_rate() {
         use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3876,15 +3850,17 @@ mod tests {
         .expect("write manifest");
         let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
         registry.rescan().await;
+        let cam = registry.get(id).await.expect("command camera");
+        assert!(!cam.takes_manual_zoom());
         let outbox = Outbox::spawn(Arc::new(Mutex::new(None)), "test".into());
 
         apply_fov_change(&registry, &outbox, id, 1.5).await;
+        apply_zoom_rate_change(&registry, &outbox, id, 1.0).await;
 
-        let bytes =
-            std::fs::read(dir.path().join(format!("{id}.control.bin"))).expect("control written");
-        let snap = crate::shared_mem::control::decode(&bytes).expect("decodes");
-        assert!(!snap.subscribed, "no viewer subscribes to this camera");
-        assert_eq!(snap.fov, Some(1.5));
+        let ctrl = cam.control.lock().await;
+        assert_eq!(ctrl.fov, None, "no field of view is passed on");
+        assert_eq!(ctrl.zoom_rate, None, "no zoom rate is passed on");
+        assert!(!dir.path().join(format!("{id}.control.bin")).exists());
     }
 
     /// A ring recreated in place within one rescan keeps its viewers' sizes on

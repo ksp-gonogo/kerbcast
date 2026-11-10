@@ -67,6 +67,31 @@ describe("MockSidecar", () => {
     expect(client.cameras.map((c) => c.flightId)).toEqual([hill.flightId]);
   });
 
+  it("a command camera takes no manual zoom, as the sidecar answers it", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.addCamera({ flightId: 42 });
+    sidecar.addCamera({ flightId: 300, kind: CameraKind.Command });
+    const client = new KerbcastClient({ host: "localhost", port: 8088 }, sidecar.createTransport());
+    const errors: ErrorPayload[] = [];
+    client.on("error", (e) => errors.push(e));
+    await client.connect([42, 300]);
+    sidecar.open();
+
+    expect(client.cameras.find((c) => c.flightId === 300)?.supportsZoom).toBe(false);
+    expect(client.cameras.find((c) => c.flightId === 42)?.supportsZoom).toBe(true);
+
+    await client.camera(300).setFov(5);
+    await client.camera(300).setZoomRate(1);
+    expect(errors.map((e) => e.message)).toEqual([
+      "camera 300 does not support zoom",
+      "camera 300 does not support zoom",
+    ]);
+
+    await client.camera(42).setFov(30);
+    await client.camera(42).setZoomRate(1);
+    expect(errors).toHaveLength(2);
+  });
+
   it("models command camera aims and the authority lock", async () => {
     const sidecar = new MockSidecar();
     sidecar.setDefaultCommandSubject(5);

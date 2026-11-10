@@ -862,22 +862,6 @@ describe("KerbcastClient", () => {
       ]);
     });
 
-    it("zoom is refused locally while a command authority holds the lock, but a stop goes out", async () => {
-      const { client, captured, snapshot } = await connected();
-      const locked = {
-        ...commandCamera(300),
-        commandTrack: { ...commandCamera(300).commandTrack, authority: { owner: "mission-control" } },
-      };
-      snapshot([locked]);
-      const cam = client.camera(300);
-      await expect(cam.setFov(5)).rejects.toBeInstanceOf(CommandLockedError);
-      await expect(cam.setZoomRate(1)).rejects.toMatchObject({ owner: "mission-control", code: ErrorCode.CommandLocked });
-      expect(captured.dc?.sent).toEqual([]);
-
-      await cam.setZoomRate(0);
-      expect(captured.dc?.sent).toEqual([JSON.stringify({ type: "set-zoom-rate", content: { flightId: 300, rate: 0 } })]);
-    });
-
     it("setCommandAim rejects while a command authority holds the lock", async () => {
       const { client, captured, snapshot } = await connected();
       const locked = {

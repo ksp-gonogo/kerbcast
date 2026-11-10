@@ -378,6 +378,9 @@ pub enum CommandAimKind {
 /// Where a command camera points. `kind` says which fields apply. With no
 /// subject (`surface`, `direction`, or `orbit` and `positionAt` without
 /// `subjectPersistentId`), the camera's default craft stays the subject.
+/// The camera zooms itself: a `vessel`, `orbit` or `positionAt` aim frames
+/// its subject, a `surface` aim frames `framingMarginM` about the point (the
+/// widest view without one) and a `direction` aim opens to the widest view.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -452,14 +455,6 @@ pub struct CommandAim {
     /// Default false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_uncertain: Option<bool>,
-    /// The lens's vertical field of view in degrees, held until the next aim
-    /// or `SetFov`, within the camera's limits (narrower than its lens allows
-    /// opens to that limit). Absent: a `vessel` aim, and an `orbit` or
-    /// `positionAt` aim, frames its subject; a `surface` aim frames
-    /// `framingMarginM` about the point, or opens to the widest view without
-    /// one; a `direction` aim opens to the widest view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fov_deg: Option<f64>,
 }
 
 /// Whether a command camera's camera network could watch a craft. Only
@@ -700,13 +695,15 @@ pub struct CameraState {
     pub max_height: Option<u32>,
     /// Whether the part's Hullcam module supports runtime FoV changes
     /// (i.e. it's a `MuMechModuleHullCameraZoom`, not the fixed base
-    /// `MuMechModuleHullCamera`). 19 of 21 stock parts do.
+    /// `MuMechModuleHullCamera`). 19 of 21 stock parts do. Always false on
+    /// a command camera, which zooms itself to frame what it is aimed at.
     pub supports_zoom: bool,
     /// Current effective FoV in degrees.
     pub fov: f32,
     /// FoV bounds the operator can choose between. Wider than the
     /// camera's "default" — these come from the Hullcam part config.
-    /// Equal to `fov` when `supports_zoom == false`.
+    /// Equal to `fov` on a part camera without zoom. On a command camera,
+    /// the narrowest and widest its own framing reaches, read only.
     pub fov_min: f32,
     pub fov_max: f32,
     /// Whether the part supports pan/tilt. True on parts with a steerable
@@ -2039,11 +2036,8 @@ pub enum ClientMessage {
     /// parts whose Hullcam module is the fixed base (`supportsZoom ==
     /// false`); clients are expected to clamp to `fovMin / fovMax`
     /// from the camera's `CameraState` before sending. A command camera
-    /// (`supportsZoom` true, `fovMin` its lens's narrowest now, which moves
-    /// with the Tracking Station level and the optics setting) holds it as
-    /// `fovDeg` on its aim would: until the next aim, clamped in game, and
-    /// refused with `ErrorCode::CommandLocked` while a command authority
-    /// holds the lock, as is its `SetZoomRate`.
+    /// zooms itself, so it refuses this and `SetZoomRate` as a fixed-lens
+    /// part camera does.
     SetFov(SetFovPayload),
     /// Pan/tilt the camera (yaw and pitch, both degrees from the
     /// part's resting forward). Honored by parts with a steerable mount

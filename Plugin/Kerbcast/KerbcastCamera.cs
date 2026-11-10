@@ -71,12 +71,8 @@ namespace Kerbcast
         void OnScaledProbe(KerbcastCamera cam, Color centre);
         /* The craft the lens rides, whose parts set the frame's live bound; null for none. */
         Vessel LensCraft { get; }
-        /* A viewer's set-fov, which the rig takes under its own rules rather than as a part camera's zoom. */
-        void ViewerFov(float fov);
         /* The galaxy cube's tint for this camera's next galaxy render; null leaves KSP's. */
         Color? GalaxyTint();
-        /* A viewer's hold-to-zoom rate, -1..1, + narrowing; 0 stops. */
-        void ViewerZoomRate(float rate);
         /* The lens's narrowest field now, degrees. */
         float FovFloor { get; }
         void Dispose();
@@ -247,9 +243,9 @@ namespace Kerbcast
         public int OperatorHeight { get; private set; }
 
         /// <summary>True when the mount exposes a zoom capability with a
-        /// real range (`Mount.Zoom != null` and `FovMax > FovMin`), or the
-        /// camera is a command camera, whose rig zooms its lens. A fixed-FoV or
-        /// zero-width source reports false and hides the zoom control.</summary>
+        /// real range (`Mount.Zoom != null` and `FovMax > FovMin`). A fixed-FoV
+        /// or zero-width source reports false and hides the zoom control, and so
+        /// does a command camera, whose rig zooms its lens itself.</summary>
         public bool SupportsZoom { get; }
         /* A command camera's narrowest field follows the Tracking Station level and the optics setting, so it is read live. */
         public float FovMin => Rig != null ? Rig.FovFloor : _commandFovMin != null ? (float)_commandFovMin() : _fovMin;
@@ -538,7 +534,7 @@ namespace Kerbcast
             // here: a zero-width range (e.g. DC.munCam 25/25) still yields a
             // capability, but the range isn't wide enough to call zoomable.
             _commandFovMin = (mount as CommandCameraMount)?.FovMinSource;
-            SupportsZoom = _commandFovMin != null || (mount.Zoom != null && mount.Zoom.FovMax > mount.Zoom.FovMin + 0.01f);
+            SupportsZoom = mount.Zoom != null && mount.Zoom.FovMax > mount.Zoom.FovMin + 0.01f;
             _fovMin = mount.Zoom != null ? mount.Zoom.FovMin : mount.DefaultFieldOfView;
             FovMax = mount.Zoom != null ? mount.Zoom.FovMax : mount.DefaultFieldOfView;
             // Snap both the displayed FoV and the slew target so a fresh camera
@@ -1804,19 +1800,16 @@ namespace Kerbcast
                 // _lastFovSeq) so the stale fov re-published on unrelated writes /
                 // the zoom-rate-stop write doesn't snap a drifting _fovTarget back.
                 long fovSeq = snap.FovSeq;
-                if (snap.Fov.HasValue && fovSeq != _lastFovSeq)
+                if (snap.Fov.HasValue && SupportsZoom && fovSeq != _lastFovSeq)
                 {
-                    if (Rig != null) Rig.ViewerFov(snap.Fov.Value);
-                    else if (SupportsZoom) SetFov(snap.Fov.Value);
+                    SetFov(snap.Fov.Value);
                 }
                 _lastFovSeq = fovSeq;
                 // Zoom rate. Absent leaves the current rate unchanged; an explicit
                 // 0 stops zooming. +rate = zoom IN (FoV decreases).
-                if (snap.ZoomRate.HasValue)
+                if (SupportsZoom && snap.ZoomRate.HasValue)
                 {
-                    float rate = Mathf.Clamp(snap.ZoomRate.Value, -1f, 1f);
-                    if (Rig != null) Rig.ViewerZoomRate(rate);
-                    else if (SupportsZoom) _zoomRate = rate;
+                    _zoomRate = Mathf.Clamp(snap.ZoomRate.Value, -1f, 1f);
                 }
 
                 // Auto-track mode (linked, sidecar-authoritative). Apply the

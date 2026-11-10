@@ -118,10 +118,9 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 /**
- * A zoom range wider than this ratio (a tracking camera's lens, 0.02 to 30
- * degrees) is stepped and slid by factors rather than degrees, so the
- * narrow end is as easy to reach as the wide one. Part cameras sit well
- * under it and keep steps in degrees.
+ * A zoom range wider than this ratio is stepped and slid by factors rather
+ * than degrees, so the narrow end is as easy to reach as the wide one.
+ * Stock part cameras sit well under it and keep steps in degrees.
  */
 export const LOG_ZOOM_RATIO = 20;
 
@@ -130,7 +129,7 @@ export const LOG_ZOOM_NUDGE_FACTOR = 1.5;
 
 /**
  * How close a FoV echo has to get on a wide range, as a fraction of the
- * setpoint: half a degree is nearly half of a 0.02 to 30 degree slider.
+ * setpoint: on a 0.02 to 30 degree slider half a degree is nearly half of it.
  */
 export const LOG_SETTLE_FRACTION = 0.02;
 
