@@ -446,7 +446,8 @@ namespace Kerbcast
             return int.TryParse(state, out int level) ? (DiscoveryLevels)level : DiscoveryLevels.Owned;
         }
 
-        private static string Localised(string name)
+        /* A saved craft name as the player reads it: stock craft carry a localisation tag. */
+        internal static string Localised(string name)
         {
             if (string.IsNullOrEmpty(name) || !name.StartsWith("#", StringComparison.Ordinal)) return name ?? "";
             try { return KSP.Localization.Localizer.Format(name); }

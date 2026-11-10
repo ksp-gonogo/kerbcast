@@ -96,7 +96,7 @@ namespace Kerbcast
             _live = v;
             Proto = v.protoVessel;
             PersistentId = v.persistentId;
-            Name = v.vesselName;
+            Name = v.GetDisplayName() ?? v.vesselName;
             SetSituation(v.situation);
             LaunchedFrom = v.launchedFrom;
             if (IsSurface(v.situation))
@@ -116,7 +116,7 @@ namespace Kerbcast
         {
             Proto = pv;
             PersistentId = pv.persistentId;
-            Name = pv.vesselName;
+            Name = TruthFixSource.Localised(pv.vesselName);
             SetSituation(pv.situation);
             LaunchedFrom = pv.launchedFrom;
             var orbit = pv.orbitSnapShot != null ? pv.orbitSnapShot.Load() : null;
@@ -186,7 +186,7 @@ namespace Kerbcast
                 Loaded = v;
                 if (v == null) return false;
                 PersistentId = v.persistentId;
-                Name = v.vesselName;
+                Name = v.GetDisplayName() ?? v.vesselName;
                 SetSituation(v.situation);
                 /* CoMD is only maintained while the craft is off rails; on rails
                    (time warp) its orbit position is the live one. */
