@@ -389,7 +389,7 @@ describe("Tile - per-feed recording", () => {
   });
 });
 
-describe("Tile - tracking network name", () => {
+describe("Tile - camera network name", () => {
   const network = () =>
     makeCamera({
       flightId: 7,

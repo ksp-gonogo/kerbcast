@@ -1,5 +1,5 @@
 /*
- * Tracking networks: a header drawer opened from Settings. Lists every
+ * Camera networks: a header drawer opened from Settings. Lists every
  * network as a card (the definition from the game, its live state from the
  * camera that runs it) and holds the create and edit form.
  */
@@ -124,7 +124,7 @@ export function NetworksPanel({ onClose, onShowInGrid, shownFlightIds }: Network
   }, [onClose, confirmingDiscard, keepEditing]);
 
   const editing = view.kind === "form" && view.networkId !== null ? networks.find((n) => n.networkId === view.networkId) : undefined;
-  const title = view.kind === "list" ? "Tracking networks" : view.networkId !== null ? "Edit network" : "New network";
+  const title = view.kind === "list" ? "Camera networks" : view.networkId !== null ? "Edit network" : "New network";
 
   return (
     <Panel ref={panelRef} role="dialog" aria-label={title} tabIndex={-1}>

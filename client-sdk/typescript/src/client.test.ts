@@ -3463,7 +3463,7 @@ describe("KerbcastClient.inboundVideoStats", () => {
     expect(seen).toEqual([1, 2]);
   });
 
-  describe("tracking networks", () => {
+  describe("camera networks", () => {
     const station = (name: string) => ({ vantage: { kind: CommandVantageKind.Station, station: name } });
 
     async function withNetworks(sidecar: MockSidecar): Promise<KerbcastClient> {

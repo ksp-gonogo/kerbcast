@@ -109,7 +109,7 @@ namespace Kerbcast
     }
 
     /*
-     * The tracking network's rules, Unity-free. A vantage is gated first (it
+     * The camera network's rules, Unity-free. A vantage is gated first (it
      * either can see the craft or says why not), then scored in stops by the
      * optics model: higher is a clearer picture. NetworkSwitch decides when
      * the camera moves between vantages.
@@ -127,7 +127,7 @@ namespace Kerbcast
         public const int HoldSamples = 4;
         /* A forecast never looks further ahead than this, in game seconds. */
         public const double ForecastMaxUt = 3600.0;
-        public const string DefaultName = "Tracking network";
+        public const string DefaultName = "Camera network";
 
         /* Whether `caller` may replace the vantages of a mod's network or remove it: its owner may, and one made under no name is anyone's. */
         public static bool MayChangeHostNetwork(string owner, string caller) =>

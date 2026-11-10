@@ -2,7 +2,7 @@ namespace Kerbcast.Api
 {
     /**
      * <summary>
-     * One place a tracking network camera may show its craft from (see <see cref="ICommand.CreateNetworkCamera"/>).
+     * One place a camera network camera may show its craft from (see <see cref="ICommand.CreateNetworkCamera"/>).
      * Immutable; build one with the factory methods. The vantage has the lens, zoom and optics a command camera
      * standing there alone would have: being in a network changes none of them.
      * </summary>
@@ -257,7 +257,7 @@ namespace Kerbcast.Api
                 : $"VantageResolution(fovMin={FovMinDeg} deg, {FrameWidthPx}x{FrameHeightPx}, pixel={PixelRad} rad, optics={(OpticsOn ? LensArcsec + " arcsec" : "off")}, best={BestResolutionRad} rad, lens={LensSource} {LensLevel} '{LensName}')";
     }
 
-    /** <summary>How a tracking network holds after a cut. Every value finite and 0 or more.</summary> */
+    /** <summary>How a camera network holds after a cut. Every value finite and 0 or more.</summary> */
     public sealed class NetworkOptions
     {
         /** <summary>Game seconds the camera stays at a vantage after cutting to it, before a clearer one may take over.</summary> */
@@ -272,7 +272,7 @@ namespace Kerbcast.Api
         public override string ToString() => $"NetworkOptions(hold={MinHoldUt}s, real={MinHoldRealSeconds}s, margin={MarginStops})";
     }
 
-    /** <summary>One vantage of a tracking network as its last scoring pass left it, from <see cref="ICommand.NetworkStatus"/>.</summary> */
+    /** <summary>One vantage of a camera network as its last scoring pass left it, from <see cref="ICommand.NetworkStatus"/>.</summary> */
     public sealed class NetworkVantageStatus
     {
         /** <summary>The vantage's site key, as <see cref="CommandFeed.SiteKey"/> names it while the camera stands there.</summary> */

@@ -6,7 +6,7 @@ using UnityEngine;
 namespace Kerbcast
 {
     /* A craft a command camera could watch. Eligibility only reports what the
-       tracking network would allow; a Vessel aim takes any of them. */
+       camera network would allow; a Vessel aim takes any of them. */
     public sealed class CommandTargetView
     {
         public uint PersistentId;

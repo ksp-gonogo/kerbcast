@@ -8,7 +8,7 @@
  * cameras and delivers animated canvas captureStream tracks to each slot.
  *
  * One camera starts destroyed to demonstrate SIGNAL LOST. A command
- * camera cycles through the target-bracket states. Tracking networks run as
+ * camera cycles through the target-bracket states. Camera networks run as
  * further command cameras (see ./networks).
  * /profile fetch is intercepted to return plausible stagger numbers.
  */

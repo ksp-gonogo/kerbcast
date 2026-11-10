@@ -525,7 +525,7 @@ export class MockSidecar {
   private _nextNetworkId = 1;
 
   /**
-   * Take tracking network saves the way a 1.12 sidecar does: `hello` says
+   * Take camera network saves the way a 1.12 sidecar does: `hello` says
    * `networks: true`, `open()` sends `networks` as the first
    * `network-definitions`, and `save-network` and `delete-network` are
    * answered (see {@link MockNetworkOptions}). Set before `open()`.
@@ -537,7 +537,7 @@ export class MockSidecar {
     return this;
   }
 
-  /** The tracking networks the mock holds now. Empty unless {@link withNetworks} was called. */
+  /** The camera networks the mock holds now. Empty unless {@link withNetworks} was called. */
   get networks(): ReadonlyArray<NetworkDefinition> {
     return this._networks ?? [];
   }
@@ -557,7 +557,7 @@ export class MockSidecar {
     this._sendToClient({ type: "network-definitions", content: this._definitionsPayload() });
   }
 
-  /** Replace the tracking networks and push a `network-definitions` message, as the game does on any change. */
+  /** Replace the camera networks and push a `network-definitions` message, as the game does on any change. */
   fireNetworkDefinitions(networks: NetworkDefinition[]): void {
     this._networks = networks.map((n) => ({ ...n }));
     this._sendToClient({ type: "network-definitions", content: this._definitionsPayload() });
@@ -593,7 +593,7 @@ export class MockSidecar {
       return refuse("tooManyVantages", `at most ${MAX_NETWORK_VANTAGES} vantages`);
     }
     if ((req.name ?? "").length > MAX_NETWORK_NAME) return refuse("badName", `at most ${MAX_NETWORK_NAME} characters`);
-    const name = req.name?.trim() || "Tracking network";
+    const name = req.name?.trim() || "Camera network";
     const existing = req.networkId !== undefined ? networks.find((n) => n.networkId === req.networkId) : undefined;
     if (req.networkId !== undefined && !existing) return refuse("notFound", `no network ${req.networkId}`);
     if (existing?.owner) return refuse("notOwner", `${existing.owner} made this network`);

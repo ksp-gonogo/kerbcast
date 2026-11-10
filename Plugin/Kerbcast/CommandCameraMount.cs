@@ -14,7 +14,7 @@ namespace Kerbcast
         private readonly string _name;
         private readonly string _group;
 
-        /* Set again only by a tracking network's cut; everything that reads the site reads it fresh. */
+        /* Set again only by a camera network's cut; everything that reads the site reads it fresh. */
         public CommandCameraSite Site { get; set; }
 
         /* The lens's narrowest field now, in degrees: it follows the Tracking Station level and the optics setting. */
@@ -63,7 +63,7 @@ namespace Kerbcast
             : Site.NodeName == "LaunchPad" ? "Launchpad camera"
             : $"{Site.DisplayName} camera";
         /* A command camera has no owning craft; the station's name is the stable
-           label clients group and key it by. A tracking network's is its own
+           label clients group and key it by. A camera network's is its own
            name, which a cut does not change. */
         public string VesselDisplayName => !string.IsNullOrEmpty(_group) ? _group : Site.DisplayName;
 

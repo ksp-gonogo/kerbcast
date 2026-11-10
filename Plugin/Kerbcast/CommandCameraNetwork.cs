@@ -4,7 +4,7 @@ using UnityEngine;
 
 namespace Kerbcast
 {
-    /* One place a tracking network may show its craft from, as the host listed it. */
+    /* One place a camera network may show its craft from, as the host listed it. */
     internal sealed class NetworkVantageSpec
     {
         public CommandVantage Vantage;
@@ -49,7 +49,7 @@ namespace Kerbcast
     }
 
     /*
-     * A tracking network: one command camera that follows its craft through
+     * A camera network: one command camera that follows its craft through
      * a host's list of vantages and shows whichever has the clearest view.
      * The camera keeps one rig, flightId and stream; a cut re-sites the rig
      * whole (CommandCameraRig.Resite) before the frame solves.

@@ -1810,7 +1810,7 @@ namespace Kerbcast
         private static readonly List<NetworkVantageReading> NetworkReadings = new List<NetworkVantageReading>();
 
         /*
-         * A tracking network's site and vantages. The manifest describes the
+         * A camera network's site and vantages. The manifest describes the
          * site the camera was built at; `site` here is where it stands now,
          * which the sidecar lays over the manifest's so the camera list
          * follows each cut.

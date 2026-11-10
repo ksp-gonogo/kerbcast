@@ -185,7 +185,7 @@ export function Settings({
 
         {networkCount !== null && (
           <>
-            <SectionLabel style={{ marginTop: "0.75rem" }}>Tracking networks</SectionLabel>
+            <SectionLabel style={{ marginTop: "0.75rem" }}>Camera networks</SectionLabel>
             <FieldRow>
               <div>
                 <FieldLabel as="span">Camera networks</FieldLabel>

@@ -901,7 +901,7 @@ async fn encode_next_frame(
             .note_read(after - last, frame.sequence - after - 1);
     }
 
-    /* A tracking network's cut changes the whole picture at once; a keyframe
+    /* A camera network's cut changes the whole picture at once; a keyframe
     on it saves viewers a second of smeared prediction from the last site. */
     let site = frame
         .capture
@@ -1617,7 +1617,7 @@ mod tests {
         fn close(&mut self) {}
     }
 
-    /// A command camera's frame from a new site (a tracking network's cut)
+    /// A command camera's frame from a new site (a camera network's cut)
     /// asks for a keyframe; frames from the same site do not.
     #[tokio::test]
     async fn a_network_cut_asks_for_a_keyframe() {

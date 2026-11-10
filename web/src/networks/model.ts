@@ -1,5 +1,5 @@
 /**
- * Plain helpers for the tracking networks drawer: the words each wire code
+ * Plain helpers for the camera networks drawer: the words each wire code
  * reads as, how a saved member is keyed, and how a definition joins the live
  * camera that runs it.
  */
@@ -21,7 +21,7 @@ export const MAX_VANTAGES = 64;
 export const MAX_NAME_LENGTH = 48;
 
 /** What a blank name saves as. */
-export const DEFAULT_NETWORK_NAME = "Tracking network";
+export const DEFAULT_NETWORK_NAME = "Camera network";
 
 /** Craft types the vessel list hides unless the viewer asks for them. */
 export const HIDDEN_VESSEL_TYPES: ReadonlySet<string> = new Set([

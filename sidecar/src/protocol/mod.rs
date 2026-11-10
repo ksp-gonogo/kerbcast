@@ -206,7 +206,7 @@ pub struct CommandCentreInfo {
     pub ut: Option<f64>,
     /// Every craft the camera could watch, eligible first, then nearest
     /// first. Any of them can be aimed at with a `vessel` aim; eligibility
-    /// only reports what the tracking network would allow. A control channel
+    /// only reports what the camera network would allow. A control channel
     /// message has a size limit, so with hundreds of craft the list over it
     /// is cut from the end and `targets_omitted` counts what was left out.
     /// A cut list keeps the feed's subject, appended at the end out of the
@@ -227,7 +227,7 @@ pub struct CommandCentreInfo {
     /// settings camera and for cameras created in game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// A tracking network camera's vantages, which it cuts between to keep
+    /// A camera network camera's vantages, which it cuts between to keep
     /// the clearest view of its craft. On such a camera `site_key`,
     /// `display_name` and the coordinates describe the vantage it shows now
     /// and change on every cut; key it by its flight id. Absent on every
@@ -236,7 +236,7 @@ pub struct CommandCentreInfo {
     pub network: Option<CommandNetworkInfo>,
 }
 
-/// A tracking network camera's vantages, as its last scoring pass left them.
+/// A camera network camera's vantages, as its last scoring pass left them.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,7 +257,7 @@ pub struct CommandNetworkInfo {
     pub vantages: Vec<CommandNetworkVantage>,
 }
 
-/// One vantage of a tracking network camera.
+/// One vantage of a camera network camera.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -462,7 +462,7 @@ pub struct CommandAim {
     pub fov_deg: Option<f64>,
 }
 
-/// Whether a command camera's tracking network could watch a craft. Only
+/// Whether a command camera's camera network could watch a craft. Only
 /// `NotTrackable` applies outside career (or with the tracking rules off),
 /// and the world-model codes only while a command authority's world model
 /// governs the feed.
@@ -1290,13 +1290,13 @@ pub struct FrameCommandState {
     #[serde(default)]
     pub waiting_for_target: bool,
     /// The site the frame was seen from and its label as the feed shows it.
-    /// On a tracking network camera both change on exactly the frame of a
+    /// On a camera network camera both change on exactly the frame of a
     /// cut. Absent from a game older than 1.12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site_label: Option<String>,
-    /// A tracking network camera's state on this frame: `ok`, or `noView`
+    /// A camera network camera's state on this frame: `ok`, or `noView`
     /// when no vantage can see the craft. Absent on every other camera.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_state: Option<String>,
@@ -1578,7 +1578,7 @@ pub struct SiteCatalogPayload {
     pub vessels_omitted: Option<u32>,
 }
 
-/// One vantage of a saved tracking network.
+/// One vantage of a saved camera network.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1592,7 +1592,7 @@ pub struct NetworkVantageSpec {
     pub fallback: bool,
 }
 
-/// How long a tracking network holds a vantage and how much clearer another
+/// How long a camera network holds a vantage and how much clearer another
 /// must be before it cuts. Absent fields keep the game's defaults.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1609,7 +1609,7 @@ pub struct NetworkOptionsSpec {
     pub margin_stops: Option<f64>,
 }
 
-/// A tracking network: one a viewer saved with the game, or one a mod made
+/// A camera network: one a viewer saved with the game, or one a mod made
 /// in game (`owner` set), which only that mod can change.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1642,7 +1642,7 @@ pub struct NetworkDefinition {
     pub create_token: Option<String>,
 }
 
-/// Every tracking network: the saved ones, then those mods made in game.
+/// Every camera network: the saved ones, then those mods made in game.
 /// Sent after `Hello` once known, and whenever one changes.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1683,7 +1683,7 @@ pub struct NetworkResultPayload {
     pub text: Option<String>,
 }
 
-/// Create or replace a saved tracking network. The game answers with a
+/// Create or replace a saved camera network. The game answers with a
 /// `NetworkResult` carrying the same token, normally within a second.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1698,7 +1698,7 @@ pub struct SaveNetworkPayload {
     /// has changed since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_revision: Option<u32>,
-    /// 1 to 48 characters; absent or blank for "Tracking network".
+    /// 1 to 48 characters; absent or blank for "Camera network".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// A `vessel` aim, or absent to watch the active vessel.
@@ -1710,7 +1710,7 @@ pub struct SaveNetworkPayload {
     pub options: Option<NetworkOptionsSpec>,
 }
 
-/// Delete a saved tracking network; its camera ends for every viewer.
+/// Delete a saved camera network; its camera ends for every viewer.
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1982,10 +1982,10 @@ pub enum ClientMessage {
     DestroyCommandCamera(DestroyCommandCameraPayload),
     /// Point a command camera, or return it to its default. Server-wide.
     SetCommandAim(SetCommandAimPayload),
-    /// Create or replace a saved tracking network. Server-wide; answered
+    /// Create or replace a saved camera network. Server-wide; answered
     /// with `NetworkResult`.
     SaveNetwork(SaveNetworkPayload),
-    /// Delete a saved tracking network. Server-wide; answered with
+    /// Delete a saved camera network. Server-wide; answered with
     /// `NetworkResult`.
     DeleteNetwork(DeleteNetworkPayload),
     /// Replace or clear this client's anchors on one camera. Per client:
@@ -2175,7 +2175,7 @@ pub enum ServerMessage {
     /// The ground stations a command camera can stand at. Sent after
     /// `Hello` once known, and whenever the list changes.
     SiteCatalog(SiteCatalogPayload),
-    /// Every tracking network. Sent after `Hello` once known, and whenever
+    /// Every camera network. Sent after `Hello` once known, and whenever
     /// one changes.
     NetworkDefinitions(NetworkDefinitionsPayload),
     /// The outcome of a `SaveNetwork` or `DeleteNetwork`, by its token.

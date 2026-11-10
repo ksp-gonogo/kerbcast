@@ -390,7 +390,7 @@ export interface CameraFeedProps {
    */
   anchorOverlay?: AnchorOverlay;
   /**
-   * Name a tracking network feed in your own layer. By default a network
+   * Name a camera network feed in your own layer. By default a network
    * feed is named like any other feed: its title (shown on hover, in the
    * title's usual case) reads "<vantage> via <network>" ("Crater Rim via
    * Kerbin ground net"), taken from the displayed frame so it changes on

@@ -42,10 +42,10 @@ namespace Kerbcast
         public string Scope;
         /* The camera has no subject to aim at yet and shows its placeholder framing instead. */
         public bool WaitingForTarget;
-        /* The site the frame was seen from, and its label as the feed shows it. On a tracking network both change on the cut frame. */
+        /* The site the frame was seen from, and its label as the feed shows it. On a camera network both change on the cut frame. */
         public string SiteKey;
         public string SiteLabel;
-        /* A tracking network's state: NetworkOk, or NetworkNoView when no vantage can see the craft. Null for a camera at one site. */
+        /* A camera network's state: NetworkOk, or NetworkNoView when no vantage can see the craft. Null for a camera at one site. */
         public string NetworkState;
 
         public const string NetworkOk = "ok";

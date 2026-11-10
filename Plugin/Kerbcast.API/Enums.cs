@@ -214,7 +214,7 @@ namespace Kerbcast.Api
         NotLockHolder = 2,
         /**
          * <summary>
-         * The flightId is no tracking network camera this caller can change: not one made through the API, built or
+         * The flightId is no camera network camera this caller can change: not one made through the API, built or
          * waiting to be, or one another mod made under its own name, or one a player saved with the game
          * (<see cref="CommandFeed.Saved"/>). A saved network's vantages and its removal are the player's alone; its aim
          * and field of view still follow <see cref="ICommand.SetAim"/> and <see cref="ICommand.SetFov"/> under the lock rules.

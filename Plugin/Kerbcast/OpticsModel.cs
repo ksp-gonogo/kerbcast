@@ -285,7 +285,7 @@ namespace Kerbcast
             return t * t * (3.0 - 2.0 * t) * Math.Min(1.0, airFactor);
         }
 
-        /* `daySkyStops` is what full daylight at the lens costs the clarity score; a tracking network tunes it. */
+        /* `daySkyStops` is what full daylight at the lens costs the clarity score; a camera network tunes it. */
         public static OpticsReading Assess(OpticsSite site, double rangeM, double daySkyStops = DaySkyStops)
         {
             double airmass = site.AirFactor > 0 ? Airmass(site.ElevationDeg) : 1.0;

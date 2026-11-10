@@ -296,7 +296,7 @@ describe("MockSidecar", () => {
     const vantages = [{ vantage: { kind: CommandVantageKind.Station, station: "KSC" } }];
     const { networkId } = await client.saveNetwork({ name: "  ", vantages });
     const made = client.networks().find((n) => n.networkId === networkId);
-    expect(made).toMatchObject({ name: "Tracking network", revision: 1, flightId: 900 });
+    expect(made).toMatchObject({ name: "Camera network", revision: 1, flightId: 900 });
     await client.saveNetwork({ networkId, baseRevision: 1, name: "Renamed", vantages });
     expect(client.networks().find((n) => n.networkId === networkId)?.revision).toBe(2);
     expect(saved).toEqual([true, false]);

@@ -3336,7 +3336,7 @@ describe("CameraFeed - command camera target brackets", () => {
       nodeName: "Crater Rim",
       displayName: "North dish",
       network: {
-        name: "Tracking network",
+        name: "Camera network",
         state: "ok",
         vantages: [
           { siteKey: "KSC", label: "KSC", state: "occluded", active: false },
@@ -3348,7 +3348,7 @@ describe("CameraFeed - command camera target brackets", () => {
       makeCamera({
         flightId: 301,
         kind: CameraKind.Command,
-        cameraName: "Tracking network",
+        cameraName: "Camera network",
         commandCentre: NETWORK,
         commandTrack: commandTrack(),
       });
@@ -3384,9 +3384,9 @@ describe("CameraFeed - command camera target brackets", () => {
     it("names the feed with the compound name in its ordinary title, renaming it on the cut", async () => {
       const { client } = await buildConnectedSource([networkCamera()]);
       const view = render(feed(client, frameAt("Crater Rim", "ok")));
-      expect(caption(view.container)).toBe("Crater Rim via Tracking network");
+      expect(caption(view.container)).toBe("Crater Rim via Camera network");
       view.rerender(feed(client, frameAt("Comms Relay", "noView")));
-      expect(caption(view.container)).toBe("Comms Relay via Tracking network");
+      expect(caption(view.container)).toBe("Comms Relay via Camera network");
       expect(view.container.querySelector("[data-kc-network-caption]")).toBeNull();
     });
 
@@ -3405,16 +3405,16 @@ describe("CameraFeed - command camera target brackets", () => {
     it("falls back to the camera list before a frame says", async () => {
       const { client } = await buildConnectedSource([networkCamera()]);
       const view = render(feed(client, null));
-      expect(caption(view.container)).toBe("North dish via Tracking network");
+      expect(caption(view.container)).toBe("North dish via Camera network");
     });
 
     it("lists a network once, by its own name", async () => {
       const station = makeCamera({ flightId: 302, kind: CameraKind.Command, cameraName: "KSC tracking", vesselName: "KSC", commandCentre: STATION });
       const { client } = await buildConnectedSource([networkCamera(), station]);
       render(feed(client, frameAt("Crater Rim", "ok")));
-      fireEvent.click(screen.getByRole("button", { name: "Crater Rim via Tracking network" }));
+      fireEvent.click(screen.getByRole("button", { name: "Crater Rim via Camera network" }));
       const items = screen.getAllByRole("menuitemradio").map((i) => i.textContent);
-      expect(items).toEqual(["Tracking network", "KSC tracking (KSC)"]);
+      expect(items).toEqual(["Camera network", "KSC tracking (KSC)"]);
     });
 
     it("hands the reading to a host that draws the name in its own layer", async () => {
@@ -3426,15 +3426,15 @@ describe("CameraFeed - command camera target brackets", () => {
           ),
         }),
       );
-      expect(screen.getByTestId("host-chip").textContent).toBe("noView:Crater Rim:Tracking network");
-      expect(screen.getByRole("button", { name: "Crater Rim via Tracking network" })).toBeTruthy();
+      expect(screen.getByTestId("host-chip").textContent).toBe("noView:Crater Rim:Camera network");
+      expect(screen.getByRole("button", { name: "Crater Rim via Camera network" })).toBeTruthy();
     });
 
     it("draws the network icon beside network rows in the camera picker only", async () => {
       const station = makeCamera({ flightId: 302, kind: CameraKind.Command, cameraName: "KSC tracking", vesselName: "KSC", commandCentre: STATION });
       const { client } = await buildConnectedSource([networkCamera(), station]);
       render(feed(client, frameAt("Crater Rim", "ok")));
-      fireEvent.click(screen.getByRole("button", { name: "Crater Rim via Tracking network" }));
+      fireEvent.click(screen.getByRole("button", { name: "Crater Rim via Camera network" }));
       const [network, plain] = screen.getAllByRole("menuitemradio");
       expect(network.querySelector("svg[data-kc-network-icon]")).not.toBeNull();
       expect(plain.querySelector("svg")).toBeNull();
@@ -3478,7 +3478,7 @@ describe("CameraFeed - command camera target brackets", () => {
         makeCamera({
           flightId: SAVED_ID,
           kind: CameraKind.Command,
-          cameraName: "Tracking network",
+          cameraName: "Camera network",
           commandCentre: STATION,
           commandTrack: commandTrack(),
         });
@@ -3488,7 +3488,7 @@ describe("CameraFeed - command camera target brackets", () => {
         const view = render(feed(client, frameAt("Crater Rim", "ok")));
         const glyph = icon(view.container)!;
         expect(glyph).not.toBeNull();
-        const button = screen.getByRole("button", { name: "Crater Rim via Tracking network" });
+        const button = screen.getByRole("button", { name: "Crater Rim via Camera network" });
         expect(button.firstElementChild?.contains(glyph)).toBe(true);
         expect(getComputedStyle(button.firstElementChild!).flexShrink).toBe("0");
       });
@@ -3496,7 +3496,7 @@ describe("CameraFeed - command camera target brackets", () => {
       it("does not spin the icon with the chevron when the menu opens", async () => {
         const { client } = await buildConnectedSource([networkCamera()]);
         const view = render(feed(client, frameAt("Crater Rim", "ok")));
-        fireEvent.click(screen.getByRole("button", { name: "Crater Rim via Tracking network" }));
+        fireEvent.click(screen.getByRole("button", { name: "Crater Rim via Camera network" }));
         expect(getComputedStyle(icon(view.container)!).transform).not.toContain("rotate");
       });
 
@@ -3510,7 +3510,7 @@ describe("CameraFeed - command camera target brackets", () => {
       it("shows nothing when the host passes null", async () => {
         const { client } = await buildConnectedSource([networkCamera()]);
         const view = render(feed(client, frameAt("Crater Rim", "ok"), { titleLeading: null }));
-        const button = screen.getByRole("button", { name: "Crater Rim via Tracking network" });
+        const button = screen.getByRole("button", { name: "Crater Rim via Camera network" });
         expect(icon(view.container)).toBeNull();
         expect(button.querySelectorAll("svg")).toHaveLength(1);
       });

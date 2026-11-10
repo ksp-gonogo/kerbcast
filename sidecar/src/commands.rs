@@ -1,6 +1,6 @@
 //! Global requests a client makes of the plugin that are not about one
 //! existing camera's control block: creating, destroying and aiming command
-//! cameras, and saving and deleting tracking networks. The sidecar validates each, then
+//! cameras, and saving and deleting camera networks. The sidecar validates each, then
 //! appends it to `global.commands.json`, which the plugin re-reads on the
 //! game frame after it changes. Each write bumps the counter in
 //! `COMMANDS_SIGNAL_FILE`, which is how the plugin knows.

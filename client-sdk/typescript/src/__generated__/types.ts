@@ -257,7 +257,7 @@ export enum CommandAimKind {
 }
 
 /**
- * Whether a command camera's tracking network could watch a craft. Only
+ * Whether a command camera's camera network could watch a craft. Only
  * `NotTrackable` applies outside career (or with the tracking rules off),
  * and the world-model codes only while a command authority's world model
  * governs the feed.
@@ -298,7 +298,7 @@ export interface CommandTarget {
 	eligibilityText: string;
 }
 
-/** One vantage of a tracking network camera. */
+/** One vantage of a camera network camera. */
 export interface CommandNetworkVantage {
 	/** The site key the camera reports while it stands here. */
 	siteKey: string;
@@ -323,7 +323,7 @@ export interface CommandNetworkVantage {
 	occluder?: string;
 }
 
-/** A tracking network camera's vantages, as its last scoring pass left them. */
+/** A camera network camera's vantages, as its last scoring pass left them. */
 export interface CommandNetworkInfo {
 	/** The camera's own name, which stays the same through every cut. */
 	name: string;
@@ -418,7 +418,7 @@ export interface CommandCentreInfo {
 	/**
 	 * Every craft the camera could watch, eligible first, then nearest
 	 * first. Any of them can be aimed at with a `vessel` aim; eligibility
-	 * only reports what the tracking network would allow. A control channel
+	 * only reports what the camera network would allow. A control channel
 	 * message has a size limit, so with hundreds of craft the list over it
 	 * is cut from the end and `targets_omitted` counts what was left out.
 	 * A cut list keeps the feed's subject, appended at the end out of the
@@ -444,7 +444,7 @@ export interface CommandCentreInfo {
 	 */
 	token?: string;
 	/**
-	 * A tracking network camera's vantages, which it cuts between to keep
+	 * A camera network camera's vantages, which it cuts between to keep
 	 * the clearest view of its craft. On such a camera `site_key`,
 	 * `display_name` and the coordinates describe the vantage it shows now
 	 * and change on every cut; key it by its flight id. Absent on every
@@ -1004,7 +1004,7 @@ export interface CreateCommandCameraPayload {
 	aim?: CommandAim;
 }
 
-/** Delete a saved tracking network; its camera ends for every viewer. */
+/** Delete a saved camera network; its camera ends for every viewer. */
 export interface DeleteNetworkPayload {
 	token: string;
 	networkId: string;
@@ -1208,13 +1208,13 @@ export interface FrameCommandState {
 	waitingForTarget?: boolean;
 	/**
 	 * The site the frame was seen from and its label as the feed shows it.
-	 * On a tracking network camera both change on exactly the frame of a
+	 * On a camera network camera both change on exactly the frame of a
 	 * cut. Absent from a game older than 1.12.
 	 */
 	siteKey?: string;
 	siteLabel?: string;
 	/**
-	 * A tracking network camera's state on this frame: `ok`, or `noView`
+	 * A camera network camera's state on this frame: `ok`, or `noView`
 	 * when no vantage can see the craft. Absent on every other camera.
 	 */
 	networkState?: string;
@@ -1404,7 +1404,7 @@ export interface LensLevelsPayload {
 	spaceSteps: SpaceLensStepPayload[];
 }
 
-/** One vantage of a saved tracking network. */
+/** One vantage of a saved camera network. */
 export interface NetworkVantageSpec {
 	vantage: CommandVantage;
 	/** Shown for this vantage in place of the site's own name. */
@@ -1414,7 +1414,7 @@ export interface NetworkVantageSpec {
 }
 
 /**
- * How long a tracking network holds a vantage and how much clearer another
+ * How long a camera network holds a vantage and how much clearer another
  * must be before it cuts. Absent fields keep the game's defaults.
  */
 export interface NetworkOptionsSpec {
@@ -1427,7 +1427,7 @@ export interface NetworkOptionsSpec {
 }
 
 /**
- * A tracking network: one a viewer saved with the game, or one a mod made
+ * A camera network: one a viewer saved with the game, or one a mod made
  * in game (`owner` set), which only that mod can change.
  */
 export interface NetworkDefinition {
@@ -1459,7 +1459,7 @@ export interface NetworkDefinition {
 }
 
 /**
- * Every tracking network: the saved ones, then those mods made in game.
+ * Every camera network: the saved ones, then those mods made in game.
  * Sent after `Hello` once known, and whenever one changes.
  */
 export interface NetworkDefinitionsPayload {
@@ -1530,7 +1530,7 @@ export interface ResumePayload {
 }
 
 /**
- * Create or replace a saved tracking network. The game answers with a
+ * Create or replace a saved camera network. The game answers with a
  * `NetworkResult` carrying the same token, normally within a second.
  */
 export interface SaveNetworkPayload {
@@ -1543,7 +1543,7 @@ export interface SaveNetworkPayload {
 	 * has changed since.
 	 */
 	baseRevision?: number;
-	/** 1 to 48 characters; absent or blank for "Tracking network". */
+	/** 1 to 48 characters; absent or blank for "Camera network". */
 	name?: string;
 	/** A `vessel` aim, or absent to watch the active vessel. */
 	watch?: CommandAim;
@@ -1850,12 +1850,12 @@ export type ClientMessage =
 	/** Point a command camera, or return it to its default. Server-wide. */
 	| { type: "set-command-aim", content: SetCommandAimPayload }
 	/**
-	 * Create or replace a saved tracking network. Server-wide; answered
+	 * Create or replace a saved camera network. Server-wide; answered
 	 * with `NetworkResult`.
 	 */
 	| { type: "save-network", content: SaveNetworkPayload }
 	/**
-	 * Delete a saved tracking network. Server-wide; answered with
+	 * Delete a saved camera network. Server-wide; answered with
 	 * `NetworkResult`.
 	 */
 	| { type: "delete-network", content: DeleteNetworkPayload }
@@ -2098,7 +2098,7 @@ export type ServerMessage =
 	 */
 	| { type: "site-catalog", content: SiteCatalogPayload }
 	/**
-	 * Every tracking network. Sent after `Hello` once known, and whenever
+	 * Every camera network. Sent after `Hello` once known, and whenever
 	 * one changes.
 	 */
 	| { type: "network-definitions", content: NetworkDefinitionsPayload }

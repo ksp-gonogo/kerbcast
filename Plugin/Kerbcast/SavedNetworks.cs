@@ -6,7 +6,7 @@ using System.Text;
 namespace Kerbcast
 {
     /*
-     * A tracking network a viewer saved with the game. Its slot fixes its
+     * A camera network a viewer saved with the game. Its slot fixes its
      * camera's flightId (CameraId.NetworkWireId) for the life of the save.
      * A network a mod made in game is listed beside these with Owner set; it
      * is never stored.

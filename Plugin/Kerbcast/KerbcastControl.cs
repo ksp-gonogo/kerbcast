@@ -225,7 +225,7 @@ namespace Kerbcast
 
         /* Every craft command feed `flightId` could watch, eligible first, then
            nearest first; empty when it is not a command feed. Eligibility only
-           reports the tracking network's rules (career, with the tracking rules
+           reports the camera network's rules (career, with the tracking rules
            difficulty setting on); a Vessel aim accepts any of them. */
         public static IReadOnlyList<CommandTargetView> CommandTargets(uint flightId)
         {
@@ -714,7 +714,7 @@ namespace Kerbcast
            knows, and against what `rig` (null for a camera not built yet)
            could frame. */
         /*
-         * TryResolveAim for a tracking network: the aim stands when any
+         * TryResolveAim for a camera network: the aim stands when any
          * vantage's site would accept it. That only allows the aim; each
          * vantage still sees the craft only by what its own site knows. The
          * first refusal is returned when none accepts it.

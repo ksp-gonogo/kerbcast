@@ -260,7 +260,7 @@ pub fn fitted_messages(msg: &ServerMessage, limit: usize) -> serde_json::Result<
 }
 
 /**
- * Tracking networks or a site catalog over `limit`, cut from the end of the
+ * Camera networks or a site catalog over `limit`, cut from the end of the
  * list until it fits, with the cut counted (`networksOmitted`,
  * `vesselsOmitted`) and logged. None for any other message, which
  * `fitted_json` handles.

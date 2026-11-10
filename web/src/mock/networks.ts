@@ -1,5 +1,5 @@
 /**
- * Mock tracking networks for ?mock=1: a site catalog of stations and craft,
+ * Mock camera networks for ?mock=1: a site catalog of stations and craft,
  * four starting networks, and a stand-in for the game's scoring that moves
  * each running network between its members, so the cards and the feed names
  * change as a real one's would. Each running network is a command camera on

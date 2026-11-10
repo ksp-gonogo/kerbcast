@@ -765,7 +765,7 @@ export interface NetworkRequestOptions {
 export type SaveNetworkSpec = Omit<SaveNetworkPayload, "token">;
 
 /**
- * A tracking network save or delete that did not succeed. `code` is the
+ * A camera network save or delete that did not succeed. `code` is the
  * game's refusal code (`stale`, `notOwner`, `noVantages` and so on, newer
  * ones possible), or one of the client's own: `timeout` when no answer came
  * in time, `unsupported` when the sidecar does not take networks, and
@@ -776,7 +776,7 @@ export class NetworkRequestError extends Error {
     readonly code: string,
     readonly detail?: string,
   ) {
-    super(`[kerbcast] tracking network request refused: ${code}${detail ? ` (${detail})` : ""}`);
+    super(`[kerbcast] camera network request refused: ${code}${detail ? ` (${detail})` : ""}`);
     this.name = "NetworkRequestError";
   }
 }
@@ -819,7 +819,7 @@ export interface KerbcastClientEvents {
   "site-catalog": SiteCatalogPayload;
   /**
    * Fired when a `network-definitions` message arrives: after `Hello` once
-   * the game has its tracking networks, and whenever one is saved, deleted
+   * the game has its camera networks, and whenever one is saved, deleted
    * or starts or stops running.
    */
   networks: NetworkDefinition[];
@@ -1985,7 +1985,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _networks: NetworkDefinition[] = [];
   private _networksEditable: boolean | null = null;
   private _networksOmitted = 0;
-  /** Whether the connected sidecar's `hello` said it takes tracking network saves. */
+  /** Whether the connected sidecar's `hello` said it takes camera network saves. */
   private _supportsNetworks = false;
   /** Save and delete requests awaiting their `network-result`, by token: a retry can overlap the try it repeats. */
   private readonly networkRequests = new Map<string, Set<(result: NetworkResultPayload) => void>>();
@@ -2239,7 +2239,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Every tracking network the game has, from the sidecar's
+   * Every camera network the game has, from the sidecar's
    * `network-definitions`: the saved ones, then those a mod made in game
    * (`owner` set). Empty until the first arrives. Kept across reconnects.
    */
@@ -2272,7 +2272,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Create a saved tracking network (no `networkId`) or replace one. Every
+   * Create a saved camera network (no `networkId`) or replace one. Every
    * viewer sees the change in {@link networks}, and the network's camera
    * appears in or updates in the camera list. Pass the `revision` you edited
    * as `baseRevision` so a change made meanwhile by someone else is refused
@@ -2293,7 +2293,7 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Delete a saved tracking network; its camera ends for every viewer.
+   * Delete a saved camera network; its camera ends for every viewer.
    * Rejects as {@link saveNetwork} does, with `notOwner` for one a mod made
    * in game.
    */

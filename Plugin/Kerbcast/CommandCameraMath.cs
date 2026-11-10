@@ -1164,7 +1164,7 @@ namespace Kerbcast
         public const string BlankNotResponding = DefaultSilentText;
 
         public const string BlankVantageGone = "vantage craft gone";
-        /* A tracking network none of whose vantages can stand in now. */
+        /* A camera network none of whose vantages can stand in now. */
         public const string BlankNoVantage = "no vantage";
 
         /* Why a command feed is blanked, or null to show it. A lens whose

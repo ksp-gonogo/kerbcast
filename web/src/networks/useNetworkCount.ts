@@ -2,7 +2,7 @@ import { useKerbcastClient, useNetworks } from "@ksp-gonogo/kerbcast-react";
 import { useCallback, useSyncExternalStore } from "react";
 
 /**
- * How many tracking networks the game has, or null when the connected
+ * How many camera networks the game has, or null when the connected
  * sidecar does not take network saves (an older game), so Settings can hide
  * its entry. Support is learnt from `hello`, which the camera list follows.
  */

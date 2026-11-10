@@ -189,10 +189,10 @@ namespace Kerbcast.Api
 
         /**
          * <summary>
-         * Creates a tracking network camera: one command feed that follows its craft through <paramref name="vantages"/>
+         * Creates a camera network camera: one command feed that follows its craft through <paramref name="vantages"/>
          * and shows whichever has the clearest view, cutting between them (see <see cref="NetworkOptions"/> for when).
          * Each vantage has the lens it would have standing alone, and under a world model is scored only on what its
-         * own site knows. <paramref name="name"/> names the feed ("Tracking network" when null); its label, in every
+         * own site knows. <paramref name="name"/> names the feed ("Camera network" when null); its label, in every
          * frame, is the current vantage's. It aims by <paramref name="aim"/>, or at the default craft when null. The
          * feed appears in <see cref="Feeds"/> once a vantage resolves, normally on the next frame, and is dropped if
          * none has within 30 s. Like any created camera it lasts until destroyed or the scene ends, a revert or quickload

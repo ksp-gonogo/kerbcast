@@ -232,7 +232,7 @@ try
 }
 finally { Directory.Delete(signalDir, true); }
 
-/* Saved tracking networks: requests, validation, slots, revisions, the file and the JSON. */
+/* Saved camera networks: requests, validation, slots, revisions, the file and the JSON. */
 {
     int tokens = 0;
     string Save(string id = null, int rev = -1, string name = "Polar net", string vantages = null, string watch = null, string options = null,
@@ -267,7 +267,7 @@ finally { Directory.Delete(signalDir, true); }
     Check(made.Ok && made.NetworkId == "n1" && before == null, "a create is saved under a new id " + made.Code + " " + made.Text);
     Check(saved.Slot == 0 && saved.FlightId == 0xFFFF0000u && saved.Revision == 1, "the first network takes slot 0 at revision 1");
     var second = set.Save(One(Save(name: "  ")), newId, out _, out var saved2);
-    Check(second.Ok && saved2.Slot == 1 && saved2.Name == "Tracking network", "a blank name reads Tracking network, next slot");
+    Check(second.Ok && saved2.Slot == 1 && saved2.Name == "Camera network", "a blank name reads Camera network, next slot");
 
     var stale = set.Save(One(Save(id: "n1", rev: 0, name: "Renamed")), newId, out _, out _);
     Check(!stale.Ok && stale.Code == "stale", "an edit of an old revision is refused as stale");

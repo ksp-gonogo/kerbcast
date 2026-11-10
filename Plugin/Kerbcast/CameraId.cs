@@ -15,7 +15,7 @@ namespace Kerbcast
         private const uint PartMask = 0x7FFFFFFFu;
 
         /*
-         * Saved tracking networks take the top 65536 ids of the bit-31 space,
+         * Saved camera networks take the top 65536 ids of the bit-31 space,
          * 0xFFFF0000 to 0xFFFFFFFE, one per slot the save hands out, so a
          * network keeps its id across scenes, reloads and sidecar restarts.
          * Part ids clear bit 31 and never reach it. A kerbal or command camera

@@ -1,5 +1,5 @@
 /**
- * The tracking networks drawer, driven by the page's own mock networks
+ * The camera networks drawer, driven by the page's own mock networks
  * through a real KerbcastClient and MockSidecar.
  */
 
@@ -424,7 +424,7 @@ describe("Settings entry", () => {
 
   it("is hidden when the game does not take networks", async () => {
     await openSettings(new MockSidecar());
-    expect(screen.queryByText("Tracking networks")).toBeNull();
+    expect(screen.queryByText("Camera networks")).toBeNull();
   });
 
   it("opens the drawer with the count", async () => {
@@ -432,6 +432,6 @@ describe("Settings entry", () => {
     installMockNetworks(sidecar);
     await openSettings(sidecar);
     fireEvent.click(screen.getByRole("button", { name: "Manage (4)" }));
-    expect(screen.getByRole("dialog", { name: "Tracking networks" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Camera networks" })).toBeTruthy();
   });
 });

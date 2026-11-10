@@ -240,7 +240,7 @@ namespace Kerbcast
         /* The site's label as the feed shows it: a network vantage's own label, else the site's name. */
         public string SiteLabel => _siteLabel ?? StationDisplayName;
         private string _siteLabel;
-        /* The tracking network that moves this lens between its vantages; null for a camera at one site. */
+        /* The camera network that moves this lens between its vantages; null for a camera at one site. */
         internal CommandCameraNetwork Network { get; private set; }
         internal CommandCameraSite Site => _mount.Site;
         /* The widest field the lens opens to, in degrees. */
@@ -1780,7 +1780,7 @@ namespace Kerbcast
         }
 
         /*
-         * Moves the lens to another site in one step, for a tracking network's
+         * Moves the lens to another site in one step, for a camera network's
          * cut. The site's own skyline, forecast, zoom limit and lens come with
          * it, as a camera standing there alone would have them. Nothing eased
          * on the old site carries over: the aim, the handover and the place a

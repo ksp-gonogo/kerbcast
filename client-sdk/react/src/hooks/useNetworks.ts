@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useKerbcastClient } from "../context";
 
 /**
- * Every tracking network the game has, saved or made by a mod, from the
+ * Every camera network the game has, saved or made by a mod, from the
  * client's `networks` event. Empty until the first definitions arrive.
  * Pair with `client.supportsNetworks` to tell "none yet" from "not offered".
  */

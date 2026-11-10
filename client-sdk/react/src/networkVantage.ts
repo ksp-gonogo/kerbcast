@@ -1,6 +1,6 @@
 import type { CameraState, CommandCentreInfo, FrameCommandState, NetworkDefinition } from "@ksp-gonogo/kerbcast";
 
-/** What a tracking network camera shows the craft from, on the displayed frame. */
+/** What a camera network camera shows the craft from, on the displayed frame. */
 export interface NetworkVantageReading {
   /** The vantage's label, as the host set it or the site's own name. */
   siteLabel: string;
@@ -24,7 +24,7 @@ const SAVED_NETWORK_FIRST_ID = 0xffff0000;
 const SAVED_NETWORK_LAST_ID = 0xfffffffe;
 
 /**
- * Whether a camera is a tracking network, whether or not it has a picture.
+ * Whether a camera is a camera network, whether or not it has a picture.
  * `commandCentre.network` is only sent while the camera's rig is up, so a
  * network at rest is recognised by its reserved flight id (a saved network)
  * or its definition (a mod's, from {@link useNetworks}).

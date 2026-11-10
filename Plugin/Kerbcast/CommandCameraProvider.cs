@@ -97,7 +97,7 @@ namespace Kerbcast
             return flightId;
         }
 
-        /* Queues a tracking network camera over `vantages` (see CommandCameraNetwork), built once one of them resolves. Returns its flightId, or 0 with `error` set. */
+        /* Queues a camera network camera over `vantages` (see CommandCameraNetwork), built once one of them resolves. Returns its flightId, or 0 with `error` set. */
         public uint CreateNetwork(IList<NetworkVantageSpec> vantages, string name, NetworkTuning tuning, CommandAim aim, Orbit aimOrbit,
             IReadOnlyCollection<uint> taken, out string error, string owner = null)
         {
@@ -289,7 +289,7 @@ namespace Kerbcast
             public readonly string Token;
             public bool Created => Vantage != null || IsNetwork;
 
-            /* A tracking network's list as the host last gave it, and the network once the feed is first enumerated. */
+            /* A camera network's list as the host last gave it, and the network once the feed is first enumerated. */
             private List<NetworkVantageSpec> _networkSpecs;
             private CommandCameraNetwork _network;
             public bool IsNetwork { get; }

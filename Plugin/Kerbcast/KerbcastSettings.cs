@@ -185,7 +185,7 @@ namespace Kerbcast
         public double OpticsBrightnessHold { get; private set; } = 1.0;
         /* How strongly a daylit sky washes out faint things. */
         public double OpticsDaySky { get; private set; } = 0.3;
-        /* What full daylight at a lens costs a tracking network's vantage, in stops of picture quality. */
+        /* What full daylight at a lens costs a camera network's vantage, in stops of picture quality. */
         public double NetworkDaylightStops { get; private set; } = OpticsModel.DaySkyStops;
 
         /* The settings' optics knobs for a lens of `resolutionArcsec`. */

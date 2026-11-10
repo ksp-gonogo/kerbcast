@@ -6,7 +6,7 @@ using UnityEngine;
 namespace Kerbcast
 {
     /*
-     * The current save's tracking networks, kept in
+     * The current save's camera networks, kept in
      * saves/<game>/Kerbcast/networks.cfg rather than in the save itself, so a
      * revert or a quickload never takes them back. A craft merge is the
      * exception: it is game state, so its new ids reach the file only once

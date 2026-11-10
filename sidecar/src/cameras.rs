@@ -88,7 +88,7 @@ pub fn parse_in_flight(body: &str) -> Option<bool> {
 /// Kept out of `global.status.json`, which is written every second.
 pub const SITES_FILE: &str = "global.sites.json";
 
-/// The plugin's tracking networks and the outcome of the latest network
+/// The plugin's camera networks and the outcome of the latest network
 /// requests, rewritten on every change.
 pub const NETWORKS_FILE: &str = "global.networks.json";
 
@@ -285,7 +285,7 @@ struct CommandTargetsStatus {
     targets: Vec<CommandTarget>,
     #[serde(default)]
     vantage_persistent_id: u32,
-    /// Where a tracking network camera stands now; the manifest only has
+    /// Where a camera network camera stands now; the manifest only has
     /// the site it was built at. Absent on every other camera, and dropped
     /// alone when malformed.
     #[serde(
@@ -294,7 +294,7 @@ struct CommandTargetsStatus {
         skip_serializing_if = "Option::is_none"
     )]
     site: Option<CommandSiteStatus>,
-    /// A tracking network camera's vantages; dropped alone when malformed.
+    /// A camera network camera's vantages; dropped alone when malformed.
     #[serde(
         default,
         deserialize_with = "lenient_part",
@@ -303,7 +303,7 @@ struct CommandTargetsStatus {
     network: Option<CommandNetworkInfo>,
 }
 
-/// The site a tracking network camera stands at now, as the plugin writes it
+/// The site a camera network camera stands at now, as the plugin writes it
 /// beside the camera's targets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -815,7 +815,7 @@ pub struct CameraState {
     /// `crew_location()`.
     crew_location: std::sync::Mutex<Option<CrewLocation>>,
     /// The site key on the last frame read from a command camera's ring, to
-    /// notice a tracking network's cut.
+    /// notice a camera network's cut.
     frame_site: std::sync::Mutex<Option<String>>,
     /// Station identity for a command camera. Static for the
     /// camera's life (the station does not move).
@@ -1192,7 +1192,7 @@ impl CameraState {
     }
 
     /// Notes the site key a frame was seen from; true when it differs from
-    /// the last frame's, which is a tracking network's cut. The first frame
+    /// the last frame's, which is a camera network's cut. The first frame
     /// and a frame without a key are no cut.
     pub fn note_frame_site(&self, key: Option<&str>) -> bool {
         let Some(key) = key else { return false };
@@ -1792,7 +1792,7 @@ pub struct CameraRegistry {
     /// Last `global.sites.json` read, so a change is broadcast once and a
     /// connecting peer is primed with it.
     last_sites: Mutex<Option<SiteCatalogPayload>>,
-    /// The tracking networks last read and the request outcomes already sent.
+    /// The camera networks last read and the request outcomes already sent.
     networks_seen: Mutex<NetworksSeen>,
     /// Capped ring of every distinct `global.status.json` snapshot seen
     /// since the last `reset_run_logs()`. Powers the harness's
@@ -3110,7 +3110,7 @@ impl CameraRegistry {
             .map_err(|e| format!("command request write failed: {e}"))
     }
 
-    /// Queue a saved tracking network for the plugin to create or replace.
+    /// Queue a saved camera network for the plugin to create or replace.
     /// Errors with a `NetworkResult` code on a malformed request or a failed
     /// write; everything else is answered by the plugin.
     pub async fn request_save_network(
@@ -3123,7 +3123,7 @@ impl CameraRegistry {
             .map_err(|e| ("writeFailed", format!("command request write failed: {e}")))
     }
 
-    /// Queue a saved tracking network's deletion, as `request_save_network`.
+    /// Queue a saved camera network's deletion, as `request_save_network`.
     pub async fn request_delete_network(
         &self,
         payload: DeleteNetworkPayload,
@@ -6305,7 +6305,7 @@ mod tests {
         }
     }
 
-    /// A tracking network camera's status names where it stands now, which
+    /// A camera network camera's status names where it stands now, which
     /// the camera list shows over the site it was built at, so a cut
     /// relabels it; a malformed network part is dropped alone.
     #[test]

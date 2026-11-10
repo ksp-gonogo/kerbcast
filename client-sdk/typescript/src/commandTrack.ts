@@ -67,7 +67,7 @@ export interface EffectiveCommandTrack {
   siteKey?: string | null;
   siteLabel?: string | null;
   /**
-   * A tracking network camera's state on the displayed frame: `ok`, or
+   * A camera network camera's state on the displayed frame: `ok`, or
    * `noView` when no vantage can see the craft. `null` on any other camera.
    */
   networkState?: string | null;
