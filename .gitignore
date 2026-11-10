@@ -69,3 +69,7 @@ GameData/KerbcastKos/Plugins/*.dll
 
 # Runtime user config (default ships from Plugin/settings.cfg)
 GameData/Kerbcast/PluginData/
+
+# local test notes, kept out of the repository
+live_tests/
+tests/manual/
