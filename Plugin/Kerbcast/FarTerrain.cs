@@ -7,19 +7,42 @@ namespace Kerbcast
     internal static class FarTerrain
     {
         /*
-         * Whether a camera leaves a body's local-space terrain, `distanceM`
-         * from the lens and reaching at most `terrainRadiusM` from the body's
-         * centre, out of its local layers: when only a far plane stretched to
-         * `reachFarM` reaches it, not the layers' native `nativeFarM`. Stock
-         * terrain is built to be seen from inside that native reach. From
-         * farther, the stretched layer's depth cannot part the ocean from the
-         * land under it and stock's near shading no longer holds, so the
-         * scaled sphere stands for the body there, light speed or not. Range
-         * alone decides it, never the field, so a zoom never switches it.
+         * Whether a lens `distanceM` from a body's centre, `altitudeM` above
+         * its sea level, sees that body's local-space terrain, reaching at
+         * most `terrainRadiusM` from the centre, as stock draws it: within the
+         * local layers' native `nativeFarM`, and no higher than
+         * `stockTerrainToM` (StockTerrainTo), above which stock switches the
+         * terrain off and the scaled sphere stands for the body. Stock sets
+         * the terrain's and ocean's materials for the main camera, so from
+         * higher than stock ever draws them the ocean near the active craft
+         * shades as a flat sky colour.
          */
-        public static bool StretchedOnly(double distanceM, double terrainRadiusM, double nativeFarM, double reachFarM) =>
-            !PictureBoundary.TerrainInReach(distanceM, terrainRadiusM, nativeFarM)
-            && PictureBoundary.TerrainInReach(distanceM, terrainRadiusM, reachFarM);
+        public static bool SeenAsStock(double distanceM, double terrainRadiusM, double nativeFarM, double altitudeM, double stockTerrainToM) =>
+            PictureBoundary.TerrainInReach(distanceM, terrainRadiusM, nativeFarM) && !(altitudeM > stockTerrainToM);
+
+        /*
+         * Whether a camera leaves a body's local-space terrain out of its
+         * local layers: when its layers, their far plane stretched to
+         * `reachFarM`, reach it but the lens does not see it as stock does
+         * (SeenAsStock). From beyond the native reach the stretched layer's
+         * depth cannot part the ocean from the land under it, and from above
+         * stock's terrain altitude its shading no longer holds, so the scaled
+         * sphere stands for the body there, light speed or not. Range and
+         * height alone decide it, never the field, so a zoom never switches
+         * it.
+         */
+        public static bool LeftOut(double distanceM, double terrainRadiusM, double nativeFarM, double reachFarM, double altitudeM, double stockTerrainToM) =>
+            PictureBoundary.TerrainInReach(distanceM, terrainRadiusM, reachFarM)
+            && !SeenAsStock(distanceM, terrainRadiusM, nativeFarM, altitudeM, stockTerrainToM);
+
+        /*
+         * The altitude above which stock switches a body's terrain off, as
+         * its PQSMod_CelestialBodyTransform decides: `highQualityM` when the
+         * terrain shader quality is 2 or more and it is set (0 then never
+         * switches off), else `deactivateM`.
+         */
+        public static double StockTerrainTo(double deactivateM, double highQualityM, int shaderQuality) =>
+            shaderQuality >= 2 && highQualityM >= 0 ? (highQualityM > 0 ? highQualityM : double.PositiveInfinity) : deactivateM;
 
         /*
          * Stock parents a sphere's most detailed quads to a storage object
