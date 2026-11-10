@@ -818,19 +818,25 @@ namespace Kerbcast
          * only: whole within LandedGroundReach(lower) of the craft along the
          * line, easing to nothing over as far again, so a low ridge or crater
          * rim kilometres away is tested against its true height.
+         *
+         * `stationRadius` does the same for the lens's end: a lens riding a
+         * landed craft rests on its own patch of ground just as a landed
+         * target does, and a line leaving it level or downhill starts inside
+         * that patch. A lens above the terrain shell lowers nothing.
          */
         public static bool SegmentClearOfTerrain(DVec3 a, DVec3 b, DVec3 centre, double radius, double radiusMax,
-            Func<DVec3, double> surfaceRadiusAt, int samples, double targetRadius = 0)
+            Func<DVec3, double> surfaceRadiusAt, int samples, double targetRadius = 0, double stationRadius = 0)
         {
-            double lower = 0;
-            if (targetRadius > 0)
+            double lowerB = LandedGroundLowering(b, centre, radiusMax, surfaceRadiusAt, targetRadius);
+            double lowerA = LandedGroundLowering(a, centre, radiusMax, surfaceRadiusAt, stationRadius);
+            var ends = b - a;
+            double endsLen = ends.Magnitude;
+            if (targetRadius > 0) b = endsLen > targetRadius ? b - ends * (targetRadius / endsLen) : a;
+            if (stationRadius > 0)
             {
-                double rb = (b - centre).Magnitude;
-                if (surfaceRadiusAt != null && rb < radiusMax)
-                    lower = Math.Max(0, Math.Min(surfaceRadiusAt(b) - rb, LandedGroundSlackM) + targetRadius);
-                var back = a - b;
-                double len = back.Magnitude;
-                b = len > targetRadius ? b + back * (targetRadius / len) : a;
+                var rest = b - a;
+                double restLen = rest.Magnitude;
+                a = restLen > stationRadius ? a + rest * (stationRadius / restLen) : b;
             }
             if (!SegmentClearOfSphere(a, b, centre, radius)) return false;
             if (surfaceRadiusAt == null || samples < 1 || radiusMax <= radius) return true;
@@ -838,15 +844,27 @@ namespace Kerbcast
 
             var ab = b - a;
             double abLen = ab.Magnitude;
-            double reach = LandedGroundReach(lower);
+            double reachB = LandedGroundReach(lowerB), reachA = LandedGroundReach(lowerA);
             for (int i = 0; i <= samples; i++)
             {
                 double t = t0 + (t1 - t0) * i / samples;
                 var p = a + ab * t;
-                double near = lower > 0 ? Math.Max(0, Math.Min(1, 2 - (1 - t) * abLen / reach)) : 0;
-                if ((p - centre).Magnitude < surfaceRadiusAt(p) - lower * near) return false;
+                double lower = 0;
+                if (lowerB > 0) lower = Math.Max(lower, lowerB * Math.Max(0, Math.Min(1, 2 - (1 - t) * abLen / reachB)));
+                if (lowerA > 0) lower = Math.Max(lower, lowerA * Math.Max(0, Math.Min(1, 2 - t * abLen / reachA)));
+                if ((p - centre).Magnitude < surfaceRadiusAt(p) - lower) return false;
             }
             return true;
+        }
+
+        /* How far the sampled ground under a craft resting at `end` is lowered, so it sits `craftRadius` below the craft's centre; 0 for no size or a craft above the terrain shell. */
+        private static double LandedGroundLowering(DVec3 end, DVec3 centre, double radiusMax, Func<DVec3, double> surfaceRadiusAt,
+            double craftRadius)
+        {
+            if (!(craftRadius > 0) || surfaceRadiusAt == null) return 0;
+            double r = (end - centre).Magnitude;
+            if (r >= radiusMax) return 0;
+            return Math.Max(0, Math.Min(surfaceRadiusAt(end) - r, LandedGroundSlackM) + craftRadius);
         }
 
         /* How far along the line from a craft its ground is lowered in full by `lower`. */

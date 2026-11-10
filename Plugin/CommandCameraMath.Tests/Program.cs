@@ -174,6 +174,35 @@ Check(!CommandCameraMath.SegmentClearOfTerrain(grazer, sunkLander, mun, MunR, Mu
     "the ridge alone, with no plain beyond the lander's patch, still hides it");
 Check(CommandCameraMath.SegmentClearOfTerrain(grazer, sunkLander, mun, MunR, MunR + 7500, p => p.X < 150 ? MunR + 2530 : MunR, 4096, nominal),
     "without the ridge the same line reaches the lander through its own lowered patch");
+/*
+ * The rc.20 ridge run: debris landed near the lander, each a lens. Each
+ * craft's centre sits 3 m under its own sampled ground, and the ground
+ * between them falls away 10 m below the line, so only the lens's own patch
+ * can hide the lander: 264 m to it at 5.5 degrees up, 905 m at 4.4 down.
+ */
+Func<DVec3, DVec3, Func<DVec3, double>> sunkEnds = (lens, craft) => p =>
+{
+    double s = (p.X - lens.X) / (craft.X - lens.X);
+    double lineY = lens.Y + (craft.Y - lens.Y) * s;
+    double fromEnd = Math.Min(Math.Abs(p.X - lens.X), Math.Abs(p.X - craft.X));
+    return lineY + (fromEnd < 50 ? 3 : -10);
+};
+var debrisUp = landed + new DVec3(-Math.Cos(5.55 * Math.PI / 180), -Math.Sin(5.55 * Math.PI / 180), 0) * 264;
+Check(CommandCameraMath.SegmentClearOfTerrain(debrisUp, landed, mun, MunR, MunR + 7500, sunkEnds(debrisUp, landed), 4096, nominal, nominal),
+    "a lens landed below the lander sees it up the slope past its own ground");
+var debrisDown = landed + new DVec3(-Math.Cos(4.37 * Math.PI / 180), Math.Sin(4.37 * Math.PI / 180), 0) * 905;
+Check(!CommandCameraMath.SegmentClearOfTerrain(debrisDown, landed, mun, MunR, MunR + 7500, sunkEnds(debrisDown, landed), 4096, nominal),
+    "with no lens allowance a landed lens beyond the lander's own patch is hidden by its own ground");
+Check(CommandCameraMath.SegmentClearOfTerrain(debrisDown, landed, mun, MunR, MunR + 7500, sunkEnds(debrisDown, landed), 4096, nominal, nominal),
+    "a lens landed above the lander sees it down the slope past its own ground");
+Func<DVec3, double> hump = p => p.X > -500 && p.X < -400 ? sunkEnds(debrisDown, landed)(p) + 30 : sunkEnds(debrisDown, landed)(p);
+Check(!CommandCameraMath.SegmentClearOfTerrain(debrisDown, landed, mun, MunR, MunR + 7500, hump, 4096, nominal, nominal),
+    "a 20 m hump halfway down the slope still hides the lander from a landed lens");
+Check(CommandCameraMath.SegmentClearOfTerrain(nadirOrbiter, landed, mun, MunR, MunR + 7500, plateau, 64, nominal, nominal),
+    "a lens allowance changes nothing for an orbiter above the terrain shell");
+var buriedLens = new DVec3(0, MunR + 2400, 0);
+Check(!CommandCameraMath.SegmentClearOfTerrain(buriedLens, buriedLens + new DVec3(-1000, 200, 0), mun, MunR, MunR + 7500, plateau, 4096, 0, nominal),
+    "a lens 130 m under the ground stays buried");
 Check(!CommandCameraMath.SegmentInsideSphere(scope, new DVec3(0, MunR + 9000, 0), mun, MunR + 7500, out _, out _),
     "a line above the shell never enters it");
 

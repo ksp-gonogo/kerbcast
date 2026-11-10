@@ -214,8 +214,10 @@ namespace Kerbcast
             /* A craft is kept clear by its own radius; an aim point with no size skips its own shell (SurfaceSightEnd), so a landed craft behind a nearby ridge still reads hidden. */
             double top = b.pqsController.radiusMax;
             var end = targetRadius > 0 ? target : CommandCameraMath.SurfaceSightEnd(station, target, centreAtT, b.Radius, top);
+            /* A lens riding a craft landed on this body rests on its ground as a landed target does; its size is not read, so the nominal one stands in. */
+            double stationRadius = b == _vantageBody ? CommandCameraMath.NominalCraftRadiusM : 0;
             return CommandCameraMath.SegmentClearOfTerrain(station, end, centreAtT, b.Radius, top, surface, _terrainSamples,
-                targetRadius);
+                targetRadius, stationRadius);
         }
 
         /* The scaled mesh's axes in world space now. ScaledMovement sets its
