@@ -624,7 +624,7 @@ namespace Kerbcast
         private static CommandCameraSite FromVessel(Vessel v) => new CommandCameraSite
         {
             NodeName = "vessel:" + v.persistentId,
-            DisplayName = v.vesselName,
+            DisplayName = v.GetDisplayName() ?? v.vesselName,
             Body = v.mainBody,
             Source = "vessel",
             Vantage = v,

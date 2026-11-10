@@ -1729,7 +1729,7 @@ namespace Kerbcast
                 into.Add(new CatalogVessel
                 {
                     PersistentId = v.persistentId,
-                    Name = v.vesselName ?? "",
+                    Name = v.GetDisplayName() ?? v.vesselName ?? "",
                     VesselType = v.vesselType.ToString(),
                     Body = v.mainBody != null ? v.mainBody.bodyName : "",
                     Situation = v.situation.ToString(),
