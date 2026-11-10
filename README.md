@@ -35,19 +35,49 @@ A from-scratch, high-performance oriented successor to OCISLY for streaming Kerb
   <img src="docs/screenshots/launchpad-and-onboard.gif" alt="A rocket lifting off and coming down under its parachute, seen from the Launchpad camera on the left and from a hull camera looking down its side on the right" width="880">
 </p>
 
-Command cameras aren't parts on a craft. They stand beside a launch site, at a ground station or anywhere on a body's surface, or ride along with a craft, and stream like any other feed.
+Command cameras aren't parts on a craft. They attach to vessels at physical sites like launchpads and groundstations, and stream like any other feed. The SDK supports custom camera creation, and the mod API allows other mods to extend this, too.
 
-- **Launchpad camera**: currently the only command camera supported by the web UI, placed beside the launch pad. It follows the active craft from the pad, panning and zooming to keep it framed through liftoff and the climb
-- Point one at a craft, a spot on the ground or a direction in the sky, and it turns smoothly onto the new aim
-- Create and aim them from the browser through the TypeScript SDK (`createCommandCamera`, `setCommandAim`)
-- Other mods can drive command cameras from their own game logic through `Kerbcast.API`, published on NuGet
+### Launchpad camera
+
+Automatically placed close to the active launchpad, it tracks the active craft and tries to keep it in frame as it ascends.
+
+### Camera Networks
+
+From settings in the Kerbcast UI, create groups of ground stations and craft that produce a shared feed of the best current visual of the target craft. They save along with your game, so you can create consistent satellite networks for visual fidelity.
+
+Right now, any craft can contribute a feed and there is no physical telescope part.
+
+<p align="center">
+  <img src="docs/screenshots/launchpad-mun-at-dusk.png" alt="The Mun at dusk through the Launchpad camera's lens, lit on one side by the Sun" width="720">
+</p>
+
+## Career mode
+
+Hullcam VDS camera parts unlock in the tech tree. Command cameras are always available but improve with a few tech levels, visible in the Kerbcast UI.
+
+### Launchpad camera tech
+
+| Tracking Station | Lens | Zooms to about                         |
+| ---------------- | ---- | -------------------------------------- |
+| Level 1          | 15"  | 1.2°                                   |
+| Level 2          | 4"   | 0.32°                                  |
+| Level 3          | 1"   | 0.08° (a little wider through the air) |
+
+### Camera network levels for vessels
+
+Note that this is distinct from physical camera parts placed on the craft.
+
+| Research              | Space lens | Zooms to about |
+| --------------------- | ---------- | -------------- |
+| Scanning Tech         | 0.5"       | 0.04°          |
+| Advanced Science Tech | 0.2"       | 0.016°         |
+| Experimental Science  | 0.05"      | 0.004°         |
 
 ## Install
 
 Easiest is **CKAN**. Otherwise grab the latest `kerbcast-*.zip` from the [releases page](https://github.com/ksp-gonogo/kerbcast/releases) (or the [SpaceDock listing](https://spacedock.info/mod/4366/Kerbcast)) and follow the install steps in that release's notes. For a manual install, ensure you also install [Hullcam VDS Continued](https://github.com/linuxgurugamer/HullcamVDSContinued) and [Harmony 2](https://github.com/KSPModdingLibs/HarmonyKSP).
 
 For the longer version with multi-device setup, configuration, info on what's in the bundle, see [docs/INSTALL.md](docs/INSTALL.md). If something doesn't work, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) walks the common failures.
-
 
 ## kOS addon (optional)
 
@@ -83,5 +113,3 @@ This mod was built initally for getting best performance out of Steam Deck, and 
 ### Dev builds
 
 `scripts/dev-build.sh` builds a test bundle of the current pushed branch: the Linux sidecar via a `sidecar-ci` dispatch, the plugin locally, and both npm packages, all versioned `<next minor>-dev.<sha>`. It writes `local_docs/dev-builds/<version>/` in the main checkout (plugin tgz to extract at `GameData/Kerbcast/`, two npm tarballs, `manifest.json` with shas and changes) and points `dev-builds/latest` at it. `--help` lists the options.
-
-
