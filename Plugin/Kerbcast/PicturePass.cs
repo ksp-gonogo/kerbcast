@@ -122,6 +122,7 @@ namespace Kerbcast
         private int _scaledDepth;
         /* Terrain renderers this camera switched off for its local layers. */
         private readonly List<Renderer> _terrainOff = new List<Renderer>();
+        private readonly LensFog _fog = new LensFog();
         private static readonly SharedWalk<PQS, Renderer> s_terrain = new SharedWalk<PQS, Renderer>();
         private static readonly Action<PQS, List<Renderer>> s_walkTerrain = WalkTerrain;
         private static readonly List<PQ> s_storedQuads = new List<PQ>();
@@ -792,9 +793,10 @@ namespace Kerbcast
         }
 
         /* Before the local layers render: each loaded craft beyond the
-           boundary is hidden from this camera (CraftHider) and stand-ins are
-           switched on at their past instants (CraftStandIns). AfterLayers
-           switches both back once the frame is drawn. It always runs after
+           boundary is hidden from this camera (CraftHider), stand-ins are
+           switched on at their past instants (CraftStandIns), and the air is
+           fogged as seen from this camera's eye (LensFog). AfterLayers puts
+           all of it back once the frame is drawn. It always runs after
            BeforeLocalLayers, even when that or a render threw part way, and
            undoes exactly what was done. */
         public void BeforeLocalLayers()
@@ -802,6 +804,7 @@ namespace Kerbcast
             _hider.Hide();
             _standIns.Show();
             HideFarTerrain();
+            _fog.Apply(_eye(), View != null ? View.name : "none");
         }
 
         public void AfterLayers()
@@ -810,7 +813,11 @@ namespace Kerbcast
             finally
             {
                 try { _standIns.Restore(); }
-                finally { RestoreFarTerrain(); }
+                finally
+                {
+                    try { RestoreFarTerrain(); }
+                    finally { _fog.Restore(); }
+                }
             }
         }
 

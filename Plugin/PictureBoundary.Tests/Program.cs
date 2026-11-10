@@ -501,5 +501,31 @@ bool Near(DVec3 a, DVec3 b, double tol) => (a - b).Magnitude <= tol;
     Check(BodyLight.LayersIn(spareMask & ~(1 << 6), got) == 2 && got[0] == 3 && got[1] == 7, "free: the layers of a mask, lowest first");
 }
 
+/* ---- aerial fog: the air at a camera's own eye ---- */
+{
+    /* Stand-in values for a sphere's aerial perspective. */
+    const double R = 600000;
+    const float Depth = 7000f, Falloff = 6.75f;
+    Check(AerialFog.TryAt(R, R, Depth, Falloff, out var seaAlt, out var seaDensity) && seaAlt == 0f && seaDensity == 1f,
+        "aerial fog: at sea level the viewer is no depths up and the air is at full density");
+
+    double lens = R + 65000;
+    Check(AerialFog.TryAt(lens, R, Depth, Falloff, out var alt, out var density), "aerial fog: a lens in low orbit has its values");
+    Check(alt == (float)(65000 / (double)Depth), "aerial fog: altitude in atmosphere depths, as stock casts it");
+    Check(density == (float)Math.Exp((0f - Falloff) * (float)(65000 / (double)Depth)), "aerial fog: density by stock's own float steps");
+
+    AerialFog.TryAt(R + 70, R, Depth, Falloff, out _, out var padDensity);
+    Check(density < padDensity * 1e-6f, "aerial fog: the air at 65 km is far thinner than at the pad, so the pad's value fogs the lens's sea solid");
+    AerialFog.TryAt(R + 1000, R, Depth, Falloff, out _, out var low);
+    AerialFog.TryAt(R + 2000, R, Depth, Falloff, out _, out var higher);
+    Check(higher < low && low < 1f, "aerial fog: the air thins with height");
+
+    Check(AerialFog.TryAt(R - 50, R, Depth, Falloff, out var underAlt, out var underDensity) && underAlt < 0f && underDensity > 1f,
+        "aerial fog: below sea level stock's sums run on as they are");
+    Check(!AerialFog.TryAt(double.NaN, R, Depth, Falloff, out _, out _), "aerial fog: an unreadable distance leaves stock's values");
+    Check(!AerialFog.TryAt(lens, R, 0f, Falloff, out _, out _), "aerial fog: a sphere with no atmosphere depth leaves stock's values");
+    Check(AerialFog.TryAt(R + 1e9, R, Depth, Falloff, out _, out var farDensity) && farDensity == 0f, "aerial fog: from far off the air at the eye is none");
+}
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
