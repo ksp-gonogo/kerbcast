@@ -9,7 +9,8 @@ namespace Kerbcast
      * what the command camera actually draws of that body:
      *
      * - The station's own body, for a surface station: its terrain skyline
-     *   (HorizonMask), built from TerrainAltitude once per azimuth bin.
+     *   (HorizonMask), built from TerrainAltitude once per azimuth bin,
+     *   then any building or other scenery collider close to the lens.
      * - Every other body: its scaled-space mesh, which KerbcastCamera draws
      *   for every body but the station's. Where that body's PQS is active
      *   its terrain also draws in the local layers, over the mesh, so the
@@ -35,6 +36,15 @@ namespace Kerbcast
         public const string SourceScaled = "scaled";
         public const string SourceTerrain = "terrain";
         public const string SourceSphere = "sphere";
+        public const string SourceScenery = "scenery";
+
+        /* Scenery farther from the lens than this is left to the skyline. */
+        private const double SceneryReachM = 5000.0;
+        /* Above the tallest KSC building, measured from a lens standing on the ground. */
+        private const double SceneryCeilingM = 300.0;
+        /* Local Scenery: buildings, launch pads and terrain quads. */
+        private const int SceneryLayers = 1 << 15;
+        private static readonly RaycastHit[] SceneryHits = new RaycastHit[8];
 
         private sealed class MeshEntry
         {
@@ -159,9 +169,13 @@ namespace Kerbcast
             if (_maskWanted && b == _maskBody && _mask != null)
             {
                 var z = b.BodyFrame.Z;
-                if (!LineOfSightMath.SkylineBlocks(_mask, station, target, centreAtT, centreNow, spin, dt, new DVec3(z.x, z.z, z.y), targetRadius))
-                    return false;
-                source = SourceTerrain;
+                if (LineOfSightMath.SkylineBlocks(_mask, station, target, centreAtT, centreNow, spin, dt, new DVec3(z.x, z.z, z.y), targetRadius))
+                {
+                    source = SourceTerrain;
+                    return true;
+                }
+                if (!SceneryBlocks(station, target, centreAtT, centreNow, spin, dt)) return false;
+                source = SourceScenery;
                 return true;
             }
 
@@ -200,6 +214,36 @@ namespace Kerbcast
             if (TerrainClear(b, station, target, centreAtT, centreNow, spin, dt, targetRadius)) return false;
             source = SourceTerrain;
             return true;
+        }
+
+        /*
+         * Whether a building or other scenery collider stands on the sight
+         * line close to a surface station's lens. The skyline knows only the
+         * terrain, so a lens beside the VAB would otherwise see straight
+         * through it. Tested in the world as it is now, where the colliders
+         * are, with terrain quads skipped since the skyline already covers
+         * them, and craft too, which are not scenery.
+         */
+        private static bool SceneryBlocks(DVec3 station, DVec3 target, DVec3 centreAtT, DVec3 centreNow, DVec3 spin, double dt)
+        {
+            var from = CommandCameraMath.ToBodyFrameNow(station, centreAtT, centreNow, spin, dt);
+            var to = CommandCameraMath.ToBodyFrameNow(target, centreAtT, centreNow, spin, dt);
+            var d = to - from;
+            double dist = d.Magnitude;
+            if (!(dist > 0)) return false;
+            var dir = d * (1.0 / dist);
+            double rise = DVec3.Dot(dir, (from - centreNow).Normalized);
+            double len = CommandCameraMath.SceneryRayM(dist, rise, SceneryReachM, SceneryCeilingM);
+            if (len <= 0) return false;
+            int n = Physics.RaycastNonAlloc(new Vector3((float)from.X, (float)from.Y, (float)from.Z),
+                new Vector3((float)dir.X, (float)dir.Y, (float)dir.Z), SceneryHits, (float)len, SceneryLayers, QueryTriggerInteraction.Ignore);
+            for (int i = 0; i < n; i++)
+            {
+                var c = SceneryHits[i].collider;
+                if (c == null || c.GetComponent<PQ>() != null || c.GetComponentInParent<Part>() != null) continue;
+                return true;
+            }
+            return false;
         }
 
         private bool TerrainClear(CelestialBody b, DVec3 station, DVec3 target, DVec3 centreAtT, DVec3 centreNow,

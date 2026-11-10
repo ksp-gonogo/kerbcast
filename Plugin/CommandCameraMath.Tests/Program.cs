@@ -2292,5 +2292,13 @@ Check(CommandCameraMath.AimLightLogDue(1, 2, false), "a change of state is said"
 Check(!CommandCameraMath.AimLightLogDue(-1, -1, true), "a new aim with no light speed says nothing");
 Check(CommandCameraMath.AimLightLogDue(-1, 2, false), "a light speed going away is said");
 
+/* How far a station looks for buildings along its sight line. */
+Check(Near(CommandCameraMath.SceneryRayM(430000, -0.1, 5000, 300), 5000, 1e-9), "a far craft below the skyline: the whole reach is tested");
+Check(Near(CommandCameraMath.SceneryRayM(330000, Math.Sin(3 * Math.PI / 180), 5000, 300), 5000, 1e-9), "a craft rising 3 degrees: the line is under the ceiling across the reach");
+Check(Near(CommandCameraMath.SceneryRayM(150000, Math.Sin(30 * Math.PI / 180), 5000, 300), 600, 1e-9), "a craft 30 degrees up: the line clears every roof after 600 m");
+Check(Near(CommandCameraMath.SceneryRayM(500, 0.01, 5000, 300), 250, 1e-9), "a craft on the pad 500 m off: only the near half counts");
+Check(CommandCameraMath.SceneryRayM(1.5, 0, 5000, 300) == 0, "a craft at the lens: nothing to test");
+Check(CommandCameraMath.SceneryRayM(double.NaN, 0, 5000, 300) == 0, "no range: nothing to test");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

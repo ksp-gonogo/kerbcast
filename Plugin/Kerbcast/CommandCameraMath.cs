@@ -782,6 +782,23 @@ namespace Kerbcast
             return Math.Exp(Math.Log(current) + alpha * (Math.Log(target) - Math.Log(current)));
         }
 
+        /*
+         * How far out from a station's lens to look for buildings and other
+         * scenery along a sight line `distanceM` long, rising at `rise` (the
+         * sine of its elevation): within `reachM`, where physics has their
+         * colliders, and no higher than `ceilingM` above the lens, where none
+         * stands. Only the near half of the line counts, so the ground and
+         * structures a nearby craft stands on never hide it. Zero skips the
+         * test.
+         */
+        public static double SceneryRayM(double distanceM, double rise, double reachM, double ceilingM)
+        {
+            if (!Finite(distanceM) || !Finite(rise)) return 0;
+            double len = Math.Min(reachM, 0.5 * distanceM);
+            if (rise > 0) len = Math.Min(len, ceilingM / rise);
+            return len >= 1.0 ? len : 0;
+        }
+
         /* True when no part of the segment a-b passes inside the sphere: a body
            blocks a sight line, nothing else does. */
         public static bool SegmentClearOfSphere(DVec3 a, DVec3 b, DVec3 centre, double radius)
