@@ -204,7 +204,7 @@ jobs:
     # backend (the `windows` crate dep only resolves on this runner) and
     # runs the test suite. The runner has no hardware encoder MFT, so the
     # MF probe correctly reports unavailable and the encode path itself
-    # is exercised only on real Windows+GPU machines);
+    # is exercised only on real Windows+GPU machines;
     # what this job locks down is type/cfg/clippy
     # regressions that the Linux lane can't see. No perf budgets here,
     # per the tier-2 policy.
