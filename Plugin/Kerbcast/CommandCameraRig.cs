@@ -1902,6 +1902,7 @@ namespace Kerbcast
             /* Before the solve, so a cut lands whole on this frame: the pose, the picture and the label all come from the new site. */
             Network?.Step(this, false);
             site = _mount.Site;
+            ReadStationTerrain(site, now);
             double dt = _lastPrepare < 0 ? double.MaxValue : now - _lastPrepare;
             _lastPrepare = now;
             double ut = Planetarium.GetUniversalTime();
@@ -2300,6 +2301,19 @@ namespace Kerbcast
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={d:F0} event=station-body-mesh "
                     + (nowStock ? "stock (left to the fader, terrain is local)" : "forced on (no local terrain seen as stock)"));
             }
+        }
+
+        /* Reads the terrain stock has built under a ground station's lens, once a frame before the solve, and writes StationTerrain's line in this camera's turn. */
+        private void ReadStationTerrain(CommandCameraSite site, float now)
+        {
+            var body = site != null && !site.HasVantage ? site.Body : null;
+            var pqs = body != null ? body.pqsController : null;
+            if (pqs == null || !pqs.isActive) return;
+            StationTerrain.NoteFrame();
+            if (!StationTerrain.LogDue(_flightId, now)) return;
+            var world = body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
+            if (!StationTerrain.StationInSphere(pqs, body, world, out var dir, out double eyeHeight)) return;
+            StationTerrain.Log(_flightId, site.NodeName, body, pqs, world, dir, eyeHeight, StationTerrain.LeafAt(pqs, dir), null);
         }
 
         /* AtmosphereFromGround fills the sky shader's camera inputs every frame
@@ -2897,6 +2911,7 @@ namespace Kerbcast
             Network?.Dispose();
             Network = null;
             _mount.DestroyAnchor();
+            StationTerrain.Forget(_flightId);
             Debug.Log($"{Tag} cam={_flightId} rig down");
         }
 
