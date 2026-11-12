@@ -398,6 +398,10 @@ namespace Kerbcast
 
         /* Seeds for the per-save station terrain switches (KerbcastGameParameters), read by its constructor like SeedThrottleMainScreen. */
         public static bool SeedStationSimpleGround { get; private set; } = false;
+        public static bool SeedStationDetailedGround { get; private set; } = false;
+
+        /* How many levels short of a sphere's finest the detailed ground stops (StationDetailMath.DetailCap); never at a level stock gives colliders. */
+        public static int StationDetailLevelsShort { get; private set; } = 1;
 
         public string HttpBind => $"{BindAddress}:{Port}";
 
@@ -661,6 +665,8 @@ namespace Kerbcast
             // first-time-on-this-save defaults.
             ApplyBool(node, "ThrottleMainScreen", v => SeedThrottleMainScreen = v);
             ApplyBool(node, "StationSimpleGround", v => SeedStationSimpleGround = v);
+            ApplyBool(node, "StationDetailedGround", v => SeedStationDetailedGround = v);
+            ApplyInt(node, "StationDetailLevelsShort", v => StationDetailLevelsShort = Mathf.Clamp(v, 0, 8));
         }
 
         // Per-camera Camera{} blocks. Called once per settings file; a user

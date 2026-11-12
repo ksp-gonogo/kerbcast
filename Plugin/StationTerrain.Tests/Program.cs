@@ -72,5 +72,59 @@ StationTerrainMath.RingPoint(1, 0, 0, ring, 0, 4, out double ax, out double ay, 
 StationTerrainMath.RingPoint(1, 0, 0, ring, 2, 4, out double bx, out double by, out double bz);
 Check(StationTerrainMath.AngleRad(ax, ay, az, bx, by, bz) > 1.9 * ring, "opposite ring points lie on opposite sides");
 
+/* Detail caps: short of the finest, and never at a level with colliders. */
+Check(StationDetailMath.DetailCap(8, 9, 1) == 7, "Low Kerbin with colliders only past its finest: one short of 8 is 7");
+Check(StationDetailMath.DetailCap(8, 8, 0) == 7, "colliders at the finest level keep detail one below it");
+Check(StationDetailMath.DetailCap(8, 6, 1) == 5, "colliders from level 6 keep detail at 5");
+Check(StationDetailMath.DetailCap(8, 9, -3) == 8, "a negative shortfall counts as none");
+
+/* A detail centre at the station, the craft 315 km round. */
+double[] dirs = { 0, 1, 0 };
+double[] heights = { 5 };
+double stockFar = StationTerrainMath.GcDistM(angle, R, h, 0);
+double atStation = StationDetailMath.DetailGcDistM(stockFar, 3, 0, 1, 0, 0, R, dirs, heights, 1, 7, out _);
+Check(Near(atStation, 5, 1e-9), "the quad over the station takes the centre's distance, the lens height");
+Check(atStation < StationTerrainMath.SubdivideThresholdM(R, LowDetail, 1.0, 6), "so it subdivides on to the cap");
+Check(StationDetailMath.DetailGcDistM(stockFar, 7, 0, 1, 0, 0, R, dirs, heights, 1, 7, out _) == stockFar,
+    "a quad at the cap keeps stock's distance, so nothing finer is built");
+Check(StationDetailMath.DetailGcDistM(stockFar, 3, 0, 1, 0, 0, R, dirs, heights, 0, 7, out _) == stockFar, "no centres: stock's distance");
+Check(StationDetailMath.DetailGcDistM(2, 3, 0, 1, 0, 0, R, dirs, heights, 1, 7, out _) == 2, "a craft nearer than the centre wins");
+StationTerrainMath.RingPoint(0, 1, 0, 50000 / R, 0, 4, out double fx, out double fy, out double fz);
+double fifty = StationDetailMath.DetailGcDistM(stockFar, 3, fx, fy, fz, 0, R, dirs, heights, 1, 7, out _);
+Check(Near(fifty, 50000 * 1.3 + 5, 1e-3), "a quad 50 km out is 1.3 times that from the centre");
+StationDetailMath.DetailGcDistM(stockFar, 7, fx, fy, fz, 0, R, dirs, heights, 1, 7, out double arc50);
+Check(Near(arc50, 50000 * 1.3, 1e-3), "its drawing arc is the stretched arc, at any level, the cap included");
+StationDetailMath.DetailGcDistM(stockFar, 3, fx, fy, fz, 0, R, dirs, heights, 0, 7, out double noArc);
+Check(double.IsPositiveInfinity(noArc), "no centres: no arc");
+double[] two = { 1, 0, 0, 0, 1, 0 };
+double[] twoH = { 5, 5 };
+Check(Near(StationDetailMath.DetailGcDistM(stockFar, 3, 0, 1, 0, 0, R, two, twoH, 2, 7, out _), 5, 1e-9), "with two centres the nearer one counts");
+
+/* With the centre, a fresh build over the station reaches the cap: the level stock would give a craft standing there, capped. */
+int level = 2;
+while (level < 7 && StationDetailMath.DetailGcDistM(stockFar, level, 0, 1, 0, StationTerrainMath.AngularIntervalM(R, level), R, dirs, heights, 1, 7, out _)
+    < StationTerrainMath.SubdivideThresholdM(R, LowDetail, 1.0, level)) level++;
+Check(level == 7, $"the station's ground is built to the cap (got {level})");
+
+/* Holding centres. */
+var hold = new DetailCentreHold<uint>(5);
+var released = new System.Collections.Generic.List<uint>();
+Check(hold.Touch(1, 0), "a first touch registers");
+Check(!hold.Touch(1, 1), "a second does not");
+hold.Touch(2, 3);
+hold.Expire(5.5, released);
+Check(released.Count == 0, "nothing is released within the hold");
+hold.Expire(6.1, released);
+Check(released.Count == 1 && released[0] == 1 && hold.Count == 1, "a centre not touched for over the hold is released");
+hold.Touch(2, 7);
+hold.Expire(11.5, released);
+Check(hold.Holds(2), "touching again restarts the hold");
+Check(hold.Release(2) && !hold.Holds(2), "releasing drops it at once");
+hold.Touch(3, 0);
+hold.Touch(4, 0);
+released.Clear();
+hold.Clear(released);
+Check(released.Count == 2 && hold.Count == 0, "clearing releases every centre");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;

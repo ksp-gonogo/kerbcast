@@ -96,7 +96,8 @@ namespace Kerbcast
 
         private static int s_settingsFrame = -1;
         private static bool s_simpleGround;
-        private static bool s_simpleGroundLogged;
+        private static bool s_detailedGround;
+        private static bool s_settingsLogged;
 
         /* The save's "simple ground for far craft" switch (KerbcastGameParameters), read once a frame, its changes logged. */
         public static bool SimpleGround
@@ -108,24 +109,40 @@ namespace Kerbcast
             }
         }
 
+        /* The save's "detailed ground" switch (KerbcastGameParameters), read once a frame, its changes logged. */
+        public static bool DetailedGround
+        {
+            get
+            {
+                ReadSettings();
+                return s_detailedGround;
+            }
+        }
+
         private static void ReadSettings()
         {
             if (Time.frameCount == s_settingsFrame) return;
             s_settingsFrame = Time.frameCount;
             bool simple = KerbcastSettings.SeedStationSimpleGround;
+            bool detailed = KerbcastSettings.SeedStationDetailedGround;
             var game = HighLogic.CurrentGame;
             try
             {
                 var p = game != null && game.Parameters != null ? game.Parameters.CustomParams<KerbcastGameParameters>() : null;
-                if (p != null) simple = p.StationSimpleGround;
+                if (p != null)
+                {
+                    simple = p.StationSimpleGround;
+                    detailed = p.StationDetailedGround;
+                }
             }
             catch (Exception) { }
-            if (simple != s_simpleGround || !s_simpleGroundLogged)
-            {
-                s_simpleGroundLogged = true;
-                s_simpleGround = simple;
+            if (simple != s_simpleGround || !s_settingsLogged)
                 Debug.Log($"{Tag} event=setting name=StationSimpleGround state={(simple ? "on" : "off")}");
-            }
+            if (detailed != s_detailedGround || !s_settingsLogged)
+                Debug.Log($"{Tag} event=setting name=StationDetailedGround state={(detailed ? "on" : "off")}");
+            s_settingsLogged = true;
+            s_simpleGround = simple;
+            s_detailedGround = detailed;
         }
 
         /* Counts one rendered frame towards the line's frame time, once per frame however many cameras render. */

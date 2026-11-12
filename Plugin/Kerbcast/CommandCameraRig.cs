@@ -2339,6 +2339,7 @@ namespace Kerbcast
                 }
                 _terrainSite = site;
             }
+            if (StationTerrain.DetailedGround) StationDetail.Touch(_flightId, pqs, _terrainDir, _terrainEyeHeight, now);
             var leaf = StationTerrain.LeafAt(pqs, _terrainDir);
             int lensLevel = StationTerrainMath.LevelForLens(pqs.radius, PQS.cacheSideVertCount, _terrainEyeHeight, pqs.maxLevel);
             bool coarse = leaf.Found && StationTerrainMath.Coarse(leaf.Level, leaf.Visible, lensLevel);
@@ -2346,7 +2347,8 @@ namespace Kerbcast
             SetSimpleGround(cam, simple ? body : null, leaf, lensLevel);
             if (!StationTerrain.LogDue(_flightId, now)) return;
             StationTerrain.Log(_flightId, site.NodeName, body, pqs, world, _terrainDir, _terrainEyeHeight, leaf,
-                $"coarse={(coarse ? "true" : "false")} simpleGround={(simple ? "on" : "off")}");
+                $"coarse={(coarse ? "true" : "false")} simpleGround={(simple ? "on" : "off")} "
+                + $"detailedGround={(StationTerrain.DetailedGround ? "on" : "off")} {StationDetail.LogFields(pqs)}");
         }
 
         private void SetSimpleGround(KerbcastCamera cam, CelestialBody body, StationTerrain.Leaf leaf, int lensLevel)
@@ -2956,6 +2958,7 @@ namespace Kerbcast
             Network = null;
             _mount.DestroyAnchor();
             StationTerrain.Forget(_flightId);
+            StationDetail.Release(_flightId, "camera-gone");
             Debug.Log($"{Tag} cam={_flightId} rig down");
         }
 
