@@ -714,11 +714,20 @@ namespace Kerbcast
          */
         private bool KeepsPresent(CelestialBody b, PictureLens lens) => TerrainLocal(b, lens.Point);
 
+        /*
+         * A body whose local terrain this camera treats as absent this frame,
+         * though built and in reach: a ground station's own body, where stock
+         * built the ground under the lens too coarsely for it (StationTerrain).
+         * The scaled sphere stands for it then, as for terrain out of reach.
+         * Set by the rig before each frame's solve.
+         */
+        public CelestialBody CoarseTerrain { get; set; }
+
         /* Whether terrain of `b` is built and `eye` sees it as stock does (FarTerrain.SeenAsStock), so the local layers draw that body's ground. */
         public bool TerrainLocal(CelestialBody b, DVec3 eye)
         {
             var pqs = b != null ? b.pqsController : null;
-            if (pqs == null || !pqs.isActive) return false;
+            if (pqs == null || !pqs.isActive || ReferenceEquals(b, CoarseTerrain)) return false;
             double far = _nativeFar != null ? _nativeFar() : View != null ? View.farClipPlane : 0;
             double distance = (eye - ToD(b.position)).Magnitude;
             return FarTerrain.SeenAsStock(distance, Math.Max(b.Radius, pqs.radiusMax), far, distance - b.Radius, StockTerrainTo(pqs));
@@ -847,9 +856,12 @@ namespace Kerbcast
                 var pqs = b.pqsController;
                 double distance = (lens.Point - ToD(b.position)).Magnitude;
                 double stockTo = pqs != null && pqs.isActive ? StockTerrainTo(pqs) : double.PositiveInfinity;
+                double terrainRadius = pqs != null ? Math.Max(b.Radius, pqs.radiusMax) : b.Radius;
+                bool coarse = ReferenceEquals(b, CoarseTerrain);
                 bool off = pqs != null && pqs.isActive
-                    && FarTerrain.LeftOut(distance, Math.Max(b.Radius, pqs.radiusMax), native, reach, distance - b.Radius, stockTo);
-                NoteFarTerrain(b, off, distance, native, reach, stockTo);
+                    && (FarTerrain.LeftOut(distance, terrainRadius, native, reach, distance - b.Radius, stockTo)
+                        || (coarse && PictureBoundary.TerrainInReach(distance, terrainRadius, reach)));
+                NoteFarTerrain(b, off, coarse, distance, native, reach, stockTo);
                 if (!off) continue;
                 SwitchOff(pqs);
                 var children = pqs.ChildSpheres;
@@ -860,12 +872,13 @@ namespace Kerbcast
         }
 
         /* Logs body `b`'s terrain being left out or drawn again by this camera, once per change. */
-        private void NoteFarTerrain(CelestialBody b, bool off, double distance, double native, double reach, double stockTo)
+        private void NoteFarTerrain(CelestialBody b, bool off, bool coarse, double distance, double native, double reach, double stockTo)
         {
             int index = b.flightGlobalsIndex;
             if (off ? !_farTerrainOff.Add(index) : !_farTerrainOff.Remove(index)) return;
             Debug.Log($"{Tag} view={(View != null ? View.name : "none")} event=far-terrain body={b.bodyName} state={(off ? "off" : "on")} "
-                + $"distance={distance:F0} nativeFar={native:F0} reach={reach:F0} altitude={distance - b.Radius:F0} stockTerrainTo={stockTo:F0}");
+                + $"distance={distance:F0} nativeFar={native:F0} reach={reach:F0} altitude={distance - b.Radius:F0} stockTerrainTo={stockTo:F0} "
+                + $"coarse={(coarse ? "true" : "false")}");
         }
 
         private void SwitchOff(PQS sphere)

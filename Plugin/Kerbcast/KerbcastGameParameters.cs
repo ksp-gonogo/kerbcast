@@ -52,6 +52,19 @@ namespace Kerbcast
         )]
         public bool CommandCameraTrackingRules = true;
 
+        /* While a ground station's camera renders, the terrain stock built near
+           it for a far craft may be too coarse for the lens (StationTerrain);
+           this draws the planet's distant view there instead. */
+        [GameParameters.CustomParameterUI(
+            "Station cameras: simple ground for far craft",
+            toolTip =
+                "When your craft is far from a ground station, the game builds the land near that station " +
+                "only roughly, and its cameras can show hills and peaks that are not there. This shows the " +
+                "planet as seen from afar instead: smoother, without nearby buildings, but no false peaks. " +
+                "Costs nothing."
+        )]
+        public bool StationSimpleGround;
+
         /* A one-shot: KerbcastCore releases the scene's command lock and clears
            any reservation, then unticks it. The way out when a mod that locks
            the command cameras has stopped answering. */
@@ -89,6 +102,7 @@ namespace Kerbcast
             // construction, which will overwrite this if the save had
             // the field stored.
             ThrottleMainScreen = KerbcastSettings.SeedThrottleMainScreen;
+            StationSimpleGround = KerbcastSettings.SeedStationSimpleGround;
         }
     }
 }

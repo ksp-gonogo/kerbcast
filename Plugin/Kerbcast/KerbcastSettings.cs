@@ -396,6 +396,9 @@ namespace Kerbcast
         // KerbcastGameParameters's constructor.
         public static bool SeedThrottleMainScreen { get; private set; } = false;
 
+        /* Seeds for the per-save station terrain switches (KerbcastGameParameters), read by its constructor like SeedThrottleMainScreen. */
+        public static bool SeedStationSimpleGround { get; private set; } = false;
+
         public string HttpBind => $"{BindAddress}:{Port}";
 
         // True if the bind address only accepts connections from this machine,
@@ -657,6 +660,7 @@ namespace Kerbcast
             // seed values. Settings.cfg is the source of truth for
             // first-time-on-this-save defaults.
             ApplyBool(node, "ThrottleMainScreen", v => SeedThrottleMainScreen = v);
+            ApplyBool(node, "StationSimpleGround", v => SeedStationSimpleGround = v);
         }
 
         // Per-camera Camera{} blocks. Called once per settings file; a user

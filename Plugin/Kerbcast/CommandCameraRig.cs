@@ -1902,7 +1902,7 @@ namespace Kerbcast
             /* Before the solve, so a cut lands whole on this frame: the pose, the picture and the label all come from the new site. */
             Network?.Step(this, false);
             site = _mount.Site;
-            ReadStationTerrain(site, now);
+            UpdateStationTerrain(cam, site, now);
             double dt = _lastPrepare < 0 ? double.MaxValue : now - _lastPrepare;
             _lastPrepare = now;
             double ut = Planetarium.GetUniversalTime();
@@ -2303,17 +2303,61 @@ namespace Kerbcast
             }
         }
 
-        /* Reads the terrain stock has built under a ground station's lens, once a frame before the solve, and writes StationTerrain's line in this camera's turn. */
-        private void ReadStationTerrain(CommandCameraSite site, float now)
+        private CommandCameraSite _terrainSite;
+        private Vector3d _terrainDir;
+        private double _terrainEyeHeight;
+        private CelestialBody _simpleGround;
+
+        /*
+         * Reads the terrain stock has built under a ground station's lens,
+         * once a frame before the solve, and writes StationTerrain's line in
+         * this camera's turn. With the save's simple ground switch on and that
+         * terrain too coarse for the lens, the picture treats the station's
+         * body as having no local terrain (PicturePass.CoarseTerrain): the
+         * terrain is hidden from this camera and the scaled sphere, with the
+         * ground drawn under the lens, stands in, as when the craft is on
+         * another world. The station's place in the sphere is fixed, so it is
+         * read once per site.
+         */
+        private void UpdateStationTerrain(KerbcastCamera cam, CommandCameraSite site, float now)
         {
             var body = site != null && !site.HasVantage ? site.Body : null;
             var pqs = body != null ? body.pqsController : null;
-            if (pqs == null || !pqs.isActive) return;
+            if (pqs == null || !pqs.isActive)
+            {
+                SetSimpleGround(cam, null, default, 0);
+                return;
+            }
             StationTerrain.NoteFrame();
-            if (!StationTerrain.LogDue(_flightId, now)) return;
             var world = body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
-            if (!StationTerrain.StationInSphere(pqs, body, world, out var dir, out double eyeHeight)) return;
-            StationTerrain.Log(_flightId, site.NodeName, body, pqs, world, dir, eyeHeight, StationTerrain.LeafAt(pqs, dir), null);
+            if (!ReferenceEquals(site, _terrainSite))
+            {
+                if (!StationTerrain.StationInSphere(pqs, body, world, out _terrainDir, out _terrainEyeHeight))
+                {
+                    SetSimpleGround(cam, null, default, 0);
+                    return;
+                }
+                _terrainSite = site;
+            }
+            var leaf = StationTerrain.LeafAt(pqs, _terrainDir);
+            int lensLevel = StationTerrainMath.LevelForLens(pqs.radius, PQS.cacheSideVertCount, _terrainEyeHeight, pqs.maxLevel);
+            bool coarse = leaf.Found && StationTerrainMath.Coarse(leaf.Level, leaf.Visible, lensLevel);
+            bool simple = coarse && StationTerrain.SimpleGround;
+            SetSimpleGround(cam, simple ? body : null, leaf, lensLevel);
+            if (!StationTerrain.LogDue(_flightId, now)) return;
+            StationTerrain.Log(_flightId, site.NodeName, body, pqs, world, _terrainDir, _terrainEyeHeight, leaf,
+                $"coarse={(coarse ? "true" : "false")} simpleGround={(simple ? "on" : "off")}");
+        }
+
+        private void SetSimpleGround(KerbcastCamera cam, CelestialBody body, StationTerrain.Leaf leaf, int lensLevel)
+        {
+            cam.Picture.CoarseTerrain = body;
+            if (ReferenceEquals(body, _simpleGround)) return;
+            _simpleGround = body;
+            Debug.Log($"{Tag} cam={_flightId} UT={F(_frameUt)} d={_lastDistance:F0} event=station-simple-ground "
+                + (body != null
+                    ? $"on body={body.bodyName} level={leaf.Level} visible={(leaf.Visible ? "true" : "false")} lensLevel={lensLevel}"
+                    : "off"));
         }
 
         /* AtmosphereFromGround fills the sky shader's camera inputs every frame

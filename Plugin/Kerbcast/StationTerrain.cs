@@ -94,6 +94,40 @@ namespace Kerbcast
             return true;
         }
 
+        private static int s_settingsFrame = -1;
+        private static bool s_simpleGround;
+        private static bool s_simpleGroundLogged;
+
+        /* The save's "simple ground for far craft" switch (KerbcastGameParameters), read once a frame, its changes logged. */
+        public static bool SimpleGround
+        {
+            get
+            {
+                ReadSettings();
+                return s_simpleGround;
+            }
+        }
+
+        private static void ReadSettings()
+        {
+            if (Time.frameCount == s_settingsFrame) return;
+            s_settingsFrame = Time.frameCount;
+            bool simple = KerbcastSettings.SeedStationSimpleGround;
+            var game = HighLogic.CurrentGame;
+            try
+            {
+                var p = game != null && game.Parameters != null ? game.Parameters.CustomParams<KerbcastGameParameters>() : null;
+                if (p != null) simple = p.StationSimpleGround;
+            }
+            catch (Exception) { }
+            if (simple != s_simpleGround || !s_simpleGroundLogged)
+            {
+                s_simpleGroundLogged = true;
+                s_simpleGround = simple;
+                Debug.Log($"{Tag} event=setting name=StationSimpleGround state={(simple ? "on" : "off")}");
+            }
+        }
+
         /* Counts one rendered frame towards the line's frame time, once per frame however many cameras render. */
         public static void NoteFrame()
         {
