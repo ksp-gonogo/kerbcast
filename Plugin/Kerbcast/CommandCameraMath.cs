@@ -679,6 +679,27 @@ namespace Kerbcast
             };
         }
 
+        /* The Sun's elevation at a lens over which the daylight at the lens (DaylightAtLens) goes from none to full. */
+        public const double LensTwilightFromDeg = -6.0;
+        public const double LensTwilightToDeg = 6.0;
+
+        /*
+         * How much daylight reaches a lens on the ground, 0 to 1, from the
+         * Sun's elevation there: none once the Sun is past civil twilight,
+         * full with it a few degrees up, eased between. It dims what the
+         * scaled planet shader adds whatever the Sun does (the rim and the
+         * environment's reflection), which a lens on that ground sees
+         * edge on and so at full strength.
+         */
+        public static double DaylightAtLens(double sunElevationDeg)
+        {
+            if (double.IsNaN(sunElevationDeg)) return 1.0;
+            double t = (sunElevationDeg - LensTwilightFromDeg) / (LensTwilightToDeg - LensTwilightFromDeg);
+            if (t <= 0) return 0.0;
+            if (t >= 1) return 1.0;
+            return t * t * (3 - 2 * t);
+        }
+
         /* Elevation of the look direction above the station's horizon, degrees. */
         public static double ElevationDeg(DVec3 forward, DVec3 localUp)
         {

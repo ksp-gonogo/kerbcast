@@ -1947,6 +1947,25 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     Check(!high.Draw, "a lens high enough to clear the near plane leaves the real mesh alone");
 }
 
+// DaylightAtLens: what dims the scaled planet's rim and reflection for a lens on its ground.
+{
+    Check(CommandCameraMath.DaylightAtLens(-40) == 0.0, "night at the lens: no daylight");
+    Check(CommandCameraMath.DaylightAtLens(CommandCameraMath.LensTwilightFromDeg) == 0.0, "none at the end of civil twilight");
+    Check(CommandCameraMath.DaylightAtLens(30) == 1.0, "day at the lens: full daylight, the stock look");
+    Check(CommandCameraMath.DaylightAtLens(CommandCameraMath.LensTwilightToDeg) == 1.0, "full a few degrees up");
+    Check(Near(CommandCameraMath.DaylightAtLens(0), 0.5, 1e-12), "half with the Sun on the horizon");
+    double last = 0;
+    bool rises = true;
+    for (double e = -10; e <= 10; e += 0.25)
+    {
+        double d = CommandCameraMath.DaylightAtLens(e);
+        if (d < last) rises = false;
+        last = d;
+    }
+    Check(rises, "dusk to day never dims");
+    Check(CommandCameraMath.DaylightAtLens(double.NaN) == 1.0, "an unknown Sun leaves the stock look");
+}
+
 // Deep-space optics.
 {
     const double KerbinPressure = 101.325;
