@@ -18,6 +18,32 @@ namespace Kerbcast
             Math.Min(maxLevel - Math.Max(0, levelsShort), colliderFromLevel - 1);
 
         /*
+         * Stock's level cap for its target's speed (PQS.maxLevelAtCurrentTgtSpeed):
+         * the finest level at or above `minLevel` whose quads are wider than
+         * the angle the target moved in its last physics step, `stepRad`,
+         * divided by `quadLengthsPerStep`. Stock measures that step against
+         * the target's direction at the step before, which it never resets,
+         * so the first step after a load spans the jump from wherever the
+         * sphere last saw a target, and the pause that follows freezes it.
+         */
+        public static int StockSpeedCap(double stepRad, int minLevel, int maxLevel, double quadLengthsPerStep)
+        {
+            if (quadLengthsPerStep <= 0) return maxLevel;
+            for (int level = maxLevel; level >= minLevel; level--)
+                if (stepRad < Math.PI / 2 / Math.Pow(2, level) * quadLengthsPerStep) return level;
+            return minLevel;
+        }
+
+        /*
+         * The speed cap a quad is held to: stock's for a quad whose distance
+         * is the craft's, and at least `detailCap` for one a centre brought
+         * nearer, since a station does not move and the craft's speed says
+         * nothing about how fast its ground must rebuild.
+         */
+        public static int SpeedCapFor(int stockCap, int detailCap, bool fromCentre) =>
+            fromCentre ? Math.Max(stockCap, detailCap) : stockCap;
+
+        /*
          * A quad's gcDist with the detail centres taken into account: the
          * smaller of stock's (the craft's) and each centre's, for a quad
          * below `capLevel`. Centres are unit directions in the sphere's

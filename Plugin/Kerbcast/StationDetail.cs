@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection.Emit;
 using HarmonyLib;
 using UnityEngine;
 
@@ -34,6 +35,12 @@ namespace Kerbcast
      * someone watches it, and released DetailHoldSeconds after the last
      * frame. The cap keeps detail quads below the level stock gives mesh
      * colliders (PQSMod_QuadMeshColliders), so they add no physics.
+     *
+     * Stock subdivides a quad only below a level cap set by its target's
+     * speed (PQS.maxLevelAtCurrentTgtSpeed, StationDetailMath.StockSpeedCap).
+     * A transpiler on PQ.UpdateSubdivision lifts that cap to the detail cap
+     * for a quad whose distance came from a centre, and leaves it as stock
+     * set it for every other quad, the craft's own included.
      */
     internal static class StationDetail
     {
@@ -70,10 +77,17 @@ namespace Kerbcast
         private static Group[] s_groups = new Group[0];
         private static Harmony s_harmony;
         private static bool s_patchFailed;
+        private static bool s_speedLift;
+
+        /* The quad whose distance the postfix last took from a centre, and its sphere's detail cap: UpdateSubdivision reads its speed cap straight after. */
+        private static PQ s_fromCentre;
+        private static int s_fromCentreCap;
 
         /* Postfix calls and quads given a centre's distance since the last line, to show the patch runs and how much it does. */
         private static long s_calls;
         private static long s_lowered;
+        /* Of those, quads due to subdivide at or past stock's speed cap: lifted past it with the transpiler, held back without. */
+        private static long s_overSpeedCap;
 
         /* Updates of unsubdivided quads stock leaves undrawn but a centre draws, about one per such quad, this frame: stock updates quads in PQS.Update, before cameras render. */
         private static int s_drawnOnlyFrame = -1;
@@ -154,9 +168,11 @@ namespace Kerbcast
         public static string LogFields(PQS pqs)
         {
             string s = $"centres={s_centres.Count} detailCap={(pqs != null ? CapFor(pqs).ToString() : "-")} "
-                + $"detailCalls={s_calls} detailLowered={s_lowered} detailDrawnOnly={(s_drawnOnlyFrame == Time.frameCount ? s_drawnOnly : 0)}";
+                + $"detailCalls={s_calls} detailLowered={s_lowered} detailDrawnOnly={(s_drawnOnlyFrame == Time.frameCount ? s_drawnOnly : 0)} "
+                + $"detailOverSpeedCap={s_overSpeedCap} speedLift={(s_speedLift ? "on" : "off")}";
             s_calls = 0;
             s_lowered = 0;
+            s_overSpeedCap = 0;
             return s;
         }
 
@@ -225,7 +241,6 @@ namespace Kerbcast
                 harmony.Patch(method, postfix: new HarmonyMethod(typeof(StationDetail), nameof(UpdateTargetRelativityPostfix)));
                 s_harmony = harmony;
                 Debug.Log($"{Tag} event=station-detail patched PQ.UpdateTargetRelativity");
-                return true;
             }
             catch (Exception ex)
             {
@@ -233,11 +248,57 @@ namespace Kerbcast
                 Debug.LogError($"{Tag} event=station-detail patch failed, detailed ground stays off: {ex}");
                 return false;
             }
+            try
+            {
+                var method = AccessTools.Method(typeof(PQ), nameof(PQ.UpdateSubdivision));
+                if (method == null) throw new MissingMethodException("PQ.UpdateSubdivision");
+                s_harmony.Patch(method, transpiler: new HarmonyMethod(typeof(StationDetail), nameof(UpdateSubdivisionTranspiler)));
+                Debug.Log($"{Tag} event=station-detail patched PQ.UpdateSubdivision speedLift={(s_speedLift ? "on" : "off")}");
+            }
+            catch (Exception ex)
+            {
+                s_speedLift = false;
+                Debug.LogError($"{Tag} event=station-detail speed cap patch failed, detail stays under the craft's speed cap: {ex}");
+            }
+            return true;
+        }
+
+        /* Swaps UpdateSubdivision's one read of sphereRoot.maxLevelAtCurrentTgtSpeed for SpeedCap(sphereRoot, this); unchanged, with speedLift off, if the read is not there exactly once. */
+        private static IEnumerable<CodeInstruction> UpdateSubdivisionTranspiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var field = AccessTools.Field(typeof(PQS), nameof(PQS.maxLevelAtCurrentTgtSpeed));
+            var code = new List<CodeInstruction>(instructions);
+            int at = -1, found = 0;
+            for (int i = 0; i < code.Count; i++)
+                if (code[i].opcode == OpCodes.Ldfld && Equals(code[i].operand, field))
+                {
+                    at = i;
+                    found++;
+                }
+            if (found != 1)
+            {
+                s_speedLift = false;
+                Debug.LogWarning($"{Tag} event=station-detail speed cap read found {found} times in PQ.UpdateSubdivision, left as stock");
+                return code;
+            }
+            var read = code[at];
+            code[at] = new CodeInstruction(OpCodes.Ldarg_0) { labels = read.labels, blocks = read.blocks };
+            code.Insert(at + 1, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(StationDetail), nameof(SpeedCap))));
+            s_speedLift = true;
+            return code;
+        }
+
+        /* The speed cap `quad` subdivides under (StationDetailMath.SpeedCapFor). */
+        private static int SpeedCap(PQS sphere, PQ quad)
+        {
+            int stock = sphere.maxLevelAtCurrentTgtSpeed;
+            return StationDetailMath.SpeedCapFor(stock, s_fromCentreCap, ReferenceEquals(quad, s_fromCentre));
         }
 
         private static void UpdateTargetRelativityPostfix(PQ __instance, double ___angularinterval)
         {
             var groups = s_groups;
+            s_fromCentre = null;
             if (groups.Length == 0) return;
             s_calls++;
             var sphere = __instance.sphereRoot;
@@ -253,6 +314,12 @@ namespace Kerbcast
                 {
                     __instance.gcDist = gc;
                     s_lowered++;
+                    s_fromCentre = __instance;
+                    s_fromCentreCap = g.Cap;
+                    int sub = __instance.subdivision;
+                    if (!__instance.isSubdivided && sub >= sphere.maxLevelAtCurrentTgtSpeed && sphere.subdivisionThresholds != null
+                        && sub < sphere.subdivisionThresholds.Length && gc < sphere.subdivisionThresholds[sub] * __instance.subdivideThresholdFactor)
+                        s_overSpeedCap++;
                 }
                 if (arc < __instance.gcd1)
                 {

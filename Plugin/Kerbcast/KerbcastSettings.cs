@@ -396,8 +396,7 @@ namespace Kerbcast
         // KerbcastGameParameters's constructor.
         public static bool SeedThrottleMainScreen { get; private set; } = false;
 
-        /* Seeds for the per-save station terrain switches (KerbcastGameParameters), read by its constructor like SeedThrottleMainScreen. */
-        public static bool SeedStationSimpleGround { get; private set; } = false;
+        /* Seed for the per-save detailed ground switch (KerbcastGameParameters), read by its constructor like SeedThrottleMainScreen. */
         public static bool SeedStationDetailedGround { get; private set; } = false;
 
         /* How many levels short of a sphere's finest the detailed ground stops (StationDetailMath.DetailCap); never at a level stock gives colliders. */
@@ -667,7 +666,6 @@ namespace Kerbcast
             // seed values. Settings.cfg is the source of truth for
             // first-time-on-this-save defaults.
             ApplyBool(node, "ThrottleMainScreen", v => SeedThrottleMainScreen = v);
-            ApplyBool(node, "StationSimpleGround", v => SeedStationSimpleGround = v);
             ApplyBool(node, "StationDetailedGround", v => SeedStationDetailedGround = v);
             ApplyInt(node, "StationDetailLevelsShort", v => StationDetailLevelsShort = Mathf.Clamp(v, 0, 8));
             ApplyBool(node, "StationTerrainLogEverySecond", v => StationTerrainLogEverySecond = v);

@@ -106,6 +106,17 @@ while (level < 7 && StationDetailMath.DetailGcDistM(stockFar, level, 0, 1, 0, St
     < StationTerrainMath.SubdivideThresholdM(R, LowDetail, 1.0, level)) level++;
 Check(level == 7, $"the station's ground is built to the cap (got {level})");
 
+/* Stock's speed cap. A craft in low orbit moves about 46 m a physics step, far inside a level 8 quad. */
+Check(StationDetailMath.StockSpeedCap(46.0 / R, LowMin, LowMax, 0.03) == LowMax, "a craft in low orbit keeps the finest level");
+Check(StationDetailMath.StockSpeedCap(Math.PI / 2, LowMin, LowMax, 0.03) == LowMin, "a first step measured from no direction at all drops to the coarsest");
+Check(StationDetailMath.StockSpeedCap(4000.0 / R, LowMin, LowMax, 0.03) == LowMin, "so does a jump of a few km between two steps, as after a load");
+Check(StationDetailMath.StockSpeedCap(1.0, LowMin, LowMax, 0) == LowMax, "no quad lengths per step means no cap");
+
+/* A centre's quads are capped by the detail cap, the craft's by stock. */
+Check(StationDetailMath.SpeedCapFor(2, 7, true) == 7, "a centre's quad subdivides to the detail cap whatever the craft's speed");
+Check(StationDetailMath.SpeedCapFor(2, 7, false) == 2, "the craft's own quads keep stock's speed cap");
+Check(StationDetailMath.SpeedCapFor(8, 7, true) == 8, "a centre never lowers stock's cap");
+
 /* Holding centres. */
 var hold = new DetailCentreHold<uint>(5);
 var released = new System.Collections.Generic.List<uint>();
