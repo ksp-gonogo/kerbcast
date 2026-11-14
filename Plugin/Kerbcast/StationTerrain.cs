@@ -8,8 +8,8 @@ namespace Kerbcast
 {
     /*
      * What stock has built of a sphere's terrain around a ground station, read
-     * from the sphere's quad tree, and the once a second [Kerbcast][TERRAIN]
-     * line that records it while a station camera renders. Stock subdivides
+     * from the sphere's quad tree, and the [Kerbcast][TERRAIN] line that
+     * records it while a station camera renders (LogDue). Stock subdivides
      * only around its one target, the active craft (StationTerrainMath), so
      * the line puts the level built at the station beside the craft's range,
      * the level stock's rule predicts there, and the quad pool's use.
@@ -17,9 +17,6 @@ namespace Kerbcast
     internal static class StationTerrain
     {
         private const string Tag = "[Kerbcast][TERRAIN]";
-        private const float LogSeconds = 1f;
-        /* A camera not heard from for this long no longer takes a turn at the line. */
-        private const float SeenSeconds = 2f;
         /* The neighbourhood sampled about the station: a ring this far out, this many points round it. */
         private const double RingM = 20000.0;
         private const int RingPoints = 8;
@@ -32,10 +29,8 @@ namespace Kerbcast
             public double GcDist;
         }
 
-        private static readonly Dictionary<uint, float> s_seen = new Dictionary<uint, float>();
-        private static readonly Dictionary<uint, float> s_logged = new Dictionary<uint, float>();
-        private static readonly List<uint> s_gone = new List<uint>();
-        private static float s_nextLog;
+        /* At most a line a second in all; quiet, a camera's line every 30 s; a camera unseen for 2 s writes at once on its return. */
+        private static readonly TerrainLinePace s_pace = new TerrainLinePace(1.0, 30.0, 2.0);
         private static int s_frame = -1;
         private static int s_frames;
         private static double s_frameSum;
@@ -157,47 +152,15 @@ namespace Kerbcast
         }
 
         /*
-         * Whether camera `cam` writes the line now: at most once a second in
-         * all, each camera rendering a station taking its turn, the one
-         * longest since its last line first.
+         * Whether camera `cam` writes the line now (TerrainLinePace): when
+         * `signature`, what the line reports that matters, changes, and every
+         * 30 s otherwise, or every second with the StationTerrainLogEverySecond
+         * debug key. Never more than one line a second in all.
          */
-        public static bool LogDue(uint cam, float now)
-        {
-            s_seen[cam] = now;
-            if (now < s_nextLog) return false;
-            uint pick = cam;
-            float oldest = s_logged.TryGetValue(cam, out float mine) ? mine : float.NegativeInfinity;
-            s_gone.Clear();
-            foreach (var kv in s_seen)
-            {
-                if (now - kv.Value > SeenSeconds)
-                {
-                    s_gone.Add(kv.Key);
-                    continue;
-                }
-                float at = s_logged.TryGetValue(kv.Key, out float t) ? t : float.NegativeInfinity;
-                if (at < oldest)
-                {
-                    oldest = at;
-                    pick = kv.Key;
-                }
-            }
-            for (int i = 0; i < s_gone.Count; i++)
-            {
-                s_seen.Remove(s_gone[i]);
-                s_logged.Remove(s_gone[i]);
-            }
-            if (pick != cam) return false;
-            s_logged[cam] = now;
-            s_nextLog = now + LogSeconds;
-            return true;
-        }
+        public static bool LogDue(uint cam, float now, int signature) =>
+            s_pace.Due(cam, now, signature, KerbcastSettings.StationTerrainLogEverySecond);
 
-        public static void Forget(uint cam)
-        {
-            s_seen.Remove(cam);
-            s_logged.Remove(cam);
-        }
+        public static void Forget(uint cam) => s_pace.Forget(cam);
 
         /*
          * The line itself, key=value pairs with no spaces in a value:
@@ -210,7 +173,7 @@ namespace Kerbcast
          *  speedCap: stock's level cap for the craft's speed
          *  quadCounts: PQS.quadCounts by level; built: quads in the tree by level, walked here
          *  cacheAssigned, cacheFree, cacheTotal: PQSCache's pool
-         *  frameMs, frameMsMax: unscaled frame time over the second
+         *  frameMs, frameMsMax: unscaled frame time since the last line
          * `extra` is appended as given.
          */
         public static void Log(uint cam, string site, CelestialBody body, PQS pqs, Vector3d world, Vector3d dir, double eyeHeightM,

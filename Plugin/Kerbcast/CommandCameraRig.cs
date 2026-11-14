@@ -2310,8 +2310,8 @@ namespace Kerbcast
 
         /*
          * Reads the terrain stock has built under a ground station's lens,
-         * once a frame before the solve, and writes StationTerrain's line in
-         * this camera's turn. With the save's simple ground switch on and that
+         * once a frame before the solve, and writes StationTerrain's line when
+         * it is due. With the save's simple ground switch on and that
          * terrain too coarse for the lens, the picture treats the station's
          * body as having no local terrain (PicturePass.CoarseTerrain): the
          * terrain is hidden from this camera and the scaled sphere, with the
@@ -2339,13 +2339,16 @@ namespace Kerbcast
                 }
                 _terrainSite = site;
             }
-            if (StationTerrain.DetailedGround) StationDetail.Touch(_flightId, pqs, _terrainDir, _terrainEyeHeight, now);
+            if (StationTerrain.DetailedGround) StationDetail.Touch(_flightId, pqs, _terrainDir, world, _terrainEyeHeight, now);
             var leaf = StationTerrain.LeafAt(pqs, _terrainDir);
             int lensLevel = StationTerrainMath.LevelForLens(pqs.radius, PQS.cacheSideVertCount, _terrainEyeHeight, pqs.maxLevel);
             bool coarse = leaf.Found && StationTerrainMath.Coarse(leaf.Level, leaf.Visible, lensLevel);
             bool simple = coarse && StationTerrain.SimpleGround;
             SetSimpleGround(cam, simple ? body : null, leaf, lensLevel);
-            if (!StationTerrain.LogDue(_flightId, now)) return;
+            /* What the line reports that is worth a line of its own when it changes. */
+            int signature = (leaf.Found ? leaf.Level + 1 : 0) | (leaf.Visible ? 1 << 8 : 0) | (coarse ? 1 << 9 : 0) | (simple ? 1 << 10 : 0)
+                | (StationTerrain.DetailedGround ? 1 << 11 : 0) | (lensLevel << 12);
+            if (!StationTerrain.LogDue(_flightId, now, signature)) return;
             StationTerrain.Log(_flightId, site.NodeName, body, pqs, world, _terrainDir, _terrainEyeHeight, leaf,
                 $"coarse={(coarse ? "true" : "false")} simpleGround={(simple ? "on" : "off")} "
                 + $"detailedGround={(StationTerrain.DetailedGround ? "on" : "off")} {StationDetail.LogFields(pqs)}");

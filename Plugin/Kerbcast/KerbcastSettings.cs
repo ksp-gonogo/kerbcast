@@ -403,6 +403,9 @@ namespace Kerbcast
         /* How many levels short of a sphere's finest the detailed ground stops (StationDetailMath.DetailCap); never at a level stock gives colliders. */
         public static int StationDetailLevelsShort { get; private set; } = 1;
 
+        /* Debug: the station terrain line every second while a station camera is watched, rather than on a change and every 30 s (StationTerrain.LogDue). */
+        public static bool StationTerrainLogEverySecond { get; private set; } = false;
+
         public string HttpBind => $"{BindAddress}:{Port}";
 
         // True if the bind address only accepts connections from this machine,
@@ -667,6 +670,7 @@ namespace Kerbcast
             ApplyBool(node, "StationSimpleGround", v => SeedStationSimpleGround = v);
             ApplyBool(node, "StationDetailedGround", v => SeedStationDetailedGround = v);
             ApplyInt(node, "StationDetailLevelsShort", v => StationDetailLevelsShort = Mathf.Clamp(v, 0, 8));
+            ApplyBool(node, "StationTerrainLogEverySecond", v => StationTerrainLogEverySecond = v);
         }
 
         // Per-camera Camera{} blocks. Called once per settings file; a user

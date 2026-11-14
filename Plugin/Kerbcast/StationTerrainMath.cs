@@ -114,4 +114,75 @@ namespace Kerbcast
             rx /= m; ry /= m; rz /= m;
         }
     }
+
+    /*
+     * When a station camera writes the terrain line: never within `gapS` of
+     * the last line from any camera. Quiet, a camera writes when what it
+     * reports (its signature) differs from its last line, and otherwise every
+     * `quietS`; every second, the cameras take turns, the one longest since
+     * its last line first. A camera not seen for `seenS` is forgotten, so it
+     * writes at once when it returns.
+     */
+    internal sealed class TerrainLinePace
+    {
+        private readonly double _gap;
+        private readonly double _quiet;
+        private readonly double _seenFor;
+        private readonly Dictionary<uint, double> _seen = new Dictionary<uint, double>();
+        private readonly Dictionary<uint, double> _logged = new Dictionary<uint, double>();
+        private readonly Dictionary<uint, int> _signature = new Dictionary<uint, int>();
+        private readonly List<uint> _gone = new List<uint>();
+        private double _next = double.NegativeInfinity;
+
+        public TerrainLinePace(double gapS, double quietS, double seenS)
+        {
+            _gap = gapS;
+            _quiet = quietS;
+            _seenFor = seenS;
+        }
+
+        public bool Due(uint cam, double now, int signature, bool everySecond)
+        {
+            _gone.Clear();
+            foreach (var kv in _seen)
+                if (now - kv.Value > _seenFor) _gone.Add(kv.Key);
+            for (int i = 0; i < _gone.Count; i++) Forget(_gone[i]);
+            _seen[cam] = now;
+            if (now < _next) return false;
+
+            bool logged = _logged.TryGetValue(cam, out double at);
+            bool due;
+            if (everySecond)
+            {
+                /* The turn goes to the camera longest since its last line. */
+                double mine = logged ? at : double.NegativeInfinity;
+                due = true;
+                foreach (var kv in _seen)
+                {
+                    double other = _logged.TryGetValue(kv.Key, out double t) ? t : double.NegativeInfinity;
+                    if (other < mine)
+                    {
+                        due = false;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                due = !logged || !_signature.TryGetValue(cam, out int was) || was != signature || now - at >= _quiet;
+            }
+            if (!due) return false;
+            _logged[cam] = now;
+            _signature[cam] = signature;
+            _next = now + _gap;
+            return true;
+        }
+
+        public void Forget(uint cam)
+        {
+            _seen.Remove(cam);
+            _logged.Remove(cam);
+            _signature.Remove(cam);
+        }
+    }
 }

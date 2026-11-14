@@ -126,5 +126,32 @@ released.Clear();
 hold.Clear(released);
 Check(released.Count == 2 && hold.Count == 0, "clearing releases every centre");
 
+/* The terrain line's pace, cameras asking every quarter second as a rendering camera does each frame. */
+int Lines(TerrainLinePace p, uint cam, double from, double to, int signature, bool everySecond)
+{
+    int n = 0;
+    for (double t = from; t < to - 1e-9; t += 0.25)
+        if (p.Due(cam, t, signature, everySecond)) n++;
+    return n;
+}
+var pace = new TerrainLinePace(1, 30, 2);
+Check(pace.Due(1, 0, 5, false), "a camera's first line is written at once");
+Check(Lines(pace, 1, 0.25, 1, 6, false) == 0, "never twice within a second, even on a change");
+Check(pace.Due(1, 1, 6, false), "a change is written once the second is up");
+Check(Lines(pace, 1, 1.25, 31, 6, false) == 0, "nothing new: quiet");
+Check(pace.Due(1, 31, 6, false), "and a line every 30 s regardless");
+Check(Lines(pace, 1, 31.25, 61, 6, false) == 0 && pace.Due(1, 61, 6, false), "and again 30 s on");
+pace.Due(2, 61.25, 1, false);
+Check(Lines(pace, 2, 61.5, 62, 1, false) == 0 && pace.Due(2, 62.25, 1, false), "a second camera's first line waits for the second to be up");
+var every = new TerrainLinePace(1, 30, 2);
+Check(every.Due(1, 0, 0, true), "every second: the first camera writes");
+every.Due(2, 0.1, 0, true);
+Check(every.Due(2, 1.1, 0, true), "every second: a camera never logged takes the turn");
+Check(!every.Due(1, 1.15, 0, true), "within the second, none other");
+Check(!every.Due(2, 2.2, 0, true) && every.Due(1, 2.2, 0, true), "then the camera longest since its line");
+Check(pace.Due(3, 70, 1, false), "a third camera writes its first line");
+Check(!pace.Due(3, 71.5, 1, false) && !pace.Due(3, 73, 1, false), "seen steadily, it stays quiet");
+Check(pace.Due(3, 76, 1, false), "unseen for over 2 s, it writes at once on its return");
+
 Console.WriteLine(failures == 0 ? "ALL PASS" : $"{failures} FAILED");
 return failures == 0 ? 0 : 1;
