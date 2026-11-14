@@ -2455,6 +2455,9 @@ namespace Kerbcast
         private CommandCameraStationGround _ground;
         private bool _groundDrawn;
         private string _groundState;
+        private readonly ScaledGroundDaylight _groundDaylight = new ScaledGroundDaylight();
+        /* The lens's own body is drawn only as its scaled mesh and the lens is close enough to its ground to see it edge on. */
+        private bool _lensOnScaledGround;
 
         /* Draws the body's ground under a lens whose body has no local terrain,
            when the view reaches below the horizon. Runs for every scaled render,
@@ -2463,12 +2466,14 @@ namespace Kerbcast
         {
             var scaled = cam.ScaledLayer;
             var body = _mount.Site.Body;
+            _lensOnScaledGround = false;
             if (scaled == null || body == null || !_poseValid) return;
             var toCentre = ToD(body.position) - _poseEye;
             bool wasDrawn = _groundDrawn;
             _groundDrawn = false;
             var plan = CommandCameraMath.PlanStationGround(toCentre.Magnitude, body.Radius, ScaledSpace.ScaleFactor,
                 _poseForward, _poseUp, toCentre.Normalized * -1.0, scaled.fieldOfView, scaled.aspect, wasDrawn);
+            _lensOnScaledGround = !_stationMeshStock && plan.Magnify > 1.0;
             string state = _stationMeshStock ? "off (terrain is local)" : "off (no ground in view, or the lens is clear of the near plane)";
             if (plan.Draw && !_stationMeshStock)
             {
@@ -2483,6 +2488,17 @@ namespace Kerbcast
                 + $"body={body.bodyName} elev={ElevationDeg:F2} lowest={plan.LowestDeg:F2} dip={plan.HorizonDipDeg:F2} "
                 + $"eyeHeight={toCentre.Magnitude - plan.GroundRadiusM:F0}m groundRadius={plan.GroundRadiusM:F0}m "
                 + $"magnify={plan.Magnify:G4} sphere={plan.SphereRadiusUnits:G6}");
+        }
+
+        /* Dims the scaled ground under a lens standing on it by the daylight there (ScaledGroundDaylight), from the Sun's light as it is aimed for this render. */
+        private void DimScaledGround()
+        {
+            var body = _mount.Site.Body;
+            var sun = Sun.Instance != null ? Sun.Instance.transform : null;
+            if (!_lensOnScaledGround || body == null || body.scaledBody == null || sun == null) return;
+            var toSun = sun.forward * -1f;
+            double elevation = CommandCameraMath.ElevationDeg(new DVec3(toSun.x, toSun.y, toSun.z), _poseEye - ToD(body.position));
+            _groundDaylight.Begin(body.scaledBody.GetComponent<Renderer>(), CommandCameraMath.DaylightAtLens(elevation), elevation, $"{Tag} cam={_flightId}");
         }
 
         public void BeforeScaledRender(KerbcastCamera cam)
@@ -2500,6 +2516,7 @@ namespace Kerbcast
             /* When the picture lights each body itself, it has already aimed the Sun and given the shells their light. */
             if (!cam.Picture.BodiesLit) _sun.Begin(cam.ScaledLayer, $"{Tag} cam={_flightId}");
             DrawStationGround(cam);
+            DimScaledGround();
             _afgOverridden = null;
             var body = _mount.Site.Body;
             var afg = body != null ? body.afg : null;
@@ -2528,8 +2545,12 @@ namespace Kerbcast
                 try { _ground?.Hide(); }
                 finally
                 {
-                    try { _sun.End(); }
-                    finally { RestoreAfg(); }
+                    try { _groundDaylight.End(); }
+                    finally
+                    {
+                        try { _sun.End(); }
+                        finally { RestoreAfg(); }
+                    }
                 }
             }
         }
