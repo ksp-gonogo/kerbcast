@@ -670,10 +670,36 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] event=sun-flare flare='{f.name}' enabled={f.enabled} active={f.gameObject.activeInHierarchy} layer={f.gameObject.layer} brightness={f.brightness:G4} fadeSpeed={f.fadeSpeed:G4} "
                         + $"color={f.color} asset={(f.flare != null ? f.flare.name : "none")} dist={to.magnitude:G5} viewport={vp} ray={hit}");
                 }
+                if (flares.Count > 0) LogSunRayRenderers(lens, flares[0].transform.position);
             }
             catch (System.Exception e)
             {
                 Debug.Log($"[Kerbcast] event=sun-flare failed: {e.Message}");
+            }
+        }
+
+        /*
+         * Every renderer the lens's scaled camera can see whose bounds the ray
+         * from the lens to the Sun crosses, with its shader and queue and whether
+         * the lens stands inside its bounds: what can draw over the Sun's disc,
+         * such as an atmosphere shell, and in what order against the disc.
+         */
+        private static void LogSunRayRenderers(Camera lens, Vector3 sunAt)
+        {
+            var origin = lens.transform.position;
+            var ray = new Ray(origin, sunAt - origin);
+            var all = UnityEngine.Object.FindObjectsOfType<Renderer>();
+            int listed = 0;
+            for (int i = 0; i < all.Length && listed < 16; i++)
+            {
+                var r = all[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy || (lens.cullingMask & (1 << r.gameObject.layer)) == 0) continue;
+                var b = r.bounds;
+                if (!b.IntersectRay(ray, out float d) && !b.Contains(origin)) continue;
+                var m = r.sharedMaterial;
+                listed++;
+                Debug.Log($"[Kerbcast] event=sun-flare ray-renderer='{r.name}' type={r.GetType().Name} layer={r.gameObject.layer} shader={(m != null ? m.shader.name : "none")} queue={(m != null ? m.renderQueue : -1)} "
+                    + $"insideBounds={b.Contains(origin)} enterAt={d:G5} size={b.size.x:G4}");
             }
         }
 
