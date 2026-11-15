@@ -1046,6 +1046,7 @@ Check(CommandCameraMath.UtStripeValue(-5) == 0 && CommandCameraMath.UtStripeValu
     double Fade(double p, double zen, bool vis, double off, double fov) => CommandCameraMath.GalaxyFade(p, zen, vis, off, fov, 0.6, 0.9, 1.1, 0.6);
     Check(Fade(0.99, 40, true, 120, 30) >= 1, "galaxy fade: sea level by day hides the stars");
     Check(Fade(0.99, 130, false, 120, 30) == 0.6, "galaxy fade: sea level at night keeps the air's own haze only");
+    Check(Fade(0.99, 179.9, false, 120, 1.2) == 0.6, "galaxy fade: KSC at midnight at a 1.2 degree field is stock's 0.6, as on the pad in the game's own view");
     double dusk = Fade(0.99, 96, true, 120, 30);
     Check(dusk > 0.6 && dusk < 1.5, "galaxy fade: dusk fades partway");
     Check(Fade(0, 40, true, 120, 30) == 0, "galaxy fade: in vacuum with the Sun out of view the stars are full");
