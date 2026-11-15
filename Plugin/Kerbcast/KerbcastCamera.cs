@@ -2538,7 +2538,7 @@ namespace Kerbcast
         private void OnPreCull()
         {
             if (!UseScaledSpace || NearCamera == null || NearCamera.transform == null) return;
-            SunFlareForLens.Begin(GetInstanceID(), ScaledSpace.LocalToScaledSpace(NearCamera.transform.position), NearCamera.transform.forward, NearCamera.transform.position);
+            SunFlareForLens.Begin(ScaledSpace.LocalToScaledSpace(NearCamera.transform.position), NearCamera.transform.forward, NearCamera.transform.position);
         }
 
         private void OnPostRender()

@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using UnityEngine;
 
 namespace Kerbcast
@@ -25,21 +24,16 @@ namespace Kerbcast
     internal static class SunFlareForLens
     {
         private const float FallbackDistance = 20f;
-        private const int LogLimit = 3;
-        private const float AimedEnterDeg = 5f;
-        private const float AimedLeaveDeg = 7f;
-        private const int AimedLogLimit = 60;
+        private const int LogLimit = 1;
 
         private static Transform s_moved;
         private static Vector3 s_was;
         private static LensFlare s_flare;
         private static bool s_enabledWas;
         private static int s_logged;
-        private static int s_aimedLogged;
-        private static readonly Dictionary<int, bool> s_aimed = new Dictionary<int, bool>();
 
         /* Moves the Sun's flare out from `lens`, a scaled-space position, toward the Sun, ready for the render that follows. */
-        public static void Begin(int lensId, Vector3 lens, Vector3 forward, Vector3 lensLocal)
+        public static void Begin(Vector3 lens, Vector3 forward, Vector3 lensLocal)
         {
             End();
             try
@@ -61,7 +55,6 @@ namespace Kerbcast
                 t.position = lens + dir * dist;
                 bool hidden = HiddenByOwnPlanet(lens, dir, lensLocal);
                 flare.enabled = !hidden;
-                LogAimed(lensId, flare, lens, dir, dist, forward, hidden);
                 if (s_logged < LogLimit)
                 {
                     s_logged++;
@@ -77,50 +70,6 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] event=sun-glare failed: {e.Message}");
                 }
             }
-        }
-
-        /*
-         * Once each time the Sun comes within AimedEnterDeg of a lens's aim, and
-         * once when it leaves (past AimedLeaveDeg, so a wobble at the edge logs
-         * once), so the frames where the glare should show are in the log. The
-         * occlusion result is a physics ray from the lens to the flare, the test
-         * Unity's flare makes; ignoring triggers it may still differ from Unity's.
-         */
-        private static void LogAimed(int lensId, LensFlare flare, Vector3 lens, Vector3 dir, float dist, Vector3 forward, bool hidden)
-        {
-            float off = Vector3.Angle(forward, dir);
-            s_aimed.TryGetValue(lensId, out bool was);
-            bool now = was ? off < AimedLeaveDeg : off < AimedEnterDeg;
-            if (now == was) return;
-            s_aimed[lensId] = now;
-            if (s_aimedLogged >= AimedLogLimit) return;
-            s_aimedLogged++;
-            string ray = "none";
-            if (Physics.Raycast(lens, dir, out var hit, dist, ~0, QueryTriggerInteraction.Ignore))
-                ray = $"{hit.collider.name} layer={hit.collider.gameObject.layer} at={hit.distance:G4}";
-            Debug.Log($"[Kerbcast] event=sun-glare {(now ? "aimed" : "left")} lens={lensId} offAxisDeg={off:F1} flareEnabled={flare.enabled} stockEnabled={s_enabledWas} brightness={flare.brightness:G4} hiddenByPlanet={hidden} dist={dist:G4} ray={ray} timeScale={Time.timeScale:G3} paused={FlightDriver.Pause} {CoronaState(lens)}");
-        }
-
-        /*
-         * Where each corona billboard of the Sun faces and how big it is, against
-         * the lens: stock turns them to its camera in FixedUpdate, which a pause
-         * stops, so a paused game could leave them turned away from the lens.
-         * faceDeg is the angle between a corona's forward and the way to the lens,
-         * near 0 when it is square on.
-         */
-        private static string CoronaState(Vector3 lens)
-        {
-            var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
-            var scaled = sun != null ? sun.scaledBody : null;
-            if (scaled == null) return "coronas=none";
-            var coronas = scaled.GetComponentsInChildren<SunCoronas>(false);
-            var text = new System.Text.StringBuilder($"coronas={coronas.Length}");
-            for (int i = 0; i < coronas.Length; i++)
-            {
-                var c = coronas[i].transform;
-                text.Append($" [faceDeg={Vector3.Angle(c.forward, lens - c.position):F1} scale={c.localScale.x:G4}]");
-            }
-            return text.ToString();
         }
 
         /* Whether the lens's own planet stands between the lens and the Sun: the ray along `dir` from `lens` enters the planet's scaled sphere. */
