@@ -52,6 +52,17 @@ namespace Kerbcast
         )]
         public bool CommandCameraTrackingRules = true;
 
+        /* Builds the terrain round each ground station being watched as if
+           a craft stood there (StationDetail), at a cost in frame time. */
+        [GameParameters.CustomParameterUI(
+            "Station cameras: detailed ground",
+            toolTip =
+                "Build detailed land around each ground station you are watching, even when your craft " +
+                "is far away, so its cameras show the real hills. Uses more frame time and memory while " +
+                "a station camera is watched, and the detail goes a few seconds after you stop watching."
+        )]
+        public bool StationDetailedGround;
+
         /* A one-shot: KerbcastCore releases the scene's command lock and clears
            any reservation, then unticks it. The way out when a mod that locks
            the command cameras has stopped answering. */
@@ -89,6 +100,7 @@ namespace Kerbcast
             // construction, which will overwrite this if the save had
             // the field stored.
             ThrottleMainScreen = KerbcastSettings.SeedThrottleMainScreen;
+            StationDetailedGround = KerbcastSettings.SeedStationDetailedGround;
         }
     }
 }

@@ -1902,6 +1902,7 @@ namespace Kerbcast
             /* Before the solve, so a cut lands whole on this frame: the pose, the picture and the label all come from the new site. */
             Network?.Step(this, false);
             site = _mount.Site;
+            UpdateStationTerrain(site, now);
             double dt = _lastPrepare < 0 ? double.MaxValue : now - _lastPrepare;
             _lastPrepare = now;
             double ut = Planetarium.GetUniversalTime();
@@ -2300,6 +2301,41 @@ namespace Kerbcast
                 Debug.Log($"{Tag} cam={_flightId} UT={F(ut)} d={d:F0} event=station-body-mesh "
                     + (nowStock ? "stock (left to the fader, terrain is local)" : "forced on (no local terrain seen as stock)"));
             }
+        }
+
+        private CommandCameraSite _terrainSite;
+        private Vector3d _terrainDir;
+        private double _terrainEyeHeight;
+
+        /*
+         * Reads the terrain stock has built under a ground station's lens,
+         * once a frame before the solve, holds the station's detail centre
+         * while the save's detailed ground switch is on, and writes
+         * StationTerrain's line when it is due. The station's place in the
+         * sphere is fixed, so it is read once per site.
+         */
+        private void UpdateStationTerrain(CommandCameraSite site, float now)
+        {
+            var body = site != null && !site.HasVantage ? site.Body : null;
+            var pqs = body != null ? body.pqsController : null;
+            if (pqs == null || !pqs.isActive) return;
+            StationTerrain.NoteFrame();
+            var world = body.GetWorldSurfacePosition(site.Latitude, site.Longitude, site.Altitude);
+            if (!ReferenceEquals(site, _terrainSite))
+            {
+                if (!StationTerrain.StationInSphere(pqs, body, world, out _terrainDir, out _terrainEyeHeight)) return;
+                _terrainSite = site;
+            }
+            if (StationTerrain.DetailedGround) StationDetail.Touch(_flightId, pqs, _terrainDir, world, _terrainEyeHeight, now);
+            var leaf = StationTerrain.LeafAt(pqs, _terrainDir);
+            int lensLevel = StationTerrainMath.LevelForLens(pqs.radius, PQS.cacheSideVertCount, _terrainEyeHeight, pqs.maxLevel);
+            bool coarse = leaf.Found && StationTerrainMath.Coarse(leaf.Level, leaf.Visible, lensLevel);
+            /* What the line reports that is worth a line of its own when it changes. */
+            int signature = (leaf.Found ? leaf.Level + 1 : 0) | (leaf.Visible ? 1 << 8 : 0) | (coarse ? 1 << 9 : 0)
+                | (StationTerrain.DetailedGround ? 1 << 11 : 0) | (lensLevel << 12);
+            if (!StationTerrain.LogDue(_flightId, now, signature)) return;
+            StationTerrain.Log(_flightId, site.NodeName, body, pqs, world, _terrainDir, _terrainEyeHeight, leaf,
+                $"coarse={(coarse ? "true" : "false")} detailedGround={(StationTerrain.DetailedGround ? "on" : "off")} {StationDetail.LogFields(pqs)}");
         }
 
         /* AtmosphereFromGround fills the sky shader's camera inputs every frame
@@ -2897,6 +2933,8 @@ namespace Kerbcast
             Network?.Dispose();
             Network = null;
             _mount.DestroyAnchor();
+            StationTerrain.Forget(_flightId);
+            StationDetail.Release(_flightId, "camera-gone");
             Debug.Log($"{Tag} cam={_flightId} rig down");
         }
 
