@@ -630,6 +630,40 @@ namespace Kerbcast
                 var r = b.scaledBody.GetComponent<Renderer>();
                 var shader = r != null && r.sharedMaterial != null ? r.sharedMaterial.shader : null;
                 Debug.Log($"[Kerbcast] event=body-light body={b.bodyName} valueName={(setter != null ? setter.valueName : "none")} target={(setter != null && setter.target != null ? setter.target.name : "none")} shader={(shader != null ? shader.name : "none")}");
+                if (b.isStar) LogStarDraw(b, r);
+            }
+        }
+
+        /* What draws a star: its mesh material's values and queue, and each corona's place, scale and material, for checking why a lens shows the disc as it does. */
+        private static void LogStarDraw(CelestialBody b, Renderer mesh)
+        {
+            var mat = mesh != null ? mesh.sharedMaterial : null;
+            var text = new System.Text.StringBuilder();
+            if (mat != null)
+            {
+                text.Append($"queue={mat.renderQueue}");
+                var shader = mat.shader;
+                for (int i = 0; i < shader.GetPropertyCount(); i++)
+                {
+                    string n = shader.GetPropertyName(i);
+                    switch (shader.GetPropertyType(i))
+                    {
+                        case UnityEngine.Rendering.ShaderPropertyType.Color: text.Append($" {n}={mat.GetColor(n)}"); break;
+                        case UnityEngine.Rendering.ShaderPropertyType.Float:
+                        case UnityEngine.Rendering.ShaderPropertyType.Range: text.Append($" {n}={mat.GetFloat(n):G4}"); break;
+                        case UnityEngine.Rendering.ShaderPropertyType.Texture: text.Append($" {n}={(mat.GetTexture(n) != null ? mat.GetTexture(n).name : "none")}"); break;
+                    }
+                }
+            }
+            Debug.Log($"[Kerbcast] event=star-draw body={b.bodyName} meshScale={b.scaledBody.transform.localScale.x:G4} {text}");
+            var coronas = b.scaledBody.GetComponentsInChildren<SunCoronas>(true);
+            for (int i = 0; i < coronas.Length; i++)
+            {
+                var c = coronas[i];
+                var cr = c.GetComponent<Renderer>();
+                var cm = cr != null ? cr.sharedMaterial : null;
+                Debug.Log($"[Kerbcast] event=star-draw body={b.bodyName} corona={c.name} local={c.transform.localPosition} scale={c.transform.localScale} "
+                    + $"shader={(cm != null ? cm.shader.name : "none")} queue={(cm != null ? cm.renderQueue : -1)} layer={c.gameObject.layer} camera={(c.m_Camera != null ? c.m_Camera.name : "none")}");
             }
         }
 

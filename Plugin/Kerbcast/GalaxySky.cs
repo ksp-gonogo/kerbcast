@@ -40,7 +40,7 @@ namespace Kerbcast
                 s_alone = FacesAloneOn(mask);
                 s_scannedMask = mask;
                 s_scanned = true;
-                Debug.Log($"[Kerbcast] galaxy layer: clear={galaxyCam.clearFlags} background={galaxyCam.backgroundColor}, {s_faces.Length} cube faces, "
+                Debug.Log($"[Kerbcast] galaxy layer: clear={galaxyCam.clearFlags} background={galaxyCam.backgroundColor}, {s_faces.Length} cube faces ({FaceTexture()}), "
                     + (s_alone ? "nothing else on the layer, so a black sky is cleared rather than rendered" : "other renderers on the layer, so it always renders"));
             }
             ReadTint();
@@ -49,6 +49,15 @@ namespace Kerbcast
             var t = tint ?? s_tint;
             return GalaxyBlackout.CanClear(galaxyCam.clearFlags == CameraClearFlags.SolidColor, bg.r, bg.g, bg.b,
                 s_alone, tinted, t.r, t.g, t.b);
+        }
+
+        /* The first face's texture as the sampler sees it, so a log says how far a narrow field magnifies the stars. */
+        private static string FaceTexture()
+        {
+            var mat = s_faces.Length > 0 && s_faces[0] != null ? s_faces[0].sharedMaterial : null;
+            var tex = mat != null && mat.HasProperty("_MainTex") ? mat.mainTexture : null;
+            if (tex == null) return "no texture";
+            return $"{tex.name} {tex.width}x{tex.height} filter={tex.filterMode} mips={(tex is Texture2D t2 ? t2.mipmapCount : 0)} aniso={tex.anisoLevel} readable={tex.isReadable}";
         }
 
         private static bool Cube()
