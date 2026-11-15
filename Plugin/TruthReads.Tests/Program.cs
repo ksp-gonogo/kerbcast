@@ -124,8 +124,6 @@ var truthPins = new[]
     Pin.Whole("PicturePass.cs", "PicturePass.Locate", "the picture: whether a craft draws itself live or is drawn at its past instant"),
     Pin.Whole("PicturePass.cs", "PicturePass.Drawn", "the picture: the craft a tracking camera aims at, where it is drawn"),
     Pin.Whole("PicturePass.cs", "PicturePass.TryCraftPoint", "where a lens on a craft stands, shared by part cameras and a command camera's vantage"),
-    Pin.Whole("PicturePass.cs", "PicturePass.LogSunFlare", "a log line: the Sun's lens flare against the lens, no craft read"),
-    Pin.Whole("PicturePass.cs", "PicturePass.LogSunRayRenderers", "a log line: what lies between the lens and the Sun, no craft read"),
     Pin.Whole("SubjectTrack.cs", "SubjectTrack.Proto", "KSP's handles for the subject, read through TruthFixSource and DrawnSubject"),
     Pin.Whole("SubjectTrack.cs", "SubjectTrack.Adopt", "captures a chosen craft's handles"),
     Pin.Whole("SubjectTrack.cs", "SubjectTrack.AdoptById", "the picture's own lookup when a non-truth source resolved the subject"),

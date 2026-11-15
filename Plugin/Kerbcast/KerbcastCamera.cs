@@ -153,9 +153,11 @@ namespace Kerbcast
 
         private void RenderScaledWithRig()
         {
+            /* OnPostRender does not fire when a render stops early, so the Sun's flare is put back here as well. */
             if (Rig == null)
             {
-                _scaledCam.Render();
+                try { _scaledCam.Render(); }
+                finally { SunFlareForLens.End(); }
                 return;
             }
             try
@@ -163,7 +165,11 @@ namespace Kerbcast
                 Rig.BeforeScaledRender(this);
                 _scaledCam.Render();
             }
-            finally { Rig.AfterScaledRender(this); }
+            finally
+            {
+                SunFlareForLens.End();
+                Rig.AfterScaledRender(this);
+            }
         }
 
         /* The frame's live bound: a rig's lens rides the rig's craft (none at a
@@ -2527,6 +2533,23 @@ namespace Kerbcast
     {
         public Camera NearCamera { get; set; }
         public bool UseScaledSpace { get; set; }
+
+        /* The Sun's flare is placed before culling reads it, where the lens will stand once OnPreRender poses it. */
+        private void OnPreCull()
+        {
+            if (!UseScaledSpace || NearCamera == null || NearCamera.transform == null) return;
+            SunFlareForLens.Begin(ScaledSpace.LocalToScaledSpace(NearCamera.transform.position), NearCamera.transform.forward, NearCamera.transform.position);
+        }
+
+        private void OnPostRender()
+        {
+            if (UseScaledSpace) SunFlareForLens.End();
+        }
+
+        private void OnDestroy()
+        {
+            if (UseScaledSpace) SunFlareForLens.End();
+        }
 
         private void OnPreRender()
         {
