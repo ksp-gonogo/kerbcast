@@ -1008,7 +1008,7 @@ namespace Kerbcast
             var nearGo = new GameObject($"Kerbcast_{FlightId}_Near");
             _nearCam = nearGo.AddComponent<Camera>();
             var sourceNear = FindRequiredKspCamera("Camera 00");
-            if (sourceNear != null) _nearCam.CopyFrom(sourceNear);
+            if (sourceNear != null) { _nearCam.CopyFrom(sourceNear); CopyFlareLayer(sourceNear, _nearCam); }
             _nearCam.name = $"Kerbcast_{FlightId}_Near";
             nearGo.transform.parent = nearParent;
             nearGo.transform.localPosition = nearLocalPos;
@@ -1060,6 +1060,7 @@ namespace Kerbcast
             if (sourceScaled != null)
             {
                 _scaledCam.CopyFrom(sourceScaled);
+                CopyFlareLayer(sourceScaled, _scaledCam);
                 scaledGo.transform.parent = sourceScaled.transform;
                 var scaledComps = sourceScaled.gameObject.GetComponents<MonoBehaviour>();
                 Debug.Log($"[Kerbcast] Camera ScaledSpace components ({scaledComps.Length}): " +
@@ -1098,6 +1099,7 @@ namespace Kerbcast
             if (sourceGalaxy != null)
             {
                 _galaxyCam.CopyFrom(sourceGalaxy);
+                CopyFlareLayer(sourceGalaxy, _galaxyCam);
                 galaxyGo.transform.parent = sourceGalaxy.transform;
             }
             _galaxyCam.name = $"Kerbcast_{FlightId}_Galaxy";
@@ -1134,6 +1136,7 @@ namespace Kerbcast
                 var farGo = new GameObject($"Kerbcast_{FlightId}_Far");
                 _farCam = farGo.AddComponent<Camera>();
                 _farCam.CopyFrom(sourceFar);
+                CopyFlareLayer(sourceFar, _farCam);
                 _farCam.name = $"Kerbcast_{FlightId}_Far";
                 farGo.transform.parent = nearParent;
                 farGo.transform.localPosition = nearLocalPos;
@@ -1311,6 +1314,27 @@ namespace Kerbcast
         {
             var all = FindKspCamerasByName(name);
             return all.FirstOrDefault(c => c.enabled) ?? all.FirstOrDefault();
+        }
+
+        /*
+         * CopyFrom reads a camera's settings but not its components, so a clone
+         * never has the FlareLayer the game's camera draws lens flares with:
+         * the Sun's glare, which sits over its disc in the game's own view,
+         * would be missing from every feed. The clone gets one wherever its
+         * source camera has one.
+         */
+        private void CopyFlareLayer(Camera source, Camera clone)
+        {
+            var from = source.GetComponent<FlareLayer>();
+            if (from == null)
+            {
+                Debug.Log($"[Kerbcast] cam={FlightId} flare-layer none on '{source.name}'");
+                return;
+            }
+            var layer = clone.GetComponent<FlareLayer>();
+            if (layer == null) layer = clone.gameObject.AddComponent<FlareLayer>();
+            layer.enabled = from.enabled;
+            Debug.Log($"[Kerbcast] cam={FlightId} flare-layer copied from '{source.name}' to '{clone.name}' enabled={from.enabled} mask=0x{source.cullingMask:X8}");
         }
 
         /* A miss means this layer is about to be built from Unity defaults
