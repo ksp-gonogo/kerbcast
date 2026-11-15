@@ -285,6 +285,7 @@ namespace Kerbcast
             if (_scaledDepth++ > 0) return;
             var bodies = FlightGlobals.Bodies;
             LogBodyLight(bodies);
+            LogSunFlare(_scaled?.Invoke());
             double? c = LightTime.LightSpeed;
             if (bodies == null || !BodyLight.Applies(c.HasValue, KerbcastSettings.PlanetPhases) || !TryFrameLens(out var lens)) return;
             var plan = c.HasValue ? BodiesFor(lens, c.Value) : null;
@@ -631,6 +632,48 @@ namespace Kerbcast
                 var shader = r != null && r.sharedMaterial != null ? r.sharedMaterial.shader : null;
                 Debug.Log($"[Kerbcast] event=body-light body={b.bodyName} valueName={(setter != null ? setter.valueName : "none")} target={(setter != null && setter.target != null ? setter.target.name : "none")} shader={(shader != null ? shader.name : "none")}");
                 if (b.isStar) LogStarDraw(b, r);
+            }
+        }
+
+        private static float s_flareLoggedAt = -100f;
+
+        /*
+         * Every few seconds, what the Sun's lens flare is doing as this camera's
+         * scaled layer is about to render: whether it is on, how bright, where it
+         * sits against the lens, what the flare's own occlusion ray would hit, and
+         * what the lens camera and the game's scaled camera carry to draw it.
+         * For finding why a lens shows the Sun without the game's glare.
+         */
+        private static void LogSunFlare(Camera lens)
+        {
+            if (lens == null || Time.realtimeSinceStartup - s_flareLoggedAt < 5f) return;
+            s_flareLoggedAt = Time.realtimeSinceStartup;
+            try
+            {
+                var flares = new List<LensFlare>();
+                if (Sun.Instance != null && Sun.Instance.sunFlare != null) flares.Add(Sun.Instance.sunFlare);
+                if (SunFlare.Instance != null && SunFlare.Instance.sunFlare != null && !flares.Contains(SunFlare.Instance.sunFlare)) flares.Add(SunFlare.Instance.sunFlare);
+                var layer = lens.GetComponent<FlareLayer>();
+                var stock = ScaledCamera.Instance != null ? ScaledCamera.Instance.cam : null;
+                var stockLayer = stock != null ? stock.GetComponent<FlareLayer>() : null;
+                Debug.Log($"[Kerbcast] event=sun-flare lens='{lens.name}' enabled={lens.enabled} mask=0x{lens.cullingMask:X8} hdr={lens.allowHDR} target={(lens.targetTexture != null ? lens.targetTexture.name : "none")} "
+                    + $"flareLayer={(layer != null ? layer.enabled.ToString() : "none")} stock='{(stock != null ? stock.name : "none")}' stockMask=0x{(stock != null ? stock.cullingMask : 0):X8} stockFlareLayer={(stockLayer != null ? stockLayer.enabled.ToString() : "none")} flares={flares.Count}");
+                for (int i = 0; i < flares.Count; i++)
+                {
+                    var f = flares[i];
+                    var at = f.transform.position;
+                    var to = at - lens.transform.position;
+                    var vp = lens.WorldToViewportPoint(at);
+                    string hit = "none";
+                    if (Physics.Raycast(lens.transform.position, to, out var h, to.magnitude, ~0, QueryTriggerInteraction.Ignore))
+                        hit = $"{h.collider.name} layer={h.collider.gameObject.layer} at={h.distance:G5}";
+                    Debug.Log($"[Kerbcast] event=sun-flare flare='{f.name}' enabled={f.enabled} active={f.gameObject.activeInHierarchy} layer={f.gameObject.layer} brightness={f.brightness:G4} fadeSpeed={f.fadeSpeed:G4} "
+                        + $"color={f.color} asset={(f.flare != null ? f.flare.name : "none")} dist={to.magnitude:G5} viewport={vp} ray={hit}");
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.Log($"[Kerbcast] event=sun-flare failed: {e.Message}");
             }
         }
 
