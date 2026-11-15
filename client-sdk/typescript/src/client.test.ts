@@ -1599,6 +1599,7 @@ describe("KerbcastClient", () => {
           setSource,
           setShowStatic: vi.fn(),
           setPassthrough: vi.fn(),
+          setPlaceholderSize: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1636,6 +1637,39 @@ describe("KerbcastClient", () => {
       }
     });
 
+    it("sizes the waiting static to the camera's announced render size and follows it", async () => {
+      const setPlaceholderSize = vi.fn();
+      const createSpy = vi.spyOn(noise, "tryCreateNoisePipeline").mockReturnValue({
+        processedStream: new MediaStream(),
+        setIntensity: vi.fn(),
+        setSource: vi.fn(),
+        setShowStatic: vi.fn(),
+        setPassthrough: vi.fn(),
+        setPlaceholderSize,
+        displayedFrame: vi.fn(() => null),
+        destroy: vi.fn(),
+      });
+      try {
+        const sidecar = new MockSidecar().withSlots(["a"]);
+        sidecar.addCamera({ flightId: 42, renderWidth: 848, renderHeight: 480 });
+        const client = new KerbcastClient({ host: "h", port: 1 }, sidecar.createTransport());
+        vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+          Promise.resolve(MockSidecar.makeOfferResponse([])),
+        );
+
+        await client.connect([], { slots: 1 });
+        sidecar.open();
+        await client.subscribe(42);
+        sidecar.deliverTrack("a", {} as MediaStreamTrack);
+        expect(setPlaceholderSize).toHaveBeenLastCalledWith(848, 480);
+
+        sidecar.updateCamera(42, { renderWidth: 1024, renderHeight: 576 });
+        expect(setPlaceholderSize).toHaveBeenLastCalledWith(1024, 576);
+      } finally {
+        createSpy.mockRestore();
+      }
+    });
+
     it("keeps the source of a resurrected camera already playing its track", async () => {
       const setSource = vi.fn();
       const createSpy = vi.spyOn(noise, "tryCreateNoisePipeline").mockReturnValue({
@@ -1644,6 +1678,7 @@ describe("KerbcastClient", () => {
         setSource,
         setShowStatic: vi.fn(),
         setPassthrough: vi.fn(),
+        setPlaceholderSize: vi.fn(),
         destroy: vi.fn(),
       });
       try {
@@ -1683,6 +1718,7 @@ describe("KerbcastClient", () => {
           setSource,
           setShowStatic: vi.fn(),
           setPassthrough: vi.fn(),
+          setPlaceholderSize: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1728,6 +1764,7 @@ describe("KerbcastClient", () => {
           setSource,
           setShowStatic: vi.fn(),
           setPassthrough: vi.fn(),
+          setPlaceholderSize: vi.fn(),
           destroy: vi.fn(),
         });
       try {
@@ -1848,6 +1885,7 @@ describe("KerbcastClient", () => {
           setSource: vi.fn(),
           setShowStatic: vi.fn(),
           setPassthrough: vi.fn(),
+          setPlaceholderSize: vi.fn(),
           destroy,
         });
       try {
@@ -1888,6 +1926,7 @@ describe("KerbcastClient", () => {
         setIntensity: vi.fn(),
         setSource: vi.fn(),
         setShowStatic,
+        setPlaceholderSize: vi.fn(),
         destroy: vi.fn(),
       };
       let opts: Parameters<typeof noise.tryCreateNoisePipeline>[2];

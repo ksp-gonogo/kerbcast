@@ -457,3 +457,26 @@ describe("CommandBlank", () => {
     );
   });
 });
+
+describe("CommandBrackets under a covering fit", () => {
+  it("places the subject where a covered frame draws it", () => {
+    let seen: CommandBracketContext | null = null;
+    /* 848x480 covering an 830x466 box: scaled to the width, about 1.5 px cropped top and bottom. */
+    render(
+      <CommandBrackets
+        state={effectiveCommandTrack(track(), 1000)}
+        displayUt={1000}
+        utSource="exact"
+        video={sizedVideo(830, 466, 848, 480)}
+        fit="cover"
+        overlay={{ render: (ctx) => ((seen = ctx), null) }}
+        subject={subjectAnchor({ x: 0, y: 0 })}
+        subjectFrameSize={{ width: 848, height: 480 }}
+      />,
+    );
+    const g = (seen as CommandBracketContext | null)!.geometry;
+    const scale = 830 / 848;
+    expect(g.cx).toBeCloseTo(0, 6);
+    expect(g.cy).toBeCloseTo((466 - 480 * scale) / 2, 6);
+  });
+});

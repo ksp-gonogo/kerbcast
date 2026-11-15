@@ -96,6 +96,13 @@ export interface NoisePipeline {
   setSource(stream: MediaStream | null): void;
   /** Runtime switch for {@link NoisePipelineOptions.showStatic}. */
   setShowStatic(enabled: boolean): void;
+  /**
+   * The size to draw at before the source's first frame and while
+   * sourceless: the size the stream is announced to arrive at. A width or
+   * height of 0 (unknown) restores the 320x180 default. Decoded frames
+   * still set the size once they arrive.
+   */
+  setPlaceholderSize(width: number, height: number): void;
   /** Runtime switch for {@link NoisePipelineOptions.passthrough}. */
   setPassthrough(enabled: boolean): void;
   /**
@@ -208,13 +215,29 @@ export function tryCreateNoisePipeline(
   const heldCtx = heldCanvas.getContext("2d");
   if (!noiseCtx || !ctx || !heldCtx) return null;
 
-  // Size the output canvas to video dimensions once frames arrive.
-  // Until then (and while sourceless), use a placeholder so the output
-  // has something to show.
-  canvas.width = NOISE_MAX_W;
-  canvas.height = NOISE_MAX_H;
-  noiseCanvas.width = Math.ceil(NOISE_MAX_W / 2);
-  noiseCanvas.height = Math.ceil(NOISE_MAX_H / 2);
+  /*
+   * The output follows the decoded frames once they arrive. Until then, and
+   * while sourceless, it is the placeholder size: the stream's announced size
+   * when the consumer has passed one (setPlaceholderSize), else 320x180. A
+   * placeholder at the stream's own size keeps the output's size, shape and
+   * grain unchanged when the first frame lands, so the element showing it
+   * does not jump.
+   */
+  let placeholderW = NOISE_MAX_W;
+  let placeholderH = NOISE_MAX_H;
+  const sizeTo = (vw: number, vh: number) => {
+    canvas.width = vw;
+    canvas.height = vh;
+    const scale = Math.min(1, NOISE_MAX_W / vw, NOISE_MAX_H / vh);
+    noiseCanvas.width = Math.max(1, Math.round(vw * scale));
+    noiseCanvas.height = Math.max(1, Math.round(vh * scale));
+  };
+  const sizeToPlaceholder = () => {
+    if (canvas.width !== placeholderW || canvas.height !== placeholderH) {
+      sizeTo(placeholderW, placeholderH);
+    }
+  };
+  sizeToPlaceholder();
 
   let intensity = initialIntensity;
   let showStatic = options?.showStatic ?? true;
@@ -325,14 +348,6 @@ export function tryCreateNoisePipeline(
     onStallChange?.(next);
   };
 
-  const sizeTo = (vw: number, vh: number) => {
-    canvas.width = vw;
-    canvas.height = vh;
-    const scale = Math.min(1, NOISE_MAX_W / vw, NOISE_MAX_H / vh);
-    noiseCanvas.width = Math.max(1, Math.round(vw * scale));
-    noiseCanvas.height = Math.max(1, Math.round(vh * scale));
-  };
-
   const detachSource = () => {
     stopReader?.();
     stopReader = null;
@@ -362,10 +377,7 @@ export function tryCreateNoisePipeline(
     } else {
       // Sourceless: draw() composites pure static. Reset the canvas to the
       // placeholder size so a stale source's dimensions don't linger.
-      canvas.width = NOISE_MAX_W;
-      canvas.height = NOISE_MAX_H;
-      noiseCanvas.width = Math.ceil(NOISE_MAX_W / 2);
-      noiseCanvas.height = Math.ceil(NOISE_MAX_H / 2);
+      sizeToPlaceholder();
     }
   };
 
@@ -628,6 +640,14 @@ export function tryCreateNoisePipeline(
     },
     setPassthrough(enabled: boolean) {
       passthrough = enabled;
+    },
+    setPlaceholderSize(width: number, height: number) {
+      const known = width > 0 && height > 0 && Number.isFinite(width) && Number.isFinite(height);
+      placeholderW = known ? Math.round(width) : NOISE_MAX_W;
+      placeholderH = known ? Math.round(height) : NOISE_MAX_H;
+      /* Once the source has delivered a frame, its own size rules. */
+      const delivering = hasSource && (lastFrameTs > 0 || video.videoWidth > 0);
+      if (!delivering) sizeToPlaceholder();
     },
     displayedFrame,
     destroy() {

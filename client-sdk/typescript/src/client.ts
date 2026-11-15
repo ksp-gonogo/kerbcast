@@ -1508,6 +1508,7 @@ class CameraHandle
   _setState(state: CameraState): boolean {
     const prevDestroyed = this._state?.lifecycle === CameraLifecycle.Destroyed;
     this._state = state;
+    this._noisePipeline?.setPlaceholderSize(state.renderWidth ?? 0, state.renderHeight ?? 0);
     this.emit("change", state);
 
     // A destroyed camera stops forwarding frames but its track never ends, so
@@ -1582,6 +1583,7 @@ class CameraHandle
 
       const pipeline = this._noisePipeline;
       if (pipeline) {
+        pipeline.setPlaceholderSize(this._state?.renderWidth ?? 0, this._state?.renderHeight ?? 0);
         pipeline.setIntensity(intensity);
         this._setOutput(pipeline.processedStream);
         return;
