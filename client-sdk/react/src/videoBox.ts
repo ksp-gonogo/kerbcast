@@ -47,3 +47,29 @@ export function videoFit(video: HTMLVideoElement | null): "contain" | "cover" {
   if (!video || typeof getComputedStyle !== "function") return "contain";
   return getComputedStyle(video).objectFit === "cover" ? "cover" : "contain";
 }
+
+/**
+ * How far a frame's aspect may sit from its box's before the feed stops
+ * covering the box and letterboxes instead, as a fraction. Streams are sized
+ * in whole 16 px blocks, so a frame lands up to about a percent off the shape
+ * laid out for it (848x480 in a 16:9 box). Letterboxing that leaves a few
+ * pixels of black bar down two edges; covering crops under a pixel or two
+ * from the others, which nobody sees.
+ */
+export const NEAR_SHAPE_TOLERANCE = 0.02;
+
+/**
+ * The fit for a feed's video: `cover` when the frame is within
+ * {@link NEAR_SHAPE_TOLERANCE} of the box's shape, `contain` otherwise or
+ * while either size is unknown.
+ */
+export function nearShapeFit(
+  boxWidth: number,
+  boxHeight: number,
+  mediaWidth: number,
+  mediaHeight: number,
+): "contain" | "cover" {
+  if (!(boxWidth > 0 && boxHeight > 0 && mediaWidth > 0 && mediaHeight > 0)) return "contain";
+  const off = (mediaWidth / mediaHeight) / (boxWidth / boxHeight);
+  return Math.abs(off - 1) <= NEAR_SHAPE_TOLERANCE ? "cover" : "contain";
+}

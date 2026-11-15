@@ -5,16 +5,18 @@ import {
   anchorPoint,
   commandReadout,
   findAnchor,
+  fitFrame,
   frameToScreen,
   type DisplayedFrameUt,
   type EffectiveCommandTrack,
   type FrameAnchor,
+  type FrameFit,
   type FrameUtSource,
 } from "@ksp-gonogo/kerbcast";
 import { type ReactNode } from "react";
 import styled from "styled-components";
 import { useDisplayedFrame } from "./AnchorMarkers";
-import { useVideoBox } from "./videoBox";
+import { useVideoBox, videoFit } from "./videoBox";
 
 const BRACKET_STROKE_PX = 2;
 const BRACKET_MIN_HALF_PX = 14;
@@ -245,6 +247,8 @@ export interface CommandBracketsProps {
    * onto a moved one.
    */
   aim?: FrameAnchor | null;
+  /** How the video fits its box. Default: read from the element's CSS. */
+  fit?: FrameFit;
 }
 
 /**
@@ -272,13 +276,15 @@ export function CommandBrackets({
   subject,
   subjectFrameSize,
   aim,
+  fit,
 }: CommandBracketsProps) {
   const { boxW, boxH, mediaW, mediaH } = useVideoBox(video);
-  const rect = containedContentRect(
+  const rect = fitFrame(
     boxW,
     boxH,
     mediaW || fallbackSize?.width || 0,
     mediaH || fallbackSize?.height || 0,
+    fit ?? videoFit(video),
   );
   const frameW = subjectFrameSize?.width || mediaW || fallbackSize?.width || 0;
   const frameH = subjectFrameSize?.height || mediaH || fallbackSize?.height || 0;

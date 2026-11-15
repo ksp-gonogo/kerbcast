@@ -1711,7 +1711,14 @@ describe("CameraFeed - ResizeObserver render-size feedback", () => {
       constructor(
         cb: (entries: ResizeObserverEntry[], observer: ResizeObserver) => void,
       ) {
-        resizeCallback = cb;
+        /* The feed watches more than one element; a resize reaches every observer. */
+        const earlier = resizeCallback;
+        resizeCallback = earlier
+          ? (entries, observer) => {
+              earlier(entries, observer);
+              cb(entries, observer);
+            }
+          : cb;
       }
       observe() {}
       unobserve() {}
@@ -4705,5 +4712,31 @@ describe("CameraFeed - camera briefly missing from the list", () => {
     });
     expect(new Set(shown)).toEqual(new Set([42]));
     expect(countFor(sidecar, "unsubscribe", 42)).toBe(0);
+  });
+});
+
+describe("CameraFeed - video fit", () => {
+  function size(video: HTMLVideoElement, boxW: number, boxH: number, mediaW: number, mediaH: number) {
+    Object.defineProperty(video, "clientWidth", { value: boxW, configurable: true });
+    Object.defineProperty(video, "clientHeight", { value: boxH, configurable: true });
+    Object.defineProperty(video, "videoWidth", { value: mediaW, configurable: true });
+    Object.defineProperty(video, "videoHeight", { value: mediaH, configurable: true });
+    act(() => {
+      video.dispatchEvent(new Event("resize"));
+    });
+  }
+
+  it("covers the box with a frame rounded to whole macroblocks and letterboxes another shape", async () => {
+    const { client } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Pad Cam", maxWidth: 1280, maxHeight: 720 }),
+    ]);
+    const view = renderFeed(client, { flightId: 42 });
+    const video = view.container.querySelector("video")!;
+
+    size(video, 830, 466, 848, 480);
+    expect(video.dataset.fit).toBe("cover");
+
+    size(video, 830, 466, 480, 480);
+    expect(video.dataset.fit).toBe("contain");
   });
 });

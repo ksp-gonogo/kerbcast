@@ -344,6 +344,58 @@ describe("noise pipeline stall presentation", () => {
 });
 
 describe("noise pipeline sizing", () => {
+  it("draws the waiting static at the announced size, so the first frame does not resize the output", () => {
+    const env = installStallEnv();
+    let vw = 0;
+    let vh = 0;
+    const proto = HTMLVideoElement.prototype;
+    const origW = Object.getOwnPropertyDescriptor(proto, "videoWidth");
+    const origH = Object.getOwnPropertyDescriptor(proto, "videoHeight");
+    Object.defineProperty(proto, "videoWidth", { configurable: true, get: () => vw });
+    Object.defineProperty(proto, "videoHeight", { configurable: true, get: () => vh });
+    const canvases: HTMLCanvasElement[] = [];
+    const origCreate = document.createElement.bind(document);
+    const createSpy = vi.spyOn(document, "createElement").mockImplementation((tag: string) => {
+      const el = origCreate(tag);
+      if (tag === "canvas") canvases.push(el as HTMLCanvasElement);
+      return el;
+    });
+    try {
+      const pipeline = tryCreateNoisePipeline(fakeStream(), 0.05)!;
+      const [output, noiseScratch] = canvases;
+      expect([output!.width, output!.height]).toEqual([320, 180]);
+      expect([noiseScratch!.width, noiseScratch!.height]).toEqual([320, 180]);
+
+      pipeline.setPlaceholderSize(848, 480);
+      env.setNow(100);
+      env.draw();
+      expect([output!.width, output!.height]).toEqual([848, 480]);
+      /* The same grain the live size gets, not a coarser placeholder one. */
+      expect([noiseScratch!.width, noiseScratch!.height]).toEqual([318, 180]);
+
+      vw = 848;
+      vh = 480;
+      env.setNow(1000);
+      env.fireFrame();
+      env.draw();
+      expect([output!.width, output!.height]).toEqual([848, 480]);
+
+      /* A frame of the source has landed: its size rules, not the announcement. */
+      pipeline.setPlaceholderSize(1024, 576);
+      expect([output!.width, output!.height]).toEqual([848, 480]);
+
+      pipeline.setSource(null);
+      expect([output!.width, output!.height]).toEqual([1024, 576]);
+      pipeline.setPlaceholderSize(0, 0);
+      expect([output!.width, output!.height]).toEqual([320, 180]);
+    } finally {
+      createSpy.mockRestore();
+      if (origW) Object.defineProperty(proto, "videoWidth", origW);
+      if (origH) Object.defineProperty(proto, "videoHeight", origH);
+      env.restore();
+    }
+  });
+
   it("resizes the output canvas when the source's decoded size changes mid-stream", () => {
     const env = installStallEnv();
     let vw = 784;

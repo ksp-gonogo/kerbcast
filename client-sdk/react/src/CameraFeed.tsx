@@ -53,6 +53,7 @@ import { isCameraDestroyed } from "./lifecycle";
 import { claimAnchors } from "./sharedAnchors";
 import { menuPortalRoot, usePortalMenu } from "./menuPositioning";
 import { formatElapsed, nowMs } from "./timing";
+import { nearShapeFit, useVideoBox } from "./videoBox";
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -1027,6 +1028,20 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       streamSize: renderedSize,
     });
 
+    /*
+     * A frame a whisker off the box's shape (its sides rounded to whole
+     * macroblocks) covers the box rather than leaving thin bars down its
+     * edges. Until the video reports a size, the size the sidecar renders at
+     * stands in, so the fit is already right for the first frame.
+     */
+    const videoBox = useVideoBox(videoEl);
+    const videoFitMode = nearShapeFit(
+      videoBox.boxW,
+      videoBox.boxH,
+      videoBox.mediaW || renderedW,
+      videoBox.mediaH || renderedH,
+    );
+
     // -------------------------------------------------------------------------
     // UI state
     // -------------------------------------------------------------------------
@@ -1628,6 +1643,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
             <>
               <StyledVideo
                 ref={attachVideo}
+                data-fit={videoFitMode}
                 autoPlay
                 playsInline
                 muted
@@ -1760,6 +1776,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                         displayUt={commandDisplayUt?.ut ?? commandTrack!.ut}
                         utSource={commandDisplayUt?.source ?? null}
                         video={videoEl}
+                        fit={videoFitMode}
                         fallbackSize={
                           camera ? { width: camera.renderWidth, height: camera.renderHeight } : null
                         }
@@ -1774,7 +1791,13 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 <NoSlotNotice role="status">{noSlotLabel}</NoSlotNotice>
               )}
               {drawsAnchors && !outOfFlight && !isDestroyed && !commandState?.blank && (
-                <LiveAnchorMarkers flightId={flightId} video={videoEl} overlay={anchorOverlay} frame={hostFrame} />
+                <LiveAnchorMarkers
+                  flightId={flightId}
+                  video={videoEl}
+                  overlay={anchorOverlay}
+                  frame={hostFrame}
+                  fit={videoFitMode}
+                />
               )}
               {outOfFlight ? (
                 showStandbyIcon && (
@@ -2739,6 +2762,10 @@ const StyledVideo = styled.video`
   width: 100%;
   height: 100%;
   object-fit: contain;
+
+  &[data-fit="cover"] {
+    object-fit: cover;
+  }
 `;
 
 /**
